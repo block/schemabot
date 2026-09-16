@@ -86,35 +86,39 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 	}
 
 	dialect := schema.Dialect(report.Dialect)
-	// A manual entry gates the whole drift set: the convergence refuses every
-	// statement in the report until an operator resolves it by hand. Printing
-	// those statements as runnable SQL would put a block an operator can copy
-	// under a heading that says what is about to happen, when nothing is — so
-	// while one is present they are listed as what they are, gated, and the
-	// manual entries below say what is holding them.
-	gated := len(report.Manual) > 0
 
 	outstanding, err := storageSchemaChanges(report.Outstanding)
 	if err != nil {
 		return err
 	}
-	if !gated {
-		templates.WriteSQLChanges(outstanding, dialect)
-	}
-
 	destructive, err := storageSchemaChanges(report.Destructive)
 	if err != nil {
 		return err
 	}
+	manual, err := storageSchemaChanges(report.Manual)
+	if err != nil {
+		return err
+	}
+
+	// Every statement in the report is printed as SQL, the way `plan` prints an
+	// unsafe change it is about to refuse: the DDL says what the difference
+	// between the two schemas is, and the sections under it say which of it
+	// runs. A statement held back is the one an operator most needs in front of
+	// them — a refused DROP to weigh, a manual remediation to run by hand.
+	//
+	// Each disposition renders on its own, rather than as one list, because the
+	// dialect's formatter combines the alters of a single table into one
+	// statement. A storage ALTER that was split so its safe half could run
+	// would be recombined into a statement nothing is going to run, and the
+	// split that is the whole point of the refusal would not be on screen.
+	templates.WriteSQLChanges(outstanding, dialect)
+	templates.WriteSQLChanges(destructive, dialect)
+	templates.WriteSQLChanges(manual, dialect)
+
 	// Set when the refusal below is one that stops the run, so it can be
 	// written after the summary.
 	var blocked func()
-	if gated {
-		templates.WriteChangeNotice(glyph.Attention,
-			"Gated behind the manual remediation below; none of these run until it is resolved:",
-			storageSchemaNotices(append(append([]apitypes.StorageSchemaStatement{}, report.Outstanding...), report.Destructive...)))
-	}
-	if len(destructive) > 0 && !gated {
+	if len(destructive) > 0 {
 		// The three dispositions a destructive change can be in are the three
 		// the rest of the CLI already renders, so they are rendered by the same
 		// templates: a plan disclosing one, an apply refusing one, and consent
@@ -123,7 +127,6 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 		// unsafe change.
 		switch {
 		case report.DestructiveAllowed:
-			templates.WriteSQLChanges(destructive, dialect)
 			// The consent is not necessarily a flag: a deployment's storage
 			// policy can permit these with nothing on the command line.
 			templates.WriteUnsafeWarningAllowed(storageSchemaNotices(report.Destructive),
@@ -154,7 +157,10 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 			storageSchemaNotices(report.Manual))
 	}
 
-	templates.WritePlanSummary(storageSchemaRunnable(report, outstanding, destructive))
+	all := make([]templates.DDLChange, 0, len(outstanding)+len(destructive)+len(manual))
+	all = append(all, outstanding...)
+	all = append(all, destructive...)
+	templates.WritePlanSummary(storageSchemaSummaryTables(append(all, manual...)))
 	// Hints before the refusal, so the command an operator copies is the last
 	// thing on screen on every path that prints one. A hint explains what was
 	// left behind; the refusal ends with the line that does something about it.
@@ -163,23 +169,6 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 		blocked()
 	}
 	return nil
-}
-
-// storageSchemaRunnable is what the summary line counts: the changes this plan
-// would actually run. Destructive statements count only where they are
-// permitted, and nothing counts while a manual entry blocks the whole set —
-// a summary promising three tables that the convergence will refuse to touch is
-// worse than no summary.
-func storageSchemaRunnable(report *apitypes.StorageSchemaReport, outstanding, destructive []templates.DDLChange) []templates.DDLChange {
-	if len(report.Manual) > 0 {
-		return nil
-	}
-	if !report.DestructiveAllowed {
-		return storageSchemaSummaryTables(outstanding)
-	}
-	runnable := make([]templates.DDLChange, 0, len(outstanding)+len(destructive))
-	runnable = append(runnable, outstanding...)
-	return storageSchemaSummaryTables(append(runnable, destructive...))
 }
 
 // storageSchemaSummaryTables collapses a change list to one entry per table and
@@ -310,12 +299,10 @@ func storageSchemaChangeType(operation string) (string, error) {
 // numbers: one line per statement, carrying the reason it will not simply run.
 //
 // A statement with no reason of its own is named by what it would do, not by
-// its DDL. The gated list is where that matters: a gated set is every statement
-// in the report, and the outstanding ones among them are unremarkable — nothing
-// is wrong with them beyond the gate — so they carry no reason at all. Printing
-// their DDL instead would put a whole CREATE TABLE, newlines and indentation
-// included, on one numbered line, and the list an operator is counting through
-// would be lost inside it.
+// its DDL, so an entry stays one line. Printing the DDL instead would put a
+// whole CREATE TABLE, newlines and indentation included, on one numbered line,
+// and the list an operator is counting through would be lost inside it. The
+// DDL is above in its own section, rendered as SQL.
 func storageSchemaNotices(statements []apitypes.StorageSchemaStatement) []apitypes.UnsafeChange {
 	if len(statements) == 0 {
 		return nil

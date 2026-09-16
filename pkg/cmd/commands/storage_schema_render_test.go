@@ -78,12 +78,11 @@ func TestOutputStorageSchemaPlan_DestructiveSeverity(t *testing.T) {
 		allowed bool
 		isApply bool
 		heading string
-		runs    bool
 		rerun   bool
 	}{
 		{name: "a plan discloses", heading: glyph.Attention + " Unsafe Changes Detected:"},
 		{name: "an apply refuses", isApply: true, heading: glyph.Refused + " Apply blocked: 1 unsafe change(s) detected", rerun: true},
-		{name: "consent in effect", allowed: true, heading: glyph.Escalation + " Unsafe Changes (destructive storage changes allowed)", runs: true},
+		{name: "consent in effect", allowed: true, heading: glyph.Escalation + " Unsafe Changes (destructive storage changes allowed)"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -104,20 +103,19 @@ func TestOutputStorageSchemaPlan_DestructiveSeverity(t *testing.T) {
 				assert.Contains(t, out, "schemabot storage apply --allow-unsafe",
 					"a blocked apply names the command that permits what it refused, carrying this one's target flags")
 			}
-			if tc.runs {
-				assert.Contains(t, out, "- stale_state", "a statement that will run is shown as a change")
-				assert.Contains(t, out, "📋 Plan: 1 table to drop")
-			} else {
-				assert.NotContains(t, out, "📋 Plan:",
-					"a refused statement is not something the convergence is about to do")
-			}
+			// The statement is printed and counted whatever its disposition,
+			// the way `plan` prints and counts an unsafe change it will
+			// refuse. What runs is what the sections under it say.
+			assert.Contains(t, out, "- stale_state")
+			assert.Contains(t, out, "📋 Plan: 1 table to drop")
 		})
 	}
 }
 
-// A manual entry blocks the whole convergence rather than being held back on
-// its own, so nothing is summarized as about to run while one is outstanding.
-func TestOutputStorageSchemaPlan_ManualBlocksEverything(t *testing.T) {
+// A manual entry is disclosed under the statements rather than in place of
+// them: the plan renders the whole difference between the two schemas, and the
+// notice says what stands in the way of converging it.
+func TestOutputStorageSchemaPlan_ManualIsDisclosedUnderThePlan(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{
 		Dialect:      "postgres",
 		Database:     "schemabot",
@@ -141,10 +139,11 @@ func TestOutputStorageSchemaPlan_ManualBlocksEverything(t *testing.T) {
 
 	assert.Contains(t, out, "Database: schemabot (deployment west)")
 	assert.Contains(t, out, "Production", "the environment heads the section, as it does in every plan")
+	assert.Contains(t, out, "~ applies")
+	assert.Contains(t, out, "~ checks", "the statement waiting on the remediation is printed, not withheld")
 	assert.Contains(t, out, glyph.Attention+" Needs manual remediation")
 	assert.Contains(t, out, "1. checks: column is NOT NULL without a DEFAULT")
-	assert.NotContains(t, out, "📋 Plan:",
-		"the convergence refuses the whole drift set, so nothing below the manual entry runs either")
+	assert.Contains(t, out, "📋 Plan: 2 tables to alter")
 }
 
 // A clean convergence states that nothing is left, rather than leaving an
@@ -268,7 +267,6 @@ func TestOutputStorageSchemaConvergence_RefusedRunsSayNothingRan(t *testing.T) {
 	assert.Contains(t, withPlan, glyph.Refused+" Ran no statements against")
 	assert.Equal(t, 1, strings.Count(withPlan, "Needs manual remediation"),
 		"the plan above already carries the refusal; repeating it below reports one refusal twice")
-	assert.Equal(t, 1, strings.Count(withPlan, "Gated behind the manual remediation below"))
 }
 
 // A convergence that applied something and refused something reports the
@@ -327,28 +325,28 @@ func lastLineOf(out string) string {
 	return lines[len(lines)-1]
 }
 
-// The summary line counts what the convergence would actually run. Promising
-// tables it will refuse to touch is worse than promising nothing.
-func TestStorageSchemaRunnable(t *testing.T) {
-	outstanding := []apitypes.StorageSchemaStatement{{Table: "applies", Operation: "alter_table", DDL: "ALTER TABLE `applies` ADD COLUMN `caller` text"}}
-	destructive := []apitypes.StorageSchemaStatement{{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"}}
-
-	runnable := func(report *apitypes.StorageSchemaReport) int {
-		outChanges, err := storageSchemaChanges(report.Outstanding)
-		require.NoError(t, err)
-		destChanges, err := storageSchemaChanges(report.Destructive)
-		require.NoError(t, err)
-		return len(storageSchemaRunnable(report, outChanges, destChanges))
+// The summary line counts the difference between the two schemas, whatever
+// each statement's disposition — the count a reader checks the printed sections
+// against. What will actually run is what the notices under them say.
+func TestOutputStorageSchemaPlan_SummaryCountsTheWholeDifference(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Outstanding:  []apitypes.StorageSchemaStatement{{Table: "applies", Operation: "alter_table", DDL: "ALTER TABLE `applies` ADD COLUMN `caller` text"}},
+		Destructive:  []apitypes.StorageSchemaStatement{{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"}},
+		Manual: []apitypes.StorageSchemaStatement{{
+			Table: "checks", Operation: "add_column",
+			DDL:    "ALTER TABLE `checks` ADD COLUMN `head_sha` varchar(64) NOT NULL",
+			Reason: "column is NOT NULL without a DEFAULT",
+		}},
 	}
 
-	assert.Equal(t, 1, runnable(&apitypes.StorageSchemaReport{Outstanding: outstanding, Destructive: destructive}),
-		"a refused destructive statement is not something the convergence will run")
-	assert.Equal(t, 2, runnable(&apitypes.StorageSchemaReport{Outstanding: outstanding, Destructive: destructive, DestructiveAllowed: true}))
-	assert.Equal(t, 0, runnable(&apitypes.StorageSchemaReport{
-		Outstanding: outstanding,
-		Destructive: destructive,
-		Manual:      []apitypes.StorageSchemaStatement{{Table: "checks", Operation: "add_column", Reason: "column is NOT NULL without a DEFAULT"}},
-	}), "a manual entry stops the whole drift set, not just itself")
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
+	})
+
+	assert.Contains(t, out, "📋 Plan: 2 tables to alter, 1 table to drop")
 }
 
 // The report's operation vocabulary maps onto the plan's three change symbols.
@@ -433,12 +431,11 @@ func TestStorageSchemaNotices(t *testing.T) {
 	assert.Empty(t, storageSchemaNotices(nil))
 }
 
-// A gated list is every statement in the report, and the outstanding ones among
-// them carry no reason — nothing is wrong with them beyond the gate. Each is one
-// numbered line naming what it would do: a CREATE TABLE printed there instead
-// would put a whole schema file, newlines and all, on one line of a list the
-// operator is counting through.
-func TestOutputStorageSchemaPlan_GatedListIsOneLinePerStatement(t *testing.T) {
+// A manual reason is one sentence written for one change, and the statement it
+// names is printed as SQL above it. The numbered entry stays a line: a CREATE
+// TABLE on one of them would put a whole schema file, newlines and all, inside
+// the list the operator is counting through.
+func TestOutputStorageSchemaPlan_ManualEntryIsOneLinePerStatement(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{
 		Dialect:      "postgres",
 		Database:     "schemabot",
@@ -459,18 +456,17 @@ func TestOutputStorageSchemaPlan_GatedListIsOneLinePerStatement(t *testing.T) {
 		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
 
-	gated := out[strings.Index(out, "Gated behind"):strings.Index(out, "Needs manual remediation")]
-	assert.Contains(t, gated, "1. plans: create table")
-	assert.Contains(t, gated, "2. applies: add column")
-	assert.NotContains(t, gated, "CREATE TABLE",
-		"the gated list names statements; it does not print the DDL of one on a numbered line")
-	assert.NotContains(t, gated, "3.", "one entry per statement, so the numbering ends where the list does")
+	assert.Contains(t, out, "+ plans", "every statement in the report is printed as SQL")
+	assert.Contains(t, out, "~ checks")
 
-	// A manual reason is one sentence written for one change. Split on its
-	// semicolon it would read as two separate things to fix, one of them the
-	// remedy for the other.
-	assert.Contains(t, out, "1. checks: definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT")
-	assert.NotContains(t, out, "2. checks:")
+	// Split on its semicolon the reason would read as two separate things to
+	// fix, one of them the remedy for the other.
+	_, notice, found := strings.Cut(out, "Needs manual remediation")
+	require.True(t, found, "the plan discloses the manual entry")
+	assert.Contains(t, notice, "1. checks: definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT")
+	assert.NotContains(t, notice, "2.", "one entry per statement, so the numbering ends where the list does")
+	assert.NotContains(t, notice, "CREATE TABLE",
+		"the notice names statements; the DDL is in the section above it")
 }
 
 // A destructive statement's reason is one finding, however it is punctuated.
@@ -531,40 +527,41 @@ func TestOutputStorageSchemaPlan_SectionOrder(t *testing.T) {
 	assert.Less(t, strings.Index(out, "Apply blocked"), strings.Index(out, "schemabot storage apply --allow-unsafe"))
 }
 
-// A manual entry gates the whole drift set, so a plan carrying one prints no
-// runnable SQL at all. The statements are still named — an operator needs to
-// know what is waiting on the remediation — but as a gated list rather than as
-// a block of DDL under a heading saying what is about to happen.
-func TestOutputStorageSchemaPlan_ManualGatesRunnableSQL(t *testing.T) {
+// Each disposition renders its own SQL section. On MySQL the formatter
+// combines a table's alters into one statement, so an ALTER split into a safe
+// half and a refused half would be recombined into a statement nothing is
+// going to run if the two were rendered together.
+func TestOutputStorageSchemaPlan_SplitAlterStaysSplit(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{
 		Dialect:      "mysql",
 		Database:     "schemabot",
 		SchemaSource: "the schema embedded in v1.4.0",
 		Outstanding:  []apitypes.StorageSchemaStatement{{Table: "applies", Operation: "alter_table", DDL: "ALTER TABLE `applies` ADD COLUMN `caller` varchar(255) NOT NULL DEFAULT ''"}},
-		Destructive:  []apitypes.StorageSchemaStatement{{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"}},
-		Manual:       []apitypes.StorageSchemaStatement{{Table: "checks", Operation: "add_column", DDL: "ALTER TABLE `checks` ADD COLUMN `head_sha` varchar(64) NOT NULL", Reason: "column is NOT NULL without a DEFAULT"}},
+		Destructive: []apitypes.StorageSchemaStatement{{
+			Table: "applies", Operation: "alter_table",
+			DDL:    "ALTER TABLE `applies` DROP COLUMN `legacy_owner`",
+			Reason: "DROP COLUMN destroys data",
+		}},
 	}
 
 	out := captureStdout(func() {
 		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
 
-	assert.NotContains(t, out, "~ applies",
-		"a statement the convergence will refuse to run is not printed as a runnable SQL section")
-	assert.Contains(t, out, "Gated behind the manual remediation below")
-	assert.Contains(t, out, "applies", "the gated statements are still named")
-	assert.Contains(t, out, "stale_state", "a gated destructive statement is named too")
-	assert.Less(t, strings.Index(out, "Gated behind the manual remediation below"),
-		strings.Index(out, "Needs manual remediation"))
-	assert.NotContains(t, out, "Destructive changes",
-		"while everything is gated there is no separate destructive disposition to report")
-	assert.NotContains(t, out, "📋 Plan:", "nothing runs, so there is nothing to summarize")
+	assert.Equal(t, 2, strings.Count(out, "~ applies"),
+		"the half that runs and the half that is refused are two statements, and the plan shows two")
+	// Keywords are colorized in place, so the assertions match the parts of the
+	// statement the formatter leaves alone.
+	assert.Contains(t, out, "COLUMN `caller`")
+	assert.Contains(t, out, "COLUMN `legacy_owner`")
+	assert.Contains(t, out, "📋 Plan: 1 table to alter",
+		"two statements against one table are one table in the summary")
 }
 
 // A dialect that needs several statements for one table still summarizes in
 // tables. PostgreSQL emits an add_column per missing column, so a table short
 // two columns must not read as two tables to alter.
-func TestStorageSchemaRunnable_SummarizesInTables(t *testing.T) {
+func TestOutputStorageSchemaPlan_SummarizesInTables(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{
 		Dialect:  "postgres",
 		Database: "schemabot",
@@ -575,12 +572,6 @@ func TestStorageSchemaRunnable_SummarizesInTables(t *testing.T) {
 			{Table: "checks", Operation: "create_table", DDL: "CREATE TABLE checks (id bigint PRIMARY KEY)"},
 		},
 	}
-	outstanding, err := storageSchemaChanges(report.Outstanding)
-	require.NoError(t, err)
-
-	runnable := storageSchemaRunnable(report, outstanding, nil)
-	assert.Len(t, runnable, 2, "one entry per table and kind, not one per statement")
-
 	out := captureStdout(func() {
 		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
