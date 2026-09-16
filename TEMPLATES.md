@@ -2576,9 +2576,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review and confirm manually
-
-Review the plan above, then confirm manually:
+⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```

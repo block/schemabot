@@ -1254,7 +1254,7 @@ func PreviewCommentApplyPlanDowngraded() string {
 		LockOwner:                  "acme/myapp#42",
 		LockAcquired:               "2026-03-14 10:30:00 UTC",
 		PendingManualConfirmation:  true,
-		AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+		AutoConfirmDowngradeReason: "Schema changes differ from auto-plan",
 	})
 }
 

@@ -168,12 +168,12 @@ type PlanCommentData struct {
 	// reading as an apply in flight.
 	PendingManualConfirmation bool
 
-	// AutoConfirmDowngradeReason states why the apply stopped, for the footer
-	// that carries the confirm instruction. It is set only when no section
-	// above already explains the cause: the disclosures head with their own
-	// glyph and name the tables at stake, so a footer that restates one spends
-	// a second marker on a sentence the reader just met. Empty means the cause
-	// is disclosed above, never that the apply is proceeding.
+	// AutoConfirmDowngradeReason states why the apply stopped, as a cause
+	// alone: the footer supplies the instruction that follows it, so a reason
+	// ending in "confirm manually" renders that sentence twice. It is set only
+	// when no section above already explains the cause, since the disclosures
+	// head with their own glyph and name the tables at stake. Empty means the
+	// cause is disclosed above, never that the apply is proceeding.
 	AutoConfirmDowngradeReason string
 
 	// StoppedConfirmedApply marks a downgrade that stopped an apply the
@@ -404,16 +404,17 @@ func RenderPlanComment(data PlanCommentData) string {
 
 		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
+			// One line states the outcome, the cause when the reader has not
+			// already met it, and what to do, in that order. A cause disclosed
+			// in a section above is left to that section: it heads with its own
+			// glyph and names the tables at stake, so repeating it here would
+			// put the same warning in front of the reader twice. The glyph
+			// follows the cause for the same reason — it marks a warning the
+			// comment makes nowhere else.
 			if data.AutoConfirmDowngradeReason != "" {
-				fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
-				sb.WriteString("Review the plan above, then confirm manually:\n")
+				fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s — review the plan above, then confirm manually:\n",
+					data.downgradeHeading(), data.AutoConfirmDowngradeReason)
 			} else {
-				// A section above already carries the cause under its own
-				// glyph, so the outcome and the instruction share a single
-				// unmarked line. Spending a second marker here would put the
-				// same warning in front of the reader twice, and dropping the
-				// outcome entirely would leave an operator who just issued the
-				// command with no word that it did not run.
 				fmt.Fprintf(&sb, "**%s** — review the plan above, then confirm manually:\n", data.downgradeHeading())
 			}
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)

@@ -540,9 +540,11 @@ func TestRenderPlanComment_PausedCommentNeverReadsAsAnApplyInFlight(t *testing.T
 	// because it is the only place it appears.
 	alone := base
 	alone.PendingManualConfirmation = true
-	alone.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
+	alone.AutoConfirmDowngradeReason = "Could not verify plan"
 	out = RenderPlanComment(alone)
-	assert.Contains(t, out, "⚠️ **Automatic apply paused**: Could not verify plan — confirm manually")
+	assert.Contains(t, out, "⚠️ **Automatic apply paused**: Could not verify plan — review the plan above, then confirm manually:")
+	assert.Equal(t, 1, strings.Count(out, "⚠️"),
+		"nothing above states this cause, so the footer is where the warning is made")
 	assert.NotContains(t, out, "**Applying automatically**")
 
 	// Not paused: an apply already under way asks nothing, so no confirm

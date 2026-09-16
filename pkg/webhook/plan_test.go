@@ -520,7 +520,7 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 			IsMySQL:                    true,
 			IsLocked:                   true,
 			PendingManualConfirmation:  true,
-			AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+			AutoConfirmDowngradeReason: "Schema changes differ from auto-plan",
 			Changes: []templates.KeyspaceChangeData{{
 				Keyspace:   "testdb",
 				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
