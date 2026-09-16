@@ -190,6 +190,12 @@ func directStorageDialect(dsn, dialectFlag string) (schema.Dialect, error) {
 		}
 		return schema.DialectPostgres, nil
 	}
+	if hasLibpqKeywordForm(dsn) {
+		if _, err := postgresconn.ConnectionDSN(dsn); err != nil {
+			return "", fmt.Errorf("--dsn is written as a PostgreSQL keyword/value connection string but does not parse as one: %w", err)
+		}
+		return schema.DialectPostgres, nil
+	}
 	if hasMySQLDSNForm(dsn) {
 		if _, err := mysqlconn.ConnectionDSN(dsn); err != nil {
 			return "", fmt.Errorf("--dsn is written as a Go MySQL driver DSN but does not parse as one: %w", err)
@@ -221,11 +227,23 @@ func hasPostgresURLScheme(dsn string) bool {
 	return strings.HasPrefix(lowered, "postgres://") || strings.HasPrefix(lowered, "postgresql://")
 }
 
-// mysqlDSNForm matches the Go MySQL driver's grammar as far as the database
-// name: an optional user[:password], an "@", an optional network and address,
-// and the "/" that introduces the database. Everything before that "/" carries
-// no "=" and no space, which a libpq keyword/value string always has.
-var mysqlDSNForm = regexp.MustCompile(`^[^=\s/]*@[a-zA-Z0-9]*(\([^()]*\))?/`)
+// libpqKeywordOpening matches the only way a libpq keyword/value connection
+// string can begin: a keyword, then "=". A Go MySQL driver DSN cannot open that
+// way — everything before its "@" is a user and an optional password, so the
+// first "=" it can carry is inside a password, behind a ":" the keyword
+// character class does not admit.
+var libpqKeywordOpening = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\s*=`)
+
+// mysqlNetAddress matches a Go MySQL driver DSN's network and address written
+// without credentials: "tcp(db.example:3306)", "unix(/tmp/mysql.sock)", or a
+// bare protocol.
+var mysqlNetAddress = regexp.MustCompile(`^[a-zA-Z0-9]+(\([^()]*\))?$`)
+
+// hasLibpqKeywordForm reports whether a DSN is written as a libpq keyword/value
+// connection string, the way hasPostgresURLScheme reports the URL spelling.
+func hasLibpqKeywordForm(dsn string) bool {
+	return libpqKeywordOpening.MatchString(strings.TrimSpace(dsn))
+}
 
 // hasMySQLDSNForm reports whether a DSN is written in the Go MySQL driver's own
 // form, the way hasPostgresURLScheme reports the other family's.
@@ -240,8 +258,24 @@ var mysqlDSNForm = regexp.MustCompile(`^[^=\s/]*@[a-zA-Z0-9]*(\([^()]*\))?/`)
 // mentions MySQL, and with --allow-unsafe the wrong family's bootstrap
 // converges against whatever that resolves to.
 //
-// Recognizing the form first turns that into what it is: a MySQL DSN with a
-// broken parameter, reported with the parser's own reason.
+// The test is the driver's own: find the last "/", which introduces the
+// database name, and ask what precedes it. Credentials do — an "@" is there —
+// or nothing does, or a network and address do. What must not decide it is the
+// character class of the credentials themselves: a generated password
+// routinely carries "=", "/" or a space, all of them legal in this grammar,
+// and excluding them put exactly those DSNs back into the parser race this
+// exists to end.
+//
+// This is asked only after the PostgreSQL spellings have been ruled out, and
+// the order is load-bearing: a keyword/value string can carry an "@" in a
+// password and a "/" in a socket directory, so it satisfies this form too and
+// has to be settled by how it opens before this is consulted.
 func hasMySQLDSNForm(dsn string) bool {
-	return mysqlDSNForm.MatchString(strings.TrimSpace(dsn))
+	trimmed := strings.TrimSpace(dsn)
+	database := strings.LastIndex(trimmed, "/")
+	if database < 0 {
+		return false
+	}
+	address := trimmed[:database]
+	return address == "" || strings.Contains(address, "@") || mysqlNetAddress.MatchString(address)
 }

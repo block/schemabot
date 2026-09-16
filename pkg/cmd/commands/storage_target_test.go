@@ -90,6 +90,60 @@ func TestDirectStorageDialect(t *testing.T) {
 			wantErr: "Go MySQL driver DSN but does not parse as one",
 		},
 		{
+			// A generated password carries "=", "/" and spaces, all legal in
+			// this grammar. Deciding the form on the credentials' characters
+			// put exactly these DSNs back into the parser race: the MySQL
+			// parser rejects the parameter, libpq accepts the whole string,
+			// and the operator is connected to a local socket under their own
+			// account with nothing naming MySQL.
+			name:    "a MySQL DSN whose password carries an equals sign",
+			dsn:     "root:aGVsbG8=@tcp(db.example:3306)/schemabot?timeout=30",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
+			name:    "a MySQL DSN whose password carries a slash",
+			dsn:     "root:s#c/et@tcp(db.example:3306)/schemabot?timeout=30",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
+			name:    "a MySQL DSN whose password carries a space",
+			dsn:     "root:p ss@tcp(db.example:3306)/schemabot?timeout=30",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
+			// Credentials are optional in this grammar, so the address alone
+			// has to settle the form.
+			name:    "a credential-less MySQL DSN with a broken parameter",
+			dsn:     "tcp(db.example:3306)/schemabot?timeout=30",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
+			name:    "a MySQL DSN naming only a database",
+			dsn:     "/schemabot?parseTime=yes",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
+			// A unix socket path puts slashes ahead of the database name, and
+			// the last one is still the one that introduces it.
+			name: "a MySQL DSN over a unix socket",
+			dsn:  "root:secret@unix(/tmp/mysql.sock)/schemabot",
+			want: schema.DialectMySQL,
+		},
+		{
+			// A keyword string can carry an "@" in a password and a "/" in a
+			// socket directory, so it is excluded by how it opens rather than
+			// by what it contains — otherwise this reads as MySQL form and is
+			// reported as a broken MySQL DSN.
+			name: "a libpq keyword string with a password and a socket directory",
+			dsn:  "user=schemabot password=p@ss host=/var/run/postgresql dbname=schemabot",
+			want: schema.DialectPostgres,
+		},
+		{
+			name:    "a libpq keyword string that does not parse",
+			dsn:     "host=db.example port=notaport dbname=schemabot",
+			wantErr: "PostgreSQL keyword/value connection string but does not parse as one",
+		},
+		{
 			name:    "a DSN in neither family",
 			dsn:     "jdbc:mysql://db.example:3306/schemabot",
 			wantErr: "cannot tell which database family --dsn addresses",
