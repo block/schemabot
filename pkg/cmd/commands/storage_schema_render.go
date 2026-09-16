@@ -383,15 +383,3 @@ func storageSchemaDatabaseLabel(report *apitypes.StorageSchemaReport) string {
 	}
 	return label
 }
-
-// storageSchemaPlanHints names the next step for the plan that was just
-// printed.
-//
-// Naming `storage apply` here would be wrong, whichever release was named: an
-// apply converges the schema of the binary that runs it, which is not
-// necessarily the schema this plan is about. The two ways to converge the named
-// release's schema are the release itself, and this is where an operator is
-// about to look for them.
-func storageSchemaPlanHints(report *apitypes.StorageSchemaReport) []string {
-	return []string{fmt.Sprintf("These are what %s needs in order to match %s. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.", storageSchemaHeaderDatabase(report), report.SchemaSource)}
-}

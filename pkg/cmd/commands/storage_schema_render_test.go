@@ -28,7 +28,7 @@ func TestOutputStorageSchemaPlan_RendersAsAPlan(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", nil))
 	})
 
 	assert.Contains(t, out, "MySQL Schema Change Plan")
@@ -37,8 +37,6 @@ func TestOutputStorageSchemaPlan_RendersAsAPlan(t *testing.T) {
 	assert.Contains(t, out, "+ checks")
 	assert.Contains(t, out, "~ applies")
 	assert.Contains(t, out, "📋 Plan: 1 table to create, 1 table to alter")
-	assert.Contains(t, out, "run that release's binary",
-		"the plan names the next step, which is never an apply of a different release's schema")
 	assert.NotContains(t, out, "(mysql)",
 		"the title already names the family; repeating it in the database line is noise")
 }
@@ -54,12 +52,12 @@ func TestOutputStorageSchemaPlan_Converged(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", []string{"resolve the manual entries above before the next roll"}))
 	})
 
 	assert.Contains(t, out, "PostgreSQL Schema Change Plan")
 	assert.Contains(t, out, "✓ No schema changes detected.")
-	assert.NotContains(t, out, "run that release's binary")
+	assert.NotContains(t, out, "resolve the manual entries above")
 	assert.NotContains(t, out, "📋 Plan:")
 }
 
@@ -390,24 +388,6 @@ func TestStorageSchemaEngineLabel(t *testing.T) {
 	assert.Equal(t, "PostgreSQL", storageSchemaEngineLabel("postgres"))
 	assert.Equal(t, "Storage", storageSchemaEngineLabel(""),
 		"a report that names no dialect still gets a title rather than a blank one")
-}
-
-// A plan always compares the database against a release the operator named, so
-// its next step is never `storage apply`: an apply converges the schema of the
-// binary that runs it, which is not necessarily the schema the plan describes.
-// The hint names the two ways to converge the named release instead.
-func TestStorageSchemaPlanHints(t *testing.T) {
-	hints := storageSchemaPlanHints(&apitypes.StorageSchemaReport{
-		Database:     "schemabot",
-		Host:         "db-1.example",
-		Dialect:      "mysql",
-		SchemaSource: "the schema files of release v1.4.0",
-	})
-	require.Len(t, hints, 1)
-	assert.Contains(t, hints[0], "schemabot on db-1.example")
-	assert.Contains(t, hints[0], "the schema files of release v1.4.0")
-	assert.Contains(t, hints[0], "run that release's binary")
-	assert.NotContains(t, hints[0], "storage apply")
 }
 
 // A report is labelled with the database, the server it is on, its family, and
