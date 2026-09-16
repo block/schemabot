@@ -19,19 +19,21 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Tern_PullSchema_FullMethodName = "/tern.v1.Tern/PullSchema"
-	Tern_Plan_FullMethodName       = "/tern.v1.Tern/Plan"
-	Tern_PlanDiff_FullMethodName   = "/tern.v1.Tern/PlanDiff"
-	Tern_Apply_FullMethodName      = "/tern.v1.Tern/Apply"
-	Tern_Progress_FullMethodName   = "/tern.v1.Tern/Progress"
-	Tern_Logs_FullMethodName       = "/tern.v1.Tern/Logs"
-	Tern_Cutover_FullMethodName    = "/tern.v1.Tern/Cutover"
-	Tern_Revert_FullMethodName     = "/tern.v1.Tern/Revert"
-	Tern_SkipRevert_FullMethodName = "/tern.v1.Tern/SkipRevert"
-	Tern_Health_FullMethodName     = "/tern.v1.Tern/Health"
-	Tern_Stop_FullMethodName       = "/tern.v1.Tern/Stop"
-	Tern_Cancel_FullMethodName     = "/tern.v1.Tern/Cancel"
-	Tern_Start_FullMethodName      = "/tern.v1.Tern/Start"
+	Tern_PullSchema_FullMethodName         = "/tern.v1.Tern/PullSchema"
+	Tern_Plan_FullMethodName               = "/tern.v1.Tern/Plan"
+	Tern_PlanDiff_FullMethodName           = "/tern.v1.Tern/PlanDiff"
+	Tern_Apply_FullMethodName              = "/tern.v1.Tern/Apply"
+	Tern_Progress_FullMethodName           = "/tern.v1.Tern/Progress"
+	Tern_Logs_FullMethodName               = "/tern.v1.Tern/Logs"
+	Tern_Cutover_FullMethodName            = "/tern.v1.Tern/Cutover"
+	Tern_Revert_FullMethodName             = "/tern.v1.Tern/Revert"
+	Tern_SkipRevert_FullMethodName         = "/tern.v1.Tern/SkipRevert"
+	Tern_Health_FullMethodName             = "/tern.v1.Tern/Health"
+	Tern_Stop_FullMethodName               = "/tern.v1.Tern/Stop"
+	Tern_Cancel_FullMethodName             = "/tern.v1.Tern/Cancel"
+	Tern_Start_FullMethodName              = "/tern.v1.Tern/Start"
+	Tern_StorageSchemaPlan_FullMethodName  = "/tern.v1.Tern/StorageSchemaPlan"
+	Tern_StorageSchemaApply_FullMethodName = "/tern.v1.Tern/StorageSchemaApply"
 )
 
 // TernClient is the client API for Tern service.
@@ -174,6 +176,32 @@ type TernClient interface {
 	//
 	// Execution resumes asynchronously (same as Apply). Use Progress to track.
 	Start(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*StartResponse, error)
+	// StorageSchemaPlan reports the DDL outstanding between the embedded storage
+	// schema of the binary serving this RPC and the live storage database that
+	// binary uses. Unlike every other RPC here, it is about the serving
+	// instance's own bookkeeping database rather than a target database an
+	// operator asked to change.
+	//
+	// It is strictly read-only: it reads the live catalog and computes a diff,
+	// executing no DDL and taking no lock, so it is safe to call at any time,
+	// including while the same storage is being converged.
+	//
+	// The answer comes from the serving binary's own embedded files, which is the
+	// whole point of routing it here rather than computing it from a release pin
+	// on the caller's side: a caller's pin says which release it was built
+	// against, not what this storage converged to, and those diverge exactly when
+	// a deploy has failed to converge.
+	StorageSchemaPlan(ctx context.Context, in *StorageSchemaPlanRequest, opts ...grpc.CallOption) (*StorageSchemaPlanResponse, error)
+	// StorageSchemaApply converges the serving instance's own storage schema and
+	// reports what it found and what it left behind.
+	//
+	// The convergence is the serving binary's startup bootstrap, called
+	// unchanged: the same differ, the same destructive-statement refusal, and the
+	// same advisory lock that serializes it against every other instance of that
+	// deployment. Destructive statements are refused unless the serving
+	// instance's storage config allows them or allow_destructive opts in for this
+	// call.
+	StorageSchemaApply(ctx context.Context, in *StorageSchemaApplyRequest, opts ...grpc.CallOption) (*StorageSchemaApplyResponse, error)
 }
 
 type ternClient struct {
@@ -308,6 +336,26 @@ func (c *ternClient) Start(ctx context.Context, in *StartRequest, opts ...grpc.C
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StartResponse)
 	err := c.cc.Invoke(ctx, Tern_Start_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) StorageSchemaPlan(ctx context.Context, in *StorageSchemaPlanRequest, opts ...grpc.CallOption) (*StorageSchemaPlanResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StorageSchemaPlanResponse)
+	err := c.cc.Invoke(ctx, Tern_StorageSchemaPlan_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) StorageSchemaApply(ctx context.Context, in *StorageSchemaApplyRequest, opts ...grpc.CallOption) (*StorageSchemaApplyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StorageSchemaApplyResponse)
+	err := c.cc.Invoke(ctx, Tern_StorageSchemaApply_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -454,6 +502,32 @@ type TernServer interface {
 	//
 	// Execution resumes asynchronously (same as Apply). Use Progress to track.
 	Start(context.Context, *StartRequest) (*StartResponse, error)
+	// StorageSchemaPlan reports the DDL outstanding between the embedded storage
+	// schema of the binary serving this RPC and the live storage database that
+	// binary uses. Unlike every other RPC here, it is about the serving
+	// instance's own bookkeeping database rather than a target database an
+	// operator asked to change.
+	//
+	// It is strictly read-only: it reads the live catalog and computes a diff,
+	// executing no DDL and taking no lock, so it is safe to call at any time,
+	// including while the same storage is being converged.
+	//
+	// The answer comes from the serving binary's own embedded files, which is the
+	// whole point of routing it here rather than computing it from a release pin
+	// on the caller's side: a caller's pin says which release it was built
+	// against, not what this storage converged to, and those diverge exactly when
+	// a deploy has failed to converge.
+	StorageSchemaPlan(context.Context, *StorageSchemaPlanRequest) (*StorageSchemaPlanResponse, error)
+	// StorageSchemaApply converges the serving instance's own storage schema and
+	// reports what it found and what it left behind.
+	//
+	// The convergence is the serving binary's startup bootstrap, called
+	// unchanged: the same differ, the same destructive-statement refusal, and the
+	// same advisory lock that serializes it against every other instance of that
+	// deployment. Destructive statements are refused unless the serving
+	// instance's storage config allows them or allow_destructive opts in for this
+	// call.
+	StorageSchemaApply(context.Context, *StorageSchemaApplyRequest) (*StorageSchemaApplyResponse, error)
 }
 
 // UnimplementedTernServer should be embedded to have
@@ -501,6 +575,12 @@ func (UnimplementedTernServer) Cancel(context.Context, *CancelRequest) (*CancelR
 }
 func (UnimplementedTernServer) Start(context.Context, *StartRequest) (*StartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
+}
+func (UnimplementedTernServer) StorageSchemaPlan(context.Context, *StorageSchemaPlanRequest) (*StorageSchemaPlanResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StorageSchemaPlan not implemented")
+}
+func (UnimplementedTernServer) StorageSchemaApply(context.Context, *StorageSchemaApplyRequest) (*StorageSchemaApplyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StorageSchemaApply not implemented")
 }
 func (UnimplementedTernServer) testEmbeddedByValue() {}
 
@@ -756,6 +836,42 @@ func _Tern_Start_Handler(srv interface{}, ctx context.Context, dec func(interfac
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Tern_StorageSchemaPlan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StorageSchemaPlanRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).StorageSchemaPlan(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_StorageSchemaPlan_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).StorageSchemaPlan(ctx, req.(*StorageSchemaPlanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_StorageSchemaApply_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StorageSchemaApplyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).StorageSchemaApply(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_StorageSchemaApply_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).StorageSchemaApply(ctx, req.(*StorageSchemaApplyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Tern_ServiceDesc is the grpc.ServiceDesc for Tern service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -814,6 +930,14 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Start",
 			Handler:    _Tern_Start_Handler,
+		},
+		{
+			MethodName: "StorageSchemaPlan",
+			Handler:    _Tern_StorageSchemaPlan_Handler,
+		},
+		{
+			MethodName: "StorageSchemaApply",
+			Handler:    _Tern_StorageSchemaApply_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
