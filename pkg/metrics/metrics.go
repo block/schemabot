@@ -548,6 +548,9 @@ var knownDirectWriteAuthOperations = map[string]bool{
 	"checks_repos":       true,
 	"webhook_redrive":    true,
 	"settings_set":       true,
+
+	"storage_schema_plan":  true,
+	"storage_schema_apply": true,
 }
 
 var knownDirectWriteAuthStatuses = map[string]bool{
