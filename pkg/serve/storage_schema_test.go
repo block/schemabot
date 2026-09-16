@@ -228,7 +228,7 @@ func TestStorageSchemaAdapter_DesiredSchemaDefaultsToThisBinary(t *testing.T) {
 // binary is not running. The attribution is the caller's, because the answer
 // came from the caller's files.
 func TestStorageSchemaAdapter_DesiredSchemaAcceptsASuppliedSchema(t *testing.T) {
-	adapter := &storageSchemaAdapter{version: "v1.2.3", logger: slog.New(slog.DiscardHandler)}
+	adapter := &storageSchemaAdapter{version: "v1.2.3", dialect: schema.DialectMySQL, logger: slog.New(slog.DiscardHandler)}
 
 	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{
 		SchemaSource: "the schema files of release v1.4.0",
@@ -255,6 +255,60 @@ func TestStorageSchemaAdapter_DesiredSchemaRefusesAnUnusableSchema(t *testing.T)
 	require.Error(t, err, "files with no source leave the report unable to attribute its answer")
 	assert.Contains(t, err.Error(), "needs a description")
 	assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+}
+
+// Supplied content is held to the dialect's real parser at the door, and a file
+// that is not valid SQL for it is named. The diff would reach a parser several
+// layers down and fail there too, but that failure is indistinguishable from
+// the storage database being unreachable: it reaches the caller as this
+// instance's fault, and sends an operator who mistyped a file looking at the
+// server.
+func TestStorageSchemaAdapter_DesiredSchemaRefusesUnparseableContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect schema.Dialect
+		files   map[string]string
+	}{
+		{
+			name:    "mysql",
+			dialect: schema.DialectMySQL,
+			files:   map[string]string{"applies.sql": "CREATE TABLE `applies` ("},
+		},
+		{
+			name:    "postgres",
+			dialect: schema.DialectPostgres,
+			files:   map[string]string{"applies.sql": "CREATE TABLE applies ("},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &storageSchemaAdapter{version: "v1.2.3", dialect: tc.dialect, logger: slog.New(slog.DiscardHandler)}
+
+			_, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{
+				SchemaSource: "the schema files in ./schema",
+				SchemaFiles:  tc.files,
+			})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+			assert.Contains(t, err.Error(), `schema file "applies.sql"`, "the refusal has to name the file the caller must fix")
+			assert.Contains(t, err.Error(), "the schema files in ./schema")
+		})
+	}
+}
+
+// A dialect with no parser of ours is this instance's configuration, not the
+// caller's request, so it is not blamed on the caller: an InvalidArgument would
+// tell an operator to fix files that are fine.
+func TestStorageSchemaAdapter_DesiredSchemaBlamesAnUnparseableDialectOnTheServer(t *testing.T) {
+	adapter := &storageSchemaAdapter{version: "v1.2.3", dialect: schema.Dialect("cockroach"), logger: slog.New(slog.DiscardHandler)}
+
+	_, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{
+		SchemaSource: "the schema files in ./schema",
+		SchemaFiles:  map[string]string{"applies.sql": "CREATE TABLE applies (id BIGINT)"},
+	})
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+	assert.Contains(t, err.Error(), "no statement parser registered")
 }
 
 // A DSN the server cannot resolve — an unreadable credential file, say —

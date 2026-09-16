@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
@@ -39,7 +42,10 @@ type storageSchemaAdapter struct {
 	// the database.
 	bootTarget storageTarget
 	dialect    schema.Dialect
-	version    string
+	// version attributes a report's embedded schema files to the build that
+	// carries them, and is empty when this build cannot be named (see
+	// attributableVersion).
+	version string
 	// configAllowsDestructive is the deployment's standing storage policy
 	// (storage.allow_destructive_schema_changes). A boot converges under it, so
 	// an operator convergence must too — otherwise "apply is what a boot does"
@@ -66,7 +72,7 @@ func (s *Server) newStorageSchemaService() (*storageSchemaAdapter, error) {
 		resolveDSN:               s.cfg.StorageDSN,
 		bootTarget:               bootTarget,
 		dialect:                  s.dialect,
-		version:                  s.version,
+		version:                  attributableVersion(s.version),
 		configAllowsDestructive:  s.cfg.Storage.AllowDestructiveSchemaChanges,
 		postgresStatementTimeout: s.cfg.Postgres.StatementTimeoutOrDefault(),
 		logger:                   s.logger,
@@ -88,6 +94,34 @@ func (s *Server) registerStorageSchema(svc *api.Service) error {
 	}
 	s.storageSchema = storageSchema
 	svc.SetStorageSchemaService(storageSchema)
+	return nil
+}
+
+// parseSupplied holds caller-supplied schema content to the dialect's real
+// parser before a diff reads a database with it.
+//
+// The diff would reach the parser anyway, several layers down, and fail there.
+// The difference is who the failure is addressed to: a parse error surfacing
+// out of the differ is indistinguishable from the storage database being
+// unreachable, so it is reported to the caller as this instance's own fault and
+// logged as one. An operator diffing a release whose file they mistyped then
+// reads that the server is broken, and goes looking at the server.
+//
+// Parsing at the door names the file instead, and classifies it as what it is:
+// a request this instance understood well enough to refuse.
+func (a *storageSchemaAdapter) parseSupplied(desired *api.StorageSchemaSource) error {
+	parser, err := ddl.ParserForDialect(a.dialect)
+	if err != nil {
+		// The dialect is this instance's, fixed at construction — not the
+		// caller's — so a dialect with no parser is this instance's problem.
+		return fmt.Errorf("parse the supplied storage schema for dialect %s: %w", a.dialect, err)
+	}
+	for _, name := range slices.Sorted(maps.Keys(desired.Files)) {
+		if _, err := parser.Split(desired.Files[name]); err != nil {
+			return fmt.Errorf("%w: schema file %q from %s is not valid %s SQL: %w",
+				tern.ErrInvalidStorageSchemaRequest, name, desired.Description, a.dialect, err)
+		}
+	}
 	return nil
 }
 
@@ -129,6 +163,9 @@ func (a *storageSchemaAdapter) desiredSchema(req *ternv1.StorageSchemaPlanReques
 		// The caller wrote these files, so the reason goes back to the caller
 		// rather than into a log it cannot read (see ErrInvalidStorageSchemaRequest).
 		return nil, fmt.Errorf("%w: read the supplied storage schema: %w", tern.ErrInvalidStorageSchemaRequest, err)
+	}
+	if err := a.parseSupplied(desired); err != nil {
+		return nil, err
 	}
 	a.logger.Info("diffing storage schema against a supplied schema",
 		"dialect", a.dialect,

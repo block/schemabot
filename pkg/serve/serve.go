@@ -111,6 +111,25 @@ func moduleVersion() string {
 	return versionFromBuildInfo(info)
 }
 
+// attributableVersion is the version a storage schema report may attribute
+// this binary's embedded schema files to.
+//
+// The two uses of a version want opposite things from a build the module graph
+// cannot name. A log field wants the sentinel present, so a query for the field
+// finds the pod running an unidentifiable build instead of silently missing it.
+// A report's attribution is prose an operator reads, and there "the schema
+// embedded in unknown" reads as a release named unknown — a worse answer than
+// the words the report already has for a build it cannot name, which say that
+// these are the answering binary's own files without claiming whose build it
+// is. So the sentinel stops here, at the one boundary where it would be read as
+// a version rather than as a log value.
+func attributableVersion(version string) string {
+	if version == unknownModuleVersion {
+		return ""
+	}
+	return version
+}
+
 // versionFromBuildInfo finds SchemaBot's version among the main module's
 // dependencies. A replace directive wins, so a host pinning a fork or a local
 // path is reported as what it actually runs rather than as the version it
@@ -315,9 +334,11 @@ type Server struct {
 	// once by Build and shared by the HTTP routes and the gRPC service, so the
 	// two surfaces cannot come to disagree about which storage they describe.
 	storageSchema tern.StorageSchemaService
-	// version is the build's SchemaBot version. Storage schema reports carry
-	// it for attribution: the diff itself is computed from this binary's
-	// embedded files, and the version only says whose files they were.
+	// version is the build's SchemaBot version as the logs carry it, which
+	// means it may be the unidentifiable-build sentinel. Storage schema
+	// reports attribute this binary's embedded files to it, and take it
+	// through attributableVersion on the way, because a report is prose and
+	// the sentinel is a log value.
 	version string
 }
 
@@ -612,7 +633,7 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 		api.WithDialect(dialect)); err != nil {
 		return nil, "", fmt.Errorf("ensure storage schema: %w", err)
 	}
-	db, err := openStoragePool(dialect, dsn, cfg, pinnedStorageDSN(dialect, dsn, cfg, logger))
+	db, err := openStoragePool(dialect, dsn, cfg, logger)
 	if err != nil {
 		return nil, "", fmt.Errorf("open storage database: %w", err)
 	}
@@ -667,13 +688,19 @@ func pinnedStorageDSN(dialect schema.Dialect, bootDSN string, cfg *api.ServerCon
 }
 
 // openStoragePool opens the long-lived reloadable storage pool for the
-// configured dialect. Both connectors re-resolve the DSN through reload on
-// authentication failure so a rotated storage credential is picked up without a
-// restart; reload is pinnedStorageDSN, which permits exactly that and refuses a
-// database that has moved. The dispatch fails closed: a dialect without a
-// connector returns an error instead of dialing with another family's driver.
-func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig, reload func() (string, error)) (*sql.DB, error) {
+// configured dialect. Both connectors re-resolve the DSN on authentication
+// failure so a rotated storage credential is picked up without a restart. The
+// dispatch fails closed: a dialect without a connector returns an error instead
+// of dialing with another family's driver.
+//
+// The reload callback is built here rather than passed in. Every pool this
+// opens must re-resolve through pinnedStorageDSN — a pool handed the raw
+// resolver follows a rewritten secret to a database nothing bootstrapped — and
+// a parameter is a place for the wrong callback to arrive. With none, there is
+// no caller left to get it wrong.
+func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig, logger *slog.Logger) (*sql.DB, error) {
 	connectTimeout := cfg.Storage.Pool.ConnectTimeoutOrZero()
+	reload := pinnedStorageDSN(dialect, dsn, cfg, logger)
 	switch dialect {
 	case schema.DialectMySQL:
 		return mysqlconn.OpenReloadable(dsn, reload,

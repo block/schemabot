@@ -3,7 +3,6 @@
 package serve
 
 import (
-	"fmt"
 	"log/slog"
 	"testing"
 
@@ -121,9 +120,7 @@ func TestStorageDialectDispatchFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), `no storage implementation for storage dialect "oracle"`)
 
 	cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: "unused"}}
-	_, err = openStoragePool(schema.Dialect("oracle"), "unused", cfg, func() (string, error) {
-		return "", fmt.Errorf("the dispatch fails before any reload")
-	})
+	_, err = openStoragePool(schema.Dialect("oracle"), "unused", cfg, slog.New(slog.DiscardHandler))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `no storage connector for storage dialect "oracle"`)
 }

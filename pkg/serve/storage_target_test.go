@@ -85,6 +85,83 @@ func TestStorageTargetForIgnoresCredentials(t *testing.T) {
 	}
 }
 
+// A hostname resolves case insensitively, so the same server spelled in
+// another case is the same target. A rotation that rewrites the secret with the
+// endpoint in a different case is the case this protects: compared
+// byte-for-byte it reads as a move, the reload is refused, and the pool stays
+// on credentials that no longer authenticate — for a database it is already
+// connected to.
+func TestStorageTargetForFoldsHostCase(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect schema.Dialect
+		first   string
+		second  string
+		want    storageTarget
+	}{
+		{
+			name:    "mysql host recased",
+			dialect: schema.DialectMySQL,
+			first:   "schemabot:pw@tcp(DB.Example:3306)/schemabot",
+			second:  "schemabot:pw@tcp(db.example:3306)/schemabot",
+			want:    storageTarget{address: "db.example:3306", database: "schemabot"},
+		},
+		{
+			name:    "postgres host recased",
+			dialect: schema.DialectPostgres,
+			first:   "postgres://schemabot@DB.Example:5432/schemabot",
+			second:  "postgres://schemabot@db.example:5432/schemabot",
+			want:    storageTarget{address: "db.example:5432", database: "schemabot"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			first, err := storageTargetFor(tc.dialect, tc.first)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, first)
+
+			second, err := storageTargetFor(tc.dialect, tc.second)
+			require.NoError(t, err)
+			assert.Equal(t, first, second, "one server spelled in two cases is one target")
+		})
+	}
+}
+
+// Only the host folds. A database name is case sensitive on both engines this
+// serves, so two names differing in case are two databases, and folding them
+// would let a reload follow a secret rewritten to a database nothing
+// bootstrapped.
+func TestStorageTargetForKeepsDatabaseCase(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect schema.Dialect
+		first   string
+		second  string
+	}{
+		{
+			name:    "mysql",
+			dialect: schema.DialectMySQL,
+			first:   "schemabot:pw@tcp(db.example:3306)/schemabot",
+			second:  "schemabot:pw@tcp(db.example:3306)/SchemaBot",
+		},
+		{
+			name:    "postgres",
+			dialect: schema.DialectPostgres,
+			first:   "postgres://schemabot@db.example:5432/schemabot",
+			second:  "postgres://schemabot@db.example:5432/SchemaBot",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			first, err := storageTargetFor(tc.dialect, tc.first)
+			require.NoError(t, err)
+			second, err := storageTargetFor(tc.dialect, tc.second)
+			require.NoError(t, err)
+			assert.NotEqual(t, first, second, "two database names differing only in case are two databases")
+		})
+	}
+}
+
 // A dialect with no DSN grammar of ours fails closed rather than being parsed
 // by whichever driver happens to accept the string.
 func TestStorageTargetForRefusesAnUnknownDialect(t *testing.T) {
