@@ -83,6 +83,9 @@ func TestPlans(t *testing.T, h Harness) {
 			SchemaPath:     "schema/commerce",
 			Environment:    "staging",
 			HeadSHA:        "sha_head",
+			// A member planned against its own live schema is bound to the
+			// reviewed plan of its round; every store must carry that link.
+			PrimaryPlanIdentifier: "plan_reviewed",
 			SchemaFiles: schema.SchemaFiles{
 				"commerce": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"}},
 			},
@@ -105,6 +108,7 @@ func TestPlans(t *testing.T, h Harness) {
 			assert.Equal(t, "schema/commerce", got.SchemaPath)
 			assert.Equal(t, "staging", got.Environment)
 			assert.Equal(t, "sha_head", got.HeadSHA)
+			assert.Equal(t, "plan_reviewed", got.PrimaryPlanIdentifier)
 			require.Contains(t, got.SchemaFiles, "commerce")
 			assert.Equal(t, "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)",
 				got.SchemaFiles["commerce"].Files["users.sql"])
@@ -374,6 +378,63 @@ func TestPlans(t *testing.T, h Harness) {
 		unmatched, err := store.Plans().List(ctx, storage.ListPlansOptions{Database: "payments", Limit: 10})
 		require.NoError(t, err)
 		assert.Empty(t, unmatched, "a filter matching nothing lists as empty, not an error")
+	})
+
+	t.Run("List_FiltersByReviewRound", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// Two review rounds of the same commit: same database, environment,
+		// repository, pull request, and head SHA, differing only in which
+		// reviewed plan each member plan was produced alongside. The round is
+		// the only thing that tells them apart, so the filter is what keeps an
+		// apply from pairing a member with a round the operator never saw.
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+		create := func(identifier, target, primary string, createdAt time.Time) {
+			t.Helper()
+			_, err := store.Plans().Create(ctx, &storage.Plan{
+				PlanIdentifier:        identifier,
+				Database:              "commerce",
+				DatabaseType:          storage.DatabaseTypeMySQL,
+				Environment:           "production",
+				Deployment:            "eu",
+				Target:                target,
+				Repository:            "org/repo",
+				PullRequest:           7,
+				HeadSHA:               "sha_head",
+				PrimaryPlanIdentifier: primary,
+				CreatedAt:             createdAt,
+			})
+			require.NoError(t, err)
+		}
+
+		create("plan_reviewed_first", "commerce-001", "", base)
+		create("plan_member_first", "commerce-002", "plan_reviewed_first", base.Add(time.Second))
+		create("plan_reviewed_second", "commerce-001", "", base.Add(2*time.Second))
+		create("plan_member_second", "commerce-002", "plan_reviewed_second", base.Add(3*time.Second))
+
+		firstRound, err := store.Plans().List(ctx, storage.ListPlansOptions{
+			Repository:            "org/repo",
+			PullRequest:           7,
+			PrimaryPlanIdentifier: "plan_reviewed_first",
+			Limit:                 10,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"plan_member_first"}, planIdentifiers(firstRound),
+			"the later round's member plan must not answer a lookup for the earlier round")
+
+		secondRound, err := store.Plans().List(ctx, storage.ListPlansOptions{
+			Repository:            "org/repo",
+			PullRequest:           7,
+			PrimaryPlanIdentifier: "plan_reviewed_second",
+			Limit:                 10,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"plan_member_second"}, planIdentifiers(secondRound))
+
+		unfiltered, err := store.Plans().List(ctx, storage.ListPlansOptions{Repository: "org/repo", PullRequest: 7, Limit: 10})
+		require.NoError(t, err)
+		assert.Len(t, unfiltered, 4, "an unfiltered listing still sees every round")
 	})
 
 	t.Run("List_RejectsNonPositiveLimit", func(t *testing.T) {
