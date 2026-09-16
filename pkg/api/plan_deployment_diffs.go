@@ -53,28 +53,29 @@ type DeploymentPlanDiff struct {
 // supplied by the caller so a database/environment is resolved once per rollup
 // rather than re-resolved here. It must be non-empty.
 //
-// primaryDeployment is the deployment the reviewed primaryPlan was created
-// against (rollout index 0 at plan time). When a primaryPlan is reused, it is
-// checked against targets[0] here so a deployment-order change between plan and
-// rollup — which would map the reviewed baseline onto a different deployment —
-// fails closed rather than being compared against the wrong live schema.
-func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string, targets []routing.ExecutionTarget) ([]DeploymentPlanDiff, error) {
+// primaryMember is the rollout member the reviewed primaryPlan was created
+// against (rollout index 0 at plan time), identified by deployment and target
+// together because one deployment can address several targets. When a
+// primaryPlan is reused, it is checked against targets[0] here so a rollout
+// order change between plan and rollup — which would map the reviewed baseline
+// onto a different member — fails closed rather than being compared against the
+// wrong live schema.
+func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget, targets []routing.ExecutionTarget) ([]DeploymentPlanDiff, error) {
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("no deployment targets for %s/%s", req.Database, req.Environment)
 	}
 
 	// Reusing primaryPlan for the primary member assumes it was created against
-	// the deployment now at rollout index 0. Verify that against the plan's
-	// recorded origin deployment (captured at plan time) and fail closed on a
-	// mismatch — e.g. deployment_order changed between plan and rollup — rather
-	// than comparing deployments against a baseline built for a different
-	// deployment.
+	// the member now at rollout index 0. Verify that against the plan's recorded
+	// origin member (captured at plan time) and fail closed on a mismatch — e.g.
+	// deployment_order changed between plan and rollup — rather than comparing
+	// members against a baseline built for a different one.
 	if primaryPlan != nil {
-		if primaryDeployment == "" {
+		if primaryMember.Deployment == "" {
 			return nil, fmt.Errorf("plan diff for %s/%s: reviewed plan has no origin deployment to verify the primary against", req.Database, req.Environment)
 		}
-		if targets[0].Deployment != primaryDeployment {
-			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the reviewed plan was created against %q", req.Database, req.Environment, targets[0].Deployment, primaryDeployment)
+		if targets[0].Deployment != primaryMember.Deployment || targets[0].Target != primaryMember.Target {
+			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the reviewed plan was created against %q", req.Database, req.Environment, targets[0].MemberID(), primaryMember.MemberID())
 		}
 	}
 

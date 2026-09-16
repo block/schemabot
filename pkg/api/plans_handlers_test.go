@@ -69,6 +69,8 @@ func storedTestPlans(now time.Time) []*storage.Plan {
 			PlanIdentifier: "plan-100",
 			Database:       "commerce",
 			DatabaseType:   storage.DatabaseTypeVitess,
+			Deployment:     "commerce-a",
+			Target:         "commerce-001",
 			Environment:    "production",
 			CreatedAt:      now.Add(-time.Minute),
 			Namespaces: map[string]*storage.NamespacePlanData{
@@ -213,6 +215,11 @@ func TestPlanGetHandler(t *testing.T) {
 	assert.Equal(t, "commerce", resp.Database)
 	require.NotNil(t, resp.Plan)
 	assert.Equal(t, storage.EnginePlanetScale, resp.Plan.Engine)
+	// A member is the deployment and the target together, so a stored plan must
+	// report both halves of the member it was created against. The deployment on
+	// its own would name the member addressing the unnamed target.
+	assert.Equal(t, "commerce-a", resp.Plan.Deployment)
+	assert.Equal(t, "commerce-001", resp.Plan.Target)
 	require.Len(t, resp.Plan.Changes, 1)
 
 	change := resp.Plan.Changes[0]

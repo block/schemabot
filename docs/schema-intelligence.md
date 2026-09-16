@@ -796,7 +796,9 @@ primary deployment the plan was computed against, when one was recorded.
 
 `GET /api/plans/{plan_id}` returns the full plan: for every table, the exact
 DDL that was computed, the change type, whether it was classified unsafe and
-why, and whether it was classified for direct execution. Because a plan is
+why, and whether it was classified for direct execution. The plan also names
+the rollout member it was computed against, as `deployment` and `target`
+together: one deployment can address several targets, so read the pair. Because a plan is
 stamped with the commit it was computed from, a caller can join it back to the
 repository to inspect the proposed change at that commit. To establish what
 actually ran, inspect the apply's task DDL and outcome through progress.
@@ -943,6 +945,8 @@ Response excerpt (illustrative values):
   "plan": {
     "plan_id": "plan-example-42",
     "engine": "spirit",
+    "deployment": "commerce-a",
+    "target": "shop-001",
     "changes": [
       {
         "namespace": "shop",
