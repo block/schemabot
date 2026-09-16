@@ -250,6 +250,19 @@ native statement and executes through pg-sprite's create path. The two facts
 the create depends on are proved in the session that executes, not at plan
 time, because absence or privilege at plan time proves nothing about apply
 time: the role holds `CREATE` on the target schema, and the name is free.
+A target configured with `table_owner` runs each create step with `SET LOCAL
+ROLE`, so the owner's default privileges apply to the table and its serial
+sequences. The connected engine role needs membership in that role (`GRANT
+app_owner TO engine`), and the owner needs `USAGE` and `CREATE` on the schema.
+Without `table_owner`, the connected role owns new tables as before. The
+owner is checked at plan time as the role the create will run as: missing
+membership blocks the create step with the `GRANT` that provides it, and an
+owner the target has no role for blocks it with no grant to print.
+
+`table_owner` is one role per target, deliberately scalar. A per-namespace
+map mirroring `schema_overrides` is a later extension for a target whose
+schemas have different owners; no such target exists today.
+
 A name needed by the create set that is already occupied is a permanent
 refusal. The occupant is a relation of any kind — table, view, index, or
 sequence — or a standalone type (an enum, domain, range, or shell type; every

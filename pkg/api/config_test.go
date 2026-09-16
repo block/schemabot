@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -291,6 +292,58 @@ target_resolver:
 	assert.Equal(t, "schemabot", target.DSNFrom.Username)
 	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials", target.DSNFrom.ConfigRef)
 	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials#password", target.DSNFrom.PasswordRef)
+}
+
+func TestLoadServerConfigFromFile_PostgresStaticTargetTableOwner(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+storage:
+  dsn: env:MYSQL_DSN
+target_resolver:
+  targets:
+    example-target:
+      type: postgres
+      table_owner: app_owner
+      dsn_from:
+        config_ref: secretsmanager:/example/schemabot/target-credentials
+        password_ref: secretsmanager:/example/schemabot/target-credentials#password
+        username: schemabot
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	target := cfg.TargetResolver.Targets["example-target"]
+	assert.Equal(t, "postgres", target.DatabaseType)
+	assert.Equal(t, "app_owner", target.TableOwner)
+	require.NotNil(t, target.DSNFrom)
+	assert.Equal(t, "schemabot", target.DSNFrom.Username)
+}
+
+// A table_owner on an engine without the setting is rejected at config
+// load whether or not the experimental Strata opt-in is set: the check has
+// nothing to do with Strata, so the flag must not change its answer.
+func TestLoadServerConfigFromFileRejectsTableOwnerForMySQL(t *testing.T) {
+	for _, strata := range []bool{false, true} {
+		t.Run(fmt.Sprintf("experimental-strata-enabled=%t", strata), func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			content := fmt.Sprintf(`
+storage:
+  dsn: env:MYSQL_DSN
+experimental-strata-enabled: %t
+target_resolver:
+  targets:
+    example-target:
+      type: mysql
+      dsn: root@tcp(localhost:3306)/
+      table_owner: app_owner
+`, strata)
+			require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+			_, err := LoadServerConfigFromFile(configPath)
+			require.ErrorContains(t, err, `table_owner is only supported for postgres, not "mysql"`)
+		})
+	}
 }
 
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {

@@ -794,6 +794,14 @@ func TestConnectionIdentityHash(t *testing.T) {
 	assert.NotEqual(t, connectionIdentityHash(postgres("")), connectionIdentityHash(overridden("svc_qa")), "adding a schema override is a new connection identity")
 	assert.NotEqual(t, connectionIdentityHash(overridden("svc_qa")), connectionIdentityHash(overridden("svc_qa2")), "re-pointing a namespace at another physical schema is a new connection identity")
 	assert.NotEqual(t, connectionIdentityHash(overridden("svc_qa")), connectionIdentityHash(&inventory.Target{Target: "t", DatabaseType: storage.DatabaseTypePostgres, DSN: "postgres://app:secret@orders-db:5432/orders", SchemaOverrides: map[string]string{"svc_qa": "svc"}}), "the canonical and physical sides of a mapping are not interchangeable")
+
+	owned := func(owner string) *inventory.Target {
+		return &inventory.Target{Target: "t", DatabaseType: storage.DatabaseTypePostgres, DSN: "postgres://app:secret@orders-db:5432/orders", TableOwner: owner}
+	}
+	assert.Equal(t, connectionIdentityHash(owned("app_owner")), connectionIdentityHash(owned("app_owner")))
+	assert.NotEqual(t, connectionIdentityHash(postgres("")), connectionIdentityHash(owned("app_owner")), "configuring a table owner is a new connection identity")
+	assert.NotEqual(t, connectionIdentityHash(owned("app_owner")), connectionIdentityHash(owned("reporting_owner")), "changing the table owner is a new connection identity")
+	assert.NotEqual(t, connectionIdentityHash(owned("svc_qa")), connectionIdentityHash(overridden("svc_qa")), "an owner and a schema override with the same spelling are different identities")
 }
 
 // TestTargetRouterSchemaOverrideChangeRotatesGeneration pins that editing only

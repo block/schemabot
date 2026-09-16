@@ -106,6 +106,7 @@ type targetRouterRecordingClient struct {
 	targetDSN          string
 	targetMetadata     map[string]string
 	schemaOverrides    map[string]string
+	tableOwner         string
 	pendingObserverSet bool
 	observerApplyID    int64
 	closed             bool
@@ -670,6 +671,25 @@ func TestTargetRouterPropagatesSchemaOverridesToLocalConfig(t *testing.T) {
 	assert.Equal(t, map[string]string{"bikeshare": "bikeshare_eu_qa"}, client.schemaOverrides)
 }
 
+func TestTargetRouterPropagatesTableOwnerToLocalConfig(t *testing.T) {
+	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
+		"bikeshare": {
+			DatabaseType: storage.DatabaseTypePostgres,
+			DSN:          "postgres://engine:secret@localhost:5432/bikeshare?sslmode=disable",
+			TableOwner:   "app_owner",
+		},
+	}})
+	require.NoError(t, err)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err = router.Plan(t.Context(), &ternv1.PlanRequest{Database: "bikeshare", Type: storage.DatabaseTypePostgres, Target: "bikeshare"})
+
+	require.NoError(t, err)
+	require.NotNil(t, created["bikeshare"])
+	assert.Equal(t, "app_owner", created["bikeshare"].tableOwner)
+}
+
 func newStaticResolver(t *testing.T) *inventory.StaticResolver {
 	t.Helper()
 	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
@@ -693,7 +713,7 @@ func newTargetRouterForTest(t *testing.T, resolver inventory.Resolver, applyStor
 		Storage:  targetRouterStorage{applies: applyStore, plans: planStore},
 		Logger:   slog.Default(),
 		LocalClientFactory: func(cfg LocalConfig, _ storage.Storage, _ *slog.Logger) (Client, error) {
-			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata, schemaOverrides: cfg.SchemaOverrides}
+			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata, schemaOverrides: cfg.SchemaOverrides, tableOwner: cfg.TableOwner}
 			key := cfg.Database
 			if existing := created[key]; existing != nil {
 				key = fmt.Sprintf("%s#%d", cfg.Database, len(created)+1)

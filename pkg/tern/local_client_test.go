@@ -4152,6 +4152,16 @@ func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
 	assert.Equal(t, "analytics", client.planNamespace("analytics"))
 }
 
+func TestNewLocalClientTableOwnerValidation(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{Database: "bikeshare", Type: storage.DatabaseTypeMySQL, TableOwner: "app_owner"}, nil, slog.Default())
+	require.ErrorContains(t, err, `table_owner is only supported for postgres, not "mysql"`)
+
+	client, err := NewLocalClient(LocalConfig{Database: "bikeshare", Type: storage.DatabaseTypePostgres, TableOwner: "app_owner"}, nil, slog.Default())
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.Equal(t, "app_owner", client.config.TableOwner)
+}
+
 // A database type without a built-in engine is served by a registered factory,
 // so an embedding service can supply an engine this build does not include.
 func TestNewLocalClientUsesRegisteredEngine(t *testing.T) {

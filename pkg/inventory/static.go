@@ -62,6 +62,9 @@ type StaticTarget struct {
 	// physical schema. MySQL and PostgreSQL only; currently limited to a
 	// single mapping per target.
 	SchemaOverrides map[string]string `yaml:"schema_overrides,omitempty"`
+	// TableOwner is the PostgreSQL role used for greenfield table creation.
+	// Empty preserves creation as the connected role. PostgreSQL only.
+	TableOwner string `yaml:"table_owner,omitempty"`
 }
 
 // StaticDSNFromConfig assembles a DSN for a static target from secret
@@ -126,6 +129,7 @@ type staticTargetEntry struct {
 	// allowlist for this target; empty means the requested namespace is the
 	// physical schema.
 	schemaOverrides map[string]string
+	tableOwner      string
 	// dsn is set (non-nil) for entries resolved once at construction.
 	dsn *string
 	// dsnFrom is set for entries assembled fresh on every request.
@@ -192,6 +196,7 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 		DSN:             dsn,
 		Metadata:        metadata,
 		SchemaOverrides: maps.Clone(entry.schemaOverrides),
+		TableOwner:      entry.tableOwner,
 	}, nil
 }
 
@@ -236,11 +241,15 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 	if err := ValidateSchemaOverrides(databaseType, entry.SchemaOverrides); err != nil {
 		return nil, fmt.Errorf("target %q: %w", target, err)
 	}
+	if err := ValidateTableOwner(databaseType, entry.TableOwner); err != nil {
+		return nil, fmt.Errorf("target %q: %w", target, err)
+	}
 	prepared := &staticTargetEntry{
 		target:          target,
 		databaseType:    databaseType,
 		metadata:        maps.Clone(entry.Metadata),
 		schemaOverrides: maps.Clone(entry.SchemaOverrides),
+		tableOwner:      entry.TableOwner,
 	}
 	if hasDSNFrom {
 		if databaseType != "mysql" && databaseType != "postgres" {
@@ -316,6 +325,21 @@ func ValidateSchemaOverrides(databaseType string, overrides map[string]string) e
 	return nil
 }
 
+// ValidateTableOwner checks the optional role used for PostgreSQL greenfield
+// table creation. An empty owner preserves creation as the connected role.
+func ValidateTableOwner(databaseType, owner string) error {
+	if owner == "" {
+		return nil
+	}
+	if databaseType != "postgres" {
+		return fmt.Errorf("table_owner is only supported for postgres, not %q", databaseType)
+	}
+	if err := validatePostgresIdentifier("role", owner); err != nil {
+		return fmt.Errorf("table_owner %q: %w", owner, err)
+	}
+	return nil
+}
+
 func validateSchemaIdentifier(databaseType, name string) error {
 	switch databaseType {
 	case "mysql":
@@ -345,20 +369,24 @@ func validateMySQLSchemaIdentifier(name string) error {
 }
 
 func validatePostgresSchemaIdentifier(name string) error {
+	return validatePostgresIdentifier("schema", name)
+}
+
+func validatePostgresIdentifier(kind, name string) error {
 	if name == "" {
-		return fmt.Errorf("schema name must not be empty")
+		return fmt.Errorf("%s name must not be empty", kind)
 	}
 	if len(name) > 63 {
-		return fmt.Errorf("schema name exceeds PostgreSQL's 63-byte identifier limit")
+		return fmt.Errorf("%s name exceeds PostgreSQL's 63-byte identifier limit", kind)
 	}
 	if strings.TrimSpace(name) != name {
-		return fmt.Errorf("schema name must not have leading or trailing whitespace")
+		return fmt.Errorf("%s name must not have leading or trailing whitespace", kind)
 	}
 	if strings.ContainsRune(name, '"') {
-		return fmt.Errorf("schema name must not contain a double quote")
+		return fmt.Errorf("%s name must not contain a double quote", kind)
 	}
 	if strings.ContainsRune(name, '\x00') {
-		return fmt.Errorf("schema name must not contain NUL")
+		return fmt.Errorf("%s name must not contain NUL", kind)
 	}
 	return nil
 }

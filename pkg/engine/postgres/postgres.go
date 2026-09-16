@@ -44,6 +44,7 @@ type Engine struct {
 	wg              sync.WaitGroup
 	pullDatabase    string
 	pullCredentials *engine.Credentials
+	tableOwner      string
 	// progress holds the latest state of every schema change this engine is
 	// tracking, keyed by the apply's identity (its
 	// ResumeState.MigrationContext). One engine is shared for the lifetime of a
@@ -182,6 +183,13 @@ func NewForTarget(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration
 	return e
 }
 
+// WithTableOwner configures the PostgreSQL role used for greenfield table
+// creation. Empty preserves creation as the connected role.
+func (e *Engine) WithTableOwner(owner string) *Engine {
+	e.tableOwner = owner
+	return e
+}
+
 // TableSizeLimit exposes the native-safe ceiling for wiring verification and observability.
 func (e *Engine) TableSizeLimit() int64 {
 	return e.tableSizeLimit
@@ -238,10 +246,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
 	}
 	defer pool.Close()
-	return planSchemas(ctx, pool, req, e.tableSizeLimit)
+	return planSchemas(ctx, pool, req, e.tableSizeLimit, e.tableOwner)
 }
 
-func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest, tableSizeLimit int64) (*engine.PlanResult, error) {
+func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest, tableSizeLimit int64, tableOwner string) (*engine.PlanResult, error) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return nil, fmt.Errorf("select PostgreSQL statement parser: %w", err)
@@ -283,7 +291,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 					"vocabulary", vocabulary.kind,
 					"value", vocabulary.value)
 			}
-			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers)
+			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers, tableOwner)
 			if err != nil {
 				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
@@ -496,7 +504,7 @@ func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
 // from classifyRefusal, so the same failure carries the same detail at plan
 // and apply time; here it is prefixed with the statement it blocks. The
 // returned slice is the input with verdicts marked.
-func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier) ([]engine.TableChange, error) {
+func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier, tableOwner string) ([]engine.TableChange, error) {
 	if len(changes) != len(tiers) {
 		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
 	}
@@ -529,7 +537,7 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 			// The off-ladder create tier is checked against the schema, not
 			// the table: CheckPrivileges' ladder walks facts about an
 			// existing table, and a greenfield target has none.
-			_, err = preflight.CheckCreatePrivileges(ctx, pool, report.Schema)
+			_, err = preflight.CheckCreatePrivilegesAs(ctx, pool, report.Schema, tableOwner)
 		} else {
 			_, err = preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
 		}
@@ -547,8 +555,9 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 			blockChangesAtTier(changes, tiers, tier, r.detail)
 			continue
 		}
-		// Any other refusal is a property of the table itself — vanished, or
-		// not an ordinary table — so it holds for every executable step.
+		// Any other refusal is a property of the table itself — vanished,
+		// not an ordinary table, or to be created for an owner the target
+		// has no role for — so it holds for every executable step.
 		blockExecutableChanges(changes, r.detail)
 		return changes, nil
 	}
