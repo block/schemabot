@@ -2249,6 +2249,44 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
+// members were planned independently and so run different plans: one is already
+// at the desired schema bar one index, the other still needs both. Each member's
+// section names the plan it runs, so a reader can tie it back to the block they
+// reviewed. The converged rollouts above name none.
+func PreviewCommentMultiDeploymentApplyDivergentPlans() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "us", State: state.ApplyOperation.Running},
+		{Deployment: "eu", State: state.ApplyOperation.Pending},
+	})
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Running
+	usTables[0].RowsCopied = 914707
+	usTables[0].RowsTotal = 1466232
+	usTables[0].PercentComplete = 62
+	usTables[0].ETASeconds = 195
+	usTables[1].Status = state.Task.Pending
+	usTables[2].Status = state.Task.Pending
+
+	euTables := sampleApplyTables()[:1]
+	euTables[0].Status = state.Task.Pending
+
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Running, usTables)
+	usDetail.PlanID = "plan_7c41f9"
+	euDetail := sampleDeploymentDetail("payments_eu", state.Apply.Pending, euTables)
+	euDetail.PlanID = "plan_3344ab"
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-6 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     []*ApplyStatusCommentData{usDetail, euDetail},
+	})
+}
+
 // PreviewCommentMultiDeploymentApplyFailed renders a halt-on-failure rollout
 // where one deployment failed: completed deployments stay completed, later
 // deployments are halted, and the aggregate is failed with retry as next action.

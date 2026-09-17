@@ -7225,6 +7225,89 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="rollout-where-plans-differ"></a><strong>Rollout Where Plans Differ</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 running, 1 waiting
+
+- 🔄 us — running table copy
+- ⏳ eu — waiting for us
+
+<details open>
+<summary>🔄 us — running table copy</summary>
+
+**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Plan**: `plan_7c41f9`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
+
+📊 1 running (62.38%) · 2 queued
+
+**Schema `testapp`**
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+
+**`users`**: ⏳ Queued
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+Stopping applies to every target in this rollout, not just `us`.
+
+</details>
+
+<details>
+<summary>⏳ eu — waiting for us</summary>
+
+**Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Plan**: `plan_3344ab`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Status**: ⏳ Waiting for us
+
+**Schema `testapp`**
+
+**`orders`**: ⏳ Queued
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+</details>
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="halt-on-failure-one-deployment-failed"></a><strong>Halt On Failure (One Deployment Failed)</strong></summary>
 
 
