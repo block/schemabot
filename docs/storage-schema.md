@@ -109,68 +109,56 @@ becoming a half-converged schema. That is invariant AV-9 in
 
 ## What converges by itself
 
-How far the automatic convergence goes depends on the storage dialect.
+A boot converges what it can do safely and stops rather than guess. What it
+does with each kind of drift depends on the dialect:
 
-**MySQL** diffs the embedded schema files against the live database and applies
-whatever DDL is needed (via Spirit) — new tables, new columns, and index changes
-all converge automatically. An index added to an existing table runs as Spirit
-online DDL — a table copy, not an in-place build — so its cost grows with the
-table's row count. On a deployment whose storage tables carry a long history,
-create a newly declared index by hand before rolling out: the startup diff then
-finds nothing to do, instead of copying the table inside the budget on every
-pod. See [Pre-creating indexes on a long-lived
+```
+  the boot finds                  MySQL             PostgreSQL
+  ────────────────────────────────────────────────────────────────────────────
+  a table it is missing           creates it        creates it
+  a column it is missing          adds it           adds it, or stops the boot
+  an index it is missing          builds it         builds it
+  a column defined differently    alters it         does not see it
+  a surplus table or column       refuses it        leaves it
+  a surplus index                 drops it          leaves it
+  an index it cannot use          does not arise    stops the boot
+  ────────────────────────────────────────────────────────────────────────────
+```
+
+A refused MySQL statement does not stop the boot, which carries on without it.
+[What is never automatic](#what-is-never-automatic) covers which statements
+those are.
+
+**MySQL builds a new index by copying the table**, so it costs time in
+proportion to the rows in the table, on every pod, inside the boot's budget. On
+storage tables carrying a long history, create a newly declared index by hand
+before rolling out the release that declares it, and the boot finds nothing to
+do. See [Pre-creating indexes on a long-lived
 database](#pre-creating-indexes-on-a-long-lived-database).
 
-**PostgreSQL** automatically creates missing tables, columns, and standalone
-indexes. It discovers drift before taking the bootstrap advisory lock, then
-re-checks and applies each table's changes transactionally under that lock.
-Convergence is additive-only: extra columns and indexes remain in place for
-binary rollback, and `allow_destructive_schema_changes` has no effect because
-this flow never produces destructive DDL. Column verification is
-presence-only, so type, length, and nullability drift is outside its scope and
-is not detected.
+**PostgreSQL stops the boot rather than make a change that locks a table for as
+long as the change takes.** A new column does that when it is `NOT NULL` with no
+`DEFAULT`, generated, an identity column, `UNIQUE`, or a foreign key with a
+`DEFAULT`. One error names every change in that state, so you see all of them at
+once, and none of them converge until all are resolved.
 
-A missing column converges automatically only when the `ADD COLUMN` is
-metadata-only. A missing `NOT NULL` column without a `DEFAULT`, a generated or
-identity column, a `UNIQUE` column, a `REFERENCES` column with a `DEFAULT`, or a
-column with a constraint shape not explicitly classified as safe fails startup
-with instructions for manual remediation: generated and identity columns rewrite
-the populated table, `UNIQUE` builds a unique index over it, and a foreign key
-with a `DEFAULT` validates every existing row against the referenced table — all
-under an exclusive lock whose hold time the startup lock timeout does not bound.
-That classification is made over the whole drift set before any DDL runs, so one
-column needing manual remediation is named together with every other, in one
-error, and nothing converges until all of them are resolved.
+An index PostgreSQL cannot use stops the boot as well. PostgreSQL reports an
+index as invalid both while it is still being built and after a build failed
+part way, and the error says which of the two it is. A build still running needs
+nothing from you, and the pod starts on its own once it finishes. A failed build
+has to be dropped, so the next boot recreates it, or reindexed by hand, once you
+have removed whatever made it fail. If the storage role cannot see other roles'
+sessions, confirm from a privileged one that no build is running before you
+treat an index as failed.
 
-Failures that only a write can discover are the other shape, and they stop where
-they happen. Additive DDL that cannot be parsed or executed, and re-verification
-that still finds drift afterwards, each fail startup at the table they occur on:
-column batches run one transaction per table and each index runs in its own, so
-earlier tables' changes are already committed. Nothing is left half-applied —
-the failing transaction rolls back whole — and because the convergence is
-additive, the next startup redoes only what is still missing.
+**PostgreSQL removes nothing**, which is what makes rolling back to an earlier
+binary safe: the tables and columns a newer binary added stay where they are.
+`allow_destructive_schema_changes` therefore has no effect there. It also does
+not compare column definitions, so a type, length, or nullability change to an
+existing column goes unnoticed and has to be made by hand.
 
-A live index only counts as present when PostgreSQL reports it valid.
-PostgreSQL marks an index invalid both while a `CREATE INDEX CONCURRENTLY` is
-still building it and after one fails part-way — a unique build that hits
-duplicate keys, a cancelled session — and in either case the planner never uses
-it. Startup fails closed naming that index rather than reading it as converged
-or colliding with it on a fresh `CREATE INDEX`, and reads
-`pg_stat_progress_create_index` to say which situation it is:
-
-- **A build is in progress** — the expected state while an operator pre-creates
-  an index ahead of a release. The error says so and asks for nothing; the pod
-  restarts on its backoff and starts cleanly once the build completes.
-- **No build is visible** — the error treats the index as a failed build. Remove
-  the cause first (a unique build keeps failing while duplicate keys remain),
-  then drop the index so the next startup recreates it, or `REINDEX INDEX
-  CONCURRENTLY` it by hand.
-
-That view only shows other roles' sessions to a caller with
-`pg_read_all_stats`, so if the storage role lacks it and the build runs under a
-different role, confirm from a privileged session that no build is running
-before recovering. A non-unique index under a name the embedded schema requires
-to be unique fails startup the same way.
+A boot that fails part way leaves nothing half applied, and the next one picks
+up whatever is still missing.
 
 ## What is never automatic
 
