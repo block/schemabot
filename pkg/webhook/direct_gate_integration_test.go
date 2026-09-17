@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -90,7 +91,9 @@ func TestE2EDirectPlanDowngradesToConfirmThenApplies(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "⚙️ **Direct execution**", "the locked comment discloses the direct change")
 		assert.Contains(t, body, "runs as native MySQL DDL")
-		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually")
+		assert.Contains(t, body, "**Confirmation required** — review the plan above, then confirm manually:")
+		assert.NotContains(t, body, glyph.Attention,
+			"the direct-execution disclosure above carries its own glyph and names the statement")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the downgraded plan comment")
 	}

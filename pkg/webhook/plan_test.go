@@ -514,12 +514,12 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 
 	t.Run("downgrade hint preserves tenant", func(t *testing.T) {
 		data := templates.PlanCommentData{
-			Database:                   "testdb",
-			Environment:                "staging",
-			Tenant:                     "alpha",
-			IsMySQL:                    true,
-			IsLocked:                   true,
-			AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+			Database:                  "testdb",
+			Environment:               "staging",
+			Tenant:                    "alpha",
+			IsMySQL:                   true,
+			IsLocked:                  true,
+			PendingManualConfirmation: true,
 			Changes: []templates.KeyspaceChangeData{{
 				Keyspace:   "testdb",
 				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
@@ -529,7 +529,7 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		rendered := templates.RenderPlanComment(data)
 
 		assert.Contains(t, rendered, "**Tenant**: `alpha`")
-		assert.Contains(t, rendered, "Automatic apply paused")
+		assert.Contains(t, rendered, "**Confirmation required**")
 		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
 	})
 
