@@ -61,8 +61,11 @@ func (s *storageProgressSubjectLog) heartbeatInterval() time.Duration {
 
 func newStorageProgressPrinter(out io.Writer) *storageProgressPrinter {
 	return &storageProgressPrinter{
-		out:      out,
-		now:      time.Now,
+		out: out,
+		// UTC, because log mode's other surface stamps in UTC and the line
+		// carries no zone to tell them apart. A host outside UTC would
+		// otherwise put two different clocks in one format.
+		now:      func() time.Time { return time.Now().UTC() },
 		subjects: map[string]*storageProgressSubjectLog{},
 	}
 }
