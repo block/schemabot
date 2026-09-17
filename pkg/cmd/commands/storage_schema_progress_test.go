@@ -200,3 +200,14 @@ func TestStorageProgressPrinter_TracksEachTableSeparately(t *testing.T) {
 	assert.Contains(t, got, "Table complete table=checks")
 	assert.NotContains(t, got, "Table complete table=applies")
 }
+
+// A line carries a time and no zone, so the two log-mode surfaces have to
+// agree on which clock it is. The apply watcher stamps in UTC.
+func TestNewStorageProgressPrinter_StampsInUTC(t *testing.T) {
+	t.Parallel()
+
+	printer := newStorageProgressPrinter(&strings.Builder{})
+
+	assert.Equal(t, time.UTC, printer.now().Location(),
+		"a host outside UTC would otherwise print a different clock than apply --output log for the same instant")
+}
