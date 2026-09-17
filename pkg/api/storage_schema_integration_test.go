@@ -10,11 +10,13 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -232,22 +234,84 @@ func TestDiffStorageSchemaMySQL_ReadsWhileBootstrapHoldsLock(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
 
-	// Hold the bootstrap's advisory lock on a dedicated session, the way a
-	// converging pod does.
-	conn, err := db.Conn(t.Context())
-	require.NoError(t, err)
-	defer func() { _ = conn.Close() }()
-	var acquired int
-	require.NoError(t, conn.QueryRowContext(t.Context(), "SELECT GET_LOCK(?, 5)", ensureSchemaLockName).Scan(&acquired))
-	require.Equal(t, 1, acquired, "hold the bootstrap lock")
-	defer func() {
-		var released sql.NullInt64
-		_ = conn.QueryRowContext(t.Context(), "SELECT RELEASE_LOCK(?)", ensureSchemaLockName).Scan(&released)
-	}()
+	holdMySQLBootstrapLock(t, db)
 
 	report, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err, "a diff must not wait on the bootstrap lock")
 	assert.True(t, report.Converged())
+}
+
+// holdMySQLBootstrapLock takes the storage bootstrap's advisory lock on a
+// dedicated session, the way a converging pod holds it, and releases it when
+// the test ends.
+func holdMySQLBootstrapLock(t *testing.T, db *sql.DB) {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	var acquired int
+	require.NoError(t, conn.QueryRowContext(t.Context(), "SELECT GET_LOCK(?, 5)", ensureSchemaLockName).Scan(&acquired))
+	require.Equal(t, 1, acquired, "hold the bootstrap lock")
+	t.Cleanup(func() {
+		var released sql.NullInt64
+		_ = conn.QueryRowContext(t.Context(), "SELECT RELEASE_LOCK(?)", ensureSchemaLockName).Scan(&released)
+		_ = conn.Close()
+	})
+}
+
+// A convergence in progress is invisible in a diff — its DDL lands on a shadow
+// table, so a database being converged reports the same outstanding statements
+// as one nobody has touched. The report says so separately, which is what
+// tells an operator whose session dropped that their run is still going, and
+// what keeps a second operator from starting an apply that would do nothing
+// but wait out the first one's budget on a lock.
+func TestDiffStorageSchemaMySQL_ReportsAConvergenceInFlight(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	report, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, logger)
+	require.NoError(t, err)
+	require.False(t, report.ConvergenceInFlight, "nothing is converging this database")
+
+	holdMySQLBootstrapLock(t, db)
+
+	report, err = PlanStorageSchema(t.Context(), sdb.DSN, nil, logger)
+	require.NoError(t, err)
+	assert.True(t, report.ConvergenceInFlight,
+		"a held bootstrap lock is a convergence in flight")
+	assert.True(t, report.Converged(),
+		"the statement sets are unchanged by another instance holding the lock")
+}
+
+// The PostgreSQL twin: the same lock, read out of a different catalog, means
+// the same thing. An operator reading two deployments' reports gets the same
+// answer to the same question whichever family the storage runs on.
+func TestDiffStorageSchemaPostgres_ReportsAConvergenceInFlight(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	logger := storageSchemaTestLogger()
+	postgres := WithDialect(schema.DialectPostgres)
+	require.NoError(t, EnsureSchema(dsn, logger, postgres))
+
+	report, err := PlanStorageSchema(t.Context(), dsn, nil, logger, postgres)
+	require.NoError(t, err)
+	require.False(t, report.ConvergenceInFlight, "nothing is converging this database")
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	acquired, err := namedlock.Postgres{}.Acquire(t.Context(), conn, ensureSchemaLockName, 5*time.Second)
+	require.NoError(t, err)
+	require.True(t, acquired, "hold the bootstrap lock")
+	t.Cleanup(func() {
+		_, _ = namedlock.Postgres{}.Release(t.Context(), conn, ensureSchemaLockName)
+		_ = conn.Close()
+	})
+
+	report, err = PlanStorageSchema(t.Context(), dsn, nil, logger, postgres)
+	require.NoError(t, err)
+	assert.True(t, report.ConvergenceInFlight,
+		"a held bootstrap lock is a convergence in flight")
+	assert.True(t, report.Converged(),
+		"the statement sets are unchanged by another instance holding the lock")
 }
 
 // An empty PostgreSQL storage database reports every embedded table as a

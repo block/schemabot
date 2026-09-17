@@ -49,6 +49,15 @@ type StorageSchemaReport struct {
 	Destructive        []StorageSchemaStatement `json:"destructive,omitempty"`
 	DestructiveAllowed bool                     `json:"destructive_allowed"`
 	Manual             []StorageSchemaStatement `json:"manual,omitempty"`
+	// ConvergenceInFlight reports that some instance held the storage bootstrap
+	// lock when the diff was taken — a pod booting, or another operator's
+	// apply. It is what separates "this DDL is outstanding" from "this DDL is
+	// being run right now", which the statement lists cannot say on their own:
+	// a convergence's work lands on a shadow table until it cuts over.
+	//
+	// Only true is a finding. False is the absence of evidence, not a claim
+	// that the database is idle.
+	ConvergenceInFlight bool `json:"convergence_in_flight,omitempty"`
 }
 
 // AppliedStatements is what a convergence ran from this report of what it
