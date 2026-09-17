@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -208,4 +211,95 @@ func TestPartitionDestructiveChangesHonorsThePlanVerdict(t *testing.T) {
 		assert.Contains(t, attrs, unsafeChange.UnsafeReason)
 		assert.Contains(t, attrs, "applies")
 	})
+}
+
+// stalledCanceller stands in for an engine whose cancel does not come back:
+// the copy it is waiting on has stopped answering, or the target has. It is
+// the case the release budget exists for, and the only way to reach it is an
+// engine that never returns.
+type stalledCanceller struct {
+	called chan struct{}
+}
+
+func (s *stalledCanceller) Cancel(ctx context.Context, _ *engine.ControlRequest) (*engine.ControlResult, error) {
+	close(s.called)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A stop reports even when the release it asked for does not come back. The
+// operator pressed Ctrl-C: a terminal that sits there indefinitely is the one
+// outcome that reads as the stop having been ignored, and the artifacts the
+// release was dropping are uncommitted copies that the next boot's stale-table
+// cleanup reclaims.
+func TestReleaseStoppedConvergence_ReportsWhenTheReleaseStalls(t *testing.T) {
+	t.Parallel()
+	canceller := &stalledCanceller{called: make(chan struct{})}
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		releaseStoppedConvergence(stopped, canceller, closedPortDSN, 50*time.Millisecond, slog.New(slog.DiscardHandler))
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a release that does not come back must not keep the stop from returning")
+	}
+
+	select {
+	case <-canceller.called:
+	default:
+		t.Fatal("the stop must ask the engine to release the schema change before giving up on it")
+	}
+}
+
+// recordingCanceller answers a cancel the way an engine does when the change
+// it was asked to cancel had already finished.
+type recordingCanceller struct {
+	ctx context.Context
+	err error
+}
+
+func (r *recordingCanceller) Cancel(ctx context.Context, _ *engine.ControlRequest) (*engine.ControlResult, error) {
+	r.ctx = ctx
+	if r.err != nil {
+		return nil, r.err
+	}
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+// The release runs on a context the stop cannot cancel. Handing it the context
+// that just ended would cancel the cleanup along with the thing being cleaned
+// up, leaving the artifacts of every stopped convergence behind.
+func TestReleaseStoppedConvergence_RunsOnALiveContext(t *testing.T) {
+	t.Parallel()
+	canceller := &recordingCanceller{}
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	releaseStoppedConvergence(stopped, canceller, closedPortDSN, time.Second, slog.New(slog.DiscardHandler))
+
+	require.NotNil(t, canceller.ctx, "the engine must be asked to release the schema change")
+	assert.NoError(t, canceller.ctx.Err(), "the release must not run on the context that just ended")
+}
+
+// A change that finished between the last progress poll and the stop is not a
+// failed release: there is nothing left to release, the statement is applied,
+// and the next plan is what says so. Reporting it as a leak would send an
+// operator looking for artifacts that were never created.
+func TestReleaseStoppedConvergence_AcceptsAChangeThatAlreadyFinished(t *testing.T) {
+	t.Parallel()
+	canceller := &recordingCanceller{err: engine.NewAlreadyCompletedError("cancel rejected: already completed")}
+	logs := &strings.Builder{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	releaseStoppedConvergence(t.Context(), canceller, closedPortDSN, time.Second, logger)
+
+	assert.Contains(t, logs.String(), "completed before the stop reached it")
+	assert.NotContains(t, logs.String(), "level=WARN",
+		"a change that finished on its own leaves nothing behind to warn about")
 }
