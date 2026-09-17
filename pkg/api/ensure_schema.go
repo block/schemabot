@@ -404,7 +404,17 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 
 		select {
 		case <-ctx.Done():
-			return ensureSchemaTimeoutError(ctx, o.convergenceTimeout, len(tableChanges), logger)
+			// The same stop the failed-progress branch above takes, for the
+			// same reason: the schema change is running on a context of its
+			// own, so returning from here without cancelling the engine would
+			// release the bootstrap lock and leave a copy working against the
+			// storage database under a convergence nobody is watching any
+			// more (AV-13).
+			//
+			// This is the branch a stop actually arrives on. The polls either
+			// side of it are in-process and return in microseconds, so the
+			// loop spends essentially all of its time blocked right here.
+			return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, len(tableChanges), logger)
 		case <-ticker.C:
 		}
 	}
@@ -425,19 +435,81 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 // would sit on the storage database until then, holding disk and shadowing a
 // table name the next convergence wants to use.
 func stopConvergence(ctx context.Context, eng engine.Engine, dsn string, budget time.Duration, ddlCount int, logger *slog.Logger) error {
-	// The engine's own cancel path drops the artifacts on a context that
-	// outlives this one, so it runs to completion on the context that just
-	// ended. A failure here is not the operator's finding — the convergence
-	// stopping is — so it is logged with what it leaves behind rather than
-	// returned in place of the reason the run ended.
-	if _, err := eng.Cancel(ctx, &engine.ControlRequest{
-		Database:    storageSchemaNamespace,
-		Credentials: &engine.Credentials{DSN: dsn},
-	}); err != nil {
-		logger.Warn("could not release the stopped storage schema change's artifacts; the next boot's stale-table cleanup will reclaim them",
-			"database", storageSchemaNamespace, "error", err)
-	}
+	releaseStoppedConvergence(ctx, eng, dsn, storageConvergenceReleaseBudget, logger)
 	return convergenceStopReason(ctx, budget, ddlCount, logger)
+}
+
+// convergenceCanceller is the one thing a stop needs from the schema change
+// engine. Naming it separately keeps the release path honest about its
+// dependency, and lets the bound below be tested against a cancel that does
+// not come back without standing up an engine to not come back from.
+type convergenceCanceller interface {
+	Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error)
+}
+
+// storageConvergenceReleaseBudget bounds the wait for the engine to release
+// what a stopped convergence was holding. It is long enough for an in-process
+// copy to notice the cancel and for the statements that drop its artifacts,
+// and short enough that an operator who pressed Ctrl-C gets an answer rather
+// than a terminal that looks like it ignored them.
+const storageConvergenceReleaseBudget = 10 * time.Second
+
+// releaseStoppedConvergence has the engine release the stopped schema change's
+// artifacts, under a budget of its own.
+//
+// The cancel is synchronous and waits for the goroutine running the copy to
+// return, which is the right thing to wait for: the artifacts cannot be
+// dropped from under a copy still writing to them. What the wait lacks is a
+// bound. It does not honor the context it is given for that wait, so a target
+// that has stopped answering turns the stop an operator asked for into a
+// process that does nothing visible, on the one path where somebody is sitting
+// at a terminal waiting for it. An engine cancel that returned when its
+// context ended would retire this entirely; until then the budget is here,
+// where the operator is.
+//
+// A budget that fires leaves the cancel running rather than abandoning the
+// release: it has already signalled the copy, and what remains is the drop.
+// The artifacts are uncommitted copies rather than live tables, so the next
+// boot's stale-table cleanup reclaims whatever this did not finish.
+//
+// Nothing here is returned. A failure to release is not the finding an
+// operator came for — the convergence stopping is — so it is logged with what
+// it leaves behind, and the caller still reports why the run ended.
+func releaseStoppedConvergence(ctx context.Context, eng convergenceCanceller, dsn string, budget time.Duration, logger *slog.Logger) {
+	// The cancel runs on a context that outlives the one that just ended:
+	// releasing the artifacts is work caused by that context ending, so tying
+	// it to the same context would cancel the cleanup along with the thing
+	// being cleaned up.
+	cancelCtx := context.WithoutCancel(ctx)
+	released := make(chan error, 1)
+	go func() {
+		_, err := eng.Cancel(cancelCtx, &engine.ControlRequest{
+			Database:    storageSchemaNamespace,
+			Credentials: &engine.Credentials{DSN: dsn},
+		})
+		released <- err
+	}()
+
+	select {
+	case err := <-released:
+		switch {
+		case err == nil:
+			logger.Debug("released the stopped storage schema change's artifacts",
+				"database", storageSchemaNamespace)
+		case engine.IsAlreadyCompleted(err):
+			// The statement finished in the window between the last progress
+			// poll and the stop. There is nothing to release, and nothing went
+			// wrong: the statement is applied, which the next plan will show.
+			logger.Info("the storage schema change completed before the stop reached it; nothing to release",
+				"database", storageSchemaNamespace)
+		default:
+			logger.Warn("could not release the stopped storage schema change's artifacts; the next boot's stale-table cleanup will reclaim them",
+				"database", storageSchemaNamespace, "error", err)
+		}
+	case <-time.After(budget):
+		logger.Warn("the stopped storage schema change is still releasing its artifacts; reporting the stop now, and the next boot's stale-table cleanup will reclaim anything it leaves",
+			"database", storageSchemaNamespace, "release_budget", budget)
+	}
 }
 
 // convergenceStopReason says which of the two ways a convergence's context
