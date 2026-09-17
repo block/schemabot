@@ -1074,7 +1074,9 @@ storage:
 ```
 
 Leave the flag false during normal operation and revert it after the removal
-converges.
+converges. An operator who would rather not widen a deploy's standing policy to
+converge one removal can run `schemabot storage apply --allow-unsafe` instead,
+which permits the same statements for that one convergence.
 
 ## Support Channel
 
