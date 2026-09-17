@@ -57,7 +57,8 @@ $ schemabot local stop my-project
 {"state":"stopped"}
 ```
 
-A selected remote or missing profile requires an explicit runtime name or a local profile.
+A selected remote, missing, or mixed local/remote profile requires an explicit runtime name
+or an unambiguous local profile.
 Neither command starts a runtime. Stopping retains its configuration and durable state.
 
 ## Connect to a server

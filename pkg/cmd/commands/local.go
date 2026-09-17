@@ -199,5 +199,8 @@ func resolveLocalRuntimeID(id, profileFlag string) (string, error) {
 	if profile.LocalRuntime == "" {
 		return "", fmt.Errorf("profile %q does not select a local runtime; provide a runtime ID or select a local profile", name)
 	}
+	if profile.Endpoint != "" || profile.Token != "" || profile.RefreshToken != "" || profile.OIDC != nil {
+		return "", fmt.Errorf("profile %q mixes a local runtime with remote connection settings; provide a runtime ID or select an unambiguous local profile", name)
+	}
 	return profile.LocalRuntime, nil
 }

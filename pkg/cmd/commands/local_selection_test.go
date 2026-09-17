@@ -78,3 +78,27 @@ func TestLocalCommandsAcceptOptionalRuntimeID(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalCommandsRejectMixedProfiles(t *testing.T) {
+	for _, remote := range []struct{ name, yaml string }{
+		{"endpoint", "endpoint: https://example.test"},
+		{"token", "token: test-only-token"},
+		{"refresh token", "refresh_token: test-only-refresh"},
+		{"OIDC", "oidc: {}"},
+	} {
+		t.Run(remote.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("SCHEMABOT_PROFILE", "")
+			require.NoError(t, os.MkdirAll(filepath.Join(home, ".schemabot"), 0700))
+			config := "profiles:\n  default:\n    local_runtime: project\n    " + remote.yaml + "\n"
+			require.NoError(t, os.WriteFile(filepath.Join(home, ".schemabot", "config.yaml"), []byte(config), 0600))
+			require.ErrorContains(t, (&LocalStopCmd{}).Run(t.Context(), &Globals{}), "mixes a local runtime")
+			require.ErrorContains(t, (&LocalStatusCmd{}).Run(t.Context(), &Globals{}), "mixes a local runtime")
+			require.NoDirExists(t, filepath.Join(home, ".schemabot", "runtimes"))
+			id, err := resolveLocalRuntimeID("chosen", "")
+			require.NoError(t, err)
+			require.Equal(t, "chosen", id)
+		})
+	}
+}
