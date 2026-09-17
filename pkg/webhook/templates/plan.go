@@ -226,6 +226,42 @@ type DeploymentDriftData struct {
 	// rollup means every target was planned rather than that they agree — which
 	// is the opposite of what the mirrored wording says.
 	Independent bool
+	// Plans is the members grouped by the plan they would run, one entry per
+	// distinct plan, the primary's first. It says how much the members actually
+	// agree this round, which the contract alone cannot: members that are free
+	// to differ usually do not. Set only for a clean rollup of independent
+	// members — members expected to match each other say nothing by matching,
+	// and a blocked rollup describes each member on its own instead.
+	Plans []DeploymentPlanGroup
+}
+
+// DeploymentPlanGroup is the members of a rollout that would run the same plan.
+// Members share a group exactly when their plans are identical work, so a group
+// is what the comment can describe once and attribute to all of them.
+type DeploymentPlanGroup struct {
+	// Members names the group's members the way an operator addresses them, in
+	// rollout order.
+	Members []string
+	// Primary marks the group the reviewed primary member belongs to. Exactly
+	// one group carries it, and it is the group operators read first: the
+	// reviewed plan is the one they have already seen.
+	Primary bool
+	// Changes is the plan every member of the group would run, in the same shape
+	// the comment renders the reviewed plan itself. Empty for a group whose
+	// members are already at the desired schema.
+	Changes []KeyspaceChangeData
+}
+
+// Empty reports that the group's members are already at the desired schema and
+// would apply nothing. That is a plan in its own right, not a missing one, and
+// naming it is the difference between a fleet that is converging and one the
+// comment has quietly left out.
+// A vschema rewrite carries no DDL and is still work, so a group is counted the
+// same way the comment counts the reviewed plan: statements and vschema
+// rewrites together.
+func (g DeploymentPlanGroup) Empty() bool {
+	statements, vschema := countChanges(g.Changes)
+	return statements+vschema == 0
 }
 
 // DeploymentDriftEntry is one rollout member's classification against the
@@ -1214,9 +1250,10 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	case drift.Clean && drift.Independent:
 		// Independent members were deliberately never compared to each other, so
 		// the mirrored headline would assert agreement the rollup did not check.
-		// It says what was actually established: every target has a plan.
-		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
-			len(drift.Deployments), strings.Join(names, ", "))
+		// It says what was actually established: every target has a plan, and how
+		// far those plans agree this round.
+		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — %s\n\n",
+			len(drift.Deployments), strings.Join(names, ", "), describePlanGroups(drift.Plans))
 	case drift.Clean:
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
 			len(drift.Deployments), strings.Join(names, ", "))
@@ -1277,6 +1314,57 @@ func blockedSuffix(blocked int) string {
 		return ""
 	}
 	return fmt.Sprintf(" · blocked: %d", blocked)
+}
+
+// describePlanGroups states how much the members' plans actually agree this
+// round: how many distinct plans there are, and how many members already hold
+// the desired schema and would apply nothing.
+//
+// The contract alone cannot say this. Targets that are free to differ usually do
+// not, and a fleet converging over time — some targets changed, the rest already
+// there — is otherwise invisible in a comment that only reports what members are
+// permitted to do.
+//
+// With no groups it falls back to the contract, which is all that is known: a
+// caller that did not group the members has established nothing about this round
+// beyond what the configuration already said.
+func describePlanGroups(groups []DeploymentPlanGroup) string {
+	if len(groups) == 0 {
+		return "each target holds its own schema, so their plans are not expected to match."
+	}
+	var plans, changing, converged int
+	for _, g := range groups {
+		if g.Empty() {
+			converged += len(g.Members)
+			continue
+		}
+		plans++
+		changing += len(g.Members)
+	}
+
+	switch {
+	case plans == 0:
+		return "every target is already at this schema."
+	case plans == 1 && converged == 0:
+		return "every target needs the same change."
+	case plans == 1:
+		return fmt.Sprintf("%s this change, %s already at this schema.",
+			countedVerb(changing, "needs", "need"), countedVerb(converged, "is", "are"))
+	case converged == 0:
+		return fmt.Sprintf("%d distinct plans. Each target applies its own.", plans)
+	default:
+		return fmt.Sprintf("%d distinct plans across the %d targets that change; %s already at this schema.",
+			plans, changing, countedVerb(converged, "is", "are"))
+	}
+}
+
+// countedVerb renders a count and the verb that agrees with it, e.g. "3 need" or
+// "1 needs".
+func countedVerb(n int, singular, plural string) string {
+	if n == 1 {
+		return "1 " + singular
+	}
+	return fmt.Sprintf("%d %s", n, plural)
 }
 
 // driftDetailSuffix renders a deployment's drift detail as a trailing clause, or

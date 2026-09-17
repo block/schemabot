@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -346,13 +347,144 @@ func TestRenderPlanComment_DriftCleanNamesMultiTargetMembers(t *testing.T) {
 				{Deployment: "primary", Target: "testapp-002", Class: "planned"},
 				{Deployment: "eu-west", Target: "orders-eu", Class: "planned"},
 			},
+			Plans: []DeploymentPlanGroup{{
+				Members: []string{"primary/testapp-001", "primary/testapp-002", "eu-west"},
+				Primary: true,
+				Changes: planGroupChanges(1),
+			}},
 		},
 	}
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "Planned separately for all 3 targets")
 	assert.Contains(t, out, "`primary/testapp-001`, `primary/testapp-002`, `eu-west`")
-	assert.True(t, strings.Contains(out, "each target holds its own schema"))
+	assert.True(t, strings.Contains(out, "every target needs the same change"))
+}
+
+// Targets are free to hold different schemas, so what an operator needs to know
+// is how much they agree this round. The comment says how many distinct plans
+// the apply would run and how many targets are already there, which the contract
+// alone cannot tell them.
+func TestRenderPlanComment_PlanGroupsDescribeThisRound(t *testing.T) {
+	render := func(plans []DeploymentPlanGroup) string {
+		members := make([]DeploymentDriftEntry, 0, 5)
+		for _, g := range plans {
+			for range g.Members {
+				members = append(members, DeploymentDriftEntry{Deployment: "primary", Class: "planned"})
+			}
+		}
+		members[0].Primary = true
+		return RenderPlanComment(PlanCommentData{
+			Database: "testapp", Environment: "production", IsMySQL: true,
+			Changes: []KeyspaceChangeData{{
+				Keyspace:   "testapp",
+				Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+			}},
+			DeploymentDrift: &DeploymentDriftData{
+				Computed: true, Clean: true, Independent: true,
+				Deployments: members,
+				Plans:       plans,
+			},
+		})
+	}
+	group := func(statements int, members ...string) DeploymentPlanGroup {
+		return DeploymentPlanGroup{Members: members, Changes: planGroupChanges(statements)}
+	}
+
+	cases := []struct {
+		name   string
+		plans  []DeploymentPlanGroup
+		expect string
+	}{
+		{
+			name:   "every target needs the same change",
+			plans:  []DeploymentPlanGroup{group(1, "a", "b", "c")},
+			expect: "every target needs the same change.",
+		},
+		{
+			name:   "some targets are already there",
+			plans:  []DeploymentPlanGroup{group(1, "a", "c", "d"), group(0, "b", "e")},
+			expect: "3 need this change, 2 are already at this schema.",
+		},
+		{
+			name:   "a single target still needs it",
+			plans:  []DeploymentPlanGroup{group(1, "a"), group(0, "b")},
+			expect: "1 needs this change, 1 is already at this schema.",
+		},
+		{
+			name:   "targets need different changes",
+			plans:  []DeploymentPlanGroup{group(1, "a", "b", "c"), group(2, "d", "e")},
+			expect: "2 distinct plans. Each target applies its own.",
+		},
+		{
+			name:   "different changes with some already there",
+			plans:  []DeploymentPlanGroup{group(1, "a", "b"), group(2, "c"), group(0, "d", "e")},
+			expect: "2 distinct plans across the 3 targets that change; 2 are already at this schema.",
+		},
+		{
+			name:   "the whole fleet is already there",
+			plans:  []DeploymentPlanGroup{group(0, "a", "b", "c")},
+			expect: "every target is already at this schema.",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Contains(t, render(tc.plans), tc.expect)
+		})
+	}
+}
+
+// A plan that only rewrites the vschema runs no DDL, and is still work. It is
+// described as a change the targets need rather than as a schema they already
+// hold, which would tell an operator the apply does nothing.
+func TestRenderPlanComment_VSchemaOnlyPlanIsNotAlreadyApplied(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production",
+		Changes: []KeyspaceChangeData{{Keyspace: "testapp", VSchemaChanged: true}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{
+					Members: []string{"primary/testapp_1"},
+					Primary: true,
+					Changes: []KeyspaceChangeData{{Keyspace: "testapp", VSchemaChanged: true}},
+				},
+				{Members: []string{"primary/testapp_2"}},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "1 needs this change, 1 is already at this schema.")
+}
+
+// A rollup that reaches the comment ungrouped states the contract and nothing
+// more. Claiming the targets agree — or that they do not — would be a claim
+// about plans nobody compared.
+func TestRenderPlanComment_UngroupedIndependentRollupStatesTheContract(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "each target holds its own schema, so their plans are not expected to match.")
+	assert.NotContains(t, out, "distinct plans")
 }
 
 // A member name reaches the comment from server config, so the rollup renders
@@ -379,4 +511,17 @@ func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
 	out := RenderPlanComment(data)
 	assert.NotContains(t, out, "\n## Injected", "a name must not start a heading of its own")
 	assert.Contains(t, out, "`` us` ## Injected ``")
+}
+
+// planGroupChanges builds a group plan running the given number of statements.
+// A group running none is already at the desired schema.
+func planGroupChanges(statements int) []KeyspaceChangeData {
+	if statements == 0 {
+		return nil
+	}
+	ks := KeyspaceChangeData{Keyspace: "testapp"}
+	for i := range statements {
+		ks.Statements = append(ks.Statements, fmt.Sprintf("ALTER TABLE `t%d` ADD COLUMN `c` int", i))
+	}
+	return []KeyspaceChangeData{ks}
 }
