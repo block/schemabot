@@ -24,6 +24,7 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', required=True)
 parser.add_argument('--output', required=True)
+parser.add_argument('--integrated', action='store_true')
 parser.add_argument('--engine', choices=['mysql', 'postgres'], default='postgres')
 args = parser.parse_args()
 binary = str(Path(args.binary).resolve())
@@ -40,7 +41,12 @@ os.close(slave)
 # recording captures typing, cursor movement, and checkbox changes as they happen.
 engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [(0.9, '\x1b[B'), (0.7, '\x1b[A'), (0.7, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
-steps.extend([('Connect your database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+steps.extend([('Connect your database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+if args.integrated:
+    steps.append(('Where should SchemaBot store its own data?', [(3.0, '\r')]))
+else:
+    steps.extend([('Where should SchemaBot store its own data?', [(2.0, '\x1b[B'), (1.5, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+
 if args.engine == 'postgres':
     steps.append(('space select', [(0.8, ' '), (0.8, '\x1b[B'), (0.8, ' '), (1.0, '\r')]))
 steps.append(('Ready when you are', [(2.0, '\r')]))

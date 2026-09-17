@@ -5,6 +5,7 @@ package localruntime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,8 +28,12 @@ func TestInitEngines(t *testing.T) {
 	defer cancelBuild()
 	output, err := exec.CommandContext(buildCtx, "go", "build", "-o", binary, "../../pkg/cmd").CombinedOutput()
 	require.NoError(t, err, string(output))
-	for _, engine := range []string{"mysql", "postgres"} {
-		t.Run(engine, func(t *testing.T) {
+	for _, setup := range []struct {
+		engine     string
+		integrated bool
+	}{{"mysql", false}, {"postgres", false}, {"mysql", true}, {"postgres", true}} {
+		engine := setup.engine
+		t.Run(fmt.Sprintf("%s/integrated=%t", engine, setup.integrated), func(t *testing.T) {
 			storageDSN, targetDSN, db := supervisorDatabase(t, engine)
 			execSQL(t, db, "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL)")
 			execSQL(t, db, "INSERT INTO widgets VALUES (1, 'keep me')")
@@ -71,10 +76,22 @@ func TestInitEngines(t *testing.T) {
 			require.Equal(t, "missing_inputs", missing.Error)
 			require.Contains(t, missing.Missing, "database")
 			args := []string{"init", "--database", "app", "--environment", "development", "--type", engine, "--dsn", "env:INIT_TARGET", "--storage-dsn", "env:INIT_STORAGE", "--schema-dir", root, "--namespace", namespace, "--profile", "project", "--json"}
+			if setup.integrated {
+				i := slices.Index(args, "--storage-dsn")
+				args = append(args[:i], append([]string{"--integrated"}, args[i+2:]...)...)
+			}
 			// A fresh installation works with the normal default profile too.
 			defaultArgs := slices.Clone(args)
 			profileIndex := slices.Index(defaultArgs, "--profile")
 			defaultArgs = append(defaultArgs[:profileIndex], defaultArgs[profileIndex+2:]...)
+			if setup.integrated {
+				execSQL(t, db, "CREATE DATABASE schemabot")
+				out, err := run(defaultArgs...)
+				require.Error(t, err, string(out))
+				require.Contains(t, string(out), "may already exist")
+				require.NoFileExists(t, filepath.Join(manager.Dir, "runtime.yaml"))
+				execSQL(t, db, "DROP DATABASE schemabot")
+			}
 			output, err := run(defaultArgs...)
 			require.NoError(t, err, string(output))
 			output, err = run("databases")

@@ -13,11 +13,14 @@ import (
 func (cmd *InitCmd) missingInputs() []string {
 	var missing []string
 	for _, field := range []struct{ name, value string }{
-		{"database", cmd.Database}, {"environment", cmd.Environment}, {"type", cmd.Type}, {"dsn", cmd.DSN}, {"storage-dsn", cmd.StorageDSN},
+		{"database", cmd.Database}, {"environment", cmd.Environment}, {"type", cmd.Type}, {"dsn", cmd.DSN},
 	} {
 		if strings.TrimSpace(field.value) == "" {
 			missing = append(missing, field.name)
 		}
+	}
+	if cmd.StorageDSN == "" && !cmd.Integrated {
+		missing = append(missing, "storage-dsn")
 	}
 	if len(cmd.Namespaces) == 0 {
 		missing = append(missing, "namespace")

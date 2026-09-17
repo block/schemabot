@@ -663,6 +663,9 @@ type GitHubAppConfig = GitHubConfig
 
 // StorageConfig configures SchemaBot's internal storage database.
 type StorageConfig struct {
+	// Database selects a separate database while retaining the DSN secret reference.
+	Database string `yaml:"database,omitempty"`
+
 	// DSN is the MySQL connection string for SchemaBot's internal database.
 	// Can be a direct DSN or a reference (e.g., "env:MYSQL_DSN" to read from env var).
 	DSN string `yaml:"dsn"`
@@ -3298,6 +3301,14 @@ func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
 // STORAGE_DSN environment variable, then to MYSQL_DSN, which is honored for
 // every storage dialect as the legacy fallback name.
 func (c *ServerConfig) StorageDSN() (string, error) {
+	dsn, err := c.resolveStorageDSN()
+	if err != nil || c.Storage.Database == "" {
+		return dsn, err
+	}
+	return storageDatabaseDSN(c.Storage.Dialect, dsn, c.Storage.Database)
+}
+
+func (c *ServerConfig) resolveStorageDSN() (string, error) {
 	if c.Storage.DSNFrom != nil {
 		return c.Storage.DSNFrom.Resolve()
 	}

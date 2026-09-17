@@ -64,6 +64,11 @@ characters. Consumer `schemabot.yaml` files are not held to this rule: the
 `database:` and `type:` values are folded to lowercase when the file is read,
 so `database: Payments` resolves to the `payments` server key.
 
+For integrated local setup, `storage.database: schemabot` selects a separate database after
+resolving the storage DSN reference. The host, credentials, and connection options are
+preserved, including later credential updates. Both MySQL and PostgreSQL support this field.
+Only `init --integrated` creates the database; normal server startup does not.
+
 ### Building DSNs from separate secrets
 
 If your deployment stores database connection metadata separately from passwords,

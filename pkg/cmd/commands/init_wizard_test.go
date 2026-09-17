@@ -19,7 +19,7 @@ func wizardKey(m *initWizard, k tea.KeyType) { m.Update(tea.KeyMsg{Type: k}) }
 func TestInitWizardNavigationAndValidation(t *testing.T) {
 	t.Setenv("DATABASE_URL", "test-only")
 	t.Setenv("SCHEMABOT_STORAGE_DSN", "test-only")
-	m := newInitWizard(&InitCmd{Namespaces: []string{"public"}}, "default", io.Discard)
+	m := newInitWizard(&InitCmd{Namespaces: []string{"public"}, StorageDSN: "env:SCHEMABOT_STORAGE_DSN"}, "default", io.Discard)
 	m.editing = true
 	wizardKey(m, tea.KeyDown)
 	require.Equal(t, "postgres", m.fields[0].value)
@@ -41,6 +41,7 @@ func TestInitWizardNavigationAndValidation(t *testing.T) {
 	m.input.SetValue("env:DATABASE_URL")
 	wizardKey(m, tea.KeyEnter)
 	m.Update(initConnectionMsg{generation: m.generation})
+	wizardKey(m, tea.KeyEnter)
 	wizardKey(m, tea.KeyEnter)
 	wizardKey(m, tea.KeyEnter)
 	m.Update(initConnectionMsg{generation: m.generation})
@@ -231,6 +232,7 @@ func TestInitWizardConfirmsConfiguredConnections(t *testing.T) {
 	require.Contains(t, m.View(), "✓ Connected")
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, 4, m.step)
+	wizardKey(m, tea.KeyEnter) // Confirm standalone, then check its connection.
 	require.Contains(t, m.View(), `Database: "state"`)
 	require.False(t, m.confirmed)
 }
@@ -368,7 +370,7 @@ func TestInitCopyBackPreservesConnectionsAndDoesNotInitialize(t *testing.T) {
 	t.Setenv("HOME", home)
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: shop\ntype: postgres\n"), 0600))
-	original := InitCmd{Namespaces: []string{"sales", "west"}}
+	original := InitCmd{Namespaces: []string{"sales", "west"}, StorageDSN: "env:STATE"}
 	m := newInitWizard(&original, "default", io.Discard)
 	values := []string{"postgres", "shop", "development", "env:APP", "env:STATE", "sales, west", root, "chosen"}
 	for i, v := range values {

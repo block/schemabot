@@ -33,6 +33,7 @@ type InitCmd struct {
 	Environment    string       `short:"e" help:"Environment to initialize"`
 	Type           string       `help:"Database engine: mysql or postgres"`
 	DSN            string       `help:"Target connection as env:VARIABLE (credentials stay out of schema files)"`
+	Integrated     bool         `help:"Create a separate schemabot database on the application server for SchemaBot state"`
 	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE; startup initializes SchemaBot metadata tables"`
 	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
 	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
@@ -73,7 +74,11 @@ func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("load CLI configuration after initialization: %w", err)
 	}
-	fmt.Print(initCompletion(&display, cmd.Environment, client.ResolveProfileName(cfg, "")))
+	defaultProfile := cfg.DefaultProfile
+	if defaultProfile == "" {
+		defaultProfile = "default"
+	}
+	fmt.Print(initCompletion(&display, cmd.Environment, defaultProfile))
 	return nil
 }
 
@@ -81,7 +86,15 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if g.Endpoint != "" || g.Token != "" || os.Getenv("SCHEMABOT_ENDPOINT") != "" || os.Getenv("SCHEMABOT_TOKEN") != "" {
 		return nil, fmt.Errorf("local initialization cannot be combined with endpoint or authentication overrides")
 	}
-	for _, ref := range []string{cmd.DSN, cmd.StorageDSN} {
+	if cmd.Integrated && cmd.StorageDSN != "" {
+		return nil, fmt.Errorf("choose --integrated or --storage-dsn, not both")
+	}
+	storage := api.StorageConfig{Dialect: cmd.Type, DSN: cmd.StorageDSN}
+	if cmd.Integrated {
+		storage.DSN = cmd.DSN
+		storage.Database = "schemabot"
+	}
+	for _, ref := range []string{cmd.DSN, storage.DSN} {
 		if !strings.HasPrefix(ref, "env:") || strings.TrimSpace(strings.TrimPrefix(ref, "env:")) == "" {
 			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE references")
 		}
@@ -146,17 +159,25 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	manager := localruntime.Manager{Dir: dir, Binary: binary, Version: g.Version}
-	for _, ref := range []string{cmd.DSN, cmd.StorageDSN} {
-		if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(ref, "env:"))); err != nil {
-			return nil, fmt.Errorf("check %s before registering runtime: %w", ref, err)
+	cmd.reportProgress("Setting up your database connection...")
+	if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(cmd.DSN, "env:"))); err != nil {
+		return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.DSN, err)
+	}
+	registration := localsetup.Registration{
+		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
+		Connection: api.EnvironmentConfig{DSN: cmd.DSN}, Storage: storage,
+	}
+	if cmd.Integrated {
+		cmd.reportProgress("Preparing a separate schemabot database on your server...")
+		if err := localsetup.PrepareIntegratedStorage(ctx, manager, registration); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(cmd.StorageDSN, "env:"))); err != nil {
+			return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err)
 		}
 	}
-	cmd.reportProgress("Setting up your database connection...")
-	_, err = localsetup.Register(manager, localsetup.Registration{
-		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
-		Connection: api.EnvironmentConfig{DSN: cmd.DSN},
-		Storage:    api.StorageConfig{Dialect: cmd.Type, DSN: cmd.StorageDSN},
-	})
+	_, err = localsetup.Register(manager, registration)
 	if err != nil {
 		return nil, err
 	}
