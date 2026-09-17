@@ -30,19 +30,24 @@ var ErrNotAlterTable = statement.ErrNotAlterTable
 // recognize waits for an operator rather than riding along with the additions.
 //
 // The additive partition must also stand on its own, because the caller runs it
-// while the rest does not. A clause that adds a name a withheld clause was going
-// to free is withheld with it: executing it against the object still in place
+// while the rest does not. An addition naming anything a withheld clause also
+// names is withheld with it: executing it against the object still in place
 // fails on a duplicate name and takes down the statement the split exists to
-// keep running. That is how the diff of a redefined index, a widened primary
-// key, or a retyped column arrives — as a drop and an add of one name in one
-// statement. Names are matched case-insensitively, as MySQL matches them, and
-// across one flat namespace, which can only widen what is withheld.
+// keep running. That is how the diff of a redefined index or a widened primary
+// key arrives — as a drop and an add of one name in one statement.
 //
 // Either string is empty when no clause falls in that partition. Both are
 // restored in the parser's canonical form rather than sliced out of the input.
 // The input must be exactly one parseable ALTER TABLE statement: anything else
 // is an error, which callers treat as fail-closed by refusing the whole
 // statement.
+//
+// This reads the differ's output apart because the differ has no way to be asked
+// for less. A Spirit diff option that emits only additions retires this file
+// entirely: a caller that never receives a removal has nothing to partition, and
+// the coupling rule below stops being necessary rather than getting simpler,
+// because the differ knows a name is being reused at the point it decides to
+// emit the pair.
 func SplitAdditiveAlter(stmt string) (additiveDDL, withheldDDL string, err error) {
 	parsed, err := statement.New(stmt)
 	if err != nil {
@@ -56,21 +61,21 @@ func SplitAdditiveAlter(stmt string) (additiveDDL, withheldDDL string, err error
 		return "", "", statement.ErrNotAlterTable
 	}
 
-	// Names the live table still holds because the clause that would have freed
-	// them is withheld.
-	occupied := make(map[string]bool)
+	// Every name a withheld clause touches, so an addition that would collide
+	// with one can be withheld alongside it.
+	withheldNames := make(map[string]bool)
 	for _, spec := range alter.Specs {
 		if addsSchemaObject(spec) {
 			continue
 		}
-		if name := vacatedName(spec); name != "" {
-			occupied[strings.ToLower(name)] = true
+		for _, name := range mentionedNames(spec) {
+			withheldNames[name] = true
 		}
 	}
 
 	var additiveSpecs, withheldSpecs []*ast.AlterTableSpec
 	for _, spec := range alter.Specs {
-		if addsSchemaObject(spec) && !claimsOccupiedName(spec, occupied) {
+		if addsSchemaObject(spec) && !mentionsAny(spec, withheldNames) {
 			additiveSpecs = append(additiveSpecs, spec)
 			continue
 		}
@@ -105,100 +110,70 @@ func addsSchemaObject(spec *ast.AlterTableSpec) bool {
 	}
 }
 
-// primaryKeyIndexName is the name MySQL gives a table's primary key index. It
-// is reserved, so using it to couple a DROP PRIMARY KEY to the ADD PRIMARY KEY
-// behind it cannot collide with a secondary index's name.
-const primaryKeyIndexName = "PRIMARY"
+// primaryKeyName stands for a table's single primary key slot, which MySQL
+// leaves unnamed in both DROP PRIMARY KEY and ADD PRIMARY KEY. It is a reserved
+// index name, so it cannot collide with a secondary index.
+const primaryKeyName = "primary"
 
-// vacatedName returns the name an ALTER TABLE clause would free, so withholding
-// the clause is known to leave that name occupied. Columns count as much as
-// indexes and constraints: a withheld DROP COLUMN or column rename leaves the
-// old column in place, and an add of that same name is then a duplicate. It is
-// empty for a clause that frees no name.
-func vacatedName(spec *ast.AlterTableSpec) string {
-	switch spec.Tp {
-	case ast.AlterTableDropPrimaryKey:
-		return primaryKeyIndexName
-	case ast.AlterTableDropIndex, ast.AlterTableDropForeignKey:
-		return spec.Name
-	case ast.AlterTableDropCheck, ast.AlterTableDropConstraint:
-		if spec.Constraint != nil {
-			return spec.Constraint.Name
+// mentionedNames returns every identifier an ALTER TABLE clause names — the
+// object it acts on and the columns it references — lowercased, as MySQL
+// compares identifiers. It deliberately does not distinguish the role a name
+// plays in the clause, because the split does not need to: a name that appears
+// anywhere in a withheld clause is a name an addition must not claim.
+//
+// Collecting a name the clause merely references, rather than holds, can only
+// withhold more clauses than strictly necessary and never fewer. That is the
+// safe direction inside a statement the plan already reported as unsafe, and it
+// is why this is one flat list instead of a per-clause-type analysis.
+func mentionedNames(spec *ast.AlterTableSpec) []string {
+	var names []string
+	add := func(name string) {
+		if name != "" {
+			names = append(names, strings.ToLower(name))
 		}
-		return ""
-	case ast.AlterTableRenameIndex:
-		return spec.FromKey.O
-	case ast.AlterTableDropColumn, ast.AlterTableRenameColumn:
-		if spec.OldColumnName != nil {
-			return spec.OldColumnName.Name.O
-		}
-		return ""
-	case ast.AlterTableChangeColumn:
-		// CHANGE COLUMN states a name as well as a definition, so it is the
-		// other form of a column rename and frees the name it renames away
-		// from. A clause that restates the same name frees nothing.
-		old, _ := renamedColumn(spec)
-		return old
-	default:
-		return ""
 	}
+
+	if spec.Tp == ast.AlterTableDropPrimaryKey {
+		add(primaryKeyName)
+	}
+	add(spec.Name)
+	add(spec.FromKey.O)
+	add(spec.ToKey.O)
+	if spec.OldColumnName != nil {
+		add(spec.OldColumnName.Name.O)
+	}
+	if spec.NewColumnName != nil {
+		add(spec.NewColumnName.Name.O)
+	}
+	for _, column := range spec.NewColumns {
+		if column.Name != nil {
+			add(column.Name.Name.O)
+		}
+	}
+	if spec.Constraint != nil {
+		add(spec.Constraint.Name)
+		if spec.Constraint.Tp == ast.ConstraintPrimaryKey {
+			add(primaryKeyName)
+		}
+		for _, key := range spec.Constraint.Keys {
+			if key.Column != nil {
+				add(key.Column.Name.O)
+			}
+		}
+	}
+	return names
 }
 
-// renamedColumn returns the name a CHANGE COLUMN clause renames away from, and
-// whether it renames at all. Names are compared the way MySQL compares
-// identifiers, case-insensitively, so restating a column's name in another case
-// is not a rename and frees no name.
-func renamedColumn(spec *ast.AlterTableSpec) (old string, renames bool) {
-	if spec.OldColumnName == nil || len(spec.NewColumns) == 0 || spec.NewColumns[0].Name == nil {
-		return "", false
-	}
-	old = spec.OldColumnName.Name.O
-	if strings.EqualFold(old, spec.NewColumns[0].Name.Name.O) {
-		return "", false
-	}
-	return old, true
-}
-
-// claimsOccupiedName reports whether an ALTER TABLE clause adds a column, index
-// or constraint under a name that a withheld clause leaves occupied, which makes
-// the clause unexecutable until that clause runs.
-func claimsOccupiedName(spec *ast.AlterTableSpec, occupied map[string]bool) bool {
-	for _, name := range addedNames(spec) {
-		if occupied[strings.ToLower(name)] {
+// mentionsAny reports whether an ALTER TABLE clause names anything in the given
+// set, which for an addition means it cannot run until the withheld clause
+// naming the same thing has run.
+func mentionsAny(spec *ast.AlterTableSpec, names map[string]bool) bool {
+	for _, name := range mentionedNames(spec) {
+		if names[name] {
 			return true
 		}
 	}
 	return false
-}
-
-// addedNames returns the names an ALTER TABLE clause claims, so a clause
-// claiming a name a withheld clause left occupied can be withheld with it. One
-// clause can add several columns. An index or constraint added without a name
-// claims none: MySQL derives that name, so no stated name can collide.
-func addedNames(spec *ast.AlterTableSpec) []string {
-	switch spec.Tp {
-	case ast.AlterTableAddColumns:
-		names := make([]string, 0, len(spec.NewColumns))
-		for _, column := range spec.NewColumns {
-			if column.Name != nil {
-				names = append(names, column.Name.Name.O)
-			}
-		}
-		return names
-	case ast.AlterTableAddConstraint:
-		if spec.Constraint == nil {
-			return nil
-		}
-		if spec.Constraint.Tp == ast.ConstraintPrimaryKey {
-			return []string{primaryKeyIndexName}
-		}
-		if spec.Constraint.Name == "" {
-			return nil
-		}
-		return []string{spec.Constraint.Name}
-	default:
-		return nil
-	}
 }
 
 // restoreAlterWithSpecs restores the given ALTER TABLE statement with its

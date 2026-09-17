@@ -84,6 +84,25 @@ func TestSplitAdditiveAlter(t *testing.T) {
 			additive: "",
 			withheld: "ALTER TABLE `applies` RENAME COLUMN `caller` TO `requested_by`, ADD COLUMN `caller` VARCHAR(64) NOT NULL",
 		},
+		{
+			// The withheld clause holds the column rather than the index name,
+			// so nothing would collide. It is withheld anyway: an index is worth
+			// building once, on the column's settled definition, and withholding
+			// more than collides is the direction this errs in.
+			name:     "an index on a column a withheld clause redefines waits with it",
+			stmt:     "ALTER TABLE `applies` MODIFY COLUMN `state` BIGINT NOT NULL, ADD INDEX `idx_state` (`state`)",
+			additive: "",
+			withheld: "ALTER TABLE `applies` MODIFY COLUMN `state` BIGINT NOT NULL, ADD INDEX `idx_state`(`state`)",
+		},
+		{
+			// A position names a neighbor, not something the clause claims, and
+			// the withheld drop is what keeps that neighbor in place. Coupling on
+			// it would withhold an addition that runs perfectly well.
+			name:     "an addition positioned after a column the withheld drop keeps still runs",
+			stmt:     "ALTER TABLE `applies` DROP COLUMN `state`, ADD COLUMN `caller` VARCHAR(64) NOT NULL AFTER `state`",
+			additive: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NOT NULL AFTER `state`",
+			withheld: "ALTER TABLE `applies` DROP COLUMN `state`",
+		},
 	}
 
 	for _, tt := range tests {
