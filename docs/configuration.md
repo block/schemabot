@@ -1048,16 +1048,20 @@ Nothing else in the diff can be unsafe, because the storage schema declares no
 foreign keys, check constraints, or named constraints to drop, and a declarative
 diff expresses no renames.
 
-The verdict is per statement, not per clause, the same answer Spirit's plan gate
-gives a mixed `ALTER TABLE`. SchemaBot's differ emits one combined `ALTER` per
-table, so an `ALTER` carrying an additive clause beside a drop is refused entire
-and none of it runs: the additive clause waits for an operator rather than
-executing beside a refusal. The statements that were not refused still apply and
-startup proceeds. This protects against rolling deploys and rollbacks: a pod
+The verdict is per statement, but SchemaBot's differ emits one combined `ALTER`
+per table, so a statement can carry a drop and an addition the starting binary
+requires. Rather than withhold both, the bootstrap reduces such a statement to
+the clauses that only add a schema object: those run and the removals do not.
+A clause that cannot execute until a withheld one has run is withheld with it,
+which is how an index or a primary key whose definition changed arrives, as a
+drop and an add of one name in one statement. A statement left with nothing to
+add is refused entire. Either way the statements that were not refused still
+apply and startup proceeds. This protects against rolling deploys and rollbacks: a pod
 running an older binary sees a newer binary's tables, columns, and indexes as
 surplus, and without the gate would remove them from under the pods that depend
-on them. Each refused statement is logged at warn level with the exact DDL, and
-counted in the `schemabot.storage_schema.destructive_refusals_total` metric.
+on them. Every refusal is logged at warn level with the exact DDL that did not
+run, and counted in the
+`schemabot.storage_schema.destructive_refusals_total` metric.
 
 To intentionally remove any of these objects, first make sure every running pod
 is on a binary whose embedded schema no longer declares the table, column, or

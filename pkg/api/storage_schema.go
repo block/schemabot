@@ -182,8 +182,10 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 // makes, so the two cannot disagree about what a boot would run. Spirit emits
 // one combined ALTER per table, and partitionDestructiveChanges sorts those
 // statements the way the bootstrap would, so each one is reported as the boot
-// would treat it — executed or refused whole — rather than as a statement whose
-// disposition an operator has to guess.
+// would treat it rather than as a statement whose disposition an operator has to
+// guess. A statement the boot would reduce to its additions is reported that
+// way too: the additions under Outstanding, the withheld clauses under
+// Destructive, which is what the two halves will actually do.
 func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSource, o ensureSchemaOptions) (*StorageSchemaReport, error) {
 	report := &StorageSchemaReport{
 		Dialect:            schema.DialectMySQL,
