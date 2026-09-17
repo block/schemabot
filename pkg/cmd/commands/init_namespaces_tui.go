@@ -3,7 +3,6 @@ package commands
 import (
 	"context"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 
@@ -33,11 +32,11 @@ func (m *initWizard) discoverNamespaces() tea.Cmd {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancelDiscovery = cancel
+	dsn, sourceErr := m.resolveConnection(ref)
 	return func() tea.Msg {
 		defer cancel()
-		dsn := os.Getenv(strings.TrimPrefix(ref, "env:"))
-		if !initVariable.MatchString(ref) || strings.TrimSpace(dsn) == "" {
-			return initNamespacesMsg{generation: generation, err: fmt.Errorf("choose an env:VARIABLE connection that you’ve already set")}
+		if sourceErr != nil {
+			return initNamespacesMsg{generation: generation, err: fmt.Errorf("choose a connection source before discovering namespaces")}
 		}
 		names, err := m.discover(ctx, engine, dsn)
 		return initNamespacesMsg{generation, names, err}

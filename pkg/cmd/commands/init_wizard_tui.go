@@ -24,6 +24,8 @@ type initField struct{ label, hint, value string }
 // The wizard edits a private draft. Only explicit confirmation copies it back;
 // initialize remains the sole registration and verification path (AZ-7, AZ-8, AZ-9).
 type initWizard struct {
+	connectionEditor                         initConnectionEditor
+	draftConnections                         map[string]string
 	integrated, choosingStorage              bool
 	connectionSummary                        string
 	hasExistingSchema                        bool
@@ -97,10 +99,12 @@ func (m *initWizard) loadField() {
 		return
 	}
 	m.choosingStorage = m.step == 4
+	m.input.EchoMode = textinput.EchoNormal
 	m.input.Placeholder = ""
 	m.input.SetValue(m.fields[m.step].value)
 	if m.step == 3 || m.step == 4 {
 		m.connectionSummary = initConnectionSummary(m.fields[0].value, m.input.Value())
+		m.loadConnectionEditor()
 	}
 	if m.step == 5 && !m.explicitNamespaces {
 		m.input.SetValue("")
@@ -123,12 +127,10 @@ func (m *initWizard) validate() string {
 			return "Use lowercase letters, numbers, hyphens, or underscores."
 		}
 	case 3, 4:
-		if !initVariable.MatchString(v) {
-			return "Use env:VARIABLE_NAME here, with the connection string saved in that variable."
+		if _, err := m.resolveConnection(v); err != nil {
+			return err.Error()
 		}
-		if os.Getenv(strings.TrimPrefix(v, "env:")) == "" {
-			return "This variable is empty. Choose one you’ve already set, or restart setup after setting it."
-		}
+
 	case 5:
 		if _, err := onboardPullNamespaces(initNamespaceInput(v, m.originalNamespaces)); err != nil {
 			return err.Error()
@@ -169,6 +171,11 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = max(20, min(72, msg.Width-4))
 		m.input.Width = max(10, m.width-4)
 	case tea.KeyMsg:
+		if (m.step == 3 || m.step == 4 && !m.choosingStorage) && (!m.checkingConnection || msg.String() == "shift+tab" || msg.String() == "esc" || msg.String() == "ctrl+c") {
+			if handled, cmd := m.connectionKey(msg); handled {
+				return m, cmd
+			}
+		}
 		if m.step == 4 && m.choosingStorage {
 			switch msg.String() {
 			case "up", "down", "left", "right":
@@ -179,6 +186,7 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.advance()
 				}
 				m.choosingStorage = false
+				m.loadConnectionEditor()
 				return m, textinput.Blink
 			}
 		}
@@ -265,13 +273,14 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, c = m.spinner.Update(msg)
 		return m, c
 	}
-	if m.step > 0 && m.step < len(m.fields) {
+	connectionReadOnly := (m.step == 3 || m.step == 4) && m.connectionEditor.mode == "ready"
+	if m.step > 0 && m.step < len(m.fields) && !connectionReadOnly {
 		var c tea.Cmd
 		before := m.input.Value()
 		m.input, c = m.input.Update(msg)
 		if m.input.Value() != before {
 			m.connectionChecked = false
-			if m.step == 3 || m.step == 4 {
+			if (m.step == 3 || m.step == 4) && m.connectionEditor.mode == "reference" {
 				m.connectionSummary = initConnectionSummary(m.fields[0].value, m.input.Value())
 			}
 			m.err = ""
@@ -310,6 +319,10 @@ func (m *initWizard) contentView() string {
 			b.WriteString(wrap.Render("We’ll turn your live schema into files and verify they match. Your application’s tables and existing files stay untouched.") + "\n\n")
 		} else {
 			b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
+		}
+		if m.step == 3 || m.step == 4 {
+			b.WriteString(bold.Render(f.label) + "\n\n" + wrap.Render(m.connectionEditorView()))
+			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
 		}
 		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(f.hint)) + "\n\n")
 		switch {
@@ -364,11 +377,14 @@ func (m *initWizard) contentView() string {
 		b.WriteString(bold.Render("Your schema files") + "\n")
 		b.WriteString(wrap.Render(initTerminalText(m.fields[6].value+" · profile "+m.fields[7].value)) + "\n\n")
 		b.WriteString(bold.Render("Connections") + "\n")
-		b.WriteString(wrap.Render("Application: "+initTerminalText(m.fields[3].value)) + "\n")
+		b.WriteString(wrap.Render("Application: "+initConnectionLabel(m.fields[3].value)) + "\n")
 		if m.integrated {
 			b.WriteString(wrap.Render("SchemaBot’s own data: new schemabot database on your application’s server") + "\n")
 		} else {
-			b.WriteString(wrap.Render("SchemaBot state: "+initTerminalText(m.fields[4].value)) + "\n")
+			b.WriteString(wrap.Render("SchemaBot state: "+initConnectionLabel(m.fields[4].value)) + "\n")
+		}
+		if strings.HasPrefix(m.fields[3].value, "draft:") || !m.integrated && strings.HasPrefix(m.fields[4].value, "draft:") {
+			b.WriteString("\nEntered credentials will be saved in private, unencrypted files\nunder ~/.schemabot/credentials, outside your project.\n")
 		}
 		if m.hasExistingSchema {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
@@ -420,6 +436,22 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 	reuse, err := initSchemaReuse(m.fields[6].value)
 	if err != nil {
 		return err
+	}
+	for _, i := range []int{3, 4} {
+		if i == 4 && m.integrated {
+			continue
+		}
+		if dsn, ok := m.draftConnections[m.fields[i].value]; ok {
+			purpose := "application"
+			if i == 4 {
+				purpose = "storage"
+			}
+			ref, err := saveInitConnection(cmd.Runtime, m.fields[1].value, m.fields[2].value, purpose, dsn)
+			if err != nil {
+				return err
+			}
+			m.fields[i].value = ref
+		}
 	}
 	cmd.Type = m.fields[0].value
 	cmd.Database = m.fields[1].value

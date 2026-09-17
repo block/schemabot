@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"net"
-	"os"
 	"strconv"
 	"strings"
 
@@ -19,14 +18,14 @@ import (
 // Show only destination fields, never a reconstructed DSN or parser error.
 // Quoting also prevents database names from injecting terminal controls.
 func initConnectionSummary(engine, ref string) string {
-	ref = strings.TrimSpace(ref)
-	if !initVariable.MatchString(ref) {
-		return "Enter env:VARIABLE_NAME to find your connection."
+	dsn, err := resolveInitConnection(strings.TrimSpace(ref))
+	if err != nil {
+		return "Choose a connection source to continue."
 	}
-	dsn := os.Getenv(strings.TrimPrefix(ref, "env:"))
-	if dsn == "" {
-		return "This variable isn’t set yet. Set it before continuing setup."
-	}
+	return initConnectionDestination(engine, dsn)
+}
+
+func initConnectionDestination(engine, dsn string) string {
 	var host, database string
 	switch engine {
 	case "mysql":
@@ -66,7 +65,11 @@ func (m *initWizard) checkConnection() tea.Cmd {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancelDiscovery = cancel
-	engine, dsn := m.fields[0].value, os.Getenv(strings.TrimPrefix(strings.TrimSpace(m.input.Value()), "env:"))
+	engine := m.fields[0].value
+	dsn, err := m.resolveConnection(strings.TrimSpace(m.input.Value()))
+	if err != nil {
+		return func() tea.Msg { return initConnectionMsg{generation: generation, err: err} }
+	}
 	check := m.check
 	if check == nil {
 		check = localsetup.CheckConnection

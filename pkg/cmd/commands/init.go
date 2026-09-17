@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -32,9 +31,9 @@ type InitCmd struct {
 	Database       string       `short:"d" help:"Name to register for this database"`
 	Environment    string       `short:"e" help:"Environment to initialize"`
 	Type           string       `help:"Database engine: mysql or postgres"`
-	DSN            string       `help:"Target connection as env:VARIABLE (credentials stay out of schema files)"`
+	DSN            string       `help:"Target connection as env:VARIABLE or file:/absolute/path (credentials stay out of schema files)"`
 	Integrated     bool         `help:"Create a separate schemabot database on the application server for SchemaBot state"`
-	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE; startup initializes SchemaBot metadata tables"`
+	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE or file:/absolute/path; startup initializes SchemaBot metadata tables"`
 	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
 	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
 	Runtime        string       `default:"local" help:"Local runtime identity"`
@@ -95,8 +94,8 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		storage.Database = "schemabot"
 	}
 	for _, ref := range []string{cmd.DSN, storage.DSN} {
-		if !strings.HasPrefix(ref, "env:") || strings.TrimSpace(strings.TrimPrefix(ref, "env:")) == "" {
-			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE references")
+		if !validInitConnectionReference(ref) {
+			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE or file:/absolute/path references")
 		}
 	}
 	namespaces, err := onboardPullNamespaces(cmd.Namespaces)
@@ -159,7 +158,11 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	}
 	manager := localruntime.Manager{Dir: dir, Binary: binary, Version: g.Version}
 	cmd.reportProgress("Setting up your database connection...")
-	if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(cmd.DSN, "env:"))); err != nil {
+	targetDSN, err := resolveInitConnection(cmd.DSN)
+	if err != nil {
+		return nil, err
+	}
+	if err := localsetup.CheckConnection(ctx, cmd.Type, targetDSN); err != nil {
 		return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.DSN, err)
 	}
 	registration := localsetup.Registration{
@@ -172,7 +175,11 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 			return nil, err
 		}
 	} else {
-		if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(cmd.StorageDSN, "env:"))); err != nil {
+		stateDSN, err := resolveInitConnection(cmd.StorageDSN)
+		if err != nil {
+			return nil, err
+		}
+		if err := localsetup.CheckConnection(ctx, cmd.Type, stateDSN); err != nil {
 			return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err)
 		}
 	}

@@ -36,6 +36,7 @@ func TestInitWizardNavigationAndValidation(t *testing.T) {
 	require.Equal(t, "shop", m.input.Value())
 	wizardKey(m, tea.KeyEnter)
 	wizardKey(m, tea.KeyEnter)
+	m.connectionEditor.mode = "reference"
 	m.input.SetValue("postgres://secret")
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, 3, m.step)
@@ -84,9 +85,10 @@ func TestInitWizardMissingVariableAndNarrowTerminal(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
 	m.step = 3
 	m.loadField()
+	m.connectionEditor.mode = "reference"
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, 3, m.step)
-	require.Contains(t, m.err, "This variable is empty")
+	require.Contains(t, m.err, "this connection is empty")
 	m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
 	require.NotEmpty(t, m.View())
 }
@@ -262,7 +264,7 @@ func TestInitConnectionSummaryRedactsCredentials(t *testing.T) {
 	t.Setenv("WIZARD_TEST_DSN", "postgres://user:secret@localhost/shop%1B%5B2J?sslmode=disable")
 	require.NotContains(t, initConnectionSummary("postgres", "env:WIZARD_TEST_DSN"), "\x1b")
 	t.Setenv("WIZARD_TEST_DSN", "")
-	require.Contains(t, initConnectionSummary("postgres", "env:WIZARD_TEST_DSN"), "isn’t set")
+	require.Contains(t, initConnectionSummary("postgres", "env:WIZARD_TEST_DSN"), "Choose a connection source")
 }
 
 func TestInitConnectionFailureRetryAndEdit(t *testing.T) {
@@ -278,6 +280,8 @@ func TestInitConnectionFailureRetryAndEdit(t *testing.T) {
 	require.True(t, m.checkingConnection)
 	m.Update(initConnectionMsg{generation: m.generation})
 	require.True(t, m.connectionChecked)
+	wizardKey(m, tea.KeyShiftTab)
+	m.connectionEditor.mode = "reference"
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("X")})
 	require.False(t, m.connectionChecked)
 }

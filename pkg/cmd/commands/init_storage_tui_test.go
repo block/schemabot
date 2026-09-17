@@ -23,7 +23,7 @@ func TestInitStorageChoices(t *testing.T) {
 			require.Contains(t, m.contentView(), "Separate server")
 			wizardKey(m, tea.KeyEnter)
 			require.False(t, m.choosingStorage)
-			require.Contains(t, m.contentView(), "env:SCHEMABOT_STORAGE_DSN")
+			require.Contains(t, m.contentView(), "Paste a connection string")
 			m.loadField()
 			wizardKey(m, tea.KeyUp)
 			wizardKey(m, tea.KeyEnter)
