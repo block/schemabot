@@ -184,6 +184,15 @@ type ApplyStatusCommentData struct {
 	// section headed by one member's name, carrying a command that stops all of
 	// them, otherwise reads as an instruction to stop that one.
 	RolloutMember string
+
+	// PlanID names the plan this member is running, alongside the database and
+	// the apply identifier. It is set only when the members of one apply do not
+	// all run the same work, which is the only case where naming it tells the
+	// reader anything: it ties a running member back to the block it came from
+	// among the several the review showed. A rollout the review showed as one
+	// block names no plan, whether its members share a plan row or were each
+	// planned into their own and came out running the same change.
+	PlanID string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -326,19 +335,31 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 }
 
-// writeApplyMetadata writes the database, apply ID, and requester info.
+// writeApplyMetadata writes the database, apply ID, plan, and requester info.
 func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
+	parts = appendPlanMetadata(parts, data.PlanID)
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	attributionAt := renderedAt
 	if data.RequestedBy == "" {
 		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
 	}
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+}
+
+// appendPlanMetadata adds the plan the member is running to a metadata line,
+// beside the database and apply identifiers it belongs with. An unset plan adds
+// nothing: every apply runs some plan, so the field is set only where naming it
+// distinguishes this member from its siblings.
+func appendPlanMetadata(parts []string, planID string) []string {
+	if planID == "" {
+		return parts
+	}
+	return append(parts, fmt.Sprintf("**Plan**: `%s`", planID))
 }
 
 func startedAtDisplay(startedAt, fallback string) string {
@@ -1551,12 +1572,13 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 }
 
 func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	// Combine database, apply ID, and duration on one metadata line.
+	// Combine database, apply ID, plan, and duration on one metadata line.
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
+	parts = appendPlanMetadata(parts, data.PlanID)
 	if d := durationDisplay(data.StartedAt, data.CompletedAt); d != "" {
 		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
 	}

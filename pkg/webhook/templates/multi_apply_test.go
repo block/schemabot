@@ -751,3 +751,70 @@ func TestRenderApplyStatusComment_NoRolloutScopeLine(t *testing.T) {
 	assert.Contains(t, out, "To stop this schema change:")
 	assert.NotContains(t, out, "applies to every target in this rollout")
 }
+
+// When the round produced more than one plan, each member's section names the
+// one it runs, beside the database and apply identifiers it already carries, so
+// a running member can be tied back to the block that was reviewed.
+func TestRenderMultiDeploymentApplyComment_MemberSectionNamesItsPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Running, PlanID: "plan_reviewed"},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Pending, PlanID: "plan_3344"},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders` | **Apply ID**: `apply-7f3a` | **Plan**: `plan_reviewed`")
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Apply ID**: `apply-7f3a` | **Plan**: `plan_3344`")
+}
+
+// A rollout whose members all run the same plan names none of them: the
+// identifier would be identical under every member and name nothing.
+func TestRenderMultiDeploymentApplyComment_ConvergedRolloutNamesNoPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Running},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders` | **Apply ID**: `apply-7f3a`\n")
+	assert.NotContains(t, out, "**Plan**:")
+}
+
+// The terminal summary names it too, wherever that summary shows identifiers at
+// all: which plan a failed member ran is the first thing triage needs, and it is
+// the record that ties the outcome back to a reviewed block. A completed member
+// keeps its deliberately bare metadata line.
+func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Completed),
+		rollingOp("eu-west", so.Failed),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Completed, PlanID: "plan_reviewed"},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Failed, PlanID: "plan_3344"},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Apply ID**: `apply-7f3a` | **Plan**: `plan_3344`")
+	assert.Contains(t, out, "**Database**: `orders`\n", "a completed member keeps its bare metadata line")
+	assert.NotContains(t, out, "**Plan**: `plan_reviewed`")
+}
