@@ -511,6 +511,89 @@ func PreviewCommentPlanDriftDetected() string {
 	})
 }
 
+// previewTargetPlan is one target group's plan in the target-fleet previews.
+func previewTargetPlan(statements ...string) []KeyspaceChangeData {
+	return []KeyspaceChangeData{{Keyspace: "testapp", Statements: statements}}
+}
+
+// PreviewCommentPlanTargetsConverging renders a plan comment for an environment
+// whose targets each hold their own schema, where some already have the reviewed
+// change and the rest still need it — the shape a fleet rolling out over several
+// PRs actually has.
+func PreviewCommentPlanTargetsConverging() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      previewTargetPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed:    true,
+			Clean:       true,
+			Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+				{Deployment: "primary", Target: "testapp_3", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{
+					Members: []string{"primary/testapp_1", "primary/testapp_3"},
+					Primary: true,
+					Changes: previewTargetPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+				},
+				{Members: []string{"primary/testapp_2"}},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanTargetsDiverging renders a plan comment for an environment
+// whose targets would run different changes from each other. Under a targets
+// list that is the contract rather than drift, so it renders on the success
+// glyph, and every target's plan is on the comment the apply is authorized from.
+func PreviewCommentPlanTargetsDiverging() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      previewTargetPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed:    true,
+			Clean:       true,
+			Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+				{Deployment: "primary", Target: "testapp_3", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{
+					Members: []string{"primary/testapp_1", "primary/testapp_2"},
+					Primary: true,
+					Changes: previewTargetPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+				},
+				{
+					Members: []string{"primary/testapp_3"},
+					Changes: previewTargetPlan(
+						"ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+						"ALTER TABLE `users` ADD INDEX `idx_email`(`email`)",
+					),
+				},
+			},
+		},
+	})
+}
+
 // PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
 // drift rollup could not be computed, so the plan check fails closed.
 func PreviewCommentPlanDriftUnverified() string {

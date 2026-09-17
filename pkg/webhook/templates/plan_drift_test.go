@@ -457,6 +457,136 @@ func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
 	assert.Contains(t, out, "`` us` ## Injected ``")
 }
 
+// renderGroupedPlan renders a plan comment for an independent rollout whose
+// members run the given groups. reviewed is the primary's own plan, which is the
+// one the comment would render on its own if the members did not disagree.
+func renderGroupedPlan(reviewed []KeyspaceChangeData, plans []DeploymentPlanGroup) string {
+	var members []DeploymentDriftEntry
+	for _, g := range plans {
+		for range g.Members {
+			members = append(members, DeploymentDriftEntry{Deployment: "primary", Class: "planned"})
+		}
+	}
+	members[0].Primary = true
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "production", DatabaseType: "mysql", IsMySQL: true,
+		Changes: reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: members,
+			Plans:       plans,
+		},
+	})
+}
+
+// A rollout whose targets all run the reviewed plan is described by the reviewed
+// plan itself. Attributing the one block to a member list would only repeat the
+// line above it, so the comment renders exactly as it does without a rollout.
+func TestRenderPlanComment_OnePlanRendersAsTheReviewedPlan(t *testing.T) {
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: []string{"primary/a", "primary/b"}, Primary: true, Changes: planGroupChanges(1)},
+	})
+
+	assert.Contains(t, out, "ALTER TABLE `t0` ADD COLUMN `c` int")
+	assert.NotContains(t, out, "<details open>")
+	assert.NotContains(t, out, "Applying runs each target's own plan")
+	// The reviewed plan's own summary, not the rollout's.
+	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
+}
+
+// Targets that are free to differ usually do, so each distinct plan is rendered
+// under the members that would run it. The reviewed plan is the one an operator
+// has already read, so its block is the one left open.
+func TestRenderPlanComment_DistinctPlansRenderUnderTheirMembers(t *testing.T) {
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: []string{"primary/a", "primary/b"}, Primary: true, Changes: planGroupChanges(1)},
+		{Members: []string{"eu/c"}, Changes: planGroupChanges(2)},
+	})
+
+	assert.Contains(t, out, "<details open>\n<summary><b>`primary/a` (primary), `primary/b` — 1 DDL statement</b></summary>")
+	assert.Contains(t, out, "<details>\n<summary><b>`eu/c` — 2 DDL statements</b></summary>")
+	// Every group's DDL is on the comment, not the reviewed one's alone.
+	assert.Contains(t, out, "ALTER TABLE `t1` ADD COLUMN `c` int")
+	assert.Contains(t, out, "⚠️ Applying runs each target's own plan, including the ones collapsed above.")
+	assert.Contains(t, out, "📋 **Plan**: 2 distinct plans on 3 targets")
+}
+
+// A target already holding the desired schema has no plan to collapse, so it is
+// named rather than hidden: a converging fleet is what the operator is watching
+// for, and the remaining group's plan stays open.
+func TestRenderPlanComment_ConvergedGroupIsNamedNotCollapsed(t *testing.T) {
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: []string{"primary/a"}, Primary: true, Changes: planGroupChanges(1)},
+		{Members: []string{"primary/b", "eu/c"}, Changes: nil},
+	})
+
+	assert.Contains(t, out, "**`primary/a` (primary)** — 1 DDL statement")
+	assert.Contains(t, out, "**`primary/b`, `eu/c`** — already at this schema, nothing to apply.")
+	assert.NotContains(t, out, "<details open>")
+	assert.NotContains(t, out, "Applying runs each target's own plan")
+	assert.Contains(t, out, "📋 **Plan**: 1 DDL statement on 1 of 3 targets")
+}
+
+// The reviewed plan is the primary's, so a primary that is already at the
+// desired schema says nothing about its siblings. The comment reports the work
+// the apply would do on them rather than reporting the round as a no-op.
+func TestRenderPlanComment_ConvergedPrimaryStillShowsSiblingWork(t *testing.T) {
+	out := renderGroupedPlan(nil, []DeploymentPlanGroup{
+		{Members: []string{"primary/a"}, Primary: true, Changes: nil},
+		{Members: []string{"eu/c"}, Changes: planGroupChanges(2)},
+	})
+
+	assert.NotContains(t, out, "No schema changes detected")
+	assert.Contains(t, out, "**`primary/a` (primary)** — already at this schema, nothing to apply.")
+	assert.Contains(t, out, "ALTER TABLE `t1` ADD COLUMN `c` int")
+	assert.Contains(t, out, "📋 **Plan**: 2 DDL statements on 1 of 2 targets")
+}
+
+// The summary line stands in for the reviewed plan's own, so it counts the
+// rollout: how much of the fleet still needs the one plan, or how many plans
+// there are when the targets disagree.
+func TestRenderPlanComment_PlanSummaryCountsTheRollout(t *testing.T) {
+	cases := []struct {
+		name   string
+		plans  []DeploymentPlanGroup
+		expect string
+	}{
+		{
+			name: "part of the fleet is already there",
+			plans: []DeploymentPlanGroup{
+				{Members: []string{"a", "b"}, Primary: true, Changes: planGroupChanges(1)},
+				{Members: []string{"c"}, Changes: nil},
+			},
+			expect: "📋 **Plan**: 1 DDL statement on 2 of 3 targets",
+		},
+		{
+			name: "the targets disagree",
+			plans: []DeploymentPlanGroup{
+				{Members: []string{"a"}, Primary: true, Changes: planGroupChanges(1)},
+				{Members: []string{"b"}, Changes: planGroupChanges(3)},
+				{Members: []string{"c"}, Changes: nil},
+			},
+			expect: "📋 **Plan**: 2 distinct plans on 3 targets",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Contains(t, renderGroupedPlan(planGroupChanges(1), tc.plans), tc.expect)
+		})
+	}
+}
+
+// A vschema rewrite carries no DDL and is still work, so a group's label counts
+// it alongside statements rather than describing the plan by its DDL alone.
+func TestPlanGroupWorkLabel(t *testing.T) {
+	assert.Equal(t, "1 DDL statement", planGroupWorkLabel(1, 0))
+	assert.Equal(t, "2 DDL statements", planGroupWorkLabel(2, 0))
+	assert.Equal(t, "1 vschema update", planGroupWorkLabel(0, 1))
+	assert.Equal(t, "2 vschema updates", planGroupWorkLabel(0, 2))
+	assert.Equal(t, "2 DDL statements and 1 vschema update", planGroupWorkLabel(2, 1))
+}
+
 // planGroupChanges builds a group plan running the given number of statements.
 // A group running none is already at the desired schema.
 func planGroupChanges(statements int) []KeyspaceChangeData {
