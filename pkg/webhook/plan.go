@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -141,7 +142,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Roll up every deployment's diff against the reviewed plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint())
@@ -438,7 +439,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the reviewed plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -757,15 +758,6 @@ const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: 
 // is re-running apply-confirm without the flag, not restarting from apply.
 // The format verb takes the environment for the coached command.
 const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `schemabot apply-confirm -e %s` without the flag."
-
-// msgCopyDiscardDowngrade explains why an apply that would throw away an
-// unfinished copy stopped for confirmation. It states the cause only: the
-// comment already renders the confirm command copy-pasteably on the next line,
-// and the section above already says what is destroyed. It deliberately does
-// not name the flag that skips the stop — the point of stopping is that the
-// operator reads the disclosure first, so the bypass does not belong next to
-// it.
-const msgCopyDiscardDowngrade = "Applying destroys work in progress on the target"
 
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together

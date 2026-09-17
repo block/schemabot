@@ -155,6 +155,28 @@ func TestClassifyRefusal(t *testing.T) {
 			wantDetail: []string{`the CREATE TABLE for "users" committed but the table does not own a name the schema file claims`, createNameMismatchRemedy},
 		},
 		{
+			name:       "create owner mismatch leaves the committed table untouched",
+			err:        &executor.CreateOwnerMismatchError{Expected: "app_owner", Actual: "engine"},
+			wantReason: "create-owner-mismatch",
+			wantDetail: []string{`the CREATE TABLE for "users" committed with owner "engine" instead of "app_owner"`, "nothing was repaired"},
+		},
+		{
+			name:       "unverified create owner leaves the committed table untouched",
+			err:        fmt.Errorf("read owner: %w", executor.ErrCreateOwnerUnverified),
+			wantReason: "create-owner-unverified",
+			wantDetail: []string{`the CREATE TABLE for "users" committed`, "owner could not be read back", "nothing was repaired"},
+		},
+		{
+			name:       "a configured owner the target has no role for blocks the create before anything runs",
+			err:        fmt.Errorf("verify creation access: %w: create owner role \"app_ownr\" does not exist", preflight.ErrCreateOwnerNotFound),
+			wantReason: "insufficient-privileges",
+			wantDetail: []string{
+				`the configured table owner for "users" is not a role on the target`,
+				"create the role or correct the target's table_owner, then re-plan",
+			},
+			wantNotDetail: []string{"GRANT", "engine role lacks access"},
+		},
+		{
 			name: "unverified create names refuse because a retry collides with the committed table",
 			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
 				Step: 1, Total: 2, Err: fmt.Errorf("%w: %w", executor.ErrCreateNamesUnverified, context.Canceled),
@@ -740,6 +762,62 @@ func TestRefusalForOutcomeBareMismatchCodeMatchesTheTypedVerdict(t *testing.T) {
 	assert.Equal(t, fromTyped.reason, fromCode.reason)
 	assert.Equal(t, fromTyped.remedy, fromCode.remedy)
 	assert.Equal(t, `the CREATE TABLE for "users" committed but the table does not own a name the schema file claims`, fromCode.cause)
+}
+
+// The bare owner codes are pinned to the verdicts their sentinel and typed
+// error produce, the same way the name codes are: refusalForCause decides
+// on the error first, so the arms exist to keep the switch total, and a
+// bare code must not drift to a different disposition than the error that
+// carries it.
+func TestRefusalForOutcomeBareOwnerCodesMatchTheirErrorVerdicts(t *testing.T) {
+	t.Run("unverified", func(t *testing.T) {
+		fromCode, known := refusalForOutcome(executor.CodeCreateOwnerUnverified, "users")
+		fromSentinel := classifyRefusal(fmt.Errorf("execute: %w", executor.ErrCreateOwnerUnverified), "users")
+
+		require.True(t, known)
+		require.NotNil(t, fromCode)
+		require.NotNil(t, fromSentinel)
+		assert.Equal(t, "create-owner-unverified", fromCode.reason)
+		assert.Equal(t, fromSentinel.reason, fromCode.reason)
+		assert.Equal(t, fromSentinel.cause, fromCode.cause)
+		assert.Equal(t, fromSentinel.remedy, fromCode.remedy)
+	})
+	t.Run("mismatch", func(t *testing.T) {
+		fromCode, known := refusalForOutcome(executor.CodeCreateOwnerMismatch, "users")
+		fromTyped := classifyRefusal(fmt.Errorf("execute: %w", &executor.CreateOwnerMismatchError{
+			Expected: "app_owner", Actual: "engine",
+		}), "users")
+
+		require.True(t, known)
+		require.NotNil(t, fromCode)
+		require.NotNil(t, fromTyped)
+		assert.Equal(t, "create-owner-mismatch", fromCode.reason)
+		assert.Equal(t, fromTyped.reason, fromCode.reason)
+		assert.Equal(t, fromTyped.remedy, fromCode.remedy)
+		assert.Equal(t, `the CREATE TABLE for "users" committed under a role other than the configured owner`, fromCode.cause)
+		assert.Equal(t, `the CREATE TABLE for "users" committed with owner "engine" instead of "app_owner"`, fromTyped.cause)
+	})
+}
+
+// The accepted-blocking outcomes are neither statement-shape refusals nor
+// plain operational failures: an invalid budget is engine configuration,
+// which no schema file edit changes, and an unknown commit outcome is the
+// one case a blind retry can turn into a duplicate effect. Each carries a
+// remedy that names the thing the operator actually has to look at.
+func TestAcceptedBlockingOutcomesCarryTheirOwnRemedies(t *testing.T) {
+	budget, known := refusalForOutcome(executor.CodeInvalidBlockingBudget, "users")
+	require.True(t, known)
+	require.NotNil(t, budget)
+	assert.Equal(t, "invalid-blocking-budget", budget.reason)
+	assert.Contains(t, budget.remedy, "blocking budget configuration")
+	assert.NotContains(t, budget.remedy, "rewrite the schema change")
+
+	unknown, known := refusalForOutcome(executor.CodeBlockingOutcomeUnknown, "users")
+	require.True(t, known)
+	require.NotNil(t, unknown, "an unknown commit outcome must not fall into the retryable tail")
+	assert.Equal(t, "blocking-outcome-unknown", unknown.reason)
+	assert.Contains(t, unknown.cause, `whether the blocking statement for "users" committed is unknown`)
+	assert.Contains(t, unknown.remedy, "inspect the target catalog before re-running")
 }
 
 // The unverified cause carries only the table name, so like the collision
@@ -2072,6 +2150,15 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// SchemaBot's retry re-runs the whole plan rather than the read
 		// alone, so every retry collides with the table this apply created.
 		executor.CodeCreateNamesUnverified: "a retry re-runs the committed CREATE TABLE",
+		// Same shape as the names: the owner read failed after the CREATE
+		// TABLE committed, and the retry cannot repeat only the read.
+		executor.CodeCreateOwnerUnverified: "a retry re-runs the committed CREATE TABLE",
+		// The engine could not learn whether the blocking statement's commit
+		// landed and leaves the retry decision to its adapter. SchemaBot's
+		// retry re-runs the identical statement, which replays a committed
+		// DDL onto its own result, so the apply waits for an operator to
+		// read the catalog instead.
+		executor.CodeBlockingOutcomeUnknown: "a retry replays a statement that may have committed",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
@@ -3115,6 +3202,40 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
 
+// TestValidateOptimisticApplyRefusesSchemaRouteDrift pins that an apply is
+// refused before any work is queued when the planned DDL names one schema and
+// the request addresses another: the request's schema is what preflight
+// proves, and the statement's qualification is what executes, so the two must
+// agree. An unqualified statement makes no such claim and is accepted.
+func TestValidateOptimisticApplyRefusesSchemaRouteDrift(t *testing.T) {
+	request := func(ddl string) *engine.ApplyRequest {
+		return &engine.ApplyRequest{
+			Database: "app",
+			Changes: []engine.SchemaChange{{Namespace: "svc_qa", TableChanges: []engine.TableChange{{
+				Table: "users",
+				DDL:   ddl,
+			}}}},
+			Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+		}
+	}
+
+	_, err := validateOptimisticApply(request("ALTER TABLE svc.users ADD COLUMN email text"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `planned statement 1 names schema "svc" but the apply targets schema "svc_qa"`)
+
+	_, err = validateOptimisticApply(request("CREATE TABLE svc.users (id bigint PRIMARY KEY);\nCREATE UNIQUE INDEX users_id_key ON svc.users (id)"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `planned statement 1 names schema "svc" but the apply targets schema "svc_qa"`, "a create set is checked statement by statement")
+
+	change, err := validateOptimisticApply(request("ALTER TABLE svc_qa.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	assert.Equal(t, "svc_qa", change.namespace)
+
+	change, err = validateOptimisticApply(request("ALTER TABLE users ADD COLUMN email text"))
+	require.NoError(t, err)
+	assert.Equal(t, "svc_qa", change.namespace)
+}
+
 func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	req := &engine.ApplyRequest{
 		Database: "app",
@@ -3196,7 +3317,7 @@ func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
 		caCertPath: filepath.Join(t.TempDir(), "missing.pem"),
 	}
 
-	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes, newTestTracker(t), slog.Default())
+	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes, newTestTracker(t), slog.Default(), "")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "open pg-sprite apply pool")

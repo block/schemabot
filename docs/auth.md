@@ -638,7 +638,7 @@ permission levels, called **tiers** in configuration and logs:
 | Access | Operations |
 |---|---|
 | Read | List databases, pull live schemas, view stored plans, status, progress, logs, history, and locks |
-| Write | Create plans, apply changes, stop or resume work, cut over, cancel, revert, skip revert, roll back, acquire or release locks, change settings, and run check or webhook maintenance |
+| Write | Create plans, apply changes, stop or resume work, cut over, cancel, revert, skip revert, roll back, acquire or release locks, change settings, run check or webhook maintenance, and inspect or converge SchemaBot's own storage schema |
 
 Creating a plan requires write access because it stages a change. Reading a
 plan that already exists requires only read access.
@@ -649,6 +649,12 @@ to writes under `forward_auth`.
 
 In the route rules, `GET` and `HEAD` requests are reads, as is `POST /api/pull`.
 Other requests require write access by default.
+
+`POST /api/storage/schema/plan` reads without changing anything, and still
+requires write access under that default. It reports the internal shape of
+SchemaBot's own bookkeeping database, and its sibling route converges that
+database, so both belong to the people who operate the server rather than to
+everyone who can see the schema changes it runs.
 
 <a id="per-database-operator-scoping"></a>
 
@@ -751,8 +757,10 @@ before allowing the request to continue. See
 and how the check works.
 
 Some operations always need an admin: changing settings, maintaining checks,
-redriving webhooks, and forcing a lock release. A database operator grant does
-not permit those operations.
+redriving webhooks, forcing a lock release, and reading or converging
+SchemaBot's own storage schema. A database operator grant does not permit those
+operations. An operator grant covers a team's own database; SchemaBot's storage
+database is not any team's, so nothing scopes to it.
 
 <a id="verify-a-request"></a>
 

@@ -3,17 +3,23 @@ package serve
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -28,9 +34,11 @@ type stubTernClient struct{ tern.Client }
 // Run own the listener.
 func TestServerRegisterGRPCRegistersTernService(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{}
 	srv := &Server{
+		cfg:             cfg,
 		dataPlaneClient: stubTernClient{},
-		svc:             api.New(mysqlstore.New(nil), &api.ServerConfig{}, nil, logger),
+		svc:             api.New(mysqlstore.New(nil), cfg, nil, logger),
 		logger:          logger,
 	}
 
@@ -317,4 +325,87 @@ func TestForwardAuthOperatorScopingThroughServerHandler(t *testing.T) {
 		handler.ServeHTTP(rec, operatorRequest(t, http.MethodGet, "/api/databases", ""))
 		assert.Equal(t, http.StatusOK, rec.Code)
 	})
+}
+
+// staticStorageSchemaService stands in for the adapter bound to an instance's
+// own storage, answering with a report no other source could have produced.
+type staticStorageSchemaService struct{ database string }
+
+func (s staticStorageSchemaService) StorageSchemaPlan(context.Context, *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
+	return &ternv1.StorageSchemaPlanResponse{Report: &ternv1.StorageSchemaReport{Database: s.database}}, nil
+}
+
+func (s staticStorageSchemaService) StorageSchemaApply(context.Context, *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
+	return &ternv1.StorageSchemaApplyResponse{
+		Planned:   &ternv1.StorageSchemaReport{Database: s.database},
+		Remaining: &ternv1.StorageSchemaReport{Database: s.database},
+	}, nil
+}
+
+// The gRPC endpoint answers for this instance's own storage only when
+// RegisterGRPC hands the adapter to the Tern server. Registering the service
+// and then dropping the option leaves a data plane that is reachable, healthy,
+// and refuses every storage schema request as Unimplemented — which a caller
+// reads as a release too old to serve them, and an operator chases as a version
+// skew that does not exist. So the RPC is driven over a real connection, and
+// both wirings are checked: with an adapter the instance's own report comes
+// back, and without one the refusal is the Unimplemented that means what it
+// says.
+func TestServerRegisterGRPCThreadsStorageSchemaService(t *testing.T) {
+	const database = "schemabot_storage_fixture"
+	for _, tc := range []struct {
+		name          string
+		storageSchema tern.StorageSchemaService
+		wantCode      codes.Code
+	}{
+		{name: "adapter registered", storageSchema: staticStorageSchemaService{database: database}, wantCode: codes.OK},
+		{name: "no adapter", wantCode: codes.Unimplemented},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := slog.New(slog.DiscardHandler)
+			cfg := &api.ServerConfig{}
+			srv := &Server{
+				cfg:             cfg,
+				dataPlaneClient: stubTernClient{},
+				svc:             api.New(mysqlstore.New(nil), cfg, nil, logger),
+				logger:          logger,
+				storageSchema:   tc.storageSchema,
+			}
+
+			client := dialRegisteredTernServer(t, srv)
+			resp, err := client.StorageSchemaPlan(t.Context(), &ternv1.StorageSchemaPlanRequest{})
+
+			require.Equal(t, tc.wantCode, status.Code(err), "unexpected gRPC code (error: %v)", err)
+			if tc.wantCode != codes.OK {
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, database, resp.GetReport().GetDatabase(),
+				"the plan must come from the adapter bound to this instance's storage")
+		})
+	}
+}
+
+// dialRegisteredTernServer serves srv's own RegisterGRPC registration on a
+// loopback listener and returns a client for it, so what is exercised is the
+// registration an embedder gets rather than a hand-built server.
+func dialRegisteredTernServer(t *testing.T, srv *Server) ternv1.TernClient {
+	t.Helper()
+
+	gs := grpc.NewServer()
+	require.NoError(t, srv.RegisterGRPC(t.Context(), gs))
+
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		utils.CloseAndLog(conn)
+		gs.Stop()
+	})
+	return ternv1.NewTernClient(conn)
 }

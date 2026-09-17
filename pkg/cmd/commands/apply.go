@@ -182,7 +182,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Show unsafe warning if --allow-unsafe was used
 	if cmd.AllowUnsafe {
-		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges())
+		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges(), templates.UnsafeConsentAllowFlag)
 	}
 
 	// Show options if any flags are set
@@ -396,7 +396,7 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 
 	// Then show the unsafe changes warning
 	unsafeChanges := planResult.UnsafeChanges()
-	templates.WriteUnsafeChangesBlocked(unsafeChanges, database, environment, schemaDir)
+	templates.WriteUnsafeChangesBlocked(unsafeChanges, fmt.Sprintf("apply -s %s -e %s --allow-unsafe", schemaDir, environment))
 	return ErrSilent
 }
 

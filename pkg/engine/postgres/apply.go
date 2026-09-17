@@ -210,6 +210,9 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
+	if err := plannedSchemaMatchesTarget(statements, req.Changes[0].Namespace); err != nil {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
+	}
 	concurrentIndex := false
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
@@ -221,6 +224,25 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		}
 	}
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex}, nil
+}
+
+// plannedSchemaMatchesTarget refuses an apply whose planned DDL names a
+// different schema than the one the request addresses. The plan qualified
+// every statement with the schema it was made against and the apply preflights
+// the request's namespace, so the two agree unless the route to the physical
+// schema changed after planning; executing then would preflight one schema and
+// alter another. An unqualified statement carries no claim to check.
+func plannedSchemaMatchesTarget(statements []string, namespace string) error {
+	for i, sql := range statements {
+		statement, err := pgstatement.ParseOne(sql)
+		if err != nil {
+			return fmt.Errorf("parse planned statement %d: %w", i+1, err)
+		}
+		if planned := statement.Schema(); planned != "" && planned != namespace {
+			return fmt.Errorf("planned statement %d names schema %q but the apply targets schema %q; the target's schema route changed after planning, so plan again", i+1, planned, namespace)
+		}
+	}
+	return nil
 }
 
 // postgresCreateSetStatements parses one statement or a greenfield create set
@@ -266,7 +288,9 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 	execute := e.execute
 	if execute == nil {
-		execute = executeOptimistic
+		execute = func(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error {
+			return executeOptimistic(ctx, conn, change, tableSizeLimit, tracker, logger, e.tableOwner)
+		}
 	}
 	err := execute(ctx, conn, change, e.tableSizeLimit, tracker, logger)
 	if err == nil {
@@ -625,6 +649,9 @@ func refusalForCause(err error, table string) *refusal {
 	if errors.Is(err, executor.ErrCreateNamesUnverified) {
 		return createNamesUnverifiedRefusal(table)
 	}
+	if errors.Is(err, executor.ErrCreateOwnerUnverified) {
+		return createOwnerUnverifiedRefusal(table)
+	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
 		return tableNotFoundRefusal(table)
 	}
@@ -638,6 +665,18 @@ func refusalForCause(err error, table string) *refusal {
 	var mismatchErr *executor.CreateNameMismatchError
 	if errors.As(err, &mismatchErr) {
 		return createNameMismatchRefusal(createNameMismatchCause(table, mismatchErr, sequenceStepClause(err)))
+	}
+	var ownerMismatchErr *executor.CreateOwnerMismatchError
+	if errors.As(err, &ownerMismatchErr) {
+		return createOwnerMismatchRefusal(table, ownerMismatchErr)
+	}
+	if errors.Is(err, preflight.ErrCreateOwnerNotFound) {
+		// The owner is target configuration and the server has no such
+		// role: the same environmental class as a missing grant, decided
+		// before anything runs, but with no grantee for a GRANT to name.
+		return &refusal{reason: "insufficient-privileges",
+			cause:  fmt.Sprintf("the configured table owner for %s is not a role on the target", quotedTable(table)),
+			remedy: "create the role or correct the target's table_owner, then re-plan"}
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
@@ -672,6 +711,17 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// decides the verdict before control reaches here; this arm keeps
 		// the switch total and gives the bare code the same verdict.
 		return createNamesUnverifiedRefusal(table), true
+	case executor.CodeCreateOwnerMismatch:
+		// Like the name mismatch, the code is only ever carried by the typed
+		// error naming both roles, which refusalForCause decides on first;
+		// this arm gives the bare code the same verdict with a cause that
+		// knows only that the owner differs.
+		return createOwnerMismatchRefusal(table, nil), true
+	case executor.CodeCreateOwnerUnverified:
+		// The sentinel is present whenever this code is, so refusalForCause
+		// decides the verdict before control reaches here; this arm keeps
+		// the switch total and gives the bare code the same verdict.
+		return createOwnerUnverifiedRefusal(table), true
 	case executor.CodeDuplicateCreateName:
 		// The cause says only what the set did; the remedy names the
 		// relation kinds that can repeat a name — a CREATE INDEX name that
@@ -696,12 +746,30 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return tableNotFoundRefusal(table), true
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
-		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable:
+		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
+		executor.CodeUnsupportedAcceptedBlocking:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the planned statement for %s is not a shape the native-safe path can run", quotedTable(table)),
 			remedy: "rewrite the schema change and re-plan"}, true
+	case executor.CodeInvalidBlockingBudget:
+		// The bound is the engine's configuration, not the statement's
+		// form: no edit to a schema file changes it, so the remedy points
+		// at the budget instead of at the schema change.
+		return &refusal{reason: "invalid-blocking-budget",
+			cause:  fmt.Sprintf("the blocking budget for the change to %s is not a bound the engine can enforce", quotedTable(table)),
+			remedy: "correct the engine's blocking budget configuration, then re-run"}, true
+	case executor.CodeBlockingOutcomeUnknown:
+		// The statement's commit was sent and its answer never arrived, so
+		// whether the change landed is open. The engine leaves the retry
+		// decision to its adapter; SchemaBot's retry re-runs the identical
+		// statement, which replays a committed blocking DDL onto its own
+		// result, so the apply fails closed until an operator has read the
+		// catalog.
+		return &refusal{reason: "blocking-outcome-unknown",
+			cause:  fmt.Sprintf("whether the blocking statement for %s committed is unknown", quotedTable(table)),
+			remedy: "inspect the target catalog before re-running"}, true
 	case executor.CodeBudgetStatementExceeded:
 		// Normally consumed upstream by the typed BudgetError arm, which
 		// renders the budget's own figures; this mapping keeps the outcome
@@ -741,9 +809,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
 		// recovers or an operator clears or waits out, or a failure outside
-		// the typed set.
-		// A retry can succeed once conditions change, so none is a permanent
-		// refusal.
+		// the typed set. A retry can succeed once conditions change, so
+		// none is a permanent refusal.
 		return nil, true
 	}
 	return nil, false
@@ -992,6 +1059,36 @@ func createNamesUnverifiedRefusal(table string) *refusal {
 	}
 }
 
+// createOwnerMismatchRefusal names both roles when the typed error carries
+// them; a nil mismatch is the bare code, which knows only that the owner
+// differs. Either way the table stands as committed: the executor never
+// repairs ownership, so the operator inspects or drops it before a re-plan.
+func createOwnerMismatchRefusal(table string, mismatch *executor.CreateOwnerMismatchError) *refusal {
+	cause := fmt.Sprintf("the CREATE TABLE for %s committed under a role other than the configured owner", quotedTable(table))
+	if mismatch != nil {
+		cause = fmt.Sprintf("the CREATE TABLE for %s committed with owner %s instead of %s",
+			quotedTable(table), strconv.Quote(mismatch.Actual), strconv.Quote(mismatch.Expected))
+	}
+	return &refusal{
+		reason: "create-owner-mismatch",
+		cause:  cause,
+		remedy: "nothing was repaired; inspect or drop the table, then " + replanRemedy,
+	}
+}
+
+// createOwnerUnverifiedRefusal is decided by the wrap, not by the cause it
+// carries, for the same reason as createNamesUnverifiedRefusal: pg-sprite
+// leaves the outcome retryable because the owner read could be repeated on
+// its own, but SchemaBot's retry re-runs the identical plan, whose CREATE
+// TABLE has already committed.
+func createOwnerUnverifiedRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-owner-unverified",
+		cause:  fmt.Sprintf("the CREATE TABLE for %s committed but its owner could not be read back", quotedTable(table)),
+		remedy: "nothing was repaired; inspect or drop the table, then " + replanRemedy,
+	}
+}
+
 func tableNotFoundRefusal(table string) *refusal {
 	return &refusal{
 		reason: "table-not-found",
@@ -1003,7 +1100,7 @@ func tableNotFoundRefusal(table string) *refusal {
 // executeOptimistic runs the planned change through pg-sprite's executors,
 // each feeding the tracker so a concurrent Progress poll reads the step and
 // statement in flight.
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error {
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger, tableOwner string) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -1026,7 +1123,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// The off-ladder create tier has its own preflight sequence: the
 		// ladder checks below state facts about an existing table, and a
 		// greenfield target has none.
-		return executeCreate(ctx, pool, change, statements, tracker)
+		return executeCreate(ctx, pool, change, statements, tracker, tableOwner)
 	}
 	if len(statements) != 1 {
 		return fmt.Errorf("execute PostgreSQL table %q: privilege tier %s requires exactly one statement, got %d", change.table, tier, len(statements))
@@ -1104,7 +1201,7 @@ func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
 // nothing about apply time. The table size gate deliberately does not run:
 // it bounds rewrites of existing data, and a table that does not exist yet
 // has none.
-func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string, tracker *progress.Tracker) error {
+func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string, tracker *progress.Tracker, tableOwner string) error {
 	// The planned statements arrive schema-qualified; the desired-schema
 	// contract wants the unqualified form and the executor pins the schema
 	// from the absence proof instead.
@@ -1120,7 +1217,7 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 	if err != nil {
 		return fmt.Errorf("parse planned CREATE TABLE for table %q: %w", change.table, err)
 	}
-	role, err := preflight.CheckCreatePrivileges(ctx, pool, change.namespace)
+	role, err := preflight.CheckCreatePrivilegesAs(ctx, pool, change.namespace, tableOwner)
 	if err != nil {
 		return fmt.Errorf("check creation access in PostgreSQL schema %q: %w", change.namespace, err)
 	}

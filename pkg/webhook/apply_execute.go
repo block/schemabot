@@ -1,15 +1,19 @@
 package webhook
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -142,7 +146,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			"Schema changes differ from auto-plan — review and confirm manually"); err != nil {
+			planDriftCause(planResp, storedPlan)); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -157,8 +161,10 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		// The direct-execution disclosure is already on this comment, naming
+		// the statements and what running them costs.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			"Plan contains direct-execution changes — review the disclosure and confirm manually"); err != nil {
+			nil); err != nil {
 			h.logger.Error("failed to post the direct-execution downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -186,7 +192,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			msgCopyDiscardDowngrade); err != nil {
+			nil); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -380,7 +386,8 @@ func applyExecutionErrorMessage(err error) string {
 func (h *Handler) postAutoConfirmDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
-	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
+	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
+	cause *templates.PausedApplyCauseData,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
@@ -389,10 +396,8 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeferCutover = result.DeferCutover
 	commentData.SkipRevert = result.SkipRevert
-	commentData.AutoConfirmDowngradeReason = reason
-	// An operator who ran apply-confirm themselves paused nothing automatic, so
-	// the comment names what actually stopped: their own apply.
-	commentData.StoppedConfirmedApply = result.Action == action.ApplyConfirm
+	commentData.PendingManualConfirmation = true
+	commentData.PausedApplyCause = cause
 	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
@@ -471,6 +476,125 @@ type planChangeIdentity struct {
 	table     string
 	operation string
 	ddl       string
+}
+
+// planDriftEntryCap bounds the drift disclosure. A re-plan that differs in
+// dozens of changes has already told the reader what they need — the plan they
+// are looking at is not the one the apply started from — and listing every one
+// buries the statements above it.
+const planDriftEntryCap = 8
+
+// planDriftChange is one table's change without the DDL that realizes it. Drift
+// is reported at this granularity because an entry names the table and the
+// operation, so two identities that differ only in DDL are one line to the
+// reader, not two.
+type planDriftChange struct {
+	namespace string
+	table     string
+	operation string
+}
+
+// planDriftStatements groups a plan's change identities by the table change
+// they realize, keeping each distinct statement and how many times it appears.
+func planDriftStatements(identities map[planChangeIdentity]int) map[planDriftChange]map[string]int {
+	grouped := make(map[planDriftChange]map[string]int)
+	for id, count := range identities {
+		change := planDriftChange{namespace: id.namespace, table: id.table, operation: id.operation}
+		if grouped[change] == nil {
+			grouped[change] = make(map[string]int)
+		}
+		grouped[change][id.ddl] += count
+	}
+	return grouped
+}
+
+// planDriftCause describes how the re-plan differs from the plan the apply was
+// started from, per table, so the reader can see what moved without diffing two
+// comments themselves. The DDL itself is not repeated: the statements that will
+// run are already fenced above this disclosure. That is why a table in both
+// plans with an amended statement is one "differs" entry rather than an added
+// and a removed one — the pair would name the same table and operation twice,
+// once as present and once as absent, and the field that tells them apart is
+// the one deliberately left out.
+func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *templates.PausedApplyCauseData {
+	now := planDriftStatements(responsePlanIdentities(planResp))
+	started := planDriftStatements(storedPlanIdentities(storedPlan))
+
+	// The namespace distinguishes the same table under two keyspaces, so it is
+	// named only when the drift spans more than one — on the single-namespace
+	// database it is noise the rest of the comment does not carry either.
+	namespaces := make(map[string]struct{})
+	for change := range now {
+		namespaces[change.namespace] = struct{}{}
+	}
+	for change := range started {
+		namespaces[change.namespace] = struct{}{}
+	}
+	qualify := len(namespaces) > 1
+
+	changes := slices.SortedFunc(
+		maps.Keys(planDriftUnion(now, started)),
+		func(a, b planDriftChange) int {
+			return cmp.Or(
+				cmp.Compare(a.namespace, b.namespace),
+				cmp.Compare(a.table, b.table),
+				cmp.Compare(a.operation, b.operation),
+			)
+		})
+
+	var entries []string
+	for _, change := range changes {
+		phrase, drifted := planDriftPhrase(now[change], started[change])
+		if !drifted {
+			continue
+		}
+		subject := fmt.Sprintf("`%s`", change.table)
+		if qualify {
+			subject = fmt.Sprintf("`%s` in `%s`", change.table, change.namespace)
+		}
+		entries = append(entries, fmt.Sprintf("%s (%s) %s", subject, change.operation, phrase))
+	}
+
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("change", "changes", remaining)))
+	}
+
+	return &templates.PausedApplyCauseData{
+		Heading: "Schema changes differ from the plan this apply was started from",
+		Entries: entries,
+		Remedy:  "The statements above are what will run. Review them, then confirm to apply them.",
+	}
+}
+
+// planDriftUnion is every table change either plan carries, so one pass over it
+// classifies each as added, dropped, or amended rather than two passes finding
+// the same change from both ends.
+func planDriftUnion(now, started map[planDriftChange]map[string]int) map[planDriftChange]struct{} {
+	union := make(map[planDriftChange]struct{}, len(now)+len(started))
+	for change := range now {
+		union[change] = struct{}{}
+	}
+	for change := range started {
+		union[change] = struct{}{}
+	}
+	return union
+}
+
+// planDriftPhrase says how one table change differs between the two plans, and
+// whether it differs at all.
+func planDriftPhrase(now, started map[string]int) (string, bool) {
+	switch {
+	case len(started) == 0:
+		return "is in this plan but not in the one this apply was started from", true
+	case len(now) == 0:
+		return "was in the plan this apply was started from but is not in this one", true
+	case maps.Equal(now, started):
+		return "", false
+	default:
+		return "runs a different statement than in the plan this apply was started from", true
+	}
 }
 
 // ddlMatchesStoredPlan reports whether the re-plan describes the same set of

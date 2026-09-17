@@ -222,15 +222,20 @@ func TestRenderPlanComment_ManualConfirmationKeepsAttributedChanges(t *testing.T
 			Repository:  "block/schemabot",
 			PullRequest: 42,
 		}},
-		IsLocked:                   true,
-		LockOwner:                  "block/schemabot#7",
-		LockAcquired:               "2026-08-22 00:13:52 UTC",
-		AutoConfirmDowngradeReason: "Could not verify plan — confirm manually",
+		IsLocked:                  true,
+		LockOwner:                 "block/schemabot#7",
+		LockAcquired:              "2026-08-22 00:13:52 UTC",
+		PendingManualConfirmation: true,
+		PausedApplyCause: &templates.PausedApplyCauseData{
+			Heading: "The plan this apply would be checked against could not be read",
+			Remedy:  "Nothing has run. Review the statements above, then confirm to apply them.",
+		},
 	}
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "⚠️ **Automatic apply paused**")
+	assert.Contains(t, rendered, "⚠️ **The plan this apply would be checked against could not be read**")
+	assert.Contains(t, rendered, "**Confirmation required** — review the plan above, then confirm manually:")
 	assert.Contains(t, rendered, "⚠️ **Check before applying**")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 	assert.Contains(t, rendered, "schemabot apply-confirm -e staging")

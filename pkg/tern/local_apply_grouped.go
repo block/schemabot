@@ -88,7 +88,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
 	// table work shares one context for progress tracking.
-	result, err := eng.Apply(ctx, &engine.ApplyRequest{
+	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
 		Database:     apply.Database,
 		PlanID:       plan.PlanIdentifier,
 		Changes:      changes,
@@ -680,7 +680,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 
-	result, err := eng.Progress(ctx, &engine.ProgressRequest{
+	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    apply.Database,
 		Credentials: creds,
 		ResumeState: resumeState,

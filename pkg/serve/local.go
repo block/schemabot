@@ -84,7 +84,11 @@ func RunLocal(ctx context.Context, config api.ServerConfig, local LocalOptions, 
 		}
 	}()
 	opts = append(opts, func(o *options) { o.authorizer = authorizer })
-	srv, err := Build(ctx, &config, opts...)
+	// Local hosting travels with the server rather than only through this
+	// function's validation: the config key ValidateLocalConfig refuses is not
+	// the only way to ask for a destructive storage bootstrap now that an
+	// operator can ask for one per request (AZ-6).
+	srv, err := Build(ctx, &config, append(opts, withLocalHosting())...)
 	if err != nil {
 		return fmt.Errorf("build local runtime: %w", err)
 	}

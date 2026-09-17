@@ -50,16 +50,21 @@ type StaticTarget struct {
 	// negligible. Prefer file: refs.
 	DSNFrom  *StaticDSNFromConfig `yaml:"dsn_from,omitempty"`
 	Metadata map[string]string    `yaml:"metadata,omitempty"`
-	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
-	// physical schema name on this target, for targets whose physical schema
-	// names embed environment or region (e.g. bikeshare → bikeshare_eu_qa).
-	// The target DSN stays namespace-free; the mapped physical name is injected
-	// per operation instead of the requested namespace. When non-empty it is a
-	// strict allowlist: a requested namespace without a mapping fails rather
-	// than falling back to the canonical name, so a misrouted request cannot
-	// land in the wrong physical schema. MySQL only; currently limited to a
+	// SchemaOverrides maps a requested (canonical) namespace to the physical
+	// schema name on this target, for targets whose physical schema names
+	// embed environment or region (e.g. bikeshare → bikeshare_eu_qa). On MySQL
+	// the physical name is a database, so the target DSN stays namespace-free
+	// and the mapped name is injected per operation. On PostgreSQL the DSN
+	// names the database and the physical name is a schema within it, swapped
+	// in at the engine boundary. When non-empty it is a strict allowlist: a
+	// requested namespace without a mapping fails rather than falling back to
+	// the canonical name, so a misrouted request cannot land in the wrong
+	// physical schema. MySQL and PostgreSQL only; currently limited to a
 	// single mapping per target.
 	SchemaOverrides map[string]string `yaml:"schema_overrides,omitempty"`
+	// TableOwner is the PostgreSQL role used for greenfield table creation.
+	// Empty preserves creation as the connected role. PostgreSQL only.
+	TableOwner string `yaml:"table_owner,omitempty"`
 }
 
 // StaticDSNFromConfig assembles a DSN for a static target from secret
@@ -124,6 +129,7 @@ type staticTargetEntry struct {
 	// allowlist for this target; empty means the requested namespace is the
 	// physical schema.
 	schemaOverrides map[string]string
+	tableOwner      string
 	// dsn is set (non-nil) for entries resolved once at construction.
 	dsn *string
 	// dsnFrom is set for entries assembled fresh on every request.
@@ -190,6 +196,7 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 		DSN:             dsn,
 		Metadata:        metadata,
 		SchemaOverrides: maps.Clone(entry.schemaOverrides),
+		TableOwner:      entry.tableOwner,
 	}, nil
 }
 
@@ -234,11 +241,15 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 	if err := ValidateSchemaOverrides(databaseType, entry.SchemaOverrides); err != nil {
 		return nil, fmt.Errorf("target %q: %w", target, err)
 	}
+	if err := ValidateTableOwner(databaseType, entry.TableOwner); err != nil {
+		return nil, fmt.Errorf("target %q: %w", target, err)
+	}
 	prepared := &staticTargetEntry{
 		target:          target,
 		databaseType:    databaseType,
 		metadata:        maps.Clone(entry.Metadata),
 		schemaOverrides: maps.Clone(entry.SchemaOverrides),
+		tableOwner:      entry.TableOwner,
 	}
 	if hasDSNFrom {
 		if databaseType != "mysql" && databaseType != "postgres" {
@@ -285,10 +296,10 @@ func canonicalDatabaseType(databaseType string) string {
 	return strings.ToLower(strings.TrimSpace(databaseType))
 }
 
-// ValidateSchemaOverrides checks a canonical→physical schema mapping. The
-// mapping is MySQL-only (it selects a MySQL schema; for Vitess the namespace
-// is a keyspace, a different concept) and is currently limited to a single
-// entry: SchemaBot's MySQL operations address one schema per target, and a
+// ValidateSchemaOverrides checks a canonical→physical schema mapping for
+// MySQL or PostgreSQL (for Vitess the namespace is a keyspace, a different
+// concept). The mapping is currently limited to a single entry: operations
+// address one schema per target, and a
 // wider map would silently permit multi-schema routing this feature does not
 // support yet. It is exported so every consumer of a resolved target (not just
 // static inventory) enforces the same contract; a custom resolver cannot hand
@@ -297,28 +308,50 @@ func ValidateSchemaOverrides(databaseType string, overrides map[string]string) e
 	if len(overrides) == 0 {
 		return nil
 	}
-	if databaseType != "mysql" {
-		return fmt.Errorf("schema_overrides is only supported for mysql, not %q", databaseType)
+	if databaseType != "mysql" && databaseType != "postgres" {
+		return fmt.Errorf("schema_overrides is only supported for mysql and postgres, not %q", databaseType)
 	}
 	if len(overrides) > 1 {
 		return fmt.Errorf("schema_overrides supports exactly one mapping, got %d", len(overrides))
 	}
 	for canonical, physical := range overrides {
-		if err := validateSchemaIdentifier(canonical); err != nil {
+		if err := validateSchemaIdentifier(databaseType, canonical); err != nil {
 			return fmt.Errorf("schema_overrides key %q: %w", canonical, err)
 		}
-		if err := validateSchemaIdentifier(physical); err != nil {
+		if err := validateSchemaIdentifier(databaseType, physical); err != nil {
 			return fmt.Errorf("schema_overrides value %q for key %q: %w", physical, canonical, err)
 		}
 	}
 	return nil
 }
 
-// validateSchemaIdentifier requires an unquoted-identifier-safe MySQL schema
-// name. Mapped names are injected into DSNs and SQL, so restrict them to the
-// character set that never needs quoting rather than supporting MySQL's full
-// quoted-identifier grammar.
-func validateSchemaIdentifier(name string) error {
+// ValidateTableOwner checks the optional role used for PostgreSQL greenfield
+// table creation. An empty owner preserves creation as the connected role.
+func ValidateTableOwner(databaseType, owner string) error {
+	if owner == "" {
+		return nil
+	}
+	if databaseType != "postgres" {
+		return fmt.Errorf("table_owner is only supported for postgres, not %q", databaseType)
+	}
+	if err := validatePostgresIdentifier("role", owner); err != nil {
+		return fmt.Errorf("table_owner %q: %w", owner, err)
+	}
+	return nil
+}
+
+func validateSchemaIdentifier(databaseType, name string) error {
+	switch databaseType {
+	case "mysql":
+		return validateMySQLSchemaIdentifier(name)
+	case "postgres":
+		return validatePostgresSchemaIdentifier(name)
+	default:
+		return fmt.Errorf("unsupported database type %q", databaseType)
+	}
+}
+
+func validateMySQLSchemaIdentifier(name string) error {
 	if name == "" {
 		return fmt.Errorf("schema name must not be empty")
 	}
@@ -331,6 +364,29 @@ func validateSchemaIdentifier(name string) error {
 		default:
 			return fmt.Errorf("schema name contains unsupported character %q; only [a-zA-Z0-9_$] is allowed", r)
 		}
+	}
+	return nil
+}
+
+func validatePostgresSchemaIdentifier(name string) error {
+	return validatePostgresIdentifier("schema", name)
+}
+
+func validatePostgresIdentifier(kind, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s name must not be empty", kind)
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("%s name exceeds PostgreSQL's 63-byte identifier limit", kind)
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("%s name must not have leading or trailing whitespace", kind)
+	}
+	if strings.ContainsRune(name, '"') {
+		return fmt.Errorf("%s name must not contain a double quote", kind)
+	}
+	if strings.ContainsRune(name, '\x00') {
+		return fmt.Errorf("%s name must not contain NUL", kind)
 	}
 	return nil
 }

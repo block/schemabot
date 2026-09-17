@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // syncBuffer collects log output from Build, which may write from more than one
@@ -186,4 +188,57 @@ func TestVersionFromBuildInfo(t *testing.T) {
 // covers the resolution itself against a synthetic graph.
 func TestModuleVersionIsNeverEmpty(t *testing.T) {
 	assert.NotEmpty(t, moduleVersion())
+}
+
+// The sentinel is a log value, and a storage schema report is prose. "the
+// schema embedded in unknown" reads as a release named unknown; the report's
+// own words for a build it cannot name say these are the answering binary's
+// files and claim nothing about whose build produced them. So attribution
+// drops the sentinel and keeps every real version, including one an embedder
+// supplied.
+func TestAttributableVersionDropsOnlyTheSentinel(t *testing.T) {
+	assert.Empty(t, attributableVersion(unknownModuleVersion))
+	assert.Equal(t, "v1.2.3", attributableVersion("v1.2.3"))
+	assert.Empty(t, attributableVersion(""))
+}
+
+// A server whose build the module graph cannot name still logs the sentinel,
+// and the adapter it builds attributes its reports to no version at all —
+// which is what makes the report say "the schema embedded in this binary"
+// instead of naming a release called "unknown".
+func TestStorageSchemaAdapterNeverAttributesToTheSentinel(t *testing.T) {
+	srv := &Server{
+		cfg:        &api.ServerConfig{},
+		dialect:    schema.DialectMySQL,
+		storageDSN: "schemabot:pw@tcp(db.example:3306)/schemabot",
+		version:    unknownModuleVersion,
+		logger:     slog.New(slog.DiscardHandler),
+	}
+
+	adapter, err := srv.newStorageSchemaService()
+	require.NoError(t, err)
+	assert.Empty(t, adapter.version, "the sentinel is a log value, not a version a report can attribute files to")
+
+	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "the schema embedded in this binary", desired.Description)
+}
+
+// A build that names itself is attributed to that version, so a report an
+// operator reads during a deploy says which release its desired side came from.
+func TestStorageSchemaAdapterAttributesToANamedBuild(t *testing.T) {
+	srv := &Server{
+		cfg:        &api.ServerConfig{},
+		dialect:    schema.DialectMySQL,
+		storageDSN: "schemabot:pw@tcp(db.example:3306)/schemabot",
+		version:    "v1.2.3",
+		logger:     slog.New(slog.DiscardHandler),
+	}
+
+	adapter, err := srv.newStorageSchemaService()
+	require.NoError(t, err)
+
+	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "the schema embedded in v1.2.3", desired.Description)
 }

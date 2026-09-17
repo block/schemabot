@@ -4077,13 +4077,13 @@ func TestLocalClient_SchemaOverrides(t *testing.T) {
 		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", checker.req.Credentials.DSN)
 	})
 
-	t.Run("NewLocalClient rejects overrides for non-MySQL targets", func(t *testing.T) {
+	t.Run("NewLocalClient rejects overrides for Vitess targets", func(t *testing.T) {
 		_, err := NewLocalClient(LocalConfig{
 			Database:        "bikeshare",
 			Type:            storage.DatabaseTypeVitess,
 			SchemaOverrides: overrides,
 		}, nil, slog.Default())
-		require.ErrorContains(t, err, "only supported for mysql")
+		require.ErrorContains(t, err, `only supported for mysql and postgres, not "vitess"`)
 	})
 
 	t.Run("NewLocalClient rejects more than one mapping", func(t *testing.T) {
@@ -4150,6 +4150,16 @@ func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
 	assert.Equal(t, "testdb", client.planNamespace(""))
 	assert.Equal(t, "testdb", client.planNamespace("default"))
 	assert.Equal(t, "analytics", client.planNamespace("analytics"))
+}
+
+func TestNewLocalClientTableOwnerValidation(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{Database: "bikeshare", Type: storage.DatabaseTypeMySQL, TableOwner: "app_owner"}, nil, slog.Default())
+	require.ErrorContains(t, err, `table_owner is only supported for postgres, not "mysql"`)
+
+	client, err := NewLocalClient(LocalConfig{Database: "bikeshare", Type: storage.DatabaseTypePostgres, TableOwner: "app_owner"}, nil, slog.Default())
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.Equal(t, "app_owner", client.config.TableOwner)
 }
 
 // A database type without a built-in engine is served by a registered factory,

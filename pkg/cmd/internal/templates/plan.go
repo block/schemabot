@@ -25,6 +25,14 @@ type PlanHeaderData struct {
 	Environment string
 	IsMySQL     bool
 	IsApply     bool
+	// EngineLabel names the database family in the title for a surface whose
+	// family IsMySQL cannot express — SchemaBot's own storage is MySQL or
+	// PostgreSQL. Empty keeps the MySQL/Vitess wording every other plan uses.
+	EngineLabel string
+	// SchemaLabel names the row carrying SchemaName. Empty says "Schema name",
+	// which is the directory a plan was built from; a surface whose desired
+	// schema is something else says what it is instead.
+	SchemaLabel string
 }
 
 // WritePlanHeader writes the common plan header to stdout.
@@ -32,6 +40,9 @@ func WritePlanHeader(data PlanHeaderData) {
 	dbType := "Vitess"
 	if data.IsMySQL {
 		dbType = "MySQL"
+	}
+	if data.EngineLabel != "" {
+		dbType = data.EngineLabel
 	}
 
 	action := "Plan"
@@ -49,9 +60,13 @@ func WritePlanHeader(data PlanHeaderData) {
 		lines = append(lines, fmt.Sprintf("Environment: %s", data.Environment))
 	}
 	// Show schema name (directory) for MySQL. Vitess uses keyspace headers instead.
-	showSchemaName := data.IsMySQL && data.SchemaName != ""
+	showSchemaName := data.SchemaName != "" && (data.IsMySQL || data.EngineLabel != "")
+	schemaLabel := "Schema name"
+	if data.SchemaLabel != "" {
+		schemaLabel = data.SchemaLabel
+	}
 	if showSchemaName {
-		lines = append(lines, fmt.Sprintf("Schema name: %s", data.SchemaName))
+		lines = append(lines, fmt.Sprintf("%s: %s", schemaLabel, data.SchemaName))
 	}
 	boxWidth := minBoxWidth
 	for _, line := range lines {
@@ -69,7 +84,7 @@ func WritePlanHeader(data PlanHeaderData) {
 		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("Environment: %s", data.Environment))
 	}
 	if showSchemaName {
-		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("Schema name: %s", data.SchemaName))
+		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("%s: %s", schemaLabel, data.SchemaName))
 	}
 	fmt.Printf("╰%s╯\n", strings.Repeat("─", boxWidth))
 	fmt.Println()
@@ -514,10 +529,44 @@ func WriteUnsafeChangesWarning(changes []UnsafeChange) {
 	fmt.Println()
 }
 
+// WriteChangeNotice writes a list of changes under a heading and the severity
+// glyph the heading earns — Attention while a change is only disclosed,
+// Refused once something has been refused, Escalation when destructive consent
+// is in effect (see pkg/glyph). It is the unsafe-change list under another
+// name, because a reader wants the same things of a change that will not run as
+// of one that might: which table, what it would do, and what stands in the way.
+//
+// One change is one numbered line, and its reason is printed as it was written.
+// The unsafe-change list splits a reason into findings because a lint reason is
+// a concatenation of them; a reason written for one change is one sentence, and
+// splitting it renders half of it as a finding of its own — "NOT NULL without a
+// DEFAULT" and "add it manually" as two separate things to fix, the second of
+// them the remedy for the first. A change carrying no reason is named by what it
+// would do, which keeps an entry a line rather than a block of DDL.
+func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
+	if len(changes) == 0 {
+		return
+	}
+	fmt.Println(severity + " " + heading)
+	for i, c := range changes {
+		reason := c.Reason
+		if reason == "" {
+			reason = c.ChangeType
+		}
+		fmt.Printf("  %d. %s: %s\n", i+1, c.Table, reason)
+	}
+	fmt.Println()
+}
+
 // WriteUnsafeChangesBlocked writes the unsafe changes list and instruction to re-run with --allow-unsafe.
 // The apply was refused, so Refused attaches to the refusal itself — the heading
 // names the blocked apply, not the unsafeness of the changes.
-func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, schemaDir string) {
+//
+// rerun is the command that permits them, without the binary name. The caller
+// builds it because it is the one that knows which flags addressed the target:
+// a suggested command that dropped them would name a different database than
+// the refusal is about, and it is meant to be copied and run.
+func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	if len(changes) > 0 {
 		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", countUnsafeFindings(changes))
 		writeUnsafeChangesList(changes)
@@ -525,22 +574,32 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, sc
 	}
 	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  %s apply -s %s -e %s --allow-unsafe\n", cliname.Name(), schemaDir, environment)
+	fmt.Printf("  %s %s\n", cliname.Name(), rerun)
 	fmt.Println()
 }
 
-// WriteUnsafeWarningAllowed writes a warning when --allow-unsafe is used.
-func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
+// WriteUnsafeWarningAllowed writes a warning when destructive changes are
+// permitted and will run.
+//
+// consent names what permitted them, in the heading, because that is the fact
+// an operator checks the heading for. It is not always a flag on the line: a
+// deployment can carry standing permission of its own, and a heading naming a
+// flag nobody passed would send them looking for it in their shell history.
+func WriteUnsafeWarningAllowed(changes []UnsafeChange, consent string) {
 	if len(changes) == 0 {
 		return
 	}
 	fmt.Println()
-	fmt.Println(glyph.Escalation + " Unsafe Changes (--allow-unsafe enabled)")
+	fmt.Printf("%s Unsafe Changes (%s)\n", glyph.Escalation, consent)
 	fmt.Println()
 	fmt.Println("The following unsafe changes will be applied:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }
+
+// UnsafeConsentAllowFlag is what permitted a schema change apply's destructive
+// changes: the flag, which is the only way to permit them there.
+const UnsafeConsentAllowFlag = "--allow-unsafe enabled"
 
 // writeUnsafeChangesList writes the unsafe changes one numbered line per
 // finding, the same list shape as the PR plan comment, so a heading's count
@@ -549,7 +608,7 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 func writeUnsafeChangesList(changes []UnsafeChange) {
 	n := 0
 	for _, c := range changes {
-		reasons := ui.LintReasons(c.Reason)
+		reasons := unsafeChangeFindings(c)
 		if len(reasons) == 0 {
 			n++
 			fmt.Printf("  %d. %s: %s\n", n, c.Table, c.ChangeType)
@@ -570,11 +629,26 @@ func writeUnsafeChangesList(changes []UnsafeChange) {
 func countUnsafeFindings(changes []UnsafeChange) int {
 	n := 0
 	for _, c := range changes {
-		if reasons := ui.LintReasons(c.Reason); len(reasons) > 0 {
+		if reasons := unsafeChangeFindings(c); len(reasons) > 0 {
 			n += len(reasons)
 		} else {
 			n++
 		}
 	}
 	return n
+}
+
+// unsafeChangeFindings is a change's findings, as the list and its count both
+// see them — one function so a heading that counts N always sits above N lines.
+//
+// A producer that separated its own findings has already said what they are.
+// The engine-reported reason is split instead because it is a concatenation of
+// findings (see ui.LintReasons), and splitting one that was written as a
+// sentence would cut it in half at its semicolon and render each half as a
+// finding of its own.
+func unsafeChangeFindings(c UnsafeChange) []string {
+	if len(c.Reasons) > 0 {
+		return c.Reasons
+	}
+	return ui.LintReasons(c.Reason)
 }

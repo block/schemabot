@@ -104,3 +104,28 @@ func TestLocalListenerReservedBeforeBuild(t *testing.T) {
 	err = RunLocal(ctx, cfg, LocalOptions{Address: listener.Addr().String(), Token: strings.Repeat("a", 64)})
 	require.ErrorContains(t, err, "listen for local runtime")
 }
+
+// Every server the local runtime hosts is built as locally hosted, so the
+// boundaries local hosting carries hold for the whole server rather than only
+// for the config keys ValidateLocalConfig reads (AZ-6).
+//
+// The option is observed through the options value Build applies them to: the
+// spy captures the pointer, and the local runtime's own option is applied to
+// the same value afterwards. Build then fails on the unreadable TLS files,
+// which needs no database.
+func TestRunLocalBuildsALocallyHostedServer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	cfg := validLocalConfig()
+	missing := filepath.Join(t.TempDir(), "missing.pem")
+	cfg.PlanetScale.MTLS = &api.PlanetScaleMTLSConfig{CABundle: missing, ClientCert: missing, ClientKey: missing}
+	require.NoError(t, ValidateLocalConfig(&cfg))
+
+	var built *options
+	spy := func(o *options) { built = o }
+	err := RunLocal(ctx, cfg, LocalOptions{Address: "127.0.0.1:0", Token: strings.Repeat("a", 64)}, spy)
+
+	require.ErrorContains(t, err, "build local runtime")
+	require.NotNil(t, built, "Build applied the options it was handed")
+	assert.True(t, built.localHosted, "the local runtime claims local hosting for the server it builds")
+}

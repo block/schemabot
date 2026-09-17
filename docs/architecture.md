@@ -399,6 +399,8 @@ tracks those scenario tables and the review checklist for future control work.
 
 Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`PullSchema`, `Plan`, `PlanDiff`, `Apply`, `Progress`, `Logs`, `Cutover`, `Stop`, `Start`, `Cancel`, `Revert`, `SkipRevert`, `Health`).
 
+Two more RPCs address the serving instance's own bookkeeping database rather than a database it manages: `StorageSchemaPlan` reports the DDL outstanding on SchemaBot's storage, and `StorageSchemaApply` converges it by running the startup bootstrap. A data plane whose embedder registered no storage-schema adapter answers both with `Unimplemented`, since the alternative is reading some other instance's storage.
+
 ### Plan
 
 A **plan** is a diff between desired schema (files on disk) and current schema (live database).

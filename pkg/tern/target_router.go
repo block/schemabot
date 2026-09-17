@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -151,16 +152,25 @@ func (g *targetClientGeneration) idle() bool {
 }
 
 // connectionIdentityHash is a short one-way digest of what a resolved target
-// connects with, safe to compare and to log. It covers the DSN and the
-// engine's connection metadata — for Vitess the API fields that stand in for
-// a DSN, for PostgreSQL the CA the connection verifies against — so a rotated
-// password, service token, or certificate changes the hash and nothing else
-// about the route does.
+// connects with and where on it a namespace lands, safe to compare and to
+// log. It covers the DSN, the engine's connection metadata — for Vitess the
+// API fields that stand in for a DSN, for PostgreSQL the CA the connection
+// verifies against — the schema overrides, and the table owner, so a rotated
+// password, service token, or certificate changes the hash, and so does
+// re-pointing a canonical namespace at a different physical schema or
+// changing the role new tables are created under: a client built with the
+// old mapping or owner must retire rather than keep routing to the schema,
+// or creating under the role, it captured at construction. Nothing else
+// about the route changes it.
 func connectionIdentityHash(resolved *inventory.Target) string {
 	parts := []string{resolved.DSN}
 	for _, key := range inventory.ConnectionMetadataKeys(resolved.DatabaseType) {
 		parts = append(parts, resolved.Metadata[key])
 	}
+	for _, canonical := range slices.Sorted(maps.Keys(resolved.SchemaOverrides)) {
+		parts = append(parts, canonical+"\x01"+resolved.SchemaOverrides[canonical])
+	}
+	parts = append(parts, resolved.TableOwner)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:6])
 }
@@ -1026,6 +1036,7 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		TargetDSN:       resolved.DSN,
 		Metadata:        maps.Clone(resolved.Metadata),
 		SchemaOverrides: maps.Clone(resolved.SchemaOverrides),
+		TableOwner:      resolved.TableOwner,
 	}, r.storage, r.logger)
 	if err != nil {
 		publish.done()

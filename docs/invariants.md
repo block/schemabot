@@ -313,17 +313,23 @@ clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handle
 
 ### AV-9: SchemaBot never destroys its own storage to start
 
-The startup schema bootstrap converges SchemaBot's own storage additively, and decides before it
-writes. On MySQL a destructive statement (a `DROP TABLE`, or an `ALTER TABLE` carrying a `DROP
-COLUMN`) is refused unless destructive storage changes are explicitly allowed, and a statement
-whose destructive clauses cannot be partitioned out is refused *whole*. Refusing the whole
-statement runs strictly less than any split of it, so the fallback can never widen what the
-bootstrap executes, and startup continues on the safe remainder. On PostgreSQL the convergence is
-additive-only and gates on the entire drift set before touching anything, so a change needing
-manual remediation aborts the pass rather than leaving storage half-converged. *Breaks if
+Every convergence of SchemaBot's own storage — at startup, or on an operator's command — is additive
+unless destroying storage state was explicitly permitted, and decides before it writes. Nothing
+about which surface asked changes that: an operator's command runs the bootstrap rather than a
+second implementation of it, converges the schema of the binary running it, and cannot narrow the
+permission a deployment already granted. On MySQL a destructive statement (a `DROP TABLE`, or an
+`ALTER TABLE` carrying a `DROP COLUMN`) is refused unless destructive storage changes are explicitly
+allowed, and a statement whose destructive clauses cannot be partitioned out is refused *whole*.
+Refusing the whole statement runs strictly less than any split of it, so the fallback can never
+widen what the bootstrap executes, and startup continues on the safe remainder. On PostgreSQL the
+convergence is additive-only and gates on the entire drift set before touching anything, so a change
+needing manual remediation aborts the pass rather than leaving storage half-converged. *Breaks if
 violated:* the first instance of a rolling deploy drops state the rest of the fleet is still
 reading. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
-`pkg/api/ensure_schema_postgres.go`).
+`pkg/api/ensure_schema_postgres.go`), which the operator-facing storage schema surface calls rather
+than reimplements (`pkg/api/storage_schema.go`); the instance's own storage is the only target a
+remote caller can address, and the deployment's permission is only ever widened, in the adapter that
+answers for it (`pkg/serve/storage_schema.go`).
 
 ### AV-10: Anything the PR can do, the CLI can do
 
@@ -1319,16 +1325,19 @@ The schema source is held to the same standard, and checked twice. A repository 
 it count as a source for a database only because server config says so, verified when the plan is
 made and verified again before the apply runs. Config that cannot answer the question is a
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
-to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`) and source policy
-(`pkg/webhook/schema_source_policy.go`).
+to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
+allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), the PostgreSQL
+apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
+source policy (`pkg/webhook/schema_source_policy.go`).
 
 ### AZ-2: Authorization fails closed at every tier
 
 An API route not classified as a read is treated as a write. Planning counts as a write, since it
 stages a change. A target that cannot be resolved never authorizes. A configured grant that could
 never match any request is a startup error rather than silent dead config. And a new mutating
-endpoint cannot ship without a test proving it denies unauthorized callers. *Enforced:* route
-classification with a structural sweep test over the route table (`pkg/api/service.go`).
+endpoint cannot ship without a test proving it denies unauthorized callers. *Enforced:* the tier
+classification (`pkg/auth/tiers.go`), with a structural sweep test over the route table
+(`pkg/api/service.go`).
 
 ### AZ-3: Identity comes from a verified lane
 
@@ -1363,7 +1372,9 @@ State storage must use an explicit connection and a different database name from
 target in the same database family. This name check does not establish isolation for dynamically
 resolved targets. Local hosting never permits destructive storage bootstrap.
 
-*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`.
+*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`; the request
+that opts in to destructive storage statements is refused rather than honored on a locally hosted server
+in `pkg/serve/storage_schema.go`.
 
 ### AZ-7: Local registration preserves existing work
 

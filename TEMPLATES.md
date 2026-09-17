@@ -249,9 +249,7 @@ These statements run synchronously outside the schema change engine: writes to e
 
 ---
 
-⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -390,9 +388,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-⚠️ **Automatic apply paused**: Applying destroys work in progress on the target
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -430,9 +426,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-⚠️ **Apply stopped**: Applying destroys work in progress on the target
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -2577,14 +2571,19 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+⚠️ **Schema changes differ from the plan this apply was started from**
+- `orders` (alter) runs a different statement than in the plan this apply was started from
+- `products` (alter) is in this plan but not in the one this apply was started from
+- `shipments` (create) was in the plan this apply was started from but is not in this one
+
+The statements above are what will run. Review them, then confirm to apply them.
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
 
-⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review and confirm manually
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```

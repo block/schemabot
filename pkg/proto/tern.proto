@@ -216,6 +216,44 @@ service Tern {
       body: "*"
     };
   }
+
+  // StorageSchemaPlan reports the DDL outstanding between the embedded storage
+  // schema of the binary serving this RPC and the live storage database that
+  // binary uses. Unlike every other RPC here, it is about the serving
+  // instance's own bookkeeping database rather than a target database an
+  // operator asked to change.
+  //
+  // It is strictly read-only: it reads the live catalog and computes a diff,
+  // executing no DDL and taking no lock, so it is safe to call at any time,
+  // including while the same storage is being converged.
+  //
+  // The answer comes from the serving binary's own embedded files, which is the
+  // whole point of routing it here rather than computing it from a release pin
+  // on the caller's side: a caller's pin says which release it was built
+  // against, not what this storage converged to, and those diverge exactly when
+  // a deploy has failed to converge.
+  rpc StorageSchemaPlan(StorageSchemaPlanRequest) returns (StorageSchemaPlanResponse) {
+    option (google.api.http) = {
+      post: "/v1/storage-schema/plan"
+      body: "*"
+    };
+  }
+
+  // StorageSchemaApply converges the serving instance's own storage schema and
+  // reports what it found and what it left behind.
+  //
+  // The convergence is the serving binary's startup bootstrap, called
+  // unchanged: the same differ, the same destructive-statement refusal, and the
+  // same advisory lock that serializes it against every other instance of that
+  // deployment. Destructive statements are refused unless the serving
+  // instance's storage config allows them or allow_destructive opts in for this
+  // call.
+  rpc StorageSchemaApply(StorageSchemaApplyRequest) returns (StorageSchemaApplyResponse) {
+    option (google.api.http) = {
+      post: "/v1/storage-schema/apply"
+      body: "*"
+    };
+  }
 }
 
 // Engine represents the schema change engine type.
@@ -922,4 +960,115 @@ message StartResponse {
   int64 started_count = 3;
   // Number of tasks skipped (not in stopped state).
   int64 skipped_count = 4;
+}
+
+// StorageSchemaPlanRequest asks the serving instance for the DDL outstanding
+// on its own storage database. It deliberately carries no target: the instance
+// answers for the storage it uses, and nothing a caller sends can point it at
+// a different database.
+//
+// The live side of the diff is therefore fixed. The desired side is not: a
+// caller deploying a later release asks what this storage needs in order to
+// match that release, which the serving binary cannot answer from files it does
+// not have. Sending the files is the only way to ask the question, and it is
+// safe to ask because a diff executes nothing. The apply RPC carries no such
+// field, so a convergence can only ever run the serving binary's own schema.
+message StorageSchemaPlanRequest {
+  // AllowDestructive reports the destructive statements as allowed rather than
+  // refused, matching what an apply carrying the same flag would run. It does
+  // not execute anything — a diff never does — and it does not change which
+  // statements are classified destructive, only whether the report says they
+  // would run.
+  bool allow_destructive = 1;
+  // SchemaFiles is the desired schema, as file name → file contents (for
+  // example "applies.sql" → "CREATE TABLE ..."). Empty diffs against the
+  // serving binary's own embedded files. The serving instance's dialect selects
+  // how they are read, exactly as it does for the embedded ones.
+  map<string, string> schema_files = 2;
+  // SchemaSource says where schema_files came from, in words, for the report to
+  // carry back. It is required with schema_files and never inferred: a report
+  // that does not say whose schema it was diffed against is one a caller can
+  // misattribute to the serving binary.
+  string schema_source = 3;
+}
+
+// StorageSchemaStatement is one outstanding storage-schema statement.
+message StorageSchemaStatement {
+  // Storage table the statement acts on.
+  string table = 1;
+  // Statement kind in the storage layer's own vocabulary (create_table,
+  // alter_table, add_column, create_index, ...).
+  string operation = 2;
+  // The statement itself, runnable as printed.
+  string ddl = 3;
+  // Why the statement is classified destructive, or why it needs manual
+  // remediation. Empty for a statement that runs automatically.
+  string reason = 4;
+}
+
+// StorageSchemaReport is what one storage database needs to match the embedded
+// schema of the binary that produced the report. The three statement sets are
+// disjoint and have different dispositions, so a caller never has to work out
+// which statements would actually run.
+message StorageSchemaReport {
+  // Storage database family: "mysql" or "postgres".
+  string dialect = 1;
+  // The live database the diff read, as the server reports it.
+  string database = 2;
+  // SchemaBot version of the binary that answered. Reported for attribution
+  // only; the diff itself is computed from schema files, never from a version.
+  string version = 3;
+  // Statements that converge the schema and run automatically, in the order
+  // the convergence would run them.
+  repeated StorageSchemaStatement outstanding = 4;
+  // Statements classified as destroying data. Refused unless destructive
+  // changes are allowed.
+  repeated StorageSchemaStatement destructive = 5;
+  // Whether the destructive statements would actually run.
+  bool destructive_allowed = 6;
+  // Changes that cannot run automatically, each naming the situation and its
+  // remediation. Any entry aborts the whole convergence before a single
+  // statement executes.
+  repeated StorageSchemaStatement manual = 7;
+  // The database server as it names itself, so a report names the machine it
+  // read and not only the database on it. Empty when the server does not
+  // report one.
+  string host = 8;
+  // Where the desired side of the diff came from, in words — the serving
+  // binary's embedded files, a directory, or a release. A report always says
+  // this, because the same live database yields different answers against
+  // different releases.
+  string schema_source = 9;
+}
+
+// StorageSchemaPlanResponse carries the outstanding storage DDL.
+message StorageSchemaPlanResponse {
+  StorageSchemaReport report = 1;
+}
+
+// StorageSchemaApplyRequest converges the serving instance's own storage
+// schema.
+message StorageSchemaApplyRequest {
+  // AllowDestructive permits the destructive statements this call would
+  // otherwise refuse. It is an addition to the serving instance's storage
+  // config, never a restriction of it: a deployment whose config already
+  // allows destructive storage changes converges the same way a boot would,
+  // with or without this flag.
+  bool allow_destructive = 1;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it, so the data plane's logs attribute the
+  // convergence to a person rather than to a control plane.
+  string caller = 2;
+}
+
+// StorageSchemaApplyResponse brackets the convergence with the report from
+// before it and the report from after it.
+message StorageSchemaApplyResponse {
+  // What was outstanding before the convergence ran.
+  StorageSchemaReport planned = 1;
+  // What is still outstanding after it. Empty on a clean convergence; it
+  // carries the refused destructive statements when the live database holds
+  // state the serving binary's schema does not declare, which is the expected
+  // steady state during a rollback rather than a failure.
+  StorageSchemaReport remaining = 2;
 }

@@ -121,11 +121,7 @@ func requireNarrowableEnvironment(cfg *ServerConfig, environment string) error {
 // operator request and returns a context bounded to the same budget, so the
 // crawl can outlive the default timeout without running unbounded.
 func (s *Service) extendWebhookOpsDeadline(w http.ResponseWriter, r *http.Request) (context.Context, context.CancelFunc) {
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(webhookOpsRequestTimeout)); err != nil {
-		s.logger.Warn("failed to extend webhook ops write deadline; the server-wide write timeout still applies",
-			"path", r.URL.Path, "error", err)
-	}
-	return context.WithTimeout(r.Context(), webhookOpsRequestTimeout)
+	return s.extendOperatorWriteDeadline(w, r, webhookOpsRequestTimeout)
 }
 
 func (s *Service) writeWebhookOpsError(w http.ResponseWriter, err error) {

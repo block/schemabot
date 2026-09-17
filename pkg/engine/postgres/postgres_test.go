@@ -419,7 +419,7 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 		},
 	}
 
-	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild})
+	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
 	require.NoError(t, err)
 	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
@@ -439,7 +439,7 @@ func TestBlockMissingPrivilegesSkipsFullyBlockedPlans(t *testing.T) {
 		ExecutionMode: engine.ExecutionModeBlocked,
 	}}
 
-	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0})
+	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0}, "")
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 }
@@ -455,7 +455,7 @@ func TestBlockMissingPrivilegesRequiresTargetTable(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{preflight.TierAlterInPlace})
+	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{preflight.TierAlterInPlace}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
 }
@@ -482,7 +482,7 @@ func TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent(t *testing.T) {
 		},
 	}
 
-	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild})
+	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
 }
@@ -569,7 +569,7 @@ func TestBlockMissingPrivilegesRequiresMatchingTiers(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, nil)
+	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, nil, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "privilege tiers")
 }
