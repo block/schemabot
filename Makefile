@@ -155,12 +155,18 @@ check-webhookheaders: ## Run webhookheaders analyzer (flags inline `## ...` mark
 # glyphs in its own diagnostics, so both are excluded the same way the
 # pre-commit hook excludes them.
 #
-# The default build is the whole surface: the analyzer skips _test.go files, and
-# no non-test file sits behind a build tag, so a tagged pass would add no
-# coverage while failing on the packages whose files all belong to another tag.
+# A build only analyzes the files its constraints select, so one pass is not the
+# whole surface. The default build leaves out the packages whose non-test files
+# all sit behind a test build tag, which the second pass picks up by carrying
+# both tags. The tags have to travel in GOFLAGS: the checker's own -tags flag is
+# registered by the analysis driver as deprecated and does nothing. What stays
+# unchecked either way is a file that only builds for another GOOS, since the
+# constraint excludes it from every pass the host can run.
 check-severityglyphs: ## Run severityglyphs analyzer (flags severity glyph literals outside pkg/glyph)
 	@echo "Running severityglyphs analyzer..."
 	@go run ./cmd/severityglyphs-check $$(go list ./... | grep -v '/pkg/glyph$$' | grep -v '/pkg/analyzers/severityglyphs')
+	@echo "Running severityglyphs analyzer (test build tags)..."
+	@GOFLAGS=-tags=e2e,integration go run ./cmd/severityglyphs-check $$(GOFLAGS=-tags=e2e,integration go list ./... | grep -v '/pkg/glyph$$' | grep -v '/pkg/analyzers/severityglyphs')
 
 lint-fix: ## Run golangci-lint with auto-fix enabled
 	@echo "Running golangci-lint with auto-fix..."
