@@ -915,14 +915,23 @@ func releaseEnsureSchemaLock(ctx context.Context, locker namedlock.Locker, conn 
 // _spirit_sentinel, _spirit_checkpoint) that Spirit normally cleans up after
 // cutover. If a pod is killed mid-apply, they persist until the next startup.
 //
-// This is safe because EnsureSchema only targets SchemaBot's own storage
-// database, and Spirit runs in-process — when the pod restarts, there is no
-// active Spirit runner to resume. Spirit's checkpoint-based resume only works
-// within a single runner lifetime. Cleaning these tables lets Spirit start
-// fresh without logging confusing "successfully dropped old table" messages.
+// Dropping them is a choice rather than a consequence. A checkpoint is durable
+// state on the target, not a handle held by the process that wrote it, and
+// Spirit decides on its own whether to adopt or discard one by comparing the
+// statement it is given against the statement the checkpoint stores. What makes
+// the choice safe is that these tables hold no committed state: the live tables
+// are untouched until cutover, so the whole cost of dropping a copy is the rows
+// it had copied.
 //
-// This must NOT be used on target databases where user schema changes may be
-// in progress or resumable.
+// What makes it the right choice is that this path converges storage against
+// the schema embedded in whichever binary is booting. A release that changed
+// the schema plans a different statement, so its copy is discarded regardless;
+// the only run that could adopt one is the same build restarting with no
+// statement yet finished. A convergence that always starts clean is worth more
+// than that case, because every boot then inherits nothing.
+//
+// This must NOT be used on target databases, where a user's schema change may
+// be in progress or resumable.
 func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger) error {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
