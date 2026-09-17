@@ -4,6 +4,10 @@
 // per meaning, one meaning per glyph — and every rendering site references
 // the named constant, so the vocabulary cannot drift surface by surface.
 //
+// It also flags glyphs that are not vocabulary members but read as severity
+// beside them (🛑), naming the member each one collapses into, so a sixth
+// level cannot enter through a glyph the vocabulary never defined.
+//
 // The analyzer inspects decoded string values, so escape-spelled glyphs
 // (e.g. "❌") are caught the same as literal ones. It matches on the
 // base codepoints (⚠ U+26A0, ℹ U+2139), so variation-selector forms are
@@ -32,6 +36,14 @@ import (
 // pkg/glyph constant that rendering code must use instead. Matching on the
 // base codepoint (not the emoji-presentation sequence) also catches literals
 // that omit or add the variation selector.
+//
+// The list also carries glyphs that are not vocabulary members but read as
+// severity to a reader — a near-synonym of one that is. Left unlisted, such a
+// glyph is invisible to this analyzer precisely because it names no existing
+// meaning, which is how one enters the vocabulary by accident: it renders
+// beside the real glyphs, at an apparent severity the reader has no way to
+// place. Each maps to the member it collapses into, so the fix is to use that
+// constant rather than to mint a sixth level.
 var severityGlyphs = []struct {
 	glyph    string
 	constant string
@@ -41,6 +53,7 @@ var severityGlyphs = []struct {
 	{"❌", "glyph.Failed"},
 	{"⚠", "glyph.Attention"},
 	{"ℹ", "glyph.Info"},
+	{"🛑", "glyph.Attention"},
 }
 
 // Analyzer flags string literals containing a severity glyph in non-test
@@ -49,7 +62,7 @@ var severityGlyphs = []struct {
 // drifts.
 var Analyzer = &analysis.Analyzer{
 	Name:     "severityglyphs",
-	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️) in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
+	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), and glyphs that read as severity without being vocabulary members (🛑), in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }

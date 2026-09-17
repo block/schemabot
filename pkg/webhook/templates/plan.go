@@ -470,7 +470,7 @@ func attributionStillActionable(data PlanCommentData) bool {
 // that last changed it, never the specific column or index.
 func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "🛑 **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	fmt.Fprintf(sb, glyph.Attention+" **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
 	for _, d := range changes {
 		if d.Unresolved {
 			fmt.Fprintf(sb, "- %s: ownership could not be established; see server logs\n", inlineCode(d.Table))

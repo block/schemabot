@@ -277,7 +277,7 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-🛑 **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
+⚠️ **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
 - `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
 - `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
 
