@@ -315,24 +315,23 @@ clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handle
 
 Every convergence of SchemaBot's own storage — at startup, or on an operator's command — is additive
 unless destroying storage state was explicitly permitted, and decides before it writes. Additivity
-is the whole rule: a statement that loses data and one that removes or renames a schema object
-without losing any are both refusals, because the exposure is the fleet reading that storage, not
-the rows alone. Nothing about which surface asked changes that: an operator's command runs the
+is the whole rule: a statement that loses data and one that removes a schema object without losing
+any are both refusals, because the exposure is the fleet reading that storage, not the rows alone. Nothing about which surface asked changes that: an operator's command runs the
 bootstrap rather than a second implementation of it, converges the schema of the binary running it,
 and cannot narrow the permission a deployment already granted. On MySQL such a statement is refused
-unless destructive storage changes are explicitly allowed, and one whose refused clauses cannot be
-partitioned out is refused *whole*. Refusing the whole statement runs strictly less than any split
-of it, so the fallback can never widen what the bootstrap executes, and startup continues on the
-safe remainder. On PostgreSQL the convergence is additive-only and gates on the entire drift set
-before touching anything, so a change needing manual remediation aborts the pass rather than
-leaving storage half-converged. *Breaks if violated:* the first instance of a rolling deploy drops
-state the rest of the fleet is still reading: a table, a column, or an index the fleet's live
-queries plan around. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
-`pkg/api/ensure_schema_postgres.go`), over the refusal vocabulary in `pkg/ddl/unsafe.go`, which the
-operator-facing storage schema surface calls rather than reimplements
-(`pkg/api/storage_schema.go`); the instance's own storage is the only target a remote caller can
-address, and the deployment's permission is only ever widened, in the adapter that answers for it
-(`pkg/serve/storage_schema.go`).
+unless destructive storage changes are explicitly allowed, and the verdict is the one the plan
+already carries, read rather than re-derived, so the boot refuses exactly what the operator-facing
+plan flagged. The verdict is per statement, so one removal refuses the whole statement and none of
+it runs; startup continues on the statements that were not refused. On PostgreSQL the convergence
+is additive-only and gates on the entire drift set before touching anything, so a change needing
+manual remediation aborts the pass rather than leaving storage half-converged. *Breaks if
+violated:* the first instance of a rolling deploy drops state the rest of the fleet is still
+reading: a table, a column, or an index the fleet's live queries plan around. *Enforced:* the
+per-dialect bootstrappers (`pkg/api/ensure_schema.go`, `pkg/api/ensure_schema_postgres.go`), over
+the unsafe verdict the engine's plan reports (`pkg/engine/spirit/spirit.go`), which the
+operator-facing storage schema surface reads rather than reimplements (`pkg/api/storage_schema.go`);
+the instance's own storage is the only target a remote caller can address, and the deployment's
+permission is only ever widened, in the adapter that answers for it (`pkg/serve/storage_schema.go`).
 
 ### AV-10: Anything the PR can do, the CLI can do
 

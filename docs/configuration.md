@@ -1029,34 +1029,39 @@ on the storage dialect:
 
 The rest of this section describes the MySQL flow.
 
-By default, destructive statements in that diff are refused and skipped. Two
-kinds count as destructive:
+By default, destructive statements in that diff are refused and skipped. A
+statement is destructive when the plan's own linters report an error against it,
+which is the same verdict an operator sees from `schemabot storage plan` and the
+same one Spirit's `--allow-unsafe` gate reads for a user schema change. For the
+storage schema that covers two kinds of statement:
 
 - Statements that lose data — `DROP TABLE`, or an `ALTER TABLE` containing
   `DROP COLUMN`.
-- Statements that remove or rename a schema object without losing any data —
-  `DROP INDEX`, `DROP FOREIGN KEY`, `DROP CHECK`, `DROP CONSTRAINT`, and
-  renames of a table, column, or index. An index drop destroys no rows and
-  completes in milliseconds because it is metadata-only, and it can still take
-  the database down by regressing the plan of a query the rest of the fleet is
+- Statements that remove an index. An index drop destroys no rows and completes
+  in milliseconds because it is metadata-only, and it can still take the
+  database down by regressing the plan of a query the rest of the fleet is
   running.
 
-A mixed `ALTER TABLE` is split: its additive clauses still execute and only the
-destructive clauses are refused, except that a clause which cannot run
-without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change,
-the `ADD INDEX` half of an index redefinition, or the `ADD COLUMN` half of a
-column redefinition) is refused with it. The
-remaining non-destructive statements still apply and startup proceeds. This
-protects against rolling deploys and rollbacks: a pod running an older binary
-sees a newer binary's tables, columns, and indexes as surplus, and without the
-gate would remove them from under the pods that depend on them. Each refused
-statement is logged at warn level with the exact DDL, and counted in the
-`schemabot.storage_schema.destructive_refusals_total` metric.
+Both arrive from the same cause: the live storage database holds a table,
+column, or index that the starting binary's embedded schema does not declare.
+Nothing else in the diff can be unsafe, because the storage schema declares no
+foreign keys, check constraints, or named constraints to drop, and a declarative
+diff expresses no renames.
 
-To intentionally remove or rename any of these objects, first make sure every
-running pod is on a binary whose embedded schema no longer declares what is
-going away: the table, column, index, foreign key, check, or constraint being
-dropped, or the old name of the one being renamed. Then opt in:
+The verdict is per statement, not per clause, the same answer Spirit's plan gate
+gives a mixed `ALTER TABLE`. SchemaBot's differ emits one combined `ALTER` per
+table, so an `ALTER` carrying an additive clause beside a drop is refused entire
+and none of it runs: the additive clause waits for an operator rather than
+executing beside a refusal. The statements that were not refused still apply and
+startup proceeds. This protects against rolling deploys and rollbacks: a pod
+running an older binary sees a newer binary's tables, columns, and indexes as
+surplus, and without the gate would remove them from under the pods that depend
+on them. Each refused statement is logged at warn level with the exact DDL, and
+counted in the `schemabot.storage_schema.destructive_refusals_total` metric.
+
+To intentionally remove any of these objects, first make sure every running pod
+is on a binary whose embedded schema no longer declares the table, column, or
+index that is going away. Then opt in:
 
 ```yaml
 storage:

@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
@@ -43,6 +44,35 @@ func TestEnsureSchema(t *testing.T) {
 	// rely on it.
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", "apply_operation_id"),
 		"tasks.apply_operation_id column not found")
+}
+
+// A cold bootstrap must refuse nothing. The refusal gate reads the plan's
+// unsafe verdict, which the engine sets when any of its linters reports an
+// error against a statement — not only the removals this gate exists to stop.
+// So a new embedded schema file that trips any other error-level rule would be
+// refused rather than created, and because refusing is deliberately not a
+// startup failure, the table would simply never exist while every pod reported
+// a healthy boot. Walking the embedded schema rather than a hand-listed set of
+// tables is what makes that fail here, at the point the file is added.
+func TestEnsureSchema_ColdBootstrapCreatesEveryEmbeddedTable(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+
+	require.NoError(t, EnsureSchema(sdb.DSN, logger), "cold EnsureSchema failed")
+
+	entries, err := schema.MySQLFS.ReadDir("mysql")
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "the embedded MySQL schema must not be empty")
+	for _, entry := range entries {
+		table := strings.TrimSuffix(entry.Name(), ".sql")
+		assert.True(t, testutil.TableExists(t, db, sdb.Name, table),
+			"embedded schema declares %s, so a cold bootstrap must create it", table)
+	}
+
+	assert.NotContains(t, logBuf.String(), "refusing destructive storage-schema change",
+		"nothing in the embedded schema may be refused against an empty database")
 }
 
 func TestEnsureSchema_Idempotent(t *testing.T) {
@@ -323,10 +353,11 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 // When the live storage database drifts from the embedded schema on the same
 // table in both directions — it misses a column the starting binary requires
 // and holds a surplus column a newer binary wrote — Spirit's diff emits one
-// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. EnsureSchema must
-// split that statement: the required column is added so the binary can run,
-// while the destructive clause is refused and the surplus column survives.
-func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
+// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. The whole statement
+// is refused: the surplus column survives, the missing column is not added,
+// and startup continues. Converging the additive half would mean running part
+// of a statement the policy refused, so the table waits for an operator.
+func TestEnsureSchema_RefusesMixedAlterWhole(t *testing.T) {
 	ctx := t.Context()
 	var logBuf syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -345,25 +376,26 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 
 	require.NoError(t, EnsureSchema(dsn, logger),
-		"EnsureSchema with a mixed additive/destructive ALTER must not fail startup")
+		"a refused mixed ALTER must not fail startup")
 
-	// The required column was added; the surplus column survived.
-	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
-		"missing embedded column must be added even when the same ALTER carries destructive clauses")
+	// Nothing in the statement ran: the surplus column survived and the missing
+	// one is still missing.
+	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"a refused statement runs in full or not at all, so its additive clause waits for an operator")
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn),
 		"surplus column from the newer schema must not be dropped by default")
 
-	// The refusal names only the destructive clauses, not the additive ones,
-	// and carries the combined ALTER it was split from.
+	// The refusal carries the whole statement and the opt-in, which is what an
+	// operator needs to see that the additive clause is waiting on it.
 	logs := logBuf.String()
-	assert.Contains(t, logs, "refusing destructive clauses of a mixed storage-schema ALTER")
-	assert.Contains(t, logs, "split_from_ddl")
+	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
 	assert.Contains(t, logs, surplusColumn)
+	assert.Contains(t, logs, missingColumn)
 
-	// A repeat run converges: the additive work is done, the destructive
-	// remainder keeps being refused without error.
-	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
-	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	// A repeat run refuses the same statement without error or changes.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a refused mixed ALTER failed")
+	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn))
 }
 
@@ -455,11 +487,11 @@ func TestEnsureSchema_RefusesIndexDropByDefault(t *testing.T) {
 
 // Spirit's diff emits one combined ALTER per table, so an index drop reaches
 // the bootstrap bundled with whatever else that table drifted by — here a
-// column the starting binary requires. EnsureSchema must split the statement:
-// the column is added so the binary can run, and the index drop is refused out
-// of the middle of the same ALTER rather than riding along with the clauses
-// that execute.
-func TestEnsureSchema_MixedAlterRefusesIndexDropAndAddsColumn(t *testing.T) {
+// column the starting binary requires. The index drop is what makes the whole
+// statement destructive, so none of it runs: the index survives intact, which
+// is the refusal's whole purpose, and the column beside it waits for an
+// operator rather than executing out of a statement that was refused.
+func TestEnsureSchema_RefusesMixedIndexDropAlterWhole(t *testing.T) {
 	ctx := t.Context()
 	var logBuf syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -478,24 +510,24 @@ func TestEnsureSchema_MixedAlterRefusesIndexDropAndAddsColumn(t *testing.T) {
 	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 
 	require.NoError(t, EnsureSchema(dsn, logger),
-		"EnsureSchema with a mixed additive/index-drop ALTER must not fail startup")
+		"a refused mixed ALTER must not fail startup")
 
-	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
-		"missing embedded column must be added even when the same ALTER carries an index drop")
+	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"a refused statement runs in full or not at all, so its additive clause waits for an operator")
 	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
-		"the index drop must be refused out of the mixed ALTER, leaving the index intact")
+		"a surplus index must survive intact: dropping it loses no data but can regress the fleet's query plans")
 
-	// The refusal names only the destructive clause and carries the combined
-	// ALTER it was split from.
+	// The refusal carries the whole statement, so an operator can see both what
+	// was protected and what is waiting on them.
 	logs := logBuf.String()
-	assert.Contains(t, logs, "refusing destructive clauses of a mixed storage-schema ALTER")
-	assert.Contains(t, logs, "split_from_ddl")
+	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
 	assert.Contains(t, logs, surplusIndexName)
+	assert.Contains(t, logs, missingColumn)
 
-	// A repeat run converges: the additive work is done, the index drop keeps
-	// being refused without error.
-	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
-	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	// A repeat run refuses the same statement without error or changes.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a refused mixed ALTER failed")
+	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
 }
 

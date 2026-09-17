@@ -55,18 +55,16 @@ type ensureSchemaOptions struct {
 }
 
 // WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
-// destructive DDL against the storage database — a statement that loses data
-// (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) or one that removes
-// or renames a schema object without losing any (DROP INDEX, DROP FOREIGN KEY,
-// DROP CHECK, DROP CONSTRAINT, and renames). It defaults to false: destructive
-// statements are refused while the remaining non-destructive statements still
-// apply. A mixed ALTER TABLE is split so its safe clauses execute and only the
-// destructive clauses — plus any clause that cannot run without them, such as
-// the ADD PRIMARY KEY behind a refused DROP PRIMARY KEY — are refused.
+// destructive DDL against the storage database — any statement the plan's own
+// linters report an error against, which for the storage schema means one that
+// loses data (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) and one
+// that removes an index. It defaults to false: those statements are refused
+// while the rest of the diff still applies. The verdict is per statement, so a
+// mixed ALTER carrying an additive clause beside a drop is refused entire.
 //
 // This is the only way to have the bootstrap execute one of those statements,
-// so removing a table, column, index, or constraint from the embedded schema
-// on purpose means setting this flag or running the DDL by hand. That is the
+// so removing a table, column, or index from the embedded schema on purpose
+// means setting this flag or running the DDL by hand. That is the
 // intended trade: a surplus index left in place costs write throughput, while
 // one dropped out from under the fleet's live queries costs availability.
 // Wire this from StorageConfig.AllowDestructiveSchemaChanges.
@@ -137,19 +135,17 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 // under the lock to confirm changes are still needed (another pod may have
 // applied them while we waited for the lock).
 //
-// Destructive statements in the diff — those that lose data (DROP TABLE, or an
-// ALTER TABLE containing DROP COLUMN) and those that remove or rename a schema
-// object without losing any (DROP INDEX and the other structural drops,
-// renames) — are refused unless WithAllowDestructiveSchemaChanges(true) is set.
-// A mixed ALTER TABLE is split so its safe clauses (an ADD COLUMN the
-// starting binary needs) still execute and only its destructive clauses are
-// refused. The remaining non-destructive statements apply,
-// and startup proceeds — a deliberate exception to fail-closed, because
-// failing here would crash-loop every pod running an older binary during a
-// rolling deploy or rollback where storage state was legitimately removed. The
+// Destructive statements in the diff — those the plan's linters report an error
+// against, which for the storage schema means losing data (DROP TABLE, or an
+// ALTER TABLE containing DROP COLUMN) or removing an index — are refused unless
+// WithAllowDestructiveSchemaChanges(true) is set. A refused statement does not
+// run at all, so a mixed ALTER's additive clause waits for an operator with the
+// drop it came bundled with. The statements that were not refused apply, and
+// startup proceeds — a deliberate exception to fail-closed, because failing
+// here would crash-loop every pod running an older binary during a rolling
+// deploy or rollback where storage state was legitimately removed. The
 // invariant is that an old binary can never destroy newer schema state: the
-// surplus table, column, index, or constraint stays in place until an operator
-// opts in.
+// surplus table, column, or index stays in place until an operator opts in.
 func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
 	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
 	defer cancel()
@@ -266,14 +262,11 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	changes := planResult.Changes
 	if !o.allowDestructive {
-		allowed, refused, err := partitionDestructiveChanges(changes)
-		if err != nil {
-			return fmt.Errorf("classify storage schema changes: %w", err)
-		}
+		allowed, refused := partitionDestructiveChanges(changes)
 		for _, r := range refused {
-			scope, message, attrs := r.refusalTelemetry()
+			message, attrs := r.refusalTelemetry()
 			logger.Warn(message, attrs...)
-			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation), scope)
+			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation))
 		}
 		if len(allowed) == 0 {
 			logger.Warn("all planned storage schema changes are destructive and refused; storage schema left unchanged",
@@ -373,126 +366,76 @@ func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Lo
 }
 
 // refusedStorageChange is a planned storage-schema statement EnsureSchema
-// refused to execute, with the reason it was classified as unsafe.
+// refused to execute, with the reason the plan classified it as unsafe.
 type refusedStorageChange struct {
 	change engine.TableChange
 	reason string
-	// splitFrom is the combined ALTER TABLE statement the refused clauses
-	// were split out of; empty when the whole statement was refused.
-	splitFrom string
-	// splitErr is the error that prevented partitioning an unsafe ALTER into
-	// safe and destructive clauses; when set, the statement was refused whole
-	// so no clause of it executed.
-	splitErr error
 }
 
 // refusalTelemetry returns the operator-facing telemetry for one refusal: the
-// metrics scope saying whether any of the statement still ran, the warning to
-// log, and its structured attributes. A split refusal carries the combined
-// ALTER its destructive clauses were split out of; a whole refusal of an
-// unsplittable ALTER carries the error that prevented the split.
-func (r refusedStorageChange) refusalTelemetry() (scope, message string, attrs []any) {
-	attrs = []any{
-		"database", storageSchemaNamespace,
-		"table", r.change.Table,
-		"operation", ddl.StatementTypeToOp(r.change.Operation),
-		"reason", r.reason,
-		"ddl", r.change.DDL,
-	}
-	switch {
-	case r.splitErr != nil:
-		return metrics.StorageSchemaRefusalWhole,
-			"refusing an unsafe storage-schema ALTER whole because its clauses could not be partitioned; no clause of it will run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-			append(attrs, "split_error", r.splitErr)
-	case r.splitFrom != "":
-		return metrics.StorageSchemaRefusalSplit,
-			"refusing destructive clauses of a mixed storage-schema ALTER; the destructive clauses will not run, the safe clauses still execute, and startup continues — set storage.allow_destructive_schema_changes: true to allow them",
-			append(attrs, "split_from_ddl", r.splitFrom)
-	default:
-		return metrics.StorageSchemaRefusalWhole,
-			"refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-			attrs
-	}
+// warning to log, and its structured attributes. The DDL is the whole statement
+// that was refused, because the whole statement is what did not run.
+func (r refusedStorageChange) refusalTelemetry() (message string, attrs []any) {
+	return "refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
+		[]any{
+			"database", storageSchemaNamespace,
+			"table", r.change.Table,
+			"operation", ddl.StatementTypeToOp(r.change.Operation),
+			"reason", r.reason,
+			"ddl", r.change.DDL,
+		}
 }
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
-// statements safe to execute and the destructive statements to refuse, using
-// the storage bootstrap's vocabulary (ddl.StorageDestructiveStatement). That
-// vocabulary is Spirit's unsafe set — every statement its UnsafeLinter flags
-// as destroying data: dropping a table, column, partition, or primary key,
-// truncating or coalescing partitions, discarding a tablespace — plus the
-// statements that remove or rename a schema object while losing nothing:
-// dropping an index, a foreign key, or a named constraint, and renaming a
-// table, column, or index. The bootstrap's exposure is availability, not data
-// loss, and an index the fleet's live queries plan around is as load-bearing
-// as a column. A statement Spirit's parser cannot classify fails startup
-// rather than executing unclassified: a classification failure can land on a
-// statement the starting binary needs — an additive ALTER in a syntax a
-// bumped parser trips on — and skipping it would trade a loud startup
-// failure for a missing column at query time. The Spirit diff emits a
-// destructive statement when the live storage database holds a table, column,
-// index, or constraint the starting binary's embedded schema does not declare
-// — during a rolling deploy or rollback that surplus state usually belongs to
-// a newer binary, not to a removal the operator intended. Spirit's diff emits
-// one combined ALTER per table, so a destructive ALTER that also carries
-// additive clauses is split (ddl.SplitStorageDestructiveAlter): the safe
-// clauses the starting binary needs still execute, and only the destructive
-// clauses are refused. Clauses that cannot run without a refused clause (the
-// ADD half of a primary-key or index redefinition) are refused with it, so the
-// executed remainder is always independently runnable. A split that cannot be
-// performed falls back to refusing the statement whole rather than failing
-// startup — the opposite disposition from a classification failure, because a
-// split failure only ever happens on a statement already classified
-// destructive: the starting binary demonstrably does not need it, so refusing
-// it whole is the established answer, and it executes strictly less than any
-// split would, so the failed split cannot widen what the bootstrap executes.
-// Startup survives it, where failing would crash-loop every pod whose pending
-// ALTER the splitter cannot partition.
-func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
+// statements safe to execute and the unsafe statements to refuse, on the
+// verdict the plan already carries.
+//
+// That verdict is the engine's, not this package's. Planning runs Spirit's
+// linter registry over the diff alongside the live schema it was diffed
+// against, and marks a change unsafe when any linter reports an error against
+// it. Re-deriving a verdict here from the statement text would answer a
+// narrower question than the plan already answered, and would answer it without
+// the live schema — so a statement the plan knows is unsafe would execute
+// because this package's vocabulary did not recognize it. Whatever the registry
+// errors on is what the bootstrap refuses, which is how the operator-facing
+// plan surface and the boot that follows it stay in agreement.
+//
+// The bootstrap's exposure is availability, not data loss alone. An index the
+// fleet's live queries plan around is as load-bearing as a column: dropping it
+// destroys no rows and completes in milliseconds because it is metadata-only,
+// and it can still take the storage database down. The registry's error set
+// spans both, so the same gate covers both.
+//
+// A statement is refused whole, because the verdict is per statement. Spirit's
+// diff emits one combined ALTER per table, so an ALTER carrying an additive
+// clause beside a drop is refused entire and none of it runs, which is the
+// answer Spirit's own plan gate gives a mixed ALTER. Executing part of a
+// statement would mean deciding which clauses can run without the refused
+// ones, a policy Spirit does not have and one whose failure mode is a
+// statement the database rejects on a duplicate name, taking down the
+// convergence the refusal exists to keep working.
+//
+// The diff emits an unsafe statement when the live storage database holds a
+// table, column, or index the starting binary's embedded schema does not
+// declare. During a rolling deploy or rollback that surplus state
+// usually belongs to a newer binary, not to a removal the operator intended.
+func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange) {
 	for _, sc := range changes {
 		kept := sc
 		kept.TableChanges = nil
 		for _, tc := range sc.TableChanges {
-			destructive, reason, err := ddl.StorageDestructiveStatement(tc.DDL)
-			if err != nil {
-				return nil, nil, fmt.Errorf("classify storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
-			}
-			if !destructive {
+			if !tc.IsUnsafe {
 				kept.TableChanges = append(kept.TableChanges, tc)
 				continue
 			}
-			if tc.Operation == ddl.StatementAlterTable {
-				safeDDL, destructiveDDL, splitErr := ddl.SplitStorageDestructiveAlter(tc.DDL)
-				if splitErr != nil {
-					// Refusing the statement whole executes strictly less
-					// than any split would, so the failed split cannot widen
-					// what the bootstrap executes — and startup proceeds,
-					// which is the reason this path exists. The caller logs
-					// the fallback with the split error.
-					refused = append(refused, refusedStorageChange{change: tc, reason: reason, splitErr: splitErr})
-					continue
-				}
-				if safeDDL != "" {
-					// A mixed ALTER: execute the clauses that remove nothing and
-					// refuse only the destructive remainder. The caller logs the
-					// refusal with the destructive clauses' exact DDL.
-					keptChange := tc
-					keptChange.DDL = safeDDL
-					kept.TableChanges = append(kept.TableChanges, keptChange)
-					refusedChange := tc
-					refusedChange.DDL = destructiveDDL
-					refused = append(refused, refusedStorageChange{change: refusedChange, reason: reason, splitFrom: tc.DDL})
-					continue
-				}
-			}
 			// The caller logs each refusal with the exact DDL and reason.
-			refused = append(refused, refusedStorageChange{change: tc, reason: reason})
+			refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
 		}
 		if len(kept.TableChanges) > 0 {
 			allowed = append(allowed, kept)
 		}
 	}
-	return allowed, refused, nil
+	return allowed, refused
 }
 
 // flatTableChanges returns all table changes across the given schema changes.
