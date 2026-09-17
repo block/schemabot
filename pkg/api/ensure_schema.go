@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -136,15 +137,33 @@ func WithConvergenceTimeout(d time.Duration) EnsureSchemaOption {
 // adding a dialect means adding a bootstrapper here, not threading
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
+	// Background, not a caller's context, and the signature is what enforces
+	// it: a boot has nobody to hang up on it, and there is no context a pod's
+	// startup could pass that should be able to abandon a table copy partway.
+	// The convergence budget is the only thing that stops this one.
+	return ensureSchema(context.Background(), dsn, logger, opts...)
+}
+
+// ensureSchema is EnsureSchema with a caller's context, for the one path that
+// has a caller: an operator sitting in front of a convergence they asked for.
+// parent is what lets them stop it — Ctrl-C at the terminal reaches the DDL
+// through here — and the convergence budget still bounds it either way.
+//
+// Nothing else should reach this. A convergence is the one write the storage
+// bootstrap makes to the database every instance depends on, and a context
+// that belongs to a request, a webhook, or an RPC can be cancelled by a
+// network blip. Callers on those paths pass context.WithoutCancel so only
+// their own deliberate stop can reach it.
+func ensureSchema(parent context.Context, dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
 	o := newEnsureSchemaOptions(opts...)
 	if o.convergenceTimeout <= 0 {
 		return fmt.Errorf("converge storage schema: convergence timeout must be positive, got %s", o.convergenceTimeout)
 	}
 	switch o.dialect {
 	case schema.DialectMySQL:
-		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
+		return ensureMySQLSchema(parent, dsn, logger, o, namedlock.MySQL{})
 	case schema.DialectPostgres:
-		return ensurePostgresSchema(dsn, logger, o, namedlock.Postgres{})
+		return ensurePostgresSchema(parent, dsn, logger, o, namedlock.Postgres{})
 	default:
 		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}
@@ -172,11 +191,8 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 // rolling deploy or rollback where a storage table or column was legitimately
 // removed. The invariant is that an old binary can never destroy newer schema
 // state: the surplus table or column stays in place until an operator opts in.
-func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	// Built from Background rather than from a caller's context: a convergence
-	// that has started must run to a state the next diff can describe, so a
-	// caller hanging up stops it waiting for the answer, never the DDL.
-	ctx, cancel := context.WithTimeout(context.Background(), o.convergenceTimeout)
+func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
+	ctx, cancel := context.WithTimeout(parent, o.convergenceTimeout)
 	defer cancel()
 
 	// Diagnostic preamble: log the actual database target and current state
@@ -346,7 +362,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 			// ("...context canceled"); name the timeout instead so the cause
 			// is clear from the message line alone.
 			if ctx.Err() != nil {
-				return ensureSchemaTimeoutError(ctx, o.convergenceTimeout, len(tableChanges), logger)
+				return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, len(tableChanges), logger)
 			}
 			return fmt.Errorf("check progress: %w", err)
 		}
@@ -380,6 +396,55 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 		"duration", time.Since(applyStart),
 	)
 	return nil
+}
+
+// stopConvergence ends a convergence whose context is gone: it releases what
+// the schema change engine was holding, then reports why the run ended.
+//
+// The engine is cancelled rather than dropped, so the shadow table of the
+// statement that was in flight goes with it. Leaving it behind would not
+// corrupt anything — the next boot's stale-table cleanup reclaims it — but it
+// would sit on the storage database until then, holding disk and shadowing a
+// table name the next convergence wants to use.
+func stopConvergence(ctx context.Context, eng engine.Engine, dsn string, budget time.Duration, ddlCount int, logger *slog.Logger) error {
+	// The engine's own cancel path drops the artifacts on a context that
+	// outlives this one, so it runs to completion on the context that just
+	// ended. A failure here is not the operator's finding — the convergence
+	// stopping is — so it is logged with what it leaves behind rather than
+	// returned in place of the reason the run ended.
+	if _, err := eng.Cancel(ctx, &engine.ControlRequest{
+		Database:    storageSchemaNamespace,
+		Credentials: &engine.Credentials{DSN: dsn},
+	}); err != nil {
+		logger.Warn("could not release the stopped storage schema change's artifacts; the next boot's stale-table cleanup will reclaim them",
+			"database", storageSchemaNamespace, "error", err)
+	}
+	return convergenceStopReason(ctx, budget, ddlCount, logger)
+}
+
+// convergenceStopReason says which of the two ways a convergence's context
+// ended. They leave the same storage state and are opposite findings: a budget
+// that fired is a database too slow to converge inside the time it was given,
+// and a cancellation is somebody deciding not to wait.
+//
+// Only the deliberate path can produce the second. A boot's convergence runs
+// on a context nothing but its own budget can end, so a pod that reports this
+// is reporting something that should not have been possible.
+func convergenceStopReason(ctx context.Context, budget time.Duration, ddlCount int, logger *slog.Logger) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return ensureSchemaTimeoutError(ctx, budget, ddlCount, logger)
+	}
+	// Not a failure of the storage, and it names no budget: nothing timed out,
+	// and an operator sent looking for a timeout that never fired is an
+	// operator not reading the state they actually left. What they need is the
+	// next command — statements that finished before the stop stay finished,
+	// so "how far did it get" is a question only another plan answers.
+	logger.Warn("storage schema convergence stopped by its caller",
+		"database", storageSchemaNamespace,
+		"ddl_count", ddlCount,
+	)
+	return fmt.Errorf("storage schema convergence stopped (%d change(s) planned); statements that had already finished are still applied, so plan the storage schema again to see what is left: %w",
+		ddlCount, ctx.Err())
 }
 
 // ensureSchemaTimeoutError builds and logs the error returned when the
@@ -693,8 +758,15 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 		// lock wait (which starts later, with the same duration), so a
 		// contended timeout surfaces here as a context error — name the
 		// likely cause instead of reporting only the raw cancellation.
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+		}
+		if ctx.Err() != nil {
+			// Stopped by the operator watching it, before the lock was ever
+			// taken. Nothing ran, and saying so is the whole answer: the run
+			// they stopped changed nothing, and the one they were queued
+			// behind is still going.
+			return nil, fmt.Errorf("stopped while waiting for advisory lock %q; this run changed nothing, and the convergence it was queued behind is still running: %w", ensureSchemaLockName, err)
 		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}

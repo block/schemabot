@@ -40,8 +40,8 @@ import (
 //	catalog reads      o.postgresStatementTimeout   ordinary queries
 //	convergence DDL    postgresBootstrapDDLBudget (per transaction)
 //	advisory-lock wait none — must be free to block for the leader
-func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), o.convergenceTimeout)
+func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
+	ctx, cancel := context.WithTimeout(parent, o.convergenceTimeout)
 	defer cancel()
 
 	tables, files, err := readEmbeddedPostgresSchemaFiles()
@@ -174,7 +174,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 			// that one table's work is pathological, while a small share of a
 			// spent deadline means the earlier tables consumed it and the
 			// deadline is simply too short for the drift set.
-			if ctx.Err() != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				logger.Error("storage schema change did not complete within the convergence budget; SchemaBot storage will not initialize",
 					"database", database,
 					"table", table,
@@ -185,6 +185,20 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 				)
 				return fmt.Errorf("converge storage table %q: convergence did not finish within its budget (%s): %w",
 					table, o.convergenceTimeout, err)
+			}
+			if ctx.Err() != nil {
+				// Stopped by the operator watching it, which only the deliberate
+				// path can do. No budget is named, because none fired — naming
+				// one sends them looking for a timeout that did not happen.
+				// Each table converges in its own transaction, so the one in
+				// flight rolled back whole and the tables before it stand.
+				logger.Warn("storage schema convergence stopped by its caller",
+					"database", database,
+					"table", table,
+					"elapsed", time.Since(applyStart),
+				)
+				return fmt.Errorf("converge storage table %q: convergence stopped; its own statements rolled back and the tables converged before it are still converged, so plan the storage schema again to see what is left: %w",
+					table, err)
 			}
 			return fmt.Errorf("converge storage table %q: %w", table, err)
 		}
@@ -961,8 +975,15 @@ func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *sl
 		// lock wait (which starts later, with the same duration), so a
 		// contended timeout surfaces here as a context error — name the
 		// likely cause instead of reporting only the raw cancellation.
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+		}
+		if ctx.Err() != nil {
+			// Stopped by the operator watching it, before the lock was ever
+			// taken. Nothing ran, and saying so is the whole answer: the run
+			// they stopped changed nothing, and the one they were queued
+			// behind is still going.
+			return nil, fmt.Errorf("stopped while waiting for advisory lock %q; this run changed nothing, and the convergence it was queued behind is still running: %w", ensureSchemaLockName, err)
 		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}

@@ -140,11 +140,23 @@ func storageApplyOptions(opts []EnsureSchemaOption) []EnsureSchemaOption {
 // does not declare, which is the expected steady state during a rollback
 // (AV-9) rather than a failure.
 //
-// ctx bounds the two diffs, not the convergence between them: EnsureSchema
-// builds its own context from the convergence budget so that a cancelled
-// request cannot abandon a table copy half-done. A caller whose own deadline is
-// shorter than that budget will therefore return before the convergence does,
-// and must not read its own timeout as the apply having stopped.
+// ctx bounds the whole run, the convergence included, and cancelling it stops
+// the DDL rather than only the wait for it. That is what makes this the
+// deliberate path: an operator watching a convergence they asked for can stop
+// it, and an operator is the only caller who should be able to. Every other
+// caller — an RPC handler, a webhook, anything holding a context a network
+// blip can cancel — passes context.WithoutCancel, because losing a connection
+// is not a decision to abandon a table copy partway.
+//
+// A stopped convergence leaves the storage in a state the next diff describes:
+// the statements that finished stay finished, the one in flight is cancelled
+// and its shadow table dropped, and the ones after it never ran. So the answer
+// to "what did that leave" is another plan, never an inference from where the
+// run got to.
+//
+// The convergence budget bounds ctx rather than the other way round. A caller
+// whose own deadline is shorter returns before the convergence does — with the
+// convergence stopped, not still running behind it.
 //
 // That budget defaults to DefaultStorageApplyTimeout here rather than to the
 // boot budget, and the default belongs on this function rather than on each of
@@ -189,7 +201,7 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 		"destructive_allowed", planned.DestructiveAllowed,
 		"convergence_timeout", newEnsureSchemaOptions(opts...).convergenceTimeout,
 	)
-	if err := EnsureSchema(dsn, logger, opts...); err != nil {
+	if err := ensureSchema(ctx, dsn, logger, opts...); err != nil {
 		return planned, nil, fmt.Errorf("converge storage schema on database %q (%s): %w", planned.Database, planned.Dialect, err)
 	}
 
