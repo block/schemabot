@@ -53,11 +53,11 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 	return data
 }
 
-// operationDisplay is the per-operation engine display projection surfaced in the
-// PR comment: the statement position and the running statement's server-side
-// work from the operation's durable progress metadata, and — for PlanetScale —
-// VSchema application state and the deploy-request URL from the engine resume
-// metadata.
+// operationDisplay is the per-operation projection surfaced in the PR comment:
+// the statement position and the running statement's server-side work from the
+// operation's durable progress metadata, the plan the operation runs when its
+// siblings run others, and — for PlanetScale — VSchema application state and the
+// deploy-request URL from the engine resume metadata.
 type operationDisplay struct {
 	VSchema          []apitypes.VSchemaChange
 	DeployRequestURL string
@@ -71,12 +71,17 @@ type operationDisplay struct {
 	// BuildWork is the server-reported work for the statement in flight, as
 	// last persisted by the driver. Zero when the engine reports none.
 	BuildWork apitypes.BuildWork
+	// PlanIdentifier is the user-facing identifier of the plan this operation
+	// runs, resolved only when the apply's members run more than one distinct
+	// plan (see resolvePlanIdentifiers). Empty everywhere else.
+	PlanIdentifier string
 }
 
 // isZero reports whether the projection carries nothing worth rendering.
 func (d operationDisplay) isZero() bool {
 	return len(d.VSchema) == 0 && d.DeployRequestURL == "" && d.RevertExpiresAt == "" &&
-		d.Step == (apitypes.ProgressStep{}) && d.BuildWork == (apitypes.BuildWork{})
+		d.Step == (apitypes.ProgressStep{}) && d.BuildWork == (apitypes.BuildWork{}) &&
+		d.PlanIdentifier == ""
 }
 
 // resolveDisplayByOperation projects each operation's engine display state from
@@ -92,6 +97,7 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 	if apply == nil || len(ops) == 0 {
 		return nil
 	}
+	planIdentifiers := resolvePlanIdentifiers(ctx, stor, apply, ops)
 	var byOp map[int64]operationDisplay
 	for _, op := range ops {
 		progress, err := storedProgressOf(op)
@@ -99,7 +105,7 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 			slog.Warn("comment will omit the malformed part of the statement progress",
 				append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		}
-		od := operationDisplay{Step: progress.Step, BuildWork: progress.BuildWork}
+		od := operationDisplay{Step: progress.Step, BuildWork: progress.BuildWork, PlanIdentifier: planIdentifiers[op.ID]}
 		if apply.Engine == storage.EnginePlanetScale {
 			od.VSchema, od.DeployRequestURL, od.RevertExpiresAt = planetScaleDisplay(ctx, stor, apply, op)
 		}
@@ -112,6 +118,83 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 		byOp[op.ID] = od
 	}
 	return byOp
+}
+
+// resolvePlanIdentifiers returns the user-facing identifier of the plan each
+// operation runs, keyed by operation id, so a member's section can name the plan
+// it came from. Members planned together share their apply's plan; members
+// planned against their own live schema carry their own.
+//
+// A rollout whose members all run the same plan resolves nothing and reads no
+// plan rows: the identifier would be identical under every member, naming
+// nothing the reader cannot already see, so the work has no reader to serve.
+//
+// Best-effort, like every other enrichment on this path: an unresolvable plan,
+// a load failure, or a missing row leaves that member's section unnamed rather
+// than failing the comment.
+func resolvePlanIdentifiers(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]string {
+	planByOp := planRowIDsByOperation(apply, ops)
+	if distinctPlanCount(planByOp) < 2 {
+		return nil
+	}
+	identifierByPlan := make(map[int64]string, len(planByOp))
+	byOp := make(map[int64]string, len(planByOp))
+	for opID, planID := range planByOp {
+		identifier, resolved := identifierByPlan[planID]
+		if !resolved {
+			identifier = planIdentifierOf(ctx, stor, apply, planID)
+			identifierByPlan[planID] = identifier
+		}
+		if identifier == "" {
+			continue
+		}
+		byOp[opID] = identifier
+	}
+	return byOp
+}
+
+// planRowIDsByOperation maps each operation to the plan row it executes. An
+// operation whose plan cannot be resolved is left out: it is not executable, and
+// the comment names what it can rather than failing over one member.
+func planRowIDsByOperation(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]int64 {
+	byOp := make(map[int64]int64, len(ops))
+	for _, op := range ops {
+		planID, err := storage.PlanIDForOperation(apply, op)
+		if err != nil {
+			slog.Warn("comment will not name this member's plan",
+				append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
+			continue
+		}
+		byOp[op.ID] = planID
+	}
+	return byOp
+}
+
+// distinctPlanCount counts how many different plans a rollout's members run.
+func distinctPlanCount(planByOp map[int64]int64) int {
+	seen := make(map[int64]struct{}, len(planByOp))
+	for _, planID := range planByOp {
+		seen[planID] = struct{}{}
+	}
+	return len(seen)
+}
+
+// planIdentifierOf loads one plan's user-facing identifier, returning "" when it
+// cannot be read. The numeric row id is never rendered: it is confusable with
+// the identifier operators paste into commands.
+func planIdentifierOf(ctx context.Context, stor storage.Storage, apply *storage.Apply, planID int64) string {
+	plan, err := stor.Plans().GetByID(ctx, planID)
+	if err != nil {
+		slog.Warn("comment will not name this member's plan: failed to load the stored plan",
+			append(apply.LogAttrs(), "error", err)...)
+		return ""
+	}
+	if plan == nil {
+		slog.Warn("comment will not name this member's plan: stored plan row not found",
+			apply.LogAttrs()...)
+		return ""
+	}
+	return plan.PlanIdentifier
 }
 
 // storedProgress is the statement progress an operation's driver last persisted:
