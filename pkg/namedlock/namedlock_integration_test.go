@@ -254,3 +254,79 @@ func TestLockAutoReleasedWhenSessionEnds(t *testing.T) {
 		})
 	}
 }
+
+// HeldByAnySession reports a lock held by a different session, which is the
+// only case it exists for: the holder is another instance, converging storage
+// right now, and the probe runs on a connection that has nothing to do with
+// it. The answer follows the lock through acquire and release, and never
+// reports a name nobody took.
+func TestHeldByAnySessionSeesAnotherSessionsLock(t *testing.T) {
+	for _, tc := range lockerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "namedlock_test_held_by_any"
+
+			observer := openLockConn(t, tc.driver, tc.dsn)
+			held, err := tc.locker.HeldByAnySession(t.Context(), observer, name)
+			require.NoError(t, err)
+			require.False(t, held, "a lock nobody has taken is not held")
+
+			holder := openLockConn(t, tc.driver, tc.dsn)
+			acquired, err := tc.locker.Acquire(t.Context(), holder, name, 5*time.Second)
+			require.NoError(t, err)
+			require.True(t, acquired)
+
+			held, err = tc.locker.HeldByAnySession(t.Context(), observer, name)
+			require.NoError(t, err)
+			assert.True(t, held, "another session's lock should be visible to the probe")
+
+			released, err := tc.locker.Release(t.Context(), holder, name)
+			require.NoError(t, err)
+			require.True(t, released)
+
+			held, err = tc.locker.HeldByAnySession(t.Context(), observer, name)
+			require.NoError(t, err)
+			assert.False(t, held, "the probe should follow the lock back down on release")
+		})
+	}
+}
+
+// The probe answers about the lock it was asked for. A different lock held on
+// the same server must not read as this one held — on PostgreSQL the name is
+// hashed to a key and the read goes through a catalog view shared by every
+// advisory lock in the cluster, so the scoping is worth pinning.
+func TestHeldByAnySessionIsPerName(t *testing.T) {
+	for _, tc := range lockerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			holder := openLockConn(t, tc.driver, tc.dsn)
+			acquired, err := tc.locker.Acquire(t.Context(), holder, "namedlock_test_held_name_a", 0)
+			require.NoError(t, err)
+			require.True(t, acquired)
+
+			observer := openLockConn(t, tc.driver, tc.dsn)
+			held, err := tc.locker.HeldByAnySession(t.Context(), observer, "namedlock_test_held_name_b")
+			require.NoError(t, err)
+			assert.False(t, held, "a lock on another name should not read as this one held")
+		})
+	}
+}
+
+// A session's own lock is included. The probe is used where the reader may or
+// may not be the holder and the question is whether a convergence is running
+// at all, so excluding the caller would report "nothing running" to the one
+// caller that knows otherwise.
+func TestHeldByAnySessionIncludesTheCallersOwnLock(t *testing.T) {
+	for _, tc := range lockerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "namedlock_test_held_by_self"
+
+			conn := openLockConn(t, tc.driver, tc.dsn)
+			acquired, err := tc.locker.Acquire(t.Context(), conn, name, 0)
+			require.NoError(t, err)
+			require.True(t, acquired)
+
+			held, err := tc.locker.HeldByAnySession(t.Context(), conn, name)
+			require.NoError(t, err)
+			assert.True(t, held, "the probe should see the lock held on its own session")
+		})
+	}
+}
