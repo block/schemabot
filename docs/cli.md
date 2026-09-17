@@ -35,6 +35,31 @@ credential or address mistakes. To use a different state database, choose a new
 `--runtime` and `--profile`; an existing runtime's durable state is never replaced.
 Use a local filesystem that supports exclusive directory rename for `--schema-dir`.
 
+## Manage a local runtime
+
+`local status` and `local stop` use the selected profile’s local runtime. Profile selection
+follows `--profile`, `SCHEMABOT_PROFILE`, then the configured default. Without any configured
+profile, they use the runtime named `local`.
+
+For a stopped default runtime:
+
+```console
+$ schemabot local status
+{"id":"local","generation":"","binary":"","config":"","version":"","pid":0,"state":"stopped"}
+$ schemabot local stop
+{"state":"stopped"}
+```
+
+An explicit runtime name overrides the profile, including a remote profile:
+
+```console
+$ schemabot local stop my-project
+{"state":"stopped"}
+```
+
+A selected remote or missing profile requires an explicit runtime name or a local profile.
+Neither command starts a runtime. Stopping retains its configuration and durable state.
+
 ## Connect to a server
 
 Install a [released CLI binary](../README.md#releases). If you have not set
