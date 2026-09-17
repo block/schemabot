@@ -16,111 +16,206 @@ import (
 // operator watching a blank terminal cannot tell a slow copy from a stuck one
 // — which is exactly when somebody kills a run that was about to finish.
 //
-// So the direct path prints what the convergence reports, raw. Only the direct
-// path: a convergence reached over the API answers once, when it is done, and
-// there is nothing to stream through a unary response.
+// So the direct path prints what the convergence reports, in the same log mode
+// `schemabot apply --output log` prints: logfmt lines, immediately on a
+// transition and on a heartbeat while something is still moving. An operator
+// who has read one of these has read both, and the same log scrapers work on
+// either.
+//
+// Only the direct path: a convergence reached over the API answers once, when
+// it is done, and there is nothing to stream through a unary response.
 
-// storageProgressMinInterval is the floor between two progress lines that say
-// the same thing in different numbers. Rows copied moves on every poll, and a
-// line per poll is a scrollback an operator cannot read; a line every couple
-// of seconds is enough to see that it is moving.
-const storageProgressMinInterval = 2 * time.Second
-
-// storageProgressPrinter turns a convergence's observations into lines, on the
-// two rules that keep them readable: never print the same line twice in a row,
-// and do not print more often than storageProgressMinInterval — except for a
-// change of state, which is the transition an operator is waiting for and is
-// rare enough to always be worth a line.
+// storageProgressPrinter turns a convergence's observations into log lines.
 //
 // It holds no lock. The convergence calls it from one goroutine, in order,
 // which is the only caller the option promises.
 type storageProgressPrinter struct {
-	out       io.Writer
-	now       func() time.Time
-	lastLine  string
-	lastState string
-	lastAt    time.Time
+	out      io.Writer
+	now      func() time.Time
+	subjects map[string]*storageProgressSubjectLog
 	// stopped is set once a write fails. There is nobody to report a terminal
 	// that has gone away to, and nothing to gain from writing to it again for
 	// the rest of a convergence that is still running either way.
 	stopped bool
 }
 
+// storageProgressSubjectLog is the last thing said about one subject, which is
+// what decides whether the next observation is worth a line.
+type storageProgressSubjectLog struct {
+	status     string
+	detail     string
+	startedAt  time.Time
+	lastEmit   time.Time
+	heartbeats int
+}
+
+// heartbeatInterval is short for the first heartbeat and then settles, so a
+// convergence confirms early that it is moving without filling a scrollback
+// for the rest of an hour-long copy. The intervals are log mode's own.
+func (s *storageProgressSubjectLog) heartbeatInterval() time.Duration {
+	if s.heartbeats == 0 {
+		return logFirstHeartbeat
+	}
+	return logHeartbeatDefault
+}
+
 func newStorageProgressPrinter(out io.Writer) *storageProgressPrinter {
-	return &storageProgressPrinter{out: out, now: time.Now}
+	return &storageProgressPrinter{
+		out:      out,
+		now:      time.Now,
+		subjects: map[string]*storageProgressSubjectLog{},
+	}
 }
 
 func (p *storageProgressPrinter) observe(o api.StorageConvergenceProgress) {
 	if p.stopped {
 		return
 	}
-	line := storageProgressLine(o)
-	if line == "" {
+	for _, subject := range storageProgressSubjects(o) {
+		p.observeSubject(subject)
+	}
+}
+
+// observeSubject decides what one subject's observation is: its first sighting,
+// a transition, a heartbeat, or nothing that has moved since the last line.
+func (p *storageProgressPrinter) observeSubject(s storageProgressSubject) {
+	now := p.now()
+	detail := strings.Join(s.kvs, " ")
+
+	last, seen := p.subjects[s.table]
+	if !seen {
+		last = &storageProgressSubjectLog{startedAt: now}
+		p.subjects[s.table] = last
+		p.emit(now, s, s.announcement())
+		last.status, last.detail, last.lastEmit = s.status, detail, now
 		return
 	}
-	stateChanged := o.State != p.lastState
-	if !stateChanged {
-		if line == p.lastLine {
-			return
-		}
-		if p.now().Sub(p.lastAt) < storageProgressMinInterval {
-			return
-		}
+
+	switch {
+	case s.status != last.status:
+		// The transition is what an operator is waiting for — the copy
+		// finishing, the cutover starting — and there are a handful in a whole
+		// run, so it prints whatever the heartbeat interval says.
+		p.emit(now, s, append(s.transition(), "duration", ui.FormatHumanDuration(now.Sub(last.startedAt))))
+		last.heartbeats = 0
+	case detail == last.detail:
+		// Nothing moved. Ten polls a second that say the same thing are one
+		// thing happening, and it has already been said.
+		return
+	case now.Sub(last.lastEmit) < last.heartbeatInterval():
+		return
+	default:
+		p.emit(now, s, s.heartbeat())
+		last.heartbeats++
 	}
-	p.lastState = o.State
-	p.lastLine = line
-	p.lastAt = p.now()
-	if _, err := fmt.Fprintln(p.out, line); err != nil {
+	last.status, last.detail, last.lastEmit = s.status, detail, now
+}
+
+func (p *storageProgressPrinter) emit(now time.Time, s storageProgressSubject, kvs []string) {
+	kvs = append(kvs, s.kvs...)
+	if _, err := fmt.Fprintln(p.out, logfmtLine(now, kvs...)); err != nil {
 		p.stopped = true
 	}
 }
 
-// storageProgressLine renders one observation, leaving out what the dialect
-// could not say rather than printing a zero for it. An empty line means the
-// observation carried nothing at all, and nothing is what gets printed.
-func storageProgressLine(o api.StorageConvergenceProgress) string {
-	var head string
-	switch {
-	case o.State != "" && o.Percent > 0:
-		head = fmt.Sprintf("%s %d%%", o.State, o.Percent)
-	case o.State != "":
-		head = o.State
-	case o.Percent > 0:
-		head = fmt.Sprintf("%d%%", o.Percent)
-	}
-
-	tables := make([]string, 0, len(o.Tables))
-	for _, t := range o.Tables {
-		if table := storageProgressTable(t); table != "" {
-			tables = append(tables, table)
-		}
-	}
-
-	switch {
-	case head == "" && len(tables) == 0:
-		return ""
-	case len(tables) == 0:
-		return "  " + head
-	case head == "":
-		return "  " + strings.Join(tables, ", ")
-	default:
-		return "  " + head + " · " + strings.Join(tables, ", ")
-	}
+// storageProgressSubject is one thing a line can be about: a table the
+// convergence is working on, or — before any table progress exists — the
+// convergence itself, under an empty name.
+type storageProgressSubject struct {
+	table  string
+	status string
+	// kvs carries the measurements this dialect could take, and only those. A
+	// zero printed as progress=0% is a measurement nobody made, and on
+	// PostgreSQL — which converges a table per transaction and has no partial
+	// state — it would be on every line.
+	kvs []string
 }
 
-func storageProgressTable(t api.StorageConvergenceTableProgress) string {
-	if t.Table == "" {
-		return ""
+// noun names what the line is about, so `table=` stays an identifier rather
+// than carrying the subject too.
+func (s storageProgressSubject) noun() string {
+	if s.table != "" {
+		return "Table"
 	}
-	line := t.Table
-	if t.State != "" {
-		line += " " + t.State
+	return "Convergence"
+}
+
+// announcement is a subject's first line. The state goes in its own key rather
+// than the message, because "started" is the event and the engine's state is a
+// separate fact about it.
+func (s storageProgressSubject) announcement() []string {
+	kvs := []string{"msg", s.noun() + " started"}
+	if s.table != "" {
+		kvs = append(kvs, "table", s.table)
 	}
-	if t.Percent > 0 {
-		line += fmt.Sprintf(" %d%%", t.Percent)
+	if s.status != "" {
+		kvs = append(kvs, "status", s.status)
 	}
-	if t.RowsCopied > 0 {
-		line += fmt.Sprintf(" (%s rows)", ui.FormatNumber(t.RowsCopied))
+	return kvs
+}
+
+// transition puts the new state in the message, which is where log mode reads
+// it from: a state the engine calls "complete" or "failed" is what decides the
+// line's color, and a duplicate status key beside it says nothing new.
+func (s storageProgressSubject) transition() []string {
+	event := s.status
+	if event == "" {
+		// The engine stopped naming a state. That the subject moved is still
+		// worth the line; there is just no word for where it moved to.
+		event = "advanced"
 	}
-	return line
+	kvs := []string{"msg", s.noun() + " " + event}
+	if s.table != "" {
+		kvs = append(kvs, "table", s.table)
+	}
+	return kvs
+}
+
+// heartbeat borrows log mode's wording for a row copy when rows are what moved,
+// so the two surfaces read alike on the line an operator sees most.
+func (s storageProgressSubject) heartbeat() []string {
+	msg := s.noun() + " running"
+	for i := 0; i+1 < len(s.kvs); i += 2 {
+		if s.kvs[i] == "rows_copied" {
+			msg = "Copying rows"
+			break
+		}
+	}
+	kvs := []string{"msg", msg}
+	if s.table != "" {
+		kvs = append(kvs, "table", s.table)
+	}
+	return kvs
+}
+
+// storageProgressSubjects splits an observation into the subjects worth a line.
+// An observation that measured nothing at all yields none, and nothing is what
+// gets printed.
+func storageProgressSubjects(o api.StorageConvergenceProgress) []storageProgressSubject {
+	if len(o.Tables) == 0 {
+		if o.State == "" && o.Percent <= 0 {
+			return nil
+		}
+		s := storageProgressSubject{status: o.State}
+		if o.Percent > 0 {
+			s.kvs = append(s.kvs, "progress", fmt.Sprintf("%d%%", o.Percent))
+		}
+		return []storageProgressSubject{s}
+	}
+
+	subjects := make([]storageProgressSubject, 0, len(o.Tables))
+	for _, t := range o.Tables {
+		if t.Table == "" {
+			continue
+		}
+		s := storageProgressSubject{table: t.Table, status: t.State}
+		if t.Percent > 0 {
+			s.kvs = append(s.kvs, "progress", fmt.Sprintf("%d%%", t.Percent))
+		}
+		if t.RowsCopied > 0 {
+			s.kvs = append(s.kvs, "rows_copied", ui.FormatNumber(t.RowsCopied))
+		}
+		subjects = append(subjects, s)
+	}
+	return subjects
 }

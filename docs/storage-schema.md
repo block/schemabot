@@ -541,21 +541,27 @@ A convergence over a table with a long history is the one that matters and the
 one that takes time. Three things are worth knowing before you start one.
 
 **It reports itself as it goes.** A convergence run against a DSN prints what
-the engine reports, to stderr, so `--json` output stays parseable. Lines are
-deduplicated and rate-limited: identical polls print once, and a change of
-state always prints.
+the engine reports, in the same log mode `schemabot apply --output log` prints:
+logfmt lines, immediately on a transition, and a heartbeat while a copy is
+moving — the first after two seconds, then every ten. Progress goes to stderr,
+so `--json` output stays parseable.
 
 ```console
 $ schemabot storage apply --dsn "$SCHEMABOT_STORAGE_DSN"
 ...
 Do you want to apply these changes to schemabot on db-1.example (mysql)? Only 'yes' will be accepted: yes
-  copying · applies copying (8,192 rows)
-  copying 24% · applies copying 24% (1,203,441 rows)
-  copying 71% · applies copying 71% (3,610,322 rows)
-  cutover 99% · applies ready 99% (5,084,117 rows)
-  completed 100% · applies complete 100% (5,084,117 rows)
+15:04:05 Table started table=applies status=copying progress=1%
+15:04:07 Copying rows table=applies progress=3% rows_copied=180,224
+15:04:17 Copying rows table=applies progress=24% rows_copied=1,203,441
+15:04:27 Copying rows table=applies progress=58% rows_copied=2,941,088
+15:04:39 Table ready table=applies duration=34s progress=99% rows_copied=5,084,117
+15:04:41 Table complete table=applies duration=36s progress=100% rows_copied=5,084,117
 ✓ Ran 1 statement against schemabot on db-1.example. Nothing is outstanding.
 ```
+
+What is missing from a line is a measurement the dialect never took, not a
+zero: PostgreSQL converges a table per transaction and has no partial state, so
+its lines carry the table and its status and nothing about rows.
 
 A convergence reached over the API answers once, when it is done, so it prints
 no progress: there is nothing to stream through a single response. A run you

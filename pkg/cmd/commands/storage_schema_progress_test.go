@@ -12,7 +12,7 @@ import (
 )
 
 // clockedPrinter is a printer over a clock a test moves by hand, so the
-// interval rule can be exercised without any test waiting for it.
+// heartbeat intervals can be exercised without any test waiting for them.
 func clockedPrinter(out *strings.Builder, now *time.Time) *storageProgressPrinter {
 	p := newStorageProgressPrinter(out)
 	p.now = func() time.Time { return *now }
@@ -33,42 +33,53 @@ func TestStorageProgressPrinter_RepeatsPrintOnce(t *testing.T) {
 		clock = clock.Add(100 * time.Millisecond)
 	}
 
-	assert.Equal(t, 1, strings.Count(out.String(), "copying 40%"),
+	assert.Equal(t, 1, strings.Count(out.String(), "progress=40%"),
 		"twenty identical polls are one thing happening, and one line")
 }
 
 // Rows copied moves on every poll, so a line per change would be a line per
 // poll under a different name. Changes that are only numbers wait out the
-// interval.
-func TestStorageProgressPrinter_RateLimitsMovingNumbers(t *testing.T) {
+// heartbeat interval — the first one briefly, for early confirmation, and the
+// rest at log mode's own cadence.
+func TestStorageProgressPrinter_HeartbeatsMovingNumbers(t *testing.T) {
 	var out strings.Builder
 	clock := time.Now()
 	printer := clockedPrinter(&out, &clock)
 
-	for rows := int64(1); rows <= 10; rows++ {
-		printer.observe(api.StorageConvergenceProgress{
+	copying := func(rows int64) api.StorageConvergenceProgress {
+		return api.StorageConvergenceProgress{
 			State:   "copying",
 			Percent: 40,
-			Tables:  []api.StorageConvergenceTableProgress{{Table: "applies", State: "copying", RowsCopied: rows * 1000}},
-		})
+			Tables:  []api.StorageConvergenceTableProgress{{Table: "applies", State: "copying", RowsCopied: rows}},
+		}
+	}
+
+	for rows := int64(1); rows <= 10; rows++ {
+		printer.observe(copying(rows * 1000))
 		clock = clock.Add(100 * time.Millisecond)
 	}
-	require.Equal(t, 1, strings.Count(out.String(), "applies copying"),
-		"a second of row counts is one line")
+	require.Equal(t, 1, strings.Count(out.String(), "table=applies"),
+		"a second of row counts is the announcement and nothing more")
 
-	clock = clock.Add(storageProgressMinInterval)
-	printer.observe(api.StorageConvergenceProgress{
-		State:   "copying",
-		Percent: 40,
-		Tables:  []api.StorageConvergenceTableProgress{{Table: "applies", State: "copying", RowsCopied: 99000}},
-	})
-	assert.Equal(t, 2, strings.Count(out.String(), "applies copying"),
-		"past the interval the numbers are worth a line again, so an operator can see it moving")
+	clock = clock.Add(logFirstHeartbeat)
+	printer.observe(copying(99000))
+	require.Equal(t, 1, strings.Count(out.String(), "Copying rows"),
+		"the first heartbeat comes quickly, so an operator sees early that it is moving")
+
+	clock = clock.Add(logFirstHeartbeat)
+	printer.observe(copying(120000))
+	assert.Equal(t, 1, strings.Count(out.String(), "Copying rows"),
+		"after the first, heartbeats settle to the longer interval")
+
+	clock = clock.Add(logHeartbeatDefault)
+	printer.observe(copying(150000))
+	assert.Equal(t, 2, strings.Count(out.String(), "Copying rows"),
+		"past that interval the numbers are worth a line again")
 }
 
 // A change of state is the transition an operator is waiting for — the copy
 // finishing, the cutover starting — and there are only a handful in a whole
-// run. It prints whatever the interval says.
+// run. It prints whatever the heartbeat interval says.
 func TestStorageProgressPrinter_AlwaysPrintsAStateChange(t *testing.T) {
 	var out strings.Builder
 	clock := time.Now()
@@ -76,59 +87,80 @@ func TestStorageProgressPrinter_AlwaysPrintsAStateChange(t *testing.T) {
 
 	printer.observe(api.StorageConvergenceProgress{State: "copying", Percent: 99})
 	clock = clock.Add(10 * time.Millisecond)
-	printer.observe(api.StorageConvergenceProgress{State: "cutover", Percent: 99})
+	printer.observe(api.StorageConvergenceProgress{State: "cutting_over", Percent: 99})
 
-	assert.Contains(t, out.String(), "copying 99%")
-	assert.Contains(t, out.String(), "cutover 99%",
-		"a state change must not be swallowed by the rate limit")
+	assert.Contains(t, out.String(), "Convergence started")
+	assert.Contains(t, out.String(), "Convergence cutting_over",
+		"a state change must not be swallowed by the heartbeat interval")
 }
 
-// An observation renders what the dialect could say and leaves out what it
-// could not. A zero printed as "0%" is a measurement the convergence never
-// took, and on PostgreSQL — which converges a table per transaction and has no
-// partial state — it would be on every line.
-func TestStorageProgressLine_LeavesOutWhatWasNotMeasured(t *testing.T) {
+// Every line is log mode's own shape — a timestamp and key=value pairs — so an
+// operator who reads `apply --output log` reads this without learning a second
+// format, and the measurements a dialect could not take are simply absent
+// rather than printed as a zero nobody measured.
+func TestStorageProgressPrinter_EmitsLogfmt(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
-		observation api.StorageConvergenceProgress
-		want        string
+		observations []api.StorageConvergenceProgress
+		want         []string
+		absent       []string
 	}{
-		"state and percent": {
-			observation: api.StorageConvergenceProgress{State: "copying", Percent: 40},
-			want:        "  copying 40%",
-		},
-		"state without a measurable percent": {
-			observation: api.StorageConvergenceProgress{
-				State:  "running",
-				Tables: []api.StorageConvergenceTableProgress{{Table: "checks", State: "running"}},
-			},
-			want: "  running · checks running",
-		},
 		"a table mid-copy": {
-			observation: api.StorageConvergenceProgress{
+			observations: []api.StorageConvergenceProgress{{
 				State:   "copying",
 				Percent: 62,
 				Tables: []api.StorageConvergenceTableProgress{
 					{Table: "applies", State: "copying", Percent: 62, RowsCopied: 1203441},
 				},
-			},
-			want: "  copying 62% · applies copying 62% (1,203,441 rows)",
+			}},
+			want: []string{"Table started", "table=applies", "status=copying", "progress=62%", "rows_copied=1,203,441"},
 		},
-		"nothing to say": {
-			observation: api.StorageConvergenceProgress{DDLCount: 3},
-			want:        "",
+		"a dialect with no partial state": {
+			observations: []api.StorageConvergenceProgress{{
+				State:   "running",
+				Percent: 50,
+				Tables:  []api.StorageConvergenceTableProgress{{Table: "checks", State: "running"}},
+			}},
+			want:   []string{"Table started", "table=checks", "status=running"},
+			absent: []string{"progress=", "rows_copied="},
+		},
+		"the convergence before any table progress exists": {
+			observations: []api.StorageConvergenceProgress{{State: "pending", Percent: 3}},
+			want:         []string{"Convergence started", "status=pending", "progress=3%"},
+			absent:       []string{"table="},
+		},
+		"a transition carries how long the subject has been running": {
+			observations: []api.StorageConvergenceProgress{
+				{Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "copying"}}},
+				{Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "complete", Percent: 100}}},
+			},
+			want: []string{"Table complete", "table=applies", "duration=", "progress=100%"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tc.want, storageProgressLine(tc.observation))
+			var out strings.Builder
+			clock := time.Now()
+			printer := clockedPrinter(&out, &clock)
+			for _, o := range tc.observations {
+				printer.observe(o)
+				clock = clock.Add(time.Second)
+			}
+			got := stripANSI(out.String())
+			for _, want := range tc.want {
+				assert.Contains(t, got, want)
+			}
+			for _, absent := range tc.absent {
+				assert.NotContains(t, got, absent,
+					"a measurement this dialect never took must not be printed as a zero")
+			}
 		})
 	}
 }
 
-// An observation carrying nothing prints nothing at all, rather than an empty
-// indented line per poll.
+// An observation carrying nothing prints nothing at all, rather than a bare
+// timestamp per poll.
 func TestStorageProgressPrinter_SaysNothingAboutAnEmptyObservation(t *testing.T) {
 	var out strings.Builder
 	clock := time.Now()
@@ -137,4 +169,34 @@ func TestStorageProgressPrinter_SaysNothingAboutAnEmptyObservation(t *testing.T)
 	printer.observe(api.StorageConvergenceProgress{DDLCount: 3})
 
 	assert.Empty(t, out.String())
+}
+
+// A convergence over several tables tracks each one on its own, so one table's
+// heartbeat cannot suppress another table's transition.
+func TestStorageProgressPrinter_TracksEachTableSeparately(t *testing.T) {
+	var out strings.Builder
+	clock := time.Now()
+	printer := clockedPrinter(&out, &clock)
+
+	printer.observe(api.StorageConvergenceProgress{
+		State: "copying",
+		Tables: []api.StorageConvergenceTableProgress{
+			{Table: "applies", State: "copying"},
+			{Table: "checks", State: "copying"},
+		},
+	})
+	clock = clock.Add(10 * time.Millisecond)
+	printer.observe(api.StorageConvergenceProgress{
+		State: "copying",
+		Tables: []api.StorageConvergenceTableProgress{
+			{Table: "applies", State: "copying"},
+			{Table: "checks", State: "complete"},
+		},
+	})
+
+	got := stripANSI(out.String())
+	assert.Contains(t, got, "Table started table=applies")
+	assert.Contains(t, got, "Table started table=checks")
+	assert.Contains(t, got, "Table complete table=checks")
+	assert.NotContains(t, got, "Table complete table=applies")
 }
