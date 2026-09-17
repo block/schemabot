@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -61,6 +62,24 @@ func TestEnsureSchema_RefusesANonPositiveBudget(t *testing.T) {
 			assert.Contains(t, err.Error(), "convergence timeout must be positive")
 		})
 	}
+}
+
+// A convergence that runs out of budget names the budget it actually had. An
+// operator who gave the run an hour and is told it did not finish in five
+// minutes goes looking for a timeout that never fired, on the one path where
+// the elapsed time is the first thing they check.
+func TestEnsureSchemaTimeoutError_NamesTheBudgetTheRunHad(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := ensureSchemaTimeoutError(ctx, apitypes.DefaultStorageApplyTimeout, 3, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), apitypes.DefaultStorageApplyTimeout.String())
+	assert.NotContains(t, err.Error(), EnsureSchemaTimeout.String(),
+		"a convergence that ran on the operator budget must not report the boot budget")
 }
 
 // The write deadline a convergence route lifts to follows the convergence's

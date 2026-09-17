@@ -346,7 +346,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 			// ("...context canceled"); name the timeout instead so the cause
 			// is clear from the message line alone.
 			if ctx.Err() != nil {
-				return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+				return ensureSchemaTimeoutError(ctx, o.convergenceTimeout, len(tableChanges), logger)
 			}
 			return fmt.Errorf("check progress: %w", err)
 		}
@@ -370,7 +370,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 		select {
 		case <-ctx.Done():
-			return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+			return ensureSchemaTimeoutError(ctx, o.convergenceTimeout, len(tableChanges), logger)
 		case <-ticker.C:
 		}
 	}
@@ -382,19 +382,24 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	return nil
 }
 
-// ensureSchemaTimeoutError builds and logs the error returned when
-// EnsureSchemaTimeout fires before the storage schema change completes. Spirit
+// ensureSchemaTimeoutError builds and logs the error returned when the
+// convergence budget fires before the storage schema change completes. Spirit
 // cancels the online DDL mid-apply and storage stays uninitialized, so the
-// message names the timeout and the most likely cause (a backend throttling the
+// message names the budget and the most likely cause (a backend throttling the
 // online DDL) instead of surfacing a bare "context canceled" from the driver.
-func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
-	logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+//
+// budget is the one this convergence actually ran under, not the boot
+// constant: a convergence an operator asked for runs under a longer one, and a
+// failure reporting a budget it did not have sends them looking for a timeout
+// that never fired.
+func ensureSchemaTimeoutError(ctx context.Context, budget time.Duration, ddlCount int, logger *slog.Logger) error {
+	logger.Error("storage schema change did not complete within the convergence budget; SchemaBot storage will not initialize",
 		"database", storageSchemaNamespace,
-		"timeout", EnsureSchemaTimeout,
+		"timeout", budget,
 		"ddl_count", ddlCount,
 	)
 	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
-		EnsureSchemaTimeout, ddlCount, ctx.Err())
+		budget, ddlCount, ctx.Err())
 }
 
 // refusedStorageChange is a planned storage-schema statement EnsureSchema
