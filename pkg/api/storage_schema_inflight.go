@@ -28,7 +28,8 @@ import (
 // but wait out the first one's whole budget on a lock, silently.
 
 // storageConvergenceInFlight reports whether a convergence currently holds the
-// storage bootstrap lock on the database at dsn.
+// storage bootstrap lock on the database the report describes, which is the
+// database at dsn.
 //
 // It takes nothing and waits for nothing: the probe reads the lock's state and
 // returns, so it is safe to run against a database being converged right now,
@@ -39,15 +40,20 @@ import (
 // holder can appear immediately afterwards, and a probe that could not run at
 // all also reports false. Callers should surface a true and stay quiet on a
 // false rather than render the negative as a finding.
-func storageConvergenceInFlight(ctx context.Context, dsn string, dialect schema.Dialect, logger *slog.Logger) bool {
-	held, err := probeStorageConvergenceLock(ctx, dsn, dialect)
+func storageConvergenceInFlight(ctx context.Context, dsn string, report *StorageSchemaReport, logger *slog.Logger) bool {
+	held, err := probeStorageConvergenceLock(ctx, dsn, report.Dialect)
 	if err != nil {
 		// Never fatal to the caller: this decorates a diff that has already
 		// been computed, and a report an operator can act on beats a refusal
 		// over a probe. Logged rather than dropped, because a probe failing on
 		// a database whose diff succeeded is itself surprising.
+		//
+		// Named by the database the report is about, not by the DSN: an
+		// operator reading this has to know which storage database went
+		// unread, and the failure is one an instance reaches for its own
+		// storage as readily as for a data plane's.
 		logger.Warn("could not determine whether a storage convergence is in flight; reporting none",
-			"dialect", dialect, "error", err)
+			append(report.logAttrs(), "error", err)...)
 		return false
 	}
 	return held

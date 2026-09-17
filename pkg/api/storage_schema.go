@@ -86,7 +86,7 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 	// act on these statements needs to know somebody else is already running
 	// them, and a stale false is the reading that costs them a silent hour
 	// waiting on a lock.
-	report.ConvergenceInFlight = storageConvergenceInFlight(ctx, dsn, o.dialect, logger)
+	report.ConvergenceInFlight = storageConvergenceInFlight(ctx, dsn, report, logger)
 
 	// The differs themselves stay quiet — the MySQL one is handed a discarding
 	// handler so Spirit's planning chatter does not read as a schema change

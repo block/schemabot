@@ -274,12 +274,32 @@ func writeStorageConvergenceInFlight(report *apitypes.StorageSchemaReport, isApp
 	if !report.ConvergenceInFlight {
 		return
 	}
-	consequence := "A convergence's work is invisible to a diff until it cuts over, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left."
+	consequence := "A statement a convergence is working on is absent from the live catalog until it finishes with it, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left."
 	if isApply {
 		consequence = "This run waits on the storage bootstrap lock until that one finishes or its budget runs out, and may then find nothing left to do."
 	}
-	fmt.Printf("%s A storage convergence is already running against %s. %s\n\n",
-		glyph.Attention, storageSchemaHeaderDatabase(report), consequence)
+	fmt.Printf("%s A storage convergence is already running against %s.%s %s\n\n",
+		glyph.Attention, storageSchemaHeaderDatabase(report), storageConvergenceLockScope(report.Dialect), consequence)
+}
+
+// storageConvergenceLockScope qualifies which database the convergence that
+// was detected is actually converging, on the dialect where the lock cannot
+// say.
+//
+// MySQL scopes a named lock to the server rather than to the database the
+// session is connected to, so two instances whose storage lives on one server
+// read each other's convergence here. The consequence above holds either way —
+// this run waits behind that one — but the database named beside it may not be
+// the one being converged, and an operator who goes looking for the run needs
+// that before they start looking in the wrong place.
+//
+// PostgreSQL advisory locks are per-database, so there the holder is
+// converging this database and there is nothing to qualify.
+func storageConvergenceLockScope(dialect string) string {
+	if schema.Dialect(dialect) != schema.DialectMySQL {
+		return ""
+	}
+	return " MySQL scopes the bootstrap lock to the server, so the run holding it may be converging another database on the same server."
 }
 
 func writeStorageSchemaHints(hints []string) {

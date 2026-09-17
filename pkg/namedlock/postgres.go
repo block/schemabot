@@ -43,6 +43,12 @@ const undoAcquireUnlockTimeout = 5 * time.Second
 // contend on the same lock — extra serialization, never lost mutual
 // exclusion.
 //
+// The key is scoped to the database the session is connected to, unlike
+// MySQL's server-wide lock names: the same name taken against two databases
+// of one server is two locks here and one lock there. Anything that reports a
+// holder to an operator has to say which, since only one of the two can say
+// that the holder is working on the database it named.
+//
 // Connections must use the pgx driver: the bounded-wait path inspects the
 // driver's typed error to distinguish an elapsed wait from a real failure.
 type Postgres struct{}
