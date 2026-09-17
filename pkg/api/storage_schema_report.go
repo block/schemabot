@@ -76,6 +76,16 @@ type StorageSchemaReport struct {
 	// situation and the remediation. Any entry aborts convergence before a
 	// single statement executes, so an apply is refused while one is present.
 	Manual []StorageSchemaStatement
+	// ConvergenceInFlight reports that some instance held the storage bootstrap
+	// lock when the diff was taken — a boot converging, or another operator's
+	// apply. The statements above are what is outstanding, not what is idle: a
+	// convergence's DDL lands on a shadow table, so work in progress looks
+	// exactly like work not started.
+	//
+	// Only true is a finding. False is the absence of evidence rather than a
+	// claim of idleness: the holder may have finished a moment later, or the
+	// probe may not have run at all.
+	ConvergenceInFlight bool
 }
 
 // Converged reports whether the storage schema needs nothing at all. A report
@@ -129,6 +139,8 @@ func (r *StorageSchemaReport) APIType() *apitypes.StorageSchemaReport {
 		Destructive:        storageSchemaStatementsAPIType(r.Destructive),
 		DestructiveAllowed: r.DestructiveAllowed,
 		Manual:             storageSchemaStatementsAPIType(r.Manual),
+
+		ConvergenceInFlight: r.ConvergenceInFlight,
 	}
 }
 

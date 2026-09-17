@@ -37,6 +37,7 @@ func TestStorageSchemaReport_ProtoRoundTrip(t *testing.T) {
 			DDL:       `ALTER TABLE "checks" ADD COLUMN "head_sha" varchar(64) NOT NULL`,
 			Reason:    "column is NOT NULL without a DEFAULT",
 		}},
+		ConvergenceInFlight: true,
 	}
 
 	wire := StorageSchemaReportProto(report)
@@ -64,6 +65,8 @@ func TestStorageSchemaReport_ProtoRoundTrip(t *testing.T) {
 	require.Len(t, wire.GetManual(), 1)
 	assert.Equal(t, "checks", wire.GetManual()[0].GetTable())
 	assert.Equal(t, "column is NOT NULL without a DEFAULT", wire.GetManual()[0].GetReason())
+	assert.True(t, wire.GetConvergenceInFlight(),
+		"a control plane that dropped this would render a mid-convergence database as an idle one")
 
 	round := StorageSchemaReportFromProto(wire)
 	require.NotNil(t, round)
