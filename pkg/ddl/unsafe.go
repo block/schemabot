@@ -147,6 +147,15 @@ func removedObjectName(spec *ast.AlterTableSpec) (name string, removes bool) {
 			return spec.OldColumnName.Name.O, true
 		}
 		return "", true
+	case ast.AlterTableChangeColumn:
+		// CHANGE COLUMN states a name as well as a definition, so it is the
+		// other form of a column rename and is refused for the same reason. A
+		// clause that restates the same name only changes the definition, which
+		// is Spirit's to classify.
+		if old, renames := renamedColumn(spec); renames {
+			return old, true
+		}
+		return "", false
 	case ast.AlterTableRenameTable:
 		// The name the table is moving to: the name it is moving from is the
 		// statement's own table, which callers already carry alongside.
@@ -157,6 +166,23 @@ func removedObjectName(spec *ast.AlterTableSpec) (name string, removes bool) {
 	default:
 		return "", false
 	}
+}
+
+// renamedColumn returns the name a CHANGE COLUMN clause renames away from, and
+// whether it renames at all. Names are compared the way MySQL compares
+// identifiers, case-insensitively, so restating a column's name in another case
+// is not a rename: no instance reads that column under a different name
+// afterwards. Spirit's RenameColumnLinter answers the same question for the
+// plan gate, where the verdict is a lint violation rather than a refusal.
+func renamedColumn(spec *ast.AlterTableSpec) (old string, renames bool) {
+	if spec.OldColumnName == nil || len(spec.NewColumns) == 0 || spec.NewColumns[0].Name == nil {
+		return "", false
+	}
+	old = spec.OldColumnName.Name.O
+	if strings.EqualFold(old, spec.NewColumns[0].Name.Name.O) {
+		return "", false
+	}
+	return old, true
 }
 
 // renamedTableName names the first table a RENAME TABLE statement renames, so
@@ -199,9 +225,11 @@ func removalReason(operation, name string) string {
 // its own but needs a refused clause to have run first moves into the
 // destructive partition with it. In practice that is a name collision: the
 // diff of an index whose definition changed drops it and adds it back under
-// the same name, and of a widened primary key drops and re-adds `PRIMARY`, so
-// executing the add against the index the refusal left in place would fail on
-// a duplicate key name and take the whole bootstrap statement down with it.
+// the same name, of a widened primary key drops and re-adds `PRIMARY`, and of
+// a redefined column drops it and adds it back, or renames it away and adds
+// the freed name. Executing either add against the object the refusal left in
+// place would fail on a duplicate name and take the whole bootstrap statement
+// down with it, which is the startup the refusal exists to keep working.
 // Names are matched case-insensitively, as MySQL matches them, and across one
 // flat namespace: coupling an add to a removal of the same name in a different
 // namespace can only move a clause into the refused partition, which never
@@ -285,12 +313,16 @@ func SplitStorageDestructiveAlter(stmt string) (safeDDL, destructiveDDL string, 
 	return safeDDL, destructiveDDL, nil
 }
 
-// claimsOccupiedName reports whether an ALTER TABLE clause adds an index or
-// constraint under a name that a refused removal leaves occupied, which makes
+// claimsOccupiedName reports whether an ALTER TABLE clause adds a column, index
+// or constraint under a name that a refused removal leaves occupied, which makes
 // the clause unexecutable until that removal runs.
 func claimsOccupiedName(spec *ast.AlterTableSpec, occupied map[string]bool) bool {
-	name := addedName(spec)
-	return name != "" && occupied[strings.ToLower(name)]
+	for _, name := range addedNames(spec) {
+		if occupied[strings.ToLower(name)] {
+			return true
+		}
+	}
+	return false
 }
 
 // primaryKeyIndexName is the name MySQL gives a table's primary key index. It
@@ -298,8 +330,10 @@ func claimsOccupiedName(spec *ast.AlterTableSpec, occupied map[string]bool) bool
 // behind it cannot collide with a secondary index's name.
 const primaryKeyIndexName = "PRIMARY"
 
-// vacatedName returns the index or constraint name an ALTER TABLE clause would
-// free, so refusing the clause is known to leave that name occupied. It is
+// vacatedName returns the name an ALTER TABLE clause would free, so refusing
+// the clause is known to leave that name occupied. Columns count as much as
+// indexes and constraints: a refused DROP COLUMN or column rename leaves the
+// old column in place, and an add of that same name is then a duplicate. It is
 // empty for a clause that frees no name.
 func vacatedName(spec *ast.AlterTableSpec) string {
 	switch spec.Tp {
@@ -314,24 +348,48 @@ func vacatedName(spec *ast.AlterTableSpec) string {
 		return ""
 	case ast.AlterTableRenameIndex:
 		return spec.FromKey.O
+	case ast.AlterTableDropColumn, ast.AlterTableRenameColumn:
+		if spec.OldColumnName != nil {
+			return spec.OldColumnName.Name.O
+		}
+		return ""
+	case ast.AlterTableChangeColumn:
+		old, _ := renamedColumn(spec)
+		return old
 	default:
 		return ""
 	}
 }
 
-// addedName returns the index or constraint name an ALTER TABLE clause claims,
-// so a clause claiming a name a refused removal left occupied can be refused
-// with it. It is empty for a clause that claims no name, including an index or
-// constraint added without one — MySQL derives that name, so no stated name
-// can collide.
-func addedName(spec *ast.AlterTableSpec) string {
-	if spec.Tp != ast.AlterTableAddConstraint || spec.Constraint == nil {
-		return ""
+// addedNames returns the names an ALTER TABLE clause claims, so a clause
+// claiming a name a refused removal left occupied can be refused with it. One
+// clause can add several columns, and adds nothing at all in most cases. An
+// index or constraint added without a name claims none: MySQL derives that
+// name, so no stated name can collide.
+func addedNames(spec *ast.AlterTableSpec) []string {
+	switch spec.Tp {
+	case ast.AlterTableAddColumns:
+		names := make([]string, 0, len(spec.NewColumns))
+		for _, column := range spec.NewColumns {
+			if column.Name != nil {
+				names = append(names, column.Name.Name.O)
+			}
+		}
+		return names
+	case ast.AlterTableAddConstraint:
+		if spec.Constraint == nil {
+			return nil
+		}
+		if spec.Constraint.Tp == ast.ConstraintPrimaryKey {
+			return []string{primaryKeyIndexName}
+		}
+		if spec.Constraint.Name == "" {
+			return nil
+		}
+		return []string{spec.Constraint.Name}
+	default:
+		return nil
 	}
-	if spec.Constraint.Tp == ast.ConstraintPrimaryKey {
-		return primaryKeyIndexName
-	}
-	return spec.Constraint.Name
 }
 
 // restoreAlterWithSpecs restores the given ALTER TABLE statement with its
