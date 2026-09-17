@@ -7202,6 +7202,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
+Stopping applies to every target in this rollout, not just `us`.
+
 </details>
 
 <details>
