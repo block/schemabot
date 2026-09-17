@@ -376,6 +376,91 @@ func TestRollupDeploymentDiffs_IndependentUnparseableMemberBlocks(t *testing.T) 
 	assert.Contains(t, rollup.Entries[1].Err.Error(), "not usable")
 }
 
+// Every member that classified carries the plan it would run and a key for it,
+// so a reader can render the member's DDL and group members by the work they
+// share. Members planning the same changes share the key; a member planning
+// different work does not.
+func TestRollupDeploymentDiffs_ClassifiedMembersCarryTheirPlan(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	diffs := []DeploymentPlanDiff{
+		rollupMember("cake", "orders-001", rollupAlterUsers(email)),
+		rollupMember("cake", "orders-002", rollupAlterUsers(email)),
+		rollupMember("cake", "orders-003", rollupAlterUsers("ALTER TABLE users ADD COLUMN phone VARCHAR(32)")),
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanIndependent)
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 3)
+	for i, entry := range rollup.Entries {
+		assert.Equal(t, DeploymentPlanned, entry.Class, "entry %d", i)
+		require.NotEmpty(t, entry.PlanFingerprint, "entry %d", i)
+		require.Len(t, entry.ChangeSet.Changes, 1, "entry %d", i)
+		assert.Equal(t, diffs[i].Changes[0].TableChanges[0].Ddl, entry.ChangeSet.Changes[0].TableChanges[0].Ddl, "entry %d", i)
+	}
+	assert.Equal(t, rollup.Entries[0].PlanFingerprint, rollup.Entries[1].PlanFingerprint,
+		"members planning the same changes group together")
+	assert.NotEqual(t, rollup.Entries[0].PlanFingerprint, rollup.Entries[2].PlanFingerprint,
+		"a member planning different changes is its own group")
+}
+
+// A member already at the desired schema plans nothing, which is work of its own
+// and keys to a group of its own: the members with nothing to run are rendered
+// together, and never folded in with the members that would change a table.
+func TestRollupDeploymentDiffs_MembersWithNothingToRunGroupTogether(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupMember("cake", "orders-001", rollupAlterUsers("ALTER TABLE users ADD COLUMN email VARCHAR(255)")),
+		rollupMember("cake", "orders-002"),
+		rollupMember("cake", "orders-003"),
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanIndependent)
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 3)
+	assert.Equal(t, rollup.Entries[1].PlanFingerprint, rollup.Entries[2].PlanFingerprint)
+	assert.NotEqual(t, rollup.Entries[0].PlanFingerprint, rollup.Entries[1].PlanFingerprint)
+	assert.Empty(t, rollup.Entries[1].ChangeSet.Changes)
+}
+
+// Mirrored members carry their plans too, and a diverged member carries the plan
+// it would actually run rather than the reviewed one — the divergence is the
+// difference between them, so rendering the reviewed plan against a diverged
+// member would show work that member will not do.
+func TestRollupDeploymentDiffs_DivergedMemberCarriesItsOwnPlan(t *testing.T) {
+	reviewed := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	diverged := "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)"
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers(reviewed)),
+		rollupDeployment("au", rollupAlterUsers(diverged)),
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 2)
+	assert.Equal(t, DeploymentDiverged, rollup.Entries[1].Class)
+	require.Len(t, rollup.Entries[1].ChangeSet.Changes, 1)
+	assert.Equal(t, diverged, rollup.Entries[1].ChangeSet.Changes[0].TableChanges[0].Ddl)
+	assert.NotEqual(t, rollup.Entries[0].PlanFingerprint, rollup.Entries[1].PlanFingerprint)
+}
+
+// A member that could not be planned has no plan to carry and no group to join,
+// and keeps the cause it blocked on. Keying it would mean grouping it with
+// members it was never compared against.
+func TestRollupDeploymentDiffs_ErroredMemberCarriesNoPlan(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
+		rollupDeployment("au"),
+	}
+	diffs[1].Err = fmt.Errorf("deployment unreachable")
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 2)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+	assert.Empty(t, rollup.Entries[1].PlanFingerprint)
+	assert.Empty(t, rollup.Entries[1].ChangeSet.Changes)
+	assert.ErrorContains(t, rollup.Entries[1].Err, "deployment unreachable")
+}
+
 // The member contract is enforced whatever the planning: independent planning
 // stops members being compared to each other, it does not stop a missing or
 // misidentified member from failing the rollup closed.
