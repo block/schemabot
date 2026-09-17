@@ -19,8 +19,8 @@
 SchemaBot runs schema changes against your databases. It also *has* one: its own
 bookkeeping storage, holding plans, applies, checks, leases, locks, and the
 webhook inbox. That storage converges through the bootstrap described here, not
-through the PR, plan, lint gate, and apply a database SchemaBot *manages* goes
-through. The bootstrap is far more conservative: it is additive, it decides
+through the PR, `plan`, lint gate, and `apply` a database SchemaBot *manages*
+goes through. The bootstrap is far more conservative: it is additive, it decides
 before it writes, and it never destroys state a peer on another release might
 still be reading. Every operator needs the first three sections; the rest is the
 deploy and incident playbook.
