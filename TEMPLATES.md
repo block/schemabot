@@ -1509,6 +1509,38 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="targets-large-fleet"></a><strong>Targets Large Fleet</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **Planned separately for all 144 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3` and 141 more) — 5 need this change, 139 are already at this schema.
+
+**`primary/testapp_1` (primary), `primary/testapp_2`, `primary/testapp_3` and 2 more** — 1 DDL statement
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255);
+```
+
+**`primary/testapp_6`, `primary/testapp_7`, `primary/testapp_8` and 136 more** — already at this schema, nothing to apply.
+
+📋 **Plan**: 1 DDL statement on 5 of 144 targets
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="drop-column-blocked"></a><strong>Drop Column Blocked</strong></summary>
 
 

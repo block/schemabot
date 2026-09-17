@@ -577,6 +577,82 @@ func TestRenderPlanComment_PlanSummaryCountsTheRollout(t *testing.T) {
 	}
 }
 
+// A fleet can run to hundreds of targets. Naming every one buries the plan the
+// names are a heading for, so a list summarizes past a fixed count while the
+// headline still states how many targets the apply covers.
+func TestRenderPlanComment_LargeFleetNamesClamp(t *testing.T) {
+	members := make([]DeploymentDriftEntry, 144)
+	for i := range members {
+		members[i] = DeploymentDriftEntry{Deployment: "primary", Target: fmt.Sprintf("my_db_%d", i+1), Class: "planned"}
+	}
+	members[0].Primary = true
+
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "production", DatabaseType: "mysql", IsMySQL: true,
+		Changes: planGroupChanges(1),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: members,
+		},
+	})
+
+	assert.Contains(t, out, "**Planned separately for all 144 targets**")
+	assert.Contains(t, out, "(`primary/my_db_1`, `primary/my_db_2`, `primary/my_db_3` and 141 more)")
+	assert.NotContains(t, out, "my_db_4")
+}
+
+// The reviewed member is first in rollout order, so a clamped group heading
+// still names the plan an operator has already read.
+func TestRenderPlanComment_ClampedGroupHeadingKeepsThePrimary(t *testing.T) {
+	big := make([]string, 0, 10)
+	for i := range 10 {
+		big = append(big, fmt.Sprintf("primary/my_db_%d", i+1))
+	}
+
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: big, Primary: true, Changes: planGroupChanges(1)},
+		{Members: []string{"eu/my_db_11"}, Changes: planGroupChanges(2)},
+	})
+
+	assert.Contains(t, out, "`primary/my_db_1` (primary), `primary/my_db_2`, `primary/my_db_3` and 7 more — 1 DDL statement")
+	assert.NotContains(t, out, "my_db_4")
+}
+
+// The clamp keeps a list readable without costing a reader a name it would have
+// been just as short to state.
+func TestClampNameList(t *testing.T) {
+	names := []string{"a", "b", "c", "d", "e", "f"}
+	assert.Equal(t, "a, b, c", clampNameList(names[:3]))
+	assert.Equal(t, "a, b, c, d", clampNameList(names[:4]), "one name over the limit is named, not summarized")
+	assert.Equal(t, "a, b, c and 2 more", clampNameList(names[:5]))
+	assert.Equal(t, "a, b, c and 3 more", clampNameList(names))
+}
+
+// A blocked rollup is the only place the comment says which member blocked and
+// why, so its list is never summarized however large the fleet is.
+func TestRenderPlanComment_BlockedMembersAreAllNamed(t *testing.T) {
+	members := make([]DeploymentDriftEntry, 6)
+	for i := range members {
+		members[i] = DeploymentDriftEntry{Deployment: "primary", Target: fmt.Sprintf("my_db_%d", i+1), Class: "match"}
+	}
+	members[0].Primary = true
+	members[5].Class = "errored"
+
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "production", DatabaseType: "mysql", IsMySQL: true,
+		Changes: planGroupChanges(1),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: false,
+			Deployments: members,
+		},
+	})
+
+	for i := range members {
+		assert.Contains(t, out, fmt.Sprintf("`primary/my_db_%d`", i+1))
+	}
+	assert.NotContains(t, out, "and 3 more")
+}
+
 // A vschema rewrite carries no DDL and is still work, so a group's label counts
 // it alongside statements rather than describing the plan by its DDL alone.
 func TestPlanGroupWorkLabel(t *testing.T) {
