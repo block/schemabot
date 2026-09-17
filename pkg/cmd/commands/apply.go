@@ -473,12 +473,7 @@ func (e *logEmitter) emit(kvs ...string) {
 	if e.nowFunc != nil {
 		now = e.nowFunc()
 	}
-	ts := now.Format("15:04:05")
-	var line []byte
-	line = append(line, ansiDim...)
-	line = append(line, ts...)
-	line = append(line, ansiReset...)
-
+	kept := make([]string, 0, len(kvs))
 	for i := 0; i+1 < len(kvs); i += 2 {
 		key, val := kvs[i], kvs[i+1]
 		// Skip noisy fields that aren't useful for human readers
@@ -489,6 +484,23 @@ func (e *logEmitter) emit(kvs ...string) {
 		if key == "apply_id" && e.applyID != "" {
 			continue
 		}
+		kept = append(kept, key, val)
+	}
+	fmt.Println(logfmtLine(now, kept...))
+}
+
+// logfmtLine renders a timestamp and key/value pairs as one colored logfmt
+// line. Every log-mode surface renders through here so an operator reads one
+// format wherever the progress comes from — a schema change the server is
+// driving, or a storage convergence running under their own terminal.
+func logfmtLine(now time.Time, kvs ...string) string {
+	var line []byte
+	line = append(line, ansiDim...)
+	line = append(line, now.Format("15:04:05")...)
+	line = append(line, ansiReset...)
+
+	for i := 0; i+1 < len(kvs); i += 2 {
+		key, val := kvs[i], kvs[i+1]
 		line = append(line, ' ')
 		if key == "msg" {
 			// Message is rendered as just the value, with color
@@ -515,7 +527,7 @@ func (e *logEmitter) emit(kvs ...string) {
 		}
 		line = append(line, ansiReset...)
 	}
-	fmt.Println(string(line))
+	return string(line)
 }
 
 // logfmtNeedsQuoting returns true if the value needs quoting in logfmt output.
