@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	seedutil "github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
@@ -743,4 +744,59 @@ func waitForPostgresBootstrapLockWaiter(t *testing.T, db *sql.DB) {
 		return count > 0
 	}, storageConvergenceStopDeadline, 100*time.Millisecond,
 		"expected the convergence to be waiting on the bootstrap advisory lock, waiter count: %d", count)
+}
+
+// A convergence an operator is watching reports itself as it runs. Without it
+// the command is silent between the plan and the answer, which on a storage
+// database with any history is the whole of a long index build — and a blank
+// terminal is what gets a run killed that was about to finish.
+func TestApplyStorageSchemaMySQL_ReportsProgressToAWatchingCaller(t *testing.T) {
+	sdb, _ := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+
+	var observed []StorageConvergenceProgress
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, logger,
+		WithConvergenceProgress(func(p StorageConvergenceProgress) { observed = append(observed, p) }))
+	require.NoError(t, err)
+	require.True(t, remaining.Converged())
+
+	require.NotEmpty(t, observed, "a convergence that ran DDL must have said so")
+	for _, p := range observed {
+		assert.NotEmpty(t, p.State, "an observation with no state says nothing an operator can read")
+		assert.Positive(t, p.DDLCount, "an observation names how much work the run is doing")
+	}
+	assert.Equal(t, string(engine.StateCompleted), observed[len(observed)-1].State,
+		"the last thing an operator sees is the run finishing")
+}
+
+// The PostgreSQL convergence has no engine polling behind it, so it reports
+// what it does know: which table it is about to converge, and how much of the
+// drift set is behind it. That is the answer an operator waiting on a long
+// CREATE INDEX is after, and it is the honest one — each table runs in one
+// transaction, so there is no partial state to report.
+func TestApplyStorageSchemaPostgres_ReportsProgressToAWatchingCaller(t *testing.T) {
+	dsn, _ := startPostgresStorage(t)
+	logger := storageSchemaTestLogger()
+	postgres := WithDialect(schema.DialectPostgres)
+
+	var observed []StorageConvergenceProgress
+	_, remaining, err := ApplyStorageSchema(t.Context(), dsn, logger, postgres,
+		WithConvergenceProgress(func(p StorageConvergenceProgress) { observed = append(observed, p) }))
+	require.NoError(t, err)
+	require.True(t, remaining.Converged())
+
+	require.NotEmpty(t, observed)
+	named := make(map[string]bool)
+	for _, p := range observed {
+		require.Len(t, p.Tables, 1, "a PostgreSQL observation is about the one table in flight")
+		named[p.Tables[0].Table] = true
+		assert.Contains(t, []string{postgresConvergenceRunning, postgresConvergenceComplete}, p.State)
+	}
+	tables, _, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	for _, table := range tables {
+		assert.True(t, named[table], "every table the convergence created should have been reported: %s", table)
+	}
+	assert.Equal(t, 100, observed[len(observed)-1].Percent,
+		"the last observation of a clean convergence is the whole drift set behind it")
 }

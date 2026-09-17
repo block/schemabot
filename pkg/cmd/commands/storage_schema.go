@@ -546,8 +546,15 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 			return nil, nil, err
 		}
 		logger.Info("converging with an operator budget", "convergence_timeout", budget)
+		// Progress goes to stderr, not stdout: it describes the run, and the
+		// run's result is what stdout carries — under --json that is a
+		// document a caller parses, and a progress line in the middle of it is
+		// not a progress line, it is a parse error.
+		progress := newStorageProgressPrinter(os.Stderr)
 		plannedReport, remainingReport, err := api.ApplyStorageSchema(ctx, target.dsn, logger,
-			append(target.ensureSchemaOptions(cmd.AllowUnsafe), api.WithConvergenceTimeout(budget))...)
+			append(target.ensureSchemaOptions(cmd.AllowUnsafe),
+				api.WithConvergenceTimeout(budget),
+				api.WithConvergenceProgress(progress.observe))...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("converge storage schema on the database from %s: %w", target.source, err)
 		}
