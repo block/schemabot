@@ -3,7 +3,6 @@
 package api
 
 import (
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -289,10 +289,10 @@ func TestDiffStorageSchemaMySQL_ReportsBothHalvesOfAMixedStatement(t *testing.T)
 // holds one rather than blocking behind it. During an incident that is the
 // difference between reading the state and waiting on it.
 func TestDiffStorageSchemaMySQL_ReadsWhileBootstrapHoldsLock(t *testing.T) {
-	sdb, db := openEnsureSchemaDatabase(t)
+	sdb := newStorageDatabase(t)
 	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
 
-	holdMySQLBootstrapLock(t, db)
+	holdMySQLBootstrapLock(t, sdb.DSN)
 
 	report, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err, "a diff must not wait on the bootstrap lock")
@@ -302,28 +302,41 @@ func TestDiffStorageSchemaMySQL_ReadsWhileBootstrapHoldsLock(t *testing.T) {
 // holdMySQLBootstrapLock takes the storage bootstrap's advisory lock on a
 // dedicated session, the way a converging pod holds it, and releases it when
 // the test ends.
-func holdMySQLBootstrapLock(t *testing.T, db *sql.DB) {
+//
+// The release is the session ending, not a RELEASE_LOCK: the lock lives on a
+// session, so releasing it by name needs a query, and a query needs a context
+// that is still live — t.Context() is already cancelled when cleanup runs.
+// Handing the holder its own pool makes the session's end something cleanup
+// can cause without a context, by returning the connection and closing the
+// pool behind it.
+//
+// Releasing deterministically matters more than the single test suggests.
+// MySQL scopes lock names to the server rather than to a database and these
+// tests share a server, so a leaked lock would not stall this test's own
+// database: it would stall every other test's convergence on that server.
+func holdMySQLBootstrapLock(t *testing.T, dsn string) {
 	t.Helper()
+	db := openStorageDB(t, dsn)
 	conn, err := db.Conn(t.Context())
 	require.NoError(t, err)
 	var acquired int
 	require.NoError(t, conn.QueryRowContext(t.Context(), "SELECT GET_LOCK(?, 5)", ensureSchemaLockName).Scan(&acquired))
 	require.Equal(t, 1, acquired, "hold the bootstrap lock")
-	t.Cleanup(func() {
-		var released sql.NullInt64
-		_ = conn.QueryRowContext(t.Context(), "SELECT RELEASE_LOCK(?)", ensureSchemaLockName).Scan(&released)
-		_ = conn.Close()
-	})
+	// Registered after openStorageDB's own close, so it runs before it: the
+	// connection goes back to the pool, then the pool closes and takes the
+	// session with it.
+	t.Cleanup(func() { utils.CloseAndLog(conn) })
 }
 
-// A convergence in progress is invisible in a diff — its DDL lands on a shadow
-// table, so a database being converged reports the same outstanding statements
-// as one nobody has touched. The report says so separately, which is what
-// tells an operator whose session dropped that their run is still going, and
-// what keeps a second operator from starting an apply that would do nothing
-// but wait out the first one's budget on a lock.
+// A convergence in progress is invisible in a diff — a statement it is working
+// on stays out of the live catalog until it finishes with it, so a database
+// being converged reports the same outstanding statements as one nobody has
+// touched. The report says so separately, which is what tells an operator
+// whose session dropped that their run is still going, and what keeps a second
+// operator from starting an apply that would do nothing but wait out the first
+// one's budget on a lock.
 func TestDiffStorageSchemaMySQL_ReportsAConvergenceInFlight(t *testing.T) {
-	sdb, db := openEnsureSchemaDatabase(t)
+	sdb := newStorageDatabase(t)
 	logger := storageSchemaTestLogger()
 	require.NoError(t, EnsureSchema(sdb.DSN, logger))
 
@@ -331,7 +344,7 @@ func TestDiffStorageSchemaMySQL_ReportsAConvergenceInFlight(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, report.ConvergenceInFlight, "nothing is converging this database")
 
-	holdMySQLBootstrapLock(t, db)
+	holdMySQLBootstrapLock(t, sdb.DSN)
 
 	report, err = PlanStorageSchema(t.Context(), sdb.DSN, nil, logger)
 	require.NoError(t, err)

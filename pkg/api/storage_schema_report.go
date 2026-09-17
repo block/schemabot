@@ -78,14 +78,29 @@ type StorageSchemaReport struct {
 	Manual []StorageSchemaStatement
 	// ConvergenceInFlight reports that some instance held the storage bootstrap
 	// lock when the diff was taken — a boot converging, or another operator's
-	// apply. The statements above are what is outstanding, not what is idle: a
-	// convergence's DDL lands on a shadow table, so work in progress looks
+	// apply. The statements above are what is outstanding, not what is idle:
+	// a statement a convergence is working on is not in the catalog the diff
+	// read until that convergence finishes with it, so work in progress looks
 	// exactly like work not started.
 	//
 	// Only true is a finding. False is the absence of evidence rather than a
 	// claim of idleness: the holder may have finished a moment later, or the
 	// probe may not have run at all.
 	ConvergenceInFlight bool
+}
+
+// logAttrs are the identifiers that say which storage database a log line is
+// about. A report is produced for an instance's own storage and for a data
+// plane's alike, so a line without them names no database at all.
+//
+// The DSN is deliberately not among them: it carries credentials, and the
+// database and host it points at are already here under their own keys.
+func (r *StorageSchemaReport) logAttrs() []any {
+	attrs := []any{"dialect", r.Dialect, "database", r.Database}
+	if r.Host != "" {
+		attrs = append(attrs, "host", r.Host)
+	}
+	return attrs
 }
 
 // Converged reports whether the storage schema needs nothing at all. A report

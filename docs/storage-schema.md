@@ -361,9 +361,10 @@ A convergence over a table with a long history is the one that matters and the
 one that takes time. Here is what to know before you start one.
 
 **A plan says when one is already running.** A convergence is invisible in a
-diff: its DDL runs against a shadow table that is not the real table yet, so a
-plan taken mid-copy reports the same outstanding statement a plan against an
-idle database reports. The plan says so separately:
+diff: a statement it is working on is absent from the live catalog until it
+finishes with that statement, so a plan taken mid-run reports the same
+outstanding statement a plan against an idle database reports. The plan says so
+separately:
 
 ```console
 $ schemabot storage plan
@@ -374,7 +375,7 @@ $ schemabot storage plan
 │  Schema: the schema embedded in v1.2.3      │
 ╰─────────────────────────────────────────────╯
 
-⚠️ A storage convergence is already running against schemabot on db-1.example. A convergence's work is invisible to a diff until it cuts over, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left.
+⚠️ A storage convergence is already running against schemabot on db-1.example. MySQL scopes the bootstrap lock to the server, so the run holding it may be converging another database on the same server. A statement a convergence is working on is absent from the live catalog until it finishes with it, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left.
 
      ~ applies
        ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;

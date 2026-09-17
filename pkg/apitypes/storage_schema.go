@@ -53,7 +53,8 @@ type StorageSchemaReport struct {
 	// lock when the diff was taken — a pod booting, or another operator's
 	// apply. It is what separates "this DDL is outstanding" from "this DDL is
 	// being run right now", which the statement lists cannot say on their own:
-	// a convergence's work lands on a shadow table until it cuts over.
+	// a statement a convergence is working on stays absent from the live
+	// catalog until that convergence finishes with it.
 	//
 	// Only true is a finding. False is the absence of evidence, not a claim
 	// that the database is idle.

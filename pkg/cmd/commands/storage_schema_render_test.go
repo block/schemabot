@@ -616,8 +616,9 @@ func TestOutputStorageSchemaPlan_SummarizesInTables(t *testing.T) {
 
 // A plan taken while another instance is converging says so, above the
 // statements it changes the meaning of. The lists cannot say it themselves: a
-// convergence's DDL lands on a shadow table, so a database being converged
-// diffs exactly like one nobody has touched.
+// statement a convergence is working on stays out of the live catalog until it
+// finishes with it, so a database being converged diffs exactly like one
+// nobody has touched.
 func TestOutputStorageSchemaPlan_SaysAConvergenceIsRunning(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{
 		Dialect:             "mysql",
@@ -635,9 +636,36 @@ func TestOutputStorageSchemaPlan_SaysAConvergenceIsRunning(t *testing.T) {
 	})
 
 	assert.Contains(t, out, glyph.Attention+" A storage convergence is already running against schemabot on db-1.example.")
+	assert.Contains(t, out, "MySQL scopes the bootstrap lock to the server",
+		"a server-wide lock cannot say the holder is converging the database named beside it")
 	assert.Contains(t, out, "Re-run this once it finishes")
 	assert.Less(t, strings.Index(out, "A storage convergence is already running"), strings.Index(out, "~ applies"),
 		"the notice has to be read before the statements it qualifies")
+}
+
+// PostgreSQL scopes advisory locks to the database, so there the holder is
+// converging the database the line names and there is nothing to qualify. The
+// sentence MySQL needs would be false here: it would send an operator looking
+// for a run on another database of the same server, which on this dialect
+// could not be holding this lock.
+func TestOutputStorageSchemaPlan_PostgresDoesNotQualifyTheLockScope(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:             "postgres",
+		Database:            "schemabot",
+		Host:                "storage.db.example",
+		ConvergenceInFlight: true,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "checks", Operation: "create_table", DDL: "CREATE TABLE checks (id bigint PRIMARY KEY)"},
+		},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", nil))
+	})
+
+	assert.Contains(t, out, "A storage convergence is already running against schemabot on storage.db.example.")
+	assert.NotContains(t, out, "scopes the bootstrap lock to the server")
+	assert.NotContains(t, out, "another database on the same server")
 }
 
 // An apply is told what it costs it, not what it costs a plan: it is about to
