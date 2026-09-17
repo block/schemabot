@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -260,6 +261,11 @@ type StorageApplyCmd struct {
 	AllowUnsafe              bool `help:"Permit the destructive statements the convergence would otherwise refuse; it widens the target's standing storage policy and never narrows it" name:"allow-unsafe"`
 	AutoApprove              bool `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	JSON                     bool `help:"Output as JSON"`
+	// Timeout is how a convergence outlives the budget a boot runs under. A
+	// booting pod gives up after minutes because a pod converging is a pod not
+	// yet serving; this command has somebody watching it, so it does not have
+	// to. Left unset, the target picks its own operator default.
+	Timeout time.Duration `help:"Bound the whole convergence — the lock wait, the diff under it, and the DDL. Defaults to the target's operator budget, which is already far above a booting pod's. Raising it holds the storage bootstrap lock for that long, and pods booting in the window will not come up" name:"timeout"`
 	// The diff's file selectors are accepted here only to be refused with the
 	// reason and the alternative. An operator who has just run the diff against
 	// a release reaches for the same flags on the apply, and Kong's bare
@@ -277,6 +283,13 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		return err
 	}
 	if err := storageSchemaSourceRefusal(cmd.SchemaDir, cmd.Release, cmd.Repo); err != nil {
+		return err
+	}
+	// Checked before the preview rather than on the way to the convergence: a
+	// budget the target will refuse is a flag the operator has to fix either
+	// way, and finding out after a diff of a production storage database has
+	// already run is finding out later for no reason.
+	if _, err := cmd.convergenceBudget(); err != nil {
 		return err
 	}
 
@@ -367,6 +380,12 @@ func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() string {
 	}
 	if cmd.Dialect != "" {
 		parts = append(parts, "--dialect", cmd.Dialect)
+	}
+	// A budget the operator chose is part of the run being offered back. An
+	// operator who shortened it to fail fast, and copies a command that drops
+	// the flag, gets the target's default instead of the ceiling they picked.
+	if cmd.Timeout > 0 {
+		parts = append(parts, "--timeout", cmd.Timeout.String())
 	}
 	return strings.Join(append(parts, "--allow-unsafe"), " ")
 }
@@ -470,6 +489,32 @@ func storageSchemaConvergenceOutcome(remaining *apitypes.StorageSchemaReport) er
 		storageSchemaDatabaseLabel(remaining), len(remaining.Manual))
 }
 
+// convergenceBudget resolves the ceiling this run bounds the convergence with,
+// refusing a value the target would refuse. The direct path bounds the
+// convergence with it here; the API path sends it and the target does the same.
+func (cmd *StorageApplyCmd) convergenceBudget() (time.Duration, error) {
+	// The wire carries whole seconds, so a budget under one truncates to the
+	// zero that means "no preference" and would come back as the hour-long
+	// default — the operator asking for the shortest possible run getting the
+	// longest one. Refuse it here, where the duration the operator typed is
+	// still intact, rather than let the truncation answer for them.
+	if cmd.Timeout > 0 && cmd.Timeout < time.Second {
+		return 0, fmt.Errorf("--timeout: a convergence budget of %s is shorter than the one second the request carries; name a whole number of seconds", cmd.Timeout)
+	}
+	budget, err := apitypes.ResolveStorageApplyTimeout(cmd.timeoutSeconds())
+	if err != nil {
+		return 0, fmt.Errorf("--timeout: %w", err)
+	}
+	return budget, nil
+}
+
+// timeoutSeconds is the flag as the request carries it. An unset flag sends
+// zero, which leaves the ceiling to the target rather than pinning the CLI's
+// idea of the default onto a server that may have a different one.
+func (cmd *StorageApplyCmd) timeoutSeconds() int64 {
+	return int64(cmd.Timeout / time.Second)
+}
+
 // converge runs the convergence over whichever path the flags selected.
 func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, remaining *apitypes.StorageSchemaReport, err error) {
 	if cmd.direct() {
@@ -483,8 +528,13 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 			"dialect", target.dialect,
 			"allow_destructive", target.allowDestructive || cmd.AllowUnsafe,
 			"config_allows_destructive", target.allowDestructive)
+		budget, err := cmd.convergenceBudget()
+		if err != nil {
+			return nil, nil, err
+		}
+		logger.Info("converging with an operator budget", "convergence_timeout", budget)
 		plannedReport, remainingReport, err := api.ApplyStorageSchema(ctx, target.dsn, logger,
-			target.ensureSchemaOptions(cmd.AllowUnsafe)...)
+			append(target.ensureSchemaOptions(cmd.AllowUnsafe), api.WithConvergenceTimeout(budget))...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("converge storage schema on the database from %s: %w", target.source, err)
 		}
@@ -500,6 +550,7 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 		Deployment:       cmd.Deployment,
 		Environment:      cmd.Environment,
 		AllowDestructive: cmd.AllowUnsafe,
+		TimeoutSeconds:   cmd.timeoutSeconds(),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("converge storage schema%s: %w", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment), err)

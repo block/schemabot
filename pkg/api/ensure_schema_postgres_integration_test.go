@@ -43,6 +43,11 @@ func requireStorageTables(t *testing.T, db *sql.DB) {
 	}
 }
 
+// bootDDLBudget is the per-statement DDL budget a boot derives, which is what
+// these tests exercise: the budget follows the convergence's own ceiling, and a
+// boot's ceiling is EnsureSchemaTimeout.
+var bootDDLBudget = postgresBootstrapDDLBudget(EnsureSchemaTimeout)
+
 // A fresh PostgreSQL storage database bootstraps to the full storage schema:
 // every embedded schema file's table exists afterwards, so the server can
 // start accepting traffic against a database that began empty.
@@ -238,7 +243,7 @@ func TestEnsureSchemaPostgres_RefusesManualRemediationWithoutWaitingForLock(t *t
 	// Hold the EnsureSchema advisory lock the way a leading pod would, for
 	// the rest of the test; a bootstrap that queued for it could not return
 	// before EnsureSchemaTimeout.
-	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{})
+	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{}, EnsureSchemaTimeout)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lockConn)
 
@@ -441,7 +446,7 @@ func TestEnsureSchemaPostgres_WaitsForAdvisoryLock(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Hold the EnsureSchema advisory lock the way a leading pod would.
-	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{})
+	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{}, EnsureSchemaTimeout)
 	require.NoError(t, err)
 
 	done := make(chan error, 1)
@@ -595,12 +600,12 @@ func TestExecPostgresChanges_ClassifiesCancelledStatement(t *testing.T) {
 		ddl:       "SET statement_timeout = '50ms'; SELECT pg_sleep(5);",
 	}}
 
-	execErr := execPostgresChanges(t.Context(), db, "cancelled_change", changes, logger)
+	execErr := execPostgresChanges(t.Context(), db, "cancelled_change", changes, logger, bootDDLBudget)
 	require.Error(t, execErr)
 
 	// The rendered error names the budget the convergence set, so an operator
 	// can compare it against how long the statement actually ran.
-	assert.ErrorContains(t, execErr, postgresBootstrapDDLStatementTimeout.String())
+	assert.ErrorContains(t, execErr, bootDDLBudget.String())
 	var pgErr *pgconn.PgError
 	require.ErrorAs(t, execErr, &pgErr, "the server's own error must stay reachable")
 	assert.Equal(t, "57014", pgErr.Code)
@@ -693,11 +698,11 @@ func TestExecPostgresChanges_RaisesStatementTimeoutForDDL(t *testing.T) {
 		ddl: `CREATE TABLE ddl_budget_probe AS
 		      SELECT setting AS observed FROM pg_settings WHERE name = 'statement_timeout'`,
 	}
-	require.NoError(t, execPostgresChanges(t.Context(), db, "ddl_budget_probe", []postgresSchemaChange{probe}, logger))
+	require.NoError(t, execPostgresChanges(t.Context(), db, "ddl_budget_probe", []postgresSchemaChange{probe}, logger, bootDDLBudget))
 
 	var observed string
 	require.NoError(t, admin.QueryRowContext(t.Context(), "SELECT observed FROM ddl_budget_probe").Scan(&observed))
-	assert.Equal(t, strconv.FormatInt(postgresBootstrapDDLStatementTimeout.Milliseconds(), 10), observed)
+	assert.Equal(t, strconv.FormatInt(bootDDLBudget.Milliseconds(), 10), observed)
 
 	// The raise is transaction-local: the pooled connection goes back to its
 	// ordinary query budget rather than carrying the DDL budget into later use.

@@ -88,13 +88,18 @@ Four consequences worth holding onto:
   carry them. That is what keeps an older binary from being handed a newer
   release's schema, where the newer tables it does not know about look like
   surplus to prune.
-- **Convergence is bounded, and the budget follows the code rather than the
-  path.** A hard five-minute budget covers the lock wait and the DDL, and
-  because `storage apply` is the same code it runs under the same one. So
-  converging ahead of a roll takes the work out of the roll, but not out of the
-  budget: a change too slow to finish keeps a pod out of service, and it will
-  time out from the CLI too. An index build that large has to be created by hand,
-  which is what [Pre-creating indexes on a long-lived
+- **Convergence is bounded, and the budget follows the path rather than the
+  code.** A boot gets five minutes, covering the lock wait and the DDL, because
+  a pod converging is a pod not yet serving and one holding the lock keeps every
+  other pod from serving too. `storage apply` runs the same code under an hour,
+  because nothing is waiting on it but the person who ran it. That is the
+  difference that lets converging ahead of a roll take work out of the roll
+  that a boot could not have finished at all — an index over a table with a
+  long history, typically. `--timeout` lowers the ceiling for a run that should
+  fail fast; it cannot raise it past an hour, because a convergence cannot yet
+  be stopped once it starts, and the lock it holds is what a booting pod waits
+  on. Work too slow even for that still has to be created by hand, which is what
+  [Pre-creating indexes on a long-lived
   database](#pre-creating-indexes-on-a-long-lived-database) is for.
 - **A converged storage costs one diff.** Steps 1 and 2 run without the lock, so
   the overwhelmingly common case — a pod booting against storage that already
@@ -382,6 +387,16 @@ running it at once serialize the way two booting pods do. It previews the
 statements and prompts before running them; `--auto-approve` (`-y`) skips the
 prompt for scripted maintenance.
 
+What it does not share with a boot is the budget. A boot gives up after five
+minutes because a converging pod is not yet serving; this command runs under an
+hour, because the only thing waiting on it is the person who ran it. That is
+what makes it worth converging ahead of a roll rather than letting the roll do
+it — the work a boot would have timed out on is exactly the work this finishes.
+`--timeout` lowers the ceiling for a run that should fail fast. It cannot raise
+it: a convergence holds the bootstrap advisory lock for its whole budget and
+cannot yet be stopped once it starts, so an hour is the longest a mistake can
+keep pods from booting.
+
 ```console
 $ schemabot storage apply
 ╭─────────────────────────────────────────────╮
@@ -543,7 +558,7 @@ not starting.
    schemabot storage plan --schema-dir ./pkg/schema/mysql --dsn "$STORAGE_DSN"
    ```
 
-2. **Decide whether the boot should do it.** Additive DDL inside the
+2. **Decide whether the boot should do it.** Additive DDL inside a boot's
    five-minute budget is fine when the tables are small. It is not fine when
    they are not: on MySQL an index added to an existing storage table runs as
    Spirit online DDL, a table copy whose cost grows with row count, and every
@@ -557,10 +572,16 @@ not starting.
    the schema embedded in whatever binary runs it. Use that release's container
    image as a one-shot job if there is no binary to hand.
 
-   This takes the work out of the roll, not out of the budget — `apply` is the
-   same bootstrap under the same five minutes. A build that will not finish in
-   them has to be created by hand instead; see [Pre-creating indexes on a
-   long-lived database](#pre-creating-indexes-on-a-long-lived-database).
+   This takes the work out of the roll *and* out of the boot's budget: `apply`
+   is the same bootstrap, but it runs under an hour rather than five minutes,
+   because the constraint on a boot is that a converging pod is not yet serving
+   and nothing here is waiting on it. So a build that a boot could not finish
+   is exactly the case this step exists for. Run it from a terminal you can
+   leave open, and expect the storage bootstrap lock to be held throughout —
+   pods booting in that window will not come up, which is why this belongs
+   ahead of the roll rather than during one. A build too slow even for the hour
+   has to be created by hand instead; see [Pre-creating indexes on a long-lived
+   database](#pre-creating-indexes-on-a-long-lived-database).
 
 3. **On MySQL, if you converged ahead of the roll, re-check right before it.** A
    table or a column you created early survives a boot of the current release;
@@ -613,10 +634,13 @@ Two failures look similar in the logs and are not:
   will clear on its own; resolve the named item.
 - **The convergence is not finishing in the budget.** The plan names outstanding
   DDL that is legal but slow, typically an index over a table with a long
-  history. `storage apply` runs under the same five-minute budget and will not
-  clear this one: build the index by hand, outside the bootstrap, and the pod
-  then finds nothing to do. The statements to run are in [Pre-creating indexes
-  on a long-lived
+  history. `storage apply` runs the same DDL under an hour rather than five
+  minutes, so try it first — this is the case that budget exists for, and it
+  clears the boot by converging once from a terminal. Hold the roll while it
+  runs: it keeps the bootstrap lock throughout, and pods booting behind it will
+  not come up. If an hour is not enough either, build the index by hand,
+  outside the bootstrap, and the pod then finds nothing to do. The statements
+  to run are in [Pre-creating indexes on a long-lived
   database](#pre-creating-indexes-on-a-long-lived-database).
 
 ## Pre-creating indexes on a long-lived database

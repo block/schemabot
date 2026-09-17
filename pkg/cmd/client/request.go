@@ -34,6 +34,25 @@ var httpClient = &http.Client{Timeout: 30 * time.Second, Transport: authTranspor
 // database. Matches the server's own budget for these routes.
 var operatorHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: authTransport}
 
+// clientForBudget builds a client for one request whose server-side work is
+// bounded by a budget the caller named, rather than by a fixed one this package
+// can know in advance.
+//
+// A client timeout below the server's budget is the worst of both: the server
+// converges to completion while the client gives up, so the operator is told
+// their command timed out and has no way to tell whether the DDL ran. The
+// margin covers the round trip and the response either side of the work.
+func clientForBudget(budget time.Duration) *http.Client {
+	return &http.Client{Timeout: budget + operatorResponseMargin, Transport: authTransport}
+}
+
+// operatorResponseMargin is the room a bounded operator request needs beyond
+// the server's own budget: the two diffs bracketing a convergence, plus the
+// round trip and the response. It is deliberately generous — overshooting means
+// waiting a little longer for an answer the server is still going to send,
+// while undershooting means not getting it at all.
+const operatorResponseMargin = 5 * time.Minute
+
 // SetAuthToken configures the Bearer token attached to every CLI request. An
 // empty token leaves requests unauthenticated, which is correct against a
 // server with auth disabled. Surrounding whitespace is trimmed so a token

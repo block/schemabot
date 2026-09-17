@@ -20,23 +20,32 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
-// EnsureSchemaTimeout bounds the whole EnsureSchema operation: acquiring the
-// advisory lock, planning, and applying the storage schema change to
-// completion. SchemaBot's storage tables are small, but Spirit applies an
-// *online* DDL, and on Aurora that carries fixed overhead (binlog subscription,
-// checksum, cutover MDL, and throttler poll loops) that can exceed a minute even
-// for a tiny table. Trailing pods also wait up to this long on the advisory lock
-// while the leader applies, then see no changes. Too short a value cancels the
-// apply mid-copy ("failed to read chunk data: context canceled") and leaves
-// storage uninitialized.
+// EnsureSchemaTimeout bounds a convergence nobody asked for: the one a pod runs
+// on the way up. It covers acquiring the advisory lock, planning, and applying
+// the storage schema change to completion. SchemaBot's storage tables are small,
+// but Spirit applies an *online* DDL, and on Aurora that carries fixed overhead
+// (binlog subscription, checksum, cutover MDL, and throttler poll loops) that can
+// exceed a minute even for a tiny table. Trailing pods also wait up to this long
+// on the advisory lock while the leader applies, then see no changes. Too short a
+// value cancels the apply mid-copy ("failed to read chunk data: context
+// canceled") and leaves storage uninitialized.
+//
+// It is short on purpose, and the reason is availability rather than DDL cost: a
+// pod converging is a pod not yet serving, and one holding the advisory lock is
+// every other pod not yet serving either. A boot must therefore give up and
+// report rather than wait out work of unbounded length — which is why a
+// convergence an operator asked for does not use this value. That one has
+// somebody watching it and no deployment waiting on it, so it names its own
+// budget through WithConvergenceTimeout, defaulting to
+// DefaultStorageApplyTimeout.
 //
 // The same constant bounds the PostgreSQL bootstrap flow — its existence
 // checks, advisory-lock wait, and transactional table creation — so tuning it
 // for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits. It is
-// also the base of a fourth derivation: postgresBootstrapDDLStatementTimeout
-// subtracts a margin from it to bound one convergence DDL statement
-// server-side, so lowering this shortens that budget too, down to its own
-// floor.
+// also the base of a fourth derivation on the boot path:
+// postgresBootstrapDDLBudget subtracts a margin from the effective budget to
+// bound one convergence DDL statement server-side, so lowering this shortens
+// that budget too, down to its own floor.
 const EnsureSchemaTimeout = 5 * time.Minute
 
 // EnsureSchemaOption customizes EnsureSchema behavior.
@@ -45,6 +54,11 @@ type EnsureSchemaOption func(*ensureSchemaOptions)
 type ensureSchemaOptions struct {
 	allowDestructive bool
 	dialect          schema.Dialect
+	// convergenceTimeout bounds one whole convergence: the lock wait, the
+	// diff under it, and the DDL. It defaults to EnsureSchemaTimeout, the
+	// budget a boot needs, so a caller that never considered the question
+	// converges the way a pod does.
+	convergenceTimeout time.Duration
 	// postgresStatementTimeout bounds a single ordinary query on the
 	// PostgreSQL bootstrap's connection. Zero disables the budget explicitly;
 	// negative means "not set", leaving the platform's ambient value in place.
@@ -84,7 +98,7 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // bootstrap issues — its catalog reads and existence checks. It deliberately
 // does not bound the two statement classes the bootstrap runs that are
 // expected to be slow: convergence DDL raises the budget per transaction to
-// postgresBootstrapDDLStatementTimeout, and the advisory-lock wait runs with
+// postgresBootstrapDDLBudget's value, and the advisory-lock wait runs with
 // no statement budget at all. A zero duration disables the budget explicitly
 // rather than inheriting the platform's, and a negative one leaves the
 // platform's value in place. Unset, the budget is
@@ -92,6 +106,22 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // PostgresConfig.StatementTimeoutOrDefault.
 func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.postgresStatementTimeout = d }
+}
+
+// WithConvergenceTimeout bounds one whole convergence — the advisory-lock wait,
+// the diff taken under it, and the DDL — replacing the boot budget
+// EnsureSchemaTimeout. A non-positive duration is refused rather than read as
+// "no limit": a convergence with no ceiling holds the advisory lock forever on a
+// statement that will never finish, and every pod that boots behind it fails its
+// own lock wait.
+//
+// Raise it only for a convergence somebody is watching. The budget is what
+// bounds how long this call can keep booting pods out of service, so the
+// deliberate path trades that availability for the ability to finish work a boot
+// could not — an index build over a storage table with a long history, say.
+// Wire it from DefaultStorageApplyTimeout unless an operator named a value.
+func WithConvergenceTimeout(d time.Duration) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.convergenceTimeout = d }
 }
 
 // EnsureSchema converges SchemaBot's own storage schema at startup, routing to
@@ -107,6 +137,9 @@ func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
 	o := newEnsureSchemaOptions(opts...)
+	if o.convergenceTimeout <= 0 {
+		return fmt.Errorf("converge storage schema: convergence timeout must be positive, got %s", o.convergenceTimeout)
+	}
 	switch o.dialect {
 	case schema.DialectMySQL:
 		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
@@ -140,7 +173,10 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 // removed. The invariant is that an old binary can never destroy newer schema
 // state: the surplus table or column stays in place until an operator opts in.
 func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
+	// Built from Background rather than from a caller's context: a convergence
+	// that has started must run to a state the next diff can describe, so a
+	// caller hanging up stops it waiting for the answer, never the DDL.
+	ctx, cancel := context.WithTimeout(context.Background(), o.convergenceTimeout)
 	defer cancel()
 
 	// Diagnostic preamble: log the actual database target and current state
@@ -222,7 +258,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	// Changes or stale Spirit tables detected — acquire advisory lock to
 	// serialize cleanup and Spirit execution across pods.
-	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, locker)
+	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, locker, o.convergenceTimeout)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
@@ -626,7 +662,7 @@ const ensureSchemaLockName = "schemabot_ensure_schema"
 // dialect's bootstrapper needs its own lock helper alongside its
 // namedlock.Locker. Returns the connection holding the lock — the lock is
 // released when the connection is closed.
-func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
+func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker, wait time.Duration) (*sql.Conn, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -639,9 +675,13 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 		return nil, fmt.Errorf("get connection: %w", err)
 	}
 
-	// Wait up to the full timeout for the lock — a trailing pod must outwait the
-	// leader's schema change, after which it re-plans and finds no changes.
-	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
+	// Wait up to this convergence's whole budget for the lock — a trailing pod
+	// must outwait the leader's schema change, after which it re-plans and finds
+	// no changes. A pod waits out a boot; it does not wait out an operator's
+	// longer convergence, whose budget is its own and larger. That pod gives up
+	// at its own ceiling and reports the contention by name, which is the
+	// intended trade: converge ahead of a roll, not during one.
+	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, wait)
 	if err != nil {
 		utils.CloseAndLog(conn)
 		// The overall EnsureSchema deadline expires before the server-side
