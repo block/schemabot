@@ -1197,13 +1197,17 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	if drift.Clean {
 		if drift.Independent {
 			fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — %s\n\n",
-				len(drift.Deployments), strings.Join(names, ", "), describePlanGroups(drift.Plans))
+				len(drift.Deployments), clampNameList(names), describePlanGroups(drift.Plans))
 			return
 		}
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
-			len(drift.Deployments), strings.Join(names, ", "))
+			len(drift.Deployments), clampNameList(names))
 		return
 	}
+
+	// The list below is not clamped. It is the only place the comment says which
+	// member blocked and why, so dropping names would leave an operator with a
+	// failing check and no way to tell which target to go look at.
 
 	// A member that could not be planned blocks under either contract, but only
 	// mirrored members can be *out of agreement* with each other. Calling an
@@ -1354,11 +1358,34 @@ func writePlanGroupSummary(sb *strings.Builder, data PlanCommentData, groups []D
 // operator can tell the plan they have already read from the ones they have not.
 func planGroupHeading(g DeploymentPlanGroup) string {
 	names := inlineCodeList(g.Members)
-	// The primary is first in rollout order, so it is its group's first member.
+	// The primary is first in rollout order, so it is its group's first member,
+	// and the clamp below keeps the first names — the reviewed member is never
+	// the one summarized away.
 	if g.Primary && len(names) > 0 {
 		names[0] += " (primary)"
 	}
-	return strings.Join(names, ", ")
+	return clampNameList(names)
+}
+
+// renderedMemberNames is how many member names a list states before it
+// summarizes the rest. A fleet can run to hundreds of targets, and a heading
+// that names every one buries the plan it is a heading for.
+const renderedMemberNames = 3
+
+// clampNameList states a member list, summarizing past renderedMemberNames
+// names. The names it keeps are the first ones, which is rollout order: the
+// targets that change first are the ones an operator watches.
+//
+// The count is of the names dropped, not of the whole list, so the sentence
+// still tells a reader how large the group is without them counting the names
+// that are there.
+func clampNameList(names []string) string {
+	// One name over the limit is named rather than summarized: "and 1 more"
+	// costs the reader that member's name and saves them nothing.
+	if len(names) <= renderedMemberNames+1 {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:renderedMemberNames], ", "), len(names)-renderedMemberNames)
 }
 
 // planGroupWorkLabel says what a group's plan runs, e.g. "1 DDL statement" or

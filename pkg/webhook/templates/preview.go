@@ -594,6 +594,49 @@ func PreviewCommentPlanTargetsDiverging() string {
 	})
 }
 
+// PreviewCommentPlanTargetsLargeFleet renders a plan comment for an environment
+// with more targets than a comment can name, where most of the fleet already
+// holds the reviewed change and a handful still need it.
+func PreviewCommentPlanTargetsLargeFleet() string {
+	const targets = 144
+	members := make([]DeploymentDriftEntry, targets)
+	converged := make([]string, 0, targets-5)
+	for i := range members {
+		target := fmt.Sprintf("testapp_%d", i+1)
+		members[i] = DeploymentDriftEntry{Deployment: "primary", Target: target, Class: "planned"}
+		if i >= 5 {
+			converged = append(converged, "primary/"+target)
+		}
+	}
+	members[0].Primary = true
+
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      previewTargetPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed:    true,
+			Clean:       true,
+			Independent: true,
+			Deployments: members,
+			Plans: []DeploymentPlanGroup{
+				{
+					Members: []string{"primary/testapp_1", "primary/testapp_2", "primary/testapp_3", "primary/testapp_4", "primary/testapp_5"},
+					Primary: true,
+					Changes: previewTargetPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+				},
+				{Members: converged},
+			},
+		},
+	})
+}
+
 // PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
 // drift rollup could not be computed, so the plan check fails closed.
 func PreviewCommentPlanDriftUnverified() string {
