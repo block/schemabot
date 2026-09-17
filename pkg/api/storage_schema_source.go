@@ -26,10 +26,13 @@ import (
 // report that did not name its desired side would leave an operator holding
 // the wrong one with no way to tell.
 //
-// A supplied schema is a diff-only input. ApplyStorageSchema takes no source
-// and has no way to accept one: a convergence runs the schema of the binary
-// running it, or "apply is what a boot does" — the property that makes this
-// usable as a pre-deploy step — stops being true (AV-9).
+// A convergence takes the same input, for the same reason: an operator rolling
+// a later release converges the storage to that release before its first pod
+// starts, which is the whole point of having this as a command. Supplying the
+// files moves which schema runs and nothing else — the destructive refusal and
+// the manual-remediation gate decide exactly as they decide for a boot, so no
+// supplied set can cost the storage a table that nobody permitted losing
+// (AV-9).
 
 // storageSchemaNamespace is the namespace the storage schema files declare.
 // EnsureSchema passes the same value to the engine; naming it once keeps the
@@ -79,12 +82,21 @@ func EmbeddedStorageSchema(version string) *StorageSchemaSource {
 //
 // What it does not do is establish that a readable set is *complete*, because
 // nothing here can: a set is a map, and a map has no way to say what is
-// missing from it. Two things keep that from being a safety hole rather than a
-// caveat. The two selectors that reach this both produce a complete set by
-// construction — a directory listing and a release listing, each an error if it
-// fetches partially — and no convergence can consume a supplied set at all
-// (AV-9), so the worst an incomplete one produces is a report that overstates
-// what is surplus, never a database that has lost a table.
+// missing from it. An incomplete set diffs cleanly and reports the tables it
+// omits as surplus, and a convergence can consume a supplied set, so the
+// question of what happens to those tables is a real one rather than a
+// hypothetical.
+//
+// Three things answer it, and none of them is this validation. The two
+// selectors that reach here produce a complete set by construction — a
+// directory listing and a release listing, each an error if it fetches
+// partially. A statement that would drop a storage table is destructive, and a
+// convergence refuses destructive statements unless destroying storage state
+// was explicitly permitted (AV-9). And a convergence to a schema the running
+// binary does not carry is confirmed by an operator who is shown those
+// statements first. So an incomplete set costs a report that overstates what is
+// surplus, and it takes a separate, explicit permission before it costs a
+// table.
 func StorageSchemaFromFiles(description string, files map[string]string) (*StorageSchemaSource, error) {
 	description = strings.TrimSpace(description)
 	if description == "" {

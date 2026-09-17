@@ -283,9 +283,11 @@ schemabot storage plan --deployment west -e production --release v1.4.0
 
 `storage plan` requires the release to be named — `--release`, or `--schema-dir`
 pointed at a checkout — so there is no way to get an answer about a release you
-did not choose. `storage apply` is the command that runs the schema embedded in
-the binary running it, and it takes no selector at all. Operators pre-creating an
-index ahead of the roll should also read [Deploying a release that changes the
+did not choose. `storage apply` takes the same selectors and converges what they
+name, which is how an operator readies the storage before the release that needs
+it rolls; naming one is confirmed at a terminal and refused with
+`--auto-approve`. Operators pre-creating an index ahead of the roll should also
+read [Deploying a release that changes the
 storage
 schema](./storage-schema.md#deploying-a-release-that-changes-the-storage-schema)
 — on MySQL a pre-created index is removed again by any boot of the

@@ -40,10 +40,11 @@ type storageTarget struct {
 	// allowDestructive is the deployment's standing storage policy
 	// (storage.allow_destructive_schema_changes), when the DSN came from a
 	// server config. A boot of that config converges under it, so an operator
-	// convergence against the same database must too — otherwise "apply is what
-	// a boot does" (AV-9) stops being true on exactly the deployments that
-	// opted in. A DSN passed on the command line carries no config and so no
-	// policy, leaving --allow-unsafe as the only way to widen it.
+	// convergence against the same database must too — an operator may name
+	// which schema runs, but not the policy it runs under (AV-9), and otherwise
+	// the two would disagree on exactly the deployments that opted in. A DSN
+	// passed on the command line carries no config and so no policy, leaving
+	// --allow-unsafe as the only way to widen it.
 	allowDestructive bool
 	// postgresStatementTimeout is the config's statement budget, for the same
 	// reason: a convergence run here has to read and write under the budget the

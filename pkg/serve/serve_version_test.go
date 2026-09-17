@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
-	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -219,7 +218,7 @@ func TestStorageSchemaAdapterNeverAttributesToTheSentinel(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, adapter.version, "the sentinel is a log value, not a version a report can attribute files to")
 
-	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{})
+	desired, err := adapter.desiredSchema(nil, "", "diff")
 	require.NoError(t, err)
 	assert.Equal(t, "the schema embedded in this binary", desired.Description)
 }
@@ -238,7 +237,7 @@ func TestStorageSchemaAdapterAttributesToANamedBuild(t *testing.T) {
 	adapter, err := srv.newStorageSchemaService()
 	require.NoError(t, err)
 
-	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{})
+	desired, err := adapter.desiredSchema(nil, "", "diff")
 	require.NoError(t, err)
 	assert.Equal(t, "the schema embedded in v1.2.3", desired.Description)
 }

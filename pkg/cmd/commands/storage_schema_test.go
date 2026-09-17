@@ -493,6 +493,24 @@ func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
 			}},
 			rerun: "storage apply --dsn <the same DSN> --dialect postgres --allow-unsafe",
 		},
+		{
+			// The refused statements were computed against the named release,
+			// so a command that dropped the selector would permit destructive
+			// changes while converging a different release's schema.
+			name: "a named release travels with the permission",
+			cmd: StorageApplyCmd{storageSchemaSourceFlags: storageSchemaSourceFlags{
+				Release: "v1.5.0",
+				Repo:    "example/mirror",
+			}},
+			rerun: "storage apply --release v1.5.0 --release-repo example/mirror --allow-unsafe",
+		},
+		{
+			name: "a named checkout travels with the permission",
+			cmd: StorageApplyCmd{storageSchemaSourceFlags: storageSchemaSourceFlags{
+				SchemaDir: "./pkg/schema/mysql",
+			}},
+			rerun: "storage apply --schema-dir ./pkg/schema/mysql --allow-unsafe",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -501,6 +519,158 @@ func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
 			assert.NotContains(t, rerun, "hunter2", "a suggested command must not print the storage credentials")
 		})
 	}
+}
+
+// Converging a release the answering binary does not carry is confirmed at a
+// terminal, so the selectors are refused together with --auto-approve. The
+// refusal is of the command form, before anything is read: an unattended run
+// must not reach a database at all to find out it will not be allowed to
+// converge (AV-9).
+func TestBlockUnattendedNamedSchema(t *testing.T) {
+	require.NoError(t, blockUnattendedNamedSchema("", true),
+		"an unattended convergence of the answering binary's own schema is the pre-deploy step this command exists for")
+	require.NoError(t, blockUnattendedNamedSchema("--release", false),
+		"a named release is fine with a person watching; the prompt is the consent")
+
+	for _, selector := range []string{"--release", "--schema-dir"} {
+		err := blockUnattendedNamedSchema(selector, true)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), selector+" cannot be combined with --auto-approve")
+		assert.Contains(t, err.Error(), "confirmed at a terminal")
+	}
+}
+
+// The refusal reaches no database and no server. An operator's pre-deploy job
+// that names a release learns that from the flags alone, and a storage
+// database that is unreachable or mid-incident is not touched to tell them.
+func TestStorageApplyCmd_UnattendedNamedReleaseRunsNothing(t *testing.T) {
+	endpoint, routes := storageSchemaTestServer(t, &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+	}, nil, nil)
+
+	cmd := StorageApplyCmd{
+		storageSchemaSourceFlags: storageSchemaSourceFlags{SchemaDir: storageSchemaCheckoutDir(t)},
+		AutoApprove:              true,
+	}
+	err := cmd.Run(t.Context(), &Globals{Endpoint: endpoint, Version: "v1.4.0"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot be combined with --auto-approve")
+	assert.Empty(t, *routes, "the flags are refused before anything is read")
+}
+
+// A named release's files travel with the convergence, because the answering
+// binary does not carry them — and they travel with the attribution, so the
+// reports name the release whose files ran rather than the binary that ran
+// them.
+func TestStorageApplyCmd_SendsTheNamedSchemaToConverge(t *testing.T) {
+	dir := storageSchemaCheckoutDir(t)
+	report := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:      "v1.4.0",
+		SchemaSource: "the schema files in " + dir,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "create_table", DDL: "CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"},
+		},
+	}
+	converged := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version: "v1.4.0", SchemaSource: "the schema files in " + dir,
+	}
+
+	var applied apitypes.StorageSchemaApplyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/storage/schema/plan":
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaPlanResponse{Report: report}))
+		case "/api/storage/schema/apply":
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&applied))
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaApplyResponse{
+				Planned: report, Remaining: converged,
+			}))
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	answerPrompt(t, "yes")
+	cmd := StorageApplyCmd{storageSchemaSourceFlags: storageSchemaSourceFlags{SchemaDir: dir}}
+	out := captureStdout(func() {
+		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: server.URL, Version: "v1.4.0"}))
+	})
+
+	assert.Equal(t, "the schema files in "+dir, applied.SchemaSource,
+		"the convergence is attributed to the release whose files ran")
+	require.Contains(t, applied.SchemaFiles, "applies.sql",
+		"the answering binary does not carry the named release's files, so they travel with the request")
+	assert.Contains(t, applied.SchemaFiles["applies.sql"], "CREATE TABLE `applies`")
+	assert.Contains(t, out, "This is not the schema v1.4.0 converges on boot",
+		"the operator is told the deployed release will converge the difference back")
+}
+
+// A convergence resolves its release as a convergence, not as a diff. The two
+// read the same files over the same path, but only one of them runs them: a
+// release read over plaintext is a report to distrust for a plan and a hazard
+// to the storage database for an apply, so the apply is refused and nothing
+// reaches the target.
+func TestStorageApplyCmd_RefusesAReleaseReadOverPlaintext(t *testing.T) {
+	t.Setenv("GITHUB_API_URL", "http://ghe.example")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+
+	var routes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routes = append(routes, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaPlanResponse{Report: &apitypes.StorageSchemaReport{
+			Dialect: "mysql", Database: "schemabot", Host: "db-1.example", Version: "v1.4.0",
+		}}))
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := StorageApplyCmd{storageSchemaSourceFlags: storageSchemaSourceFlags{Release: "v1.5.0"}}
+	err := cmd.Run(t.Context(), &Globals{Endpoint: server.URL, Version: "v1.4.0"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to converge a release read from http://ghe.example over plaintext")
+	assert.NotContains(t, routes, "/api/storage/schema/apply", "nothing converges on a refused release")
+}
+
+// The notice under a cross-release convergence states the one consequence an
+// operator cannot see in the plan: the deployed release converges the
+// difference back, and it does so asymmetrically. A surplus table or column is
+// refused as destructive and survives; a surplus index loses no data, so that
+// release's own bootstrap removes it without asking. A pre-applied index
+// therefore has a shelf life measured in pod restarts, which is invisible in
+// a plan that shows only what the storage needs.
+func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:      "v1.4.0",
+		SchemaSource: "the schema files of release v1.5.0 in block/schemabot",
+	}
+
+	named := storageSchemaConfirmation(report, true)
+	assert.Contains(t, named, "Converging schemabot on db-1.example (mysql) to the schema files of release v1.5.0 in block/schemabot")
+	assert.Contains(t, named, "This is not the schema v1.4.0 converges on boot")
+	assert.Contains(t, named, "refused as destructive and stays")
+	assert.Contains(t, named, "an index loses no")
+	assert.Contains(t, named, "storage plan")
+	assert.Contains(t, named, "Only 'yes' will be accepted")
+
+	own := storageSchemaConfirmation(report, false)
+	assert.NotContains(t, own, "This is not the schema",
+		"a convergence of the answering binary's own schema has no cross-release consequence to state")
+	assert.Contains(t, own, "Only 'yes' will be accepted")
+
+	// A report with no version still states the asymmetry; the release it
+	// names is the one that answered, which is all the operator needs to know
+	// they are ahead of it.
+	unversioned := storageSchemaConfirmation(&apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", SchemaSource: "the schema files in ./pkg/schema/mysql",
+	}, true)
+	assert.Contains(t, unversioned, "the release answering this command")
+	assert.NotContains(t, unversioned, "schema  converges", "an empty version must not leave a gap in the sentence")
 }
 
 // Destructive statements the target has permitted are not gated: the report
@@ -559,4 +729,105 @@ func TestAttributeStorageSchemaConvergence(t *testing.T) {
 func TestStorageSchemaTargetSuffix(t *testing.T) {
 	assert.Empty(t, storageSchemaTargetSuffix("", ""))
 	assert.Equal(t, " for deployment west in production", storageSchemaTargetSuffix("west", "production"))
+}
+
+// The storage target is resolved once per run. Every resolution of a config
+// using storage.dsn_from is a fresh read of secret references, so a second one
+// can answer differently than the first — and the run that resolved twice would
+// be the one that converged a database its own preview never looked at.
+func TestStorageSchemaTargetFlags_ResolveTheTargetOnce(t *testing.T) {
+	flags := storageSchemaTargetFlags{DSN: "postgres://schemabot@db-1.example:5432/schemabot"}
+	first, err := flags.target()
+	require.NoError(t, err)
+	assert.Equal(t, "--dsn flag", first.source)
+	require.NotNil(t, flags.resolvedTarget)
+
+	// The selectors are emptied, so a second resolution has nothing to resolve
+	// from: an answer at all is the memo answering.
+	flags.DSN = ""
+	second, err := flags.target()
+	require.NoError(t, err)
+	assert.Same(t, first, second, "the target is resolved once; a second read is the same database, not another lookup")
+}
+
+// The resolution travels with the flags that named it. An apply hands its
+// target flags to its own preview, and it is that hand-off — a struct copy —
+// that has to carry the resolved database rather than the selectors that would
+// resolve one again.
+func TestStorageSchemaTargetFlags_CopyCarriesTheResolution(t *testing.T) {
+	flags := storageSchemaTargetFlags{DSN: "schemabot@tcp(db-1.example:3306)/schemabot"}
+	resolved, err := flags.target()
+	require.NoError(t, err)
+
+	preview := StoragePlanCmd{storageSchemaTargetFlags: flags}
+	preview.DSN = ""
+	carried, err := preview.target()
+	require.NoError(t, err)
+	assert.Same(t, resolved, carried, "the preview addresses the database the apply resolved")
+}
+
+// A refused --json convergence is reported as JSON. It is the case a program
+// most needs to read, and nothing ran, so every statement the plan found is
+// still outstanding and both halves of the response are the same report. A
+// human plan printed instead would be unparseable text where a caller expects
+// an object, and the destructive gate alone would print nothing at all.
+func TestStorageApplyCmd_RefusalIsReportedAsJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		plan  *apitypes.StorageSchemaReport
+		human string
+	}{
+		{
+			name:  "manual remediation",
+			human: "Needs manual remediation",
+			plan: &apitypes.StorageSchemaReport{
+				Dialect:      "postgres",
+				Database:     "schemabot",
+				Host:         "db-1.example",
+				SchemaSource: "the schema embedded in v1.4.0",
+				Manual: []apitypes.StorageSchemaStatement{{
+					Table:     "checks",
+					Operation: "add_column",
+					DDL:       `ALTER TABLE "checks" ADD COLUMN "head_sha" varchar(64) NOT NULL`,
+					Reason:    "definition is NOT NULL without a DEFAULT",
+				}},
+			},
+		},
+		{
+			name:  "destructive statement",
+			human: "Apply blocked",
+			plan: &apitypes.StorageSchemaReport{
+				Dialect:      "mysql",
+				Database:     "schemabot",
+				Host:         "db-1.example",
+				SchemaSource: "the schema embedded in v1.4.0",
+				Destructive: []apitypes.StorageSchemaStatement{
+					{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint, routes := storageSchemaTestServer(t, tc.plan, nil, nil)
+
+			var err error
+			out := captureStdout(func() {
+				cmd := StorageApplyCmd{AutoApprove: true, JSON: true}
+				err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+			})
+
+			require.Error(t, err)
+			assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes, "a refusal converges nothing")
+			assert.NotContains(t, out, tc.human, "a program reads this surface, so the refusal is the response shape")
+
+			var response apitypes.StorageSchemaApplyResponse
+			require.NoError(t, json.Unmarshal([]byte(out), &response), "the whole of stdout is the response")
+			require.NotNil(t, response.Planned)
+			require.NotNil(t, response.Remaining)
+			assert.Equal(t, tc.plan.Manual, response.Remaining.Manual)
+			assert.Equal(t, tc.plan.Destructive, response.Remaining.Destructive)
+			assert.Equal(t, response.Planned, response.Remaining, "nothing ran, so what was planned is what is still outstanding")
+		})
+	}
 }

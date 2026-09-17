@@ -10,6 +10,7 @@
 - [Ask what storage DDL is outstanding](#ask-what-storage-ddl-is-outstanding)
 - [Name the release, and the storage database](#name-the-release-and-the-storage-database)
 - [Converge it](#converge-it)
+- [Converging a release before it rolls](#converging-a-release-before-it-rolls)
 - [Deploying a release that changes the storage schema](#deploying-a-release-that-changes-the-storage-schema)
 - [When a pod will not start](#when-a-pod-will-not-start)
 - [Pre-creating indexes on a long-lived database](#pre-creating-indexes-on-a-long-lived-database)
@@ -58,8 +59,8 @@ the startup path                        the CLI path
                    └────────────────┬─────────────────┘
                                     ▼
                   the storage database, converged to the
-                  schema of the binary that ran it, and to
-                  nothing else
+                  schema the run was given: the running
+                  binary's own, or a release an operator named
 ```
 
 Two consequences worth holding onto:
@@ -67,9 +68,13 @@ Two consequences worth holding onto:
 - **`storage apply` is what a boot does**, not an equivalent of it: the same
   differ, the same refusal, the same lock. Converging ahead of a roll cannot
   disagree with what the roll then does, and concurrent runs serialize.
-- **A binary converges its own schema, never another's.** Neither the command
-  line nor the RPC behind it can hand it another release's files, which stops an
-  older binary from reading newer tables as surplus to prune.
+- **Which schema it converges is yours to name.** With no selector it runs the
+  files the answering binary carries, which is what that binary's own next boot
+  would run. With `--release` or `--schema-dir` it runs that release's files
+  instead, so the storage a release needs can be in place before its first pod
+  starts. Naming a release supplies the files and nothing else: every refusal
+  that guards a boot guards this too, so an older binary handed a newer
+  release's files still cannot prune the newer tables.
 
 The storage database is the one SchemaBot cannot be down for, so the bootstrap
 fails closed: uncertainty keeps a pod out of service rather than becoming a
@@ -184,23 +189,28 @@ emits the whole report.
 ## Name the release, and the storage database
 
 The live side of a plan is always a read of the database. The desired side is
-one release's schema *files*. One selector is required, and naming both is
-refused rather than resolved by precedence:
+one release's schema *files*, named the same way on both commands: `storage
+plan` requires a selector, and `storage apply` converges the answering binary's
+own schema when given none. Naming both selectors is refused rather than
+resolved by precedence:
 
 - **`--release <tag>`** fetches that tag's `pkg/schema/<dialect>/` files over the
   repository's contents API, for the dialect the live storage runs.
   `--release-repo` points at a fork or mirror (`block/schemabot` by default),
   `GITHUB_API_URL` at a different API host, and `GITHUB_TOKEN` or `GH_TOKEN`
-  authorizes the fetch.
+  authorizes the fetch. Where `GITHUB_API_URL` names a plaintext host, a plan
+  warns and a convergence is refused: anything on that path can rewrite the
+  files before they arrive, and a convergence runs whatever arrives. A host on
+  this machine is exempt, having no network path.
 - **`--schema-dir <path>`** reads `*.sql` from a checkout or an extracted image
   layer, needs no network, and is how you ask about a commit that was never
   tagged. Point it at the dialect directory (`pkg/schema/mysql`), not its parent.
 
-There is no default because the same storage is converged against the release
+A plan has no default because the same storage is converged against the release
 that is running and short of the release about to roll, and an operator who
-assumed the wrong one either rolls into a failing bootstrap or converges storage
-they did not mean to touch. `storage apply` takes neither selector, because a
-convergence runs the schema of the binary running it.
+assumed the wrong one either misreads the report or converges storage they did
+not mean to touch. What the answering binary carries is not a selector either:
+through the API, which release that is depends on which pod took the call.
 
 Which storage database either command reads is stated rather than discovered:
 
@@ -227,9 +237,12 @@ access](auth.md#what-read-and-write-access-include)).
 
 `storage apply` runs the bootstrap described above, so two operators running it
 at once serialize the way two booting pods do. It prints the plan, asks for a
-literal `yes`, and reports what ran, naming the schema embedded in the binary
-that ran it; `--auto-approve` (`-y`) skips the prompt for scripted maintenance.
-A convergence that leaves statements behind prints them as a plan underneath.
+literal `yes`, and reports what ran, naming the schema it converged: the
+answering binary's own, or the release the command named. `--auto-approve`
+(`-y`) skips the prompt for scripted maintenance, and is refused when a release
+is named, for the reason in [Converging a release before it
+rolls](#converging-a-release-before-it-rolls). A convergence that leaves
+statements behind prints them as a plan underneath.
 
 A run that finds nothing outstanding is still worth taking, because the
 bootstrap converges more than the catalog. On MySQL it clears the schema change
@@ -285,6 +298,38 @@ not, so a maintenance script keyed on the status gets them right:
 | a change needs manual remediation, so nothing ran | non-zero |
 | the target could not be read, or the DDL failed | non-zero |
 
+Under `--json` a refusal comes back in the shape a convergence does, so nothing
+has to be re-read to learn which statements were refused: nothing ran, so the
+planned and the remaining halves of the report are the same.
+
+## Converging a release before it rolls
+
+Name the release and `storage apply` converges *its* files, from whatever CLI
+you have to hand:
+
+```bash
+schemabot storage apply --release v1.4.0 --dsn "$STORAGE_DSN"
+```
+
+This is the command's reason for existing: the storage a release needs has to be
+there before the first pod of that release starts, and the pod that would
+otherwise converge it is the one that cannot start until it is.
+
+It is confirmed at a terminal, and `--auto-approve` is refused with it. Naming a
+release substitutes files the answering binary never carried, so until that
+release is deployed the fleet's own boots converge the difference back, and the
+confirmation's notice says what that costs: a pre-applied table or column
+survives those boots, **an index does not** ([What is never
+automatic](#what-is-never-automatic)). Converge close to the deploy, re-run
+`storage plan` just before it, and leave unattended runs to a job with no
+selector, which converges the answering binary's own schema.
+
+The convergence gets no more permission than a boot: a statement that would drop
+a storage table or column is refused as it is at startup, and a PostgreSQL
+column shape the convergence will not run still stops the whole set. So a
+hand-assembled `--schema-dir` missing half its tables is refused rather than
+applied.
+
 ## Deploying a release that changes the storage schema
 
 Every startup converges the storage schema on its own, so the routine case needs
@@ -303,15 +348,18 @@ starting.
 2. **Decide whether the boot should do it.** Additive DDL inside the five-minute
    budget is fine when the tables are small, and not when they are not: on MySQL
    an index added to an existing storage table copies the table, and every pod in
-   the roll pays it. Converge once, ahead of the roll, from a binary of the new
-   release, or that release's image as a one-shot job.
+   the roll pays it. Converge once, ahead of the roll, naming the release you are
+   about to roll: the files come from the tag, so any binary you have to hand
+   converges it.
 
    ```bash
-   schemabot storage apply --dsn "$STORAGE_DSN"   # from the new release's binary
+   schemabot storage apply --release v1.4.0 --dsn "$STORAGE_DSN"
    ```
 
-   This takes the work out of the roll, not out of the budget. A build that will
-   not finish in five minutes has to be created by hand instead.
+   It prompts, with the notice from [Converging a release before it
+   rolls](#converging-a-release-before-it-rolls), and `--auto-approve` is refused
+   here. This takes the work out of the roll, not out of the budget. A build that
+   will not finish in five minutes has to be created by hand instead.
 
 3. **On MySQL, if you converged ahead of the roll, re-check right before it.** A
    table or a column you created early survives a boot of the current release;
@@ -346,10 +394,10 @@ schemabot storage plan --release v1.4.0 --dsn "$STORAGE_DSN"
 
 The statements it prints are the ones the pod is failing on. With no network to
 the repository, `--schema-dir` reads the same files from a checkout of that
-release; with neither, `storage apply --dsn "$STORAGE_DSN"` prints what the
-binary in your hand would run and waits for a `yes`. It clears the statements
-under the same advisory lock the pods are contending for, and the pod starts on
-its next backoff. Two failures look similar in the logs and are not:
+release, on either command: swapping `plan` for `apply` prints them and waits
+for a `yes`. It clears the statements under the same advisory lock the pods are
+contending for, and the pod starts on its next backoff. Two failures look
+similar in the logs and are not:
 
 - **The convergence is refusing something.** The plan names it: a destructive
   statement, or a PostgreSQL column shape needing manual remediation. Nothing

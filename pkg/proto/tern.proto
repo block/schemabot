@@ -971,8 +971,8 @@ message StartResponse {
 // caller deploying a later release asks what this storage needs in order to
 // match that release, which the serving binary cannot answer from files it does
 // not have. Sending the files is the only way to ask the question, and it is
-// safe to ask because a diff executes nothing. The apply RPC carries no such
-// field, so a convergence can only ever run the serving binary's own schema.
+// safe to ask because a diff executes nothing. The apply RPC takes the same
+// field, so the schema an operator previewed here is the schema they converge.
 message StorageSchemaPlanRequest {
   // AllowDestructive reports the destructive statements as allowed rather than
   // refused, matching what an apply carrying the same flag would run. It does
@@ -1047,7 +1047,16 @@ message StorageSchemaPlanResponse {
 }
 
 // StorageSchemaApplyRequest converges the serving instance's own storage
-// schema.
+// schema. Like the diff, it carries no target: the instance converges the
+// storage it uses, and nothing a caller sends can point it at a different
+// database.
+//
+// What a caller may send is the schema to converge *to*. An operator rolling a
+// later release converges the storage to that release before its first pod
+// starts, and the serving binary cannot do that from files it does not have.
+// Sending the files moves which schema runs and nothing else: the destructive
+// refusal and the manual-remediation gate decide exactly as they decide for a
+// boot.
 message StorageSchemaApplyRequest {
   // AllowDestructive permits the destructive statements this call would
   // otherwise refuse. It is an addition to the serving instance's storage
@@ -1059,6 +1068,16 @@ message StorageSchemaApplyRequest {
   // plane that accepted it, so the data plane's logs attribute the
   // convergence to a person rather than to a control plane.
   string caller = 2;
+  // SchemaFiles is the schema to converge to, as file name → file contents
+  // (for example "applies.sql" → "CREATE TABLE ..."). Empty converges the
+  // serving binary's own embedded files, which is what its next boot would
+  // converge.
+  map<string, string> schema_files = 3;
+  // SchemaSource says where schema_files came from, in words, for the reports
+  // to carry back and for the converging instance's logs to name. It is
+  // required with schema_files and never inferred: a convergence attributed to
+  // a release whose files it did not run is worse than one that names nothing.
+  string schema_source = 4;
 }
 
 // StorageSchemaApplyResponse brackets the convergence with the report from

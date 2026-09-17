@@ -316,10 +316,13 @@ clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handle
 Every convergence of SchemaBot's own storage — at startup, or on an operator's command — is additive
 unless destroying storage state was explicitly permitted, and decides before it writes. Nothing
 about which surface asked changes that: an operator's command runs the bootstrap rather than a
-second implementation of it, converges the schema of the binary running it, and cannot narrow the
-permission a deployment already granted. On MySQL a destructive statement (a `DROP TABLE`, or an
-`ALTER TABLE` carrying a `DROP COLUMN`) is refused unless destructive storage changes are explicitly
-allowed, and a statement whose destructive clauses cannot be partitioned out is refused *whole*.
+second implementation of it, and cannot narrow the permission a deployment already granted. Which
+schema a convergence runs is the operator's to name, so that the storage a release needs can be in
+place before the first pod of it starts; naming one supplies the files the bootstrap computes from
+and nothing else, and is confirmed by a person, never unattended. On MySQL a destructive statement
+(a `DROP TABLE`, or an `ALTER TABLE` carrying a `DROP COLUMN`) is refused unless destructive storage
+changes are explicitly allowed, and a statement whose destructive clauses cannot
+be partitioned out is refused *whole*.
 Refusing the whole statement runs strictly less than any split of it, so the fallback can never
 widen what the bootstrap executes, and startup continues on the safe remainder. On PostgreSQL the
 convergence is additive-only and gates on the entire drift set before touching anything, so a change
@@ -329,7 +332,8 @@ reading. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
 `pkg/api/ensure_schema_postgres.go`), which the operator-facing storage schema surface calls rather
 than reimplements (`pkg/api/storage_schema.go`); the instance's own storage is the only target a
 remote caller can address, and the deployment's permission is only ever widened, in the adapter that
-answers for it (`pkg/serve/storage_schema.go`).
+answers for it (`pkg/serve/storage_schema.go`); the confirmation a named schema is converged behind
+and its refusal to run unattended (`pkg/cmd/commands/storage_schema.go`).
 
 ### AV-10: Anything the PR can do, the CLI can do
 

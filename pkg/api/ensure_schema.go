@@ -45,6 +45,11 @@ type EnsureSchemaOption func(*ensureSchemaOptions)
 type ensureSchemaOptions struct {
 	allowDestructive bool
 	dialect          schema.Dialect
+	// schemaSource is the schema this convergence brings the storage database
+	// to. Nil is the binary's own embedded files, which is what a boot
+	// converges to, so the startup path never sets it and every existing call
+	// site keeps its behavior by not setting it either.
+	schemaSource *StorageSchemaSource
 	// postgresStatementTimeout bounds a single ordinary query on the
 	// PostgreSQL bootstrap's connection. Zero disables the budget explicitly;
 	// negative means "not set", leaving the platform's ambient value in place.
@@ -64,6 +69,27 @@ type ensureSchemaOptions struct {
 // Wire this from StorageConfig.AllowDestructiveSchemaChanges.
 func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
+}
+
+// WithStorageSchema converges the storage database to a schema other than the
+// binary's own embedded files — the schema of a release an operator is about to
+// roll, so the storage is ready before the first pod of it starts.
+//
+// Unset, the convergence runs the embedded files, which is what a boot does and
+// what every startup call site wants. Set, the convergence runs the supplied
+// files instead, under the same differ, the same destructive-change refusal and
+// the same advisory lock: the schema moves, the policy does not (AV-9). Nothing
+// here checks that the files are a *complete* schema, because a file set cannot
+// say what is missing from it — an incomplete one reports the storage's own
+// tables as surplus, and what keeps that from destroying them is the same
+// refusal that guards a boot.
+//
+// The option carries no version and never resolves one. A caller supplying
+// files says in words where they came from (see StorageSchemaSource), because
+// only the caller knows, and a convergence attributed to a release whose files
+// it did not run is the failure this whole surface exists to prevent.
+func WithStorageSchema(source *StorageSchemaSource) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.schemaSource = source }
 }
 
 // WithDialect selects the database family of the storage database so
@@ -160,11 +186,14 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 		)
 	}
 
-	schemaFiles, err := readEmbeddedSchemaFiles()
+	// Nil is the embedded files, so a boot reads its own schema through the
+	// same call an operator converging a named release reads theirs.
+	schemaFiles, err := o.schemaSource.mysqlSchemaFiles()
 	if err != nil {
 		return err
 	}
-	logger.Info("loaded embedded storage schema files",
+	logger.Info("loaded storage schema files",
+		"schema_source", o.schemaSource.Describe(),
 		"namespace_count", len(schemaFiles),
 		"file_count", countSchemaFiles(schemaFiles),
 		"files", schemaFileNames(schemaFiles),

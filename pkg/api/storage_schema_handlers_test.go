@@ -602,21 +602,52 @@ func TestStorageSchemaRoutes_OutliveTheServerWideWriteTimeout(t *testing.T) {
 	}
 }
 
-// A half-supplied desired schema is refused. Files with no source produce a
-// report that cannot say what it was compared against; a source with no files
-// would label this server's own embedded schema with another release's name.
-func TestValidateStorageSchemaPlanRequest(t *testing.T) {
-	require.NoError(t, validateStorageSchemaPlanRequest(apitypes.StorageSchemaPlanRequest{}))
-	require.NoError(t, validateStorageSchemaPlanRequest(apitypes.StorageSchemaPlanRequest{
-		SchemaFiles:  validStorageSchemaFiles(),
-		SchemaSource: "the schema files of release v1.4.0",
-	}))
+// A half-supplied schema is refused on both routes. Files with no source
+// produce an answer that cannot say which schema it used; a source with no
+// files would label this server's own embedded schema with another release's
+// name, which on the convergence route means telling an operator their storage
+// is ready for a release it was never compared against.
+func TestValidateStorageSchemaSource(t *testing.T) {
+	require.NoError(t, validateStorageSchemaSource(nil, ""))
+	require.NoError(t, validateStorageSchemaSource(validStorageSchemaFiles(), "the schema files of release v1.4.0"))
 
-	err := validateStorageSchemaPlanRequest(apitypes.StorageSchemaPlanRequest{SchemaFiles: validStorageSchemaFiles()})
+	err := validateStorageSchemaSource(validStorageSchemaFiles(), "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "without schema_source")
 
-	err = validateStorageSchemaPlanRequest(apitypes.StorageSchemaPlanRequest{SchemaSource: "the schema files of release v1.4.0"})
+	err = validateStorageSchemaSource(nil, "the schema files of release v1.4.0")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "without schema_files")
+}
+
+// Both storage schema routes refuse a half-supplied schema over HTTP, before
+// anything is resolved or converged. On the convergence route that refusal is
+// the one that matters: a source with no files would run the server's own
+// embedded schema and report it as the named release's, telling an operator
+// their storage is ready for a release it was never compared against.
+func TestStorageSchemaRoutes_RefuseHalfSuppliedSchema(t *testing.T) {
+	local := &fakeStorageSchemaService{
+		planResp: &ternv1.StorageSchemaPlanResponse{Report: storageSchemaReportMessage("schemabot_storage")},
+		applyResp: &ternv1.StorageSchemaApplyResponse{
+			Planned:   storageSchemaReportMessage("schemabot_storage"),
+			Remaining: storageSchemaReportMessage("schemabot_storage"),
+		},
+	}
+	const body = `{"schema_source":"the schema files of release v1.5.0"}`
+
+	t.Run("plan", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		svc.SetStorageSchemaService(local)
+		rec := storageSchemaPlanRequestFor(t, svc, body)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "without schema_files")
+	})
+	t.Run("apply", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		svc.SetStorageSchemaService(local)
+		rec := storageSchemaApplyRequest(t, svc, body)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "without schema_files")
+		assert.Nil(t, local.applyReq, "nothing converges on a refused request")
+	})
 }
