@@ -749,9 +749,168 @@ func TestChecks(t *testing.T, h Harness) {
 		}
 	})
 
+	// The merge gate fan-out must find every change planning against a target
+	// across repositories — a CLI apply carries no repository, so the reverse
+	// index cannot be scoped to one. The lookup folds its arguments, so a
+	// caller holding a mixed-case spelling still finds the rows.
+	t.Run("GetByTargetSpansRepositories", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		for _, c := range []struct {
+			repo string
+			pr   int
+			db   string
+		}{
+			{"org/repo-a", 1, "db_target"},
+			{"org/repo-b", 2, "db_target"},
+			{"org/repo-a", 3, "db_other"},
+		} {
+			require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+				Repository:   c.repo,
+				PullRequest:  c.pr,
+				HeadSHA:      "sha",
+				Environment:  "staging",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				DatabaseName: c.db,
+				Status:       "completed",
+				Conclusion:   "success",
+			}))
+		}
+
+		checks, err := store.Checks().GetByTarget(ctx, "Staging", "MySQL", "DB_Target")
+		require.NoError(t, err)
+		require.Len(t, checks, 2)
+		assert.Equal(t, "org/repo-a", checks[0].Repository)
+		assert.Equal(t, 1, checks[0].PullRequest)
+		assert.Equal(t, "org/repo-b", checks[1].Repository)
+		assert.Equal(t, 2, checks[1].PullRequest)
+	})
+
+	// After a merge gate re-plan fails, the stored check is failed closed —
+	// but only while the row still holds the head SHA the processor read (a
+	// racing synchronize that stored a newer head wins) and never while an
+	// in-progress apply owns the row (the started apply's lifecycle stays
+	// authoritative).
+	t.Run("MarkBlockedForFailedRefresh", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		seed := func(pr int, headSHA, status string, applyID int64) *storage.Check {
+			check := &storage.Check{
+				Repository:   "org/repo",
+				PullRequest:  pr,
+				HeadSHA:      headSHA,
+				Environment:  "staging",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				DatabaseName: "db_block",
+				ApplyID:      applyID,
+				Status:       status,
+				Conclusion:   "success",
+			}
+			require.NoError(t, store.Checks().Upsert(ctx, check))
+			return check
+		}
+
+		flip := func(check *storage.Check) (bool, error) {
+			blocked := *check
+			blocked.Status = "completed"
+			blocked.Conclusion = "action_required"
+			blocked.HasChanges = true
+			blocked.BlockingReason = "schema_changed_replan_failed"
+			blocked.ErrorMessage = "re-plan failed"
+			blocked.ChangeSummary = "schema changed; re-plan failed"
+			return store.Checks().MarkBlockedForFailedRefresh(ctx, &blocked)
+		}
+
+		// Matching head SHA: the flip lands and the row blocks.
+		current := seed(101, "head-current", "completed", 0)
+		flipped, err := flip(current)
+		require.NoError(t, err)
+		assert.True(t, flipped)
+		got, err := store.Checks().Get(ctx, "org/repo", 101, "staging", storage.DatabaseTypeMySQL, "db_block")
+		require.NoError(t, err)
+		assert.Equal(t, "action_required", got.Conclusion)
+		assert.Equal(t, "schema_changed_replan_failed", got.BlockingReason)
+		assert.Equal(t, "re-plan failed", got.ErrorMessage)
+		assert.Equal(t, "schema changed; re-plan failed", got.ChangeSummary)
+		assert.True(t, got.HasChanges)
+
+		// Stale head SHA: a racing synchronize stored a newer head; its result wins.
+		racing := seed(102, "head-old", "completed", 0)
+		seed(102, "head-new", "completed", 0)
+		flipped, err = flip(racing)
+		require.NoError(t, err)
+		assert.False(t, flipped)
+		got, err = store.Checks().Get(ctx, "org/repo", 102, "staging", storage.DatabaseTypeMySQL, "db_block")
+		require.NoError(t, err)
+		assert.Equal(t, "success", got.Conclusion, "the newer head's stored result is preserved")
+
+		// In-progress apply-owned row: the started apply stays authoritative.
+		owned := seed(103, "head-owned", "in_progress", 424242)
+		flipped, err = flip(owned)
+		require.NoError(t, err)
+		assert.False(t, flipped)
+		got, err = store.Checks().Get(ctx, "org/repo", 103, "staging", storage.DatabaseTypeMySQL, "db_block")
+		require.NoError(t, err)
+		assert.Equal(t, "in_progress", got.Status, "the in-flight apply-owned row is untouched")
+		assert.Equal(t, int64(424242), got.ApplyID)
+
+		// A finished apply's row is still apply-owned: its result is what the
+		// apply wrote about the live database, and a re-plan failure must not
+		// erase the owner and overwrite it.
+		settled := seed(104, "head-settled", "completed", 515151)
+		flipped, err = flip(settled)
+		require.NoError(t, err)
+		assert.False(t, flipped)
+		got, err = store.Checks().Get(ctx, "org/repo", 104, "staging", storage.DatabaseTypeMySQL, "db_block")
+		require.NoError(t, err)
+		assert.Equal(t, "success", got.Conclusion, "the apply's own result is preserved")
+		assert.Equal(t, int64(515151), got.ApplyID, "ownership is not cleared")
+
+		// A row already blocked for review-time deployment drift keeps that
+		// reason: the reviewed plan's block outranks a re-plan failure, and the
+		// caller is told the gate is closed rather than that the flip failed.
+		drifted := seed(105, "head-drift", "completed", 0)
+		drifted.Conclusion = "action_required"
+		drifted.BlockingReason = storage.ReviewTimeDeploymentDriftBlockingReason
+		require.NoError(t, store.Checks().Upsert(ctx, drifted))
+		flipped, err = flip(drifted)
+		require.NoError(t, err)
+		assert.True(t, flipped, "the row blocks merge after the call")
+		got, err = store.Checks().Get(ctx, "org/repo", 105, "staging", storage.DatabaseTypeMySQL, "db_block")
+		require.NoError(t, err)
+		assert.Equal(t, storage.ReviewTimeDeploymentDriftBlockingReason, got.BlockingReason,
+			"the drift block is not laundered into a re-plan failure")
+
+		// Redelivery: the same flip applied twice reports the gate closed both
+		// times, so a caller on a dialect that reports changed rows does not
+		// read the second call as a lost block.
+		repeated := seed(106, "head-repeat", "completed", 0)
+		flipped, err = flip(repeated)
+		require.NoError(t, err)
+		require.True(t, flipped)
+		flipped, err = flip(repeated)
+		require.NoError(t, err)
+		assert.True(t, flipped, "a redelivered flip still reports the gate closed")
+	})
+
 	t.Run("Upsert_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		err := store.Checks().Upsert(t.Context(), &storage.Check{
+			Repository: "org/repo", PullRequest: 123, Environment: "staging",
+			DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "errors_db",
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("GetByTarget_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().GetByTarget(t.Context(), "staging", storage.DatabaseTypeMySQL, "errors_db")
+		require.Error(t, err)
+	})
+
+	t.Run("MarkBlockedForFailedRefresh_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().MarkBlockedForFailedRefresh(t.Context(), &storage.Check{
 			Repository: "org/repo", PullRequest: 123, Environment: "staging",
 			DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "errors_db",
 		})

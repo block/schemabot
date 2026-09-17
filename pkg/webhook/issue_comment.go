@@ -913,7 +913,7 @@ func (h *Handler) enqueueDurableIssueCommentCommand(ctx context.Context, w http.
 // install.
 func (h *Handler) enqueueDurableIssueComment(ctx context.Context, body []byte, deliveryID, repo string, pr int, installationID int64) (bool, error) {
 	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "issue_comment",
 		Action:      "created",

@@ -19,6 +19,7 @@ CREATE TABLE `checks` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_check_key` (`repository`,`pull_request`,`environment`,`database_type`,`database_name`),
   KEY `idx_repo_env_db` (`repository`,`environment`,`database_type`,`database_name`),
+  KEY `idx_env_db` (`environment`,`database_type`,`database_name`),
   KEY `idx_repo_pr` (`repository`,`pull_request`),
   KEY `idx_check_run` (`check_run_id`),
   KEY `idx_apply_id` (`apply_id`)

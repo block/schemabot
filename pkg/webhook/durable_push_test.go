@@ -28,7 +28,7 @@ func durablePushEvent() *storage.WebhookEvent {
 		"installation": {"id": 12345}
 	}`)
 	return &storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-push-1",
 		Event:      "push",
 		Repository: "octocat/hello-world",
@@ -59,7 +59,7 @@ func TestDurablePushWebhookQueuesAndAcks(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.JSONEq(t, `{"message":"default-branch check queued"}`, rr.Body.String())
 
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-push-1")
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-push-1")
 	require.NoError(t, err)
 	require.NotNil(t, event)
 	require.Equal(t, "push", event.Event)
@@ -93,7 +93,7 @@ func TestDurablePushWebhookCanonicalizesRepository(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-push")
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "mixed-case-push")
 	require.NoError(t, err)
 	require.NotNil(t, event)
 	assert.Equal(t, "mixedcase/sample-repo", event.Repository)
