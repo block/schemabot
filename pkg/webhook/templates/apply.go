@@ -177,6 +177,13 @@ type ApplyStatusCommentData struct {
 	// the drive triggers cutover automatically — surfacing the command there
 	// would tell the operator to act when no action is needed.
 	DeferCutover bool
+
+	// RolloutMember names this member when the apply fans out across several,
+	// and is empty on a single-member apply. It qualifies the stop and cancel
+	// footers, whose commands address the apply rather than one member of it: a
+	// section headed by one member's name, carrying a command that stops all of
+	// them, otherwise reads as an instruction to stop that one.
+	RolloutMember string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -460,6 +467,28 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 		prefix = cancelPrefix
 	}
 	writeFooterAction(sb, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
+	writeRolloutWideControlScope(sb, data.RolloutMember, command)
+}
+
+// writeRolloutWideControlScope states that a control command addresses the whole
+// rollout, not the member whose section it sits in.
+//
+// stop and cancel are scoped to the apply. There is no member selector, so a
+// command printed under one member's name would be read as addressing that
+// member and would do something broader than the operator intended. Rather than
+// print a command nobody can narrow, the comment says what the one it has does.
+//
+// A single-member apply renders nothing: there is no other member for the
+// command to reach, so the sentence would only add words.
+func writeRolloutWideControlScope(sb *strings.Builder, member, command string) {
+	if member == "" {
+		return
+	}
+	verb := "Stopping"
+	if command == "cancel" {
+		verb = "Cancelling"
+	}
+	fmt.Fprintf(sb, "\n%s applies to every target in this rollout, not just %s.\n", verb, inlineCode(member))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window

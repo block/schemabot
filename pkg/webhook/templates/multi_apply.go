@@ -239,6 +239,7 @@ func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApp
 // already carries the title and the <summary> line names the deployment, so
 // repeating the headline inside every section is noise.
 func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentApplyData, renderDetail func(ApplyStatusCommentData) string) {
+	fanOut := len(data.Model.Deployments) > 1
 	for i, d := range data.Model.Deployments {
 		openAttr := ""
 		if d.Open {
@@ -248,6 +249,12 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		if detail := memberDetail(data.Details, i); detail != nil {
 			body := *detail
 			body.DerivedStatus = siblingDerivedStatus(d)
+			// The member's own name, so its footer can say that the apply-wide
+			// stop and cancel commands under it reach past this section. Left
+			// empty when there is nothing else for them to reach.
+			if fanOut {
+				body.RolloutMember = d.Name
+			}
 			sb.WriteString(stripLeadingHeading(renderDetail(body)))
 		} else {
 			sb.WriteString("_No details available yet._\n")

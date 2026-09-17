@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -672,4 +673,81 @@ func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *t
 	})
 
 	assert.Contains(t, out, "To cut over `primary/testapp-002`:")
+}
+
+// stop and cancel address the apply, not one member of it, and the CLI offers no
+// way to narrow them. A member's section therefore says how far its own stop
+// command reaches, so an operator reading one target's body does not send a
+// command believing it stops that target alone.
+func TestRenderMultiDeploymentApplyComment_StopFooterNamesTheWholeRollout(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		memberOp("primary", "testapp-001", so.Running),
+		memberOp("primary", "testapp-002", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "testapp_001", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+			{Database: "testapp_002", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+
+	assert.Contains(t, out, "To stop this schema change:")
+	assert.Contains(t, out, "Stopping applies to every target in this rollout, not just `primary/testapp-001`.")
+	assert.Contains(t, out, "Stopping applies to every target in this rollout, not just `primary/testapp-002`.")
+}
+
+// On an engine whose control command is cancel, the sentence follows the command
+// it qualifies rather than keeping the stop vocabulary.
+func TestRenderMultiDeploymentApplyComment_CancelFooterNamesTheWholeRollout(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EnginePlanetScale},
+			{Database: "orders_eu", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EnginePlanetScale},
+		},
+	})
+
+	assert.Contains(t, out, "To cancel this schema change:")
+	assert.Contains(t, out, "Cancelling applies to every target in this rollout, not just `primary`.")
+	assert.NotContains(t, out, "Stopping applies to every target")
+}
+
+// A single-deployment apply has nothing for the command to reach past, so the
+// scope sentence would only add words to the one section that exists.
+func TestRenderMultiDeploymentApplyComment_SoleMemberHasNoRolloutScopeLine(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{rollingOp("primary", so.Running)})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+
+	assert.Contains(t, out, "To stop this schema change:")
+	assert.NotContains(t, out, "applies to every target in this rollout")
+}
+
+// The single-deployment comment is rendered by the same footer code, and carries
+// no member name, so it keeps the unqualified command it has always shown.
+func TestRenderApplyStatusComment_NoRolloutScopeLine(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "orders",
+		State:       state.Apply.Running,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.Contains(t, out, "To stop this schema change:")
+	assert.NotContains(t, out, "applies to every target in this rollout")
 }
