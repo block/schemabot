@@ -9,7 +9,6 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -68,176 +67,80 @@ func TestEnsureSchemaDefaultsToMySQLDialect(t *testing.T) {
 	require.ErrorContains(t, err, "plan schema")
 }
 
-// partitionDestructiveChanges delegates its refusal vocabulary to
-// ddl.StorageDestructiveStatement, so these cases pin the accept/refuse
-// boundary the storage-schema bootstrap relies on: statements that destroy
-// data are refused, so are those that remove or rename a schema object without
-// destroying any, statements that add or converge execute, an ALTER that mixes
-// both is split so only its destructive clauses are refused, and a statement
-// Spirit cannot classify fails the bootstrap rather than executing
-// unclassified.
-func TestPartitionDestructiveChangesPinsDestructiveVocabulary(t *testing.T) {
+// partitionDestructiveChanges gates on the verdict the plan already carries,
+// so these cases pin what it does with that verdict rather than restating the
+// linter registry that produces it: an unsafe statement is refused whole and
+// carries the plan's own reason, a safe one executes, and the two are sorted
+// per statement so one refusal does not withhold another table's change.
+// Whether a given statement is unsafe is the engine's answer, exercised
+// end-to-end against a real plan in the integration tests.
+func TestPartitionDestructiveChangesHonorsThePlanVerdict(t *testing.T) {
 	t.Parallel()
 
-	single := func(ddlStmt string) []engine.SchemaChange {
-		// Operation mirrors what the Spirit engine sets on planned changes; a
-		// classification error leaves it Unknown, matching a change the
-		// engine could not classify.
-		stmtType, _, _ := ddl.ClassifyStatement(ddlStmt)
-		return []engine.SchemaChange{{TableChanges: []engine.TableChange{{Table: "applies", Operation: stmtType, DDL: ddlStmt}}}}
+	const mixedDDL = "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP INDEX `idx_state`"
+
+	unsafeChange := engine.TableChange{
+		Table:        "applies",
+		Operation:    ddl.StatementAlterTable,
+		DDL:          mixedDDL,
+		IsUnsafe:     true,
+		UnsafeReason: "Unsafe operation detected: \"DROP INDEX `idx_state`\"",
+	}
+	safeChange := engine.TableChange{
+		Table:     "plans",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `plans` ADD COLUMN `caller` VARCHAR(64)",
 	}
 
-	refusedCases := []struct {
-		name string
-		ddl  string
-	}{
-		{name: "DROP TABLE", ddl: "DROP TABLE `applies`"},
-		{name: "DROP COLUMN", ddl: "ALTER TABLE `applies` DROP COLUMN `caller`"},
-		{name: "DROP PRIMARY KEY", ddl: "ALTER TABLE `applies` DROP PRIMARY KEY"},
-		{name: "DROP PARTITION", ddl: "ALTER TABLE `applies` DROP PARTITION p2020"},
-		{name: "TRUNCATE PARTITION", ddl: "ALTER TABLE `applies` TRUNCATE PARTITION p2020"},
-		{name: "DROP INDEX", ddl: "ALTER TABLE `applies` DROP INDEX `idx_state`"},
-		{name: "DROP FOREIGN KEY", ddl: "ALTER TABLE `applies` DROP FOREIGN KEY `fk_plan`"},
-		{name: "DROP CHECK", ddl: "ALTER TABLE `applies` DROP CHECK `chk_state`"},
-		{name: "DROP CONSTRAINT", ddl: "ALTER TABLE `applies` DROP CONSTRAINT `uq_identifier`"},
-		{name: "RENAME COLUMN", ddl: "ALTER TABLE `applies` RENAME COLUMN `caller` TO `requester`"},
-		{name: "RENAME INDEX", ddl: "ALTER TABLE `applies` RENAME INDEX `idx_state` TO `idx_apply_state`"},
-	}
-	for _, tt := range refusedCases {
-		t.Run("refuses "+tt.name, func(t *testing.T) {
-			t.Parallel()
-			allowed, refused, err := partitionDestructiveChanges(single(tt.ddl))
-			require.NoError(t, err)
-			assert.Empty(t, allowed)
-			require.Len(t, refused, 1)
-			assert.Equal(t, tt.ddl, refused[0].change.DDL)
-			assert.NotEmpty(t, refused[0].reason)
-			scope, _, _ := refused[0].refusalTelemetry()
-			assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
-		})
-	}
-
-	allowedCases := []struct {
-		name string
-		ddl  string
-	}{
-		{name: "ADD COLUMN", ddl: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)"},
-		{name: "ADD INDEX", ddl: "ALTER TABLE `applies` ADD INDEX `idx_state` (`state`)"},
-		{name: "a table option", ddl: "ALTER TABLE `applies` ENGINE=InnoDB"},
-		{name: "CREATE TABLE", ddl: "CREATE TABLE `audit` (`id` BIGINT UNSIGNED AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
-	}
-	for _, tt := range allowedCases {
-		t.Run("allows "+tt.name, func(t *testing.T) {
-			t.Parallel()
-			allowed, refused, err := partitionDestructiveChanges(single(tt.ddl))
-			require.NoError(t, err)
-			assert.Empty(t, refused)
-			require.Len(t, allowed, 1)
-			require.Len(t, allowed[0].TableChanges, 1)
-			assert.Equal(t, tt.ddl, allowed[0].TableChanges[0].DDL)
-		})
-	}
-
-	t.Run("a mixed ALTER splits so only its destructive clauses are refused", func(t *testing.T) {
+	// The whole statement is withheld, including the additive clause riding
+	// along with the drop. Executing the additive half would mean deciding
+	// which clauses can run without the refused one, which is a policy the
+	// plan did not express.
+	t.Run("an unsafe statement is refused whole", func(t *testing.T) {
 		t.Parallel()
-		allowed, refused, err := partitionDestructiveChanges(single("ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP COLUMN `lease_owner`"))
-		require.NoError(t, err)
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{unsafeChange}}})
+		assert.Empty(t, allowed, "no part of the statement executes")
+		require.Len(t, refused, 1)
+		assert.Equal(t, mixedDDL, refused[0].change.DDL, "the refusal carries the whole statement, not a partition of it")
+		assert.Equal(t, unsafeChange.UnsafeReason, refused[0].reason, "the reason is the plan's, not this package's")
+	})
+
+	t.Run("a safe statement executes", func(t *testing.T) {
+		t.Parallel()
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{safeChange}}})
+		assert.Empty(t, refused)
 		require.Len(t, allowed, 1)
 		require.Len(t, allowed[0].TableChanges, 1)
-		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)", allowed[0].TableChanges[0].DDL)
-		require.Len(t, refused, 1)
-		assert.Equal(t, "ALTER TABLE `applies` DROP COLUMN `lease_owner`", refused[0].change.DDL)
-		assert.Contains(t, refused[0].reason, "DROP COLUMN")
-		assert.Contains(t, refused[0].reason, "lease_owner")
-		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP COLUMN `lease_owner`", refused[0].splitFrom)
-		scope, _, attrs := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalSplit, scope)
-		assert.Contains(t, attrs, "split_from_ddl")
+		assert.Equal(t, safeChange.DDL, allowed[0].TableChanges[0].DDL)
 	})
 
-	// Spirit's diff emits one combined ALTER per table, so an index drop
-	// almost always arrives bundled with additive clauses rather than alone.
-	// The split has to refuse the drop out of the middle of that statement:
-	// classifying only the whole statement would leave the drop riding along
-	// in the executed partition.
-	t.Run("a DROP INDEX bundled with additive clauses is refused out of the middle", func(t *testing.T) {
+	// One table's refusal must not withhold another's convergence: a pod
+	// starting against newer storage should still add the columns its own
+	// binary needs.
+	t.Run("a refusal withholds only its own statement", func(t *testing.T) {
 		t.Parallel()
-		mixed := "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP INDEX `idx_state`"
-		allowed, refused, err := partitionDestructiveChanges(single(mixed))
-		require.NoError(t, err)
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{
+			TableChanges: []engine.TableChange{unsafeChange, safeChange},
+		}})
 		require.Len(t, allowed, 1)
 		require.Len(t, allowed[0].TableChanges, 1)
-		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)", allowed[0].TableChanges[0].DDL)
+		assert.Equal(t, safeChange.DDL, allowed[0].TableChanges[0].DDL, "the other table still converges")
 		require.Len(t, refused, 1)
-		assert.Equal(t, "ALTER TABLE `applies` DROP INDEX `idx_state`", refused[0].change.DDL)
-		assert.Contains(t, refused[0].reason, "DROP INDEX")
-		assert.Contains(t, refused[0].reason, "idx_state")
-		assert.Equal(t, mixed, refused[0].splitFrom)
-		scope, _, attrs := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalSplit, scope)
-		assert.Contains(t, attrs, "split_from_ddl")
+		assert.Equal(t, mixedDDL, refused[0].change.DDL)
 	})
 
-	// An index whose definition changed diffs to a drop and a re-add under the
-	// same name. The add is only executable after the drop, so refusing the
-	// drop must refuse the add with it rather than leave the bootstrap a
-	// statement the database rejects on a duplicate key name.
-	t.Run("an index redefinition is refused whole because its ADD half cannot run alone", func(t *testing.T) {
+	// The warning is what an operator reads during a rolling deploy, so it
+	// carries the statement that did not run and the reason it did not.
+	t.Run("the refusal warning names the statement and the reason", func(t *testing.T) {
 		t.Parallel()
-		redefinition := "ALTER TABLE `applies` DROP INDEX `idx_state`, ADD INDEX `idx_state` (`state`, `deployment`)"
-		allowed, refused, err := partitionDestructiveChanges(single(redefinition))
-		require.NoError(t, err)
-		assert.Empty(t, allowed)
+		_, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{unsafeChange}}})
 		require.Len(t, refused, 1)
-		assert.Equal(t, redefinition, refused[0].change.DDL)
-		assert.Empty(t, refused[0].splitFrom)
-		scope, _, _ := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
-	})
-
-	t.Run("a primary-key change is refused whole because its ADD half cannot run alone", func(t *testing.T) {
-		t.Parallel()
-		pkChange := "ALTER TABLE `applies` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `caller`)"
-		allowed, refused, err := partitionDestructiveChanges(single(pkChange))
-		require.NoError(t, err)
-		assert.Empty(t, allowed)
-		require.Len(t, refused, 1)
-		assert.Equal(t, pkChange, refused[0].change.DDL)
-		assert.NotEmpty(t, refused[0].reason)
-		assert.Empty(t, refused[0].splitFrom)
-		scope, _, _ := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
-	})
-
-	t.Run("an unsafe ALTER whose clauses cannot be partitioned is refused whole", func(t *testing.T) {
-		t.Parallel()
-		// The Operation is set directly: the DDL carries two statements,
-		// which the splitter rejects, standing in for any split failure on
-		// an unsafe ALTER — for example a future linter rule with
-		// cross-clause reasoning tripping the safe-partition re-check. The
-		// fallback must refuse the statement whole, so nothing in it
-		// executes and the bootstrap still succeeds rather than
-		// crash-looping every starting pod.
-		multi := "ALTER TABLE `applies` DROP COLUMN `caller`; ALTER TABLE `applies` DROP COLUMN `lease_owner`"
-		changes := []engine.SchemaChange{{TableChanges: []engine.TableChange{{Table: "applies", Operation: ddl.StatementAlterTable, DDL: multi}}}}
-		allowed, refused, err := partitionDestructiveChanges(changes)
-		require.NoError(t, err)
-		assert.Empty(t, allowed)
-		require.Len(t, refused, 1)
-		assert.Equal(t, multi, refused[0].change.DDL)
-		assert.NotEmpty(t, refused[0].reason)
-		assert.Empty(t, refused[0].splitFrom)
-		require.Error(t, refused[0].splitErr)
-		scope, message, attrs := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
-		assert.Contains(t, message, "could not be partitioned")
-		assert.Contains(t, attrs, "split_error")
-	})
-
-	t.Run("a statement Spirit cannot classify fails the bootstrap", func(t *testing.T) {
-		t.Parallel()
-		_, _, err := partitionDestructiveChanges(single("TRUNCATE TABLE `applies`"))
-		require.Error(t, err)
-		require.ErrorContains(t, err, "classify storage schema change")
+		message, attrs := refused[0].refusalTelemetry()
+		assert.Contains(t, message, "allow_destructive_schema_changes", "the warning names the option that allows it")
+		assert.Contains(t, attrs, "ddl")
+		assert.Contains(t, attrs, mixedDDL)
+		assert.Contains(t, attrs, "reason")
+		assert.Contains(t, attrs, unsafeChange.UnsafeReason)
+		assert.Contains(t, attrs, "applies")
 	})
 }
