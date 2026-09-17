@@ -1044,7 +1044,8 @@ kinds count as destructive:
 A mixed `ALTER TABLE` is split: its additive clauses still execute and only the
 destructive clauses are refused, except that a clause which cannot run
 without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change,
-or the `ADD INDEX` half of an index redefinition) is refused with it. The
+the `ADD INDEX` half of an index redefinition, or the `ADD COLUMN` half of a
+column redefinition) is refused with it. The
 remaining non-destructive statements still apply and startup proceeds. This
 protects against rolling deploys and rollbacks: a pod running an older binary
 sees a newer binary's tables, columns, and indexes as surplus, and without the
@@ -1052,9 +1053,10 @@ gate would remove them from under the pods that depend on them. Each refused
 statement is logged at warn level with the exact DDL, and counted in the
 `schemabot.storage_schema.destructive_refusals_total` metric.
 
-To intentionally remove a storage table, column, or index, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then
-opt in:
+To intentionally remove or rename any of these objects, first make sure every
+running pod is on a binary whose embedded schema no longer declares what is
+going away: the table, column, index, foreign key, check, or constraint being
+dropped, or the old name of the one being renamed. Then opt in:
 
 ```yaml
 storage:

@@ -88,6 +88,7 @@ func TestStorageDestructiveStatement(t *testing.T) {
 		{name: "DROP CHECK", stmt: "ALTER TABLE `users` DROP CHECK `chk_age`", contains: []string{"DROP CHECK", "chk_age"}},
 		{name: "DROP CONSTRAINT", stmt: "ALTER TABLE `users` DROP CONSTRAINT `uq_email`", contains: []string{"DROP CONSTRAINT", "uq_email"}},
 		{name: "RENAME COLUMN", stmt: "ALTER TABLE `users` RENAME COLUMN `fax` TO `phone`", contains: []string{"RENAME COLUMN", "fax"}},
+		{name: "CHANGE COLUMN that renames", stmt: "ALTER TABLE `users` CHANGE COLUMN `fax` `phone` VARCHAR(20)", contains: []string{"CHANGE COLUMN", "fax"}},
 		{name: "RENAME INDEX", stmt: "ALTER TABLE `users` RENAME INDEX `idx_email` TO `idx_addr`", contains: []string{"RENAME INDEX", "idx_email"}},
 		{name: "ALTER TABLE RENAME", stmt: "ALTER TABLE `users` RENAME TO `people`", contains: []string{"RENAME TABLE", "people"}},
 		{name: "RENAME TABLE as its own statement", stmt: "RENAME TABLE `users` TO `people`", contains: []string{"RENAME TABLE", "users"}},
@@ -110,6 +111,12 @@ func TestStorageDestructiveStatement(t *testing.T) {
 		{name: "ADD COLUMN", stmt: "ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)"},
 		{name: "ADD INDEX", stmt: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)"},
 		{name: "MODIFY COLUMN", stmt: "ALTER TABLE `users` MODIFY COLUMN `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT"},
+		// CHANGE COLUMN only renames when the name it states differs from the
+		// one it replaces, and MySQL matches identifiers case-insensitively, so
+		// a restatement in another case leaves every reader of that column
+		// reading it under a name that still resolves.
+		{name: "CHANGE COLUMN that only redefines", stmt: "ALTER TABLE `users` CHANGE COLUMN `phone` `phone` VARCHAR(40)"},
+		{name: "CHANGE COLUMN that restates the name in another case", stmt: "ALTER TABLE `users` CHANGE COLUMN `phone` `PHONE` VARCHAR(40)"},
 		{name: "CREATE TABLE", stmt: "CREATE TABLE `audit` (`id` BIGINT UNSIGNED AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
 		// Table options converge properties rather than removing objects, and
 		// the diff emits them routinely; refusing them would strand the
@@ -215,6 +222,48 @@ func TestSplitStorageDestructiveAlter(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, safeDDL, "an ADD INDEX cannot run while the refused DROP leaves the old index in place")
 		assert.Equal(t, "ALTER TABLE `users` DROP INDEX `idx_email`, ADD INDEX `idx_email`(`email`, `org_id`)", destructiveDDL)
+	})
+
+	// A column the schema redefines in a way the differ cannot express as a
+	// MODIFY diffs to a drop and a re-add, or to a rename away and an add of
+	// the freed name. Either way the add is only executable once the refused
+	// clause has run, so it is refused with it rather than left to fail on a
+	// duplicate column name and take the whole bootstrap DDL down.
+	columnCollisions := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "a column redefinition",
+			stmt: "ALTER TABLE `users` DROP COLUMN `email`, ADD COLUMN `email` VARCHAR(255) NOT NULL",
+		},
+		{
+			name: "a rename onto the freed name",
+			stmt: "ALTER TABLE `users` RENAME COLUMN `email` TO `contact_email`, ADD COLUMN `email` VARCHAR(255) NOT NULL",
+		},
+		{
+			name: "a CHANGE COLUMN rename onto the freed name",
+			stmt: "ALTER TABLE `users` CHANGE COLUMN `email` `contact_email` VARCHAR(255), ADD COLUMN `email` VARCHAR(255) NOT NULL",
+		},
+		{
+			name: "a multi-column add claiming the freed name",
+			stmt: "ALTER TABLE `users` DROP COLUMN `email`, ADD COLUMN (`email` VARCHAR(255), `phone` VARCHAR(20))",
+		},
+	}
+	for _, tt := range columnCollisions {
+		t.Run(tt.name+" refuses the ADD with the clause that frees the name", func(t *testing.T) {
+			safeDDL, destructiveDDL, err := SplitStorageDestructiveAlter(tt.stmt)
+			require.NoError(t, err)
+			assert.Empty(t, safeDDL, "an ADD COLUMN cannot run while the refused clause leaves the old column in place")
+			assert.Contains(t, destructiveDDL, "`email`")
+		})
+	}
+
+	t.Run("an ADD COLUMN under an unrelated name stays in the safe statement", func(t *testing.T) {
+		safeDDL, destructiveDDL, err := SplitStorageDestructiveAlter("ALTER TABLE `users` RENAME COLUMN `fax` TO `pager`, ADD COLUMN `phone` VARCHAR(20)")
+		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)", safeDDL)
+		assert.Equal(t, "ALTER TABLE `users` RENAME COLUMN `fax` TO `pager`", destructiveDDL)
 	})
 
 	t.Run("a name collision is matched case-insensitively as MySQL matches it", func(t *testing.T) {
