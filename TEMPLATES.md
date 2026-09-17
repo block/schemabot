@@ -1431,6 +1431,84 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="targets-converging"></a><strong>Targets Converging</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
+
+**`primary/testapp_1` (primary), `primary/testapp_3`** — 1 DDL statement
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255);
+```
+
+**`primary/testapp_2`** — already at this schema, nothing to apply.
+
+📋 **Plan**: 1 DDL statement on 2 of 3 targets
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="targets-diverging"></a><strong>Targets Diverging</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 distinct plans. Each target applies its own.
+
+<details open>
+<summary><b>`primary/testapp_1` (primary), `primary/testapp_2` — 1 DDL statement</b></summary>
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255);
+```
+
+</details>
+
+<details>
+<summary><b>`primary/testapp_3` — 2 DDL statements</b></summary>
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255);
+
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+</details>
+
+⚠️ Applying runs each target's own plan, including the ones collapsed above.
+
+📋 **Plan**: 2 distinct plans on 3 targets
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="drop-column-blocked"></a><strong>Drop Column Blocked</strong></summary>
 
 

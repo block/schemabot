@@ -349,11 +349,22 @@ func RenderPlanComment(data PlanCommentData) string {
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
+	// When the rollout's members would run more than one plan, each group's plan
+	// is rendered under the members it applies to. The reviewed plan is then one
+	// group among several, so the single block below is suppressed: rendering it
+	// would show part of the apply as though it were all of it.
+	groups := data.planGroups()
+
 	// No changes — short-circuit with a single clean message. The
 	// ignore_namespaces disclosure still renders: a no-changes result is
 	// exactly where a reviewer needs to tell a withheld namespace apart from a
 	// genuinely unchanged one.
-	if totalChanges == 0 {
+	//
+	// The count is of the reviewed plan, which is the primary's. A primary
+	// already at the desired schema says nothing about its sibling targets, so a
+	// rollout whose groups carry work is never short-circuited on it — that would
+	// report an apply that changes several targets as changing nothing.
+	if totalChanges == 0 && !groupsCarryWork(groups) {
 		writeNoChangesDetected(&sb, data)
 		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
@@ -364,7 +375,11 @@ func RenderPlanComment(data PlanCommentData) string {
 	}
 
 	// Detailed changes
-	writeKeyspaceChanges(&sb, data)
+	if len(groups) > 0 {
+		writePlanGroups(&sb, data, groups)
+	} else {
+		writeKeyspaceChanges(&sb, data)
+	}
 
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
@@ -426,8 +441,15 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeErrors(&sb, data.Errors)
 	}
 
-	// Summary and options (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	// Summary and options (after DDL, matching CLI layout). When the members run
+	// more than one plan, the summary counts the rollout rather than the reviewed
+	// plan: reporting the primary's tables as the plan would understate an apply
+	// that runs different work on other targets.
+	if len(groups) > 0 {
+		writePlanGroupSummary(&sb, data, groups)
+	} else {
+		writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	}
 	writeOptions(&sb, data)
 
 	// Footer
@@ -1216,6 +1238,142 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		}
 	}
 	sb.WriteString("\n")
+}
+
+// planGroups returns the member plan groups when they, rather than the reviewed
+// plan on its own, should carry the comment's DDL.
+//
+// That is when the members would run more than one distinct plan. With a single
+// group every member runs the reviewed plan, so the comment already shows what
+// the apply does and attributing it to a member list would only repeat the line
+// above it.
+func (d PlanCommentData) planGroups() []DeploymentPlanGroup {
+	if d.DeploymentDrift == nil || len(d.DeploymentDrift.Plans) < 2 {
+		return nil
+	}
+	return d.DeploymentDrift.Plans
+}
+
+// groupsCarryWork reports whether any group would apply something.
+func groupsCarryWork(groups []DeploymentPlanGroup) bool {
+	return slices.ContainsFunc(groups, func(g DeploymentPlanGroup) bool { return !g.Empty() })
+}
+
+// writePlanGroups renders each distinct plan under the members that would run
+// it, so a reviewer reads one block per plan rather than one per target, and
+// every target's work is on the comment rather than the reviewed one's alone.
+//
+// The primary's group is open and the rest are collapsed when there is more than
+// one plan to run: the reviewed plan is the one an operator has already read, so
+// it is the block they should not have to expand. A single plan is never
+// collapsed, since there is nothing to collapse it against.
+func writePlanGroups(sb *strings.Builder, data PlanCommentData, groups []DeploymentPlanGroup) {
+	collapse := slices.ContainsFunc(groups, func(g DeploymentPlanGroup) bool { return !g.Empty() && !g.Primary })
+
+	for _, g := range groups {
+		heading := planGroupHeading(g)
+		if g.Empty() {
+			// Nothing to expand, and the summary is the whole story: these
+			// members apply nothing. Naming them is what keeps a converging
+			// fleet visible.
+			fmt.Fprintf(sb, "**%s** — already at this schema, nothing to apply.\n\n", heading)
+			continue
+		}
+
+		label := planGroupWorkLabel(countChanges(g.Changes))
+
+		// A group's plan renders through the same code that renders the reviewed
+		// plan, so one target's DDL is never formatted by a second renderer that
+		// agrees with the first until it does not.
+		scoped := data
+		scoped.Changes = g.Changes
+
+		if !collapse {
+			fmt.Fprintf(sb, "**%s** — %s\n\n", heading, label)
+			writeKeyspaceChanges(sb, scoped)
+			continue
+		}
+
+		open := ""
+		if g.Primary {
+			open = " open"
+		}
+		fmt.Fprintf(sb, "<details%s>\n<summary><b>%s — %s</b></summary>\n\n", open, heading, label)
+		writeKeyspaceChanges(sb, scoped)
+		sb.WriteString("</details>\n\n")
+	}
+
+	if collapse {
+		// The operator is about to authorize every group's plan, not just the one
+		// they can see. Saying so is the consent statement, which is why it is the
+		// only attention line here: the targets differing is the contract.
+		sb.WriteString(glyph.Attention + " Applying runs each target's own plan, including the ones collapsed above.\n\n")
+	}
+}
+
+// writePlanGroupSummary states what the apply runs across the whole rollout,
+// standing in for the reviewed plan's own summary. Counting the primary's tables
+// would understate an apply that runs different work on the other targets, and
+// summing every group's would overstate it: one target's statement is not two
+// because a sibling runs it too.
+//
+// So the summary counts targets. A rollout with one plan says how much of the
+// fleet still needs it; a rollout with several says how many plans there are,
+// and the blocks above say what each one is.
+//
+// There is no "on all N targets" wording, because the summary is only reached
+// once the members hold more than one distinct plan. A single plan among them
+// therefore means the rest are already at the desired schema, and the reader
+// needs to be told how much of the fleet that leaves.
+func writePlanGroupSummary(sb *strings.Builder, data PlanCommentData, groups []DeploymentPlanGroup) {
+	var plans, changing, targets int
+	var only DeploymentPlanGroup
+	for _, g := range groups {
+		targets += len(g.Members)
+		if g.Empty() {
+			continue
+		}
+		plans++
+		changing += len(g.Members)
+		only = g
+	}
+
+	if plans == 1 {
+		fmt.Fprintf(sb, "📋 **Plan**: %s on %d of %d targets\n\n", planGroupWorkLabel(countChanges(only.Changes)), changing, targets)
+	} else {
+		fmt.Fprintf(sb, "📋 **Plan**: %d distinct plans on %d targets\n\n", plans, targets)
+	}
+
+	// Disclosed directly under the plan summary so the exclusion reads as part of
+	// the plan result, the same way the single-plan summary discloses it.
+	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
+	writeExemptTables(sb, data.ExemptTables)
+}
+
+// planGroupHeading names a group's members, marking the reviewed member so an
+// operator can tell the plan they have already read from the ones they have not.
+func planGroupHeading(g DeploymentPlanGroup) string {
+	names := inlineCodeList(g.Members)
+	// The primary is first in rollout order, so it is its group's first member.
+	if g.Primary && len(names) > 0 {
+		names[0] += " (primary)"
+	}
+	return strings.Join(names, ", ")
+}
+
+// planGroupWorkLabel says what a group's plan runs, e.g. "1 DDL statement" or
+// "2 DDL statements and a vschema update".
+func planGroupWorkLabel(statements, vschemaNamespaces int) string {
+	switch {
+	case statements == 0:
+		return fmt.Sprintf("%d vschema %s", vschemaNamespaces, pluralize("update", vschemaNamespaces))
+	case vschemaNamespaces == 0:
+		return fmt.Sprintf("%d DDL %s", statements, pluralize("statement", statements))
+	default:
+		return fmt.Sprintf("%d DDL %s and %d vschema %s",
+			statements, pluralize("statement", statements),
+			vschemaNamespaces, pluralize("update", vschemaNamespaces))
+	}
 }
 
 // describePlanGroups states how much the members' plans actually agree this
