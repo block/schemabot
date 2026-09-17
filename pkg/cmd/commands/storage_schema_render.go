@@ -16,11 +16,11 @@ import (
 // per-table sections with their change symbols, the disclosure of changes that
 // will not run, and the plan summary line.
 //
-// The database is unusual — SchemaBot's own bookkeeping storage rather than one
-// an operator asked to change — but nothing an operator does with the output is
-// unusual, so nothing about the output should be. Whoever can read `plan` can
-// read `storage plan`, which matters because the second one is read during an
-// incident and the first one is read every day.
+// The question being asked is the same one either way — here is a live
+// database, here is a desired schema, here is the DDL between them — and only
+// the target differs. So anyone who can read `plan` can read `storage plan`,
+// which matters because `plan` is read every day and `storage plan` is read
+// during an incident.
 
 // writeStorageSchemaHeader writes the header box and the environment heading.
 //
