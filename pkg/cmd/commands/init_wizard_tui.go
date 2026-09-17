@@ -302,7 +302,12 @@ func (m *initWizard) contentView() string {
 		if m.step == 4 && m.choosingStorage {
 			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String() + m.storageChoiceView())
 		}
-		b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
+		if m.step == 0 {
+			b.WriteString(bold.Render("Let’s bring your database into SchemaBot.") + "\n\n")
+			b.WriteString(wrap.Render("We’ll turn your live schema into files and verify they match. Your application’s tables and existing files stay untouched.") + "\n\n")
+		} else {
+			b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
+		}
 		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(f.hint)) + "\n\n")
 		switch {
 		case m.step == 0:

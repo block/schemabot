@@ -1,6 +1,8 @@
 # Initialize a database
 
-Run `schemabot init` in a terminal to connect a database and start with a verified schema.
+Run `schemabot init` in a terminal to bring an existing database into SchemaBot.
+Setup reads its live schema into files and verifies they match, without changing application
+tables or rewriting existing SQL scripts. An empty database follows the same flow.
 The wizard and explicit CLI flags use the same setup workflow.
 
 ![SchemaBot setup, a schema edit, and the first plan](../assets/init-demo.gif)
