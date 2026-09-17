@@ -383,6 +383,26 @@ caller's options (`pkg/api/storage_schema.go`); and the bounds both ends of the 
 against (`apitypes.ResolveStorageApplyTimeout`), applied at the CLI before a request is sent and
 again in the adapter that answers it (`pkg/serve/storage_schema.go`).
 
+### AV-12: A storage convergence records nothing in the storage it converges
+
+Converging SchemaBot's own storage changes that storage's shape and nothing else in it. The
+convergence writes no row about itself — no audit entry, no apply record, no progress marker —
+whichever surface asked for it. The target is the one database that cannot be assumed to be there:
+on a first boot it holds no schema at all, so a table to record into does not exist yet, and
+during a convergence its tables are the ones being rewritten, so a write about the convergence
+lands in something mid-change. A path that records its own progress is therefore a path that
+converges a fresh database only until the recording fails, and one whose failure to write becomes
+a failure to converge. *Breaks if violated:* the bootstrap stops being runnable against an empty
+database, which is every instance's first start. *Enforced:* by construction, in that the
+convergence entry points take a connection string rather than a store and nothing on the path
+reaches one (`pkg/api/ensure_schema.go`, `pkg/api/ensure_schema_postgres.go`,
+`pkg/api/storage_schema.go`, `pkg/serve/storage_schema.go`); and behaviorally by
+`TestEnsureSchema_RecordsNothingInTheStorageItConverges` and
+`TestEnsureSchemaPostgres_RecordsNothingInTheStorageItConverges`, which converge a seeded database
+and require the row count of every table in the live catalog to come through unchanged — read
+from the catalog rather than a list, so a table added to the embedded schema is covered without
+anyone extending the test.
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
