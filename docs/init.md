@@ -12,9 +12,18 @@ the setup, and verify the baseline before making a first edit.
 
 ## Before you start
 
-Use MySQL or PostgreSQL with an existing application database. Set `DATABASE_URL` to
-its connection string. The wizard saves references to environment variables, never their
-values in schema files. Keep those variables available for later CLI invocations.
+Use MySQL or PostgreSQL with an existing application database. You can paste a connection string or enter host, port, database, username, and password
+inside the wizard. Passwords and pasted strings are hidden. The final review asks you to
+confirm saving entered credentials in private, **unencrypted** files under
+`~/.schemabot/credentials`, outside the project. These files persist across terminal and
+laptop restarts; keep them private and include them in your credential-management practices.
+Cancelling before final confirmation writes no credentials.
+
+If `DATABASE_URL` is already set, the wizard shows its destination and offers to use it.
+Environment-variable and absolute file references remain available as an advanced option;
+a referenced file must contain only the connection string. References stay references,
+so environment variables must remain available to later CLI invocations. Schema files
+never contain credentials. OS credential-store integration is not implemented.
 Vitess is not offered by the wizard yet; use [server configuration](configuration.md).
 
 The wizard asks **Where should SchemaBot store its own data?**
@@ -42,11 +51,14 @@ If a connection check fails, keep the wizard open, restore access, and retry.
 
 ## Follow the wizard
 
-The wizard checks your application connection before offering the storage choice. Standalone
-setup also checks the state connection; Integrated creates its database only after final confirmation. Each connection step shows the host and database without credentials; edit
-the variable reference to use a different connection. Press Enter to test access, then continue
-after “Connected” appears. The check runs a read-only query and creates no metadata. It keeps `development`, `schema`, and your default profile as editable defaults,
-and includes everything in the final review.
+The wizard detects an available connection and offers **Use this connection**, or lets you
+paste a connection string, enter details, or use a reference. It shows the host and database
+without credentials and checks access before continuing. Failed checks can be retried;
+Shift+Tab returns to connection choices without leaving the wizard.
+
+Standalone setup uses the same adaptive connection flow. Integrated creates its database
+only after final confirmation. Connection checks run a read-only query and create no metadata.
+Environment, schema directory, and profile defaults remain editable in the final review.
 
 Before setting up a runtime, SchemaBot reads the target catalog to discover namespaces. One
 result is selected automatically; multiple results appear in a searchable list. Use Space to

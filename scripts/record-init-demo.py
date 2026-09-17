@@ -24,6 +24,7 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', required=True)
 parser.add_argument('--output', required=True)
+parser.add_argument('--paste-connection', action='store_true')
 parser.add_argument('--integrated', action='store_true')
 parser.add_argument('--engine', choices=['mysql', 'postgres'], default='postgres')
 args = parser.parse_args()
@@ -31,6 +32,9 @@ binary = str(Path(args.binary).resolve())
 work = Path(tempfile.mkdtemp(prefix='schemabot-init-demo-'))
 (work / 'home').mkdir()
 env = dict(os.environ, HOME=str(work / 'home'), SCHEMABOT_PROFILE='', SCHEMABOT_ENDPOINT='', SCHEMABOT_TOKEN='', TERM='xterm-256color', COLORTERM='truecolor', CLICOLOR_FORCE='1', NO_COLOR='', COLORFGBG='0;15')
+pasted_connection = env.get('DATABASE_URL', '')
+if args.paste_connection:
+    env.pop('DATABASE_URL', None)
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
 screen = pyte.Screen(88, 24)
@@ -41,7 +45,10 @@ os.close(slave)
 # recording captures typing, cursor movement, and checkbox changes as they happen.
 engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [(0.9, '\x1b[B'), (0.7, '\x1b[A'), (0.7, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
-steps.extend([('Connect your database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+if args.paste_connection:
+    steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.035, c) for c in pasted_connection] + [(1.0, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+else:
+    steps.extend([('Connect your database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
 if args.integrated:
     steps.append(('Where should SchemaBot store its own data?', [(3.0, '\r')]))
 else:

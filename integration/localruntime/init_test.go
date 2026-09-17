@@ -77,6 +77,11 @@ func TestInitEngines(t *testing.T) {
 			require.Contains(t, missing.Missing, "database")
 			args := []string{"init", "--database", "app", "--environment", "development", "--type", engine, "--dsn", "env:INIT_TARGET", "--storage-dsn", "env:INIT_STORAGE", "--schema-dir", root, "--namespace", namespace, "--profile", "project", "--json"}
 			if setup.integrated {
+				// A wizard-entered connection persists as a file reference and
+				// must work for later commands and repeated initialization too.
+				connectionFile := filepath.Join(t.TempDir(), "connection.dsn")
+				require.NoError(t, os.WriteFile(connectionFile, []byte(targetDSN), 0600))
+				args[slices.Index(args, "--dsn")+1] = "file:" + connectionFile
 				i := slices.Index(args, "--storage-dsn")
 				args = append(args[:i], append([]string{"--integrated"}, args[i+2:]...)...)
 			}
@@ -132,7 +137,7 @@ func TestInitEngines(t *testing.T) {
 			require.True(t, os.IsNotExist(err))
 			config, err := os.ReadFile(filepath.Join(manager.Dir, "runtime.yaml"))
 			require.NoError(t, err)
-			require.Contains(t, string(config), "env:INIT_TARGET")
+			require.Contains(t, string(config), args[slices.Index(args, "--dsn")+1])
 			require.NotContains(t, string(config), targetDSN)
 			schemaPath := filepath.Join(root, namespace, "widgets.sql")
 			schema, err := os.ReadFile(schemaPath)
