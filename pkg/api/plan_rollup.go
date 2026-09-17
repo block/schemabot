@@ -88,6 +88,20 @@ type DeploymentRollupEntry struct {
 	Diff    tern.ChangeSetDiff
 	Err     error
 
+	// ChangeSet is what this member would run: the change set its own diff
+	// produced, or the reviewed plan's for the primary. Empty for a member that
+	// errored, which has no plan to describe.
+	ChangeSet tern.ChangeSet
+	// PlanFingerprint keys ChangeSet by the work it would run, so a reader can
+	// group members that would run the same plan without comparing every pair.
+	// Two members share it exactly when tern.CompareChangeSets reports them
+	// identical. Empty for a member that errored.
+	//
+	// A member classified Match or Planned always has one: both classifications
+	// are reached through a self-comparison that proves the member's content
+	// canonicalizes, which is the same thing the fingerprint needs.
+	PlanFingerprint string
+
 	// PlanIdentifier names the stored plan this member will run, set when the
 	// member was planned on its own and its plan was persisted as a row of its
 	// own. Empty means the member runs the plan the apply itself was created
@@ -237,10 +251,14 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 				entry.Class = DeploymentMatch
 			}
 		}
+		if !recordMemberPlan(&entry, baselineDialect, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}) {
+			clean = false
+		}
 		// A blocked count is only as trustworthy as the plan it is read from. An
 		// errored entry's plan is the one the rollup just declared unusable, so
 		// it publishes no count rather than a precise-looking number a reviewer
-		// would read as a real refusal total.
+		// would read as a real refusal total. The class is read after the member
+		// is keyed, because a member that cannot be keyed errors there.
 		if entry.Class != DeploymentErrored {
 			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
 		}
@@ -248,6 +266,36 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 	}
 
 	return PlanRollup{Entries: entries, Clean: clean, Planning: planning}, nil
+}
+
+// recordMemberPlan records what a classified member would run — its change set
+// and the key that groups it with members running the same work — and reports
+// whether the entry still passes.
+//
+// It is only reached for a member whose content a comparison already
+// canonicalized, so a fingerprint failure here contradicts that comparison. It
+// still fails the member closed rather than leaving the key empty: a member
+// SchemaBot cannot key is one it cannot group, and an ungrouped member renders
+// as work nobody reviewed.
+//
+// An errored member is left alone and reported as not passing. It has no plan to
+// describe, and overwriting its cause with a second one would bury the reason it
+// blocked. The caller has already failed that member closed, so the repeated
+// signal changes nothing; the point is that the result means the same thing for
+// every member, whichever branch classified it.
+func recordMemberPlan(entry *DeploymentRollupEntry, dialect schema.Dialect, cs tern.ChangeSet) bool {
+	if entry.Class == DeploymentErrored {
+		return false
+	}
+	fingerprint, err := tern.ChangeSetFingerprint(dialect, cs)
+	if err != nil {
+		entry.Class = DeploymentErrored
+		entry.Err = fmt.Errorf("member plan could not be keyed for grouping: %w", err)
+		return false
+	}
+	entry.ChangeSet = cs
+	entry.PlanFingerprint = fingerprint
+	return true
 }
 
 // rollupIndependentMembers classifies members that were each planned against
@@ -280,6 +328,12 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 			} else {
 				entry.Class = DeploymentPlanned
 			}
+		}
+		// Each member is keyed under its own grammar. Members here are never
+		// compared to each other, so nothing has established that they share a
+		// dialect the way the mirrored path's baseline does.
+		if !recordMemberPlan(&entry, schema.DialectForDatabaseType(d.DatabaseType), tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}) {
+			clean = false
 		}
 		// Same rule as the mirrored path: an errored entry's plan is the one just
 		// declared unusable, so it publishes no count. The count matters more
