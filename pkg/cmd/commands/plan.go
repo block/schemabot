@@ -177,6 +177,7 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 
 	// Header box (title + database only, environment shown below)
 	templates.WritePlanHeader(templates.PlanHeaderData{
+		Engine:     engine,
 		Database:   database,
 		SchemaName: filepath.Base(schemaDir),
 		IsMySQL:    isMySQL,
@@ -403,6 +404,7 @@ func OutputPlanResult(result *apitypes.PlanResponse, database, environment, sche
 
 	// Header box + environment
 	templates.WritePlanHeader(templates.PlanHeaderData{
+		Engine:     result.Engine,
 		Database:   database,
 		SchemaName: filepath.Base(schemaDir),
 		IsMySQL:    isMySQL,

@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	runtimehost "github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/localsetup"
 )
 
 // Initialization runs the installed CLI, creates its own private runtime and
@@ -37,6 +38,16 @@ func TestInitEngines(t *testing.T) {
 			if engine == "postgres" {
 				namespace = "public"
 			}
+			require.NoError(t, localsetup.CheckConnection(t.Context(), engine, targetDSN))
+			discovered, err := localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
+			require.NoError(t, err)
+			require.Equal(t, []string{namespace}, discovered)
+			if engine == "postgres" {
+				execSQL(t, db, "CREATE SCHEMA analytics")
+				discovered, err = localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
+				require.NoError(t, err)
+				require.Contains(t, discovered, "analytics")
+			}
 			manager := runtimehost.Manager{Dir: filepath.Join(home, ".schemabot", "runtimes", "local"), Binary: binary, Version: "dev"}
 			t.Cleanup(func() {
 				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), runtimeDeadline)
@@ -50,6 +61,18 @@ func TestInitEngines(t *testing.T) {
 				cmd.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=", "INIT_TARGET="+targetDSN, "INIT_STORAGE="+storageDSN)
 				return cmd.CombinedOutput()
 			}
+			missingOutput, missingErr := run("init", "--non-interactive", "--json")
+			require.Error(t, missingErr)
+			var missing struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+				Missing []string `json:"missing"`
+			}
+			require.NoError(t, json.Unmarshal(missingOutput, &missing))
+			require.Equal(t, "missing_inputs", missing.Error.Code)
+			require.Contains(t, missing.Missing, "database")
 			args := []string{"init", "--database", "app", "--environment", "development", "--type", engine, "--dsn", "env:INIT_TARGET", "--storage-dsn", "env:INIT_STORAGE", "--schema-dir", root, "--namespace", namespace, "--profile", "project", "--json"}
 			// A fresh installation works with the normal default profile too.
 			defaultArgs := slices.Clone(args)
@@ -104,10 +127,11 @@ func TestInitEngines(t *testing.T) {
 			require.NoError(t, os.WriteFile(schemaPath, edited, 0600))
 			output, err = run(args...)
 			require.Error(t, err, string(output))
-			require.Contains(t, string(output), "existing files were preserved")
+			require.Contains(t, string(output), "still produce schema changes")
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
+			// Existing schema files are verified automatically, preserving harmless comments.
 			// Reuse must reject a real difference without changing the user's files.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.Error(t, err, string(output))
@@ -115,6 +139,9 @@ func TestInitEngines(t *testing.T) {
 			require.FileExists(t, filepath.Join(root, namespace, "notes.sql"))
 			// Explicit reuse accepts harmless formatting/comments without replacing files.
 			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))
+			output, err = run(args...)
+			require.NoError(t, err, string(output))
+			// The explicit flag remains supported for scripted callers.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.NoError(t, err, string(output))
 			after, err = os.ReadFile(schemaPath)

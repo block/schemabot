@@ -20,6 +20,7 @@ const minBoxWidth = 45
 
 // PlanHeaderData contains data for rendering the plan header.
 type PlanHeaderData struct {
+	Engine      string
 	Database    string
 	SchemaName  string
 	Environment string
@@ -43,6 +44,10 @@ func WritePlanHeader(data PlanHeaderData) {
 	}
 	if data.EngineLabel != "" {
 		dbType = data.EngineLabel
+	}
+
+	if strings.EqualFold(data.Engine, "postgres") || strings.EqualFold(data.Engine, "PostgreSQL") {
+		dbType = "PostgreSQL"
 	}
 
 	action := "Plan"

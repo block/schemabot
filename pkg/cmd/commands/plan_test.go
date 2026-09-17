@@ -721,6 +721,16 @@ func TestWriteNamespaceChanges_NoCollapseUnderThreshold(t *testing.T) {
 	assert.Equal(t, 4, strings.Count(plainOutput, "ADD COLUMN"), "each keyspace should show DDL")
 }
 
+func TestWritePlanHeaderPostgres(t *testing.T) {
+	for _, engine := range []string{"postgres", "PostgreSQL"} {
+		output := captureStdout(func() {
+			templates.WritePlanHeader(templates.PlanHeaderData{Database: "shop", Engine: engine, IsMySQL: true})
+		})
+		assert.Contains(t, output, "PostgreSQL Schema Change Plan")
+		assert.NotContains(t, output, "MySQL Schema Change Plan")
+	}
+}
+
 // Plan output retains the target grammar and each statement while leaving
 // the supplied API response unchanged, including for unknown database types.
 func TestPlanOutputPreservesTargetDialect(t *testing.T) {
