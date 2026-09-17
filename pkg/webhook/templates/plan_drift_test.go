@@ -618,6 +618,80 @@ func TestRenderPlanComment_ClampedGroupHeadingKeepsThePrimary(t *testing.T) {
 	assert.NotContains(t, out, "my_db_4")
 }
 
+// A rollout of many targets against many tables renders past what GitHub will
+// accept, and an oversized comment is rejected outright — which would leave the
+// PR with no plan at all. The comment gives up DDL bodies, largest plan first,
+// until it fits, and points at the stored plan it withheld.
+func TestRenderPlanComment_OversizedRolloutWithholdsTheLargestPlan(t *testing.T) {
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: []string{"primary/a"}, Primary: true, Changes: planGroupChanges(1), PlanID: "plan_reviewed"},
+		{Members: []string{"eu/b"}, Changes: planGroupChanges(2000), PlanID: "plan_eu"},
+		{Members: []string{"ap/c"}, Changes: planGroupChanges(2500), PlanID: "plan_ap"},
+	})
+
+	assert.LessOrEqual(t, len(out), planCommentBudget)
+	// The largest plan is the one withheld, and it is still named, still counted,
+	// and still reachable.
+	assert.Contains(t, out, "`ap/c` — 2500 DDL statements")
+	assert.Contains(t, out, "This plan is too large to render here.")
+	assert.Contains(t, out, "schemabot list-plans plan_ap")
+	assert.Contains(t, out, "📋 **Plan**: 3 distinct plans on 3 targets")
+	// The plans that fit are untouched.
+	assert.Contains(t, out, "`primary/a` (primary) — 1 DDL statement")
+	assert.NotContains(t, out, "schemabot list-plans plan_eu")
+	assert.NotContains(t, out, "schemabot list-plans plan_reviewed")
+}
+
+// Withholding stops as soon as the comment fits, so a reader keeps as many
+// plans as the budget allows rather than losing all of them to the first one
+// that did not fit.
+func TestRenderPlanComment_WithholdingStopsWhenTheCommentFits(t *testing.T) {
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: []string{"primary/a"}, Primary: true, Changes: planGroupChanges(2000), PlanID: "plan_reviewed"},
+		{Members: []string{"eu/b"}, Changes: planGroupChanges(2100), PlanID: "plan_eu"},
+		{Members: []string{"ap/c"}, Changes: planGroupChanges(2200), PlanID: "plan_ap"},
+		{Members: []string{"us/d"}, Changes: planGroupChanges(2300), PlanID: "plan_us"},
+	})
+
+	assert.LessOrEqual(t, len(out), planCommentBudget)
+	assert.Equal(t, 3, strings.Count(out, "This plan is too large to render here."),
+		"only as many plans as the budget needs are withheld")
+	// Every group is still named and counted, whether or not its DDL survived.
+	for _, heading := range []string{
+		"`primary/a` (primary) — 2000 DDL statements",
+		"`eu/b` — 2100 DDL statements",
+		"`ap/c` — 2200 DDL statements",
+		"`us/d` — 2300 DDL statements",
+	} {
+		assert.Contains(t, out, heading)
+	}
+}
+
+// A plan the comment cannot show and cannot point at is said to be missing
+// rather than pointed at with a command that would not resolve.
+func TestRenderPlanComment_WithheldPlanWithoutAnIdentifierSaysSo(t *testing.T) {
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: []string{"primary/a"}, Primary: true, Changes: planGroupChanges(1), PlanID: "plan_reviewed"},
+		{Members: []string{"eu/b"}, Changes: planGroupChanges(2000), PlanID: "plan_eu"},
+		{Members: []string{"ap/c"}, Changes: planGroupChanges(2500)},
+	})
+
+	assert.LessOrEqual(t, len(out), planCommentBudget)
+	assert.Contains(t, out, "SchemaBot has no stored identifier for this plan.")
+	assert.NotContains(t, out, "schemabot list-plans\n")
+}
+
+// A comment that fits withholds nothing.
+func TestRenderPlanComment_ComfortableRolloutShowsEveryPlan(t *testing.T) {
+	out := renderGroupedPlan(planGroupChanges(1), []DeploymentPlanGroup{
+		{Members: []string{"primary/a"}, Primary: true, Changes: planGroupChanges(1), PlanID: "plan_reviewed"},
+		{Members: []string{"eu/b"}, Changes: planGroupChanges(2), PlanID: "plan_eu"},
+	})
+
+	assert.NotContains(t, out, "too large to render here")
+	assert.Contains(t, out, "ALTER TABLE `t1` ADD COLUMN `c` int")
+}
+
 // The clamp keeps a list readable without costing a reader a name it would have
 // been just as short to state.
 func TestClampNameList(t *testing.T) {

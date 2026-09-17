@@ -128,7 +128,7 @@ func TestDeploymentDriftPreview_NilForSingleDeployment(t *testing.T) {
 		Entries: []api.DeploymentRollupEntry{{Deployment: "primary", Class: api.DeploymentMatch}},
 		Clean:   true,
 	}
-	assert.Nil(t, deploymentDriftPreview(rollup))
+	assert.Nil(t, deploymentDriftPreview(rollup, "plan_reviewed"))
 }
 
 // A clean multi-deployment rollup becomes preview data flagged clean and
@@ -141,7 +141,7 @@ func TestDeploymentDriftPreview_CleanMultiDeployment(t *testing.T) {
 		},
 		Clean: true,
 	}
-	preview := deploymentDriftPreview(rollup)
+	preview := deploymentDriftPreview(rollup, "plan_reviewed")
 	assert.NotNil(t, preview)
 	assert.True(t, preview.Computed)
 	assert.True(t, preview.Clean)
@@ -166,7 +166,7 @@ func TestDeploymentDriftPreview_DivergedAndErroredDetails(t *testing.T) {
 		},
 		Clean: false,
 	}
-	preview := deploymentDriftPreview(rollup)
+	preview := deploymentDriftPreview(rollup, "plan_reviewed")
 	assert.False(t, preview.Clean)
 	assert.Equal(t, "diverged", preview.Deployments[1].Class)
 	assert.Contains(t, preview.Deployments[1].Detail, "1 unexpected")
@@ -250,11 +250,35 @@ func TestDeploymentPlanGroups_SameWorkGroupsTogether(t *testing.T) {
 		},
 	}
 
-	groups := deploymentPlanGroups(rollup)
+	groups := deploymentPlanGroups(rollup, "plan_reviewed")
 	assert.Equal(t, [][]string{{"primary/testapp_1", "primary/testapp_2", "primary/testapp_3"}}, groupMembers(groups))
 	assert.True(t, groups[0].Primary)
 	assert.Equal(t, []string{email}, groups[0].Changes[0].Statements)
 	assert.False(t, groups[0].Empty())
+}
+
+// A withheld plan is only reachable if the comment can name it. The primary
+// runs the reviewed plan itself and has no member plan row of its own, so its
+// group carries the reviewed plan's identifier; every other group carries the
+// identifier of the member plan its members were stored with.
+func TestDeploymentPlanGroups_GroupsCarryThePlanToPrintThem(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	index := "ALTER TABLE users ADD INDEX idx_email (email)"
+	member := plannedMember("eu", "testapp_2", email, index)
+	member.PlanIdentifier = "plan_eu"
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("primary", "testapp_1", email),
+			member,
+		},
+	}
+
+	groups := deploymentPlanGroups(rollup, "plan_reviewed")
+	require.Len(t, groups, 2)
+	assert.Equal(t, "plan_reviewed", groups[0].PlanID)
+	assert.Equal(t, "plan_eu", groups[1].PlanID)
 }
 
 // Targets that hold their own schemas can need different work. Each distinct
@@ -273,7 +297,7 @@ func TestDeploymentPlanGroups_DifferentWorkSplits(t *testing.T) {
 		},
 	}
 
-	groups := deploymentPlanGroups(rollup)
+	groups := deploymentPlanGroups(rollup, "plan_reviewed")
 	assert.Equal(t, [][]string{
 		{"primary/testapp_1", "primary/testapp_3"},
 		{"primary/testapp_2"},
@@ -299,7 +323,7 @@ func TestDeploymentPlanGroups_ConvergedTargetsAreTheirOwnGroup(t *testing.T) {
 		},
 	}
 
-	groups := deploymentPlanGroups(rollup)
+	groups := deploymentPlanGroups(rollup, "plan_reviewed")
 	assert.Equal(t, [][]string{
 		{"primary/testapp_1", "primary/testapp_3"},
 		{"primary/testapp_2", "primary/testapp_4"},
@@ -322,7 +346,7 @@ func TestDeploymentPlanGroups_PrimaryGroupComesFirst(t *testing.T) {
 		},
 	}
 
-	groups := deploymentPlanGroups(rollup)
+	groups := deploymentPlanGroups(rollup, "plan_reviewed")
 	assert.True(t, groups[0].Primary)
 	assert.Equal(t, []string{"primary/testapp_1"}, groups[0].Members)
 	assert.True(t, groups[0].Empty(), "the primary having nothing to apply does not move its group")
@@ -346,7 +370,7 @@ func TestDeploymentDriftPreview_BlockedRollupIsNotGrouped(t *testing.T) {
 		},
 	}
 
-	preview := deploymentDriftPreview(rollup)
+	preview := deploymentDriftPreview(rollup, "plan_reviewed")
 	assert.Empty(t, preview.Plans)
 	assert.Len(t, preview.Deployments, 2)
 }
@@ -367,7 +391,7 @@ func TestDeploymentDriftPreview_MirroredMembersAreNotGrouped(t *testing.T) {
 		Entries:  []api.DeploymentRollupEntry{eu, au},
 	}
 
-	preview := deploymentDriftPreview(rollup)
+	preview := deploymentDriftPreview(rollup, "plan_reviewed")
 	assert.Empty(t, preview.Plans)
 }
 
@@ -385,7 +409,7 @@ func TestDeploymentDriftPreview_CleanIndependentRollupCarriesGroups(t *testing.T
 		},
 	}
 
-	preview := deploymentDriftPreview(rollup)
+	preview := deploymentDriftPreview(rollup, "plan_reviewed")
 	assert.Len(t, preview.Plans, 2)
 }
 

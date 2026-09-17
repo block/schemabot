@@ -227,6 +227,17 @@ type DeploymentPlanGroup struct {
 	// the comment renders the reviewed plan itself. Empty for a group whose
 	// members are already at the desired schema.
 	Changes []KeyspaceChangeData
+	// PlanID names the stored plan the group's members would run, so a reader
+	// can print it in full when the comment has no room to show it. Every member
+	// of the group has a stored plan of its own and they are identical, so any
+	// one of them answers the question; this is the first member's.
+	PlanID string
+
+	// clamped marks a group whose DDL body this comment gave up to stay inside
+	// GitHub's size cap. It is set while rendering, never by the caller: how much
+	// room a plan needs is a fact about the comment it lands in, not about the
+	// group.
+	clamped bool
 }
 
 // Empty reports that the group's members are already at the desired schema and
@@ -316,8 +327,88 @@ type KeyspaceShardChange struct {
 	Satisfied bool
 }
 
+// planCommentChromeHeadroom reserves room under GitHub's cap for the markup a
+// caller adds to the body after this renders — the tracking marker and the
+// support-channel footer — plus margin, so an assembled comment never lands
+// exactly at the limit.
+const planCommentChromeHeadroom = 1024
+
+// planCommentBudget is how large a plan comment may render. A comment over
+// GitHub's cap is rejected outright, which would leave the PR with no plan at
+// all rather than a long one.
+const planCommentBudget = GitHubIssueCommentMaxChars - planCommentChromeHeadroom
+
 // RenderPlanComment renders the plan comment markdown.
+//
+// A rollout of N targets against M tables can render past what GitHub will
+// accept, so an oversized comment gives up DDL bodies until it fits, largest
+// plan first. What it never gives up is the summary lines: the comment still
+// names every target and says how much each one would run, and each withheld
+// plan is replaced by the command that prints it in full. A reader who cannot
+// see one plan's statements can still see that it exists, which target runs it,
+// and where to read it.
 func RenderPlanComment(data PlanCommentData) string {
+	out := renderPlanComment(data)
+	if len(out) <= planCommentBudget || len(data.planGroups()) == 0 {
+		return out
+	}
+
+	// Clamping works on a copy so the caller's groups are not rewritten by the
+	// act of rendering them.
+	groups := slices.Clone(data.DeploymentDrift.Plans)
+	drift := *data.DeploymentDrift
+	drift.Plans = groups
+	data.DeploymentDrift = &drift
+
+	for range groups {
+		i := largestUnclampedGroup(groups)
+		if i < 0 {
+			break
+		}
+		groups[i].clamped = true
+		out = renderPlanComment(data)
+		if len(out) <= planCommentBudget {
+			break
+		}
+	}
+	return out
+}
+
+// largestUnclampedGroup is the group whose DDL body would free the most room,
+// or -1 when every group's body has already been given up. Taking the largest
+// first withholds the fewest plans for the room it recovers.
+func largestUnclampedGroup(groups []DeploymentPlanGroup) int {
+	best, bestSize := -1, 0
+	for i, g := range groups {
+		if g.clamped || g.Empty() {
+			continue
+		}
+		if size := renderedDDLSize(g.Changes); size > bestSize {
+			best, bestSize = i, size
+		}
+	}
+	return best
+}
+
+// renderedDDLSize approximates how much of a comment a group's statements
+// occupy. It is used only to order the groups against each other, so it counts
+// the statements rather than rendering them.
+func renderedDDLSize(changes []KeyspaceChangeData) int {
+	size := 0
+	for _, ks := range changes {
+		for _, s := range ks.Statements {
+			size += len(s)
+		}
+		for _, shard := range ks.Shards {
+			for _, s := range shard.Statements {
+				size += len(s)
+			}
+		}
+	}
+	return size
+}
+
+func renderPlanComment(data PlanCommentData) string {
 	var sb strings.Builder
 
 	// Header
@@ -1294,7 +1385,7 @@ func writePlanGroups(sb *strings.Builder, data PlanCommentData, groups []Deploym
 
 		if !collapse {
 			fmt.Fprintf(sb, "**%s** — %s\n\n", heading, label)
-			writeKeyspaceChanges(sb, scoped)
+			writePlanGroupBody(sb, scoped, g)
 			continue
 		}
 
@@ -1303,7 +1394,7 @@ func writePlanGroups(sb *strings.Builder, data PlanCommentData, groups []Deploym
 			open = " open"
 		}
 		fmt.Fprintf(sb, "<details%s>\n<summary><b>%s — %s</b></summary>\n\n", open, heading, label)
-		writeKeyspaceChanges(sb, scoped)
+		writePlanGroupBody(sb, scoped, g)
 		sb.WriteString("</details>\n\n")
 	}
 
@@ -1313,6 +1404,27 @@ func writePlanGroups(sb *strings.Builder, data PlanCommentData, groups []Deploym
 		// only attention line here: the targets differing is the contract.
 		sb.WriteString(glyph.Attention + " Applying runs each target's own plan, including the ones collapsed above.\n\n")
 	}
+}
+
+// writePlanGroupBody renders a group's statements, or the pointer that replaces
+// them when the comment had no room for this plan.
+//
+// The pointer names the stored plan rather than summarizing it. A summary of
+// withheld DDL is the one thing worse than withholding it: a reader would take
+// it for the plan and stop looking.
+func writePlanGroupBody(sb *strings.Builder, scoped PlanCommentData, g DeploymentPlanGroup) {
+	if !g.clamped {
+		writeKeyspaceChanges(sb, scoped)
+		return
+	}
+	sb.WriteString("This plan is too large to render here. To read it in full:\n\n")
+	if g.PlanID == "" {
+		// Without an identifier there is nothing to point at, so the comment says
+		// so plainly rather than printing a command that cannot work.
+		sb.WriteString("SchemaBot has no stored identifier for this plan. Re-plan the pull request to store one.\n\n")
+		return
+	}
+	fmt.Fprintf(sb, "```\nschemabot list-plans %s\n```\n\n", g.PlanID)
 }
 
 // writePlanGroupSummary states what the apply runs across the whole rollout,

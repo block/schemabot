@@ -64,7 +64,7 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 			summary: "drift check failed; see logs",
 		}, &templates.DeploymentDriftData{Computed: false}
 	}
-	preview := deploymentDriftPreview(rollup)
+	preview := deploymentDriftPreview(rollup, primaryPlan.GetPlanId())
 	if rollup.Clean {
 		return reviewDriftOutcome{state: driftClean}, preview
 	}
@@ -83,7 +83,7 @@ const erroredDriftDetail = "diff failed; see server logs"
 // deploymentDriftPreview turns a computed rollup into the PR-preview rendering
 // data. It returns nil for a single-deployment database: with one deployment
 // there is nothing to compare, so a "same plan everywhere" line would be noise.
-func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftData {
+func deploymentDriftPreview(rollup api.PlanRollup, reviewedPlanID string) *templates.DeploymentDriftData {
 	if len(rollup.Entries) <= 1 {
 		return nil
 	}
@@ -124,7 +124,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 	// vocabulary of a fleet that may diverge, would suggest the agreement was an
 	// outcome rather than the requirement that let the check pass.
 	if rollup.Clean && independent {
-		data.Plans = deploymentPlanGroups(rollup)
+		data.Plans = deploymentPlanGroups(rollup, reviewedPlanID)
 	}
 	return data
 }
@@ -139,16 +139,23 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 // the reviewed plan is the one an operator has already seen, and a fixed order
 // keeps a comment that is re-rendered on a later push from reshuffling under a
 // reader who is looking for what changed.
-func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup {
+func deploymentPlanGroups(rollup api.PlanRollup, reviewedPlanID string) []templates.DeploymentPlanGroup {
 	names := rollupMemberNames(rollup)
 	var groups []templates.DeploymentPlanGroup
 	byPlan := make(map[string]int, len(rollup.Entries))
 	for i, e := range rollup.Entries {
 		at, ok := byPlan[e.PlanFingerprint]
 		if !ok {
+			// The primary runs the reviewed plan itself, so it has no member plan
+			// row of its own and its identifier is the reviewed plan's.
+			planID := e.PlanIdentifier
+			if i == 0 {
+				planID = reviewedPlanID
+			}
 			groups = append(groups, templates.DeploymentPlanGroup{
 				Primary: i == 0,
 				Changes: memberPlanChanges(e.ChangeSet),
+				PlanID:  planID,
 			})
 			at = len(groups) - 1
 			byPlan[e.PlanFingerprint] = at
