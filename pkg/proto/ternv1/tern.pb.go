@@ -4268,9 +4268,19 @@ type StorageSchemaApplyRequest struct {
 	// Caller identifies the operator who issued the command, as resolved by the
 	// plane that accepted it, so the data plane's logs attribute the
 	// convergence to a person rather than to a control plane.
-	Caller        string `protobuf:"bytes,2,opt,name=caller,proto3" json:"caller,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Caller string `protobuf:"bytes,2,opt,name=caller,proto3" json:"caller,omitempty"`
+	// TimeoutSeconds bounds the whole convergence: the advisory-lock wait, the
+	// diff taken under it, and the DDL. Zero means the serving instance's
+	// default for an operator-requested convergence, which is already far above
+	// the budget a booting pod uses. Raise it only to finish work a boot cannot,
+	// such as an index build over a storage table with a long history: the
+	// convergence holds the bootstrap advisory lock for its whole budget, and a
+	// pod booting in that window fails its own lock wait and does not come up.
+	// A value above the serving instance's maximum is refused rather than
+	// clamped, so a caller is never told a budget it did not get.
+	TimeoutSeconds int64 `protobuf:"varint,3,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *StorageSchemaApplyRequest) Reset() {
@@ -4315,6 +4325,13 @@ func (x *StorageSchemaApplyRequest) GetCaller() string {
 		return x.Caller
 	}
 	return ""
+}
+
+func (x *StorageSchemaApplyRequest) GetTimeoutSeconds() int64 {
+	if x != nil {
+		return x.TimeoutSeconds
+	}
+	return 0
 }
 
 // StorageSchemaApplyResponse brackets the convergence with the report from
@@ -4743,10 +4760,11 @@ const file_tern_proto_rawDesc = "" +
 	"\x04host\x18\b \x01(\tR\x04host\x12#\n" +
 	"\rschema_source\x18\t \x01(\tR\fschemaSource\"Q\n" +
 	"\x19StorageSchemaPlanResponse\x124\n" +
-	"\x06report\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\x06report\"`\n" +
+	"\x06report\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\x06report\"\x89\x01\n" +
 	"\x19StorageSchemaApplyRequest\x12+\n" +
 	"\x11allow_destructive\x18\x01 \x01(\bR\x10allowDestructive\x12\x16\n" +
-	"\x06caller\x18\x02 \x01(\tR\x06caller\"\x90\x01\n" +
+	"\x06caller\x18\x02 \x01(\tR\x06caller\x12'\n" +
+	"\x0ftimeout_seconds\x18\x03 \x01(\x03R\x0etimeoutSeconds\"\x90\x01\n" +
 	"\x1aStorageSchemaApplyResponse\x126\n" +
 	"\aplanned\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\aplanned\x12:\n" +
 	"\tremaining\x18\x02 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\tremaining*[\n" +

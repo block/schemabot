@@ -38,10 +38,10 @@ import (
 // for different reasons and a single value cannot serve all of them:
 //
 //	catalog reads      o.postgresStatementTimeout   ordinary queries
-//	convergence DDL    postgresBootstrapDDLStatementTimeout (per transaction)
+//	convergence DDL    postgresBootstrapDDLBudget (per transaction)
 //	advisory-lock wait none — must be free to block for the leader
 func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), o.convergenceTimeout)
 	defer cancel()
 
 	tables, files, err := readEmbeddedPostgresSchemaFiles()
@@ -124,7 +124,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 		"table_count", len(drift),
 	)
 
-	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, locker)
+	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, locker, o.convergenceTimeout)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
@@ -152,6 +152,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 	}
 
 	applyStart := time.Now()
+	ddlBudget := postgresBootstrapDDLBudget(o.convergenceTimeout)
 	for _, table := range tables {
 		changes := drift[table]
 		if len(changes) == 0 {
@@ -159,7 +160,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 			continue
 		}
 		tableStart := time.Now()
-		if err := applyPostgresTableChanges(ctx, db, table, changes, logger); err != nil {
+		if err := applyPostgresTableChanges(ctx, db, table, changes, logger, ddlBudget); err != nil {
 			// A statement killed by the overall deadline surfaces as a context
 			// cancellation carrying no budget, so name the deadline that ended
 			// it the way the advisory-lock wait names its own. Logged as well
@@ -174,16 +175,16 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 			// spent deadline means the earlier tables consumed it and the
 			// deadline is simply too short for the drift set.
 			if ctx.Err() != nil {
-				logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+				logger.Error("storage schema change did not complete within the convergence budget; SchemaBot storage will not initialize",
 					"database", database,
 					"table", table,
-					"timeout", EnsureSchemaTimeout,
+					"timeout", o.convergenceTimeout,
 					"elapsed", time.Since(applyStart),
 					"table_elapsed", time.Since(tableStart),
 					"error", err,
 				)
-				return fmt.Errorf("converge storage table %q: bootstrap did not finish within EnsureSchemaTimeout (%s): %w",
-					table, EnsureSchemaTimeout, err)
+				return fmt.Errorf("converge storage table %q: convergence did not finish within its budget (%s): %w",
+					table, o.convergenceTimeout, err)
 			}
 			return fmt.Errorf("converge storage table %q: %w", table, err)
 		}
@@ -692,54 +693,56 @@ func missingPostgresTables(ctx context.Context, db *sql.DB, want []string) ([]st
 // fails visibly instead.
 const postgresDDLLockTimeout = 10 * time.Second
 
-// postgresBootstrapDDLStatementTimeout bounds how long a convergence DDL
-// statement may run once its lock is granted. lock_timeout bounds only the
-// wait for the lock; without a statement budget a CREATE INDEX against a large
-// storage table runs until something outside SchemaBot stops it.
+// postgresBootstrapDDLBudget bounds how long a convergence DDL statement may
+// run once its lock is granted. lock_timeout bounds only the wait for the lock;
+// without a statement budget a CREATE INDEX against a large storage table runs
+// until something outside SchemaBot stops it.
 //
-// The value is derived from EnsureSchemaTimeout rather than chosen, and the
-// derivation is the safety argument. EnsureSchemaTimeout already bounds the
-// whole bootstrap through the context every statement runs under, so a
-// statement that outlives this budget was going to be cancelled by that
-// context anyway — its transaction began after the context did, so the context
-// deadline is always the earlier of the two. No statement that converges today
-// fails once this budget exists; the only statements it affects are ones that
-// would have died at the context deadline, and they now die a little sooner
-// with an error naming a budget instead of a bare cancellation. That is what
-// keeps a short budget from turning a slow-but-healthy boot into a crashloop:
-// the boot path's real ceiling is unchanged.
+// The value is derived from the convergence's own budget rather than chosen,
+// and the derivation is the safety argument. That budget already bounds the
+// whole convergence through the context every statement runs under, so a
+// statement that outlives this one was going to be cancelled by that context
+// anyway — its transaction began after the context did, so the context deadline
+// is always the earlier of the two. No statement that converges today fails
+// once this budget exists; the only statements it affects are ones that would
+// have died at the context deadline, and they now die a little sooner with an
+// error naming a budget instead of a bare cancellation. That is what keeps a
+// short budget from turning a slow-but-healthy boot into a crashloop: the boot
+// path's real ceiling is unchanged.
+//
+// Deriving it per convergence rather than once per process is what makes the
+// budget follow the caller. An operator who raises the ceiling to finish an
+// index build a boot could not raises this with it; a boot keeps the ceiling it
+// has always had. A single package-level value would silently re-impose the
+// boot budget on every statement of a convergence that had asked for longer,
+// which is the whole ceiling the deliberate path exists to escape.
 //
 // The margin decides which of the two bounds reports the failure, and it does
 // so by start time rather than by remaining time. statement_timeout is armed
-// per statement, so a statement beginning at offset s from the bootstrap's
-// start fires server-side at s+budget while the context fires at
-// EnsureSchemaTimeout — the server wins only while s is under the margin.
-// Convergence runs each index in its own transaction, so on any bootstrap
-// whose cumulative work passes the margin, every later statement reports the
-// context error instead of a 57014 naming the budget. Winning is the narrow
-// case, not the common one. That costs only error quality: the caller's
-// deadline branch names EnsureSchemaTimeout, so neither outcome is a bare
-// cancellation.
+// per statement, so a statement beginning at offset s from the convergence's
+// start fires server-side at s+budget while the context fires at the ceiling —
+// the server wins only while s is under the margin. Convergence runs each index
+// in its own transaction, so on any convergence whose cumulative work passes
+// the margin, every later statement reports the context error instead of a
+// 57014 naming the budget. Winning is the narrow case, not the common one. That
+// costs only error quality: the caller's deadline branch names the ceiling, so
+// neither outcome is a bare cancellation.
 //
 // The subtraction must stay positive. Once the ceiling reaches the margin it
 // yields a budget of 0, which PostgreSQL reads as *disabled* rather than as
 // very short — the budget would silently cease to exist instead of becoming
 // strict, the one failure this whole mechanism exists to prevent. The floor
-// keeps a shrunken ceiling deriving a short budget instead. Today's ceiling is
-// far above the margin, so the floor is not what selects the shipped value;
-// postgresBootstrapDDLBudget exists so that guard is checkable at the ceilings
-// where it does select, rather than resting on this comment.
-func postgresBootstrapDDLBudget(ceiling, margin, floor time.Duration) time.Duration {
-	return max(ceiling-margin, floor)
+// keeps a shrunken ceiling deriving a short budget instead. It is reachable,
+// because the ceiling is a caller's value: a convergence asked to run in ten
+// seconds gets the floor, not a disabled budget.
+func postgresBootstrapDDLBudget(ceiling time.Duration) time.Duration {
+	return max(ceiling-postgresBootstrapDDLTimeoutMargin, postgresBootstrapDDLFloor)
 }
 
 const (
 	postgresBootstrapDDLTimeoutMargin = 15 * time.Second
 	postgresBootstrapDDLFloor         = 5 * time.Second
 )
-
-var postgresBootstrapDDLStatementTimeout = postgresBootstrapDDLBudget(
-	EnsureSchemaTimeout, postgresBootstrapDDLTimeoutMargin, postgresBootstrapDDLFloor)
 
 // applyPostgresTableChanges executes one table's additive changes. A CREATE
 // TABLE change contains its complete embedded schema file, including indexes,
@@ -753,9 +756,9 @@ var postgresBootstrapDDLStatementTimeout = postgresBootstrapDDLBudget(
 // block is the accepted cost. Cross-transaction atomicity is unnecessary: a
 // startup killed between transactions leaves additive drift the next run
 // re-discovers and converges.
-func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger) error {
+func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger, ddlBudget time.Duration) error {
 	if changes[0].operation == postgresOpCreateTable {
-		return execPostgresChanges(ctx, db, table, changes, logger)
+		return execPostgresChanges(ctx, db, table, changes, logger, ddlBudget)
 	}
 	var columnChanges []postgresSchemaChange
 	var indexChanges []postgresSchemaChange
@@ -767,12 +770,12 @@ func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, ch
 		}
 	}
 	if len(columnChanges) > 0 {
-		if err := execPostgresChanges(ctx, db, table, columnChanges, logger); err != nil {
+		if err := execPostgresChanges(ctx, db, table, columnChanges, logger, ddlBudget); err != nil {
 			return err
 		}
 	}
 	for _, index := range indexChanges {
-		if err := execPostgresChanges(ctx, db, table, []postgresSchemaChange{index}, logger); err != nil {
+		if err := execPostgresChanges(ctx, db, table, []postgresSchemaChange{index}, logger, ddlBudget); err != nil {
 			return err
 		}
 	}
@@ -781,7 +784,7 @@ func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, ch
 
 // execPostgresChanges executes one batch of changes in a single transaction
 // with a bounded lock wait.
-func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger) error {
+func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger, ddlBudget time.Duration) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -803,7 +806,7 @@ func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes 
 	// read. Transaction-local like lock_timeout above, so the connection
 	// returns to the pool on its session default.
 	if _, err := tx.ExecContext(ctx, "SELECT set_config('statement_timeout', $1, true)",
-		strconv.FormatInt(postgresBootstrapDDLStatementTimeout.Milliseconds(), 10)); err != nil {
+		strconv.FormatInt(ddlBudget.Milliseconds(), 10)); err != nil {
 		return fmt.Errorf("set statement_timeout for table %q: %w", table, err)
 	}
 	for _, change := range changes {
@@ -812,13 +815,13 @@ func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes 
 			"operation", change.operation,
 			"object", change.object,
 			"ddl", change.ddl,
-			"statement_timeout", postgresBootstrapDDLStatementTimeout,
+			"statement_timeout", ddlBudget,
 			"lock_timeout", postgresDDLLockTimeout,
 		)
 		start := time.Now()
 		if _, err := tx.ExecContext(ctx, change.ddl); err != nil {
 			elapsed := time.Since(start)
-			err = postgresStatementTimeoutError(err, postgresBootstrapDDLStatementTimeout, elapsed)
+			err = postgresStatementTimeoutError(err, ddlBudget, elapsed)
 			// Logged as well as returned: on the boot path a crashloop's only
 			// artifact is the log, and the structured budget and elapsed fields
 			// are what separate a platform-imposed cancellation from a genuinely
@@ -827,7 +830,7 @@ func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes 
 				"table", table,
 				"operation", change.operation,
 				"object", change.object,
-				"statement_timeout", postgresBootstrapDDLStatementTimeout,
+				"statement_timeout", ddlBudget,
 				"elapsed", elapsed,
 				"error", err,
 			)
@@ -934,7 +937,7 @@ func verifyStorageSessionAffinity(ctx context.Context, db *sql.DB, locker namedl
 // normally. Disabling the budget is not an unbounded wait: the wait is bounded
 // server-side by the lock_timeout namedlock scopes to the acquisition, and
 // client-side by ctx.
-func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
+func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker, wait time.Duration) (*sql.Conn, error) {
 	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(0))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -947,10 +950,11 @@ func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *sl
 		return nil, fmt.Errorf("get connection: %w", err)
 	}
 
-	// Wait up to the full timeout for the lock — a trailing pod must outwait
-	// the leader's table creation, after which it re-checks and finds every
-	// table present.
-	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
+	// Wait up to this convergence's whole budget for the lock — a trailing pod
+	// must outwait the leader's table creation, after which it re-checks and
+	// finds every table present. A pod waits out a boot; it does not wait out an
+	// operator's longer convergence, whose budget is its own and larger.
+	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, wait)
 	if err != nil {
 		utils.CloseAndLog(conn)
 		// The overall EnsureSchema deadline expires before the server-side

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -96,6 +97,14 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 	return report, nil
 }
 
+// storageApplyOptions puts the operator's convergence budget in front of a
+// caller's options, so every entry point onto the deliberate path gets it
+// without having to remember to ask. Caller options are applied after and so
+// still win, which is what lets a command honor an operator's --timeout.
+func storageApplyOptions(opts []EnsureSchemaOption) []EnsureSchemaOption {
+	return append([]EnsureSchemaOption{WithConvergenceTimeout(apitypes.DefaultStorageApplyTimeout)}, opts...)
+}
+
 // ApplyStorageSchema converges the storage database at dsn and reports what it
 // found and what it left behind.
 //
@@ -123,11 +132,20 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 // (AV-9) rather than a failure.
 //
 // ctx bounds the two diffs, not the convergence between them: EnsureSchema
-// builds its own context from EnsureSchemaTimeout so that a cancelled request
-// cannot abandon a table copy half-done. A caller whose own deadline is shorter
-// than that budget will therefore return before the convergence does, and must
-// not read its own timeout as the apply having stopped.
+// builds its own context from the convergence budget so that a cancelled
+// request cannot abandon a table copy half-done. A caller whose own deadline is
+// shorter than that budget will therefore return before the convergence does,
+// and must not read its own timeout as the apply having stopped.
+//
+// That budget defaults to DefaultStorageApplyTimeout here rather than to the
+// boot budget, and the default belongs on this function rather than on each of
+// its callers. This is the deliberate path by definition — a convergence
+// reached through it was asked for by somebody, whether over the RPC or from a
+// terminal holding the DSN — so every entry point should get the operator's
+// ceiling without having to remember to ask for it. A caller passing
+// WithConvergenceTimeout still wins, since caller options are applied last.
 func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) (planned, remaining *StorageSchemaReport, err error) {
+	opts = storageApplyOptions(opts)
 	planned, err = PlanStorageSchema(ctx, dsn, nil, logger, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("diff storage schema before converging it: %w", err)
@@ -150,12 +168,17 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 	// here would report the storage clean while leaving them on it. The
 	// bootstrap is cheap in that case by construction: it takes no lock and
 	// does no DDL when there is nothing to do.
+	// The budget is logged because it is the one thing about this run an
+	// operator cannot see from the reports either side of it, and it is the
+	// first question asked when a convergence is still going or a booting pod
+	// reports losing the lock wait.
 	logger.Info("converging storage schema on operator request",
 		"dialect", planned.Dialect,
 		"database", planned.Database,
 		"outstanding_count", len(planned.Outstanding),
 		"destructive_count", len(planned.Destructive),
 		"destructive_allowed", planned.DestructiveAllowed,
+		"convergence_timeout", newEnsureSchemaOptions(opts...).convergenceTimeout,
 	)
 	if err := EnsureSchema(dsn, logger, opts...); err != nil {
 		return planned, nil, fmt.Errorf("converge storage schema on database %q (%s): %w", planned.Database, planned.Dialect, err)
@@ -332,6 +355,7 @@ func planPostgresStorageSchema(ctx context.Context, dsn string, desired *Storage
 func newEnsureSchemaOptions(opts ...EnsureSchemaOption) ensureSchemaOptions {
 	o := ensureSchemaOptions{
 		dialect:                  schema.DialectMySQL,
+		convergenceTimeout:       EnsureSchemaTimeout,
 		postgresStatementTimeout: DefaultPostgresStatementTimeout,
 	}
 	for _, opt := range opts {
