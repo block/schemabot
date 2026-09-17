@@ -39,13 +39,41 @@ func planIdentityStore(plans map[int64]*storage.Plan) *planIdentityPlanStore {
 	return &planIdentityPlanStore{plans: plans}
 }
 
-// A rollout whose members were planned independently names each member's plan,
-// so an operator can tie a running member to the block they reviewed. The
-// primary carries no plan of its own and runs the apply's.
+// addEmail is the change a converged rollout runs on every one of its members.
+const addEmail = "ALTER TABLE `customers` ADD COLUMN `email` VARCHAR(255)"
+
+// addZip is a second change, so a member carrying it runs work its siblings do
+// not.
+const addZip = "ALTER TABLE `customers` ADD COLUMN `zip` VARCHAR(16)"
+
+// storedPlan builds a plan row carrying the given DDL, the shape the comment
+// keys on when it decides whether a rollout's members run the same work.
+func storedPlan(id int64, identifier string, ddl ...string) *storage.Plan {
+	tables := make([]storage.TableChange, 0, len(ddl))
+	for _, statement := range ddl {
+		tables = append(tables, storage.TableChange{
+			Namespace: "shop",
+			Table:     "customers",
+			DDL:       statement,
+			Operation: "alter",
+		})
+	}
+	return &storage.Plan{
+		ID:             id,
+		PlanIdentifier: identifier,
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespaces:     map[string]*storage.NamespacePlanData{"shop": {Tables: tables}},
+	}
+}
+
+// A rollout whose members were planned independently and came out running
+// different work names each member's plan, so an operator can tie a running
+// member to the block they reviewed. The primary carries no plan of its own and
+// runs the apply's.
 func TestResolvePlanIdentifiers_NamesEachMembersPlan(t *testing.T) {
 	store := planIdentityStore(map[int64]*storage.Plan{
-		7:  {ID: 7, PlanIdentifier: "plan_reviewed"},
-		42: {ID: 42, PlanIdentifier: "plan_3344"},
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addEmail, addZip),
 	})
 	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
 	ops := []*storage.ApplyOperation{
@@ -58,11 +86,11 @@ func TestResolvePlanIdentifiers_NamesEachMembersPlan(t *testing.T) {
 	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, byOp)
 }
 
-// Members that share one plan name nothing: the same identifier under every
+// Members that share one plan row name nothing: the same identifier under every
 // member tells the reader nothing, so the comment neither renders it nor reads
 // the row it would come from.
 func TestResolvePlanIdentifiers_ConvergedRolloutReadsNoPlans(t *testing.T) {
-	store := planIdentityStore(map[int64]*storage.Plan{7: {ID: 7, PlanIdentifier: "plan_reviewed"}})
+	store := planIdentityStore(map[int64]*storage.Plan{7: storedPlan(7, "plan_reviewed", addEmail)})
 	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "primary"},
@@ -72,14 +100,78 @@ func TestResolvePlanIdentifiers_ConvergedRolloutReadsNoPlans(t *testing.T) {
 	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
 
 	assert.Empty(t, byOp)
-	assert.Empty(t, store.reads, "a converged rollout reads no plan rows")
+	assert.Empty(t, store.reads, "members sharing a plan row need no plan read to be seen as converged")
+}
+
+// Members planned against their own live schemas each get a plan row of their
+// own whether or not those schemas differ. When they converge on the same work,
+// the review comment shows one block for all of them — so the apply comment
+// names no plan either, rather than printing three identifiers for one change
+// and reading as three different rollouts.
+func TestResolvePlanIdentifiers_SeparatelyPlannedMembersRunningTheSameWorkNameNoPlan(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addEmail),
+		43: storedPlan(43, "plan_3345", addEmail),
+	})
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary"},
+		{ID: 2, Deployment: "eu-west", PlanID: 42},
+		{ID: 3, Deployment: "ap-south", PlanID: 43},
+	}
+
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+
+	assert.Empty(t, byOp, "three plan rows carrying one change set are one change set")
+}
+
+// The same rollout with one member running more names every member's plan: the
+// members really do differ, and the identifier is how a reader tells which is
+// which.
+func TestResolvePlanIdentifiers_SeparatelyPlannedMembersRunningDifferentWorkAreNamed(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addEmail),
+		43: storedPlan(43, "plan_3345", addEmail, addZip),
+	})
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary"},
+		{ID: 2, Deployment: "eu-west", PlanID: 42},
+		{ID: 3, Deployment: "ap-south", PlanID: 43},
+	}
+
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+
+	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344", 3: "plan_3345"}, byOp)
+}
+
+// Work is compared on the change set, not on how the DDL was written. Two
+// members planned against equivalent schemas can render the same change
+// differently, and splitting them on that would name plans for a rollout the
+// review already showed as one block.
+func TestResolvePlanIdentifiers_SameWorkWrittenDifferentlyNamesNoPlan(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", "alter table customers add column email varchar(255)"),
+	})
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary"},
+		{ID: 2, Deployment: "eu-west", PlanID: 42},
+	}
+
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+
+	assert.Empty(t, byOp)
 }
 
 // Each distinct plan is read once however many members run it.
 func TestResolvePlanIdentifiers_ReadsEachPlanOnce(t *testing.T) {
 	store := planIdentityStore(map[int64]*storage.Plan{
-		7:  {ID: 7, PlanIdentifier: "plan_reviewed"},
-		42: {ID: 42, PlanIdentifier: "plan_3344"},
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addEmail, addZip),
 	})
 	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
 	ops := []*storage.ApplyOperation{
@@ -104,7 +196,7 @@ func TestResolvePlanIdentifiers_UnreadablePlanLeavesMembersUnnamed(t *testing.T)
 		store *planIdentityPlanStore
 	}{
 		{"load fails", &planIdentityPlanStore{err: errors.New("storage read failed")}},
-		{"row missing", planIdentityStore(map[int64]*storage.Plan{7: {ID: 7, PlanIdentifier: "plan_reviewed"}})},
+		{"row missing", planIdentityStore(map[int64]*storage.Plan{7: storedPlan(7, "plan_reviewed", addEmail)})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
@@ -120,12 +212,70 @@ func TestResolvePlanIdentifiers_UnreadablePlanLeavesMembersUnnamed(t *testing.T)
 	}
 }
 
+// A member whose plan cannot be read is not evidence that the rollout converged.
+// Its siblings keep their identifiers, so a reader is told what is known about
+// the members that could be read instead of being shown a rollout that looks
+// uniform because one member went unchecked.
+func TestResolvePlanIdentifiers_UnreadablePlanDoesNotConvergeItsSiblings(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addEmail),
+	})
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary"},
+		{ID: 2, Deployment: "eu-west", PlanID: 42},
+		{ID: 3, Deployment: "ap-south", PlanID: 43},
+	}
+
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+
+	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, byOp)
+}
+
+// A plan whose DDL will not parse cannot be shown to run the same work as its
+// siblings, so it is treated as its own and the rollout keeps its identifiers.
+func TestResolvePlanIdentifiers_UnkeyablePlanDoesNotConvergeItsSiblings(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", "this is not DDL"),
+	})
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary"},
+		{ID: 2, Deployment: "eu-west", PlanID: 42},
+	}
+
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+
+	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, byOp)
+}
+
+// Two members whose plans could not be keyed are two unknowns, not one shared
+// answer. Treating them as one would report a rollout as converged on the
+// strength of nothing having been compared, and drop the identifiers from the
+// one rollout where a reader most needs somewhere to look.
+func TestResolvePlanIdentifiers_TwoUnkeyablePlansAreNotOneAnswer(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		42: storedPlan(42, "plan_3344", "this is not DDL"),
+		43: storedPlan(43, "plan_3345", "nor is this"),
+	})
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu-west", PlanID: 42},
+		{ID: 2, Deployment: "ap-south", PlanID: 43},
+	}
+
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, &storage.Apply{ApplyIdentifier: "apply-1"}, ops)
+
+	assert.Equal(t, map[int64]string{1: "plan_3344", 2: "plan_3345"}, byOp)
+}
+
 // An operation with no resolvable plan contributes no plan to the rollout's
 // distinct set. Counting it would make a converged rollout look divergent and
 // start naming a plan under every member, on the strength of a member whose plan
 // could not be read at all.
 func TestResolvePlanIdentifiers_UnresolvableOperationDoesNotSplitAConvergedRollout(t *testing.T) {
-	store := planIdentityStore(map[int64]*storage.Plan{7: {ID: 7, PlanIdentifier: "plan_reviewed"}})
+	store := planIdentityStore(map[int64]*storage.Plan{7: storedPlan(7, "plan_reviewed", addEmail)})
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "primary", PlanID: 7},
 		{ID: 2, Deployment: "eu-west", PlanID: 7},
@@ -142,8 +292,8 @@ func TestResolvePlanIdentifiers_UnresolvableOperationDoesNotSplitAConvergedRollo
 // executable. It is left unnamed while its siblings are still named.
 func TestResolvePlanIdentifiers_OperationWithoutAPlanIsSkipped(t *testing.T) {
 	store := planIdentityStore(map[int64]*storage.Plan{
-		42: {ID: 42, PlanIdentifier: "plan_3344"},
-		43: {ID: 43, PlanIdentifier: "plan_3345"},
+		42: storedPlan(42, "plan_3344", addEmail),
+		43: storedPlan(43, "plan_3345", addEmail, addZip),
 	})
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "primary"},
@@ -161,8 +311,8 @@ func TestResolvePlanIdentifiers_OperationWithoutAPlanIsSkipped(t *testing.T) {
 // member is exactly the one a reader checks to see what it is about to run.
 func TestResolveDisplayByOperation_NamesThePlanOfAMemberWithNoOtherState(t *testing.T) {
 	store := planIdentityStore(map[int64]*storage.Plan{
-		7:  {ID: 7, PlanIdentifier: "plan_reviewed"},
-		42: {ID: 42, PlanIdentifier: "plan_3344"},
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addEmail, addZip),
 	})
 	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7, Engine: storage.EngineSpirit}
 	ops := []*storage.ApplyOperation{

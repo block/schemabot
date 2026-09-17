@@ -187,10 +187,11 @@ type ApplyStatusCommentData struct {
 
 	// PlanID names the plan this member is running, alongside the database and
 	// the apply identifier. It is set only when the members of one apply do not
-	// all run the same plan, which is the only case where naming it tells the
-	// reader anything: it ties a running member back to the reviewed block it
-	// came from. On a converged rollout the same identifier would appear under
-	// every member and name nothing.
+	// all run the same work, which is the only case where naming it tells the
+	// reader anything: it ties a running member back to the block it came from
+	// among the several the review showed. A rollout the review showed as one
+	// block names no plan, whether its members share a plan row or were each
+	// planned into their own and came out running the same change.
 	PlanID string
 }
 
