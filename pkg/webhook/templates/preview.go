@@ -1256,6 +1256,7 @@ func PreviewCommentApplyPlanDowngraded() string {
 		PausedApplyCause: &PausedApplyCauseData{
 			Heading: "Schema changes differ from the plan this apply was started from",
 			Entries: []string{
+				"`orders` (alter) runs a different statement than in the plan this apply was started from",
 				"`products` (alter) is in this plan but not in the one this apply was started from",
 				"`shipments` (create) was in the plan this apply was started from but is not in this one",
 			},

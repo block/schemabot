@@ -484,28 +484,76 @@ type planChangeIdentity struct {
 // buries the statements above it.
 const planDriftEntryCap = 8
 
+// planDriftChange is one table's change without the DDL that realizes it. Drift
+// is reported at this granularity because an entry names the table and the
+// operation, so two identities that differ only in DDL are one line to the
+// reader, not two.
+type planDriftChange struct {
+	namespace string
+	table     string
+	operation string
+}
+
+// planDriftStatements groups a plan's change identities by the table change
+// they realize, keeping each distinct statement and how many times it appears.
+func planDriftStatements(identities map[planChangeIdentity]int) map[planDriftChange]map[string]int {
+	grouped := make(map[planDriftChange]map[string]int)
+	for id, count := range identities {
+		change := planDriftChange{namespace: id.namespace, table: id.table, operation: id.operation}
+		if grouped[change] == nil {
+			grouped[change] = make(map[string]int)
+		}
+		grouped[change][id.ddl] += count
+	}
+	return grouped
+}
+
 // planDriftCause describes how the re-plan differs from the plan the apply was
 // started from, per table, so the reader can see what moved without diffing two
 // comments themselves. The DDL itself is not repeated: the statements that will
-// run are already fenced above this disclosure.
+// run are already fenced above this disclosure. That is why a table in both
+// plans with an amended statement is one "differs" entry rather than an added
+// and a removed one — the pair would name the same table and operation twice,
+// once as present and once as absent, and the field that tells them apart is
+// the one deliberately left out.
 func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *templates.PausedApplyCauseData {
-	now := responsePlanIdentities(planResp)
-	started := storedPlanIdentities(storedPlan)
+	now := planDriftStatements(responsePlanIdentities(planResp))
+	started := planDriftStatements(storedPlanIdentities(storedPlan))
+
+	// The namespace distinguishes the same table under two keyspaces, so it is
+	// named only when the drift spans more than one — on the single-namespace
+	// database it is noise the rest of the comment does not carry either.
+	namespaces := make(map[string]struct{})
+	for change := range now {
+		namespaces[change.namespace] = struct{}{}
+	}
+	for change := range started {
+		namespaces[change.namespace] = struct{}{}
+	}
+	qualify := len(namespaces) > 1
+
+	changes := slices.SortedFunc(
+		maps.Keys(planDriftUnion(now, started)),
+		func(a, b planDriftChange) int {
+			return cmp.Or(
+				cmp.Compare(a.namespace, b.namespace),
+				cmp.Compare(a.table, b.table),
+				cmp.Compare(a.operation, b.operation),
+			)
+		})
 
 	var entries []string
-	appendEntries := func(from, against map[planChangeIdentity]int, phrase string) {
-		identities := slices.SortedFunc(maps.Keys(from), func(a, b planChangeIdentity) int {
-			return cmp.Or(cmp.Compare(a.table, b.table), cmp.Compare(a.operation, b.operation))
-		})
-		for _, id := range identities {
-			if against[id] >= from[id] {
-				continue
-			}
-			entries = append(entries, fmt.Sprintf("`%s` (%s) %s", id.table, id.operation, phrase))
+	for _, change := range changes {
+		phrase, drifted := planDriftPhrase(now[change], started[change])
+		if !drifted {
+			continue
 		}
+		subject := fmt.Sprintf("`%s`", change.table)
+		if qualify {
+			subject = fmt.Sprintf("`%s` in `%s`", change.table, change.namespace)
+		}
+		entries = append(entries, fmt.Sprintf("%s (%s) %s", subject, change.operation, phrase))
 	}
-	appendEntries(now, started, "is in this plan but not in the one this apply was started from")
-	appendEntries(started, now, "was in the plan this apply was started from but is not in this one")
 
 	if len(entries) > planDriftEntryCap {
 		remaining := len(entries) - planDriftEntryCap
@@ -517,6 +565,35 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 		Heading: "Schema changes differ from the plan this apply was started from",
 		Entries: entries,
 		Remedy:  "The statements above are what will run. Review them, then confirm to apply them.",
+	}
+}
+
+// planDriftUnion is every table change either plan carries, so one pass over it
+// classifies each as added, dropped, or amended rather than two passes finding
+// the same change from both ends.
+func planDriftUnion(now, started map[planDriftChange]map[string]int) map[planDriftChange]struct{} {
+	union := make(map[planDriftChange]struct{}, len(now)+len(started))
+	for change := range now {
+		union[change] = struct{}{}
+	}
+	for change := range started {
+		union[change] = struct{}{}
+	}
+	return union
+}
+
+// planDriftPhrase says how one table change differs between the two plans, and
+// whether it differs at all.
+func planDriftPhrase(now, started map[string]int) (string, bool) {
+	switch {
+	case len(started) == 0:
+		return "is in this plan but not in the one this apply was started from", true
+	case len(now) == 0:
+		return "was in the plan this apply was started from but is not in this one", true
+	case maps.Equal(now, started):
+		return "", false
+	default:
+		return "runs a different statement than in the plan this apply was started from", true
 	}
 }
 

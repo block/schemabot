@@ -2572,6 +2572,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 ⚠️ **Schema changes differ from the plan this apply was started from**
+- `orders` (alter) runs a different statement than in the plan this apply was started from
 - `products` (alter) is in this plan but not in the one this apply was started from
 - `shipments` (create) was in the plan this apply was started from but is not in this one
 
