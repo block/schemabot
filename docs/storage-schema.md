@@ -11,6 +11,7 @@
 - [Which release you are asking about](#which-release-you-are-asking-about)
 - [Reach the right storage database](#reach-the-right-storage-database)
 - [Converge it](#converge-it)
+- [While it runs](#while-it-runs)
 - [Deploying a release that changes the storage schema](#deploying-a-release-that-changes-the-storage-schema)
 - [When a pod will not start](#when-a-pod-will-not-start)
 - [Pre-creating indexes on a long-lived database](#pre-creating-indexes-on-a-long-lived-database)
@@ -96,9 +97,9 @@ Four consequences worth holding onto:
   difference that lets converging ahead of a roll take work out of the roll
   that a boot could not have finished at all — an index over a table with a
   long history, typically. `--timeout` lowers the ceiling for a run that should
-  fail fast; it cannot raise it past an hour, because a convergence cannot yet
-  be stopped once it starts, and the lock it holds is what a booting pod waits
-  on. Work too slow even for that still has to be created by hand, which is what
+  fail fast; it cannot raise it past an hour, because the lock a convergence
+  holds for its whole budget is what a booting pod waits on. Work too slow even
+  for that still has to be created by hand, which is what
   [Pre-creating indexes on a long-lived
   database](#pre-creating-indexes-on-a-long-lived-database) is for.
 - **A converged storage costs one diff.** Steps 1 and 2 run without the lock, so
@@ -393,9 +394,8 @@ hour, because the only thing waiting on it is the person who ran it. That is
 what makes it worth converging ahead of a roll rather than letting the roll do
 it — the work a boot would have timed out on is exactly the work this finishes.
 `--timeout` lowers the ceiling for a run that should fail fast. It cannot raise
-it: a convergence holds the bootstrap advisory lock for its whole budget and
-cannot yet be stopped once it starts, so an hour is the longest a mistake can
-keep pods from booting.
+it: a convergence holds the bootstrap advisory lock for its whole budget, so an
+hour is the longest a mistake can keep pods from booting.
 
 ```console
 $ schemabot storage apply
@@ -534,6 +534,76 @@ bootstrap, which skips it and converges the safe remainder (AV-9). That
 asymmetry is deliberate: a pod that refused to boot over surplus state a
 rollback left behind would take the deployment down to protect a table nobody
 asked it to drop, while an operator at a terminal is exactly who should decide.
+
+## While it runs
+
+A convergence over a table with a long history is the one that matters and the
+one that takes time. Three things are worth knowing before you start one.
+
+**It reports itself as it goes.** A convergence run against a DSN prints what
+the engine reports, to stderr, so `--json` output stays parseable. Lines are
+deduplicated and rate-limited: identical polls print once, and a change of
+state always prints.
+
+```console
+$ schemabot storage apply --dsn "$SCHEMABOT_STORAGE_DSN"
+...
+Do you want to apply these changes to schemabot on db-1.example (mysql)? Only 'yes' will be accepted: yes
+  copying · applies copying (8,192 rows)
+  copying 24% · applies copying 24% (1,203,441 rows)
+  copying 71% · applies copying 71% (3,610,322 rows)
+  cutover 99% · applies ready 99% (5,084,117 rows)
+  completed 100% · applies complete 100% (5,084,117 rows)
+✓ Ran 1 statement against schemabot on db-1.example. Nothing is outstanding.
+```
+
+A convergence reached over the API answers once, when it is done, so it prints
+no progress: there is nothing to stream through a single response. A run you
+want to watch is a run you point at the storage database directly.
+
+**You can stop it.** Ctrl-C stops a convergence you started from a terminal,
+and stopping is safe by construction rather than by luck: statements that had
+already finished stay finished, the one in flight is cancelled and what it was
+building is reclaimed, and the ones after it never ran. What that leaves is
+what the next `storage plan` reports — never something to infer from how far
+the run got.
+
+Nothing else can stop one. A convergence an instance runs to start cannot be
+interrupted at all, and one reached over the API survives the connection
+dropping, because losing a connection is not a decision about the storage every
+instance depends on (AV-13).
+
+**A plan says when one is already running.** A convergence is invisible in a
+diff: its DDL runs against a shadow table that is not the real table yet, so a
+plan taken mid-copy reports the same outstanding statement a plan against an
+idle database reports. The plan says so separately:
+
+```console
+$ schemabot storage plan
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Plan                   │
+│                                             │
+│  Database: schemabot on db-1.example        │
+│  Schema: the schema embedded in v1.2.3      │
+╰─────────────────────────────────────────────╯
+
+⚠️ A storage convergence is already running against schemabot on db-1.example. A convergence's work is invisible to a diff until it cuts over, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left.
+
+     ~ applies
+       ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
+
+📋 Plan: 1 table to alter
+```
+
+This is the read for two situations. One is losing the session a convergence
+was running in — the run continues, and this is how you see that it is still
+going. The other is arriving behind somebody else's: an apply started now would
+wait on the bootstrap lock for as long as the run ahead of it takes, and being
+told that beats discovering it by sitting there.
+
+The line only ever appears when a convergence is detected. Its absence is not a
+statement that the database is idle — the same read answers "nothing running"
+and "could not tell", so a plan never claims the second as the first.
 
 ## Deploying a release that changes the storage schema
 
