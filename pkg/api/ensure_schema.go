@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -59,8 +60,9 @@ type ensureSchemaOptions struct {
 // linters report an error against, which for the storage schema means one that
 // loses data (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) and one
 // that removes an index. It defaults to false: those statements are refused
-// while the rest of the diff still applies. The verdict is per statement, so a
-// mixed ALTER carrying an additive clause beside a drop is refused entire.
+// while the rest of the diff still applies. A mixed ALTER carrying an additive
+// clause beside a drop runs the addition and withholds the drop, so a pod never
+// starts missing a column its own binary needs.
 //
 // This is the only way to have the bootstrap execute one of those statements,
 // so removing a table, column, or index from the embedded schema on purpose
@@ -138,10 +140,10 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 // Destructive statements in the diff — those the plan's linters report an error
 // against, which for the storage schema means losing data (DROP TABLE, or an
 // ALTER TABLE containing DROP COLUMN) or removing an index — are refused unless
-// WithAllowDestructiveSchemaChanges(true) is set. A refused statement does not
-// run at all, so a mixed ALTER's additive clause waits for an operator with the
-// drop it came bundled with. The statements that were not refused apply, and
-// startup proceeds — a deliberate exception to fail-closed, because failing
+// WithAllowDestructiveSchemaChanges(true) is set. A statement carrying an
+// addition beside a drop runs the addition, so a pod never starts missing a
+// column its own binary needs. The statements and clauses that were not refused
+// apply, and startup proceeds — a deliberate exception to fail-closed, because failing
 // here would crash-loop every pod running an older binary during a rolling
 // deploy or rollback where storage state was legitimately removed. The
 // invariant is that an old binary can never destroy newer schema state: the
@@ -365,25 +367,40 @@ func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Lo
 		EnsureSchemaTimeout, ddlCount, ctx.Err())
 }
 
-// refusedStorageChange is a planned storage-schema statement EnsureSchema
-// refused to execute, with the reason the plan classified it as unsafe.
+// refusedStorageChange is storage-schema DDL EnsureSchema refused to execute,
+// with the reason the plan classified its statement as unsafe.
 type refusedStorageChange struct {
-	change engine.TableChange
-	reason string
+	// change carries the DDL that did not run. That is the whole planned
+	// statement, or only its withheld clauses when the clauses that add were
+	// split out and executed.
+	change  engine.TableChange
+	reason  string
+	partial bool
+	// splitErr records why a gated ALTER could not be reduced to the clauses
+	// that only add, which is why the whole statement was refused rather than
+	// part of it. It is nil for every other refusal.
+	splitErr error
 }
 
 // refusalTelemetry returns the operator-facing telemetry for one refusal: the
-// warning to log, and its structured attributes. The DDL is the whole statement
-// that was refused, because the whole statement is what did not run.
+// warning to log, and its structured attributes. The DDL is what did not run,
+// so it narrows to the withheld clauses on a statement that was split.
 func (r refusedStorageChange) refusalTelemetry() (message string, attrs []any) {
-	return "refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-		[]any{
-			"database", storageSchemaNamespace,
-			"table", r.change.Table,
-			"operation", ddl.StatementTypeToOp(r.change.Operation),
-			"reason", r.reason,
-			"ddl", r.change.DDL,
-		}
+	message = "refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it"
+	if r.partial {
+		message = "withholding the destructive clauses of a storage-schema change; the statement's additions ran and its removals did not — set storage.allow_destructive_schema_changes: true to run them"
+	}
+	attrs = []any{
+		"database", storageSchemaNamespace,
+		"table", r.change.Table,
+		"operation", ddl.StatementTypeToOp(r.change.Operation),
+		"reason", r.reason,
+		"ddl", r.change.DDL,
+	}
+	if r.splitErr != nil {
+		attrs = append(attrs, "split_error", r.splitErr)
+	}
+	return message, attrs
 }
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
@@ -406,14 +423,21 @@ func (r refusedStorageChange) refusalTelemetry() (message string, attrs []any) {
 // and it can still take the storage database down. The registry's error set
 // spans both, so the same gate covers both.
 //
-// A statement is refused whole, because the verdict is per statement. Spirit's
-// diff emits one combined ALTER per table, so an ALTER carrying an additive
-// clause beside a drop is refused entire and none of it runs, which is the
-// answer Spirit's own plan gate gives a mixed ALTER. Executing part of a
-// statement would mean deciding which clauses can run without the refused
-// ones, a policy Spirit does not have and one whose failure mode is a
-// statement the database rejects on a duplicate name, taking down the
-// convergence the refusal exists to keep working.
+// The verdict is per statement and Spirit's diff emits one combined ALTER per
+// table, so a gated statement is reduced to the clauses that only add a schema
+// object: those execute and the rest is withheld. The bootstrap exists to give
+// the starting binary the tables, columns, and indexes it needs to run at all,
+// and withholding an addition because it was bundled with a removal leaves a
+// pod serving traffic against storage missing a column its own queries name.
+// Nothing is gained by the bundling: the addition is the same statement's other
+// half, not a consequence of the removal.
+//
+// The reduction is structural, not a second safety verdict. Which clauses add
+// is a closed question about clause shapes (see ddl.SplitAdditiveAlter);
+// whether the statement is gated at all stays the registry's answer. A gated
+// statement that cannot be reduced — a DROP TABLE has no clauses, and an ALTER
+// whose every clause is withheld has nothing left — is refused whole, as is one
+// the parser cannot partition, which is the fail-closed direction.
 //
 // The diff emits an unsafe statement when the live storage database holds a
 // table, column, or index the starting binary's embedded schema does not
@@ -428,8 +452,36 @@ func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engin
 				kept.TableChanges = append(kept.TableChanges, tc)
 				continue
 			}
-			// The caller logs each refusal with the exact DDL and reason.
-			refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
+			// The caller logs every refusal below with its DDL and reason.
+			additive, withheld, err := ddl.SplitAdditiveAlter(tc.DDL)
+			switch {
+			case errors.Is(err, ddl.ErrNotAlterTable):
+				// A statement with no clauses — a DROP TABLE — is all or nothing.
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
+				continue
+			case err != nil:
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason, splitErr: err})
+				continue
+			case additive == "":
+				// Every clause was withheld, so the statement is refused whole
+				// rather than reported as a split that ran nothing.
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
+				continue
+			}
+
+			addition := tc
+			addition.DDL = additive
+			addition.IsUnsafe = false
+			addition.UnsafeReason = ""
+			kept.TableChanges = append(kept.TableChanges, addition)
+
+			withheldChange := tc
+			withheldChange.DDL = withheld
+			refused = append(refused, refusedStorageChange{
+				change:  withheldChange,
+				reason:  tc.UnsafeReason,
+				partial: true,
+			})
 		}
 		if len(kept.TableChanges) > 0 {
 			allowed = append(allowed, kept)
