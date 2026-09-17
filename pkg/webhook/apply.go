@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -73,7 +74,7 @@ type operationDisplay struct {
 	BuildWork apitypes.BuildWork
 	// PlanIdentifier is the user-facing identifier of the plan this operation
 	// runs, resolved only when the apply's members run more than one distinct
-	// plan (see resolvePlanIdentifiers). Empty everywhere else.
+	// change set (see resolvePlanIdentifiers). Empty everywhere else.
 	PlanIdentifier string
 }
 
@@ -125,32 +126,116 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 // it came from. Members planned together share their apply's plan; members
 // planned against their own live schema carry their own.
 //
-// A rollout whose members all run the same plan resolves nothing and reads no
-// plan rows: the identifier would be identical under every member, naming
-// nothing the reader cannot already see, so the work has no reader to serve.
+// A rollout whose members all run the same work resolves nothing: the plan
+// identifier is context for a reader deciding which member is doing what, and
+// where they are all doing the same thing it distinguishes nobody.
+//
+// Sameness is judged on the work, not on which plan row carries it. Members
+// planned against their own live schemas each get a plan row of their own
+// whether or not those schemas differ, so counting rows would report a rollout
+// as divergent whenever it was planned per target — including one whose members
+// converge on identical DDL, which the review comment shows as a single block.
+// Keying on the same change set the review keyed on is what keeps the two
+// comments telling the reader the same story.
 //
 // Best-effort, like every other enrichment on this path: an unresolvable plan,
 // a load failure, or a missing row leaves that member's section unnamed rather
 // than failing the comment.
 func resolvePlanIdentifiers(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]string {
 	planByOp := planRowIDsByOperation(apply, ops)
+	// Members that share a plan row share its work by construction, so a rollout
+	// that already agrees here is settled without reading anything.
 	if distinctPlanCount(planByOp) < 2 {
 		return nil
 	}
-	identifierByPlan := make(map[int64]string, len(planByOp))
+	plans := loadPlansByRowID(ctx, stor, apply, planByOp)
+	if distinctWorkCount(planWorkKeys(apply, planByOp, plans)) < 2 {
+		return nil
+	}
 	byOp := make(map[int64]string, len(planByOp))
 	for opID, planID := range planByOp {
-		identifier, resolved := identifierByPlan[planID]
-		if !resolved {
-			identifier = planIdentifierOf(ctx, stor, apply, planID)
-			identifierByPlan[planID] = identifier
-		}
-		if identifier == "" {
+		plan := plans[planID]
+		if plan == nil || plan.PlanIdentifier == "" {
 			continue
 		}
-		byOp[opID] = identifier
+		byOp[opID] = plan.PlanIdentifier
 	}
 	return byOp
+}
+
+// loadPlansByRowID loads each distinct plan a rollout's members run, once per
+// plan however many members run it. A plan that cannot be read is absent from
+// the result rather than an error: the comment names the members it can.
+func loadPlansByRowID(ctx context.Context, stor storage.Storage, apply *storage.Apply, planByOp map[int64]int64) map[int64]*storage.Plan {
+	plans := make(map[int64]*storage.Plan, len(planByOp))
+	for _, planID := range planByOp {
+		if _, loaded := plans[planID]; loaded {
+			continue
+		}
+		plan, err := stor.Plans().GetByID(ctx, planID)
+		if err != nil {
+			slog.Warn("comment will not name this member's plan: failed to load the stored plan",
+				append(apply.LogAttrs(), "error", err)...)
+			continue
+		}
+		if plan == nil {
+			slog.Warn("comment will not name this member's plan: stored plan row not found",
+				apply.LogAttrs()...)
+			continue
+		}
+		plans[planID] = plan
+	}
+	return plans
+}
+
+// planWorkKeys keys each plan a rollout runs by the work it would do, so plans
+// that run the same change set collapse to one key however many rows carry it.
+//
+// A plan that could not be read or could not be keyed gets a key of its own. A
+// rollout is reported as converged only when every member's work was actually
+// compared, and a member nobody could read is not evidence of agreement —
+// falling the other way would suppress the identifiers on exactly the rollout
+// whose members went unchecked.
+func planWorkKeys(apply *storage.Apply, planByOp map[int64]int64, plans map[int64]*storage.Plan) map[int64]string {
+	keys := make(map[int64]string, len(planByOp))
+	for _, planID := range planByOp {
+		if _, keyed := keys[planID]; keyed {
+			continue
+		}
+		plan := plans[planID]
+		if plan == nil {
+			keys[planID] = unkeyedWork(planID)
+			continue
+		}
+		fingerprint, err := tern.StoredPlanFingerprint(schema.DialectForDatabaseType(plan.DatabaseType), plan)
+		if err != nil {
+			slog.Warn("comment will treat this member's plan as its own: failed to key the stored plan by its work",
+				append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "error", err)...)
+			keys[planID] = unkeyedWork(planID)
+			continue
+		}
+		keys[planID] = fingerprint
+	}
+	return keys
+}
+
+// unkeyedWork is the work key of a plan whose work could not be determined. The
+// row id is what makes it its own: two plans nobody could key are two unknowns,
+// not one shared answer. A fingerprint is a 64-character hex digest, so nothing
+// of this shape is one; the prefix is there to say so at a glance in a log line,
+// not to do the separating.
+func unkeyedWork(planID int64) string {
+	return "unkeyed:" + strconv.FormatInt(planID, 10)
+}
+
+// distinctWorkCount counts how many different change sets a rollout's members
+// would run.
+func distinctWorkCount(keys map[int64]string) int {
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		seen[key] = struct{}{}
+	}
+	return len(seen)
 }
 
 // planRowIDsByOperation maps each operation to the plan row it executes. An
@@ -177,24 +262,6 @@ func distinctPlanCount(planByOp map[int64]int64) int {
 		seen[planID] = struct{}{}
 	}
 	return len(seen)
-}
-
-// planIdentifierOf loads one plan's user-facing identifier, returning "" when it
-// cannot be read. The numeric row id is never rendered: it is confusable with
-// the identifier operators paste into commands.
-func planIdentifierOf(ctx context.Context, stor storage.Storage, apply *storage.Apply, planID int64) string {
-	plan, err := stor.Plans().GetByID(ctx, planID)
-	if err != nil {
-		slog.Warn("comment will not name this member's plan: failed to load the stored plan",
-			append(apply.LogAttrs(), "error", err)...)
-		return ""
-	}
-	if plan == nil {
-		slog.Warn("comment will not name this member's plan: stored plan row not found",
-			apply.LogAttrs()...)
-		return ""
-	}
-	return plan.PlanIdentifier
 }
 
 // storedProgress is the statement progress an operation's driver last persisted:
