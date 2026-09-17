@@ -101,3 +101,30 @@ func TestStorageSchemaApplyWriteBudget_CoversTheConvergenceItBounds(t *testing.T
 			"a convergence is bracketed by two diffs, and the deadline covers all three")
 	}
 }
+
+// The two ways a convergence's context can end are opposite findings, and the
+// message has to say which one happened. A budget that fired is a database
+// too slow to converge in the time it was given; a cancellation is an operator
+// deciding not to wait. Naming a budget that never fired sends them looking
+// for a timeout that did not happen.
+func TestConvergenceStopReason_SeparatesAnExpiredBudgetFromAnOperatorStopping(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	err := convergenceStopReason(expired, apitypes.DefaultStorageApplyTimeout, 3, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "did not complete within "+apitypes.DefaultStorageApplyTimeout.String())
+
+	stopped, cancelStopped := context.WithCancel(t.Context())
+	cancelStopped()
+	err = convergenceStopReason(stopped, apitypes.DefaultStorageApplyTimeout, 3, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "convergence stopped")
+	assert.Contains(t, err.Error(), "plan the storage schema again",
+		"a stopped run leaves state only another plan can describe")
+	assert.NotContains(t, err.Error(), apitypes.DefaultStorageApplyTimeout.String(),
+		"nothing timed out, so naming a budget sends the operator after a timeout that never fired")
+}
