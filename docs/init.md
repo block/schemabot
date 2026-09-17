@@ -5,16 +5,31 @@ The wizard and explicit CLI flags use the same setup workflow.
 
 ![SchemaBot setup, a schema edit, and the first plan](../assets/init-demo.gif)
 
-The demo shows PostgreSQL: choose an engine, name the database, select namespaces, review
+The demo shows MySQL: choose an engine, name the database, choose Integrated storage, review
 the setup, and verify the baseline before making a first edit.
 
 ## Before you start
 
-Use MySQL or PostgreSQL, with an existing application database and a separate database for
-SchemaBot's state. Vitess databases are not offered by the wizard yet; register them in the
-[server configuration](configuration.md) instead. They can share a server. Set `DATABASE_URL` and `SCHEMABOT_STORAGE_DSN` to
-their connection strings; the wizard saves references to those variables, never their values
-in your schema files. Keep those variables available for later CLI invocations.
+Use MySQL or PostgreSQL with an existing application database. Set `DATABASE_URL` to
+its connection string. The wizard saves references to environment variables, never their
+values in schema files. Keep those variables available for later CLI invocations.
+Vitess is not offered by the wizard yet; use [server configuration](configuration.md).
+
+The wizard asks **Where should SchemaBot store its own data?**
+
+- **Integrated:** a simple setup for a single database project. SchemaBot creates a new
+  `schemabot` database on your application's server, using the same credentials. Those
+  credentials need permission to create a database. Your application's tables stay separate.
+- **Standalone:** provide `SCHEMABOT_STORAGE_DSN` for an existing, dedicated state database.
+  A separate server is a good fit for teams managing multiple databases.
+
+Integrated setup refuses to adopt an existing `schemabot` database silently. If you already
+prepared one for SchemaBot, choose Standalone and provide its connection explicitly.
+
+You can move state to another server later, but this is an operator-managed transfer, not a
+wizard toggle: drain in-flight work, stop the runtime, transfer the complete state database,
+update its connection configuration, and verify it before restarting. Keep the original state
+until the new connection is verified. Re-running `init` never replaces existing state storage.
 
 Setup initializes SchemaBot's metadata tables in the state database. Baseline planning also
 needs the engine's scratch privileges. Setup never applies application schema changes.
@@ -25,8 +40,8 @@ If a connection check fails, keep the wizard open, restore access, and retry.
 
 ## Follow the wizard
 
-The wizard confirms both connections before discovering namespaces, even when their variables
-are already set. Each connection step shows the host and database without credentials; edit
+The wizard checks your application connection before offering the storage choice. Standalone
+setup also checks the state connection; Integrated creates its database only after final confirmation. Each connection step shows the host and database without credentials; edit
 the variable reference to use a different connection. Press Enter to test access, then continue
 after “Connected” appears. The check runs a read-only query and creates no metadata. It keeps `development`, `schema`, and your default profile as editable defaults,
 and includes everything in the final review.
@@ -78,6 +93,8 @@ $ schemabot init --non-interactive --json --type mysql \
     --schema-dir schema
 {"database":"shop","environment":"development","profile":"default","schema_dir":"/project/schema","plan_id":"plan-example","tables":1,"verified":true}
 ```
+
+Use `--integrated` instead of `--storage-dsn` to create SchemaBot’s own database on the application server. The flags are mutually exclusive.
 
 Paths and plan IDs vary. Existing schema directories with a valid `schemabot.yaml` are verified and
 reused automatically, including with flags. `--reuse-schema` is also accepted. Select a named

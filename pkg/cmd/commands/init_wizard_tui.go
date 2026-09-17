@@ -24,6 +24,7 @@ type initField struct{ label, hint, value string }
 // The wizard edits a private draft. Only explicit confirmation copies it back;
 // initialize remains the sole registration and verification path (AZ-7, AZ-8, AZ-9).
 type initWizard struct {
+	integrated, choosingStorage              bool
 	connectionSummary                        string
 	hasExistingSchema                        bool
 	originalNamespaces                       []string
@@ -65,6 +66,7 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
 		{"Connection profile", "Give this connection a profile name so you can use it again.", profile},
 	}}
+	m.integrated = cmd.Integrated || cmd.StorageDSN == ""
 	m.originalNamespaces = slices.Clone(cmd.Namespaces)
 	m.spinner = spinner.New()
 	m.spinner.Spinner = spinner.Dot
@@ -94,6 +96,7 @@ func (m *initWizard) loadField() {
 		m.input.Blur()
 		return
 	}
+	m.choosingStorage = m.step == 4
 	m.input.Placeholder = ""
 	m.input.SetValue(m.fields[m.step].value)
 	if m.step == 3 || m.step == 4 {
@@ -131,14 +134,15 @@ func (m *initWizard) validate() string {
 			return err.Error()
 		}
 	case 6:
-		if _, err := initSchemaReuse(v); err != nil {
-			return err.Error()
-		}
 		if info, err := os.Stat(v); err == nil && !info.IsDir() {
 			return "There’s a file at that path. Choose a folder for your schema files."
 		} else if err != nil && !os.IsNotExist(err) {
 			return "We couldn’t read that path: " + err.Error()
 		}
+		if _, err := initSchemaReuse(v); err != nil {
+			return err.Error()
+		}
+
 	}
 	return ""
 }
@@ -165,6 +169,19 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = max(20, min(72, msg.Width-4))
 		m.input.Width = max(10, m.width-4)
 	case tea.KeyMsg:
+		if m.step == 4 && m.choosingStorage {
+			switch msg.String() {
+			case "up", "down", "left", "right":
+				m.integrated = !m.integrated
+				return m, nil
+			case "enter":
+				if m.integrated {
+					return m, m.advance()
+				}
+				m.choosingStorage = false
+				return m, textinput.Blink
+			}
+		}
 		if m.checkingConnection && msg.String() != "esc" && msg.String() != "ctrl+c" && msg.String() != "shift+tab" {
 			return m, nil
 		}
@@ -285,6 +302,9 @@ func (m *initWizard) contentView() string {
 	}
 	if m.step < len(m.fields) {
 		f := m.fields[m.step]
+		if m.step == 4 && m.choosingStorage {
+			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String() + m.storageChoiceView())
+		}
 		b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
 		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(f.hint)) + "\n\n")
 		switch {
@@ -340,7 +360,11 @@ func (m *initWizard) contentView() string {
 		b.WriteString(wrap.Render(initTerminalText(m.fields[6].value+" · profile "+m.fields[7].value)) + "\n\n")
 		b.WriteString(bold.Render("Connections") + "\n")
 		b.WriteString(wrap.Render("Application: "+initTerminalText(m.fields[3].value)) + "\n")
-		b.WriteString(wrap.Render("SchemaBot state: "+initTerminalText(m.fields[4].value)) + "\n")
+		if m.integrated {
+			b.WriteString(wrap.Render("SchemaBot’s own data: new schemabot database on your application’s server") + "\n")
+		} else {
+			b.WriteString(wrap.Render("SchemaBot state: "+initTerminalText(m.fields[4].value)) + "\n")
+		}
 		if m.hasExistingSchema {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}
@@ -396,10 +420,14 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 	cmd.Database = m.fields[1].value
 	cmd.Environment = m.fields[2].value
 	cmd.DSN = m.fields[3].value
+	cmd.Integrated = m.integrated
 	cmd.StorageDSN = m.fields[4].value
+	if cmd.Integrated {
+		cmd.StorageDSN = ""
+	}
 	cmd.Namespaces = m.namespaceChoices(cmd.Namespaces)
 	cmd.SchemaDir = m.fields[6].value
 	g.Profile = m.fields[7].value
-	cmd.ReuseSchema = reuse
+	cmd.ReuseSchema = cmd.ReuseSchema || reuse
 	return nil
 }

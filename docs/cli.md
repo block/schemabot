@@ -21,9 +21,10 @@ quick start uses `testapp`; it does not create the `shop` database shown here.
 
 `init` connects to your database, imports its schema, and stores a plan proving
 that the files match. It does not apply changes to the application database.
-Set `APP_DSN` and `STATE_DSN` in your shell first. The state connection must name
-a separate, existing database where SchemaBot can store its own metadata. In a
-terminal, the wizard asks for everything else:
+Set `DATABASE_URL` in your shell first. Choose Integrated to create a separate `schemabot`
+database on the same server, or set `SCHEMABOT_STORAGE_DSN` for Standalone. A standalone
+connection must name an existing database dedicated to SchemaBot’s own data. In a terminal,
+the wizard asks for everything else:
 
 ```console
 $ schemabot init
