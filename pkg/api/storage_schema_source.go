@@ -99,7 +99,7 @@ func StorageSchemaFromFiles(description string, files map[string]string) (*Stora
 		return nil, fmt.Errorf("%q is reserved for a binary's own embedded schema; describe a supplied schema by where it came from, so the report can attribute the answer to it", description)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would report every existing storage table as surplus", description)
+		return nil, fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would propose dropping every existing storage table", description)
 	}
 	names := make([]string, 0, len(files))
 	for name := range files {
@@ -111,7 +111,7 @@ func StorageSchemaFromFiles(description string, files map[string]string) (*Stora
 			return nil, fmt.Errorf("schema file %q from %s: %w", name, description, err)
 		}
 		if strings.TrimSpace(files[name]) == "" {
-			return nil, fmt.Errorf("schema file %q from %s is empty: an empty file declares no table, so the table it is named for would be reported as surplus", name, description)
+			return nil, fmt.Errorf("schema file %q from %s is empty: an empty file declares no table, so the diff would propose dropping the table it is named for", name, description)
 		}
 	}
 	return &StorageSchemaSource{Description: description, Files: files}, nil
@@ -174,7 +174,7 @@ func (s *StorageSchemaSource) checkSupplied() error {
 	if len(s.Files) > 0 {
 		return nil
 	}
-	return fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would report every existing storage table as surplus", s.Describe())
+	return fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would propose dropping every existing storage table", s.Describe())
 }
 
 // Describe is the report's attribution for this source.

@@ -137,7 +137,7 @@ func TestStorageSchemaFromDirectory(t *testing.T) {
 }
 
 // A directory with no .sql files is refused. A diff against an empty schema
-// would report every existing storage table as surplus, which reads as a
+// would propose dropping every existing storage table, which reads as a
 // storage database that needs destroying rather than as a mistyped path.
 func TestStorageSchemaFromDirectory_RefusesEmptyDirectory(t *testing.T) {
 	_, err := (&storageSchemaSourceFlags{SchemaDir: t.TempDir()}).resolve(t.Context(), mysqlDialect)
