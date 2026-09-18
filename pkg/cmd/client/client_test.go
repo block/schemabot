@@ -317,7 +317,7 @@ func TestCallPlanAPI_IgnoreSoleFlatNamespace(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
 
-	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, []string{"orders"}, false)
+	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, PlanExclusions{Namespaces: []string{"orders"}}, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "after excluding ignored namespaces")
 	assert.Contains(t, err.Error(), "orders")
@@ -346,7 +346,7 @@ func TestCallPlanAPI_SendsIgnoredNamespaces(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, []string{"local_fixtures"}, false)
+	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{Namespaces: []string{"local_fixtures"}}, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"local_fixtures"}, ignored)
@@ -372,12 +372,12 @@ func TestCallPlanAPI_SendsGroupedExecution(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, true)
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, true)
 	require.NoError(t, err)
 	assert.True(t, gotReq.GroupedExecution, "the grouping the apply will use reaches the server")
 
 	gotReq = apitypes.PlanRequest{}
-	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, false)
+	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false)
 	require.NoError(t, err)
 	assert.False(t, gotReq.GroupedExecution, "a caller that has not chosen leaves the plan on the ungrouped default")
 }

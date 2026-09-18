@@ -54,7 +54,7 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	if err := rewriteOnboardNamespaces(resp, cmd.Environment, cmd.TemplateEnvSuffix); err != nil {
 		return err
 	}
-	preservedIgnores, err := preservedIgnoreNamespaces(cmd.SchemaDir)
+	preservedIgnores, err := preservedExclusions(cmd.SchemaDir)
 	if err != nil {
 		return err
 	}
@@ -121,26 +121,26 @@ type onboardWritePlan struct {
 	root         string
 	databaseType string
 	files        map[string]string
-	// ignoreNamespaces carries an existing config's ignore_namespaces through
-	// a rewrite, so re-onboarding does not drop the exclusions an operator
-	// configured, and plan verification excludes the same namespaces a real
-	// plan would.
-	ignoreNamespaces []string
+	// exclusions carries an existing config's ignore_namespaces and
+	// ignore_tables through a rewrite, so re-onboarding does not drop the
+	// exclusions an operator configured, and plan verification excludes the
+	// same namespaces and withholds the same tables a real plan would.
+	exclusions client.PlanExclusions
 }
 
-// preservedIgnoreNamespaces returns the ignore_namespaces of an existing
-// schemabot.yaml under schemaRoot. A missing config is a fresh onboarding with
-// nothing to preserve; an unreadable one is an error — rewriting it would
-// silently drop whatever it configured.
-func preservedIgnoreNamespaces(schemaRoot string) ([]string, error) {
+// preservedExclusions returns the ignore_namespaces and ignore_tables of an
+// existing schemabot.yaml under schemaRoot. A missing config is a fresh
+// onboarding with nothing to preserve; an unreadable one is an error —
+// rewriting it would silently drop whatever it configured.
+func preservedExclusions(schemaRoot string) (client.PlanExclusions, error) {
 	if _, err := os.Stat(filepath.Join(schemaRoot, "schemabot.yaml")); os.IsNotExist(err) {
-		return nil, nil
+		return client.PlanExclusions{}, nil
 	}
 	cfg, err := LoadCLIConfig(schemaRoot)
 	if err != nil {
-		return nil, fmt.Errorf("read existing schemabot.yaml to preserve ignore_namespaces: %w", err)
+		return client.PlanExclusions{}, fmt.Errorf("read existing schemabot.yaml to preserve ignore_namespaces and ignore_tables: %w", err)
 	}
-	return cfg.IgnoreNamespaces, nil
+	return cfg.PlanExclusions(), nil
 }
 
 func onboardPullNamespaces(namespaces []string) ([]string, error) {
@@ -195,7 +195,7 @@ func onboardOutputNamespace(namespace, environment string, templateEnvSuffix boo
 	return namespace
 }
 
-func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse, ignoreNamespaces []string) (*onboardWritePlan, error) {
+func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse, exclusions client.PlanExclusions) (*onboardWritePlan, error) {
 	if strings.TrimSpace(schemaRoot) == "" {
 		return nil, fmt.Errorf("schema root is required")
 	}
@@ -215,7 +215,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	}
 	root := filepath.Clean(schemaRoot)
 	files := map[string]string{
-		"schemabot.yaml": onboardConfigYAML(resp.Database, string(resp.Type), ignoreNamespaces),
+		"schemabot.yaml": onboardConfigYAML(resp.Database, string(resp.Type), exclusions),
 	}
 
 	namespaces := make([]string, 0, len(resp.Namespaces))
@@ -258,7 +258,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		}
 	}
 
-	return &onboardWritePlan{root: root, databaseType: resp.Type, files: files, ignoreNamespaces: ignoreNamespaces}, nil
+	return &onboardWritePlan{root: root, databaseType: resp.Type, files: files, exclusions: exclusions}, nil
 }
 
 // Generated paths must remain distinct on case-insensitive filesystems too.
@@ -274,16 +274,24 @@ func rejectCaseCollisions(kind string, names []string) error {
 	return nil
 }
 
-func onboardConfigYAML(database, databaseType string, ignoreNamespaces []string) string {
+func onboardConfigYAML(database, databaseType string, exclusions client.PlanExclusions) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "database: %s\ntype: %s\n", database, databaseType)
-	if len(ignoreNamespaces) > 0 {
-		b.WriteString("ignore_namespaces:\n")
-		for _, ns := range ignoreNamespaces {
-			fmt.Fprintf(&b, "  - %s\n", ns)
-		}
-	}
+	writeConfigList(&b, "ignore_namespaces", exclusions.Namespaces)
+	writeConfigList(&b, "ignore_tables", exclusions.Tables)
 	return b.String()
+}
+
+// writeConfigList emits one schemabot.yaml string list, or nothing when the
+// list is empty — an empty key would read as a configured exclusion of nothing.
+func writeConfigList(b *strings.Builder, key string, values []string) {
+	if len(values) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "%s:\n", key)
+	for _, value := range values {
+		fmt.Fprintf(b, "  - %s\n", value)
+	}
 }
 
 func validateRelativePathPart(kind, value string) error {
@@ -431,7 +439,7 @@ func verifyOnboardPlan(endpoint, database, environment string, plan *onboardWrit
 	var planResult *apitypes.PlanResponse
 	err := withLoading("Verifying pulled schema...", true, func() error {
 		var planErr error
-		planResult, _, planErr = client.CallPlanAPI(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.ignoreNamespaces, false)
+		planResult, _, planErr = client.CallPlanAPI(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.exclusions, false)
 		return planErr
 	})
 	if err != nil {

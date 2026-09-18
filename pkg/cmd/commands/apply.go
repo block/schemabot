@@ -107,7 +107,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	var ignoredNamespaces []string
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
-		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces,
+		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
 			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover))
 		return planErr
 	})
@@ -117,6 +117,10 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	if cmd.Output != OutputFormatJSON {
 		templates.WriteIgnoredNamespaces(ignoredNamespaces,
 			schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces))
+		templates.WriteUnmatchedIgnoreTables(schema.UnmatchedIgnoreTables(cfg.IgnoreTables, planResult.WithheldTables()))
+		// The operator about to reconcile the target is the one who most needs
+		// to know which live tables the plan was not shown.
+		templates.WriteExemptTables(planResult.ExemptTables)
 	}
 
 	// Validate engine-specific options

@@ -85,7 +85,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces, false)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(), false)
 			return planErr
 		})
 		if err != nil {
@@ -110,12 +110,16 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]
 		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
-		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",")
+		// An ignore_tables entry resolves against the live schema, so it can
+		// withhold a table in one environment and match nothing in another.
+		unmatchedTables := schema.UnmatchedIgnoreTables(cfg.IgnoreTables, allResults[env].WithheldTables())
+		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",") + "|" + strings.Join(unmatchedTables, ",")
 		if disclosed[key] {
 			continue
 		}
 		disclosed[key] = true
 		templates.WriteIgnoredNamespaces(ignored, unmatched)
+		templates.WriteUnmatchedIgnoreTables(unmatchedTables)
 	}
 
 	// Human-readable output for all environments
