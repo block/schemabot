@@ -928,9 +928,9 @@ sections. This section covers only the settings.
 ### `allow_destructive_schema_changes`
 
 On MySQL, destructive statements in the startup diff are refused and skipped by
-default, because a pod running an older binary sees a newer binary's tables,
-columns, and indexes as surplus and would otherwise remove what the newer pods
-depend on. That covers statements that lose data — `DROP TABLE`, or an `ALTER
+default, because a pod running an older binary does not declare a newer
+binary's tables, columns, and indexes, and would otherwise remove what the
+newer pods depend on. That covers statements that lose data — `DROP TABLE`, or an `ALTER
 TABLE` containing `DROP COLUMN` — and statements that remove an index, which
 destroy no rows and can still take the database down by regressing the plan of a
 query the rest of the fleet is running. Each refusal is logged at warn level with

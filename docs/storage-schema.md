@@ -69,7 +69,7 @@ Two consequences worth holding onto:
   disagree with what the roll then does, and concurrent runs serialize.
 - **A binary converges its own schema, never another's.** Neither the command
   line nor the RPC behind it can hand it another release's files, which stops an
-  older binary from reading newer tables as surplus to prune.
+  older binary from treating a newer release's tables as state to prune.
 
 The storage database is the one SchemaBot cannot be down for, so the bootstrap
 fails closed: uncertainty keeps a pod out of service rather than becoming a
@@ -87,17 +87,28 @@ does with each kind of drift depends on the dialect:
   a column it is missing          adds it           adds it, or stops the boot
   an index it is missing          builds it         builds it
   a column defined differently    alters it         does not see it
-  a surplus table or column       keeps it, warns   keeps it
-  a surplus index                 keeps it, warns   keeps it
+  a table it does not declare     keeps it, warns   keeps it
+  a column it does not declare    keeps it, warns   keeps it
+  an index it does not declare    keeps it, warns   keeps it
   an index it cannot use          does not arise    stops the boot
   ────────────────────────────────────────────────────────────────────────────
 ```
 
-The MySQL warning is a refusal: the differ emits a drop for the surplus state,
-the boot declines to run it, and the boot carries on without it rather than
-stopping. PostgreSQL never emits the statement in the first place, so it keeps
-the same state silently. [What is never automatic](#what-is-never-automatic)
-covers which statements get refused.
+**The three *does not declare* rows are the rollback case, and are worth being
+concrete about.** A binary declares a table, column, or index by carrying it in
+the schema files compiled into it. Anything the live database holds that the
+booting binary does not declare is state that binary did not create and cannot
+account for — in practice, something a newer release added.
+
+Say `v1.4.0` adds a `cancelled_by` column to `applies` and rolls out, and the
+fleet is then rolled back to `v1.3.0`. Every `v1.3.0` pod now boots against a
+database holding a column its own schema files never mention, so its diff emits
+`ALTER TABLE applies DROP COLUMN cancelled_by`. On MySQL the boot refuses that
+statement, logs it, and converges the rest; on PostgreSQL the diff never emits
+it at all. Either way the column stays and the pod serves traffic beside it,
+which is what keeps the rollback reversible: roll `v1.4.0` forward again and
+the column is already there, with its data. [What is never
+automatic](#what-is-never-automatic) covers which statements get refused.
 
 **MySQL builds a new index by copying the table**, so it costs time in
 proportion to the rows in it, on every pod, inside the boot's budget (see
@@ -353,8 +364,8 @@ starting.
 
 During a MySQL rollback window the plan reports the newer release's tables,
 columns, and indexes as refused destructive statements and exits 2. That is the
-expected steady state rather than drift: the surplus state is deliberate, and it
-is what lets the release be rolled forward again. A gate keyed on exit status 0
+expected steady state rather than drift: keeping what the newer release added
+is what lets it be rolled forward again. A gate keyed on exit status 0
 flags it, which is the correct signal to pause on. A PostgreSQL plan carries no
 destructive statements, so the same window shows up only as extra tables.
 
