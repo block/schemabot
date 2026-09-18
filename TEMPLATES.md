@@ -207,7 +207,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 
 An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
-📋 **Plan**: **3** tables to alter
+📋 **Plan**: **2** tables to alter
 
 
 ---
@@ -7686,7 +7686,7 @@ _Already applied — no change._
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: 1 DDL statement
+📋 **Plan**: **1** table to alter
 
 
 ---
@@ -7732,7 +7732,7 @@ ALTER TABLE `mutes`
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
 
-📋 **Plan**: 2 DDL statements
+📋 **Plan**: **1** table to alter
 
 
 ---

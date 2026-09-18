@@ -147,7 +147,7 @@ func TestSummarizeChanges(t *testing.T) {
 		assert.Equal(t, "1 vschema update", SummarizeChanges(data))
 	})
 
-	t.Run("per-shard-only DDL falls back to a statement count", func(t *testing.T) {
+	t.Run("per-shard-only DDL is classified once per distinct statement", func(t *testing.T) {
 		data := PlanCommentData{
 			IsMySQL:      false,
 			DatabaseType: "vitess",
@@ -159,10 +159,50 @@ func TestSummarizeChanges(t *testing.T) {
 				},
 			}},
 		}
-		// countStatementTypes does not walk per-shard statements, so the
-		// create/alter/drop tally is zero; the fallback reports the deduped total
-		// rather than implying "no changes".
-		assert.Equal(t, "1 DDL statement", SummarizeChanges(data))
+		assert.Equal(t, "1 alter", SummarizeChanges(data))
+	})
+
+	t.Run("a statement confined to one shard is counted", func(t *testing.T) {
+		// The collapsed namespace-level Statements carry only the change every
+		// shard shares; the CREATE INDEX exists on one drifted shard alone. The
+		// comment renders the per-shard DDL, so the summary counts from it and
+		// names the index statement instead of reporting the collapsed view.
+		data := PlanCommentData{
+			IsMySQL:      false,
+			DatabaseType: "vitess",
+			Changes: []KeyspaceChangeData{{
+				Keyspace:   "orders",
+				Statements: []string{"ALTER TABLE a ADD COLUMN b INT"},
+				Shards: []KeyspaceShardChange{
+					{Shard: "-80", Statements: []string{"ALTER TABLE a ADD COLUMN b INT", "CREATE INDEX `i` ON `a` (`b`)"}},
+					{Shard: "80-", Statements: []string{"ALTER TABLE a ADD COLUMN b INT"}},
+				},
+			}},
+		}
+		assert.Equal(t, "1 alter, 1 other DDL statement", SummarizeChanges(data))
+		totalStatements, _ := countChanges(data.Changes)
+		assert.Equal(t, 2, totalStatements)
+	})
+
+	t.Run("a table whose shards diverge is one table to alter", func(t *testing.T) {
+		// Two shard groups render two different ALTER statements against the
+		// same table; the summary counts tables, so it reports one alter while
+		// the raw statement total still sees both.
+		data := PlanCommentData{
+			IsMySQL:      false,
+			DatabaseType: "vitess",
+			Changes: []KeyspaceChangeData{{
+				Keyspace:   "orders",
+				Statements: []string{"ALTER TABLE a ADD COLUMN b INT"},
+				Shards: []KeyspaceShardChange{
+					{Shard: "-80", Statements: []string{"ALTER TABLE a ADD COLUMN b INT"}},
+					{Shard: "80-", Statements: []string{"ALTER TABLE a ADD COLUMN b INT, ADD COLUMN c INT"}},
+				},
+			}},
+		}
+		assert.Equal(t, "1 alter", SummarizeChanges(data))
+		totalStatements, _ := countChanges(data.Changes)
+		assert.Equal(t, 2, totalStatements)
 	})
 
 	t.Run("no changes returns empty", func(t *testing.T) {
