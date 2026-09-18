@@ -89,6 +89,11 @@ type Handler struct {
 	// package default.
 	participantNudgeRefoldDelay time.Duration
 
+	// unclaimedCommandGraceOverride overrides how long the aggregate leader
+	// waits before deciding an apply-scoped control command went unclaimed.
+	// Zero means the package default.
+	unclaimedCommandGraceOverride time.Duration
+
 	// participantRefoldDelayOverride overrides the backoff before each
 	// self-scheduled aggregate re-fold armed while expected participants
 	// remain unresolved. Test-only: when set it applies to every attempt.

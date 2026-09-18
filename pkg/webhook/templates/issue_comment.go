@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
@@ -99,6 +100,34 @@ func RenderControlMissingApplyID(command string) string {
 	return offerSupportChannel(fmt.Sprintf("## Missing Apply ID\n\n"+
 		"Usage: `%s`\n\n"+
 		"Use `schemabot status -e <environment>` to find the apply ID.", usage))
+}
+
+// UnclaimedControlCommandData describes a control command that named an apply
+// no SchemaBot on the repository is driving.
+type UnclaimedControlCommandData struct {
+	Command     string
+	ApplyID     string
+	Environment string
+	RequestedBy string
+}
+
+// RenderUnclaimedControlCommand renders the reply to an apply-scoped control
+// command that no deployment claimed. Several SchemaBot deployments can serve
+// one repository, and each stays quiet about an apply another one owns, so the
+// operator's own view of an unrecognized apply ID is a command that produced
+// nothing at all. This says so, and says where the identifiers that do resolve
+// come from.
+func RenderUnclaimedControlCommand(data UnclaimedControlCommandData) string {
+	body := "## " + glyph.Attention + " No Schema Change Matched This Command\n\n" +
+		fmt.Sprintf("**Apply**: %s | **Environment**: %s\n", markdownInlineCode(data.ApplyID), markdownInlineCode(data.Environment))
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += fmt.Sprintf("\nNo SchemaBot on this repository is driving a schema change with this identifier, so `%s` acted on nothing.\n\n", data.Command) +
+		"Apply identifiers appear on the schema change comments SchemaBot posts to this pull request, and in " +
+		"`schemabot status -e " + data.Environment + "`. Identifiers reported by a database engine are its own and " +
+		"are not accepted here."
+	return offerSupportChannel(body)
 }
 
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR
