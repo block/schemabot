@@ -88,7 +88,7 @@ does with each kind of drift depends on the dialect:
   an index it is missing          builds it         builds it
   a column defined differently    alters it         does not see it
   a surplus table or column       refuses it        leaves it
-  a surplus index                 drops it          leaves it
+  a surplus index                 refuses it        leaves it
   an index it cannot use          does not arise    stops the boot
   ────────────────────────────────────────────────────────────────────────────
 ```
@@ -193,6 +193,12 @@ half: `0` when the storage needs nothing, `2` when statements are outstanding,
 and `1` when the read itself failed. A pre-deploy gate needs those three apart,
 since "converged" and "unreachable" call for opposite decisions, and `--json`
 emits the whole report.
+
+Exit 2 covers two situations a gate should not treat alike, and the report keeps
+them in separate arrays. Statements under `outstanding` converge on the next
+boot on their own. Statements under `destructive` are refused, so no number of
+boots will clear them and the exit stays 2 until an operator decides. A gate
+that only reads the exit status waits for a convergence that is never coming.
 
 ## Name the release, and the storage database
 
@@ -341,11 +347,11 @@ starting.
    schemabot storage plan --release v1.4.0 --deployment west -e production  # a data plane's storage
    ```
 
-During a MySQL rollback window the plan reports the newer release's tables and
-columns as refused destructive statements and exits 2. That is the expected
-steady state rather than drift: the surplus state is deliberate, and it is what
-lets the release be rolled forward again. A gate keyed on exit status 0 flags
-it, which is the correct signal to pause on. A PostgreSQL plan carries no
+During a MySQL rollback window the plan reports the newer release's tables,
+columns, and indexes as refused destructive statements and exits 2. That is the
+expected steady state rather than drift: the surplus state is deliberate, and it
+is what lets the release be rolled forward again. A gate keyed on exit status 0
+flags it, which is the correct signal to pause on. A PostgreSQL plan carries no
 destructive statements, so the same window shows up only as extra tables.
 
 ## When a pod will not start
