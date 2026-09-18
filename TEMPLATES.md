@@ -139,6 +139,25 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-ignore-tables"></a><strong>MySQL Plan (Ignore Tables)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **No schema changes detected**
+
+ℹ️ Tables in namespace `testapp` exempt from the undeclared-table verdict (ignore\_tables): `flyway_schema_history`
+
+⚠️ `ignore_tables` entry `alembic_verison` matched no live table and withheld nothing
+
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-many-lint-warnings"></a><strong>MySQL Plan (Many Lint Warnings)</strong></summary>
 
 

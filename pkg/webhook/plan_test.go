@@ -99,6 +99,40 @@ func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
 	}, data.ExemptTables)
 }
 
+// An ignore_tables entry resolves against this environment's live schema, so
+// what the repository configured is compared against what the plan reports
+// withholding: the entries left over are the ones that withheld nothing, and
+// they reach the comment so a reviewer is not left believing a table is
+// withheld when the plan is free to propose dropping it. The engine's own
+// exemptions are not the config's, so they never mark an entry as matched.
+func TestBuildPlanCommentData_ReportsUnmatchedIgnoreTables(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{
+		Database:     "app",
+		Type:         "postgres",
+		IgnoreTables: []string{"flyway_schema_history", "flyway_schema_hist", "Legacy_Audit_Log"},
+	}
+	planResp := &apitypes.PlanResponse{
+		ExemptTables: []*apitypes.ExemptTablesResponse{
+			{Namespace: "app", Tables: []string{"flyway_schema_history"}, Reason: apitypes.ExemptReasonIgnoreTables},
+			{Namespace: "app", Tables: []string{"legacy_audit_log"}, Reason: "archive naming"},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	assert.Equal(t, []string{"flyway_schema_hist", "Legacy_Audit_Log"}, data.UnmatchedIgnoreTables)
+}
+
+// A repository that configures no exclusions has nothing to report, so the
+// comment carries no report rather than an empty one.
+func TestBuildPlanCommentData_NoIgnoreTablesNothingUnmatched(t *testing.T) {
+	data := buildPlanCommentData(
+		&ghclient.SchemaRequestResult{Database: "app", Type: "postgres"},
+		&apitypes.PlanResponse{}, "staging", "", "testuser", "")
+
+	assert.Empty(t, data.UnmatchedIgnoreTables)
+}
+
 // An unsafe change on a single shard (per-shard plan) is surfaced with its shard,
 // even when the collapsed namespace-level Changes don't carry it.
 func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {

@@ -124,6 +124,14 @@ type PlanCommentData struct {
 	// ExemptTables lists live tables excluded from a plan verdict by namespace.
 	ExemptTables []ExemptTablesData
 
+	// UnmatchedIgnoreTables lists the repository's ignore_tables entries that
+	// withheld no live table from this plan. An entry resolves against the
+	// target's catalog rather than against anything in the diff, so a reviewer
+	// reading the pull request cannot tell a withheld table from a misspelled
+	// entry without being told — which is why this is disclosed on the comment
+	// and the ignore_namespaces equivalent is not.
+	UnmatchedIgnoreTables []string
+
 	// Unsafe change tracking
 	HasUnsafeChanges bool
 	AllowUnsafe      bool
@@ -305,10 +313,11 @@ func RenderPlanComment(data PlanCommentData) string {
 	// genuinely unchanged one.
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
-		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
+		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) || len(data.UnmatchedIgnoreTables) > 0 {
 			sb.WriteString("\n")
 			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
 			writeExemptTables(&sb, data.ExemptTables)
+			writeUnmatchedIgnoreTables(&sb, data.UnmatchedIgnoreTables)
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -590,6 +599,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		sb.WriteString("\n")
 		writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 		writeExemptTables(sb, data.ExemptTables)
+		writeUnmatchedIgnoreTables(sb, data.UnmatchedIgnoreTables)
 		return
 	}
 
@@ -606,9 +616,11 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	// Disclosed directly under the plan summary so the exclusion reads as
-	// part of the plan result: what was counted, then what was withheld.
+	// part of the plan result: what was counted, then what was withheld, then
+	// what the config asked to withhold and did not.
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
+	writeUnmatchedIgnoreTables(sb, data.UnmatchedIgnoreTables)
 }
 
 // writeIgnoredNamespaces renders the ignore_namespaces disclosure line. No-op
@@ -655,6 +667,78 @@ func hasExemptTables(groups []ExemptTablesData) bool {
 
 func exemptReason(reason string) string {
 	return escapeInlineMarkdown(SanitizeInlineError(reason))
+}
+
+// writeUnmatchedIgnoreTables renders one line per ignore_tables entry that
+// withheld nothing, so a reviewer is not left believing a table is withheld
+// when the plan is free to propose dropping it. The tables an entry did
+// withhold are disclosed by writeExemptTables, which names the same config
+// key as its reason.
+//
+// Entries are repository config rather than catalog names, so they render as
+// code spans they cannot break out of.
+func writeUnmatchedIgnoreTables(sb *strings.Builder, unmatched []string) {
+	for _, entry := range unmatched {
+		fmt.Fprintf(sb, glyph.Attention+" `ignore_tables` entry %s matched no live table and withheld nothing\n\n", inlineCode(entry))
+	}
+}
+
+// writeMultiEnvUnmatchedIgnoreTables renders the unmatched-entry report for
+// the all-environments-clean path, where no per-environment sections exist to
+// carry it. An entry resolves against each target's own catalog, so it can
+// withhold a table in one environment and match nothing in another: when the
+// environments agree it renders the shared lines once, and otherwise names
+// the environment each unmatched entry belongs to.
+func writeMultiEnvUnmatchedIgnoreTables(sb *strings.Builder, data MultiEnvPlanCommentData) {
+	anyUnmatched := false
+	identical := true
+	var first []string
+	for i, env := range data.Environments {
+		unmatched := planUnmatchedIgnoreTables(data, env)
+		if len(unmatched) > 0 {
+			anyUnmatched = true
+		}
+		if i == 0 {
+			first = unmatched
+		} else if !slices.Equal(unmatched, first) {
+			identical = false
+		}
+	}
+	if !anyUnmatched {
+		return
+	}
+	if identical {
+		writeUnmatchedIgnoreTables(sb, first)
+		return
+	}
+	for _, env := range data.Environments {
+		for _, entry := range planUnmatchedIgnoreTables(data, env) {
+			fmt.Fprintf(sb, glyph.Attention+" **%s**: `ignore_tables` entry %s matched no live table and withheld nothing\n\n",
+				capitalizeFirst(env), inlineCode(entry))
+		}
+	}
+}
+
+// multiEnvHasUnmatchedIgnoreTables reports whether any environment's plan left
+// an ignore_tables entry unmatched, so callers can decide whether the
+// disclosure (and its spacing) renders at all.
+func multiEnvHasUnmatchedIgnoreTables(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		if len(planUnmatchedIgnoreTables(data, env)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// planUnmatchedIgnoreTables returns one environment's unmatched entries, or
+// nil when that environment has no plan (for example, it failed to plan).
+func planUnmatchedIgnoreTables(data MultiEnvPlanCommentData, env string) []string {
+	plan, ok := data.Plans[env]
+	if !ok || plan == nil {
+		return nil
+	}
+	return plan.UnmatchedIgnoreTables
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -1616,10 +1700,11 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	// unchanged.
 	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
-		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) {
+		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) || multiEnvHasUnmatchedIgnoreTables(data) {
 			sb.WriteString("\n")
 			writeMultiEnvIgnoredNamespaces(&sb, data)
 			writeMultiEnvExemptTables(&sb, data)
+			writeMultiEnvUnmatchedIgnoreTables(&sb, data)
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -1751,6 +1836,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		sb.WriteString("✅ **No schema changes detected**\n\n")
 		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		writeExemptTables(sb, plan.ExemptTables)
+		writeUnmatchedIgnoreTables(sb, plan.UnmatchedIgnoreTables)
 		return
 	}
 

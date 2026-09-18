@@ -443,6 +443,21 @@ func WriteIgnoredNamespaces(ignored, unmatched []string) {
 	}
 }
 
+// WriteUnmatchedIgnoreTables disclosure: an ignore_tables entry that withheld
+// nothing (typo, case mismatch, or a table already dropped) is reported, so an
+// operator is not left believing a table is withheld when the plan is free to
+// propose dropping it. The tables an entry did withhold are disclosed by
+// WriteExemptTables, which names the same config key as its reason.
+func WriteUnmatchedIgnoreTables(unmatched []string) {
+	if len(unmatched) == 0 {
+		return
+	}
+	for _, entry := range unmatched {
+		fmt.Printf(glyph.Attention+"  ignore_tables entry %q matched no live table and withheld nothing\n", entry)
+	}
+	fmt.Println()
+}
+
 // WriteExemptTables disclosure: one line per namespace whose live tables the
 // plan exempted from the undeclared-table verdict, so a reader can tell an
 // exempted table from a declared one. No-op when nothing was exempted, which

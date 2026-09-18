@@ -120,6 +120,7 @@ const (
 	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
 	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
 	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with live tables exempt from the undeclared-table verdict
+	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanBlockedPostgres          PreviewType = "comment_plan_blocked_postgres"           // PostgreSQL plan with a refused statement carrying two independent causes
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)

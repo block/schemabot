@@ -185,6 +185,7 @@ type: mysql
 | `database` | Yes | Must match a database name in your SchemaBot server config |
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
+| `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
 

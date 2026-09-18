@@ -13,6 +13,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/routing"
+	sbschema "github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -123,6 +124,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		HeadSHA:           &schemaResult.HeadSHA,
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		IgnoreTables:      schemaResult.IgnoreTables,
 		SourceTrusted:     true,
 	}
 
@@ -427,6 +429,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			HeadSHA:           &schemaResult.HeadSHA,
 			SchemaPath:        schemaResult.SchemaPath,
 			IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+			IgnoreTables:      schemaResult.IgnoreTables,
 			SourceTrusted:     true,
 		}
 
@@ -899,6 +902,13 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		DatabaseType:      schema.Type,
 		IsMySQL:           schema.Type == "mysql",
 		IgnoredNamespaces: schema.IgnoredNamespaces,
+
+		// An ignore_tables entry resolves against this environment's live
+		// schema, so the config alone cannot say whether it withheld
+		// anything. Comparing what was configured against what the plan
+		// reports withholding is the only way a reviewer learns that an entry
+		// is misspelled, case-mismatched, or stale.
+		UnmatchedIgnoreTables: sbschema.UnmatchedIgnoreTables(schema.IgnoreTables, planResp.WithheldTables()),
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {
