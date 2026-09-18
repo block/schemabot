@@ -1600,6 +1600,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		HeadSHA:        req.HeadSha,
 		CreatedAt:      time.Now(),
 	}
+	plan.RecordWithheldTables(withheldTablesFromEngine(result.ExemptTables))
 	c.logger.Info("Plan: storing plan",
 		"plan_id", result.PlanID,
 		"ddl_change_count", len(ddlChanges),
@@ -1858,6 +1859,7 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 		PullRequest:      int(req.PullRequest),
 		Credentials:      creds,
 		GroupedExecution: groupedExecution,
+		IgnoreTables:     req.GetIgnoreTables(),
 	})
 }
 
@@ -2242,6 +2244,26 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 		}
 	}
 	return namespaces, allShardPlans
+}
+
+// withheldTablesFromEngine returns the live tables the plan withheld on the
+// repository's instruction, so the stored plan can record them and a re-plan
+// — a rollback, a resume — withholds the same tables instead of proposing to
+// drop the tables the plan never captured.
+//
+// Only the ignore_tables exemption counts. An engine's own naming conventions
+// are applied on every plan unconditionally, so a re-plan reproduces those
+// without being told.
+func withheldTablesFromEngine(exempt []*engine.ExemptTables) []string {
+	var withheld []string
+	for _, group := range exempt {
+		if group == nil || group.Reason != engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		withheld = append(withheld, group.Tables...)
+	}
+	slices.Sort(withheld)
+	return slices.Compact(withheld)
 }
 
 // namespacesFromApplyRequest rebuilds per-namespace plan data from a dispatch

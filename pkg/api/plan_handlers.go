@@ -53,6 +53,13 @@ type PlanRequest struct {
 	// environment. Forwarded to the data plane so it can refuse engine shapes
 	// that cannot honor the exclusion.
 	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
+	// IgnoreTables lists the live tables the config's ignore_tables withholds
+	// from the planner, so a table no schema file declares is not proposed for
+	// DROP TABLE. Unlike ignored namespaces the exclusion cannot be expressed
+	// by leaving files out of the request — the tables are on the target, not
+	// in the repository — so the data plane applies it and reports what it
+	// actually withheld through exempt_tables on the response.
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
 
 	// SourceTrusted is set by the GitHub webhook path after SchemaBot has
 	// discovered the PR source itself. It is deliberately not JSON-decodable:
@@ -729,6 +736,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
+		IgnoreTables:      req.IgnoreTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
@@ -759,6 +767,18 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"deployment", deployment,
 			"repository", req.Repository,
 			"ignored_namespaces", req.IgnoredNamespaces,
+		)
+	}
+	if len(req.IgnoreTables) > 0 {
+		// The live-schema view is deliberately partial: the config withholds
+		// these tables from the planner. Recorded so an operator tracing "why
+		// does this plan not touch table X" finds the answer in server logs.
+		s.logger.Info("plan request withholds live tables named by ignore_tables",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"ignore_tables", req.IgnoreTables,
 		)
 	}
 
@@ -805,6 +825,21 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 				"ddl_len", len(tc.Ddl),
 			)
 		}
+	}
+
+	// A configured entry that withheld nothing is a typo, a case mismatch, or a
+	// stale entry for a table that no longer exists — the table it names is
+	// fully reconciled, so surface it rather than letting the config imply an
+	// exclusion that is not happening.
+	if unmatched := schema.UnmatchedIgnoreTables(req.IgnoreTables, withheldTablesFromProto(resp.ExemptTables)); len(unmatched) > 0 {
+		s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"pull_request", prInt,
+			"unmatched_entries", unmatched,
+		)
 	}
 
 	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
@@ -923,6 +958,7 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 		HeadSHA:        headSHA,
 		CreatedAt:      time.Now(),
 	}
+	storedPlan.RecordWithheldTables(withheldTablesFromProto(resp.ExemptTables))
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
 		return fmt.Errorf("store plan: %w", err)
 	}
@@ -1719,6 +1755,11 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		PullRequest: prNumber,
 		Environment: req.Environment,
 		Target:      plan.Target,
+		// The rollback restores the schema the source plan captured, and that
+		// capture never included the tables the plan's ignore_tables withheld.
+		// Withholding them again is what keeps the rollback from proposing to
+		// drop tables the repository asked SchemaBot to leave alone.
+		IgnoreTables: plan.WithheldTables(),
 	})
 	if err != nil {
 		// Mirror ExecutePlanProto's transport classification: only remote

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 )
@@ -669,6 +671,13 @@ type PlanRequest struct {
 	// target as one unit (a database-scoped MySQL DSN), where a withheld
 	// namespace's live tables would otherwise be planned as drops.
 	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
+	// IgnoreTables lists the live tables the config's ignore_tables withholds
+	// from the planner, so a live table no schema file declares is not proposed
+	// for DROP TABLE. Unlike ignored namespaces the exclusion cannot be
+	// expressed by leaving files out of the request — the tables are on the
+	// target, not in the repository — so the data plane applies it and reports
+	// what it actually withheld through ExemptTables on the response.
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
 	// GroupedExecution reports whether an apply of this plan will hand the
 	// engine every ALTER at once or one table at a time. Engines predicting what
 	// an apply will do to unfinished work already on the target need the
@@ -738,6 +747,32 @@ type ExemptTablesResponse struct {
 	Namespace string   `json:"namespace"`
 	Tables    []string `json:"tables"`
 	Reason    string   `json:"reason"`
+}
+
+// ExemptReasonIgnoreTables is the exemption reason a plan carries for a live
+// table the repository's ignore_tables config withheld from the planner. It
+// mirrors the engine's own vocabulary on the wire; this package holds its own
+// copy because it is dependency-free by design. A test pins the two together.
+const ExemptReasonIgnoreTables = "ignore_tables"
+
+// WithheldTables returns the live tables this plan reports it withheld on the
+// repository's instruction, across every namespace and sorted. The planner
+// exempts tables for reasons of its own as well — an engine's archive naming
+// convention — and only the config's own exclusions answer whether a
+// configured ignore_tables entry matched anything.
+func (r *PlanResponse) WithheldTables() []string {
+	if r == nil {
+		return nil
+	}
+	var tables []string
+	for _, group := range r.ExemptTables {
+		if group == nil || group.Reason != ExemptReasonIgnoreTables {
+			continue
+		}
+		tables = append(tables, group.Tables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
 }
 
 // Dispositions an ExistingCopyResponse can carry. These mirror the engine's
