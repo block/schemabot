@@ -2150,6 +2150,11 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 		Namespaces:     namespaces,
 		CreatedAt:      time.Now(),
 	}
+	// The dispatch's record of what the reviewed plan withheld has to survive on
+	// this deployment's own row. The drift check above was handed it directly,
+	// but a later rollback or resume here reads it back off the stored plan, and
+	// a plan that forgot its exclusions re-plans the withheld tables as drops.
+	plan.RecordWithheldTables(req.GetIgnoreTables())
 	c.logger.Info("Apply: materializing plan from dispatch request",
 		"plan_id", req.PlanId,
 		"database", c.config.Database,
