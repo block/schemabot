@@ -3,10 +3,12 @@ package api
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -255,6 +257,23 @@ func exemptTablesFromProto(groups []*ternv1.ExemptTables) []*apitypes.ExemptTabl
 		})
 	}
 	return result
+}
+
+// withheldTablesFromProto returns the live tables a plan reports it withheld
+// on the repository's instruction, across every namespace and sorted. The
+// planner exempts tables for reasons of its own as well — an engine's archive
+// naming convention — and only the config's own exclusions answer whether a
+// configured entry matched anything.
+func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
+	var tables []string
+	for _, group := range groups {
+		if group == nil || group.Reason != engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		tables = append(tables, group.Tables...)
+	}
+	slices.Sort(tables)
+	return slices.Compact(tables)
 }
 
 // existingCopiesFromProto carries the target's unfinished copies through to the

@@ -127,6 +127,13 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		Type:        c.config.Type,
 		Environment: req.Environment,
 		Target:      req.Target,
+		// The re-plan must be shown the same live schema the reviewed plan
+		// saw. A table the plan withheld has no declaring file, so a re-plan
+		// that sees it proposes dropping it — a change the reviewed DDL
+		// cannot contain, which would fail this guard on every apply of a
+		// plan that withheld anything. The dispatch carries the plan's own
+		// record of what it withheld, so the two sides stay symmetric.
+		IgnoreTables: req.GetIgnoreTables(),
 	}, c.config.Database, schemaFiles)
 	if err != nil {
 		return replannedChanges{}, fmt.Errorf("recompute local plan: %w", err)

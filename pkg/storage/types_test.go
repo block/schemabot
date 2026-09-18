@@ -495,3 +495,44 @@ func TestPlanIDForOperation(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+func TestPlanRecordWithheldTables(t *testing.T) {
+	(*Plan)(nil).RecordWithheldTables([]string{"flyway_schema_history"})
+
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"app":       {Tables: []TableChange{{Table: "users"}}},
+		"billing":   {Tables: []TableChange{{Table: "invoices"}}},
+		"nil_entry": nil,
+	}}
+	plan.RecordWithheldTables([]string{"legacy_audit_log", "flyway_schema_history", "legacy_audit_log"})
+
+	// Every namespace carries the whole list, sorted and deduplicated: the
+	// exclusions are the plan's, and plan_data has no plan-level slot.
+	want := []string{"flyway_schema_history", "legacy_audit_log"}
+	assert.Equal(t, want, plan.Namespaces["app"].WithheldTables)
+	assert.Equal(t, want, plan.Namespaces["billing"].WithheldTables)
+	assert.Equal(t, want, plan.WithheldTables())
+
+	// A plan that withheld nothing records nothing rather than an empty
+	// list a reader could mistake for an exclusion of nothing.
+	clean := &Plan{Namespaces: map[string]*NamespacePlanData{"app": {}}}
+	clean.RecordWithheldTables(nil)
+	assert.Nil(t, clean.Namespaces["app"].WithheldTables)
+}
+
+func TestPlanWithheldTables(t *testing.T) {
+	assert.Nil(t, (*Plan)(nil).WithheldTables(), "a nil plan withheld nothing")
+	assert.Nil(t, (&Plan{}).WithheldTables(), "a plan with no namespaces withheld nothing")
+
+	// ignore_tables applies to the whole plan, so every stored namespace
+	// carries the same list and the union is what a re-plan must withhold
+	// even when it rebuilds only some of the plan's namespaces.
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"billing":   {WithheldTables: []string{"legacy_audit_log", "flyway_schema_history"}},
+		"app":       {WithheldTables: []string{"flyway_schema_history"}},
+		"nil_entry": nil,
+		"tables":    {Tables: []TableChange{{Table: "orders"}}},
+	}}
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, plan.WithheldTables(),
+		"the union, sorted and deduplicated, so a re-plan withholds each table once")
+}

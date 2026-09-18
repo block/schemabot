@@ -285,6 +285,7 @@ func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespaceP
 			OriginalFilesCaptured: nsData.OriginalFilesCaptured,
 			Artifacts:             nsData.Artifacts,
 			Metadata:              nsData.Metadata,
+			WithheldTables:        nsData.WithheldTables,
 		}
 	}
 	for _, shard := range sortedShardPlans(plan.Shards) {
