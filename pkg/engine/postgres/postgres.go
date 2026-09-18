@@ -571,23 +571,41 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 // where concurrent index builds keep their verdict because their bound is a
 // duration envelope, not the table size. A typed refusal is rendered as a
 // blocked verdict; an operational failure fails planning rather than producing
-// an executable plan while the table size is unknown.
+// an executable plan while the table size is unknown. When an earlier gate has
+// already blocked every step, an operational failure leaves those safe
+// verdicts intact and is logged for operator triage.
 func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
-	if !hasExecutableChanges(changes) {
-		return changes, nil
-	}
+	return blockOversizedTableWithCheck(ctx, pool, report, changes, tableSizeLimit, preflight.CheckTable)
+}
+
+func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64, checkTable func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error)) ([]engine.TableChange, error) {
+	// When an earlier gate has already blocked every step the plan is safe as
+	// it stands; the size check then runs only so the operator sees both
+	// causes at once, and nothing it finds may turn that safe plan into a
+	// planning failure.
+	fullyBlocked := !hasExecutableChanges(changes)
 	if report.Table == "" {
+		if fullyBlocked {
+			return changes, nil
+		}
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
 	if isGreenfieldTable(report) {
 		return changes, nil
 	}
-	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	_, err := checkTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
 	if err == nil {
 		return changes, nil
 	}
 	r := classifyRefusal(err, report.Table)
 	if r == nil {
+		if fullyBlocked {
+			slog.Warn("PostgreSQL table size check failed; existing blocked plan verdicts remain unchanged",
+				"namespace", report.Schema,
+				"table", report.Table,
+				"error", err)
+			return changes, nil
+		}
 		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
 	}
 	// The table name is a database-sourced identifier. Quoting escapes control
@@ -607,17 +625,17 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	return changes, nil
 }
 
-// blockRewriteSteps marks every still-executable step whose native cost
-// scales with the existing table blocked with the reason. A concurrent index
-// build keeps its verdict: it is bounded by its duration envelope rather than
-// the table size ceiling. Steps already carrying a verdict keep it, so a
-// refusal an earlier gate recorded is never overwritten by the size verdict.
+// blockRewriteSteps marks every step whose native cost scales with the existing
+// table blocked with the reason. A concurrent index build keeps its verdict: it
+// is bounded by its duration envelope rather than the table size ceiling. An
+// earlier blocked verdict retains its reason and gains the independent size
+// cause so the operator can resolve both without another planning round trip.
 // Every executable step here was parsed when its privilege tier was derived,
 // so a statement that fails to classify is an invariant violation and fails
 // planning rather than being exempted or blocked on a guess.
 func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 	for i := range changes {
-		if changes[i].ExecutionMode != "" {
+		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
 		}
 		concurrentIndex, err := concurrentIndexStatement(changes[i].DDL)
@@ -625,6 +643,12 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
 		if concurrentIndex {
+			continue
+		}
+		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
+			if !strings.Contains(changes[i].ModeReason, reason) {
+				changes[i].ModeReason += "; " + reason
+			}
 			continue
 		}
 		changes[i].ExecutionMode = engine.ExecutionModeBlocked
