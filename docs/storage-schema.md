@@ -87,16 +87,20 @@ does with each kind of drift depends on the dialect:
   a column it is missing          adds it           adds it, or stops the boot
   an index it is missing          builds it         builds it
   a column defined differently    alters it         does not see it
-  a surplus table or column       refuses it        leaves it
-  a surplus index                 refuses it        leaves it
+  a surplus table or column       keeps it, warns   keeps it
+  a surplus index                 keeps it, warns   keeps it
   an index it cannot use          does not arise    stops the boot
   ────────────────────────────────────────────────────────────────────────────
 ```
 
-A refused MySQL statement does not stop the boot, which carries on without it;
-[What is never automatic](#what-is-never-automatic) covers which statements
-those are. **MySQL builds a new index by copying the table**, so it costs time
-in proportion to the rows in it, on every pod, inside the boot's budget (see
+The MySQL warning is a refusal: the differ emits a drop for the surplus state,
+the boot declines to run it, and the boot carries on without it rather than
+stopping. PostgreSQL never emits the statement in the first place, so it keeps
+the same state silently. [What is never automatic](#what-is-never-automatic)
+covers which statements get refused.
+
+**MySQL builds a new index by copying the table**, so it costs time in
+proportion to the rows in it, on every pod, inside the boot's budget (see
 [Pre-creating indexes](#pre-creating-indexes-on-a-long-lived-database)).
 
 **PostgreSQL stops the boot rather than make a change that locks a table for as
