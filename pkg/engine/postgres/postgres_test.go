@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"testing"
@@ -614,7 +615,7 @@ func TestBlockOversizedTableAppendsSizeCauseToPrivilegeBlocks(t *testing.T) {
 		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN phone text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"},
 	}
 
-	changes, err := blockOversizedTableWithCheck(t.Context(), nil, report, changes, 1024, checkTable)
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	want := `missing ALTER privilege; statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`
 	assert.Equal(t, want, changes[0].ModeReason)
@@ -632,7 +633,7 @@ func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {
 		{Table: "users", DDL: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing CREATE privilege"},
 	}
 
-	changes, err := blockOversizedTableWithCheck(t.Context(), nil, report, changes, 1024, checkTable)
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Contains(t, changes[0].ModeReason, "; statement for table")
 	assert.Equal(t, "missing CREATE privilege", changes[1].ModeReason)
@@ -651,11 +652,52 @@ func TestBlockOversizedTableKeepsBlockedReasonsWhenLookupFails(t *testing.T) {
 	report.Table = "users"
 	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"}}
 
-	changes, err := blockOversizedTableWithCheck(t.Context(), nil, report, changes, 1024, checkTable)
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Equal(t, "missing ALTER privilege", changes[0].ModeReason)
 	assert.Contains(t, logs.String(), "level=WARN")
 	assert.Contains(t, logs.String(), "existing blocked plan verdicts remain unchanged")
+}
+
+// A table the plan leaves untouched has no step a size verdict could land on,
+// so the gate must not spend a catalog round trip on it.
+func TestBlockOversizedTableSkipsUntouchedTable(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		t.Fatal("size lookup must not run for a table with no planned steps")
+		return preflight.PreflightedTable{}, nil
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, nil, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Empty(t, changes)
+}
+
+// When every step is already blocked, a refusal about the table itself rather
+// than its size has nothing executable left to block; the existing verdicts
+// stand and the refusal is logged so the catalog answer is not lost.
+func TestBlockOversizedTableLogsNonSizeRefusalOnFullyBlockedPlan(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, fmt.Errorf("%w: public.users has relkind %q", preflight.ErrNotTable, "v")
+	}
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(originalLogger) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, "missing ALTER privilege", changes[0].ModeReason)
+	assert.Contains(t, logs.String(), "level=WARN")
+	assert.Contains(t, logs.String(), "size check refused the table")
+	assert.Contains(t, logs.String(), "database=orders_db")
+	assert.Contains(t, logs.String(), "refusal=not-a-table")
 }
 
 func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
@@ -666,7 +708,7 @@ func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
 	report.Table = "users"
 	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"}}
 
-	changes, err := blockOversizedTableWithCheck(t.Context(), nil, report, changes, 1024, checkTable)
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 	assert.Equal(t, `statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`, changes[0].ModeReason)
@@ -681,7 +723,7 @@ func TestBlockOversizedTableRequiresTargetTable(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
+	_, err := blockOversizedTable(t.Context(), nil, "orders_db", report, changes, 1)
 	require.Error(t, err)
 	assert.EqualError(t, err, "plan report carries executable steps but names no target table")
 }
@@ -696,7 +738,7 @@ func TestBlockOversizedTableFailsClosedOnCheckError(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockOversizedTable(t.Context(), nil, report, changes, -1)
+	_, err := blockOversizedTable(t.Context(), nil, "orders_db", report, changes, -1)
 	require.Error(t, err)
 	assert.EqualError(t, err, `check size for table "users": size limit must be positive, got -1`)
 }

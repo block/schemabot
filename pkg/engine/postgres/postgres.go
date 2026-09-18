@@ -295,7 +295,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if err != nil {
 				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
-			changes, err = blockOversizedTable(ctx, pool, report, changes, tableSizeLimit)
+			changes, err = blockOversizedTable(ctx, pool, req.Database, report, changes, tableSizeLimit)
 			if err != nil {
 				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
@@ -572,13 +572,18 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 // duration envelope, not the table size. A typed refusal is rendered as a
 // blocked verdict; an operational failure fails planning rather than producing
 // an executable plan while the table size is unknown. When an earlier gate has
-// already blocked every step, an operational failure leaves those safe
-// verdicts intact and is logged for operator triage.
-func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
-	return blockOversizedTableWithCheck(ctx, pool, report, changes, tableSizeLimit, preflight.CheckTable)
+// already blocked every step, an operational failure or a refusal unrelated to
+// size leaves those safe verdicts intact and is logged for operator triage.
+func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
+	return blockOversizedTableWithCheck(ctx, pool, database, report, changes, tableSizeLimit, preflight.CheckTable)
 }
 
-func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64, checkTable func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error)) ([]engine.TableChange, error) {
+func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64, checkTable func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error)) ([]engine.TableChange, error) {
+	// A table the plan leaves untouched has no step for a size verdict to
+	// land on, so it is not charged a catalog round trip.
+	if len(changes) == 0 {
+		return changes, nil
+	}
 	// When an earlier gate has already blocked every step the plan is safe as
 	// it stands; the size check then runs only so the operator sees both
 	// causes at once, and nothing it finds may turn that safe plan into a
@@ -601,6 +606,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, repor
 	if r == nil {
 		if fullyBlocked {
 			slog.Warn("PostgreSQL table size check failed; existing blocked plan verdicts remain unchanged",
+				"database", database,
 				"namespace", report.Schema,
 				"table", report.Table,
 				"error", err)
@@ -619,6 +625,19 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, repor
 		if err := blockRewriteSteps(changes, reason); err != nil {
 			return nil, err
 		}
+		return changes, nil
+	}
+	if fullyBlocked {
+		// A refusal about the table itself, not its size, has no executable
+		// step left to land on; the verdicts already carry a cause the
+		// operator can act on, so the answer goes to the log instead of
+		// being lost.
+		slog.Warn("PostgreSQL table size check refused the table; existing blocked plan verdicts remain unchanged",
+			"database", database,
+			"namespace", report.Schema,
+			"table", report.Table,
+			"refusal", r.reason,
+			"detail", r.detail)
 		return changes, nil
 	}
 	blockExecutableChanges(changes, reason)
