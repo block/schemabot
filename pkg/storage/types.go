@@ -655,6 +655,22 @@ func (p *Plan) BlockedChanges() []TableChange {
 	return result
 }
 
+// BlockedApplyError returns the operator-facing refusal for a plan containing
+// a blocked change. Keeping this with the whole-plan verdict ensures every
+// admission path gives the same remedy.
+func (p *Plan) BlockedApplyError() error {
+	blocked := p.BlockedChanges()
+	if len(blocked) == 0 {
+		return nil
+	}
+	change := blocked[0]
+	reason := change.ModeReason
+	if reason == "" {
+		reason = "the engine refuses this statement"
+	}
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
+}
+
 // HasOriginalFilesCapture reports whether every stored namespace has an
 // explicit original-files capture, including intentionally empty captures.
 func (p *Plan) HasOriginalFilesCapture() bool {

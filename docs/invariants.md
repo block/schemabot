@@ -1255,8 +1255,10 @@ execution mode), is recorded on the plan using the engine's own checks rather th
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
 direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
 estimate is trusted only in the blocking direction: an estimate alone never approves. *Enforced:*
-plan-time execution verdicts and apply-time verdict gates (`pkg/engine`); the direct-execution
-size bound ([direct-execution.md](direct-execution.md)).
+plan-time execution verdicts (`pkg/engine`); the whole-plan blocked verdict
+(`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission path
+(`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`); the direct-execution size bound
+([direct-execution.md](direct-execution.md)).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 

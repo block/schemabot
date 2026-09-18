@@ -2777,6 +2777,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		if err != nil {
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 		}
+		if err := plan.BlockedApplyError(); err != nil {
+			return &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: err.Error(),
+			}, nil
+		}
 		return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "hit")
 	}
 
@@ -2796,6 +2802,16 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	scope, err := deriveDispatchScope(plan, req)
 	if err != nil {
 		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+	}
+	// A blocked step is refused before the conflict check and before any apply
+	// or task row exists: no opt-in makes a statement the engine refuses
+	// executable, and task rows do not carry the verdict, so admission is the
+	// last place the whole plan can be judged.
+	if err := plan.BlockedApplyError(); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
 	}
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,
