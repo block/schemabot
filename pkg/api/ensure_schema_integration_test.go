@@ -528,6 +528,41 @@ func TestEnsureSchema_RunsTheAdditiveClausesBesideAnIndexDrop(t *testing.T) {
 	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
 }
 
+// MySQL keeps column names and index names in separate namespaces, so a table
+// can carry an index named the same as one of its columns. When the surplus
+// index a newer binary left behind shares its name with a column the starting
+// binary requires, nothing collides: the column is added while the index drop
+// is withheld. Reading the two names as one namespace would withhold the
+// addition too, and the pod would report a healthy boot and then serve against
+// storage missing a column its own queries name.
+func TestEnsureSchema_AddsAColumnNamedLikeAWithheldIndex(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// The column the starting binary requires is missing, and a surplus index
+	// stands under that same name.
+	const missingColumn = "throttle_reason"
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ADD INDEX `%s` (`%s`)", missingColumn, strings.Join(surplusIndexColumns, "`,`")))
+	require.NoError(t, err)
+	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"a withheld index drop sharing a name with a required column must not fail startup")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column the starting binary requires must be added: an index of the same name occupies a different namespace and collides with nothing")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", missingColumn),
+		"the surplus index must survive intact, whatever it shares its name with")
+}
+
 // A withheld clause stays in the diff for as long as the drift stands, and pods
 // restart for reasons that have nothing to do with a deploy: a node drain, an
 // OOM kill, a scale-up. So the boot after a split must recognize that the

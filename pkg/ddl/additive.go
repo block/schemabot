@@ -31,10 +31,17 @@ var ErrNotAlterTable = statement.ErrNotAlterTable
 //
 // The additive partition must also stand on its own, because the caller runs it
 // while the rest does not. An addition naming anything a withheld clause also
-// names is withheld with it: executing it against the object still in place
-// fails on a duplicate name and takes down the statement the split exists to
-// keep running. That is how the diff of a redefined index or a widened primary
-// key arrives — as a drop and an add of one name in one statement.
+// names, in the same namespace, is withheld with it: executing it against the
+// object still in place fails on a duplicate name and takes down the statement
+// the split exists to keep running. That is how the diff of a redefined index or
+// a widened primary key arrives — as a drop and an add of one name in one
+// statement.
+//
+// The namespace is part of that test because MySQL keeps columns and keys
+// apart. A table may carry an index named the same as a column, so a withheld
+// index drop must not hold back the addition of a column that happens to share
+// its name: nothing collides, and withholding it would leave the binary running
+// against storage missing a column its own queries name.
 //
 // Either string is empty when no clause falls in that partition. Both are
 // restored in the parser's canonical form rather than sliced out of the input.
@@ -63,13 +70,13 @@ func SplitAdditiveAlter(stmt string) (additiveDDL, withheldDDL string, err error
 
 	// Every name a withheld clause touches, so an addition that would collide
 	// with one can be withheld alongside it.
-	withheldNames := make(map[string]bool)
+	withheldNames := make(map[objectRef]bool)
 	for _, spec := range alter.Specs {
 		if addsSchemaObject(spec) {
 			continue
 		}
-		for _, name := range mentionedNames(spec) {
-			withheldNames[name] = true
+		for _, ref := range mentionedNames(spec) {
+			withheldNames[ref] = true
 		}
 	}
 
@@ -115,61 +122,85 @@ func addsSchemaObject(spec *ast.AlterTableSpec) bool {
 // index name, so it cannot collide with a secondary index.
 const primaryKeyName = "primary"
 
+// objectKind is the namespace an identifier lives in. MySQL keeps columns and
+// keys apart, so a table may carry an index and a column of the same name at
+// once, and an addition claiming one of them does not collide with a withheld
+// clause holding the other.
+type objectKind int
+
+const (
+	columnObject objectKind = iota
+	keyObject
+)
+
+// objectRef is an identifier together with the namespace it occupies.
+type objectRef struct {
+	kind objectKind
+	name string
+}
+
 // mentionedNames returns every identifier an ALTER TABLE clause names — the
-// object it acts on and the columns it references — lowercased, as MySQL
-// compares identifiers. It deliberately does not distinguish the role a name
-// plays in the clause, because the split does not need to: a name that appears
-// anywhere in a withheld clause is a name an addition must not claim.
+// object it acts on and the columns it references — paired with the namespace
+// that identifier lives in, and lowercased, as MySQL compares identifiers.
 //
-// Collecting a name the clause merely references, rather than holds, can only
-// withhold more clauses than strictly necessary and never fewer. That is the
-// safe direction inside a statement the plan already reported as unsafe, and it
-// is why this is one flat list instead of a per-clause-type analysis.
-func mentionedNames(spec *ast.AlterTableSpec) []string {
-	var names []string
-	add := func(name string) {
+// The namespace comes from where in the clause the name was read, not from what
+// the clause does with it, so this stays a flat read of the syntax rather than a
+// per-clause-type analysis. The parser only ever fills Name for DROP INDEX and
+// DROP FOREIGN KEY, which is why it can be read as a key without asking which
+// clause it came from.
+//
+// The role a name plays is still not distinguished, and a column an index
+// references is collected the same way as one a clause holds. Within a
+// namespace that can only withhold more clauses than strictly necessary and
+// never fewer, which is the safe direction inside a statement the plan already
+// reported as unsafe. It cannot cost a column: an addition's only claim in the
+// column namespace is the column it defines, so the names collected from an
+// index's column list can withhold that index and nothing else.
+func mentionedNames(spec *ast.AlterTableSpec) []objectRef {
+	var refs []objectRef
+	add := func(kind objectKind, name string) {
 		if name != "" {
-			names = append(names, strings.ToLower(name))
+			refs = append(refs, objectRef{kind: kind, name: strings.ToLower(name)})
 		}
 	}
 
 	if spec.Tp == ast.AlterTableDropPrimaryKey {
-		add(primaryKeyName)
+		add(keyObject, primaryKeyName)
 	}
-	add(spec.Name)
-	add(spec.FromKey.O)
-	add(spec.ToKey.O)
+	add(keyObject, spec.Name)
+	add(keyObject, spec.FromKey.O)
+	add(keyObject, spec.ToKey.O)
 	if spec.OldColumnName != nil {
-		add(spec.OldColumnName.Name.O)
+		add(columnObject, spec.OldColumnName.Name.O)
 	}
 	if spec.NewColumnName != nil {
-		add(spec.NewColumnName.Name.O)
+		add(columnObject, spec.NewColumnName.Name.O)
 	}
 	for _, column := range spec.NewColumns {
 		if column.Name != nil {
-			add(column.Name.Name.O)
+			add(columnObject, column.Name.Name.O)
 		}
 	}
 	if spec.Constraint != nil {
-		add(spec.Constraint.Name)
+		add(keyObject, spec.Constraint.Name)
 		if spec.Constraint.Tp == ast.ConstraintPrimaryKey {
-			add(primaryKeyName)
+			add(keyObject, primaryKeyName)
 		}
 		for _, key := range spec.Constraint.Keys {
 			if key.Column != nil {
-				add(key.Column.Name.O)
+				add(columnObject, key.Column.Name.O)
 			}
 		}
 	}
-	return names
+	return refs
 }
 
 // mentionsAny reports whether an ALTER TABLE clause names anything in the given
 // set, which for an addition means it cannot run until the withheld clause
 // naming the same thing has run.
-func mentionsAny(spec *ast.AlterTableSpec, names map[string]bool) bool {
-	for _, name := range mentionedNames(spec) {
-		if names[name] {
+func mentionsAny(spec *ast.AlterTableSpec, names map[objectRef]bool) bool {
+	for _, ref := range mentionedNames(spec) {
+		if names[ref] {
 			return true
 		}
 	}

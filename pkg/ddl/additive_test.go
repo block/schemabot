@@ -103,6 +103,22 @@ func TestSplitAdditiveAlter(t *testing.T) {
 			additive: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NOT NULL AFTER `state`",
 			withheld: "ALTER TABLE `applies` DROP COLUMN `state`",
 		},
+		{
+			// MySQL keeps columns and keys in separate namespaces, so the
+			// column is added beside the index the refusal leaves in place.
+			// Withholding it would start a pod against storage missing a
+			// column its own queries name.
+			name:     "a column is added beside a withheld index drop of the same name",
+			stmt:     "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NOT NULL, DROP INDEX `caller`",
+			additive: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NOT NULL",
+			withheld: "ALTER TABLE `applies` DROP INDEX `caller`",
+		},
+		{
+			name:     "an index is added beside a withheld column drop of the same name",
+			stmt:     "ALTER TABLE `applies` ADD INDEX `caller` (`id`), DROP COLUMN `caller`",
+			additive: "ALTER TABLE `applies` ADD INDEX `caller`(`id`)",
+			withheld: "ALTER TABLE `applies` DROP COLUMN `caller`",
+		},
 	}
 
 	for _, tt := range tests {
