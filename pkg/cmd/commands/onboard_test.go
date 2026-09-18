@@ -470,3 +470,45 @@ func TestOnboardRetainsEmptyNamespacesAndRejectsCaseCollisions(t *testing.T) {
 	_, err = buildOnboardWritePlan(root, response, client.PlanExclusions{})
 	require.ErrorContains(t, err, "case-insensitive filesystem")
 }
+
+// A table name the target's catalog allows but YAML would reinterpret has to
+// survive the write. Written bare, a name opening with a comment marker is
+// read back as a comment: the config would state an exclusion that no longer
+// loads, and the table it names would face the undeclared-table verdict on
+// the next plan.
+func TestOnboardConfigYAML_ExclusionsRoundTripThroughQuoting(t *testing.T) {
+	exclusions := client.PlanExclusions{
+		Namespaces: []string{"#reporting", "app"},
+		Tables:     []string{"#audit", "flyway_schema_history", "yes"},
+	}
+
+	out, err := onboardConfigYAML("testapp", "mysql", exclusions)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(out), 0o600))
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+
+	assert.Equal(t, "testapp", cfg.Database)
+	assert.Equal(t, exclusions.Namespaces, cfg.PlanExclusions().Namespaces)
+	assert.Equal(t, exclusions.Tables, cfg.PlanExclusions().Tables)
+}
+
+// A name needing no quoting is written plain, so an ordinary onboarded config
+// reads the way an operator would have written it by hand.
+func TestOnboardConfigYAML_OrdinaryNamesStayUnquoted(t *testing.T) {
+	out, err := onboardConfigYAML("testapp", "mysql", client.PlanExclusions{
+		Tables: []string{"flyway_schema_history"},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, out, "ignore_tables:\n  - flyway_schema_history\n")
+}
+
+// An empty exclusion list is omitted: a bare key reads as a configured
+// exclusion of nothing rather than as no configuration at all.
+func TestOnboardConfigYAML_EmptyExclusionsOmitTheirKeys(t *testing.T) {
+	out, err := onboardConfigYAML("testapp", "mysql", client.PlanExclusions{})
+	require.NoError(t, err)
+	assert.Equal(t, "database: testapp\ntype: mysql\n", out)
+}

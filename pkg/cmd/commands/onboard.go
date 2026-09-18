@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
+	"gopkg.in/yaml.v3"
 )
 
 // OnboardCmd pulls live schema into a new declarative schema directory.
@@ -214,8 +215,12 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
 	}
 	root := filepath.Clean(schemaRoot)
+	configYAML, err := onboardConfigYAML(resp.Database, string(resp.Type), exclusions)
+	if err != nil {
+		return nil, err
+	}
 	files := map[string]string{
-		"schemabot.yaml": onboardConfigYAML(resp.Database, string(resp.Type), exclusions),
+		"schemabot.yaml": configYAML,
 	}
 
 	namespaces := make([]string, 0, len(resp.Namespaces))
@@ -274,24 +279,38 @@ func rejectCaseCollisions(kind string, names []string) error {
 	return nil
 }
 
-func onboardConfigYAML(database, databaseType string, exclusions client.PlanExclusions) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "database: %s\ntype: %s\n", database, databaseType)
-	writeConfigList(&b, "ignore_namespaces", exclusions.Namespaces)
-	writeConfigList(&b, "ignore_tables", exclusions.Tables)
-	return b.String()
+// onboardConfig is the schemabot.yaml onboarding writes. An empty exclusion
+// list is omitted rather than written as a bare key, which would read as a
+// configured exclusion of nothing.
+type onboardConfig struct {
+	Database         string   `yaml:"database"`
+	Type             string   `yaml:"type"`
+	IgnoreNamespaces []string `yaml:"ignore_namespaces,omitempty"`
+	IgnoreTables     []string `yaml:"ignore_tables,omitempty"`
 }
 
-// writeConfigList emits one schemabot.yaml string list, or nothing when the
-// list is empty — an empty key would read as a configured exclusion of nothing.
-func writeConfigList(b *strings.Builder, key string, values []string) {
-	if len(values) == 0 {
-		return
+// onboardConfigYAML renders the config for a freshly onboarded database. The
+// document is encoded rather than formatted because the names in it come from
+// the target's catalog: a name that needs YAML quoting to survive a load —
+// one opening with a comment marker, say — would otherwise be written bare and
+// read back as something else, silently dropping the exclusion it states and
+// leaving its table exposed to the undeclared-table verdict.
+func onboardConfigYAML(database, databaseType string, exclusions client.PlanExclusions) (string, error) {
+	var b strings.Builder
+	enc := yaml.NewEncoder(&b)
+	enc.SetIndent(2)
+	if err := enc.Encode(onboardConfig{
+		Database:         database,
+		Type:             databaseType,
+		IgnoreNamespaces: exclusions.Namespaces,
+		IgnoreTables:     exclusions.Tables,
+	}); err != nil {
+		return "", fmt.Errorf("encode schemabot.yaml for database %s: %w", database, err)
 	}
-	fmt.Fprintf(b, "%s:\n", key)
-	for _, value := range values {
-		fmt.Fprintf(b, "  - %s\n", value)
+	if err := enc.Close(); err != nil {
+		return "", fmt.Errorf("encode schemabot.yaml for database %s: %w", database, err)
 	}
+	return b.String(), nil
 }
 
 func validateRelativePathPart(kind, value string) error {
