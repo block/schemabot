@@ -131,6 +131,13 @@ func TestFormatDDL(t *testing.T) {
 			expected: "CREATE TABLE `t4` (`id` bigint NOT NULL) ENGINE InnoDB,\n  COMMENT 'do not PARTITION BY hand';",
 		},
 		{
+			name:  "COMMENT with doubled quote and PARTITION BY before the clause",
+			input: "CREATE TABLE `t4` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='don''t PARTITION BY hand' PARTITION BY HASH (`id`) PARTITIONS 2",
+			expected: "CREATE TABLE `t4` (`id` bigint NOT NULL) ENGINE InnoDB,\n" +
+				"  COMMENT 'don''t PARTITION BY hand'\n" +
+				"  PARTITION BY HASH (`id`) PARTITIONS 2;",
+		},
+		{
 			name:  "non-ASCII COMMENT before PARTITION BY",
 			input: "CREATE TABLE `t5` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='ılık ıslak' PARTITION BY HASH (`id`) PARTITIONS 2",
 			expected: "CREATE TABLE `t5` (`id` bigint NOT NULL) ENGINE InnoDB,\n" +
@@ -204,6 +211,33 @@ func TestFormatCreateTableQuotedContent(t *testing.T) {
 			expected: "CREATE TABLE t (\n" +
 				"    id int,\n" +
 				"    note text DEFAULT 'it''s, ok'\n" +
+				")",
+		},
+		{
+			name:  "backslash before the closing quote is content",
+			input: `CREATE TABLE t (id int, note text DEFAULT 'a\', c int)`,
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				`    note text DEFAULT 'a\',` + "\n" +
+				"    c int\n" +
+				")",
+		},
+		{
+			name:  "backslash followed by doubled quote",
+			input: `CREATE TABLE t (id int, note text DEFAULT 'a\''b, (c', c int)`,
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				`    note text DEFAULT 'a\''b, (c',` + "\n" +
+				"    c int\n" +
+				")",
+		},
+		{
+			name:  "escape string literal with doubled quote",
+			input: `CREATE TABLE t (id int, note text DEFAULT E'a\\''b, (c', c int)`,
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				`    note text DEFAULT E'a\\''b, (c',` + "\n" +
+				"    c int\n" +
 				")",
 		},
 		{
@@ -495,6 +529,21 @@ func TestSplitAlterClauses(t *testing.T) {
 			input: "ALTER TABLE `t` ADD INDEX `idx`(`a`, `b`, `c`)",
 			expected: []string{
 				"ALTER TABLE `t` ADD INDEX `idx`(`a`, `b`, `c`)",
+			},
+		},
+		{
+			name:  "clause keyword inside a literal not split",
+			input: "ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD y (', ADD INDEX `b`(`b`)",
+			expected: []string{
+				"ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD y ('",
+				"ADD INDEX `b`(`b`)",
+			},
+		},
+		{
+			name:  "unterminated literal left whole",
+			input: "ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD INDEX `b`(`b`)",
+			expected: []string{
+				"ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD INDEX `b`(`b`)",
 			},
 		},
 	}

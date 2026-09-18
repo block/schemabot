@@ -197,17 +197,18 @@ func formatCreateTable(ddl string) string {
 }
 
 // splitPartitionClause separates the trailing PARTITION BY clause, if any,
-// from a CREATE TABLE options footer. Quoted strings are skipped so a COMMENT
-// mentioning PARTITION BY is not mistaken for the clause.
+// from a CREATE TABLE options footer. Quoted regions are skipped so a COMMENT
+// mentioning PARTITION BY is not mistaken for the clause; an unterminated
+// quote leaves the footer whole.
 func splitPartitionClause(options string) (opts, partition string) {
 	const clause = "PARTITION BY"
-	inQuote := false
 	for i := 0; i+len(clause) <= len(options); i++ {
-		if options[i] == '\'' {
-			inQuote = !inQuote
-			continue
-		}
-		if inQuote {
+		if isQuote(options[i]) {
+			end, ok := quotedEnd(options, i)
+			if !ok {
+				return options, ""
+			}
+			i = end - 1
 			continue
 		}
 		if strings.EqualFold(options[i:i+len(clause)], clause) {
@@ -239,8 +240,9 @@ func formatFooter(options, partition string) string {
 
 // tableOptionPattern matches individual table options in the options string.
 // TiDB restores options as: ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI COMMENT = '...'
+// A quoted value runs to its closing quote, with a doubled quote staying inside.
 var tableOptionPattern = regexp.MustCompile(
-	`(?:DEFAULT\s+)?(?:ENGINE|CHARACTER SET|CHARSET|COLLATE|COMMENT|AUTO_INCREMENT|ROW_FORMAT|COMPRESSION|KEY_BLOCK_SIZE|STATS_PERSISTENT|STATS_AUTO_RECALC|PACK_KEYS)\s*=?\s*(?:'[^']*'|\S+)`)
+	`(?:DEFAULT\s+)?(?:ENGINE|CHARACTER SET|CHARSET|COLLATE|COMMENT|AUTO_INCREMENT|ROW_FORMAT|COMPRESSION|KEY_BLOCK_SIZE|STATS_PERSISTENT|STATS_AUTO_RECALC|PACK_KEYS)\s*=?\s*(?:'(?:[^']|'')*'|\S+)`)
 
 // formatTableOptions splits table options onto separate indented lines.
 // Input: "ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI"
@@ -284,18 +286,23 @@ func formatTableOptions(options string) string {
 }
 
 // isQuote reports whether c opens a single-quoted literal or a quoted
-// identifier (double quotes in standard SQL, backticks in MySQL). Commas and
-// parentheses inside any of these are content, not structure, so every
-// scanner in this file must step over them as a unit.
+// identifier (double quotes in standard SQL, backticks in MySQL). Commas,
+// parentheses, and keywords inside any of these are content, not structure,
+// so the layout scanners in this file step over a quoted region as a unit
+// via quotedEnd.
 func isQuote(c byte) bool {
 	return c == '\'' || c == '"' || c == '`'
 }
 
 // quotedEnd returns the index just past the quoted region that opens at
-// s[openPos], honouring the SQL doubled-quote escape (two consecutive quote
-// characters stay inside the literal). ok is false when the quote is never
-// closed, in which case the caller cannot lay the statement out safely and
-// should leave it as is.
+// s[openPos]. The scanners only ever see a parser's canonical output, and
+// both canonical grammars write an embedded quote as two consecutive quote
+// characters — never as a backslash escape — so the doubled quote is the one
+// escape honoured here. A backslash is ordinary content: MySQL's canonical
+// form writes a literal ending in a backslash as 'a\', which a backslash
+// aware scanner would misread as unterminated. ok is false when the quote is
+// never closed, in which case the caller cannot lay the statement out safely
+// and should leave it as is.
 func quotedEnd(s string, openPos int) (end int, ok bool) {
 	q := s[openPos]
 	for i := openPos + 1; i < len(s); i++ {
@@ -409,14 +416,24 @@ func splitAlterClauses(ddl string) []string {
 	tablePart := ddl[:tableEnd]
 	clausesPart := ddl[tableEnd:]
 
-	// Split on ", ADD ", ", DROP ", ", MODIFY ", ", CHANGE "
-	// Track parentheses to avoid splitting inside column definitions
+	// Split on ", ADD ", ", DROP ", ", MODIFY ", ", CHANGE ". Parentheses and
+	// quoted regions are opaque so a compound key or a literal is never split;
+	// an unterminated quote leaves the statement whole.
 	var clauses []string
 	var current strings.Builder
 	parenDepth := 0
 
 	for i := 0; i < len(clausesPart); i++ {
 		c := clausesPart[i]
+		if isQuote(c) {
+			end, ok := quotedEnd(clausesPart, i)
+			if !ok {
+				return []string{ddl}
+			}
+			current.WriteString(clausesPart[i:end])
+			i = end - 1
+			continue
+		}
 		switch c {
 		case '(':
 			parenDepth++
