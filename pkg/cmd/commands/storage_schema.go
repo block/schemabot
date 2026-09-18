@@ -493,18 +493,24 @@ func storageSchemaConvergenceOutcome(remaining *apitypes.StorageSchemaReport) er
 // refusing a value the target would refuse. The direct path bounds the
 // convergence with it here; the API path sends it and the target does the same.
 func (cmd *StorageApplyCmd) convergenceBudget() (time.Duration, error) {
-	// The wire carries whole seconds, so anything under one truncates to the
-	// zero that means "no preference" and would come back as the hour-long
-	// default: the operator asking for the shortest possible run gets the
-	// longest one, and a negative budget too small to survive the truncation
-	// gets a budget at all. Both are refused here, where the duration the
-	// operator typed is still intact, rather than letting the truncation
-	// answer for them.
+	// Every refusal below is made against the duration the operator typed,
+	// because the request carries whole seconds and the truncation to them
+	// destroys the evidence. A budget under a second truncates to the zero
+	// meaning "no preference" and comes back as the hour-long default; a
+	// negative one too small to survive the truncation does the same; and a
+	// fractional one loses its remainder, which turns a budget just over the
+	// maximum into one exactly at it. Refusing a value the wire cannot carry
+	// is also what makes the maximum enforceable at all: once the budget is a
+	// whole number of seconds, bounding the seconds and bounding the duration
+	// are the same bound, and ResolveStorageApplyTimeout applies it for both
+	// ends of the wire.
 	switch {
 	case cmd.Timeout < 0:
 		return 0, fmt.Errorf("--timeout: a convergence budget of %s must be positive, or unset for the default of %s", cmd.Timeout, apitypes.DefaultStorageApplyTimeout)
 	case cmd.Timeout > 0 && cmd.Timeout < time.Second:
 		return 0, fmt.Errorf("--timeout: a convergence budget of %s is shorter than the one second the request carries; name a whole number of seconds", cmd.Timeout)
+	case cmd.Timeout%time.Second != 0:
+		return 0, fmt.Errorf("--timeout: a convergence budget of %s is not the whole number of seconds the request carries; naming it would run under %s instead", cmd.Timeout, cmd.Timeout.Truncate(time.Second))
 	}
 	budget, err := apitypes.ResolveStorageApplyTimeout(cmd.timeoutSeconds())
 	if err != nil {

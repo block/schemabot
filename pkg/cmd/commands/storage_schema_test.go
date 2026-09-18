@@ -370,6 +370,30 @@ func TestStorageApplyCmd_RefusesABudgetTheWireCannotCarry(t *testing.T) {
 	assert.Contains(t, err.Error(), "shorter than the one second the request carries")
 }
 
+// A budget carrying a fraction of a second is refused rather than rounded.
+// The request carries whole seconds, so the remainder is dropped on the way
+// out — and a budget just over the maximum loses exactly the part that put it
+// over, arriving as one the target accepts. Refusing the fraction is what
+// keeps the maximum a refusal rather than a clamp.
+func TestStorageApplyCmd_RefusesAFractionalBudget(t *testing.T) {
+	for name, tc := range map[string]struct {
+		timeout time.Duration
+		ran     string
+	}{
+		"a fraction the target would accept": {timeout: 1500 * time.Millisecond, ran: "1s"},
+		"a fraction that hides the maximum":  {timeout: time.Hour + 500*time.Millisecond, ran: "1h0m0s"},
+		"a fraction on a many-second budget": {timeout: 90*time.Second + time.Millisecond, ran: "1m30s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd := StorageApplyCmd{AutoApprove: true, Timeout: tc.timeout}
+			err := cmd.Run(t.Context(), &Globals{Endpoint: "http://127.0.0.1:1"})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not the whole number of seconds the request carries")
+			assert.Contains(t, err.Error(), tc.ran, "the refusal names the budget the truncation would have run")
+		})
+	}
+}
+
 // A negative budget is refused whatever its magnitude. One smaller than a
 // whole second truncates to the zero that means "no preference", so a bound
 // applied only after the truncation would answer an invalid flag with the
