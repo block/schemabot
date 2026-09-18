@@ -276,6 +276,36 @@ func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
 	return slices.Compact(tables)
 }
 
+// plannedDropsAmong returns the tables from names that the plan proposes
+// dropping, sorted. Callers use it to tell an exclusion that matched nothing
+// because the table is not there from one that matched nothing because the
+// planner was never shown the exclusion at all.
+func plannedDropsAmong(changes []*ternv1.SchemaChange, names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	var dropped []string
+	for _, change := range changes {
+		if change == nil {
+			continue
+		}
+		for _, tc := range change.TableChanges {
+			if tc == nil || tc.ChangeType != ternv1.ChangeType_CHANGE_TYPE_DROP {
+				continue
+			}
+			if wanted[tc.TableName] {
+				dropped = append(dropped, tc.TableName)
+			}
+		}
+	}
+	slices.Sort(dropped)
+	return slices.Compact(dropped)
+}
+
 // existingCopiesFromProto carries the target's unfinished copies through to the
 // plan response so the operator is told, before applying, whether the apply
 // resumes an existing copy or throws it away and starts over.

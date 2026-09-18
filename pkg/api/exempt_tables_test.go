@@ -117,3 +117,96 @@ func TestExecutePlanCarriesIgnoreTablesAndRecordsWhatWasWithheld(t *testing.T) {
 	assert.Equal(t, []string{"flyway_schema_history"}, plans.created.WithheldTables(),
 		"the re-plan of this stored plan withholds the same tables")
 }
+
+// An entry that withheld nothing while the plan proposes dropping the very
+// table it names can only mean the exclusion never reached the planner: the
+// target holds the table, so a data plane that honored the request would have
+// withheld it. Every other unmatched shape names a table that is not there to
+// drop. The plan is refused rather than stored and reviewed as a drop, which
+// is the change the entry was written to prevent.
+func TestExecutePlanRefusesADropOfAWithheldTable(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
+		PlanId: "plan-unhonored",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "payments",
+			TableChanges: []*ternv1.TableChange{{
+				TableName: "flyway_schema_history", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+				Ddl: "DROP TABLE `flyway_schema_history`",
+			}},
+		}},
+	}}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type:         storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
+			},
+		},
+		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
+	}
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": mockClient,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		IgnoreTables: []string{"flyway_schema_history"},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "flyway_schema_history")
+	assert.Contains(t, err.Error(), "ignore_tables withholds")
+	assert.Contains(t, err.Error(), "honors ignore_tables", "the error names the remedy")
+	assert.Nil(t, plans.created, "a plan that would drop a withheld table is not stored")
+}
+
+// An entry that matched nothing because the table is not on the target is the
+// ordinary typo, and it is reported rather than refused: the plan proceeds and
+// the unmatched entry reaches the pull request comment. Only a drop of the
+// entry's own name proves the exclusion was not applied.
+func TestExecutePlanKeepsPlanningWhenAnUnmatchedEntryIsNotDropped(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
+		PlanId: "plan-typo",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "payments",
+			TableChanges: []*ternv1.TableChange{{
+				TableName: "legacy_audit_log", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+				Ddl: "DROP TABLE `legacy_audit_log`",
+			}},
+		}},
+	}}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type:         storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
+			},
+		},
+		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
+	}
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": mockClient,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// The entry names one table; the plan drops a different one.
+	resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		IgnoreTables: []string{"flyway_schema_hist"},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.NotNil(t, plans.created, "the plan is stored and the unmatched entry is reported, not refused")
+}

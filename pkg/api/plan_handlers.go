@@ -876,6 +876,26 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"pull_request", prInt,
 			"unmatched_entries", unmatched,
 		)
+		// An entry the plan did not withhold and whose exact name it proposes
+		// dropping is not a typo: the target holds that table, so the exclusion
+		// reached a data plane that did not apply it — one that predates the
+		// field and discarded it. Every other unmatched shape names a table
+		// that is not there to drop, so this one is unambiguous, and letting it
+		// through would turn a reviewed exclusion into the drop it was written
+		// to prevent.
+		if dropped := plannedDropsAmong(resp.Changes, unmatched); len(dropped) > 0 {
+			s.logger.Error("plan proposes dropping tables that ignore_tables withholds",
+				"database", req.Database,
+				"environment", req.Environment,
+				"deployment", deployment,
+				"repository", req.Repository,
+				"pull_request", prInt,
+				"tables", dropped,
+			)
+			return nil, nil, fmt.Errorf(
+				"plan for deployment %q proposes dropping table(s) %s that ignore_tables withholds: the target holds them, so the exclusion did not reach the planner and the plan is refused rather than reviewed as a drop; upgrade the deployment's data plane to a build that honors ignore_tables",
+				deployment, strings.Join(dropped, ", "))
+		}
 	}
 
 	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
