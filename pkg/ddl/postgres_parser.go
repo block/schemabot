@@ -7,6 +7,7 @@ import (
 
 	pgproto "github.com/pganalyze/pg_query_go/v6"
 	pgquery "github.com/wasilibs/go-pgquery"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // postgresStatementParser implements StatementParser over libpg_query — the
@@ -521,15 +522,88 @@ func firstDropObjectName(drop *pgproto.DropStmt) string {
 // unchanged when parsing or deparsing fails or when the input contains more
 // than one statement, so canonicalization never truncates its input.
 func (postgresStatementParser) Canonicalize(ddl string) string {
+	return canonicalizePostgres(ddl, func(*pgproto.Node) {})
+}
+
+// CanonicalizeUnqualified implements StatementParser. Before the deparse it
+// clears the schema of every relation reference in the parse tree — the
+// statement's own relation, an index's table, a foreign key's target, an
+// inherited parent — and reduces the qualified names of DROP TABLE and DROP
+// INDEX to the bare object name, so a statement rendered against one physical
+// schema canonicalizes exactly like the same statement rendered against
+// another. Type names and sequence names embedded in expressions are not
+// relation references and keep whatever qualification they carry.
+func (postgresStatementParser) CanonicalizeUnqualified(ddl string) string {
+	return canonicalizePostgres(ddl, func(stmt *pgproto.Node) {
+		unqualifyRelations(stmt.ProtoReflect())
+		unqualifyDropObjects(stmt.GetDropStmt())
+	})
+}
+
+// canonicalizePostgres parses exactly one statement, lets rewrite edit its
+// parse tree, and deparses the result. It returns the input unchanged when
+// parsing or deparsing fails or when the input holds more than one statement,
+// so canonicalization never truncates its input.
+func canonicalizePostgres(ddl string, rewrite func(stmt *pgproto.Node)) string {
 	result, err := pgquery.Parse(ddl)
 	if err != nil || len(result.GetStmts()) != 1 {
 		return ddl
 	}
+	stmt := result.GetStmts()[0].GetStmt()
+	rewrite(stmt)
 	canonical, err := pgquery.Deparse(result)
 	if err != nil {
 		return ddl
 	}
-	return restoreDropColumnKeyword(result.GetStmts()[0].GetStmt(), canonical)
+	return restoreDropColumnKeyword(stmt, canonical)
+}
+
+// rangeVarDescriptor identifies relation-reference nodes in a parse tree by
+// message type, so a walk finds them wherever the grammar nests one.
+var rangeVarDescriptor = (&pgproto.RangeVar{}).ProtoReflect().Descriptor()
+
+// unqualifyRelations clears the schema on every relation reference reachable
+// from m, walking nested messages and repeated fields.
+func unqualifyRelations(m protoreflect.Message) {
+	if m.Descriptor().FullName() == rangeVarDescriptor.FullName() {
+		m.Clear(rangeVarDescriptor.Fields().ByName("schemaname"))
+		return
+	}
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		switch {
+		case fd.IsList():
+			if fd.Kind() == protoreflect.MessageKind {
+				list := v.List()
+				for i := 0; i < list.Len(); i++ {
+					unqualifyRelations(list.Get(i).Message())
+				}
+			}
+		case fd.Kind() == protoreflect.MessageKind:
+			unqualifyRelations(v.Message())
+		}
+		return true
+	})
+}
+
+// unqualifyDropObjects reduces each dropped table or index to its bare name.
+// Drop targets are qualified-name component lists rather than relation
+// references, so the relation walk does not reach them. Drops of other object
+// kinds are outside the DDL vocabulary drift admits and are left as written.
+func unqualifyDropObjects(drop *pgproto.DropStmt) {
+	if drop == nil {
+		return
+	}
+	switch drop.GetRemoveType() {
+	case pgproto.ObjectType_OBJECT_TABLE, pgproto.ObjectType_OBJECT_INDEX:
+	default:
+		return
+	}
+	for _, object := range drop.GetObjects() {
+		list := object.GetList()
+		if items := list.GetItems(); len(items) > 1 {
+			list.Items = items[len(items)-1:]
+		}
+	}
 }
 
 // restoreDropColumnKeyword reinstates the optional COLUMN keyword the

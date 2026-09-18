@@ -322,6 +322,45 @@ func TestCompareChangeSets_PostgresDialect(t *testing.T) {
 	require.Error(t, err, "PostgreSQL DDL judged under the MySQL grammar must fail closed")
 }
 
+// Two PostgreSQL targets that map the same canonical namespace to differently
+// named physical schemas plan the same change with different schema
+// qualifiers in the DDL. The namespace is already the key, so the qualifier
+// is not drift; a real difference under the qualifiers still is.
+func TestCompareChangeSets_PostgresPhysicalSchemaQualifierIsNotDrift(t *testing.T) {
+	regionSet := func(physicalSchema, alterColumn string) ChangeSet {
+		q := `"` + physicalSchema + `".`
+		return ChangeSet{Changes: []*ternv1.SchemaChange{{
+			Namespace: "orders",
+			TableChanges: []*ternv1.TableChange{
+				{
+					TableName:  "agency_config",
+					Ddl:        "ALTER TABLE " + q + "agency_config ADD COLUMN " + alterColumn + " text",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+					Namespace:  "orders",
+				},
+				{
+					TableName: "recall",
+					Ddl: "CREATE TABLE " + q + "recall (id bigserial NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id));\n" +
+						"CREATE INDEX idx_recall_consumer_uuid ON " + q + "recall USING btree (consumer_uuid)",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE,
+					Namespace:  "orders",
+				},
+			},
+		}}}
+	}
+
+	diff, err := CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "recall_file_prefix"), regionSet("orders-region-b", "recall_file_prefix"))
+	require.NoError(t, err)
+	assert.True(t, diff.Empty(), "the same change on differently named physical schemas must match: %+v", diff)
+
+	diff, err = CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "recall_file_prefix"), regionSet("orders-region-b", "recall_file_suffix"))
+	require.NoError(t, err)
+	require.Len(t, diff.MissingFromCandidate, 1, "a different column under a different qualifier must still diverge")
+	require.Len(t, diff.UnexpectedInCandidate, 1)
+	assert.Equal(t, "agency_config", diff.MissingFromCandidate[0].Table)
+	assert.Equal(t, "agency_config", diff.UnexpectedInCandidate[0].Table)
+}
+
 // A dialect with no registered parser gives the comparison no grammar to
 // canonicalize with, so it fails closed instead of guessing — even when both
 // change sets are empty and would trivially match.
