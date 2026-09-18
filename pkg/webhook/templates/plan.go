@@ -579,7 +579,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	// Count statement types (Terraform-style: X to create, Y to alter, Z to drop)
-	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
+	creates, alters, drops, other := countStatementTypes(data.Changes, data.DatabaseType)
 
 	var parts []string
 	if creates > 0 {
@@ -591,14 +591,18 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("**%d** %s to drop", drops, pluralize("table", drops)))
 	}
-	// Last-resort total: when nothing classified as create/alter/drop — a plan
-	// of only index or rename DDL, or per-shard-only DDL that
-	// countStatementTypes does not walk — report the raw statement total so
-	// the plan never reads as "no changes", and report it before the vschema
-	// clause so a vschema update never hides DDL the plan will run. A mixed
-	// plan with a non-zero typed count renders only the typed counts, so its
-	// untyped statements are not reflected here; SummarizeChanges shares this
-	// behavior, keeping the two surfaces in agreement.
+	// Statements outside the create/alter/drop buckets (types, extensions,
+	// comments, indexes) still run, so a mixed plan names them alongside the
+	// table counts rather than letting the typed counts imply they are all
+	// there is.
+	if other > 0 && len(parts) > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", other, pluralize("statement", other)))
+	}
+	// A plan with no create/alter/drop at all — only unbucketed DDL, or
+	// per-shard-only DDL that countStatementTypes does not walk — reports the
+	// raw statement total so it never reads as "no changes", and reports it
+	// before the vschema clause so a vschema update never hides DDL the plan
+	// will run.
 	if len(parts) == 0 && totalStatements > 0 {
 		parts = append(parts, fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements)))
 	}
@@ -794,7 +798,7 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 // create/alter/drop and vschema counting is identical to the plan comment's
 // summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
-	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
+	creates, alters, drops, other := countStatementTypes(data.Changes, data.DatabaseType)
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
 	var parts []string
@@ -807,12 +811,16 @@ func SummarizeChanges(data PlanCommentData) string {
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("%d %s", drops, pluralize("drop", drops)))
 	}
+	// Mirrors the plan comment: unbucketed DDL in a mixed plan is named next
+	// to the typed counts so the Change column agrees with the comment.
+	if other > 0 && len(parts) > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", other, pluralize("statement", other)))
+	}
 	ddlSummary := strings.Join(parts, ", ")
 
-	// Fallback matching the plan comment: statements that classify as none of
-	// create/alter/drop — or per-shard-only DDL that countStatementTypes does not
-	// walk — still count. Report the raw statement total so the Change column
-	// never implies "no changes" for a plan that has them.
+	// A plan with no create/alter/drop at all — only unbucketed DDL, or
+	// per-shard-only DDL that countStatementTypes does not walk — reports the
+	// raw statement total so the Change column never implies "no changes".
 	if ddlSummary == "" && totalStatements > 0 {
 		ddlSummary = fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements))
 	}
@@ -827,19 +835,20 @@ func SummarizeChanges(data PlanCommentData) string {
 	return ddlSummary
 }
 
-// countStatementTypes counts CREATE, ALTER, and DROP statements across all
+// countStatementTypes counts CREATE, ALTER, DROP, and other statements across all
 // keyspaces with each dialect's parser, counting a valid greenfield create set
 // as one create. A database type with no
-// registered parser, or a statement its parser rejects, contributes nothing
-// to the typed counts — the callers' raw statement-total fallbacks keep the
-// summary honest — and each case is logged so a miscounted summary is
-// triageable from server logs.
-func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops int) {
+// registered parser, a statement its parser rejects, or a recognized statement
+// outside the table buckets contributes to other so the summary stays complete.
+func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops, other int) {
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
 	if err != nil {
-		slog.Warn("plan summary cannot classify statements; the summary will report raw statement totals instead of create/alter/drop counts",
+		slog.Warn("plan summary cannot classify statements; the summary will report them as other statements instead of create/alter/drop counts",
 			"database_type", databaseType, "error", err)
-		return 0, 0, 0
+		for _, ks := range changes {
+			other += len(ks.Statements)
+		}
+		return 0, 0, 0, other
 	}
 	for _, ks := range changes {
 		for _, stmt := range ks.Statements {
@@ -850,6 +859,7 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 					slog.Warn("plan summary could not classify a statement or parse it as a supported create set; it is left out of the create/alter/drop counts",
 						"database_type", databaseType, "keyspace", ks.Keyspace,
 						"classify_error", classifyErr, "create_set_error", createSetErr)
+					other++
 					continue
 				}
 				stmtType = createSet.Type
@@ -861,6 +871,8 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 				alters++
 			case ddl.StatementDropTable:
 				drops++
+			default:
+				other++
 			}
 		}
 	}

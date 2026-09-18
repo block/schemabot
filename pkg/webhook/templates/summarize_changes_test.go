@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -54,10 +55,11 @@ func TestSummarizeChanges(t *testing.T) {
 				},
 			}},
 		}
-		creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
+		creates, alters, drops, other := countStatementTypes(data.Changes, data.DatabaseType)
 		assert.Equal(t, 1, creates)
 		assert.Zero(t, alters)
 		assert.Zero(t, drops)
+		assert.Zero(t, other)
 	})
 
 	t.Run("does not count a MySQL create index as a table change", func(t *testing.T) {
@@ -65,11 +67,64 @@ func TestSummarizeChanges(t *testing.T) {
 			Keyspace:   "orders",
 			Statements: []string{"CREATE INDEX `i` ON `t` (`v`)"},
 		}}
-		creates, alters, drops := countStatementTypes(changes, "mysql")
+		creates, alters, drops, other := countStatementTypes(changes, "mysql")
 		assert.Zero(t, creates)
 		assert.Zero(t, alters)
 		assert.Zero(t, drops)
+		assert.Equal(t, 1, other)
 	})
+
+	tests := []struct {
+		name            string
+		statements      []string
+		wantSummary     string
+		wantPlanSummary string
+	}{
+		{
+			name: "mixed table and other statements",
+			statements: []string{
+				"ALTER TABLE orders ADD COLUMN state text",
+				"CREATE TYPE order_state AS ENUM ('new', 'paid')",
+				"COMMENT ON TABLE orders IS 'customer orders'",
+			},
+			wantSummary:     "1 alter, 2 other DDL statements",
+			wantPlanSummary: "📋 **Plan**: **1** table to alter, 2 other DDL statements\n\n",
+		},
+		{
+			name:            "one table change and one other statement",
+			statements:      []string{"ALTER TABLE orders ADD COLUMN state text", "CREATE TYPE order_state AS ENUM ('new', 'paid')"},
+			wantSummary:     "1 alter, 1 other DDL statement",
+			wantPlanSummary: "📋 **Plan**: **1** table to alter, 1 other DDL statement\n\n",
+		},
+		{
+			name:            "only unbucketed statements keep the raw total",
+			statements:      []string{"CREATE TYPE order_state AS ENUM ('new', 'paid')", "COMMENT ON TABLE orders IS 'customer orders'"},
+			wantSummary:     "2 DDL statements",
+			wantPlanSummary: "📋 **Plan**: 2 DDL statements\n\n",
+		},
+		{
+			name:            "bucketed statements stay unchanged",
+			statements:      []string{"ALTER TABLE orders ADD COLUMN state text"},
+			wantSummary:     "1 alter",
+			wantPlanSummary: "📋 **Plan**: **1** table to alter\n\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := PlanCommentData{
+				DatabaseType: "postgres",
+				Changes: []KeyspaceChangeData{{
+					Keyspace:   "orders",
+					Statements: tt.statements,
+				}},
+			}
+
+			assert.Equal(t, tt.wantSummary, SummarizeChanges(data))
+			var summary strings.Builder
+			writePlanSummary(&summary, data, len(tt.statements), 0)
+			assert.Equal(t, tt.wantPlanSummary, summary.String())
+		})
+	}
 
 	t.Run("appends vschema updates for non-MySQL", func(t *testing.T) {
 		data := PlanCommentData{
