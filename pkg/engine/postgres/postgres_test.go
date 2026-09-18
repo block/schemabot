@@ -700,6 +700,42 @@ func TestBlockOversizedTableLogsNonSizeRefusalOnFullyBlockedPlan(t *testing.T) {
 	assert.Contains(t, logs.String(), "refusal=not-a-table")
 }
 
+func TestBlockOversizedTableKeepsFullyBlockedPlanWhenStepCannotBeClassified(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	want := []engine.TableChange{{
+		Table:         "users",
+		DDL:           "ALTER TABLE public.users ADD COLUMN email text; ALTER TABLE public.users ADD COLUMN phone text",
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    "earlier gate verdict",
+	}}
+	changes := append([]engine.TableChange(nil), want...)
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes)
+}
+
+func TestBlockOversizedTableFailsWhenExecutableStepCannotBeClassified(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text; ALTER TABLE public.users ADD COLUMN phone text",
+	}}
+
+	_, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
+}
+
 func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
 	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
 		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
@@ -726,6 +762,25 @@ func TestBlockOversizedTableRequiresTargetTable(t *testing.T) {
 	_, err := blockOversizedTable(t.Context(), nil, "orders_db", report, changes, 1)
 	require.Error(t, err)
 	assert.EqualError(t, err, "plan report carries executable steps but names no target table")
+}
+
+func TestBlockOversizedTableKeepsFullyBlockedPlanWithoutTargetTable(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		t.Fatal("size lookup must not run without a target table")
+		return preflight.PreflightedTable{}, nil
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	want := []engine.TableChange{{
+		Table:         "users",
+		DDL:           "ALTER TABLE public.users ADD COLUMN email text",
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    "earlier gate verdict",
+	}}
+	changes := append([]engine.TableChange(nil), want...)
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes)
 }
 
 // An operational size-check failure fails the plan closed instead of leaving

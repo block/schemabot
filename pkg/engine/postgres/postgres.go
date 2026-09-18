@@ -623,6 +623,14 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
 		if err := blockRewriteSteps(changes, reason); err != nil {
+			if fullyBlocked {
+				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"error", err)
+				return changes, nil
+			}
 			return nil, err
 		}
 		return changes, nil
@@ -649,10 +657,14 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // is bounded by its duration envelope rather than the table size ceiling. An
 // earlier blocked verdict retains its reason and gains the independent size
 // cause so the operator can resolve both without another planning round trip.
-// Every executable step here was parsed when its privilege tier was derived,
-// so a statement that fails to classify is an invariant violation and fails
-// planning rather than being exempted or blocked on a guess.
+// parser.Classify in tableChanges parsed every rendered statement, including
+// blocked steps, with the same single-statement requirements used here. A
+// statement that now fails to classify is therefore an invariant violation.
+// Every step is classified before any verdict is written, so a caller that
+// keeps the plan on that error keeps it exactly as it was rather than with
+// the size cause on some steps and not others.
 func blockRewriteSteps(changes []engine.TableChange, reason string) error {
+	concurrentIndexes := make([]bool, len(changes))
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
@@ -661,7 +673,13 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 		if err != nil {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
-		if concurrentIndex {
+		concurrentIndexes[i] = concurrentIndex
+	}
+	for i := range changes {
+		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
+			continue
+		}
+		if concurrentIndexes[i] {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
