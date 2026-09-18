@@ -13,6 +13,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/serve"
 )
@@ -137,11 +138,15 @@ func (cmd *LocalManagedCmd) Run(ctx context.Context, g *Globals) error {
 }
 
 type LocalStatusCmd struct {
-	ID string `arg:"" help:"Runtime ID"`
+	ID string `arg:"" optional:"" help:"Runtime ID (defaults to the selected profile’s local runtime)"`
 }
 
-func (cmd *LocalStatusCmd) Run(ctx context.Context) error {
-	dir, err := localruntime.Directory(cmd.ID)
+func (cmd *LocalStatusCmd) Run(ctx context.Context, g *Globals) error {
+	id, err := resolveLocalRuntimeID(cmd.ID, g.Profile)
+	if err != nil {
+		return err
+	}
+	dir, err := localruntime.Directory(id)
 	if err != nil {
 		return err
 	}
@@ -153,11 +158,15 @@ func (cmd *LocalStatusCmd) Run(ctx context.Context) error {
 }
 
 type LocalStopCmd struct {
-	ID string `arg:"" help:"Runtime ID"`
+	ID string `arg:"" optional:"" help:"Runtime ID (defaults to the selected profile’s local runtime)"`
 }
 
-func (cmd *LocalStopCmd) Run(ctx context.Context) error {
-	dir, err := localruntime.Directory(cmd.ID)
+func (cmd *LocalStopCmd) Run(ctx context.Context, g *Globals) error {
+	id, err := resolveLocalRuntimeID(cmd.ID, g.Profile)
+	if err != nil {
+		return err
+	}
+	dir, err := localruntime.Directory(id)
 	if err != nil {
 		return err
 	}
@@ -167,4 +176,31 @@ func (cmd *LocalStopCmd) Run(ctx context.Context) error {
 	return json.NewEncoder(os.Stdout).Encode(struct {
 		State string `json:"state"`
 	}{State: "stopped"})
+}
+
+// Explicit runtime IDs remain independent of profiles, including remote ones.
+// Only an unconfigured selection may fall back to the conventional local ID.
+func resolveLocalRuntimeID(id, profileFlag string) (string, error) {
+	if id != "" {
+		return id, nil
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return "", err
+	}
+	name := client.ResolveProfileName(cfg, profileFlag)
+	profile, exists := cfg.Profiles[name]
+	if !exists {
+		if profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != "" || cfg.DefaultProfile != "" || len(cfg.Profiles) > 0 {
+			return "", fmt.Errorf("unknown profile %q; select a local profile or provide a runtime ID", name)
+		}
+		return "local", nil
+	}
+	if profile.LocalRuntime == "" {
+		return "", fmt.Errorf("profile %q does not select a local runtime; provide a runtime ID or select a local profile", name)
+	}
+	if profile.Endpoint != "" || profile.Token != "" || profile.RefreshToken != "" || profile.OIDC != nil {
+		return "", fmt.Errorf("profile %q mixes a local runtime with remote connection settings; provide a runtime ID or select an unambiguous local profile", name)
+	}
+	return profile.LocalRuntime, nil
 }
