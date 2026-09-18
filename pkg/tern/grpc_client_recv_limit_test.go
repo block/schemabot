@@ -96,6 +96,34 @@ func TestGRPCClientPullSchemaAcceptsResponseOverGRPCDefault(t *testing.T) {
 		"fixture must serialize above gRPC's default limit to prove the raised ceiling is in effect")
 }
 
+// The default ceiling is a real bound, not just a raised one: a client that
+// configures nothing still refuses a response above it rather than buffering
+// whatever a deployment sends. The fixture is sized from the constant, so the
+// bound stays pinned if the default moves.
+func TestGRPCClientPullSchemaRefusesResponseOverDefaultCeiling(t *testing.T) {
+	const ddlBytes = 4096
+	server := &bigPullTernServer{
+		tableCount: DefaultMaxRecvMsgBytes/ddlBytes + 64,
+		ddlBytes:   ddlBytes,
+	}
+
+	// Measure the fixture through the same builder the server answers with, so
+	// the test cannot silently stop exceeding the ceiling it is checking.
+	probe, err := server.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
+	require.NoError(t, err)
+	require.Greater(t, proto.Size(probe), DefaultMaxRecvMsgBytes,
+		"fixture must serialize above the default ceiling for this test to bound anything")
+
+	client := newRecvLimitTestClient(t, server, Config{})
+
+	_, err = client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "wide",
+		Environment: "production",
+	})
+	require.Error(t, err, "a response above the default ceiling must be refused")
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+}
+
 // The ceiling stays a ceiling: a configured limit is honored, so an oversized
 // response is refused rather than buffered without bound.
 func TestGRPCClientPullSchemaHonorsConfiguredRecvLimit(t *testing.T) {
