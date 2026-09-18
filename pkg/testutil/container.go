@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -83,21 +84,41 @@ func ColumnExists(t *testing.T, db *sql.DB, schemaName, tableName, columnName st
 	return count > 0
 }
 
+// IndexColumns returns the columns of indexName on schemaName.tableName in key
+// order, or nil when no such index exists. One call therefore answers both
+// whether an index survived and whether it survived intact.
+//
+// Both the `information_schema.STATISTICS` view it reads and its `?`
+// placeholders are MySQL-only; PostgreSQL names indexes database-wide and needs
+// its own query.
+func IndexColumns(t *testing.T, db *sql.DB, schemaName, tableName, indexName string) []string {
+	t.Helper()
+
+	rows, err := db.QueryContext(t.Context(),
+		`SELECT COLUMN_NAME FROM information_schema.STATISTICS
+		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
+		 ORDER BY SEQ_IN_INDEX`,
+		schemaName, tableName, indexName,
+	)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+
+	var columns []string
+	for rows.Next() {
+		var column string
+		require.NoError(t, rows.Scan(&column))
+		columns = append(columns, column)
+	}
+	require.NoError(t, rows.Err())
+	return columns
+}
+
 // IndexExists reports whether indexName exists on schemaName.tableName on a
-// MySQL connection. Both the `information_schema.statistics` view it reads and
-// its `?` placeholders are MySQL-only; PostgreSQL names indexes database-wide
-// and needs its own query.
+// MySQL connection.
 func IndexExists(t *testing.T, db *sql.DB, schemaName, tableName, indexName string) bool {
 	t.Helper()
 
-	var count int
-	err := db.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM information_schema.statistics
-		 WHERE table_schema = ? AND table_name = ? AND index_name = ?`,
-		schemaName, tableName, indexName,
-	).Scan(&count)
-	require.NoError(t, err)
-	return count > 0
+	return len(IndexColumns(t, db, schemaName, tableName, indexName)) > 0
 }
 
 func retryContainerOp(ctx context.Context, opName string, op func() (string, error)) (string, error) {

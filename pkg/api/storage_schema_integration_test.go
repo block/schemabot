@@ -114,10 +114,13 @@ func TestDiffStorageSchemaMySQL_ReportsMissingColumn(t *testing.T) {
 	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
 
 	// Put the database back into the state a partly converged deploy leaves:
-	// the table is there, one column the embedded schema declares is not.
-	_, err := db.ExecContext(t.Context(), "ALTER TABLE `applies` DROP COLUMN `deployment`")
+	// the table is there, one column the embedded schema declares is not. The
+	// column is one no index covers, so the diff is the missing column and
+	// nothing else: dropping an indexed column narrows the index with it, and
+	// the diff of a narrowed index is a removal the convergence refuses.
+	_, err := db.ExecContext(t.Context(), "ALTER TABLE `applies` DROP COLUMN `caller`")
 	require.NoError(t, err, "drop a column the embedded schema declares")
-	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "deployment"))
+	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "caller"))
 
 	report, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
@@ -131,14 +134,14 @@ func TestDiffStorageSchemaMySQL_ReportsMissingColumn(t *testing.T) {
 	assert.Equal(t, "applies", statement.Table)
 	assert.Equal(t, "alter_table", statement.Operation)
 	assert.Contains(t, statement.DDL, "ADD COLUMN")
-	assert.Contains(t, statement.DDL, "`deployment`")
+	assert.Contains(t, statement.DDL, "`caller`")
 
 	// Applying the reported statement is what converges it, and nothing else
 	// is left behind.
 	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
 	require.NoError(t, err)
 	assert.True(t, remaining.Converged(), "the reported statement should be the whole difference")
-	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "deployment"))
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "caller"))
 }
 
 // A storage database holding a table the embedded schema does not declare —
@@ -184,16 +187,16 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusTable(t *testing.T) {
 	assert.Equal(t, "newer_release_state", allowed.Destructive[0].Table)
 }
 
-// A surplus index is reported as a statement that runs, not as a refused one —
-// unlike a surplus table or column. Dropping an index destroys no data, so it
-// is outside the destructive set that protects newer storage state from an
-// older binary.
+// A surplus index is reported as refused, the same as a surplus table or
+// column. Dropping one destroys no rows and still takes an index the rest of
+// the fleet plans its queries around away from them, so it is inside the set
+// that protects newer storage state from an older binary (AV-9).
 //
-// The asymmetry is what an operator pre-creating an index ahead of a release
-// has to plan around: the index survives only as long as no instance of the
-// earlier release boots, because that boot converges it away. A diff run with
-// the earlier release's binary is what says so before it happens.
-func TestDiffStorageSchemaMySQL_SurplusIndexIsNotProtected(t *testing.T) {
+// That is what an operator pre-creating an index ahead of a release relies on:
+// an instance of the earlier release booting against that index leaves it in
+// place, and a diff run with the earlier release's binary says so, naming the
+// statement it will not run.
+func TestDiffStorageSchemaMySQL_RefusesSurplusIndex(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
 
@@ -201,27 +204,82 @@ func TestDiffStorageSchemaMySQL_SurplusIndexIsNotProtected(t *testing.T) {
 	// an operator pre-creates one to keep the startup budget clear.
 	_, err := db.ExecContext(t.Context(), "CREATE INDEX `idx_applies_caller` ON `applies` (`caller`)")
 	require.NoError(t, err, "pre-create an index the embedded schema does not declare")
-	require.True(t, testutil.IndexExists(t, db, sdb.Name, "applies", "idx_applies_caller"))
+	require.Equal(t, []string{"caller"}, testutil.IndexColumns(t, db, sdb.Name, "applies", "idx_applies_caller"))
 
 	report, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 
-	assert.False(t, report.Converged())
-	assert.Empty(t, report.Destructive, "dropping an index destroys no data, so it is not refused")
+	assert.False(t, report.Converged(), "a refused statement is not convergence")
+	assert.False(t, report.DestructiveAllowed)
+	assert.Empty(t, report.Outstanding, "the drop is the only difference, and it is refused")
 	assert.Empty(t, report.Manual)
-	require.Len(t, report.Outstanding, 1, "only the one table diverges: %v", statementTables(report.Outstanding))
-	statement := report.Outstanding[0]
+	require.Len(t, report.Destructive, 1, "only the one table diverges: %v", statementTables(report.Destructive))
+	statement := report.Destructive[0]
 	assert.Equal(t, "applies", statement.Table)
 	assert.Equal(t, "alter_table", statement.Operation)
 	assert.Contains(t, statement.DDL, "idx_applies_caller")
+	assert.NotEmpty(t, statement.Reason, "a refusal has to say why it was refused")
 
-	// And a convergence removes it, which is exactly what a boot of this binary
-	// would do to an index a later release owns.
+	// And a convergence leaves it intact, which is what a boot of this binary
+	// does to an index a later release owns.
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	require.NoError(t, err, "a convergence that refuses destructive statements still succeeds")
+	assert.Len(t, remaining.Destructive, 1, "the refused statement is still outstanding afterwards")
+	assert.Equal(t, []string{"caller"}, testutil.IndexColumns(t, db, sdb.Name, "applies", "idx_applies_caller"),
+		"a surplus index must survive intact, like a surplus table or column")
+
+	// An operator who removed the index from the embedded schema on purpose
+	// opts in, and the report then says the statement would run.
+	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithAllowDestructiveSchemaChanges(true))
+	require.NoError(t, err)
+	assert.True(t, allowed.DestructiveAllowed)
+	require.Len(t, allowed.Destructive, 1)
+	assert.Equal(t, "applies", allowed.Destructive[0].Table)
+}
+
+// One table can drift in both directions at once: it misses a column the
+// running binary declares and holds an index a later release owns. The differ
+// emits that as a single ALTER, and the report has to say what the boot will
+// actually do with it, which is run the addition and withhold the drop. An
+// operator reading only "destructive" here would expect the column to stay
+// missing and go looking for a convergence that never comes.
+func TestDiffStorageSchemaMySQL_ReportsBothHalvesOfAMixedStatement(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
+
+	const missingColumn = "throttle_reason"
+	_, err := db.ExecContext(t.Context(), "CREATE INDEX `idx_tasks_later_release` ON `tasks` (`environment`)")
+	require.NoError(t, err, "pre-create an index the embedded schema does not declare")
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err, "drop a column the embedded schema does declare")
+
+	report, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.False(t, report.Converged())
+
+	require.Len(t, report.Outstanding, 1, "the addition is reported as a statement that will run: %v", statementTables(report.Outstanding))
+	assert.Equal(t, "tasks", report.Outstanding[0].Table)
+	assert.Contains(t, report.Outstanding[0].DDL, missingColumn)
+	assert.NotContains(t, report.Outstanding[0].DDL, "DROP",
+		"the half that will run carries no removal")
+
+	require.Len(t, report.Destructive, 1, "the removal is reported as a statement that will not run")
+	assert.Equal(t, "tasks", report.Destructive[0].Table)
+	assert.Contains(t, report.Destructive[0].DDL, "idx_tasks_later_release")
+	assert.NotContains(t, report.Destructive[0].DDL, missingColumn,
+		"the half that will not run carries no addition")
+	assert.NotEmpty(t, report.Destructive[0].Reason)
+
+	// The convergence does what the report said: the column lands, the index
+	// survives, and the refusal is still outstanding afterwards.
 	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
 	require.NoError(t, err)
-	assert.True(t, remaining.Converged())
-	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "applies", "idx_applies_caller"),
-		"a surplus index is converged away, unlike a surplus table or column")
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the addition the report listed as outstanding must have run")
+	assert.Equal(t, []string{"environment"}, testutil.IndexColumns(t, db, sdb.Name, "tasks", "idx_tasks_later_release"),
+		"the index a later release owns must survive")
+	assert.Empty(t, remaining.Outstanding, "nothing additive is left")
+	assert.Len(t, remaining.Destructive, 1, "the withheld clause is still waiting for an operator")
 }
 
 // A diff is safe to run against a storage database another process is

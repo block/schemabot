@@ -470,12 +470,12 @@ func TestOutputStorageSchemaPlan_ManualEntryIsOneLinePerStatement(t *testing.T) 
 }
 
 // A destructive statement's reason is one finding, however it is punctuated.
-// The convergence writes one for a statement whose destructive clauses could
-// not be partitioned, and it names the classification and then what that meant
-// for the statement — two halves of one sentence. Numbered as two findings, the
-// second would read as a separate statement that was also refused.
+// The plan joins every linter that erred on one statement into a single reason,
+// so a combined ALTER that both loses data and removes an index carries two
+// semicolon-joined messages about the one statement. Numbered as two findings,
+// the second would read as a separate statement that was also refused.
 func TestOutputStorageSchemaPlan_DestructiveReasonIsOneFinding(t *testing.T) {
-	reason := "DROP COLUMN destroys data; refused whole because its clauses could not be partitioned: unsupported clause"
+	reason := "Unsafe operation detected: \"DROP COLUMN\"; Index \"idx_state\" should be made invisible before dropping to ensure it's not needed"
 	report := &apitypes.StorageSchemaReport{
 		Dialect:      "mysql",
 		Database:     "schemabot",
@@ -483,7 +483,7 @@ func TestOutputStorageSchemaPlan_DestructiveReasonIsOneFinding(t *testing.T) {
 		Destructive: []apitypes.StorageSchemaStatement{{
 			Table:     "applies",
 			Operation: "alter_table",
-			DDL:       "ALTER TABLE `applies` DROP COLUMN `caller`",
+			DDL:       "ALTER TABLE `applies` DROP COLUMN `caller`, DROP INDEX `idx_state`",
 			Reason:    reason,
 		}},
 	}

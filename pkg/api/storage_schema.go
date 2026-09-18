@@ -180,10 +180,12 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 // planMySQLStorageSchema diffs the desired MySQL schema files against the live
 // storage database with Spirit's differ — the same Plan call ensureMySQLSchema
 // makes, so the two cannot disagree about what a boot would run. Spirit emits
-// one combined ALTER per table, and partitionDestructiveChanges splits it the
-// way the bootstrap would, so a mixed ALTER is reported as the additive clauses
-// that run plus the destructive clauses that are refused, not as one statement
-// whose disposition an operator has to guess.
+// one combined ALTER per table, and partitionDestructiveChanges sorts those
+// statements the way the bootstrap would, so each one is reported as the boot
+// would treat it rather than as a statement whose disposition an operator has to
+// guess. A statement the boot would reduce to its additions is reported that
+// way too: the additions under Outstanding, the withheld clauses under
+// Destructive, which is what the two halves will actually do.
 func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSource, o ensureSchemaOptions) (*StorageSchemaReport, error) {
 	report := &StorageSchemaReport{
 		Dialect:            schema.DialectMySQL,
@@ -221,10 +223,7 @@ func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSch
 		return report, nil
 	}
 
-	allowed, refused, err := partitionDestructiveChanges(planResult.Changes)
-	if err != nil {
-		return nil, fmt.Errorf("classify storage schema changes on database %q: %w", diag.database, err)
-	}
+	allowed, refused := partitionDestructiveChanges(planResult.Changes)
 	for _, tc := range flatTableChanges(allowed) {
 		operation, err := storageSchemaOperation(tc.Operation)
 		if err != nil {
@@ -245,7 +244,7 @@ func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSch
 			Table:     r.change.Table,
 			Operation: operation,
 			DDL:       r.change.DDL,
-			Reason:    r.reportedReason(),
+			Reason:    r.reason,
 		})
 	}
 	return report, nil
@@ -325,18 +324,6 @@ func planPostgresStorageSchema(ctx context.Context, dsn string, desired *Storage
 		}
 	}
 	return report, nil
-}
-
-// reportedReason is the refusal reason for an operator-facing report. A split
-// refusal and a whole refusal both carry Spirit's classification; a refusal
-// that happened because the clauses could not be partitioned says so, because
-// that is the difference between "these clauses are refused" and "none of this
-// statement ran".
-func (r refusedStorageChange) reportedReason() string {
-	if r.splitErr != nil {
-		return fmt.Sprintf("%s; refused whole because its clauses could not be partitioned: %v", r.reason, r.splitErr)
-	}
-	return r.reason
 }
 
 // newEnsureSchemaOptions applies opts over the defaults every entry point

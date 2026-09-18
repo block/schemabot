@@ -1029,22 +1029,43 @@ on the storage dialect:
 
 The rest of this section describes the MySQL flow.
 
-By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped. A mixed
-`ALTER TABLE` is split: its additive clauses still execute and only the
-destructive clauses are refused, except that a clause which cannot run
-without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change)
-is refused with it. The remaining non-destructive statements still apply and
-startup proceeds. This protects
-against rolling deploys and rollbacks: a pod running an older binary sees a
-newer binary's tables and columns as surplus, and without the gate would drop
-them (destroying data the newer pods depend on). Each refused statement is
-logged at warn level with the exact DDL, and counted in the
+By default, destructive statements in that diff are refused and skipped. A
+statement is destructive when the plan's own linters report an error against it,
+which is the same verdict an operator sees from `schemabot storage plan` and the
+same one Spirit's `--allow-unsafe` gate reads for a user schema change. For the
+storage schema that covers two kinds of statement:
+
+- Statements that lose data — `DROP TABLE`, or an `ALTER TABLE` containing
+  `DROP COLUMN`.
+- Statements that remove an index. An index drop destroys no rows and completes
+  in milliseconds because it is metadata-only, and it can still take the
+  database down by regressing the plan of a query the rest of the fleet is
+  running.
+
+Both arrive from the same cause: the live storage database holds a table,
+column, or index that the starting binary's embedded schema does not declare.
+Nothing else in the diff can be unsafe, because the storage schema declares no
+foreign keys, check constraints, or named constraints to drop, and a declarative
+diff expresses no renames.
+
+The verdict is per statement, but SchemaBot's differ emits one combined `ALTER`
+per table, so a statement can carry a drop and an addition the starting binary
+requires. Rather than withhold both, the bootstrap reduces such a statement to
+the clauses that only add a schema object: those run and the removals do not.
+A clause that cannot execute until a withheld one has run is withheld with it,
+which is how an index or a primary key whose definition changed arrives, as a
+drop and an add of one name in one statement. A statement left with nothing to
+add is refused entire. Either way the statements that were not refused still
+apply and startup proceeds. This protects against rolling deploys and rollbacks: a pod
+running an older binary sees a newer binary's tables, columns, and indexes as
+surplus, and without the gate would remove them from under the pods that depend
+on them. Every refusal is logged at warn level with the exact DDL that did not
+run, and counted in the
 `schemabot.storage_schema.destructive_refusals_total` metric.
 
-To intentionally remove a storage table or column, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then
-opt in:
+To intentionally remove any of these objects, first make sure every running pod
+is on a binary whose embedded schema no longer declares the table, column, or
+index that is going away. Then opt in:
 
 ```yaml
 storage:
@@ -1053,7 +1074,9 @@ storage:
 ```
 
 Leave the flag false during normal operation and revert it after the removal
-converges.
+converges. An operator who would rather not widen a deploy's standing policy to
+converge one removal can run `schemabot storage apply --allow-unsafe` instead,
+which permits the same statements for that one convergence.
 
 ## Support Channel
 

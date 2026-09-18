@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
@@ -42,6 +44,35 @@ func TestEnsureSchema(t *testing.T) {
 	// rely on it.
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", "apply_operation_id"),
 		"tasks.apply_operation_id column not found")
+}
+
+// A cold bootstrap must refuse nothing. The refusal gate reads the plan's
+// unsafe verdict, which the engine sets when any of its linters reports an
+// error against a statement — not only the removals this gate exists to stop.
+// So a new embedded schema file that trips any other error-level rule would be
+// refused rather than created, and because refusing is deliberately not a
+// startup failure, the table would simply never exist while every pod reported
+// a healthy boot. Walking the embedded schema rather than a hand-listed set of
+// tables is what makes that fail here, at the point the file is added.
+func TestEnsureSchema_ColdBootstrapCreatesEveryEmbeddedTable(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+
+	require.NoError(t, EnsureSchema(sdb.DSN, logger), "cold EnsureSchema failed")
+
+	entries, err := schema.MySQLFS.ReadDir("mysql")
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "the embedded MySQL schema must not be empty")
+	for _, entry := range entries {
+		table := strings.TrimSuffix(entry.Name(), ".sql")
+		assert.True(t, testutil.TableExists(t, db, sdb.Name, table),
+			"embedded schema declares %s, so a cold bootstrap must create it", table)
+	}
+
+	assert.NotContains(t, logBuf.String(), "refusing destructive storage-schema change",
+		"nothing in the embedded schema may be refused against an empty database")
 }
 
 func TestEnsureSchema_Idempotent(t *testing.T) {
@@ -322,10 +353,10 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 // When the live storage database drifts from the embedded schema on the same
 // table in both directions — it misses a column the starting binary requires
 // and holds a surplus column a newer binary wrote — Spirit's diff emits one
-// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. EnsureSchema must
-// split that statement: the required column is added so the binary can run,
-// while the destructive clause is refused and the surplus column survives.
-func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
+// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. The ADD executes and
+// the DROP does not: the starting binary gets the column its own queries name,
+// the surplus column survives for the newer binary, and startup continues.
+func TestEnsureSchema_RunsTheAdditiveClausesOfAMixedAlter(t *testing.T) {
 	ctx := t.Context()
 	var logBuf syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -344,24 +375,25 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 
 	require.NoError(t, EnsureSchema(dsn, logger),
-		"EnsureSchema with a mixed additive/destructive ALTER must not fail startup")
+		"a mixed ALTER with withheld clauses must not fail startup")
 
-	// The required column was added; the surplus column survived.
+	// The addition ran and the removal did not.
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
-		"missing embedded column must be added even when the same ALTER carries destructive clauses")
+		"the column the starting binary requires must be added, not withheld because a drop rode along with it")
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn),
 		"surplus column from the newer schema must not be dropped by default")
 
-	// The refusal names only the destructive clauses, not the additive ones,
-	// and carries the combined ALTER it was split from.
+	// The warning names the clauses that did not run and the opt-in that would
+	// run them, and says the additions did run so an operator is not left
+	// looking for a column that is already there.
 	logs := logBuf.String()
-	assert.Contains(t, logs, "refusing destructive clauses of a mixed storage-schema ALTER")
-	assert.Contains(t, logs, "split_from_ddl")
+	assert.Contains(t, logs, "withholding the destructive clauses of a storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
 	assert.Contains(t, logs, surplusColumn)
 
-	// A repeat run converges: the additive work is done, the destructive
-	// remainder keeps being refused without error.
-	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
+	// A repeat run withholds the same clause without error or changes, and the
+	// converged column stays converged.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a withheld clause failed")
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn))
 }
@@ -396,6 +428,238 @@ func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
 		"EnsureSchema with a refused primary-key change must not fail startup")
 	assert.Equal(t, 2, primaryKeyColumns(),
 		"the wider live primary key must survive: an ADD PRIMARY KEY cannot execute without the refused DROP PRIMARY KEY")
+}
+
+// surplusIndexName and surplusIndexColumns describe an index that exists in
+// the live storage database but that the starting binary's embedded schema does
+// not declare — the shape a newer binary's index takes to an older one during a
+// rolling deploy or rollback.
+const surplusIndexName = "idx_newer_binary"
+
+var surplusIndexColumns = []string{"environment", "created_at"}
+
+// seedSurplusIndex adds the surplus index to the live `tasks` table. The Spirit
+// diff turns it into an ALTER ... DROP INDEX, which loses no data and so is
+// invisible to Spirit's unsafe vocabulary.
+func seedSurplusIndex(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("ALTER TABLE `tasks` ADD INDEX `%s` (`%s`)", surplusIndexName, strings.Join(surplusIndexColumns, "`,`")))
+	require.NoError(t, err)
+}
+
+// During a rolling deploy or rollback, an older binary's pod starts against a
+// storage database holding an index its embedded schema does not declare. The
+// drop the diff emits loses no data, completes in milliseconds because it is
+// metadata-only, and can still take the database down by regressing the plan of
+// a query the rest of the fleet is running. EnsureSchema must refuse it by
+// default, leave the index intact, and let startup proceed.
+func TestEnsureSchema_RefusesIndexDropByDefault(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+	seedSurplusIndex(t, db)
+	require.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"EnsureSchema with an index drop in the diff must not fail startup")
+
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"a surplus index from the newer schema must survive intact: dropping it loses no data but can regress the fleet's query plans")
+
+	// The refusal names the index and the opt-in, so an operator who removed it
+	// on purpose can see how to proceed.
+	logs := logBuf.String()
+	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
+	assert.Contains(t, logs, "DROP INDEX")
+	assert.Contains(t, logs, surplusIndexName)
+
+	// A repeat run keeps refusing without error or changes.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a refused index drop failed")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+}
+
+// Spirit's diff emits one combined ALTER per table, so an index drop reaches
+// the bootstrap bundled with whatever else that table drifted by — here a
+// column the starting binary requires. The index drop is withheld and the
+// column is added: the index survives intact, which is the refusal's whole
+// purpose, and the binary still gets the column it needs to serve.
+func TestEnsureSchema_RunsTheAdditiveClausesBesideAnIndexDrop(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// Same-table drift in both directions: `tasks` misses an embedded column
+	// the binary requires and holds a surplus index it does not declare.
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"a mixed ALTER with withheld clauses must not fail startup")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column the starting binary requires must be added, not withheld because an index drop rode along with it")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"a surplus index must survive intact: dropping it loses no data but can regress the fleet's query plans")
+
+	// The warning names the index that was protected, so an operator who
+	// removed it on purpose can see how to proceed.
+	logs := logBuf.String()
+	assert.Contains(t, logs, "withholding the destructive clauses of a storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
+	assert.Contains(t, logs, surplusIndexName)
+
+	// A repeat run withholds the same clause without error or changes.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a withheld clause failed")
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+}
+
+// MySQL keeps column names and index names in separate namespaces, so a table
+// can carry an index named the same as one of its columns. When the surplus
+// index a newer binary left behind shares its name with a column the starting
+// binary requires, nothing collides: the column is added while the index drop
+// is withheld. Reading the two names as one namespace would withhold the
+// addition too, and the pod would report a healthy boot and then serve against
+// storage missing a column its own queries name.
+func TestEnsureSchema_AddsAColumnNamedLikeAWithheldIndex(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// The column the starting binary requires is missing, and a surplus index
+	// stands under that same name.
+	const missingColumn = "throttle_reason"
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ADD INDEX `%s` (`%s`)", missingColumn, strings.Join(surplusIndexColumns, "`,`")))
+	require.NoError(t, err)
+	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"a withheld index drop sharing a name with a required column must not fail startup")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column the starting binary requires must be added: an index of the same name occupies a different namespace and collides with nothing")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", missingColumn),
+		"the surplus index must survive intact, whatever it shares its name with")
+}
+
+// A withheld clause stays in the diff for as long as the drift stands, and pods
+// restart for reasons that have nothing to do with a deploy: a node drain, an
+// OOM kill, a scale-up. So the boot after a split must recognize that the
+// additions already landed and reach Spirit with nothing at all. Re-running the
+// additions would put SchemaBot's own tables through a copy on every pod start,
+// against the database the whole fleet reads, which is a worse outage than the
+// drop being refused.
+func TestEnsureSchema_WithheldClauseConvergesWithoutFurtherDDL(t *testing.T) {
+	ctx := t.Context()
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	var boot syncBuffer
+	bootLogger := slog.New(slog.NewTextHandler(&boot, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, bootLogger))
+
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+
+	var first syncBuffer
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.NewTextHandler(&first, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	require.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	require.Contains(t, first.String(), "applying storage schema changes",
+		"the first boot after the drift must apply the additions it partitioned out")
+
+	var second syncBuffer
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.NewTextHandler(&second, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+
+	logs := second.String()
+	assert.Contains(t, logs, "all planned storage schema changes are destructive and refused",
+		"the withheld drop is still outstanding, so every later boot must still refuse it")
+	assert.NotContains(t, logs, "applying storage schema changes",
+		"a converged split must reach Spirit with no DDL on later boots, or every pod restart copies SchemaBot's own tables")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+}
+
+// A rollback starts many pods at once, each running the bootstrap against the
+// same storage database. With a mixed statement in the diff, whichever pod wins
+// the advisory lock partitions it and applies the additions; the others re-plan
+// once the lock frees and find only the refusal left. Every pod must start, the
+// column they all need must exist, and none of them may take the surplus index
+// the rest of the fleet plans around.
+func TestEnsureSchema_ConcurrentPodsDuringRollbackWithholdTheSameDrop(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+
+	podA := startEnsureSchema(t, dsn, logger)
+	podB := startEnsureSchema(t, dsn, logger)
+	podC := startEnsureSchema(t, dsn, logger)
+
+	// Collect every outcome before asserting so a failure in one pod never
+	// leaves another holding the server-wide advisory lock past the test.
+	errA, errB, errC := <-podA, <-podB, <-podC
+	require.NoError(t, errA, "a pod must start while a mixed statement is being partitioned")
+	require.NoError(t, errB, "a pod must start while a mixed statement is being partitioned")
+	require.NoError(t, errC, "a pod must start while a mixed statement is being partitioned")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column every one of these binaries requires must exist once they have all started")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"no pod may drop the surplus index, however many of them raced to converge")
+}
+
+// An operator who intentionally removed an index from the embedded schema opts
+// in to destructive storage-schema changes; EnsureSchema then executes the drop
+// and converges the database to the embedded schema. Without this the flag
+// would be unreachable for indexes and a deliberate removal would have no
+// supported path.
+func TestEnsureSchema_AllowDestructiveExecutesIndexDrop(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+	seedSurplusIndex(t, db)
+	require.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+		"EnsureSchema with destructive changes allowed failed")
+
+	assert.Empty(t, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"surplus index should be dropped when destructive changes are allowed")
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+		"second EnsureSchema not idempotent")
 }
 
 // An operator who intentionally removed a storage table and column opts in to

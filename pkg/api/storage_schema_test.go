@@ -7,7 +7,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/ddl"
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -35,26 +34,6 @@ func TestStorageSchemaOperation_UnexpectedTypeIsAnError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unexpected statement type")
 	assert.Contains(t, err.Error(), "CREATE TABLE")
-}
-
-// A refusal reason says whether the whole statement was refused because its
-// clauses could not be partitioned, which is the difference between "these
-// clauses are refused" and "none of this ran".
-func TestRefusedStorageChange_ReportedReason(t *testing.T) {
-	classified := refusedStorageChange{
-		change: engine.TableChange{Table: "applies"},
-		reason: "DROP COLUMN destroys data",
-	}
-	assert.Equal(t, "DROP COLUMN destroys data", classified.reportedReason())
-
-	unsplittable := refusedStorageChange{
-		change:   engine.TableChange{Table: "applies"},
-		reason:   "DROP COLUMN destroys data",
-		splitErr: assert.AnError,
-	}
-	assert.Contains(t, unsplittable.reportedReason(), "DROP COLUMN destroys data")
-	assert.Contains(t, unsplittable.reportedReason(), "refused whole")
-	assert.Contains(t, unsplittable.reportedReason(), assert.AnError.Error())
 }
 
 // The diff and the bootstrap start from one set of option defaults, so a
