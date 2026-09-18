@@ -250,30 +250,49 @@ can grep their own configs.
 SchemaBot bootstraps its own storage schema at startup (`EnsureSchema`), diffing
 the embedded schema files against the live database and applying what is missing.
 It **refuses destructive statements by default** — both those that lose data and
-those that only remove or rename a schema object, such as a `DROP INDEX`: the
-offending statement is skipped with a warning and a metric, startup continues,
-and the live schema keeps the old shape until an operator opts in with
+those that only remove a schema object, such as a `DROP INDEX`: the offending
+statement is skipped with a warning and a metric, startup continues, and the
+live schema keeps the old shape until an operator opts in with
 `storage.allow_destructive_schema_changes` (see
 [configuration.md](./configuration.md)). That means a release that drops a column
-or an index still starts, running against a database where the drop never
-happened, so the code in that release has to tolerate the old shape too. It also
-means a pre-applied index survives a rollback: no boot of an older binary
-reverts it.
+still starts, running against a database where the drop never happened, so the
+code in that release has to tolerate the old shape too.
 
-Diff the embedded schema files. On MySQL, additive changes need no action. On
-PostgreSQL, new tables, metadata-only columns, and standalone indexes land
-automatically. A new index builds as a plain `CREATE INDEX` under the startup
-budget, so on a deployment with a long history it belongs in the release notes
-with its statement so operators can pre-create it — finish the `CREATE INDEX
+Diff the embedded schema files. On MySQL, a new table or column converges on
+its own, but a new index does not come for free: the engine runs an index add
+as a table copy, inside the same startup budget, so on a deployment with a long
+history it belongs in the release notes with its statement. On PostgreSQL, new
+tables, metadata-only columns, and standalone indexes land automatically. A new
+index builds as a plain `CREATE INDEX` under the startup budget, so on a
+deployment with a long history it belongs in the release notes with its
+statement so operators can pre-create it — finish the `CREATE INDEX
 CONCURRENTLY` before rolling the release, since a pod that starts while the
 build is still running fails closed until it completes. A new column whose shape
 needs manual remediation — `NOT NULL` without a `DEFAULT`, generated or
 identity, `UNIQUE`, `REFERENCES` with a `DEFAULT` — fails startup until an
 operator creates it by hand, so it always belongs in the release notes with its
-statement (see [configuration.md](./configuration.md)). A destructive
-change — including removing an index from an embedded schema file — is a
-coordinated operation and belongs in the release notes with instructions, not in
-a routine patch release.
+statement (see [storage-schema.md](./storage-schema.md)). A destructive
+change is a coordinated operation and belongs in the release notes with
+instructions, not in a routine patch release.
+
+The diff does not have to be read out of the files by hand. Name the release
+being tested and the command answers it against the live database:
+
+```bash
+schemabot storage plan --deployment west -e production --release v1.4.0
+```
+
+`storage plan` requires the release to be named — `--release`, or `--schema-dir`
+pointed at a checkout — so there is no way to get an answer about a release you
+did not choose. `storage apply` is the command that runs the schema embedded in
+the binary running it, and it takes no selector at all. Operators pre-creating an
+index ahead of the roll should also read [Deploying a release that changes the
+storage
+schema](./storage-schema.md#deploying-a-release-that-changes-the-storage-schema)
+— on MySQL an index drop is refused like any other destructive statement, but
+only by a binary carrying that behavior, so a pre-created index is still removed
+again by any boot of a release from before it. PostgreSQL's convergence is
+additive-only and leaves it alone.
 
 ### 3. The public Go API
 
