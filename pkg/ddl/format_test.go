@@ -168,6 +168,74 @@ func TestFormatDDL(t *testing.T) {
 	}
 }
 
+func TestFormatCreateTableQuotedContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:  "comma in default literal",
+			input: "CREATE TABLE t (id int, note text DEFAULT 'x, y')",
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				"    note text DEFAULT 'x, y'\n" +
+				")",
+		},
+		{
+			name:  "check list and literal default",
+			input: "CREATE TABLE t (c text CHECK (c IN ('a','b')), note text DEFAULT 'x, y')",
+			expected: "CREATE TABLE t (\n" +
+				"    c text CHECK (c IN ('a','b')),\n" +
+				"    note text DEFAULT 'x, y'\n" +
+				")",
+		},
+		{
+			name:  "parentheses and comma in comment literal",
+			input: "CREATE TABLE t (id int COMMENT 'see (a) and (b), then c', note text)",
+			expected: "CREATE TABLE t (\n" +
+				"    id int COMMENT 'see (a) and (b), then c',\n" +
+				"    note text\n" +
+				")",
+		},
+		{
+			name:  "doubled quote and comma in literal",
+			input: "CREATE TABLE t (id int, note text DEFAULT 'it''s, ok')",
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				"    note text DEFAULT 'it''s, ok'\n" +
+				")",
+		},
+		{
+			name:     "unterminated literal",
+			input:    "CREATE TABLE t (id int, note text DEFAULT 'x, y)",
+			expected: "CREATE TABLE t (id int, note text DEFAULT 'x, y)",
+		},
+		{
+			name:  "backtick identifier with punctuation",
+			input: "CREATE TABLE `t(a` (`id` int, `note,value` text)",
+			expected: "CREATE TABLE `t(a` (\n" +
+				"    `id` int,\n" +
+				"    `note,value` text\n" +
+				")",
+		},
+		{
+			name:  "double quoted identifier with punctuation",
+			input: `CREATE TABLE "t(a" ("id" int, "note,value" text)`,
+			expected: "CREATE TABLE \"t(a\" (\n" +
+				"    \"id\" int,\n" +
+				"    \"note,value\" text\n" +
+				")",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, formatCreateTable(tt.input))
+		})
+	}
+}
+
 func TestFormatDDL_LowercaseTypes(t *testing.T) {
 	tests := []struct {
 		name     string

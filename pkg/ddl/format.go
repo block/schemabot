@@ -144,7 +144,7 @@ func lowercaseTypes(ddl string) string {
 // formatCreateTable formats a CREATE TABLE statement with line breaks.
 func formatCreateTable(ddl string) string {
 	// Find the opening parenthesis
-	openParen := strings.Index(ddl, "(")
+	openParen := findOpeningParen(ddl)
 	if openParen == -1 {
 		return ddl
 	}
@@ -160,7 +160,10 @@ func formatCreateTable(ddl string) string {
 	footer := ddl[closeParen:]            // ") ENGINE = ..."
 
 	// Split the body by commas (respecting parentheses for things like VARCHAR(255))
-	parts := splitByComma(body)
+	parts, ok := splitByComma(body)
+	if !ok {
+		return ddl
+	}
 
 	// Format table options
 	options := strings.TrimSpace(footer[1:]) // Skip the ")"
@@ -280,11 +283,67 @@ func formatTableOptions(options string) string {
 	return sb.String()
 }
 
+// isQuote reports whether c opens a single-quoted literal or a quoted
+// identifier (double quotes in standard SQL, backticks in MySQL). Commas and
+// parentheses inside any of these are content, not structure, so every
+// scanner in this file must step over them as a unit.
+func isQuote(c byte) bool {
+	return c == '\'' || c == '"' || c == '`'
+}
+
+// quotedEnd returns the index just past the quoted region that opens at
+// s[openPos], honouring the SQL doubled-quote escape (two consecutive quote
+// characters stay inside the literal). ok is false when the quote is never
+// closed, in which case the caller cannot lay the statement out safely and
+// should leave it as is.
+func quotedEnd(s string, openPos int) (end int, ok bool) {
+	q := s[openPos]
+	for i := openPos + 1; i < len(s); i++ {
+		if s[i] != q {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == q {
+			i++
+			continue
+		}
+		return i + 1, true
+	}
+	return len(s), false
+}
+
+// findOpeningParen returns the index of the first parenthesis outside any
+// quoted region, or -1 when there is none.
+func findOpeningParen(s string) int {
+	for i := 0; i < len(s); i++ {
+		if isQuote(s[i]) {
+			end, ok := quotedEnd(s, i)
+			if !ok {
+				return -1
+			}
+			i = end - 1
+			continue
+		}
+		if s[i] == '(' {
+			return i
+		}
+	}
+	return -1
+}
+
 // findMatchingParen finds the index of the closing parenthesis that matches
-// the opening parenthesis at the given position.
+// the opening parenthesis at the given position, ignoring parentheses inside
+// quoted regions.
 func findMatchingParen(s string, openPos int) int {
 	depth := 0
 	for i := openPos; i < len(s); i++ {
+		if isQuote(s[i]) {
+			end, ok := quotedEnd(s, i)
+			if !ok {
+				return -1
+			}
+			i = end - 1
+			continue
+		}
 		switch s[i] {
 		case '(':
 			depth++
@@ -298,14 +357,23 @@ func findMatchingParen(s string, openPos int) int {
 	return -1
 }
 
-// splitByComma splits a string by commas, respecting parentheses.
-func splitByComma(s string) []string {
-	var parts []string
+// splitByComma splits a string by top-level commas, treating parentheses and
+// quoted regions as opaque. ok is false when a quote is left unterminated.
+func splitByComma(s string) (parts []string, ok bool) {
 	var current strings.Builder
 	depth := 0
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
+		if isQuote(c) {
+			end, closed := quotedEnd(s, i)
+			if !closed {
+				return nil, false
+			}
+			current.WriteString(s[i:end])
+			i = end - 1
+			continue
+		}
 		switch c {
 		case '(':
 			depth++
@@ -327,7 +395,7 @@ func splitByComma(s string) []string {
 	if current.Len() > 0 {
 		parts = append(parts, current.String())
 	}
-	return parts
+	return parts, true
 }
 
 // splitAlterClauses splits an ALTER TABLE statement into individual clauses.
