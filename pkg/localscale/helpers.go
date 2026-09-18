@@ -162,7 +162,10 @@ func showCreateAllFromConn(ctx context.Context, conn *sql.Conn, opts ...table.Fi
 			return nil, fmt.Errorf("show create table %s: %w", name, err)
 		}
 		if optSet[table.WithStrippedAutoIncrement] {
-			createStmt = table.StripAutoIncrement(createStmt)
+			createStmt, err = ddl.StripTableAutoIncrement(createStmt)
+			if err != nil {
+				return nil, fmt.Errorf("strip auto-increment counter for table %s: %w", name, err)
+			}
 		}
 		result = append(result, table.TableSchema{Name: tbl, Schema: createStmt})
 	}

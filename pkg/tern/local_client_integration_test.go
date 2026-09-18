@@ -678,6 +678,90 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.Empty(t, basicNamespace.TableCatalog, "table catalog is detailed-only")
 }
 
+// A pull drops the volatile table counter without touching column defaults,
+// column comments or identifiers that happen to spell AUTO_INCREMENT, so the
+// file written into a repository still describes the live table. A pulled file
+// that lost a default or truncated a comment would become the desired state on
+// the next plan and generate an ALTER against a table nobody changed.
+func TestLocalClient_PullSchemaKeepsLiteralsSpellingAutoIncrement(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container // container is managed by TestMain
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	const dropTable = "DROP TABLE IF EXISTS `pull_schema_counters`"
+	_, err = db.ExecContext(t.Context(), dropTable)
+	require.NoError(t, err, "drop old counter table")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for counter table cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, dropTable)
+		assert.NoError(t, cleanupErr, "drop counter table")
+	})
+
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_counters` ("+
+		"`id` bigint unsigned NOT NULL AUTO_INCREMENT, "+
+		"`note` varchar(64) NOT NULL DEFAULT 'AUTO_INCREMENT=123', "+
+		"`rollover` int DEFAULT NULL COMMENT 'reset AUTO_INCREMENT 1000 on rollover', "+
+		"`auto_increment_2024` int DEFAULT NULL, "+
+		"PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create counter table")
+	// MySQL only reports the table counter once the sequence has advanced.
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `pull_schema_counters` (`rollover`) VALUES (1)")
+	require.NoError(t, err, "advance the auto-increment counter")
+
+	var name, liveDDL string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `pull_schema_counters`").Scan(&name, &liveDDL))
+	require.Contains(t, liveDDL, "AUTO_INCREMENT=2", "the live table should carry a counter for the pull to strip")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, nil, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err, "pull schema")
+	require.Contains(t, resp.Namespaces, "testdb")
+	pulled := resp.Namespaces["testdb"].Tables["pull_schema_counters"]
+	require.NotEmpty(t, pulled, "counter table should be pulled")
+
+	assert.Contains(t, pulled, "`note` varchar(64) NOT NULL DEFAULT 'AUTO_INCREMENT=123'")
+	assert.Contains(t, pulled, "COMMENT 'reset AUTO_INCREMENT 1000 on rollover'")
+	assert.Contains(t, pulled, "`auto_increment_2024` int DEFAULT NULL")
+	assert.Contains(t, pulled, "`id` bigint unsigned NOT NULL AUTO_INCREMENT,", "the column attribute keeps ids generating")
+
+	lines := strings.Split(strings.TrimRight(pulled, "\n"), "\n")
+	tableOptions := lines[len(lines)-1]
+	assert.Contains(t, tableOptions, "ENGINE=InnoDB")
+	assert.NotContains(t, tableOptions, "AUTO_INCREMENT", "the table counter is instance state and must not be pulled")
+
+	// The pulled file is what a repository would hold, so MySQL must accept it
+	// as the definition of the same table.
+	_, err = db.ExecContext(t.Context(), dropTable)
+	require.NoError(t, err, "drop the live table before recreating it from the pulled file")
+	_, err = db.ExecContext(t.Context(), pulled)
+	require.NoError(t, err, "recreate the table from the pulled file")
+	var recreatedName, recreatedDDL string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `pull_schema_counters`").Scan(&recreatedName, &recreatedDDL))
+	assert.Contains(t, recreatedDDL, "DEFAULT 'AUTO_INCREMENT=123'")
+	assert.Contains(t, recreatedDDL, "COMMENT 'reset AUTO_INCREMENT 1000 on rollover'")
+}
+
 // A DETAILED pull surfaces engine-agnostic constraint and column metadata that
 // schema-intelligence consumers need beyond raw DDL: foreign-key relationships
 // (local/referenced columns plus referential actions), generated and
