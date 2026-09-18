@@ -409,6 +409,26 @@ and require the row count of every table in the live catalog to come through unc
 from the catalog rather than a list, so a table added to the embedded schema is covered without
 anyone extending the test.
 
+### AV-13: Only its budget or a deliberate stop ends a storage convergence
+
+A convergence of SchemaBot's own storage runs until it finishes, its budget expires (AV-11), or the
+person who asked for it stops it. Nothing else reaches it. A dropped connection, an abandoned
+request, a caller that went away: none of those is a decision about the storage every instance
+depends on, and none of them ends the DDL. A convergence an instance runs to start cannot be
+stopped by anything but its budget at all, because a start has nobody to decide otherwise. However
+it ends, it releases rather than abandons: the statement in flight is cancelled and what it was
+building is reclaimed, statements that already finished stay finished, and what is left is what the
+next diff reports rather than something inferred from how far the run got. *Breaks if violated:* a
+network blip abandons a table copy partway through SchemaBot's own storage, leaving the schema
+between two releases with nobody watching and artifacts nobody owns. *Enforced:* by the signatures,
+in that the startup entry point accepts no caller context at all while the operator entry point
+takes one (`pkg/api/ensure_schema.go`, `pkg/api/storage_schema.go`), and in that the adapter
+answering a remote convergence strips cancellation from the request's context before calling it
+(`pkg/serve/storage_schema.go`); behaviorally by
+`TestApplyStorageSchemaMySQL_StopsWhenItsCallerStops` and
+`TestApplyStorageSchemaPostgres_StopsWhenItsCallerStops`, which stop a queued convergence and
+require it to return having changed nothing rather than wait out its budget.
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
