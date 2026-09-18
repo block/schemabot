@@ -144,7 +144,10 @@ func TestLocalClientApplyRejectsWholePlanWithBlockedStepBeforeCreatingWork(t *te
 
 	_, dsn := setupMySQLContainer(t)
 	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
 	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
 	client, engineRecorder := newTasklessControlClient(t, dsn, stor)
 	ctx := t.Context()
 	reason := "requires privileges unavailable to the engine"
