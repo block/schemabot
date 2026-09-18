@@ -528,6 +528,80 @@ func TestEnsureSchema_RunsTheAdditiveClausesBesideAnIndexDrop(t *testing.T) {
 	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
 }
 
+// A withheld clause stays in the diff for as long as the drift stands, and pods
+// restart for reasons that have nothing to do with a deploy: a node drain, an
+// OOM kill, a scale-up. So the boot after a split must recognize that the
+// additions already landed and reach Spirit with nothing at all. Re-running the
+// additions would put SchemaBot's own tables through a copy on every pod start,
+// against the database the whole fleet reads, which is a worse outage than the
+// drop being refused.
+func TestEnsureSchema_WithheldClauseConvergesWithoutFurtherDDL(t *testing.T) {
+	ctx := t.Context()
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	var boot syncBuffer
+	bootLogger := slog.New(slog.NewTextHandler(&boot, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, bootLogger))
+
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+
+	var first syncBuffer
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.NewTextHandler(&first, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	require.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	require.Contains(t, first.String(), "applying storage schema changes",
+		"the first boot after the drift must apply the additions it partitioned out")
+
+	var second syncBuffer
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.NewTextHandler(&second, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+
+	logs := second.String()
+	assert.Contains(t, logs, "all planned storage schema changes are destructive and refused",
+		"the withheld drop is still outstanding, so every later boot must still refuse it")
+	assert.NotContains(t, logs, "applying storage schema changes",
+		"a converged split must reach Spirit with no DDL on later boots, or every pod restart copies SchemaBot's own tables")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+}
+
+// A rollback starts many pods at once, each running the bootstrap against the
+// same storage database. With a mixed statement in the diff, whichever pod wins
+// the advisory lock partitions it and applies the additions; the others re-plan
+// once the lock frees and find only the refusal left. Every pod must start, the
+// column they all need must exist, and none of them may take the surplus index
+// the rest of the fleet plans around.
+func TestEnsureSchema_ConcurrentPodsDuringRollbackWithholdTheSameDrop(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+
+	podA := startEnsureSchema(t, dsn, logger)
+	podB := startEnsureSchema(t, dsn, logger)
+	podC := startEnsureSchema(t, dsn, logger)
+
+	// Collect every outcome before asserting so a failure in one pod never
+	// leaves another holding the server-wide advisory lock past the test.
+	errA, errB, errC := <-podA, <-podB, <-podC
+	require.NoError(t, errA, "a pod must start while a mixed statement is being partitioned")
+	require.NoError(t, errB, "a pod must start while a mixed statement is being partitioned")
+	require.NoError(t, errC, "a pod must start while a mixed statement is being partitioned")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column every one of these binaries requires must exist once they have all started")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"no pod may drop the surplus index, however many of them raced to converge")
+}
+
 // An operator who intentionally removed an index from the embedded schema opts
 // in to destructive storage-schema changes; EnsureSchema then executes the drop
 // and converges the database to the embedded schema. Without this the flag
