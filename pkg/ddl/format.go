@@ -312,11 +312,10 @@ func formatTableOptions(options string) string {
 	return sb.String()
 }
 
-// isQuote reports whether c opens a single-quoted literal or a quoted
-// identifier (double quotes in standard SQL, backticks in MySQL). Commas,
-// parentheses, and keywords inside any of these are content, not structure,
-// so the layout scanners in this file step over a quoted region as a unit
-// via quotedEnd.
+// isQuote reports whether c opens a quoted literal or identifier. The CREATE
+// and ALTER layout scanners and the case pass step over quoted regions via
+// quotedEnd. findTableNameEnd only finds the ALTER header's first backtick-space
+// pair, which is unambiguous in canonical output.
 func isQuote(c byte) bool {
 	return c == '\'' || c == '"' || c == '`'
 }

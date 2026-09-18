@@ -63,6 +63,22 @@ func TestFormatDDL(t *testing.T) {
 				");",
 		},
 		{
+			name:  "CREATE TABLE comma in default literal",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` varchar(10) DEFAULT 'x, y'\n" +
+				");",
+		},
+		{
+			name:  "backslash literal remains intact in formatted output",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\b, c')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` varchar(10) DEFAULT 'a\b, c'\n" +
+				");",
+		},
+		{
 			name:  "CREATE TABLE with indexes formatted",
 			input: "CREATE TABLE users (id INT, name VARCHAR(255), INDEX idx_name (name)) ENGINE=InnoDB",
 			expected: "CREATE TABLE `users` (\n" +
@@ -211,18 +227,18 @@ func TestFormatCreateTableQuotedContent(t *testing.T) {
 	}{
 		{
 			name:  "comma in default literal",
-			input: "CREATE TABLE t (id int, note text DEFAULT 'x, y')",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y')",
 			expected: "CREATE TABLE t (\n" +
 				"    id int,\n" +
-				"    note text DEFAULT 'x, y'\n" +
+				"    note varchar(10) DEFAULT 'x, y'\n" +
 				")",
 		},
 		{
 			name:  "check list and literal default",
-			input: "CREATE TABLE t (c text CHECK (c IN ('a','b')), note text DEFAULT 'x, y')",
+			input: "CREATE TABLE t (c text CHECK (c IN ('a','b')), note varchar(10) DEFAULT 'x, y')",
 			expected: "CREATE TABLE t (\n" +
 				"    c text CHECK (c IN ('a','b')),\n" +
-				"    note text DEFAULT 'x, y'\n" +
+				"    note varchar(10) DEFAULT 'x, y'\n" +
 				")",
 		},
 		{
@@ -235,27 +251,27 @@ func TestFormatCreateTableQuotedContent(t *testing.T) {
 		},
 		{
 			name:  "doubled quote and comma in literal",
-			input: "CREATE TABLE t (id int, note text DEFAULT 'it''s, ok')",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'it''s, ok')",
 			expected: "CREATE TABLE t (\n" +
 				"    id int,\n" +
-				"    note text DEFAULT 'it''s, ok'\n" +
+				"    note varchar(10) DEFAULT 'it''s, ok'\n" +
 				")",
 		},
 		{
 			name:  "backslash before the closing quote is content",
-			input: `CREATE TABLE t (id int, note text DEFAULT 'a\', c int)`,
+			input: `CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\', c int)`,
 			expected: "CREATE TABLE t (\n" +
 				"    id int,\n" +
-				`    note text DEFAULT 'a\',` + "\n" +
+				`    note varchar(10) DEFAULT 'a\',` + "\n" +
 				"    c int\n" +
 				")",
 		},
 		{
 			name:  "backslash followed by doubled quote",
-			input: `CREATE TABLE t (id int, note text DEFAULT 'a\''b, (c', c int)`,
+			input: `CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\''b, (c', c int)`,
 			expected: "CREATE TABLE t (\n" +
 				"    id int,\n" +
-				`    note text DEFAULT 'a\''b, (c',` + "\n" +
+				`    note varchar(10) DEFAULT 'a\''b, (c',` + "\n" +
 				"    c int\n" +
 				")",
 		},
@@ -270,8 +286,8 @@ func TestFormatCreateTableQuotedContent(t *testing.T) {
 		},
 		{
 			name:     "unterminated literal",
-			input:    "CREATE TABLE t (id int, note text DEFAULT 'x, y)",
-			expected: "CREATE TABLE t (id int, note text DEFAULT 'x, y)",
+			input:    "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y)",
+			expected: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y)",
 		},
 		{
 			name:  "backtick identifier with punctuation",
@@ -561,17 +577,17 @@ func TestSplitAlterClauses(t *testing.T) {
 		},
 		{
 			name:  "clause keyword inside a literal not split",
-			input: "ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD y (', ADD INDEX `b`(`b`)",
+			input: "ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD y (', ADD INDEX `b`(`b`)",
 			expected: []string{
-				"ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD y ('",
+				"ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD y ('",
 				"ADD INDEX `b`(`b`)",
 			},
 		},
 		{
 			name:  "unterminated literal left whole",
-			input: "ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD INDEX `b`(`b`)",
+			input: "ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD INDEX `b`(`b`)",
 			expected: []string{
-				"ALTER TABLE `t` ADD COLUMN `note` text DEFAULT 'x, ADD INDEX `b`(`b`)",
+				"ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD INDEX `b`(`b`)",
 			},
 		},
 	}
@@ -614,6 +630,24 @@ func TestFormatDDLForDialect(t *testing.T) {
 			"    id uuid PRIMARY KEY,\n"+
 			"    payload jsonb,\n"+
 			"    created_at timestamptz\n"+
+			");", got)
+	})
+
+	t.Run("postgres escape-string literal remains intact in formatted output", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"CREATE TABLE t (id int, note text DEFAULT E'a\\b, c')")
+		assert.Equal(t, "CREATE TABLE t (\n"+
+			"    id int,\n"+
+			"    note text DEFAULT 'a\b, c'\n"+
+			");", got)
+	})
+
+	t.Run("postgres dollar-quoted literal remains intact in formatted output", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			`CREATE TABLE t (id int, note text DEFAULT $$x, (y$$)`)
+		assert.Equal(t, "CREATE TABLE t (\n"+
+			"    id int,\n"+
+			"    note text DEFAULT 'x, (y'\n"+
 			");", got)
 	})
 
