@@ -235,20 +235,45 @@ func SaveConfig(cfg *Config) error {
 	return nil
 }
 
-// ResolveProfileName returns the active profile name using the standard
-// precedence: the --profile flag, then SCHEMABOT_PROFILE, then the configured
-// default profile, then "default". It does not check that the profile exists.
-func ResolveProfileName(cfg *Config, profileFlag string) string {
+// ProfileSource identifies where the selected profile name came from.
+type ProfileSource uint8
+
+const (
+	ProfileSourceFallback ProfileSource = iota
+	ProfileSourceFlag
+	ProfileSourceEnvironment
+	ProfileSourceConfig
+)
+
+// ProfileSelection keeps the selected name and its source together.
+type ProfileSelection struct {
+	Name   string
+	Source ProfileSource
+}
+
+// Explicit reports whether the caller requested a profile for this invocation.
+func (selection ProfileSelection) Explicit() bool {
+	return selection.Source == ProfileSourceFlag || selection.Source == ProfileSourceEnvironment
+}
+
+// ResolveProfile selects a name using flag, environment, configured default,
+// then "default" precedence. It does not check that the profile exists.
+func ResolveProfile(cfg *Config, profileFlag string) ProfileSelection {
 	if profileFlag != "" {
-		return profileFlag
+		return ProfileSelection{Name: profileFlag, Source: ProfileSourceFlag}
 	}
 	if env := os.Getenv("SCHEMABOT_PROFILE"); env != "" {
-		return env
+		return ProfileSelection{Name: env, Source: ProfileSourceEnvironment}
 	}
 	if cfg.DefaultProfile != "" {
-		return cfg.DefaultProfile
+		return ProfileSelection{Name: cfg.DefaultProfile, Source: ProfileSourceConfig}
 	}
-	return "default"
+	return ProfileSelection{Name: "default", Source: ProfileSourceFallback}
+}
+
+// ResolveProfileName returns the name selected by ResolveProfile.
+func ResolveProfileName(cfg *Config, profileFlag string) string {
+	return ResolveProfile(cfg, profileFlag).Name
 }
 
 // GetProfile loads and returns the resolved profile (see ResolveProfileName for
@@ -261,15 +286,11 @@ func GetProfile(profileFlag string) (*Profile, error) {
 		return nil, err
 	}
 
-	// Track whether the user explicitly requested a profile (flag or env), so we
-	// can error if it doesn't exist instead of silently falling back.
-	explicit := profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != ""
-	profileName := ResolveProfileName(cfg, profileFlag)
-
-	profile, ok := cfg.Profiles[profileName]
+	selection := ResolveProfile(cfg, profileFlag)
+	profile, ok := cfg.Profiles[selection.Name]
 	if !ok {
-		if explicit {
-			return nil, fmt.Errorf("unknown profile %q", profileName)
+		if selection.Explicit() {
+			return nil, fmt.Errorf("unknown profile %q", selection.Name)
 		}
 		return &Profile{}, nil
 	}

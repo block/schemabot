@@ -188,10 +188,11 @@ func resolveLocalRuntimeID(id, profileFlag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	name := client.ResolveProfileName(cfg, profileFlag)
+	selection := client.ResolveProfile(cfg, profileFlag)
+	name := selection.Name
 	profile, exists := cfg.Profiles[name]
 	if !exists {
-		if profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != "" || cfg.DefaultProfile != "" || len(cfg.Profiles) > 0 {
+		if selection.Source != client.ProfileSourceFallback || len(cfg.Profiles) > 0 {
 			return "", fmt.Errorf("unknown profile %q; select a local profile or provide a runtime ID", name)
 		}
 		return "local", nil
