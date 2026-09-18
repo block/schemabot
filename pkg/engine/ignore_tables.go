@@ -23,10 +23,13 @@ const ExemptReasonIgnoreTables = "ignore_tables"
 type IgnoredTables struct {
 	entries map[string]bool
 
-	// folded maps each entry's case-folded form to the entry as the config
-	// spells it, for RefuseDeclared. Only the contradiction check consults it:
-	// see RefuseDeclared for why that check is the one that ignores case.
-	folded map[string]string
+	// folded maps each entry's case-folded form to every entry the config
+	// spells that way, for RefuseDeclared. Only the contradiction check
+	// consults it: see RefuseDeclared for why that check is the one that
+	// ignores case. A config can spell one folded name several ways, and
+	// resolving the contradiction then means removing all of them, so the
+	// error has to name all of them.
+	folded map[string][]string
 }
 
 // NewIgnoredTables indexes the config's ignore_tables entries for matching.
@@ -36,12 +39,17 @@ func NewIgnoredTables(entries []string) IgnoredTables {
 		return IgnoredTables{}
 	}
 	indexed := make(map[string]bool, len(entries))
-	folded := make(map[string]string, len(entries))
+	folded := make(map[string][]string, len(entries))
 	for _, name := range entries {
-		indexed[name] = true
-		if _, ok := folded[strings.ToLower(name)]; !ok {
-			folded[strings.ToLower(name)] = name
+		if indexed[name] {
+			continue
 		}
+		indexed[name] = true
+		key := strings.ToLower(name)
+		folded[key] = append(folded[key], name)
+	}
+	for _, spellings := range folded {
+		slices.Sort(spellings)
 	}
 	return IgnoredTables{entries: indexed, folded: folded}
 }
@@ -78,6 +86,11 @@ func (i IgnoredTables) Withholds(table string) bool { return i.entries[table] }
 // through costs an apply that fails part way with the target already holding
 // a table the plan believed it was creating.
 //
+// The error names every entry that folds to the declared name, not just the
+// first: a config that spells one table two ways is resolved only by removing
+// both, so naming one would send an operator to make a change that leaves the
+// plan failing for the same reason.
+//
 // declared is the tables the namespace's schema files declare.
 func (i IgnoredTables) RefuseDeclared(namespace string, declared []string) error {
 	if i.Empty() {
@@ -86,26 +99,28 @@ func (i IgnoredTables) RefuseDeclared(namespace string, declared []string) error
 	var collisions []string
 	seen := make(map[string]bool)
 	for _, table := range declared {
-		entry, withheld := i.folded[strings.ToLower(table)]
+		spellings, withheld := i.folded[strings.ToLower(table)]
 		if !withheld {
 			continue
 		}
-		collision := fmt.Sprintf("%q", entry)
-		if entry != table {
-			collision = fmt.Sprintf("%q (declared as %q)", entry, table)
+		for _, entry := range spellings {
+			collision := fmt.Sprintf("%q", entry)
+			if entry != table {
+				collision = fmt.Sprintf("%q (declared as %q)", entry, table)
+			}
+			if seen[collision] {
+				continue
+			}
+			seen[collision] = true
+			collisions = append(collisions, collision)
 		}
-		if seen[collision] {
-			continue
-		}
-		seen[collision] = true
-		collisions = append(collisions, collision)
 	}
 	if len(collisions) == 0 {
 		return nil
 	}
 	slices.Sort(collisions)
 	return fmt.Errorf(
-		"ignore_tables withholds table(s) %s that schema files in namespace %q also declare: a table cannot be both withheld from the planner and declared to it, so the plan would propose creating a table that already exists or would manage a table the config says to leave alone; remove the ignore_tables entry or delete the declaring schema file",
+		"ignore_tables withholds table(s) %s that schema files in namespace %q also declare: a table cannot be both withheld from the planner and declared to it, so the plan would propose creating a table that already exists or would manage a table the config says to leave alone; remove every ignore_tables entry named here or delete the declaring schema file",
 		strings.Join(collisions, ", "), namespace)
 }
 

@@ -120,7 +120,7 @@ func TestWithholdIgnoredTablesRefusesDeclaredTable(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), `namespace "commerce"`)
-	assert.Contains(t, err.Error(), "remove the ignore_tables entry or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
 
 	assert.Equal(t, []string{"flyway_schema_history"}, tableSchemaNames(currentSchema["commerce"]),
 		"a refused plan leaves the live schema as it found it")

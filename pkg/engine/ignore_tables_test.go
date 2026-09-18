@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -41,7 +42,7 @@ func TestIgnoredTablesRefuseDeclared(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"flyway_schema_history"`)
 	assert.Contains(t, err.Error(), `namespace "app"`)
-	assert.Contains(t, err.Error(), "remove the ignore_tables entry or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
 	assert.NotContains(t, err.Error(), "users")
 
 	// Every colliding table is named, sorted and deduplicated, so one plan
@@ -63,7 +64,7 @@ func TestIgnoredTablesRefuseDeclaredIgnoresCase(t *testing.T) {
 	err := ignored.RefuseDeclared("app", []string{"Flyway_Schema_History"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"flyway_schema_history" (declared as "Flyway_Schema_History")`)
-	assert.Contains(t, err.Error(), "remove the ignore_tables entry or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
 
 	// An exact collision reads as one name, not as a table declared as itself.
 	err = ignored.RefuseDeclared("app", []string{"flyway_schema_history"})
@@ -77,6 +78,30 @@ func TestIgnoredTablesRefuseDeclaredIgnoresCase(t *testing.T) {
 
 	// A name that merely shares a prefix or suffix is still a different table.
 	assert.NoError(t, ignored.RefuseDeclared("app", []string{"flyway_schema_history_archive", "old_flyway_schema_history"}))
+}
+
+// A config can spell one folded name several ways, and on a target that folds
+// identifiers all of them name the declared table. Resolving the contradiction
+// then means removing every one of them, so the error names every one of them
+// rather than sending an operator to delete a single entry and re-plan into the
+// same refusal.
+func TestIgnoredTablesRefuseDeclaredNamesEverySpelling(t *testing.T) {
+	ignored := NewIgnoredTables([]string{"Orders", "orders", "ORDERS"})
+
+	err := ignored.RefuseDeclared("app", []string{"Orders"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"ORDERS" (declared as "Orders")`)
+	assert.Contains(t, err.Error(), `"Orders"`)
+	assert.Contains(t, err.Error(), `"orders" (declared as "Orders")`)
+
+	// Only the entry spelled as the file declares it reads as one name; the
+	// other two are reported against the spelling that collided with them.
+	assert.Equal(t, 2, strings.Count(err.Error(), "declared as"))
+
+	// Each of the three still withholds only the table it names.
+	assert.True(t, ignored.Withholds("orders"))
+	assert.True(t, ignored.Withholds("Orders"))
+	assert.False(t, ignored.Withholds("oRdErS"))
 }
 
 func TestIgnoredTablesExemption(t *testing.T) {

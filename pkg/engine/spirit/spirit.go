@@ -1095,19 +1095,25 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		return nil, nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithoutArchiveTables, table.WithStrippedAutoIncrement)
+	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load schema: %w", err)
 	}
-	if ignored.Empty() {
-		return tables, nil, nil
-	}
 
+	// The archive-naming exclusion is applied here rather than by the loader so
+	// that the config's own entries are matched against the target's catalog
+	// first. An entry naming a table the archive convention also excludes is
+	// then disclosed as withheld, the same as on every other engine, instead of
+	// being reported as an entry that matched no live table because another
+	// exclusion reached it first.
 	kept := make([]table.TableSchema, 0, len(tables))
 	var withheld []string
 	for _, ts := range tables {
 		if ignored.Withholds(ts.Name) {
 			withheld = append(withheld, ts.Name)
+			continue
+		}
+		if table.IsArchiveTable(ts.Name) {
 			continue
 		}
 		kept = append(kept, ts)

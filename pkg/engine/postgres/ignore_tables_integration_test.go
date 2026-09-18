@@ -104,7 +104,7 @@ func TestEnginePlanIgnoreTablesRefusesDeclaredTable(t *testing.T) {
 	require.Error(t, err, "Plan() must refuse a table that is both withheld and declared")
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), `namespace "public"`)
-	assert.Contains(t, err.Error(), "remove the ignore_tables entry or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
 
 	assert.True(t, testutil.PostgresTableExists(t, db, "public", "flyway_schema_history"),
 		"a refused plan must never touch the target")

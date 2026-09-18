@@ -150,7 +150,7 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTable(t *testing.T) {
 	require.Error(t, err, "Plan() must refuse a table that is both withheld and declared")
 	assert.Contains(t, err.Error(), flywayTable)
 	assert.Contains(t, err.Error(), "ignore_tables")
-	assert.Contains(t, err.Error(), "remove the ignore_tables entry or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
 }
 
 // Whether a declaration and a differently-cased entry name one table is the
@@ -179,7 +179,49 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTableWhateverTheCase(t *testing.
 	require.Error(t, err, "Plan() must refuse a declaration that differs from the entry only by case")
 	assert.Contains(t, err.Error(), `"flyway_schema_history" (declared as "Flyway_Schema_History")`,
 		"the error names both spellings so an operator can find the entry they wrote")
-	assert.Contains(t, err.Error(), "remove the ignore_tables entry or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
+}
+
+// The planner excludes a table whose name follows the archive convention on
+// its own, and says nothing about it. An entry naming such a table is matched
+// against the target's catalog before that exclusion reaches it, so the plan
+// reports it as withheld by the config — the same answer every other engine
+// gives — rather than as an entry that matched no live table.
+func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
+	const archiveTable = "executions_archive_2024"
+
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE executions (id INT PRIMARY KEY, name VARCHAR(100))`)
+	require.NoError(t, err, "create executions")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `"+archiveTable+"` (id INT PRIMARY KEY)")
+	require.NoError(t, err, "create archive table")
+
+	files := testSchemaFiles(map[string]string{
+		"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY, name VARCHAR(100))`,
+	})
+
+	// Without the entry the archive table is excluded by its name alone: not
+	// dropped, and not disclosed.
+	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: files,
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	assert.Empty(t, droppedTables(result), "the archive table is not proposed for DROP TABLE")
+	assert.Empty(t, result.ExemptTables, "the archive exclusion is the engine's own and is not disclosed here")
+
+	result, err = New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database:     "testdb",
+		SchemaFiles:  files,
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{archiveTable},
+	})
+	require.NoError(t, err, "Plan()")
+	assert.Empty(t, droppedTables(result), "the withheld table is still not proposed for DROP TABLE")
+	assertWithheld(t, result, "testdb", archiveTable)
 }
 
 func droppedTables(result *engine.PlanResult) []string {
