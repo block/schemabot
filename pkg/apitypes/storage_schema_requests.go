@@ -2,6 +2,7 @@ package apitypes
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -142,8 +143,19 @@ func ResolveStorageApplyTimeout(timeoutSeconds int64) (time.Duration, error) {
 	case timeoutSeconds < 0:
 		return 0, fmt.Errorf("a convergence budget must be positive, or zero for the default of %s", DefaultStorageApplyTimeout)
 	case timeoutSeconds > maxSeconds:
-		return 0, fmt.Errorf("a convergence budget of %ds exceeds the maximum of %s; a convergence holds the storage bootstrap lock for its whole budget and cannot yet be stopped, so pods booting in that window will not come up",
-			timeoutSeconds, MaxStorageApplyTimeout)
+		return 0, fmt.Errorf("a convergence budget of %s exceeds the maximum of %s; a convergence holds the storage bootstrap lock for its whole budget and cannot yet be stopped, so pods booting in that window will not come up",
+			describeBudgetSeconds(timeoutSeconds), MaxStorageApplyTimeout)
 	}
 	return time.Duration(timeoutSeconds) * time.Second, nil
+}
+
+// describeBudgetSeconds names a rejected budget the way the operator typed it.
+// A duration reads better than a second count — "2h0m0s" against a maximum of
+// "1h0m0s" rather than "7200s" — but only a value a time.Duration can hold can
+// be rendered as one, so an absurd request falls back to its seconds.
+func describeBudgetSeconds(seconds int64) string {
+	if seconds <= int64(math.MaxInt64/int64(time.Second)) {
+		return (time.Duration(seconds) * time.Second).String()
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
