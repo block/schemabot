@@ -238,10 +238,13 @@ func canonicalDriftStatement(p ddl.StatementParser, statement string, stmtType d
 	// qualifier the engine writes into the DDL is the physical schema of the
 	// target that planned it — noise that differs between targets mapping the
 	// same namespace to differently named schemas, never signal. That holds
-	// for every relation the statement names, not only the one it changes: a
-	// foreign key's target is qualified by the same namespace mapping applied
-	// to the same desired schema, so two targets can only disagree on it by
-	// disagreeing on the mapping, which the key's own namespace already trusts.
+	// for every relation the statement names in that same schema, not only
+	// the one it changes: a foreign key's target there is qualified by the
+	// same namespace mapping applied to the same desired schema, so two
+	// targets can only disagree on it by disagreeing on the mapping, which
+	// the key's own namespace already trusts. A reference into any other
+	// schema is outside that mapping and stays qualified, so targets that
+	// point at different schemas there still diverge.
 	return p.CanonicalizeUnqualified(statement), nil
 }
 

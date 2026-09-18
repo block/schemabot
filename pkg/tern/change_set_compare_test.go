@@ -333,15 +333,15 @@ func TestCompareChangeSets_PostgresPhysicalSchemaQualifierIsNotDrift(t *testing.
 			Namespace: "orders",
 			TableChanges: []*ternv1.TableChange{
 				{
-					TableName:  "agency_config",
-					Ddl:        "ALTER TABLE " + q + "agency_config ADD COLUMN " + alterColumn + " text",
+					TableName:  "carrier_config",
+					Ddl:        "ALTER TABLE " + q + "carrier_config ADD COLUMN " + alterColumn + " text",
 					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
 					Namespace:  "orders",
 				},
 				{
-					TableName: "recall",
-					Ddl: "CREATE TABLE " + q + "recall (id bigserial NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id));\n" +
-						"CREATE INDEX idx_recall_consumer_uuid ON " + q + "recall USING btree (consumer_uuid)",
+					TableName: "shipment",
+					Ddl: "CREATE TABLE " + q + "shipment (id bigserial NOT NULL, tracking_code text, CONSTRAINT shipment_pkey PRIMARY KEY (id));\n" +
+						"CREATE INDEX idx_shipment_tracking_code ON " + q + "shipment USING btree (tracking_code)",
 					ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE,
 					Namespace:  "orders",
 				},
@@ -349,16 +349,16 @@ func TestCompareChangeSets_PostgresPhysicalSchemaQualifierIsNotDrift(t *testing.
 		}}}
 	}
 
-	diff, err := CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "recall_file_prefix"), regionSet("orders-region-b", "recall_file_prefix"))
+	diff, err := CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "tracking_prefix"), regionSet("orders-region-b", "tracking_prefix"))
 	require.NoError(t, err)
 	assert.True(t, diff.Empty(), "the same change on differently named physical schemas must match: %+v", diff)
 
-	diff, err = CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "recall_file_prefix"), regionSet("orders-region-b", "recall_file_suffix"))
+	diff, err = CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "tracking_prefix"), regionSet("orders-region-b", "tracking_suffix"))
 	require.NoError(t, err)
 	require.Len(t, diff.MissingFromCandidate, 1, "a different column under a different qualifier must still diverge")
 	require.Len(t, diff.UnexpectedInCandidate, 1)
-	assert.Equal(t, "agency_config", diff.MissingFromCandidate[0].Table)
-	assert.Equal(t, "agency_config", diff.UnexpectedInCandidate[0].Table)
+	assert.Equal(t, "carrier_config", diff.MissingFromCandidate[0].Table)
+	assert.Equal(t, "carrier_config", diff.UnexpectedInCandidate[0].Table)
 }
 
 // A dialect with no registered parser gives the comparison no grammar to

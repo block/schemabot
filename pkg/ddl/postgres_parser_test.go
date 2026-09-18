@@ -400,6 +400,54 @@ func TestPostgresParserCanonicalizeUnqualified(t *testing.T) {
 		in := `DROP TABLE "app-region-a".a; DROP TABLE "app-region-a".b`
 		assert.Equal(t, in, p.CanonicalizeUnqualified(in))
 	})
+
+	t.Run("a catalog-qualified name reduces to the bare relation, not a two-part one", func(t *testing.T) {
+		assert.Equal(t, "ALTER TABLE orders ADD COLUMN c text",
+			p.CanonicalizeUnqualified(`ALTER TABLE cat."app-region-a".orders ADD COLUMN c text`))
+		assert.Equal(t, "CREATE INDEX i ON orders USING btree (c)",
+			p.CanonicalizeUnqualified(`CREATE INDEX i ON cat."app-region-a".orders (c)`))
+		assert.Equal(t, "DROP TABLE orders",
+			p.CanonicalizeUnqualified(`DROP TABLE cat."app-region-a".orders`))
+	})
+}
+
+// A relation the statement names in a schema that is not the statement's own
+// is not the physical rendering of this namespace's mapping, so two targets
+// that name different schemas there are genuinely diverged and the
+// unqualified form must keep them apart.
+func TestPostgresParserCanonicalizeUnqualifiedKeepsForeignSchemas(t *testing.T) {
+	p := postgresStatementParser{}
+
+	t.Run("a view body pointing at a different schema stays distinguishable", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`CREATE VIEW "app-region-a".orders_enriched AS SELECT o.id FROM "app-region-a".orders o JOIN "reference-east".currency c ON c.code = o.currency`)
+		regionB := p.CanonicalizeUnqualified(`CREATE VIEW "app-region-b".orders_enriched AS SELECT o.id FROM "app-region-b".orders o JOIN "reference-west".currency c ON c.code = o.currency`)
+		assert.NotEqual(t, regionA, regionB, "a view reading a different foreign schema is drift, not noise")
+		assert.Contains(t, regionA, `FROM orders o JOIN "reference-east".currency c`)
+	})
+
+	t.Run("a foreign key into a different schema stays distinguishable", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-east".currency (code)`)
+		regionB := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-b".orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-west".currency (code)`)
+		assert.NotEqual(t, regionA, regionB, "a foreign key into a different foreign schema is drift, not noise")
+		assert.Equal(t, `ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-east".currency (code)`, regionA)
+	})
+
+	t.Run("a drop of an object in a different schema keeps its qualifier", func(t *testing.T) {
+		assert.Equal(t, `DROP TABLE orders, "reference-east".currency`,
+			p.CanonicalizeUnqualified(`DROP TABLE "app-region-a".orders, "reference-east".currency`))
+	})
+
+	t.Run("the statement's own schema is still cleared everywhere", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD CONSTRAINT fk FOREIGN KEY (customer_id) REFERENCES "app-region-a".customers (id)`)
+		regionB := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-b".orders ADD CONSTRAINT fk FOREIGN KEY (customer_id) REFERENCES "app-region-b".customers (id)`)
+		assert.Equal(t, regionA, regionB)
+		assert.NotContains(t, regionA, "app-region")
+	})
+
+	t.Run("an unqualified statement leaves every reference as written", func(t *testing.T) {
+		in := `ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-east".currency (code)`
+		assert.Equal(t, in, p.CanonicalizeUnqualified(in))
+	})
 }
 
 func TestPostgresParserCreateTableColumns(t *testing.T) {

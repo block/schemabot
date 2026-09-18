@@ -526,17 +526,27 @@ func (postgresStatementParser) Canonicalize(ddl string) string {
 }
 
 // CanonicalizeUnqualified implements StatementParser. Before the deparse it
-// clears the schema of every relation reference in the parse tree — the
-// statement's own relation, an index's table, a foreign key's target, an
+// reads the schema the statement's own relation is qualified with and clears
+// that schema from every relation reference in the parse tree that carries it
+// — the relation itself, an index's table, a foreign key's target, an
 // inherited parent — and reduces the qualified names of DROP TABLE and DROP
-// INDEX to the bare object name, so a statement rendered against one physical
-// schema canonicalizes exactly like the same statement rendered against
-// another. Type names and sequence names embedded in expressions are not
-// relation references and keep whatever qualification they carry.
+// INDEX in that schema to the bare object name, so a statement rendered
+// against one physical schema canonicalizes exactly like the same statement
+// rendered against another. A reference into a different schema is not a
+// rendering of the statement's own schema and keeps its qualifier, so two
+// statements that point at genuinely different schemas stay distinct. A
+// statement whose own relation is unqualified, or whose shape names no
+// relation, is left as Canonicalize renders it. Type names and sequence names
+// embedded in expressions are not relation references and keep whatever
+// qualification they carry.
 func (postgresStatementParser) CanonicalizeUnqualified(ddl string) string {
 	return canonicalizePostgres(ddl, func(stmt *pgproto.Node) {
-		unqualifyRelations(stmt.ProtoReflect())
-		unqualifyDropObjects(stmt.GetDropStmt())
+		own := ownSchema(stmt)
+		if own == "" {
+			return
+		}
+		unqualifyRelations(stmt.ProtoReflect(), own)
+		unqualifyDropObjects(stmt.GetDropStmt(), own)
 	})
 }
 
@@ -558,15 +568,61 @@ func canonicalizePostgres(ddl string, rewrite func(stmt *pgproto.Node)) string {
 	return restoreDropColumnKeyword(stmt, canonical)
 }
 
+// ownSchema returns the schema qualifier on the relation a statement changes,
+// read from the statement's own field rather than from a tree walk, whose
+// visiting order the reflection API does not define. It is empty when that
+// relation is unqualified or when the statement's shape is not one drift
+// admits, and callers then leave the statement as written.
+func ownSchema(stmt *pgproto.Node) string {
+	switch n := stmt.GetNode().(type) {
+	case *pgproto.Node_CreateStmt:
+		return n.CreateStmt.GetRelation().GetSchemaname()
+	case *pgproto.Node_AlterTableStmt:
+		return n.AlterTableStmt.GetRelation().GetSchemaname()
+	case *pgproto.Node_IndexStmt:
+		return n.IndexStmt.GetRelation().GetSchemaname()
+	case *pgproto.Node_RenameStmt:
+		return n.RenameStmt.GetRelation().GetSchemaname()
+	case *pgproto.Node_ViewStmt:
+		return n.ViewStmt.GetView().GetSchemaname()
+	case *pgproto.Node_TruncateStmt:
+		if rels := n.TruncateStmt.GetRelations(); len(rels) > 0 {
+			return rels[0].GetRangeVar().GetSchemaname()
+		}
+	case *pgproto.Node_DropStmt:
+		if objects := n.DropStmt.GetObjects(); len(objects) > 0 {
+			return qualifiedNameSchema(objects[0].GetList().GetItems())
+		}
+	}
+	return ""
+}
+
+// qualifiedNameSchema returns the schema component of a qualified-name
+// component list (`[catalog,] schema, name`), or "" when the name is bare.
+func qualifiedNameSchema(items []*pgproto.Node) string {
+	if len(items) < 2 {
+		return ""
+	}
+	return items[len(items)-2].GetString_().GetSval()
+}
+
 // rangeVarDescriptor identifies relation-reference nodes in a parse tree by
 // message type, so a walk finds them wherever the grammar nests one.
 var rangeVarDescriptor = (&pgproto.RangeVar{}).ProtoReflect().Descriptor()
 
-// unqualifyRelations clears the schema on every relation reference reachable
-// from m, walking nested messages and repeated fields.
-func unqualifyRelations(m protoreflect.Message) {
+// unqualifyRelations clears the qualification on every relation reference
+// reachable from m whose schema is own, walking nested messages and repeated
+// fields. The catalog goes with the schema, so a three-part name reduces to
+// the bare relation rather than to a different two-part one. References into
+// other schemas are left as written.
+func unqualifyRelations(m protoreflect.Message, own string) {
 	if m.Descriptor().FullName() == rangeVarDescriptor.FullName() {
-		m.Clear(rangeVarDescriptor.Fields().ByName("schemaname"))
+		fields := rangeVarDescriptor.Fields()
+		schemaname := fields.ByName("schemaname")
+		if m.Get(schemaname).String() == own {
+			m.Clear(schemaname)
+			m.Clear(fields.ByName("catalogname"))
+		}
 		return
 	}
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
@@ -575,21 +631,25 @@ func unqualifyRelations(m protoreflect.Message) {
 			if fd.Kind() == protoreflect.MessageKind {
 				list := v.List()
 				for i := 0; i < list.Len(); i++ {
-					unqualifyRelations(list.Get(i).Message())
+					unqualifyRelations(list.Get(i).Message(), own)
 				}
 			}
+		case fd.IsMap():
+			// A map's values are not relation references; without this arm
+			// a map field would be read as a message and panic mid-compare.
 		case fd.Kind() == protoreflect.MessageKind:
-			unqualifyRelations(v.Message())
+			unqualifyRelations(v.Message(), own)
 		}
 		return true
 	})
 }
 
-// unqualifyDropObjects reduces each dropped table or index to its bare name.
-// Drop targets are qualified-name component lists rather than relation
-// references, so the relation walk does not reach them. Drops of other object
-// kinds are outside the DDL vocabulary drift admits and are left as written.
-func unqualifyDropObjects(drop *pgproto.DropStmt) {
+// unqualifyDropObjects reduces each dropped table or index in schema own to
+// its bare name. Drop targets are qualified-name component lists rather than
+// relation references, so the relation walk does not reach them. Drops of
+// other object kinds are outside the DDL vocabulary drift admits and are left
+// as written, as are objects in other schemas.
+func unqualifyDropObjects(drop *pgproto.DropStmt, own string) {
 	if drop == nil {
 		return
 	}
@@ -600,7 +660,7 @@ func unqualifyDropObjects(drop *pgproto.DropStmt) {
 	}
 	for _, object := range drop.GetObjects() {
 		list := object.GetList()
-		if items := list.GetItems(); len(items) > 1 {
+		if items := list.GetItems(); qualifiedNameSchema(items) == own {
 			list.Items = items[len(items)-1:]
 		}
 	}

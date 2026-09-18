@@ -88,8 +88,10 @@ type StatementParser interface {
 
 	// CanonicalizeUnqualified normalizes a single DDL statement like
 	// Canonicalize and additionally removes the schema qualifier from every
-	// relation the statement names, so the same change rendered against
-	// differently named physical schemas canonicalizes to one form. It is for
+	// relation the statement names in the schema of the relation it changes,
+	// so the same change rendered against differently named physical schemas
+	// canonicalizes to one form while a reference into any other schema stays
+	// qualified. It is for
 	// comparisons that already key on the relation's namespace separately;
 	// used anywhere else it would conflate relations that differ only by
 	// schema. It returns the input unchanged when it cannot be parsed.
