@@ -645,20 +645,54 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 	fmt.Fprintf(sb, glyph.Info+" Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
 }
 
+// exemptTablesInlineLimit caps how many exempt table names render inline in
+// the disclosure. Beyond it the names read as a wall standing above the plan
+// they annotate, so the disclosure leads with its count and folds the names
+// into a collapsed block. The count rides on the visible line either way: a
+// reviewer has to be able to see that the plan withheld tables, and how many,
+// without opening anything.
+const exemptTablesInlineLimit = 5
+
 // writeExemptTables renders one disclosure line per namespace whose live
 // tables the plan exempted from the undeclared-table verdict, so a reviewer
 // can tell an exempted table from a declared one. No-op when nothing was
-// exempted, which is the ordinary case. The namespace and table names come
-// from the target's catalog, so they render as code spans they cannot break
-// out of; the reason is engine prose and is sanitized like any other.
+// exempted, which is the ordinary case.
 func writeExemptTables(sb *strings.Builder, groups []ExemptTablesData) {
 	for _, group := range groups {
-		if len(group.Tables) == 0 {
-			continue
-		}
-		fmt.Fprintf(sb, glyph.Info+" Tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
-			inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
+		writeExemptTablesGroup(sb, group, "")
 	}
+}
+
+// writeExemptTablesGroup renders one namespace's exempt-table disclosure,
+// naming the environment when the caller breaks the disclosure down per
+// environment. The namespace and table names come from the target's catalog
+// and the reason is engine prose, so each is escaped for the surface it lands
+// on: markdown inline, HTML inside the <summary> of the collapsed form.
+func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env string) {
+	if len(group.Tables) == 0 {
+		return
+	}
+	names := strings.Join(inlineCodeList(group.Tables), ", ")
+
+	if len(group.Tables) <= exemptTablesInlineLimit {
+		prefix, noun := "", "Tables"
+		if env != "" {
+			prefix, noun = fmt.Sprintf("**%s**: ", capitalizeFirst(env)), "tables"
+		}
+		fmt.Fprintf(sb, glyph.Info+" %s%s in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
+			prefix, noun, inlineCode(group.Namespace), exemptReason(group.Reason), names)
+		return
+	}
+
+	// GitHub renders <summary> content as HTML, not markdown, so the folded
+	// header names the namespace in a <code> tag and escapes as HTML.
+	prefix := ""
+	if env != "" {
+		prefix = fmt.Sprintf("<b>%s</b>: ", html.EscapeString(capitalizeFirst(env)))
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d tables in namespace <code>%s</code> exempt from the undeclared-table verdict (%s)</summary>\n\n%s\n\n</details>\n\n",
+		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
+		html.EscapeString(SanitizeInlineError(group.Reason)), names)
 }
 
 // hasExemptTables reports whether writeExemptTables would render anything for
@@ -772,11 +806,7 @@ func writeMultiEnvExemptTables(sb *strings.Builder, data MultiEnvPlanCommentData
 	}
 	for _, env := range data.Environments {
 		for _, group := range planExemptTables(data, env) {
-			if len(group.Tables) == 0 {
-				continue
-			}
-			fmt.Fprintf(sb, glyph.Info+" **%s**: tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
-				capitalizeFirst(env), inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
+			writeExemptTablesGroup(sb, group, env)
 		}
 	}
 }
