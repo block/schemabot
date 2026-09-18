@@ -1,6 +1,7 @@
 package apitypes
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -44,6 +45,17 @@ func TestResolveStorageApplyTimeout_RefusesOutOfRange(t *testing.T) {
 		"negative": {seconds: -1, message: "must be positive"},
 		"above the maximum": {
 			seconds: int64(MaxStorageApplyTimeout/time.Second) + 1,
+			message: "exceeds the maximum",
+		},
+		// Bounding after multiplying by time.Second would wrap this into a
+		// small or negative duration and hand it back as a budget the caller
+		// never named, which is the one way past a bound stated in seconds.
+		"beyond what a duration can hold": {
+			seconds: math.MaxInt64,
+			message: "exceeds the maximum",
+		},
+		"one second short of the overflow": {
+			seconds: math.MaxInt64/int64(time.Second) + 1,
 			message: "exceeds the maximum",
 		},
 	} {

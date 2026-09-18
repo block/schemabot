@@ -493,12 +493,17 @@ func storageSchemaConvergenceOutcome(remaining *apitypes.StorageSchemaReport) er
 // refusing a value the target would refuse. The direct path bounds the
 // convergence with it here; the API path sends it and the target does the same.
 func (cmd *StorageApplyCmd) convergenceBudget() (time.Duration, error) {
-	// The wire carries whole seconds, so a budget under one truncates to the
+	// The wire carries whole seconds, so anything under one truncates to the
 	// zero that means "no preference" and would come back as the hour-long
-	// default — the operator asking for the shortest possible run getting the
-	// longest one. Refuse it here, where the duration the operator typed is
-	// still intact, rather than let the truncation answer for them.
-	if cmd.Timeout > 0 && cmd.Timeout < time.Second {
+	// default: the operator asking for the shortest possible run gets the
+	// longest one, and a negative budget too small to survive the truncation
+	// gets a budget at all. Both are refused here, where the duration the
+	// operator typed is still intact, rather than letting the truncation
+	// answer for them.
+	switch {
+	case cmd.Timeout < 0:
+		return 0, fmt.Errorf("--timeout: a convergence budget of %s must be positive, or unset for the default of %s", cmd.Timeout, apitypes.DefaultStorageApplyTimeout)
+	case cmd.Timeout > 0 && cmd.Timeout < time.Second:
 		return 0, fmt.Errorf("--timeout: a convergence budget of %s is shorter than the one second the request carries; name a whole number of seconds", cmd.Timeout)
 	}
 	budget, err := apitypes.ResolveStorageApplyTimeout(cmd.timeoutSeconds())

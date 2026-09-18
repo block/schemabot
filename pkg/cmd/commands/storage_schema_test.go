@@ -370,6 +370,24 @@ func TestStorageApplyCmd_RefusesABudgetTheWireCannotCarry(t *testing.T) {
 	assert.Contains(t, err.Error(), "shorter than the one second the request carries")
 }
 
+// A negative budget is refused whatever its magnitude. One smaller than a
+// whole second truncates to the zero that means "no preference", so a bound
+// applied only after the truncation would answer an invalid flag with the
+// hour-long default instead of an error.
+func TestStorageApplyCmd_RefusesANegativeBudget(t *testing.T) {
+	for name, timeout := range map[string]time.Duration{
+		"smaller than the wire's resolution": -500 * time.Millisecond,
+		"a whole number of seconds":          -30 * time.Second,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd := StorageApplyCmd{AutoApprove: true, Timeout: timeout}
+			err := cmd.Run(t.Context(), &Globals{Endpoint: "http://127.0.0.1:1"})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "must be positive")
+		})
+	}
+}
+
 // A declined confirmation converges nothing at all. The preview is read-only,
 // so the command has to leave the database exactly as it found it.
 func TestStorageApplyCmd_DeclinedConfirmationRunsNothing(t *testing.T) {

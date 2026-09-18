@@ -129,16 +129,21 @@ const MaxStorageApplyTimeout = DefaultStorageApplyTimeout
 // end spells that field differently and prefixes the refusal with its own name
 // for it.
 func ResolveStorageApplyTimeout(timeoutSeconds int64) (time.Duration, error) {
+	// Bounded in seconds, before the conversion. A time.Duration counts
+	// nanoseconds, so multiplying an arbitrary wire value by time.Second
+	// overflows past roughly nine billion seconds and wraps — a budget far
+	// above the maximum comes out small or negative and passes a bound
+	// applied after the conversion, which is the one way a caller could be
+	// handed a budget it never named.
+	const maxSeconds = int64(MaxStorageApplyTimeout / time.Second)
 	switch {
 	case timeoutSeconds == 0:
 		return DefaultStorageApplyTimeout, nil
 	case timeoutSeconds < 0:
 		return 0, fmt.Errorf("a convergence budget must be positive, or zero for the default of %s", DefaultStorageApplyTimeout)
+	case timeoutSeconds > maxSeconds:
+		return 0, fmt.Errorf("a convergence budget of %ds exceeds the maximum of %s; a convergence holds the storage bootstrap lock for its whole budget and cannot yet be stopped, so pods booting in that window will not come up",
+			timeoutSeconds, MaxStorageApplyTimeout)
 	}
-	budget := time.Duration(timeoutSeconds) * time.Second
-	if budget > MaxStorageApplyTimeout {
-		return 0, fmt.Errorf("a convergence budget of %s exceeds the maximum of %s; a convergence holds the storage bootstrap lock for its whole budget and cannot yet be stopped, so pods booting in that window will not come up",
-			budget, MaxStorageApplyTimeout)
-	}
-	return budget, nil
+	return time.Duration(timeoutSeconds) * time.Second, nil
 }
