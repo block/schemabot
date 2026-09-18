@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -185,15 +186,25 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 	if err != nil {
 		return nil, err
 	}
-	// No timeout of its own, and no cancellation either: the convergence is the
-	// startup bootstrap, which bounds itself with EnsureSchemaTimeout and takes
-	// no context, so once the DDL starts a caller hanging up does not stop it.
-	// That is the safe direction. A convergence is a sequence of statements
-	// against SchemaBot's own storage, and abandoning it part-way would leave
-	// the schema between two releases with nobody watching; running it out
-	// leaves a state the next plan can describe. Only the plans either side of
-	// it observe ctx, so a caller that disconnects stops waiting for an answer
-	// rather than stopping the work.
+	// The budget comes from the request, not from ctx, and the distinction is
+	// the safe one: the convergence is the startup bootstrap, which bounds
+	// itself and takes no context, so once the DDL starts a caller hanging up
+	// does not stop it. A convergence is a sequence of statements against
+	// SchemaBot's own storage, and abandoning it part-way would leave the schema
+	// between two releases with nobody watching; running it out leaves a state
+	// the next plan can describe. Only the plans either side of it observe ctx,
+	// so a caller that disconnects stops waiting for an answer rather than
+	// stopping the work.
+	//
+	// An absent or out-of-range budget is the control plane's to reject before
+	// it gets here, but this is a server boundary and the field arrives over the
+	// wire, so it is re-checked rather than trusted: a data plane reached
+	// directly must not convert a caller's zero into an unbounded lock hold.
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.GetTimeoutSeconds())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", tern.ErrInvalidStorageSchemaRequest, err)
+	}
+	opts = append(opts, api.WithConvergenceTimeout(budget))
 	planned, remaining, err := api.ApplyStorageSchema(ctx, dsn, a.logger, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("converge storage schema (dialect %s): %w", a.dialect, err)

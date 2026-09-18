@@ -152,12 +152,21 @@ func StorageSchemaPlan(ctx context.Context, endpoint string, req apitypes.Storag
 // StorageSchemaApply converges a SchemaBot instance's own storage database by
 // running the startup bootstrap that instance would run on its next boot,
 // under the same advisory lock.
+//
+// The client waits out the budget the request named rather than the shared
+// operator timeout: a convergence is the one operator call whose duration the
+// caller chooses, so a fixed client deadline would abandon exactly the runs
+// that asked for longer.
 func StorageSchemaApply(ctx context.Context, endpoint string, req apitypes.StorageSchemaApplyRequest) (*apitypes.StorageSchemaApplyResponse, error) {
 	if req.Caller == "" {
 		req.Caller = GenerateCLIOwner()
 	}
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds)
+	if err != nil {
+		return nil, err
+	}
 	var result apitypes.StorageSchemaApplyResponse
-	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/storage/schema/apply", req, &result); err != nil {
+	if err := doPostIntoWithClient(ctx, clientForBudget(budget), endpoint, "/api/storage/schema/apply", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

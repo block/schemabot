@@ -62,7 +62,7 @@ the startup path                        the CLI path
                   nothing else
 ```
 
-Two consequences worth holding onto:
+Four consequences worth holding onto:
 
 - **`storage apply` is what a boot does**, not an equivalent of it: the same
   differ, the same refusal, the same lock. Converging ahead of a roll cannot
@@ -70,6 +70,22 @@ Two consequences worth holding onto:
 - **A binary converges its own schema, never another's.** Neither the command
   line nor the RPC behind it can hand it another release's files, which stops an
   older binary from treating a newer release's tables as state to prune.
+- **Convergence is bounded, and the budget follows the path, not the code.** A
+  boot gets five minutes, covering the lock wait and the DDL, because a pod
+  converging is a pod not yet serving, and one holding the lock keeps the others
+  from serving too. `storage apply` runs the same code under an hour, since
+  nothing waits on it but the operator who ran it. That gap is what lets
+  converging ahead of a roll take on work a boot could not have finished at all,
+  an index over a table with a long history being the usual one. `--timeout`
+  lowers that ceiling for a run that should fail fast and cannot raise it,
+  because a convergence cannot yet be stopped once it starts and the lock it
+  holds is what a booting pod waits on. Work too slow even for an hour is
+  [created by hand](#pre-creating-indexes-on-a-long-lived-database) instead.
+- **A converged storage costs one diff.** Steps 1 and 2 run without the lock, so
+  the overwhelmingly common case, a pod booting against storage that already
+  matches it, contends with nothing. The re-diff at step 4 is what makes that
+  safe: whoever wins the lock decides again while holding it, so two pods that
+  both saw work do not both run it.
 
 The storage database is the one SchemaBot cannot be down for, so the bootstrap
 fails closed: uncertainty keeps a pod out of service rather than becoming a
@@ -265,6 +281,15 @@ literal `yes`, and reports what ran, naming the schema embedded in the binary
 that ran it; `--auto-approve` (`-y`) skips the prompt for scripted maintenance.
 A convergence that leaves statements behind prints them as a plan underneath.
 
+What it does not share with a boot is the budget. A boot gives up after five
+minutes, because a converging pod is not yet serving; this runs under an hour,
+since the only thing waiting on it is the operator. That is what makes
+converging ahead of a roll worth doing: the work a boot would have timed out on
+is exactly the work this finishes. `--timeout` lowers that ceiling for a run
+that should fail fast and cannot raise it, because a convergence holds the
+advisory lock for its whole budget and cannot yet be stopped once it starts, so
+an hour is the longest a mistake can keep pods from booting.
+
 A run that finds nothing outstanding is still worth taking, because the
 bootstrap converges more than the catalog. On MySQL it clears the schema change
 engine's leftover tables, which outlive an interrupted convergence and which a
@@ -344,8 +369,14 @@ starting.
    schemabot storage apply --dsn "$STORAGE_DSN"   # from the new release's binary
    ```
 
-   This takes the work out of the roll, not out of the budget. A build that will
-   not finish in five minutes has to be created by hand instead.
+   This takes the work out of the roll *and* out of the boot's budget: `apply`
+   is the same bootstrap running under an hour rather than five minutes, so a
+   build a boot could not have finished is exactly what this step is for.
+   Expect the bootstrap lock to be held throughout — pods booting in that
+   window will not come up, which is why this belongs ahead of a roll rather
+   than during one. A build too slow even for the hour has to be created by
+   hand instead; see [Pre-creating indexes on a long-lived
+   database](#pre-creating-indexes-on-a-long-lived-database).
 
 3. **On MySQL, if you converged ahead of the roll, re-check right before it.** A
    table, column, or index you created early survives a boot of the current
@@ -391,19 +422,24 @@ its next backoff. Two failures look similar in the logs and are not:
   clears on its own, so resolve the named item.
 - **The convergence is not finishing in the budget.** The plan names DDL that is
   legal but slow, typically an index over a table with a long history. `storage
-  apply` shares the five minutes and will not clear it: build the index by hand,
-  and the pod then finds nothing to do.
+  apply` runs the same DDL under an hour rather than five minutes, so try it
+  first: this is the case that budget exists for, and one run from a terminal
+  clears the boot. Hold the roll while it runs, since it keeps the bootstrap
+  lock throughout and pods booting behind it will not come up. If an hour is
+  not enough either, build the index by hand, outside the bootstrap, and the
+  pod then finds nothing to do; the statements are in [Pre-creating indexes on
+  a long-lived database](#pre-creating-indexes-on-a-long-lived-database).
 
 ## Pre-creating indexes on a long-lived database
 
 An index declared after a database was bootstrapped converges on the next
-startup, inside the same five-minute budget: on MySQL as a startup `ALTER` that
-copies the table, on PostgreSQL as a plain `CREATE INDEX` that holds a `SHARE`
-lock and blocks writes for the whole build. Where the storage tables carry a
-long history, create the index by hand before rolling out, and the startup diff
-finds it present and skips the build. Use `CREATE INDEX CONCURRENTLY` on
-PostgreSQL, and finish the build before rolling, since a pod that starts while
-it is still running fails closed until it completes.
+startup, inside the boot's five-minute budget: on MySQL as a startup `ALTER`
+that copies the table, on PostgreSQL as a plain `CREATE INDEX` that holds a
+`SHARE` lock and blocks writes for the whole build. Where the storage tables
+carry a long history, create the index by hand before rolling out, and the
+startup diff finds it present and skips the build. Use `CREATE INDEX
+CONCURRENTLY` on PostgreSQL, and finish the build before rolling, since a pod
+that starts while it is still running fails closed until it completes.
 
 `storage plan` names whichever indexes this database actually needs; the four
 below are the ones a long-lived database is most likely to be missing. Each is

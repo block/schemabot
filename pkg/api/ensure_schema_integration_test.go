@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
@@ -140,7 +141,7 @@ func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	// Simulate pod A actively running EnsureSchema. The lock is the production
 	// coordination mechanism, and the shadow table represents Spirit work that
 	// must not be cleaned up by a second pod before it acquires the lock.
-	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, sdb.DSN, logger, namedlock.MySQL{})
+	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, sdb.DSN, logger, namedlock.MySQL{}, EnsureSchemaTimeout)
 	require.NoError(t, err)
 	lockReleased := false
 	defer func() {
@@ -684,6 +685,87 @@ func TestEnsureSchema_AllowDestructiveExecutesDrops(t *testing.T) {
 
 	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
 		"second EnsureSchema not idempotent")
+}
+
+// A convergence changes the shape of SchemaBot's storage and nothing else in
+// it: it records no row about itself in the database it is converging. That is
+// what lets one implementation serve both a boot against a database with no
+// schema at all — where a table to record into does not exist yet — and a
+// deliberate convergence against tables Spirit is copying under live traffic,
+// where a write about the convergence would land in a table mid-copy.
+//
+// The census reads the live catalog rather than a list of tables, so a table
+// added to the embedded schema is covered the day it lands rather than when
+// someone remembers this test.
+func TestEnsureSchema_RecordsNothingInTheStorageItConverges(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, logger), "first EnsureSchema")
+
+	// Rows for a spurious write to be visible against, on the table the
+	// convergence below copies — so the census also proves the copy carried
+	// them across rather than merely that nothing new appeared.
+	seedStorageSettings(t, db, 3)
+	before := storageRowCensus(t, db, sdb.Name)
+
+	// Drift that makes the convergence do real DDL. Re-adding the column is a
+	// Spirit table copy of a seeded table, which is the case that would show a
+	// row gained or lost.
+	_, err := db.ExecContext(t.Context(), "ALTER TABLE `settings` DROP COLUMN `updated_at`")
+	require.NoError(t, err, "introduce drift on settings")
+
+	require.NoError(t, EnsureSchema(sdb.DSN, logger), "second EnsureSchema")
+	require.True(t, testutil.ColumnExists(t, db, sdb.Name, "settings", "updated_at"),
+		"the convergence must have run the DDL whose side effects this test measures")
+
+	assert.Equal(t, before, storageRowCensus(t, db, sdb.Name),
+		"a convergence must not add, remove, or lose a row in the storage it converges")
+}
+
+// seedStorageSettings writes count rows a convergence has to carry across a
+// table copy untouched.
+func seedStorageSettings(t *testing.T, db *sql.DB, count int) {
+	t.Helper()
+	for i := range count {
+		_, err := db.ExecContext(t.Context(),
+			"INSERT INTO `settings` (`setting_key`, `setting_value`) VALUES (?, ?)",
+			fmt.Sprintf("census-key-%d", i), fmt.Sprintf("census-value-%d", i))
+		require.NoError(t, err, "seed settings row %d", i)
+	}
+}
+
+// storageRowCensus counts the rows in every table the storage database holds,
+// Spirit's own internal tables aside — those are the convergence's scaffolding
+// and come and go with it.
+func storageRowCensus(t *testing.T, db *sql.DB, database string) map[string]int64 {
+	t.Helper()
+
+	rows, err := db.QueryContext(t.Context(),
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ?", database)
+	require.NoError(t, err, "list tables in %s", database)
+	var tables []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name), "scan table name")
+		if ddl.IsSpiritInternalTable(name) {
+			continue
+		}
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Err(), "iterate tables in %s", database)
+	require.NoError(t, rows.Close(), "close table listing")
+	require.NotEmpty(t, tables, "a converged storage database has tables to count")
+
+	census := make(map[string]int64, len(tables))
+	for _, table := range tables {
+		var count int64
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)).Scan(&count),
+			"count rows in %s", table)
+		census[table] = count
+	}
+	return census
 }
 
 // syncBuffer is an io.Writer safe for concurrent log writes from EnsureSchema
