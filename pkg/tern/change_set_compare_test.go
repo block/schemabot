@@ -322,6 +322,45 @@ func TestCompareChangeSets_PostgresDialect(t *testing.T) {
 	require.Error(t, err, "PostgreSQL DDL judged under the MySQL grammar must fail closed")
 }
 
+// Two PostgreSQL targets that map the same canonical namespace to differently
+// named physical schemas plan the same change with different schema
+// qualifiers in the DDL. The namespace is already the key, so the qualifier
+// is not drift; a real difference under the qualifiers still is.
+func TestCompareChangeSets_PostgresPhysicalSchemaQualifierIsNotDrift(t *testing.T) {
+	regionSet := func(physicalSchema, alterColumn string) ChangeSet {
+		q := `"` + physicalSchema + `".`
+		return ChangeSet{Changes: []*ternv1.SchemaChange{{
+			Namespace: "orders",
+			TableChanges: []*ternv1.TableChange{
+				{
+					TableName:  "carrier_config",
+					Ddl:        "ALTER TABLE " + q + "carrier_config ADD COLUMN " + alterColumn + " text",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+					Namespace:  "orders",
+				},
+				{
+					TableName: "shipment",
+					Ddl: "CREATE TABLE " + q + "shipment (id bigserial NOT NULL, tracking_code text, CONSTRAINT shipment_pkey PRIMARY KEY (id));\n" +
+						"CREATE INDEX idx_shipment_tracking_code ON " + q + "shipment USING btree (tracking_code)",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE,
+					Namespace:  "orders",
+				},
+			},
+		}}}
+	}
+
+	diff, err := CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "tracking_prefix"), regionSet("orders-region-b", "tracking_prefix"))
+	require.NoError(t, err)
+	assert.True(t, diff.Empty(), "the same change on differently named physical schemas must match: %+v", diff)
+
+	diff, err = CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "tracking_prefix"), regionSet("orders-region-b", "tracking_suffix"))
+	require.NoError(t, err)
+	require.Len(t, diff.MissingFromCandidate, 1, "a different column under a different qualifier must still diverge")
+	require.Len(t, diff.UnexpectedInCandidate, 1)
+	assert.Equal(t, "carrier_config", diff.MissingFromCandidate[0].Table)
+	assert.Equal(t, "carrier_config", diff.UnexpectedInCandidate[0].Table)
+}
+
 // A dialect with no registered parser gives the comparison no grammar to
 // canonicalize with, so it fails closed instead of guessing — even when both
 // change sets are empty and would trivially match.
