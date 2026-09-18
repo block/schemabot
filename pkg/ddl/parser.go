@@ -85,6 +85,17 @@ type StatementParser interface {
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
 	Canonicalize(ddl string) string
+
+	// CanonicalizeUnqualified normalizes a single DDL statement like
+	// Canonicalize and additionally removes the schema qualifier from every
+	// relation the statement names in the schema of the relation it changes,
+	// so the same change rendered against differently named physical schemas
+	// canonicalizes to one form while a reference into any other schema stays
+	// qualified. It is for
+	// comparisons that already key on the relation's namespace separately;
+	// used anywhere else it would conflate relations that differ only by
+	// schema. It returns the input unchanged when it cannot be parsed.
+	CanonicalizeUnqualified(ddl string) string
 }
 
 type DropTargets struct {
@@ -528,6 +539,14 @@ func (tidbStatementParser) Canonicalize(ddl string) string {
 
 	// For CREATE TABLE and DROP TABLE, use TiDB's Restore for canonical format.
 	return restoreCanonical(ddl)
+}
+
+// CanonicalizeUnqualified implements StatementParser. MySQL-family targets
+// select their physical schema through the connection rather than in the
+// DDL, so the engine's statements carry no schema qualifier to remove and the
+// canonical form is Canonicalize's.
+func (p tidbStatementParser) CanonicalizeUnqualified(ddl string) string {
+	return p.Canonicalize(ddl)
 }
 
 // restoreCanonical uses TiDB parser to restore a statement in canonical
