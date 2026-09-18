@@ -138,6 +138,34 @@ func TestFormatDDL(t *testing.T) {
 				"  PARTITION BY HASH (`id`) PARTITIONS 2;",
 		},
 		{
+			name:  "type words inside a column COMMENT literal keep their case",
+			input: "CREATE TABLE t (id INT, note TEXT COMMENT 'stored as INT, not TEXT')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` text COMMENT 'stored as INT, not TEXT'\n" +
+				");",
+		},
+		{
+			name:  "backticked identifiers that spell a type keep their case",
+			input: "CREATE TABLE `DATE` (`INT` INT, `TEXT` TEXT DEFAULT NULL)",
+			expected: "CREATE TABLE `DATE` (\n" +
+				"    `INT` int,\n" +
+				"    `TEXT` text DEFAULT NULL\n" +
+				");",
+		},
+		{
+			name:     "table COMMENT with doubled quote and a type word",
+			input:    "CREATE TABLE `t` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='it''s a VARCHAR(255) thing'",
+			expected: "CREATE TABLE `t` (`id` bigint NOT NULL) ENGINE InnoDB,\n  COMMENT 'it''s a VARCHAR(255) thing';",
+		},
+		{
+			name:  "ALTER clauses with type words in identifier and literal",
+			input: "ALTER TABLE `t` ADD COLUMN `INT` INT COMMENT 'was a BIGINT, then TEXT', ADD COLUMN `b` TIMESTAMP DEFAULT CURRENT_TIMESTAMP()",
+			expected: "ALTER TABLE `t`\n" +
+				"    ADD COLUMN `INT` int COMMENT 'was a BIGINT, then TEXT',\n" +
+				"    ADD COLUMN `b` timestamp DEFAULT current_timestamp();",
+		},
+		{
 			name:  "non-ASCII COMMENT before PARTITION BY",
 			input: "CREATE TABLE `t5` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='ılık ıslak' PARTITION BY HASH (`id`) PARTITIONS 2",
 			expected: "CREATE TABLE `t5` (`id` bigint NOT NULL) ENGINE InnoDB,\n" +
@@ -595,6 +623,23 @@ func TestFormatDDLForDialect(t *testing.T) {
 		assert.Equal(t, "ALTER TABLE users\n"+
 			"    ADD COLUMN a int,\n"+
 			"    ADD COLUMN b text;", got)
+	})
+
+	t.Run("postgres quoted identifiers with punctuation stay whole", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			`CREATE TABLE "t(a" ("id" int, "note,value" text)`)
+		assert.Equal(t, "CREATE TABLE \"t(a\" (\n"+
+			"    id int,\n"+
+			"    \"note,value\" text\n"+
+			");", got)
+	})
+
+	t.Run("postgres ALTER splits clauses around quoted names and literals", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			`ALTER TABLE "Orders" ADD COLUMN "INT" text DEFAULT 'a, (b', ADD COLUMN "x,y" int`)
+		assert.Equal(t, "ALTER TABLE \"Orders\"\n"+
+			"    ADD COLUMN \"INT\" text DEFAULT 'a, (b',\n"+
+			"    ADD COLUMN \"x,y\" int;", got)
 	})
 
 	t.Run("postgres DROP COLUMN keeps the explicit COLUMN keyword", func(t *testing.T) {

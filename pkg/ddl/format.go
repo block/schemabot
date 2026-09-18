@@ -110,13 +110,46 @@ var funcPattern = regexp.MustCompile(`\b(CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_
 var charsetCollatePattern = regexp.MustCompile(
 	`((?:CHARACTER SET|CHARSET|COLLATE)\s*=?\s*)([A-Z][A-Z0-9_]+)`)
 
-// charsetLiteralPattern matches _CHARSET'string' prefixes like _UTF8MB4'pending'.
-// These are stripped entirely since the column charset makes them redundant.
-var charsetLiteralPattern = regexp.MustCompile(`_(UTF8MB4|UTF8|LATIN1|ASCII|BINARY)(')`)
+// charsetIntroducerPattern matches a _CHARSET introducer left at the end of
+// the text before a string literal, as in _UTF8MB4'pending'. The introducer
+// is stripped since the column charset makes it redundant.
+var charsetIntroducerPattern = regexp.MustCompile(`_(UTF8MB4|UTF8|LATIN1|ASCII|BINARY)$`)
 
 // lowercaseTypes post-processes canonicalized DDL to lowercase data types,
-// function names, and charset/collate values while keeping SQL keywords uppercase.
+// function names, and charset/collate values while keeping SQL keywords
+// uppercase. Only text outside quoted regions is rewritten: a type word inside
+// a COMMENT or DEFAULT literal, or a quoted identifier that happens to be a
+// type name, is content and stays as written. An unterminated quote leaves
+// the rest of the statement untouched.
 func lowercaseTypes(ddl string) string {
+	var sb strings.Builder
+	start := 0
+	for i := 0; i < len(ddl); i++ {
+		if !isQuote(ddl[i]) {
+			continue
+		}
+		end, ok := quotedEnd(ddl, i)
+		if !ok {
+			sb.WriteString(lowercaseUnquotedTypes(ddl[start:i]))
+			sb.WriteString(ddl[i:])
+			return sb.String()
+		}
+		unquoted := ddl[start:i]
+		if ddl[i] == '\'' {
+			unquoted = charsetIntroducerPattern.ReplaceAllString(unquoted, "")
+		}
+		sb.WriteString(lowercaseUnquotedTypes(unquoted))
+		sb.WriteString(ddl[i:end])
+		start = end
+		i = end - 1
+	}
+	sb.WriteString(lowercaseUnquotedTypes(ddl[start:]))
+	return sb.String()
+}
+
+// lowercaseUnquotedTypes applies the lowercasing passes to a run of DDL that
+// contains no quoted region.
+func lowercaseUnquotedTypes(ddl string) string {
 	// Lowercase charset/collate values first (before data types, to avoid
 	// matching SET in "CHARACTER SET" as the SET data type)
 	ddl = charsetCollatePattern.ReplaceAllStringFunc(ddl, func(match string) string {
@@ -128,9 +161,6 @@ func lowercaseTypes(ddl string) string {
 		value := match[loc[4]:loc[5]]
 		return prefix + strings.ToLower(value)
 	})
-
-	// Strip _CHARSET'...' introducers (redundant with column charset)
-	ddl = charsetLiteralPattern.ReplaceAllString(ddl, "$2")
 
 	// Lowercase data types
 	ddl = dataTypePattern.ReplaceAllStringFunc(ddl, strings.ToLower)
@@ -160,10 +190,7 @@ func formatCreateTable(ddl string) string {
 	footer := ddl[closeParen:]            // ") ENGINE = ..."
 
 	// Split the body by commas (respecting parentheses for things like VARCHAR(255))
-	parts, ok := splitByComma(body)
-	if !ok {
-		return ddl
-	}
+	parts := splitByComma(body)
 
 	// Format table options
 	options := strings.TrimSpace(footer[1:]) // Skip the ")"
@@ -365,18 +392,19 @@ func findMatchingParen(s string, openPos int) int {
 }
 
 // splitByComma splits a string by top-level commas, treating parentheses and
-// quoted regions as opaque. ok is false when a quote is left unterminated.
-func splitByComma(s string) (parts []string, ok bool) {
+// quoted regions as opaque. Callers pass a parenthesized body that
+// findMatchingParen has already scanned, so every quote in it is closed; the
+// unterminated case still keeps the remainder whole rather than splitting
+// inside it.
+func splitByComma(s string) []string {
+	var parts []string
 	var current strings.Builder
 	depth := 0
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if isQuote(c) {
-			end, closed := quotedEnd(s, i)
-			if !closed {
-				return nil, false
-			}
+			end, _ := quotedEnd(s, i)
 			current.WriteString(s[i:end])
 			i = end - 1
 			continue
@@ -402,7 +430,7 @@ func splitByComma(s string) (parts []string, ok bool) {
 	if current.Len() > 0 {
 		parts = append(parts, current.String())
 	}
-	return parts, true
+	return parts
 }
 
 // splitAlterClauses splits an ALTER TABLE statement into individual clauses.
