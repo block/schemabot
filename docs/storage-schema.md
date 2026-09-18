@@ -120,25 +120,38 @@ applied.
 
 ## What is never automatic
 
-On MySQL, destructive statements are refused and skipped by default: `DROP
-TABLE`, and the destructive clauses of an `ALTER TABLE`. A mixed `ALTER TABLE`
-is split, so its additive clauses still execute, except a clause that cannot run
-without a refused one (the `ADD PRIMARY KEY` half of a primary-key change),
-which is refused with it. The rest of the diff applies and startup proceeds.
-Each refusal is logged at warn level with the exact DDL and counted in the
+On MySQL, destructive statements are refused and skipped by default. Two kinds
+qualify, and the second is the one operators do not expect:
+
+- Statements that lose data — `DROP TABLE`, or an `ALTER TABLE` containing
+  `DROP COLUMN`.
+- Statements that remove an index. An index drop destroys no rows and completes
+  in milliseconds because it is metadata-only, and it can still take the
+  database down by regressing the plan of a query the rest of the fleet is
+  running.
+
+The verdict is per statement, but the differ emits one combined `ALTER` per
+table, so a statement can carry a removal and an addition the starting binary
+requires. Rather than withhold both, a flagged statement is reduced to the
+clauses that only add a schema object: those run and the removals do not. A
+clause that cannot execute until a withheld one has run is withheld with it,
+which is how an index or a primary key whose definition changed arrives — as a
+drop and an add of one name in one statement. A statement left with nothing to
+add is refused entire. The rest of the diff applies and startup proceeds. Each
+refusal is logged at warn level with the exact DDL and counted in the
 `schemabot.storage_schema.destructive_refusals_total` metric.
 
-**One asymmetry bites operators, and it is worth memorizing:** dropping an index
-destroys no data, so it is *not* destructive and *not* refused. A table or
-column you create ahead of a roll survives a boot of the still-running older
-release. **An index does not.** Any boot of the earlier release converges a
-newly created index away without comment, be that a pod restart, a scale-up, or
-a health-check replacement. Treat a long gap between pre-creating an index and
-rolling the release that declares it as a gap the index probably did not
-survive, and re-check before you roll.
+**One caveat is worth memorizing:** this protection lives in the binary that is
+booting, so it reaches only as far back as the release carrying it. A release
+from before indexes were protected still converges a newly created index away on
+any boot, be that a pod restart, a scale-up, or a health-check replacement.
+While any such release is still running, treat a long gap between pre-creating
+an index and rolling the release that declares it as a gap the index may not
+have survived, and re-check before you roll.
 
-To intentionally remove a storage table or column, first make sure every running
-pod is on a binary whose embedded schema no longer declares it, then opt in with
+To intentionally remove a storage table, column, or index, first make sure every
+running pod is on a binary whose embedded schema no longer declares it, then opt
+in with
 [`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes),
 and revert the flag once the removal converges. `--allow-unsafe` opts in for one
 CLI invocation, widening the deployment's standing policy and never narrowing
@@ -314,8 +327,9 @@ starting.
    not finish in five minutes has to be created by hand instead.
 
 3. **On MySQL, if you converged ahead of the roll, re-check right before it.** A
-   table or a column you created early survives a boot of the current release;
-   **an index does not**, for the reason in [What is never
+   table, column, or index you created early survives a boot of the current
+   release — but **an index does not survive a boot of a release from before
+   indexes were protected**, for the reason in [What is never
    automatic](#what-is-never-automatic). PostgreSQL has no such gap.
 
 4. **After the roll, confirm through the API, per deployment.** Name the release

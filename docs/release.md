@@ -249,9 +249,10 @@ can grep their own configs.
 
 SchemaBot bootstraps its own storage schema at startup (`EnsureSchema`), diffing
 the embedded schema files against the live database and applying what is missing.
-It **refuses destructive statements by default**: the offending statement is
-skipped with a warning and a metric, startup continues, and the live schema keeps
-the old shape until an operator opts in with
+It **refuses destructive statements by default** — both those that lose data and
+those that only remove a schema object, such as a `DROP INDEX`: the offending
+statement is skipped with a warning and a metric, startup continues, and the
+live schema keeps the old shape until an operator opts in with
 `storage.allow_destructive_schema_changes` (see
 [configuration.md](./configuration.md)). That means a release that drops a column
 still starts, running against a database where the drop never happened, so the
@@ -288,10 +289,10 @@ the binary running it, and it takes no selector at all. Operators pre-creating a
 index ahead of the roll should also read [Deploying a release that changes the
 storage
 schema](./storage-schema.md#deploying-a-release-that-changes-the-storage-schema)
-— on MySQL a pre-created index is removed again by any boot of the
-still-running earlier release, because dropping an index is not destructive and
-so is not refused. PostgreSQL's convergence is additive-only and leaves it
-alone.
+— on MySQL an index drop is refused like any other destructive statement, but
+only by a binary carrying that behavior, so a pre-created index is still removed
+again by any boot of a release from before it. PostgreSQL's convergence is
+additive-only and leaves it alone.
 
 ### 3. The public Go API
 
