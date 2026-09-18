@@ -29,7 +29,7 @@ func TestResolveProfileSelection(t *testing.T) {
 	}
 }
 
-func TestGetProfileSelection(t *testing.T) {
+func TestProfileConsumersSelection(t *testing.T) {
 	for _, tt := range []struct {
 		name, flag, env, configured string
 		exists, wantError           bool
@@ -46,24 +46,32 @@ func TestGetProfileSelection(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
+			t.Setenv("SCHEMABOT_TOKEN", "")
+			t.Setenv("SCHEMABOT_ENDPOINT", "")
 			t.Setenv("SCHEMABOT_PROFILE", tt.env)
 			cfg := &Config{DefaultProfile: tt.configured, Profiles: map[string]Profile{}}
-			want := Profile{Endpoint: "https://example.test"}
+			want := Profile{Endpoint: "https://example.test", Token: "test-token"}
 			if tt.exists {
 				cfg.Profiles["selected"] = want
 				cfg.Profiles["default"] = want
 			}
 			require.NoError(t, SaveConfig(cfg))
+			token, tokenErr := ResolveBearerToken(t.Context(), "", "", tt.flag)
 			got, err := GetProfile(tt.flag)
 			if tt.wantError {
 				require.ErrorContains(t, err, "unknown profile")
 				require.Nil(t, got)
+				require.ErrorContains(t, tokenErr, "unknown profile")
+				require.Empty(t, token)
 			} else {
 				require.NoError(t, err)
+				require.NoError(t, tokenErr)
 				if tt.exists {
 					require.Equal(t, &want, got)
+					require.Equal(t, want.Token, token)
 				} else {
 					require.Equal(t, &Profile{}, got)
+					require.Empty(t, token)
 				}
 			}
 		})

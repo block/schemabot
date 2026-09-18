@@ -409,12 +409,13 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 	if err != nil {
 		return "", err
 	}
-	profileName := ResolveProfileName(cfg, profileFlag)
+	selection := ResolveProfile(cfg, profileFlag)
+	profileName := selection.Name
 	profile, ok := cfg.Profiles[profileName]
 	if !ok {
 		// Mirror GetProfile: an explicitly requested missing profile is an error;
 		// an unrequested missing profile simply has no token.
-		if profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != "" {
+		if selection.Explicit() {
 			return "", fmt.Errorf("unknown profile %q", profileName)
 		}
 		return "", nil
