@@ -190,7 +190,7 @@ func (c *LocalClient) statementParser() (ddl.StatementParser, error) {
 
 // canonicalDDLForDrift normalizes a DDL statement, or a greenfield create set,
 // for comparison and fails closed if it cannot be parsed or is not actually
-// DDL. The parser's Canonicalize returns the input unchanged on a parse
+// DDL. The parser's canonicalizers return the input unchanged on a parse
 // failure, so such input would otherwise compare by raw text and could mask
 // drift — Classify errors reject it first. Classify also rejects
 // multi-statement input; the one multi-statement shape drift admits is a
@@ -234,7 +234,18 @@ func canonicalDriftStatement(p ddl.StatementParser, statement string, stmtType d
 	if !stmtType.IsDDL() {
 		return "", fmt.Errorf("expected a DDL statement, got %s", stmtType)
 	}
-	return p.Canonicalize(statement), nil
+	// Every drift key carries the change's canonical namespace, so the schema
+	// qualifier the engine writes into the DDL is the physical schema of the
+	// target that planned it — noise that differs between targets mapping the
+	// same namespace to differently named schemas, never signal. That holds
+	// for every relation the statement names in that same schema, not only
+	// the one it changes: a foreign key's target there is qualified by the
+	// same namespace mapping applied to the same desired schema, so two
+	// targets can only disagree on it by disagreeing on the mapping, which
+	// the key's own namespace already trusts. A reference into any other
+	// schema is outside that mapping and stays qualified, so targets that
+	// point at different schemas there still diverge.
+	return p.CanonicalizeUnqualified(statement), nil
 }
 
 // diffDriftMultisets returns the changes each side of a comparison holds that
