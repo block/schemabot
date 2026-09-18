@@ -256,6 +256,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	}
 
 	namespaces := sortedKeys(req.SchemaFiles)
+	ignored := engine.NewIgnoredTables(req.IgnoreTables)
 	result := &engine.PlanResult{}
 	for _, namespace := range namespaces {
 		ns := req.SchemaFiles[namespace]
@@ -301,7 +302,13 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
-		drops, exempt, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, parser)
+		// A table the config withholds that a schema file also declares is a
+		// contradiction: the declaring file would keep managing the table while
+		// the config says to leave it alone.
+		if err := ignored.RefuseDeclared(namespace, sortedKeys(desiredTables)); err != nil {
+			return nil, err
+		}
+		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, ignored, parser)
 		if err != nil {
 			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
 		}
@@ -313,6 +320,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				Tables:    exempt,
 				Reason:    "archive naming",
 			})
+		}
+		if exemption := ignored.Exemption(namespace, withheld); exemption != nil {
+			result.ExemptTables = append(result.ExemptTables, exemption)
 		}
 		if len(schemaChange.TableChanges) > 0 {
 			result.Changes = append(result.Changes, schemaChange)
@@ -735,15 +745,27 @@ func concurrentIndexStatement(sql string) (bool, error) {
 // relationship needs instead of pointing at a file the pull cannot write. The
 // catalog is read directly because the namespace's schema may not exist yet,
 // in which case the answer is an empty set, not an error.
-func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, parser ddl.StatementParser) ([]engine.TableChange, []string, error) {
+func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
 	tables, err := liveTables(ctx, pool, namespace)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var drops []engine.TableChange
 	var exempt []string
+	var withheld []string
 	for _, live := range tables {
 		if declared[live.name] {
+			continue
+		}
+		// The config's own entry is reported ahead of the naming conventions:
+		// an operator who wrote the table down deserves to read their own
+		// reason back, not an incidental one the table also happens to match.
+		if ignored.Withholds(live.name) {
+			slog.Info("live table withheld from the plan by ignore_tables",
+				"database", database,
+				"namespace", namespace,
+				"table", live.name)
+			withheld = append(withheld, live.name)
 			continue
 		}
 		if spirittable.IsArchiveTable(live.name) {
@@ -757,7 +779,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, live.name}.Sanitize())
 		operation, _, err := parser.Classify(sql)
 		if err != nil {
-			return nil, nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
+			return nil, nil, nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
 		}
 		// The plan comment classifies this drop from the statement; when a
 		// stored plan carries no statement it falls back to the words "DROP
@@ -773,7 +795,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 			ModeReason:    sanitizeReasonText(undeclaredTableReason(namespace, live)),
 		})
 	}
-	return drops, exempt, nil
+	return drops, exempt, withheld, nil
 }
 
 // undeclaredTableReason explains why the drop is blocked and what the

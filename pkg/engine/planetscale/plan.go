@@ -91,6 +91,17 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
 
+	// The config withholds named live tables from the planner, so a table no
+	// schema file declares is not proposed for DROP TABLE. Applied before the
+	// diff below, per keyspace, and disclosed on the result: the diff never
+	// sees a withheld table, so without the disclosure it would be
+	// indistinguishable from an unchanged one.
+	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	exemptTables, err := e.withholdIgnoredTables(ignored, req, keyspaces, currentSchema)
+	if err != nil {
+		return nil, err
+	}
+
 	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
 	type keyspaceResult struct {
 		change     engine.SchemaChange
@@ -214,9 +225,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	if len(changes) == 0 {
+		// The exemption travels on a no-changes plan too: this is exactly where
+		// a reviewer needs to tell a withheld live table from an unchanged one.
 		return &engine.PlanResult{
-			PlanID:    engine.NewPlanID(),
-			NoChanges: true,
+			PlanID:       engine.NewPlanID(),
+			NoChanges:    true,
+			ExemptTables: exemptTables,
 		}, nil
 	}
 
@@ -224,7 +238,63 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		PlanID:         engine.NewPlanID(),
 		Changes:        changes,
 		LintViolations: lintViolations,
+		ExemptTables:   exemptTables,
 	}, nil
+}
+
+// withholdIgnoredTables removes the live tables the config's ignore_tables
+// withholds from each keyspace's current schema, in place, and returns the
+// plan's disclosure of what it actually withheld. A keyspace whose schema
+// files declare a withheld table is refused: the declaration and the ignore
+// contradict each other, and the diff would resolve that contradiction by
+// proposing to create a table that already exists.
+func (e *Engine) withholdIgnoredTables(ignored engine.IgnoredTables, req *engine.PlanRequest, keyspaces []string, currentSchema map[string][]table.TableSchema) ([]*engine.ExemptTables, error) {
+	if ignored.Empty() {
+		return nil, nil
+	}
+	var exemptTables []*engine.ExemptTables
+	for _, ks := range keyspaces {
+		ns := req.SchemaFiles[ks]
+		if ns == nil {
+			return nil, fmt.Errorf("plan keyspace %q: schema files are required", ks)
+		}
+		declared, err := parseDesiredSchemas(ks, ns)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, len(declared))
+		for i, ts := range declared {
+			names[i] = ts.Name
+		}
+		if err := ignored.RefuseDeclared(ks, names); err != nil {
+			return nil, err
+		}
+
+		live, ok := currentSchema[ks]
+		if !ok {
+			continue
+		}
+		kept := make([]table.TableSchema, 0, len(live))
+		var withheld []string
+		for _, ts := range live {
+			if ignored.Withholds(ts.Name) {
+				withheld = append(withheld, ts.Name)
+				continue
+			}
+			kept = append(kept, ts)
+		}
+		if len(withheld) == 0 {
+			continue
+		}
+		currentSchema[ks] = kept
+		// The plan discloses this too; the log is where an operator tracing
+		// "why does the plan not mention table X" finds the answer without a
+		// plan comment in front of them.
+		e.logger.Info("live tables withheld from the plan by ignore_tables",
+			"database", req.Database, "keyspace", ks, "tables", withheld)
+		exemptTables = append(exemptTables, ignored.Exemption(ks, withheld))
+	}
+	return exemptTables, nil
 }
 
 // parseDesiredSchemas parses CREATE TABLE statements from schema files in a namespace,

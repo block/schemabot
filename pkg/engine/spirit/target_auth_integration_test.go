@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
@@ -40,7 +41,7 @@ func TestEngine_FetchCurrentSchema_ClassifiesTargetAuthFailure(t *testing.T) {
 			require.NoError(t, err)
 			tc.mutate(cfg)
 
-			_, err = New(Config{}).fetchCurrentSchema(t.Context(), cfg.FormatDSN(), cfg.DBName)
+			_, _, err = New(Config{}).fetchCurrentSchema(t.Context(), cfg.FormatDSN(), cfg.DBName, engine.IgnoredTables{})
 			require.Error(t, err)
 
 			classification, ok := targetauth.ClassificationOf(err)
