@@ -67,6 +67,10 @@ type ensureSchemaOptions struct {
 	// so a caller that never considered the question still bootstraps under a
 	// budget SchemaBot states instead of one the platform imposed.
 	postgresStatementTimeout time.Duration
+	// progress is called as the convergence runs, for a caller with somebody
+	// watching. Nil on a boot, where the log already carries every statement
+	// and there is nobody to show anything to.
+	progress func(StorageConvergenceProgress)
 }
 
 // WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
@@ -130,6 +134,69 @@ func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 // Wire it from DefaultStorageApplyTimeout unless an operator named a value.
 func WithConvergenceTimeout(d time.Duration) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.convergenceTimeout = d }
+}
+
+// WithConvergenceProgress reports a convergence as it runs, for the caller
+// that has somebody watching it.
+//
+// Without it a convergence is silent between the plan and the answer. That is
+// the right shape for a boot — the log carries every statement, and nobody is
+// reading a terminal — but it is the wrong shape for an operator who has just
+// been told an index build may take an hour and cannot tell a slow copy from
+// a stuck one.
+//
+// fn is called from the convergence's own goroutine, once per observation.
+// Observations are frequent and mostly identical, and deciding what is worth
+// showing is the caller's job rather than this package's: a terminal prints on
+// a change, and something else might sample or aggregate. fn must not block —
+// the convergence is what is waiting on it — and must not panic, since it runs
+// inside the run it is describing.
+func WithConvergenceProgress(fn func(StorageConvergenceProgress)) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.progress = fn }
+}
+
+// StorageConvergenceProgress is one observation of a convergence in flight.
+//
+// The fields are the ones every dialect can fill. What a dialect cannot say it
+// leaves empty rather than inventing: PostgreSQL converges each table in a
+// transaction and knows which one it is on but not how far into it, so its
+// observations carry the table and no percentage — which is the honest answer,
+// and is still the one thing an operator watching a long CREATE INDEX needs.
+type StorageConvergenceProgress struct {
+	// DDLCount is how many statements this convergence is running in total.
+	DDLCount int
+	// State is the engine's own name for what it is doing, or the convergence's
+	// own on a dialect with no engine behind it.
+	State string
+	// Percent is how far along the whole convergence is, 0 to 100. A dialect
+	// that cannot measure it reports 0 throughout.
+	Percent int
+	// Message is the engine's own status line. Empty when it has none.
+	Message string
+	// Tables is what is happening per table, where that is known.
+	Tables []StorageConvergenceTableProgress
+}
+
+// StorageConvergenceTableProgress is one table's share of a convergence.
+type StorageConvergenceTableProgress struct {
+	Table string
+	// State is the engine's own name for the table's phase — copying, ready,
+	// complete. A dialect without per-table phases leaves it empty.
+	State string
+	// Percent is how far this table's statement has got, 0 to 100.
+	Percent int
+	// RowsCopied is how many rows have been copied into the table's shadow
+	// copy. Zero for a statement that copies nothing, and for an engine that
+	// does not count.
+	RowsCopied int64
+}
+
+// report hands one observation to the caller watching, if anyone is.
+func (o ensureSchemaOptions) report(p StorageConvergenceProgress) {
+	if o.progress == nil {
+		return
+	}
+	o.progress(p)
 }
 
 // EnsureSchema converges SchemaBot's own storage schema at startup, routing to
@@ -372,6 +439,10 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 			return fmt.Errorf("check progress: %w", err)
 		}
 
+		// Straight out of the poll the wait already runs — an operator watching
+		// sees what the engine sees, at the rate it is asked.
+		o.report(mysqlConvergenceProgress(progress, len(tableChanges)))
+
 		if progress.State == engine.StateFailed {
 			// Surface the cause in an Error log here — callers typically wrap the
 			// returned error as a structured attribute, which is easy to miss in
@@ -411,6 +482,29 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 		"duration", time.Since(applyStart),
 	)
 	return nil
+}
+
+// mysqlConvergenceProgress narrows one engine poll to what an operator is
+// watching for. The engine's result also carries resume state, retry
+// classification, and its own metadata map, none of which describes how far
+// along the run is; passing them through would make the observation a second
+// name for the engine's response and tie every consumer to it.
+func mysqlConvergenceProgress(result *engine.ProgressResult, ddlCount int) StorageConvergenceProgress {
+	p := StorageConvergenceProgress{
+		DDLCount: ddlCount,
+		State:    string(result.State),
+		Percent:  result.Progress,
+		Message:  result.Message,
+	}
+	for _, table := range result.Tables {
+		p.Tables = append(p.Tables, StorageConvergenceTableProgress{
+			Table:      table.Table,
+			State:      table.State,
+			Percent:    table.Progress,
+			RowsCopied: table.RowsCopied,
+		})
+	}
+	return p
 }
 
 // stopConvergence ends a convergence whose context is gone: it releases what
@@ -901,14 +995,23 @@ func releaseEnsureSchemaLock(ctx context.Context, locker namedlock.Locker, conn 
 // _spirit_sentinel, _spirit_checkpoint) that Spirit normally cleans up after
 // cutover. If a pod is killed mid-apply, they persist until the next startup.
 //
-// This is safe because EnsureSchema only targets SchemaBot's own storage
-// database, and Spirit runs in-process — when the pod restarts, there is no
-// active Spirit runner to resume. Spirit's checkpoint-based resume only works
-// within a single runner lifetime. Cleaning these tables lets Spirit start
-// fresh without logging confusing "successfully dropped old table" messages.
+// Dropping them is a choice rather than a consequence. A checkpoint is durable
+// state on the target, not a handle held by the process that wrote it, and
+// Spirit decides on its own whether to adopt or discard one by comparing the
+// statement it is given against the statement the checkpoint stores. What makes
+// the choice safe is that these tables hold no committed state: the live tables
+// are untouched until cutover, so the whole cost of dropping a copy is the rows
+// it had copied.
 //
-// This must NOT be used on target databases where user schema changes may be
-// in progress or resumable.
+// What makes it the right choice is that this path converges storage against
+// the schema embedded in whichever binary is booting. A release that changed
+// the schema plans a different statement, so its copy is discarded regardless;
+// the only run that could adopt one is the same build restarting with no
+// statement yet finished. A convergence that always starts clean is worth more
+// than that case, because every boot then inherits nothing.
+//
+// This must NOT be used on target databases, where a user's schema change may
+// be in progress or resumable.
 func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger) error {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
