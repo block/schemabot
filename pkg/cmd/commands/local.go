@@ -192,7 +192,7 @@ func resolveLocalRuntimeID(id, profileFlag string) (string, error) {
 	name := selection.Name
 	profile, exists := cfg.Profiles[name]
 	if !exists {
-		if selection.Source != client.ProfileSourceFallback || len(cfg.Profiles) > 0 {
+		if selection.Configured() || len(cfg.Profiles) > 0 {
 			return "", fmt.Errorf("unknown profile %q; select a local profile or provide a runtime ID", name)
 		}
 		return "local", nil

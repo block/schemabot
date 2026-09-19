@@ -29,20 +29,21 @@ func TestResolveProfileSelection(t *testing.T) {
 	}
 }
 
+// Local runtime selection has a stricter policy, covered in commands/local_selection_test.go.
 func TestProfileConsumersSelection(t *testing.T) {
 	for _, tt := range []struct {
-		name, flag, env, configured string
-		exists, wantError           bool
+		name, flag, env, configured, wantName string
+		exists, wantError, fallbackExists     bool
 	}{
 		{name: "missing fallback"},
-		{name: "missing configured default", configured: "selected"},
+		{name: "missing configured default", configured: "selected", fallbackExists: true},
 		{name: "missing environment", env: "selected", wantError: true},
 		{name: "missing flag", flag: "selected", wantError: true},
 		{name: "missing explicit default", flag: "default", wantError: true},
-		{name: "existing fallback", exists: true},
-		{name: "existing configured default", configured: "selected", exists: true},
-		{name: "existing environment", env: "selected", configured: "missing", exists: true},
-		{name: "existing flag wins", flag: "selected", env: "missing", exists: true},
+		{name: "existing fallback", exists: true, wantName: "default"},
+		{name: "existing configured default", configured: "selected", exists: true, wantName: "selected"},
+		{name: "existing environment", env: "selected", configured: "missing", exists: true, wantName: "selected"},
+		{name: "existing flag wins", flag: "selected", env: "missing", exists: true, wantName: "selected"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
@@ -50,10 +51,18 @@ func TestProfileConsumersSelection(t *testing.T) {
 			t.Setenv("SCHEMABOT_ENDPOINT", "")
 			t.Setenv("SCHEMABOT_PROFILE", tt.env)
 			cfg := &Config{DefaultProfile: tt.configured, Profiles: map[string]Profile{}}
-			want := Profile{Endpoint: "https://example.test", Token: "test-token"}
+			profiles := map[string]Profile{
+				"selected": {Endpoint: "https://selected.example.test", Token: "selected-token"},
+				"default":  {Endpoint: "https://default.example.test", Token: "default-token"},
+			}
+			want := profiles[tt.wantName]
 			if tt.exists {
-				cfg.Profiles["selected"] = want
-				cfg.Profiles["default"] = want
+				cfg.Profiles = profiles
+			}
+			// Keep a fallback available when the configured profile is missing:
+			// ignoring the configured name must not return the fallback's credentials.
+			if tt.fallbackExists {
+				cfg.Profiles["default"] = profiles["default"]
 			}
 			require.NoError(t, SaveConfig(cfg))
 			token, tokenErr := ResolveBearerToken(t.Context(), "", "", tt.flag)
@@ -74,6 +83,26 @@ func TestProfileConsumersSelection(t *testing.T) {
 					require.Empty(t, token)
 				}
 			}
+		})
+	}
+}
+
+func TestProfileSelectionPolicies(t *testing.T) {
+	for _, tt := range []struct {
+		name                 string
+		source               ProfileSource
+		explicit, configured bool
+	}{
+		{"unspecified", ProfileSourceUnspecified, true, true},
+		{"fallback", ProfileSourceFallback, false, false},
+		{"flag", ProfileSourceFlag, true, true},
+		{"environment", ProfileSourceEnvironment, true, true},
+		{"config", ProfileSourceConfig, false, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			selection := ProfileSelection{Source: tt.source}
+			require.Equal(t, tt.explicit, selection.Explicit())
+			require.Equal(t, tt.configured, selection.Configured())
 		})
 	}
 }

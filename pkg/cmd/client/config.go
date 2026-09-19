@@ -239,7 +239,8 @@ func SaveConfig(cfg *Config) error {
 type ProfileSource uint8
 
 const (
-	ProfileSourceFallback ProfileSource = iota
+	ProfileSourceUnspecified ProfileSource = iota
+	ProfileSourceFallback
 	ProfileSourceFlag
 	ProfileSourceEnvironment
 	ProfileSourceConfig
@@ -251,9 +252,16 @@ type ProfileSelection struct {
 	Source ProfileSource
 }
 
-// Explicit reports whether the caller requested a profile for this invocation.
+// Explicit reports whether a missing selection must be rejected by profile lookup.
+// An unspecified source fails closed rather than allowing an implicit fallback.
 func (selection ProfileSelection) Explicit() bool {
-	return selection.Source == ProfileSourceFlag || selection.Source == ProfileSourceEnvironment
+	return selection.Source != ProfileSourceFallback && selection.Source != ProfileSourceConfig
+}
+
+// Configured reports whether runtime selection must reject a missing profile.
+// Only the conventional fallback is unconfigured; unknown sources fail closed.
+func (selection ProfileSelection) Configured() bool {
+	return selection.Source != ProfileSourceFallback
 }
 
 // ResolveProfile selects a name using flag, environment, configured default,
@@ -276,7 +284,7 @@ func ResolveProfileName(cfg *Config, profileFlag string) string {
 	return ResolveProfile(cfg, profileFlag).Name
 }
 
-// GetProfile loads and returns the resolved profile (see ResolveProfileName for
+// GetProfile loads and returns the resolved profile (see ResolveProfile for
 // the name precedence, which includes the final fallback to "default"). An
 // explicitly requested profile (via --profile or SCHEMABOT_PROFILE) that does
 // not exist is an error; an unrequested missing profile yields an empty Profile.
