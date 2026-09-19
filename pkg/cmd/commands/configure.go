@@ -166,21 +166,7 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 
 	configPath, _ := client.ConfigPath()
 
-	// Determine active profile name
-	activeProfileName := g.Profile
-	activeSource := "flag"
-	if activeProfileName == "" {
-		activeProfileName = os.Getenv("SCHEMABOT_PROFILE")
-		activeSource = "env"
-	}
-	if activeProfileName == "" {
-		activeProfileName = cfg.DefaultProfile
-		activeSource = "config"
-	}
-	if activeProfileName == "" {
-		activeProfileName = "default"
-		activeSource = "default"
-	}
+	selection := client.ResolveProfile(cfg, g.Profile)
 
 	fmt.Println("SchemaBot Configuration")
 	fmt.Println()
@@ -188,13 +174,13 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 	fmt.Println()
 
 	// Show how profile was determined
-	fmt.Printf("  Active profile: %s", activeProfileName)
-	switch activeSource {
-	case "flag":
+	fmt.Printf("  Active profile: %s", selection.Name)
+	switch selection.Source {
+	case client.ProfileSourceFlag:
 		fmt.Printf(" (from --profile flag)\n")
-	case "env":
+	case client.ProfileSourceEnvironment:
 		fmt.Printf(" (from SCHEMABOT_PROFILE env)\n")
-	case "config":
+	case client.ProfileSourceConfig:
 		fmt.Printf(" (from config default_profile)\n")
 	default:
 		fmt.Printf(" (default)\n")
@@ -226,7 +212,7 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 		for _, name := range names {
 			profile := cfg.Profiles[name]
 			marker := "  "
-			if name == activeProfileName {
+			if name == selection.Name {
 				marker = "* "
 			}
 			fmt.Printf("    %s%s: %s\n", marker, name, profile.Endpoint)
