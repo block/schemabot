@@ -501,6 +501,10 @@ type ListPlansOptions struct {
 	// that PR number. Requires Repository — a PR number is only meaningful
 	// within one repository, so List errors when it is set alone.
 	PullRequest int
+	// PrimaryPlanIdentifier, when set, restricts results to the member plans
+	// produced alongside that reviewed plan — the one review round's members,
+	// rather than every plan stored for the pull request.
+	PrimaryPlanIdentifier string
 	// Since, when set, restricts results to plans created at or after this
 	// instant.
 	Since time.Time
