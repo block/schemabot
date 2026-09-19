@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // driftChangeKey identifies a single table DDL change for drift comparison. Two
@@ -42,6 +43,38 @@ type driftChangeKey struct {
 // compared exactly (set equality would silently tolerate a duplicated change).
 type driftChangeMultiset map[driftChangeKey]int
 
+// driftVerdict is the execution-mode verdict this deployment's own re-plan
+// reached for one change: how the statement would run against this target.
+type driftVerdict struct {
+	mode   string
+	reason string
+}
+
+// driftVerdicts records, per change, the verdict this deployment's re-plan
+// reached, keyed exactly as the drift comparison keyed the changes (so
+// targetShard is the shard every key carries: "" for a whole-deployment
+// apply). The verdict is a property of a target, not of the plan text: the
+// same statement can be executable on the primary's target and refused on
+// this one (a table above the direct-execution size bound here, a grant
+// missing here), so the dispatched changes cannot carry it and the re-plan is
+// the only place it exists.
+type driftVerdicts struct {
+	targetShard string
+	byChange    map[driftChangeKey]driftVerdict
+}
+
+// record keeps the verdict for a key. A key can repeat when the re-plan holds
+// the same change twice; a blocked verdict then wins because admitting a plan
+// one copy would refuse is the failure this exists to prevent. Otherwise the
+// first verdict seen stands.
+func (v driftVerdicts) record(key driftChangeKey, mode, reason string) {
+	existing, seen := v.byChange[key]
+	if seen && (existing.mode == engine.ExecutionModeBlocked || mode != engine.ExecutionModeBlocked) {
+		return
+	}
+	v.byChange[key] = driftVerdict{mode: mode, reason: reason}
+}
+
 // driftRecoveryHint gives a blocked operator the defined next step when the
 // guard fails closed: the reviewed plan no longer matches live schema, so it
 // must be regenerated against the current schema and re-reviewed before
@@ -55,19 +88,27 @@ const driftRecoveryHint = "to recover, re-plan against the current live schema t
 // deployment whose schema has drifted; recomputing the local diff and requiring
 // an exact match keeps non-primary drift from being applied unreviewed.
 //
+// On a match it returns this deployment's execution-mode verdicts for the
+// dispatched changes, keyed the same way the comparison was. The dispatch is
+// built from task rows, which carry no verdict, so the re-plan is the only
+// source of "would this target refuse the statement" — and the materialized
+// plan must carry that verdict for the admission gate to have anything to
+// refuse. Returning it from here rather than re-planning again keeps one
+// engine call serving both the drift comparison and the verdict.
+//
 // The comparison is shard-aware. A sharded engine's work is dispatched one
 // apply_operation per shard, so a request that carries a target shard is scoped
 // to that single shard: the reviewed DDL is compared against this deployment's
 // re-plan restricted to the same shard. A request with no target shard is a
 // whole-deployment (or non-sharded) apply, compared against the re-plan's
 // non-sharded changes.
-func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, schemaFiles schema.SchemaFiles) error {
+func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, schemaFiles schema.SchemaFiles) (driftVerdicts, error) {
 	shardScoped := len(req.TargetShards) > 0
 	targetShard := ""
 	if shardScoped {
 		shard, err := dispatchTargetShard(req.TargetShards)
 		if err != nil {
-			return fmt.Errorf("drift guard: %w", err)
+			return driftVerdicts{}, fmt.Errorf("drift guard: %w", err)
 		}
 		targetShard = shard
 	}
@@ -79,19 +120,19 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		Target:      req.Target,
 	}, c.config.Database, schemaFiles)
 	if err != nil {
-		return fmt.Errorf("recompute local plan: %w", err)
+		return driftVerdicts{}, fmt.Errorf("recompute local plan: %w", err)
 	}
 
-	recomputed, err := c.driftMultisetFromPlanResult(result, shardScoped, targetShard)
+	recomputed, verdicts, err := c.driftMultisetFromPlanResult(result, shardScoped, targetShard)
 	if err != nil {
-		return fmt.Errorf("recomputed plan: %w", err)
+		return driftVerdicts{}, fmt.Errorf("recomputed plan: %w", err)
 	}
 	dispatched, err := c.driftMultisetFromApplyRequest(req.DdlChanges, targetShard)
 	if err != nil {
-		return fmt.Errorf("dispatched plan: %w", err)
+		return driftVerdicts{}, fmt.Errorf("dispatched plan: %w", err)
 	}
 	if err := compareDriftMultisets(recomputed, dispatched); err != nil {
-		return fmt.Errorf("local schema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
+		return driftVerdicts{}, fmt.Errorf("local schema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 	}
 
 	// VSchema changes are namespace-level, not shard-scoped, and travel on the
@@ -105,24 +146,26 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 	// namespace from one set, which trips parity in the fail-closed direction.
 	if !shardScoped {
 		if err := compareVSchemaParity(vschemaNamespacesFromPlanResult(c, result), vschemaNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
-			return fmt.Errorf("local vschema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
+			return driftVerdicts{}, fmt.Errorf("local vschema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 		}
 	}
-	return nil
+	return verdicts, nil
 }
 
 // driftMultisetFromPlanResult builds the table DDL multiset this deployment
 // would plan against its own live schema, restricted to the dispatch's shard
-// scope. A shard-scoped dispatch covers exactly one shard, so other shards'
-// remaining changes are not part of this comparison; a whole-deployment dispatch
-// covers only the non-sharded changes. VSchema changes carry no table DDL and
-// are compared separately, so they are excluded here.
-func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, shardScoped bool, targetShard string) (driftChangeMultiset, error) {
+// scope, together with the re-plan's execution-mode verdict for each key. A
+// shard-scoped dispatch covers exactly one shard, so other shards' remaining
+// changes are not part of this comparison; a whole-deployment dispatch covers
+// only the non-sharded changes. VSchema changes carry no table DDL and are
+// compared separately, so they are excluded here.
+func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, shardScoped bool, targetShard string) (driftChangeMultiset, driftVerdicts, error) {
 	parser, err := c.statementParser()
 	if err != nil {
-		return nil, err
+		return nil, driftVerdicts{}, err
 	}
 	ms := driftChangeMultiset{}
+	verdicts := driftVerdicts{targetShard: targetShard, byChange: map[driftChangeKey]driftVerdict{}}
 	for _, sc := range result.Changes {
 		shard := sc.ShardName()
 		if shardScoped {
@@ -136,12 +179,47 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 		for _, tc := range sc.TableChanges {
 			canon, err := canonicalDDLForDrift(parser, tc.DDL)
 			if err != nil {
-				return nil, fmt.Errorf("table %q: %w", tc.Table, err)
+				return nil, driftVerdicts{}, fmt.Errorf("table %q: %w", tc.Table, err)
 			}
-			ms[driftChangeKey{ns, shard, tc.Table, ddl.StatementTypeToOp(tc.Operation), canon}]++
+			key := driftChangeKey{ns, shard, tc.Table, ddl.StatementTypeToOp(tc.Operation), canon}
+			ms[key]++
+			verdicts.record(key, tc.ExecutionMode, tc.ModeReason)
 		}
 	}
-	return ms, nil
+	return ms, verdicts, nil
+}
+
+// stampLocalVerdicts writes this deployment's re-plan verdicts onto the
+// materialized table changes so the admission gate judges the plan as this
+// target would run it. The dispatch never carries a verdict today (task rows
+// have no field for one), but if a future dispatch arrives already blocked
+// that refusal is kept: a verdict is only ever tightened here, never relaxed.
+// Every materialized change has a verdict because the drift comparison
+// already required the two multisets to match key for key.
+func (c *LocalClient) stampLocalVerdicts(namespaces map[string]*storage.NamespacePlanData, verdicts driftVerdicts) error {
+	parser, err := c.statementParser()
+	if err != nil {
+		return err
+	}
+	for _, nsData := range namespaces {
+		for i := range nsData.Tables {
+			tc := &nsData.Tables[i]
+			if tc.EngineBlocked() {
+				continue
+			}
+			canon, err := canonicalDDLForDrift(parser, tc.DDL)
+			if err != nil {
+				return fmt.Errorf("table %q: %w", tc.Table, err)
+			}
+			verdict, ok := verdicts.byChange[driftChangeKey{c.planNamespace(tc.Namespace), verdicts.targetShard, tc.Table, tc.Operation, canon}]
+			if !ok {
+				return fmt.Errorf("table %q: no local verdict for a change the drift comparison matched", tc.Table)
+			}
+			tc.ExecutionMode = verdict.mode
+			tc.ModeReason = verdict.reason
+		}
+	}
+	return nil
 }
 
 // driftMultisetFromApplyRequest builds the table DDL multiset the dispatch

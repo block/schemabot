@@ -85,6 +85,30 @@ func TestPlanBlockedChanges(t *testing.T) {
 	assert.Equal(t, "testdb", changes[1].Namespace)
 }
 
+// TestPlanBlockedApplyError verifies the refusal every admission path returns
+// for a plan with a blocked step: it names the first blocked table and its
+// reason, falls back to a fixed reason when the engine recorded none, and is
+// nil for a plan whose every step is executable.
+func TestPlanBlockedApplyError(t *testing.T) {
+	blocked := &Plan{PlanIdentifier: "plan-blocked", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{
+			{Table: "orders", Operation: "alter"},
+			{Table: "users", Operation: "alter", ExecutionMode: "blocked", ModeReason: "requires privileges unavailable to the engine"},
+		}},
+	}}
+	require.EqualError(t, blocked.BlockedApplyError(), `stored plan plan-blocked contains a blocked change for table "users": requires privileges unavailable to the engine`)
+
+	noReason := &Plan{PlanIdentifier: "plan-no-reason", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "blocked"}}},
+	}}
+	require.EqualError(t, noReason.BlockedApplyError(), `stored plan plan-no-reason contains a blocked change for table "users": the engine refuses this statement`)
+
+	clean := &Plan{PlanIdentifier: "plan-clean", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "direct"}}},
+	}}
+	require.NoError(t, clean.BlockedApplyError())
+}
+
 // TestReleasesPausedRollout verifies the one-way release latch semantics: a
 // pending or completed release request releases a paused rollout, while a
 // failed release, any non-release operation, and a nil request do not (the

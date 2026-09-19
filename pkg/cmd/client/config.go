@@ -235,23 +235,56 @@ func SaveConfig(cfg *Config) error {
 	return nil
 }
 
-// ResolveProfileName returns the active profile name using the standard
-// precedence: the --profile flag, then SCHEMABOT_PROFILE, then the configured
-// default profile, then "default". It does not check that the profile exists.
-func ResolveProfileName(cfg *Config, profileFlag string) string {
-	if profileFlag != "" {
-		return profileFlag
-	}
-	if env := os.Getenv("SCHEMABOT_PROFILE"); env != "" {
-		return env
-	}
-	if cfg.DefaultProfile != "" {
-		return cfg.DefaultProfile
-	}
-	return "default"
+// ProfileSource identifies where the selected profile name came from.
+type ProfileSource uint8
+
+const (
+	ProfileSourceUnspecified ProfileSource = iota
+	ProfileSourceFallback
+	ProfileSourceFlag
+	ProfileSourceEnvironment
+	ProfileSourceConfig
+)
+
+// ProfileSelection keeps the selected name and its source together.
+type ProfileSelection struct {
+	Name   string
+	Source ProfileSource
 }
 
-// GetProfile loads and returns the resolved profile (see ResolveProfileName for
+// Explicit reports whether a missing selection must be rejected by profile lookup.
+// An unspecified source fails closed rather than allowing an implicit fallback.
+func (selection ProfileSelection) Explicit() bool {
+	return selection.Source != ProfileSourceFallback && selection.Source != ProfileSourceConfig
+}
+
+// Configured reports whether runtime selection must reject a missing profile.
+// Only the conventional fallback is unconfigured; unknown sources fail closed.
+func (selection ProfileSelection) Configured() bool {
+	return selection.Source != ProfileSourceFallback
+}
+
+// ResolveProfile selects a name using flag, environment, configured default,
+// then "default" precedence. It does not check that the profile exists.
+func ResolveProfile(cfg *Config, profileFlag string) ProfileSelection {
+	if profileFlag != "" {
+		return ProfileSelection{Name: profileFlag, Source: ProfileSourceFlag}
+	}
+	if env := os.Getenv("SCHEMABOT_PROFILE"); env != "" {
+		return ProfileSelection{Name: env, Source: ProfileSourceEnvironment}
+	}
+	if cfg.DefaultProfile != "" {
+		return ProfileSelection{Name: cfg.DefaultProfile, Source: ProfileSourceConfig}
+	}
+	return ProfileSelection{Name: "default", Source: ProfileSourceFallback}
+}
+
+// ResolveProfileName returns the name selected by ResolveProfile.
+func ResolveProfileName(cfg *Config, profileFlag string) string {
+	return ResolveProfile(cfg, profileFlag).Name
+}
+
+// GetProfile loads and returns the resolved profile (see ResolveProfile for
 // the name precedence, which includes the final fallback to "default"). An
 // explicitly requested profile (via --profile or SCHEMABOT_PROFILE) that does
 // not exist is an error; an unrequested missing profile yields an empty Profile.
@@ -261,15 +294,11 @@ func GetProfile(profileFlag string) (*Profile, error) {
 		return nil, err
 	}
 
-	// Track whether the user explicitly requested a profile (flag or env), so we
-	// can error if it doesn't exist instead of silently falling back.
-	explicit := profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != ""
-	profileName := ResolveProfileName(cfg, profileFlag)
-
-	profile, ok := cfg.Profiles[profileName]
+	selection := ResolveProfile(cfg, profileFlag)
+	profile, ok := cfg.Profiles[selection.Name]
 	if !ok {
-		if explicit {
-			return nil, fmt.Errorf("unknown profile %q", profileName)
+		if selection.Explicit() {
+			return nil, fmt.Errorf("unknown profile %q", selection.Name)
 		}
 		return &Profile{}, nil
 	}
@@ -388,12 +417,13 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 	if err != nil {
 		return "", err
 	}
-	profileName := ResolveProfileName(cfg, profileFlag)
+	selection := ResolveProfile(cfg, profileFlag)
+	profileName := selection.Name
 	profile, ok := cfg.Profiles[profileName]
 	if !ok {
 		// Mirror GetProfile: an explicitly requested missing profile is an error;
 		// an unrequested missing profile simply has no token.
-		if profileFlag != "" || os.Getenv("SCHEMABOT_PROFILE") != "" {
+		if selection.Explicit() {
 			return "", fmt.Errorf("unknown profile %q", profileName)
 		}
 		return "", nil
