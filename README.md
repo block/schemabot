@@ -30,6 +30,18 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 [Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
+## From your terminal
+
+**Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
+
+<img src="./assets/cli-plan-apply.gif" width="800" alt="Plan and apply a schema change through the CLI">
+
+**Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
+
+<img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
+
+[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
+
 Block runs SchemaBot for the majority of its production schema changes, including MySQL tables spanning terabytes and Vitess databases with hundreds of shards.
 
 ## Your policies, enforced
@@ -86,18 +98,6 @@ make down
 ```
 
 This stops and removes the demo containers while retaining their database volumes. See the [CLI guide](./docs/cli.md) for more commands and example output.
-
-## From your terminal
-
-**Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
-
-<img src="./assets/cli-plan-apply.gif" width="800" alt="Plan and apply a schema change through the CLI">
-
-**Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
-
-<img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
-
-[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
 ## Supported databases
 
