@@ -191,9 +191,9 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 
 // stampLocalVerdicts writes this deployment's re-plan verdicts onto the
 // materialized table changes so the admission gate judges the plan as this
-// target would run it. The dispatch never carries a verdict today (task rows
-// have no field for one), but if a future dispatch arrives already blocked
-// that refusal is kept: a verdict is only ever tightened here, never relaxed.
+// target would run it. The dispatch never carries a verdict today, but if a
+// future dispatch arrives already blocked that refusal is kept: a verdict is
+// only ever tightened here, never relaxed.
 // Every materialized change has a verdict because the drift comparison
 // already required the two multisets to match key for key.
 func (c *LocalClient) stampLocalVerdicts(namespaces map[string]*storage.NamespacePlanData, verdicts driftVerdicts) error {

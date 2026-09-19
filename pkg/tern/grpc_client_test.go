@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -6292,7 +6293,9 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 		return &storage.Task{
 			ID: 41, TaskIdentifier: "task-shard-sync", ApplyID: apply.ID,
 			ApplyOperationID: &opID, Namespace: "commerce_sharded", TableName: "customers",
-			State: state.Task.Running,
+			State:         state.Task.Running,
+			ExecutionMode: engine.ExecutionModeDirect,
+			ModeReason:    "instant metadata change",
 		}
 	}
 	remoteTables := func() []*ternv1.TableProgress {
@@ -6330,6 +6333,12 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 		assert.Equal(t, opID, *byShard["-80"].ApplyOperationID)
 		assert.Equal(t, "commerce_sharded", byShard["-80"].Namespace)
 		assert.Equal(t, "customers", byShard["-80"].TableName)
+		// The admission verdict is carried too, so a per-shard row is never
+		// stored without the mode the drive admitted the table under.
+		for shard, row := range byShard {
+			assert.Equal(t, engine.ExecutionModeDirect, row.ExecutionMode, "shard %s", shard)
+			assert.Equal(t, "instant metadata change", row.ModeReason, "shard %s", shard)
+		}
 		assert.Equal(t, int64(100), byShard["-80"].RowsCopied)
 		assert.Equal(t, 100, byShard["-80"].ProgressPercent) // 100/100
 		assert.Equal(t, 25, byShard["80-"].ProgressPercent)  // 50/200

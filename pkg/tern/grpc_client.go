@@ -4171,6 +4171,8 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 			Shard:            sh.Shard,
 			DDL:              storedTask.DDL,
 			DDLAction:        storedTask.DDLAction,
+			ExecutionMode:    storedTask.ExecutionMode,
+			ModeReason:       storedTask.ModeReason,
 			State:            shardState,
 			RowsCopied:       sh.RowsCopied,
 			RowsTotal:        sh.RowsTotal,
