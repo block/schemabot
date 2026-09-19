@@ -614,6 +614,12 @@ type PullSchemaRequest struct {
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
+//
+// Namespaces holds the primary target's live schema, which is the schema a
+// caller materializes. Targets is populated only for an environment whose
+// targets each hold their own schema. It names every target the environment
+// addresses, including the primary, and describes how each of the others
+// differs from it.
 type PullSchemaResponse struct {
 	Database    string `json:"database"`
 	Type        string `json:"type"`
@@ -624,6 +630,45 @@ type PullSchemaResponse struct {
 	App        string                      `json:"app,omitempty"`
 	Namespaces map[string]*PulledNamespace `json:"namespaces"`
 	TableCount int32                       `json:"table_count"`
+	Targets    []*TargetDivergence         `json:"targets,omitempty"`
+}
+
+// Difference values for DivergedTable.
+const (
+	// DivergenceDiffers means both targets hold the table with different DDL.
+	DivergenceDiffers = "differs"
+	// DivergenceOnlyOnPrimary means only the primary target holds the table.
+	DivergenceOnlyOnPrimary = "only_on_primary"
+	// DivergenceOnlyOnTarget means only this target holds the table.
+	DivergenceOnlyOnTarget = "only_on_target"
+)
+
+// TargetDivergence reports how one target's live schema differs from the
+// primary's. An empty DivergedTables means the two targets hold the same
+// schema; it never means the comparison was skipped, since a target that could
+// not be pulled or compared fails the pull instead.
+//
+// Exactly one entry carries Primary, and it is the target whose schema
+// Namespaces holds. It is listed alongside the others so the response names the
+// environment's whole member set: a caller reconciling shards against its own
+// inventory can read the members off the payload instead of having to know
+// which target was left out for being the baseline.
+type TargetDivergence struct {
+	Deployment string `json:"deployment"`
+	Target     string `json:"target"`
+	TableCount int32  `json:"table_count"`
+	// Primary marks the target the other targets are compared against, whose
+	// schema is the one in PullSchemaResponse.Namespaces. It never carries
+	// diverged tables, since it is the baseline of the comparison.
+	Primary        bool            `json:"primary,omitempty"`
+	DivergedTables []DivergedTable `json:"diverged_tables,omitempty"`
+}
+
+// DivergedTable names one table two targets do not agree on, and how.
+type DivergedTable struct {
+	Namespace  string `json:"namespace"`
+	Table      string `json:"table"`
+	Difference string `json:"difference"`
 }
 
 // DatabaseListResponse is the HTTP response body for GET /api/databases.
