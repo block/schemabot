@@ -62,6 +62,20 @@ func (i IgnoredTables) Empty() bool { return len(i.entries) == 0 }
 // planner's view.
 func (i IgnoredTables) Withholds(table string) bool { return i.entries[table] }
 
+// NamesAny reports whether any entry satisfies match. An engine whose own
+// exclusions are cheaper to apply before reading a table asks this first: the
+// config's entries have to resolve ahead of those exclusions, but only a
+// config that reaches the same tables makes that ordering observable, and
+// every other plan can leave the engine's exclusion where it was.
+func (i IgnoredTables) NamesAny(match func(string) bool) bool {
+	for name := range i.entries {
+		if match(name) {
+			return true
+		}
+	}
+	return false
+}
+
 // RefuseDeclared refuses the one shape in which ignoring a table inverts into
 // changing it: a table the config withholds from the planner that a schema
 // file also declares to it. The repository is then saying both "manage this

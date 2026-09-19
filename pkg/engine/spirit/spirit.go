@@ -1082,6 +1082,27 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // second return value is what it actually withheld, sorted, for the plan to
 // disclose: the diff never sees these tables, so without the disclosure a
 // withheld table would be indistinguishable from an unchanged one.
+// liveSchemaFilterOptions returns the loader options for a live-schema read.
+//
+// The loader drops an excluded table before reading its definition, so an
+// exclusion moved to this side of it costs one SHOW CREATE TABLE per table it
+// would have dropped — and turns a table that cannot be read into a failed
+// plan, where the loader would never have looked at it. The archive exclusion
+// therefore stays with the loader unless the config names a table the archive
+// convention also excludes, which is the only case where the two orderings
+// disagree about what the plan discloses.
+//
+// The leading-underscore exclusion stays with the loader unconditionally: it
+// discards the names it drops, so an entry naming one cannot be disclosed as
+// withheld from here whatever the ordering.
+func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption {
+	opts := []table.FilterOption{table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement}
+	if !ignored.NamesAny(table.IsArchiveTable) {
+		opts = append(opts, table.WithoutArchiveTables)
+	}
+	return opts
+}
+
 func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) ([]table.TableSchema, []string, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
@@ -1095,17 +1116,18 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		return nil, nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement)
+	tables, err := table.LoadSchemaFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load schema: %w", err)
 	}
 
-	// The archive-naming exclusion is applied here rather than by the loader so
-	// that the config's own entries are matched against the target's catalog
-	// first. An entry naming a table the archive convention also excludes is
-	// then disclosed as withheld, the same as on every other engine, instead of
-	// being reported as an entry that matched no live table because another
-	// exclusion reached it first.
+	// The archive-naming exclusion is applied here when the loader was not
+	// asked for it, so that the config's own entries are matched against the
+	// target's catalog first. An entry naming a table the archive convention
+	// also excludes is then disclosed as withheld, the same as on every other
+	// engine, instead of being reported as an entry that matched no live table
+	// because another exclusion reached it first. When the loader did apply it
+	// this pass finds nothing, since it is the same predicate.
 	kept := make([]table.TableSchema, 0, len(tables))
 	var withheld []string
 	for _, ts := range tables {
