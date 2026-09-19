@@ -196,11 +196,14 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 	// so a caller that disconnects stops waiting for an answer rather than
 	// stopping the work.
 	//
-	// An absent or out-of-range budget is the control plane's to reject before
-	// it gets here, but this is a server boundary and the field arrives over the
-	// wire, so it is re-checked rather than trusted: a data plane reached
-	// directly must not convert a caller's zero into an unbounded lock hold.
-	budget, err := apitypes.ResolveStorageApplyTimeout(req.GetTimeoutSeconds())
+	// An out-of-range budget is the control plane's to reject before it gets
+	// here, but this is a server boundary and the field arrives over the wire,
+	// so it is re-checked rather than trusted. The control plane always names
+	// the budget it resolved, so a zero here is a caller that could not name
+	// one, and it runs under the boot budget: a data plane reached directly
+	// must not convert a caller's zero into an hour-long lock hold on behalf
+	// of a caller that may have stopped waiting long before.
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.GetTimeoutSeconds(), api.EnsureSchemaTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", tern.ErrInvalidStorageSchemaRequest, err)
 	}

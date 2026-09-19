@@ -264,8 +264,9 @@ type StorageApplyCmd struct {
 	// Timeout is how a convergence outlives the budget a boot runs under. A
 	// booting pod gives up after minutes because a pod converging is a pod not
 	// yet serving; this command has somebody watching it, so it does not have
-	// to. Left unset, the target picks its own operator default.
-	Timeout time.Duration `help:"Bound the whole convergence — the lock wait, the diff under it, and the DDL. Defaults to the target's operator budget, which is already far above a booting pod's. Raising it holds the storage bootstrap lock for that long, and pods booting in the window will not come up" name:"timeout"`
+	// to. Left unset, the operator default is named on its behalf, so the
+	// target always runs the budget this command is waiting for.
+	Timeout time.Duration `help:"Bound the whole convergence — the lock wait, the diff under it, and the DDL. Defaults to the operator budget, which is already far above a booting pod's. Raising it holds the storage bootstrap lock for that long, and pods booting in the window will not come up" name:"timeout"`
 	// The diff's file selectors are accepted here only to be refused with the
 	// reason and the alternative. An operator who has just run the diff against
 	// a release reaches for the same flags on the apply, and Kong's bare
@@ -512,16 +513,17 @@ func (cmd *StorageApplyCmd) convergenceBudget() (time.Duration, error) {
 	case cmd.Timeout%time.Second != 0:
 		return 0, fmt.Errorf("--timeout: a convergence budget of %s is not the whole number of seconds the request carries; naming it would run under %s instead", cmd.Timeout, cmd.Timeout.Truncate(time.Second))
 	}
-	budget, err := apitypes.ResolveStorageApplyTimeout(cmd.timeoutSeconds())
+	budget, err := apitypes.ResolveStorageApplyTimeout(cmd.timeoutSeconds(), apitypes.DefaultStorageApplyTimeout)
 	if err != nil {
 		return 0, fmt.Errorf("--timeout: %w", err)
 	}
 	return budget, nil
 }
 
-// timeoutSeconds is the flag as the request carries it. An unset flag sends
-// zero, which leaves the ceiling to the target rather than pinning the CLI's
-// idea of the default onto a server that may have a different one.
+// timeoutSeconds is the flag as the request carries it. An unset flag is zero
+// here, and the client names the operator default in its place before sending,
+// so the request the target sees always carries the budget this command waits
+// for.
 func (cmd *StorageApplyCmd) timeoutSeconds() int64 {
 	return int64(cmd.Timeout / time.Second)
 }
