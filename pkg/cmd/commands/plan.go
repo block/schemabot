@@ -239,7 +239,11 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// The exempt-table disclosure renders on both branches: a clean result is
 	// exactly where a reader needs to tell an exempted live table from one the
 	// plan simply found declared.
-	tables := result.FlatTables()
+	//
+	// The DDL block and the summary below are both built from this one set, so
+	// the summary counts what the block shows — and for a sharded plan that is
+	// every distinct per-shard statement, the same set the PR comment counts.
+	tables := result.RenderedTables()
 	if len(tables) == 0 && len(vschemaChanges) == 0 {
 		templates.WriteNoChanges()
 		templates.WriteExemptTables(result.ExemptTables)
@@ -255,6 +259,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		}
 		namespaceMap[ns] = append(namespaceMap[ns], templates.DDLChange{
 			ChangeType: tbl.ChangeType,
+			Namespace:  ns,
 			TableName:  tbl.TableName,
 			DDL:        tbl.DDL,
 		})
