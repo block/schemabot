@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
@@ -111,6 +112,30 @@ func TestProtoChangesToNamespacesPreservesUnsafeMetadata(t *testing.T) {
 	change := namespaces["testapp"].Tables[0]
 	assert.True(t, change.IsUnsafe)
 	assert.Equal(t, "DROP COLUMN removes data", change.UnsafeReason)
+}
+
+// A plan stored from a remote plan response keeps the engine's blocked verdict
+// and its reason, which is what the apply admission gate reads.
+func TestProtoChangesToNamespacesPreservesBlockedVerdict(t *testing.T) {
+	reason := "requires privileges unavailable to the engine"
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "public",
+		TableChanges: []*ternv1.TableChange{{
+			TableName:     "users",
+			Ddl:           "ALTER TABLE users ADD COLUMN email text",
+			ChangeType:    ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason:    reason,
+		}},
+	}}, nil)
+	require.NoError(t, err)
+
+	change := namespaces["public"].Tables[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Equal(t, reason, change.ModeReason)
+	plan := &storage.Plan{PlanIdentifier: "plan-x", Namespaces: namespaces}
+	require.EqualError(t, plan.BlockedApplyError(),
+		`stored plan plan-x contains a blocked change for table "users": `+reason)
 }
 
 func TestProtoShardPlansToStoragePreservesUnsafeMetadata(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -242,10 +243,9 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
-// TestEnginePlanPrivilegeRefusal proves a role that cannot alter the target
-// gets a blocked plan naming the exact provisioning statement, instead of an
-// executable plan that deterministically fails at apply. The plan itself
-// still succeeds: the operator needs the review surface to carry the grant.
+// TestEnginePlanPrivilegeRefusal proves a role that cannot alter an oversized
+// target gets one blocked verdict with the privilege cause followed by the
+// size cause, so the operator can address both findings from one plan.
 func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_privilege_test")
 	_, err := db.ExecContext(t.Context(), `
@@ -268,7 +268,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
 	}
 
-	result, err := New().Plan(t.Context(), req)
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
 	require.NoError(t, err)
 	require.Len(t, result.Changes, 1)
 	require.Len(t, result.Changes[0].TableChanges, 1)
@@ -280,6 +280,12 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		"the reason must carry the exact provisioning statement")
 	assert.Contains(t, change.ModeReason, "pg_has_role(plan_limited,",
 		"the reason must carry the exact failed catalog check")
+	privilegeAt := strings.Index(change.ModeReason, "in-place ALTER TABLE")
+	sizeAt := strings.Index(change.ModeReason, `statement for table "users": table size`)
+	assert.Greater(t, sizeAt, privilegeAt, "the size cause must follow the privilege cause")
+	assert.Equal(t, 1, strings.Count(change.ModeReason, `statement for table "users": table size`))
+	assert.Contains(t, change.ModeReason, "; statement for table",
+		"independent causes must use the package's sentence separator")
 }
 
 // TestEnginePlanPrivilegeRefusalPerTier proves a privilege gap blocks only
