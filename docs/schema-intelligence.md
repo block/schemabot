@@ -323,7 +323,7 @@ The envelope differs by dialect:
   envelope is in [postgresql.md](postgresql.md).
 - **Lint.** The MySQL family runs Spirit's schema-shape linters. PostgreSQL
   runs the rules with a PostgreSQL analog — `primary_key`, `has_float`,
-  `name_case` — as warnings; see
+  `name_case`, `redundant_indexes` — as warnings; see
   [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
   A lint request against a database of any other type is rejected rather than
   answered clean.

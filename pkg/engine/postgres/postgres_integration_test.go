@@ -1824,6 +1824,9 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
 		CREATE TABLE app.legacy_orders (id integer PRIMARY KEY, weight real);
 		CREATE INDEX legacy_orders_weight_idx ON app.legacy_orders (weight);
+		CREATE TABLE app.sessions (token char(36) PRIMARY KEY, account_id bigint NOT NULL, seen_at timestamptz);
+		CREATE INDEX sessions_account_idx ON app.sessions (account_id);
+		CREATE INDEX sessions_account_seen_idx ON app.sessions (account_id, seen_at);
 		CREATE TABLE app."Events" (id uuid PRIMARY KEY, payload jsonb)`)
 	require.NoError(t, err)
 
@@ -1832,7 +1835,7 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 		Database: "pull_lint_test", Type: "postgres", Environment: "test", Namespace: "app",
 	})
 	require.NoError(t, err)
-	require.Len(t, response.Namespaces["app"].Tables, 3)
+	require.Len(t, response.Namespaces["app"].Tables, 4)
 
 	results, err := lint.New().LintPostgresSchema(response.Namespaces["app"].Tables)
 	require.NoError(t, err)
@@ -1840,5 +1843,7 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 		{Table: "Events", Linter: "name_case", Severity: "warning", Message: `table name "Events" is not lowercase`},
 		{Table: "legacy_orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "legacy_orders" uses "integer"; allowed types: bigint, uuid`},
 		{Table: "legacy_orders", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "legacy_orders" uses "real" data type`},
+		{Table: "sessions", Linter: "redundant_indexes", Severity: "warning", Message: `Index "sessions_account_idx" on column "account_id" is redundant - covered by index "sessions_account_seen_idx" on columns ("account_id", "seen_at")`},
+		{Table: "sessions", Column: "token", Linter: "primary_key", Severity: "warning", Message: `Primary key column "token" in table "sessions" uses "character(36)"; allowed types: bigint, uuid`},
 	}, results)
 }

@@ -53,10 +53,14 @@ answered with the basic shape.
 
 `schemabot pull --lint` audits each pulled table for the schema-shape rules
 that have a PostgreSQL analog: a missing primary key or a key column whose type
-is not `bigint` or `uuid`, `real` / `double precision` / `float(n)` columns, and
-a quoted table name that is not lowercase. Every finding is a warning, and a
-clean audit returns an empty list for the namespace. The rules and their
-MySQL-only counterparts are in
+is not `bigint` or `uuid`, `real` / `double precision` / `float(n)` columns, a
+quoted table name that is not lowercase, and a btree index that another index
+or the primary key already covers. Every finding is a warning, and a clean
+audit returns an empty list for the namespace. Each pulled entry is audited as
+the create set the renderer emits — the `CREATE TABLE` followed by that table's
+`CREATE INDEX` statements — and an entry of any other shape fails the request
+rather than producing a partial audit. The rules and the MySQL-only rules they
+leave out are in
 [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
 
 ## Supported changes
