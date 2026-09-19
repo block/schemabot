@@ -154,9 +154,9 @@ func TestRenderPlanComment_ShardedOnlyPerShardDDLNotMiscounted(t *testing.T) {
 	assert.Contains(t, out, "```sql", "the per-shard DDL is rendered")
 }
 
-// A plan whose DDL is only per-shard still reports its raw statement count in
-// the summary when the same plan also carries a vschema update — the vschema
-// clause must not hide DDL the plan will run.
+// A plan whose DDL is only per-shard is classified in the summary like any
+// other, and the count stays next to the vschema clause — a vschema update
+// must not hide DDL the plan will run.
 func TestRenderPlanComment_PerShardDDLCountedAlongsideVSchema(t *testing.T) {
 	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
 	out := RenderPlanComment(PlanCommentData{
@@ -173,7 +173,7 @@ func TestRenderPlanComment_PerShardDDLCountedAlongsideVSchema(t *testing.T) {
 		}},
 	})
 
-	assert.Contains(t, out, "📋 **Plan**: 1 DDL statement, **1** vschema update")
+	assert.Contains(t, out, "📋 **Plan**: **1** table to alter, **1** vschema update")
 }
 
 // A uniform plan across a wide keyspace leads with how much of the keyspace
