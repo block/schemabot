@@ -3,6 +3,7 @@ package templates
 import (
 	"testing"
 
+	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,6 +28,30 @@ func TestDDLSummaryParts_CountsNamelessChangesWithoutMerging(t *testing.T) {
 		{ChangeType: "ALTER", TableName: "orders"},
 	}
 	require.Equal(t, []string{"3 tables to alter"}, ddlSummaryParts(changes))
+}
+
+func TestPlanSummarySurfacesShareCounts(t *testing.T) {
+	cliChanges := []DDLChange{
+		{ChangeType: "CHANGE_TYPE_CREATE", TableName: "users"},
+		{ChangeType: "CHANGE_TYPE_ALTER", TableName: "users"},
+		{ChangeType: "ALTER", TableName: "users"},
+		{ChangeType: "ALTER", TableName: "orders"},
+		{ChangeType: "CREATE_INDEX", TableName: "orders"},
+	}
+	commentData := webhooktemplates.PlanCommentData{
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Changes: []webhooktemplates.KeyspaceChangeData{{Keyspace: "app", Statements: []string{
+			"CREATE TABLE users (id INT)",
+			"ALTER TABLE users ADD COLUMN name TEXT",
+			"ALTER TABLE users ADD COLUMN email TEXT",
+			"ALTER TABLE orders ADD COLUMN state TEXT",
+			"CREATE INDEX orders_state ON orders (state)",
+		}}},
+	}
+
+	assert.Equal(t, []string{"1 table to create", "2 tables to alter", "1 other DDL statement"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 create, 2 alters, 1 other DDL statement", webhooktemplates.SummarizeChanges(commentData))
 }
 
 // The CLI plan summary counts every statement the plan will run, matching the

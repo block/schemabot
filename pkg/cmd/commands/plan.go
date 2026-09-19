@@ -255,6 +255,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		}
 		namespaceMap[ns] = append(namespaceMap[ns], templates.DDLChange{
 			ChangeType: tbl.ChangeType,
+			Namespace:  ns,
 			TableName:  tbl.TableName,
 			DDL:        tbl.DDL,
 		})

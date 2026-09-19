@@ -1158,6 +1158,13 @@ and its rules (`pkg/glyph`), the shared bar and its colors (`pkg/ui`), the share
 introducing a severity glyph as a literal outside its home package
 (`pkg/analyzers/severityglyphs`, `scripts/lint-fix.sh`).
 
+### UX-6: A plan's statement totals agree across surfaces
+
+Every plan summary derives its create, alter, drop, and other DDL totals through one shared
+counter. The CLI and PR comment may style those totals differently, but they report the same
+table-level operations and unclassified statement count. *Enforced:* the shared plan counter and
+summary renderer (`pkg/ui/plan_summary.go`).
+
 ## Recovery (RC)
 
 ### RC-1: Nothing is orphaned
