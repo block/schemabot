@@ -470,6 +470,20 @@ type NamespacePlanData struct {
 	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate
 	// keys and the rendered VSchema diff apply-time display shows.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// WithheldTables are the live tables the plan's ignore_tables config kept
+	// out of the planner's view, and which are therefore absent from
+	// OriginalFiles. A re-plan of a stored plan — a rollback, a resume — must
+	// withhold the same tables, or the tables it never captured would come back
+	// as DROP TABLE proposals, the inverse of the exclusion the repository
+	// asked for.
+	//
+	// The exclusions are the plan's, not the namespace's: ignore_tables applies
+	// to every namespace a plan covers, and plan_data is namespace-keyed with
+	// no plan-level slot, so every stored namespace carries the same list and
+	// Plan.WithheldTables reads their union. A re-plan that rebuilds only some
+	// of the plan's namespaces therefore still withholds all of them.
+	WithheldTables []string `json:"withheld_tables,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
@@ -579,6 +593,46 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 		}
 	}
 	return result
+}
+
+// WithheldTables returns, in sorted order, every live table the plan's
+// ignore_tables config withheld from the planner, across all namespaces. A
+// re-plan of a stored plan passes these back so the tables it withheld once
+// stay withheld: they were never captured in the plan's original files, so a
+// re-plan that saw them would propose dropping them.
+// RecordWithheldTables stores the plan's ignore_tables exclusions on every
+// namespace it carries, so a re-plan of this plan — a rollback, a resume —
+// withholds the same tables instead of proposing to drop the tables the plan
+// never captured. plan_data is namespace-keyed with no plan-level slot, which
+// is why every namespace carries the whole list; WithheldTables reads it back.
+func (p *Plan) RecordWithheldTables(tables []string) {
+	if p == nil || len(tables) == 0 {
+		return
+	}
+	normalized := slices.Clone(tables)
+	sort.Strings(normalized)
+	normalized = slices.Compact(normalized)
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		nsData.WithheldTables = slices.Clone(normalized)
+	}
+}
+
+func (p *Plan) WithheldTables() []string {
+	if p == nil {
+		return nil
+	}
+	var tables []string
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		tables = append(tables, nsData.WithheldTables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
 }
 
 // VSchemaNamespaces returns, in sorted order, every namespace in the plan that

@@ -547,7 +547,10 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey][]string {
 // speaks in — see replanVerdictForTask, which is how a task should be judged
 // against it.
 func (c *LocalClient) replanTargetSchema(ctx context.Context, apply *storage.Apply, plan *storage.Plan) (map[shardTableKey][]string, error) {
-	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
+	// The re-plan withholds what the stored plan withheld: those tables were
+	// never captured in its original files, so a re-plan that saw them would
+	// report them as changes the apply still owes.
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{IgnoreTables: plan.WithheldTables()}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("re-plan check failed: %w", err)
 	}
@@ -637,7 +640,7 @@ type replanResult struct {
 // Used by both Start() and ResumeApply() to handle tables that completed before
 // stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
-	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
+	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{IgnoreTables: plan.WithheldTables()}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("re-plan failed: %w", err)
 	}
