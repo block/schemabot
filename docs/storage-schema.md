@@ -386,12 +386,13 @@ $ schemabot storage plan
 This is the read for two situations. One is losing the session a convergence
 was running in: the run continues, and this is how you see that it is still
 going. The other is arriving behind somebody else's. An apply started now would
-wait on the bootstrap lock for as long as the run ahead of it takes, and being
-told that beats discovering it by sitting there.
+wait on the bootstrap lock until the run ahead of it finishes or its own budget
+runs out, and being told that beats discovering it by sitting there.
 
 The line only ever appears when a convergence is detected. Its absence is not a
 statement that the database is idle: the same read answers "nothing running"
 and "could not tell", so a plan never claims the second as the first.
+
 ## Deploying a release that changes the storage schema
 
 Every startup converges the storage schema on its own, so the routine case needs
