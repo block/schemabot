@@ -86,8 +86,16 @@ drops, invisible-index-before-drop) never fire on a pull. A clean pull audit
 means the existing schema is well-shaped, not that any particular change to it
 is safe: the safety gates above still apply when you plan one.
 
-The linters parse MySQL-family DDL only, so a lint request against any other
-dialect is rejected rather than reporting a misleadingly clean audit.
+The rules are dialect-specific. On the MySQL family the audit runs Spirit's
+schema-shape linters. On PostgreSQL it runs the rules that have a PostgreSQL
+analog — `primary_key` (no primary key, or a key column whose type is not
+`bigint` or `uuid`; serial types are judged by the integer they store),
+`has_float` (`real`, `double precision`, `float(n)`), and `name_case` (a quoted
+table name that is not lowercase) — and every finding is a warning, since a
+pulled table is existing schema. Rules about storage engines, character sets,
+zero dates, and timestamp defaults have no PostgreSQL counterpart and are not
+approximated. A lint request against a database of any other type is rejected
+rather than reporting a misleadingly clean audit.
 
 ## What "unsafe" means
 

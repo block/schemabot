@@ -51,6 +51,14 @@ partial output is produced. Only basic catalog detail is supported on
 PostgreSQL; a request for detailed catalog output is rejected rather than
 answered with the basic shape.
 
+`schemabot pull --lint` audits each pulled table for the schema-shape rules
+that have a PostgreSQL analog: a missing primary key or a key column whose type
+is not `bigint` or `uuid`, `real` / `double precision` / `float(n)` columns, and
+a quoted table name that is not lowercase. Every finding is a warning, and a
+clean audit returns an empty list for the namespace. The rules and their
+MySQL-only counterparts are in
+[lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
+
 ## Supported changes
 
 The apply path normally executes a plan one statement at a time. Each statement

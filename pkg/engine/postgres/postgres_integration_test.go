@@ -21,6 +21,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/lint"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
@@ -1808,4 +1809,36 @@ func awaitPostgresProgress(t *testing.T, eng *Engine, table string) *engine.Prog
 	}, postgresApplyDeadline, 10*time.Millisecond)
 	require.True(t, finished, "PostgreSQL apply did not finish; last progress: %+v", result)
 	return result
+}
+
+// TestEnginePullSchemaLintsRenderedTables proves the PostgreSQL pull audit
+// runs over the schema exactly as the engine renders it — one CREATE TABLE
+// followed by that table's CREATE INDEX statements — and reports an integer
+// primary key, a float column, and a mixed-case table name as warnings while a
+// well-shaped table audits clean.
+func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_lint_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, balance bigint NOT NULL);
+		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
+		CREATE TABLE app.legacy_orders (id integer PRIMARY KEY, weight real);
+		CREATE INDEX legacy_orders_weight_idx ON app.legacy_orders (weight);
+		CREATE TABLE app."Events" (id uuid PRIMARY KEY, payload jsonb)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_lint_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "pull_lint_test", Type: "postgres", Environment: "test", Namespace: "app",
+	})
+	require.NoError(t, err)
+	require.Len(t, response.Namespaces["app"].Tables, 3)
+
+	results, err := lint.New().LintPostgresSchema(response.Namespaces["app"].Tables)
+	require.NoError(t, err)
+	assert.Equal(t, []lint.Result{
+		{Table: "Events", Linter: "name_case", Severity: "warning", Message: `table name "Events" is not lowercase`},
+		{Table: "legacy_orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "legacy_orders" uses "integer"; allowed types: bigint, uuid`},
+		{Table: "legacy_orders", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "legacy_orders" uses "real" data type`},
+	}, results)
 }
