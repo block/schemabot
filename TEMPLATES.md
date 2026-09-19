@@ -527,7 +527,8 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ---
 
 **⛔ Apply rejected**: 1 planned change the engine refuses to execute
-- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
+- `users`: dropping primary key is not supported; rewrite the primary key change
+  - table has ~2,400,000 rows, above the configured native-safe limit of 1,000,000; use an online path
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 

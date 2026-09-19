@@ -3,9 +3,29 @@ package templates
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestWriteChangeNoticeListsIndependentCauses(t *testing.T) {
+	single := "planner requires a rewrite; choose a supported statement"
+	singleOut := captureStdout(t, func() {
+		WriteChangeNotice(glyph.Refused, "Cannot apply", []UnsafeChange{{Table: "users", Reason: single}})
+	})
+	assert.Equal(t, glyph.Refused+" Cannot apply\n  1. users: "+single+"\n\n", singleOut)
+
+	multipleOut := captureStdout(t, func() {
+		WriteChangeNotice(glyph.Refused, "Cannot apply", []UnsafeChange{{
+			Table: "users",
+			Reason: engine.JoinBlockedCauses([]string{
+				single,
+				"table exceeds the native-safe size ceiling; use an online path",
+			}),
+		}})
+	})
+	assert.Equal(t, glyph.Refused+" Cannot apply\n  1. users: "+single+"\n     - table exceeds the native-safe size ceiling; use an online path\n\n", multipleOut)
+}
 
 // The CLI unsafe-change list mirrors the PR comment rendering: one line per
 // single-finding table, nested bullets when the engine joined several

@@ -9,6 +9,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBlockedCauses(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  []string
+		joined string
+		want   []string
+	}{
+		{name: "empty", input: []string{"", "  "}, joined: "", want: nil},
+		{name: "single", input: []string{"planner refused the statement"}, joined: "planner refused the statement", want: []string{"planner refused the statement"}},
+		{name: "internal clauses", input: []string{"cause; step; remedy"}, joined: "cause; step; remedy", want: []string{"cause; step; remedy"}},
+		{name: "trims and drops", input: []string{" first cause ", "", " second cause\t"}, joined: "first cause ‖ second cause", want: []string{"first cause", "second cause"}},
+		// Sanitizers preserve the reserved separator, so producer text containing
+		// it is decoded as separate causes rather than round-tripping as one.
+		{name: "reserved separator after sanitization", input: []string{"left ‖ right"}, joined: "left ‖ right", want: []string{"left", "right"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			joined := JoinBlockedCauses(tt.input)
+			assert.Equal(t, tt.joined, joined)
+			assert.Equal(t, tt.want, BlockedCauses(joined))
+		})
+	}
+}
+
 func TestState_IsTerminal(t *testing.T) {
 	tests := []struct {
 		state    State

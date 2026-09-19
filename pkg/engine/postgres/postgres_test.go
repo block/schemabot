@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/block/pg-sprite/pkg/executor"
@@ -543,14 +544,14 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) 
 
 	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Equal(t, "privilege verdict; size verdict", changes[0].ModeReason)
+	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 	assert.Empty(t, changes[2].ExecutionMode)
 	assert.Empty(t, changes[2].ModeReason)
 
 	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
-	assert.Equal(t, "privilege verdict; size verdict", changes[0].ModeReason)
+	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
 
@@ -617,9 +618,20 @@ func TestBlockOversizedTableAppendsSizeCauseToPrivilegeBlocks(t *testing.T) {
 
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
-	want := `missing ALTER privilege; statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`
-	assert.Equal(t, want, changes[0].ModeReason)
-	assert.Equal(t, want, changes[1].ModeReason)
+	changes, err = blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	for _, change := range changes {
+		causes := engine.BlockedCauses(change.ModeReason)
+		require.Len(t, causes, 2)
+		assert.Equal(t, "missing ALTER privilege", causes[0])
+		assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size 2048 bytes exceeds`))
+	}
+}
+
+func TestBlockedCauseSeparatorSurvivesReasonSanitization(t *testing.T) {
+	reason := engine.JoinBlockedCauses([]string{"planner cause", "size cause"})
+
+	assert.Equal(t, []string{"planner cause", "size cause"}, engine.BlockedCauses(sanitizeReasonText(reason)))
 }
 
 func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {
@@ -635,7 +647,7 @@ func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {
 
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
-	assert.Contains(t, changes[0].ModeReason, "; statement for table")
+	assert.Len(t, engine.BlockedCauses(changes[0].ModeReason), 2)
 	assert.Equal(t, "missing CREATE privilege", changes[1].ModeReason)
 }
 

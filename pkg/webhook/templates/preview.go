@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
@@ -423,7 +424,10 @@ func PreviewCommentApplyBlockedRejected() string {
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000"},
+			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
+				"dropping primary key is not supported; rewrite the primary key change",
+				"table has ~2,400,000 rows, above the configured native-safe limit of 1,000,000; use an online path",
+			})},
 		},
 	})
 }

@@ -683,8 +683,9 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
-			if !strings.Contains(changes[i].ModeReason, reason) {
-				changes[i].ModeReason += clauseSeparator + reason
+			causes := engine.BlockedCauses(changes[i].ModeReason)
+			if !slices.Contains(causes, reason) {
+				changes[i].ModeReason = engine.JoinBlockedCauses(append(causes, reason))
 			}
 			continue
 		}

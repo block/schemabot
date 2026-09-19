@@ -3,6 +3,7 @@ package templates
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -157,6 +158,19 @@ func TestRenderBlockedChangesApplyRejected(t *testing.T) {
 	assert.Contains(t, out, "Fix what each reason names")
 	assert.NotContains(t, out, "--allow-unsafe", "a guaranteed failure must not coach an unsafe override")
 	assert.NotContains(t, out, "retry", "no retry of this command can succeed")
+}
+
+func TestRenderBlockedChangesApplyRejectedListsIndependentCauses(t *testing.T) {
+	reason := engine.JoinBlockedCauses([]string{
+		"planner requires a table rewrite; choose a supported statement",
+		"table exceeds the native-safe size ceiling; use an online path",
+	})
+	out := RenderBlockedChangesApplyRejected(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		BlockedChanges: []BlockedChangeData{{Table: "users", Reason: reason}},
+	})
+
+	assert.Contains(t, out, "- `users`: planner requires a table rewrite; choose a supported statement\n  - table exceeds the native-safe size ceiling; use an online path\n")
 }
 
 // An engine refusal reason is untrusted error text: endpoints are redacted,

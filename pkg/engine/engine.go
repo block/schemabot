@@ -495,6 +495,45 @@ const (
 	ExecutionModeDirect = "direct"
 )
 
+// blockedCauseSeparator separates independent reasons for a blocked verdict.
+// The double vertical line is readable in raw text, unlike a control character,
+// and is unlikely to occur in natural refusal prose. It is also distinct from
+// the semicolon separator used for clauses within one reason and survives the
+// reason sanitizers used by rendering surfaces.
+const blockedCauseSeparator = " ‖ "
+
+// JoinBlockedCauses encodes independent blocked causes in ModeReason.
+func JoinBlockedCauses(causes []string) string {
+	clean := make([]string, 0, len(causes))
+	for _, cause := range causes {
+		if cause = strings.TrimSpace(cause); cause != "" {
+			clean = append(clean, cause)
+		}
+	}
+	return strings.Join(clean, blockedCauseSeparator)
+}
+
+// BlockedCauses decodes the independent causes carried by ModeReason. The
+// separator text is reserved: if it occurs within one cause, that cause is
+// necessarily decoded as multiple causes.
+func BlockedCauses(reason string) []string {
+	if strings.TrimSpace(reason) == "" {
+		return nil
+	}
+	return splitNonEmptyTrimmed(reason, blockedCauseSeparator)
+}
+
+func splitNonEmptyTrimmed(value, separator string) []string {
+	parts := strings.Split(value, separator)
+	clean := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			clean = append(clean, part)
+		}
+	}
+	return clean
+}
+
 // CopyDisposition is what applying a plan will do with work an earlier schema
 // change already did on the target and left behind — for engines that copy a
 // table, the partly filled copy and the checkpoint describing it.

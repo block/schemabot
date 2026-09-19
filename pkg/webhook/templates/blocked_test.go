@@ -1,10 +1,24 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestWriteEngineReasonItem(t *testing.T) {
+	single := "planner refused the statement; rewrite the column type"
+	var sb strings.Builder
+	writeEngineReasonItem(&sb, "`users`", single)
+	assert.Equal(t, "- `users`: "+single+"\n", sb.String())
+
+	multiple := engine.JoinBlockedCauses([]string{single, "table exceeds the native-safe size ceiling; use an online path"})
+	sb.Reset()
+	writeEngineReasonItem(&sb, "`users`", multiple)
+	assert.Equal(t, "- `users`: "+single+"\n  - table exceeds the native-safe size ceiling; use an online path\n", sb.String())
+}
 
 // A statement the engine refuses is disclosed in its own ⛔ section, naming the
 // table and the engine's reason verbatim, separate from unsafe warnings. Unlike

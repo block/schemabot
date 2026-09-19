@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
@@ -549,11 +550,14 @@ func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
 	}
 	fmt.Println(severity + " " + heading)
 	for i, c := range changes {
-		reason := c.Reason
-		if reason == "" {
-			reason = c.ChangeType
+		causes := engine.BlockedCauses(c.Reason)
+		if len(causes) == 0 {
+			causes = []string{c.ChangeType}
 		}
-		fmt.Printf("  %d. %s: %s\n", i+1, c.Table, reason)
+		fmt.Printf("  %d. %s: %s\n", i+1, c.Table, causes[0])
+		for _, cause := range causes[1:] {
+			fmt.Printf("     - %s\n", cause)
+		}
 	}
 	fmt.Println()
 }
