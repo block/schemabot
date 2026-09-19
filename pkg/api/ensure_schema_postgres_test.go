@@ -287,12 +287,13 @@ func TestPostgresBootstrapDDLBudgetStaysUnderItsCeiling(t *testing.T) {
 // derivation has to stay strictly under every one of them, not only the two
 // that ship. A budget at or above its ceiling stops bounding anything: the
 // convergence's own deadline fires first and the failure names a context
-// instead of a statement_timeout. The sweep is cheap and closed-form, so it
-// covers the whole range rather than sampling the edges.
-func TestPostgresBootstrapDDLBudgetStaysUnderEveryNameableCeiling(t *testing.T) {
+// instead of a statement_timeout. The sweep starts at the shortest ceiling
+// EnsureSchema admits, is cheap and closed-form, and so covers the whole range
+// rather than sampling the edges.
+func TestPostgresBootstrapDDLBudgetStaysUnderEveryAdmissibleCeiling(t *testing.T) {
 	t.Parallel()
 
-	for ceiling := time.Second; ceiling <= apitypes.MaxStorageApplyTimeout; ceiling += time.Second {
+	for ceiling := MinConvergenceTimeout; ceiling <= apitypes.MaxStorageApplyTimeout; ceiling += time.Second {
 		budget := postgresBootstrapDDLBudget(ceiling)
 		if !assert.Less(t, budget, ceiling, "ceiling %s", ceiling) {
 			return
@@ -306,10 +307,10 @@ func TestPostgresBootstrapDDLBudgetStaysUnderEveryNameableCeiling(t *testing.T) 
 // A budget of 0 disables statement_timeout rather than making it strict, so
 // the derivation must never reach one however far the bootstrap ceiling is
 // shortened. Below the margin the budget can no longer keep its floor without
-// crossing the ceiling, so it takes half the ceiling instead — under it, but
-// still a whole millisecond. The shipped ceilings sit far above the margin, so
-// this branch is only exercised at ceilings nobody ships — which is exactly
-// why it is worth pinning here instead of trusting it on inspection.
+// crossing the ceiling, so it takes half the ceiling instead. The shipped
+// ceilings sit far above the margin, so this branch is only exercised at
+// ceilings nobody ships — which is exactly why it is worth pinning here
+// instead of trusting it on inspection.
 func TestPostgresBootstrapDDLBudgetNeverDerivesADisabledBudget(t *testing.T) {
 	t.Parallel()
 
@@ -327,9 +328,7 @@ func TestPostgresBootstrapDDLBudgetNeverDerivesADisabledBudget(t *testing.T) {
 		{name: "a ceiling at the margin would derive a disable", ceiling: margin, want: floor},
 		{name: "a ceiling under the margin would derive a negative", ceiling: 12 * time.Second, want: floor},
 		{name: "a ceiling at the floor halves rather than matching it", ceiling: floor, want: floor / 2},
-		{name: "a one-second ceiling stays under itself", ceiling: time.Second, want: 500 * time.Millisecond},
-		{name: "a two-millisecond ceiling still yields a whole millisecond", ceiling: 2 * time.Millisecond, want: time.Millisecond},
-		{name: "a zero ceiling cannot disable the budget", ceiling: 0, want: time.Millisecond},
+		{name: "the shortest admissible ceiling stays under itself", ceiling: MinConvergenceTimeout, want: MinConvergenceTimeout / 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

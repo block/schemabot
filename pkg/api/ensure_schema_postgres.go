@@ -741,15 +741,17 @@ const postgresDDLLockTimeout = 10 * time.Second
 // cases are reachable, because the ceiling is a caller's value: a convergence
 // asked to run in ten seconds gets the floor, and one asked to run in four
 // gets two.
+//
+// The ceiling is one EnsureSchema admitted, so it is at least
+// MinConvergenceTimeout. That lower bound is what lets the halving be the
+// whole story: statement_timeout is set in whole milliseconds, and half of any
+// admissible ceiling is hundreds of them — strictly under the ceiling, and
+// nowhere near the 0 that disables the budget.
 func postgresBootstrapDDLBudget(ceiling time.Duration) time.Duration {
 	if budget := ceiling - postgresBootstrapDDLTimeoutMargin; budget >= postgresBootstrapDDLFloor {
 		return budget
 	}
-	// statement_timeout is set in whole milliseconds, so anything shorter
-	// rounds to the 0 that disables it. A ceiling that short is refused long
-	// before it gets here; the bound only keeps this derivation from being the
-	// one place a disabled budget could come from.
-	return max(min(postgresBootstrapDDLFloor, ceiling/2), time.Millisecond)
+	return min(postgresBootstrapDDLFloor, ceiling/2)
 }
 
 const (

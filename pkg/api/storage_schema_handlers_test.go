@@ -370,8 +370,12 @@ func TestHandleStorageSchemaApply_ConvergesThisServersStorage(t *testing.T) {
 }
 
 // An empty body converges the storage of the server the request was made to,
-// with destructive statements refused: every field is optional and the defaults
-// are the safe ones.
+// with destructive statements refused and the convergence bounded by the boot
+// budget: every field is optional and the defaults are the safe ones. The
+// budget default is the boot's rather than the operator's because a caller
+// that named none is one whose wait this server cannot know, and the operator
+// default would hold the bootstrap lock for an hour on behalf of a caller that
+// may have hung up long before (AV-11).
 func TestHandleStorageSchemaApply_EmptyBodyUsesSafeDefaults(t *testing.T) {
 	svc := newStorageSchemaService(t, &ServerConfig{})
 	local := &fakeStorageSchemaService{
@@ -386,6 +390,26 @@ func TestHandleStorageSchemaApply_EmptyBodyUsesSafeDefaults(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.NotNil(t, local.applyReq)
 	assert.False(t, local.applyReq.GetAllowDestructive())
+	assert.Equal(t, int64(EnsureSchemaTimeout/time.Second), local.applyReq.GetTimeoutSeconds(),
+		"a request naming no budget runs under the boot's, not the operator default")
+}
+
+// A budget the caller names reaches the target unchanged, so the ceiling the
+// convergence runs under is the one the caller is waiting for.
+func TestHandleStorageSchemaApply_CarriesTheNamedBudgetToTheTarget(t *testing.T) {
+	svc := newStorageSchemaService(t, &ServerConfig{})
+	local := &fakeStorageSchemaService{
+		applyResp: &ternv1.StorageSchemaApplyResponse{
+			Planned:   storageSchemaReportMessage("schemabot_storage"),
+			Remaining: storageSchemaReportMessage("schemabot_storage"),
+		},
+	}
+	svc.SetStorageSchemaService(local)
+
+	rec := storageSchemaApplyRequest(t, svc, `{"timeout_seconds":1200}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotNil(t, local.applyReq)
+	assert.Equal(t, int64(1200), local.applyReq.GetTimeoutSeconds())
 }
 
 // A misspelled field is refused rather than ignored: a dropped "deployment"
