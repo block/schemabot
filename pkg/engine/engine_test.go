@@ -20,9 +20,11 @@ func TestBlockedCauses(t *testing.T) {
 		{name: "single", input: []string{"planner refused the statement"}, joined: "planner refused the statement", want: []string{"planner refused the statement"}},
 		{name: "internal clauses", input: []string{"cause; step; remedy"}, joined: "cause; step; remedy", want: []string{"cause; step; remedy"}},
 		{name: "trims and drops", input: []string{" first cause ", "", " second cause\t"}, joined: "first cause ‖ second cause", want: []string{"first cause", "second cause"}},
-		// Sanitizers preserve the reserved separator, so producer text containing
-		// it is decoded as separate causes rather than round-tripping as one.
-		{name: "reserved separator after sanitization", input: []string{"left ‖ right"}, joined: "left ‖ right", want: []string{"left", "right"}},
+		// A cause that itself contains the separator — an identifier a schema
+		// author chose — is neutralized on the way in, so it cannot decode as
+		// causes the engine never issued.
+		{name: "separator inside one cause", input: []string{`table "left ‖ right" is refused`}, joined: `table "left // right" is refused`, want: []string{`table "left // right" is refused`}},
+		{name: "bare separator rune inside one cause", input: []string{"a‖b", "c"}, joined: "a//b ‖ c", want: []string{"a//b", "c"}},
 	}
 
 	for _, tt := range tests {

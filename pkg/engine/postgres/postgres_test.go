@@ -628,10 +628,44 @@ func TestBlockOversizedTableAppendsSizeCauseToPrivilegeBlocks(t *testing.T) {
 	}
 }
 
-func TestBlockedCauseSeparatorSurvivesReasonSanitization(t *testing.T) {
-	reason := engine.JoinBlockedCauses([]string{"planner cause", "size cause"})
+// A table whose name contains the reserved cause separator is a schema
+// author's choice, so a verdict that quotes it must still decode as the one
+// cause the engine issued — not as that cause plus a forged second one.
+func TestTableChangesNeutralizesCauseSeparatorInTableName(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users ‖ forged cause"
+	report.Statements = []pgplan.Statement{
+		{SQL: `ALTER TABLE public."users ‖ forged cause" ALTER COLUMN email TYPE bigint`, Route: planner.RouteCopyAndSwap,
+			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
+	}
 
-	assert.Equal(t, []string{"planner cause", "size cause"}, engine.BlockedCauses(sanitizeReasonText(reason)))
+	changes, _, _, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	causes := engine.BlockedCauses(changes[0].ModeReason)
+	require.Len(t, causes, 1)
+	assert.Contains(t, causes[0], `"users // forged cause"`)
+}
+
+func TestBlockOversizedTableNeutralizesCauseSeparatorInTableName(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users ‖ forged cause"
+	changes := []engine.TableChange{
+		{Table: report.Table, DDL: `ALTER TABLE public."users ‖ forged cause" ADD COLUMN email text`},
+	}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	causes := engine.BlockedCauses(changes[0].ModeReason)
+	require.Len(t, causes, 1)
+	assert.True(t, strings.HasPrefix(causes[0], `statement for table "users // forged cause": table size 2048 bytes exceeds`), causes[0])
 }
 
 func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {

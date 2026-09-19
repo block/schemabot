@@ -1247,16 +1247,24 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 }
 
 // writeEngineReasonItem keeps one cause in the established one-line shape and
-// gives each additional independent cause its own nested Markdown bullet.
+// gives each additional independent cause its own nested Markdown bullet. A
+// cause is judged empty after sanitization, so a reason made only of
+// characters the sanitizer strips falls back to the bare table line instead of
+// a dangling colon.
 func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
-	causes := engine.BlockedCauses(reason)
+	causes := make([]string, 0)
+	for _, cause := range engine.BlockedCauses(reason) {
+		if cause = SanitizeInlineError(cause); cause != "" {
+			causes = append(causes, cause)
+		}
+	}
 	if len(causes) == 0 {
 		fmt.Fprintf(sb, "- %s\n", table)
 		return
 	}
-	fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(causes[0])))
+	fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(causes[0]))
 	for _, cause := range causes[1:] {
-		fmt.Fprintf(sb, "  - %s\n", escapeInlineMarkdown(SanitizeInlineError(cause)))
+		fmt.Fprintf(sb, "  - %s\n", escapeInlineMarkdown(cause))
 	}
 }
 

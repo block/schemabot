@@ -403,7 +403,10 @@ func PreviewCommentPlanCopyRunning() string {
 }
 
 // PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
-// plan containing statements the engine refuses.
+// plan containing statements the engine refuses. The table carries two
+// independent causes — a planner refusal and the native-safe size ceiling —
+// which is a PostgreSQL shape: that engine's size gate adds its cause to a
+// step the planner already refused, so both reach the operator at once.
 func PreviewCommentApplyBlockedRejected() string {
 	return RenderBlockedChangesApplyRejected(PlanCommentData{
 		Database:     "testapp",
@@ -412,21 +415,21 @@ func PreviewCommentApplyBlockedRejected() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
-		IsMySQL:      true,
-		DatabaseType: "mysql",
+		IsMySQL:      false,
+		DatabaseType: "postgres",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
 				Statements: []string{
-					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
-					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE orders ADD COLUMN notes text",
 				},
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
 			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
-				"dropping primary key is not supported; rewrite the primary key change",
-				"table has ~2,400,000 rows, above the configured native-safe limit of 1,000,000; use an online path",
+				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
 			})},
 		},
 	})
