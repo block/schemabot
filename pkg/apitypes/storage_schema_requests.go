@@ -56,12 +56,17 @@ type StorageSchemaApplyRequest struct {
 	// overrides it.
 	Caller string `json:"caller,omitempty"`
 	// TimeoutSeconds bounds the whole convergence: the advisory-lock wait, the
-	// diff taken under it, and the DDL. Zero means the target's default for an
-	// operator-requested convergence, which is already far above the budget a
-	// booting pod uses. Raise it only to finish work a boot cannot, and expect
-	// to hold the bootstrap advisory lock for that long — a pod booting in the
-	// window fails its own lock wait. A value above the target's maximum is
-	// refused rather than clamped.
+	// diff taken under it, and the DDL. Zero means the caller named no budget,
+	// and the target then runs the convergence under the budget it boots with
+	// rather than under an operator's: a caller that could not name a budget
+	// is one whose wait the target cannot know, and the boot budget is the one
+	// every such caller has always waited out. SchemaBot's own client names a
+	// budget on every request, so a convergence runs under the operator
+	// default only because the client asked for it and is waiting that long.
+	// Raise it only to finish work a boot cannot, and expect to hold the
+	// bootstrap advisory lock for that long — a pod booting in the window
+	// fails its own lock wait. A value above the target's maximum is refused
+	// rather than clamped.
 	TimeoutSeconds int64 `json:"timeout_seconds,omitempty"`
 }
 
@@ -73,12 +78,18 @@ type StorageSchemaApplyResponse struct {
 	Remaining *StorageSchemaReport `json:"remaining"`
 }
 
-// DefaultStorageApplyTimeout bounds a convergence an operator asked for, when
-// they named no budget of their own. It is the deliberate path's counterpart to
-// the boot budget, and it is far larger for a reason that is about who is
-// waiting rather than about how much DDL there is. A boot's budget is short
-// because a pod converging is a pod not yet serving; nothing is waiting on this
-// one but the person who ran it.
+// DefaultStorageApplyTimeout is the budget SchemaBot's client names for a
+// convergence an operator asked for, when the operator named none of their own.
+// It is the deliberate path's counterpart to the boot budget, and it is far
+// larger for a reason that is about who is waiting rather than about how much
+// DDL there is. A boot's budget is short because a pod converging is a pod not
+// yet serving; nothing is waiting on this one but the person who ran it.
+//
+// It is the client's default rather than the server's, and always sent, so the
+// wire carries the budget the client is actually waiting for. A server that
+// received no budget would have to guess how long the caller can wait, and an
+// hour is the wrong guess for a caller that could not say: it runs the boot
+// budget instead (see ResolveStorageApplyTimeout).
 //
 // The point of the larger value is that the two paths need not agree on what is
 // too slow. An index over a storage table with years of history can outlast a
@@ -113,12 +124,25 @@ const DefaultStorageApplyTimeout = time.Hour
 const MaxStorageApplyTimeout = DefaultStorageApplyTimeout
 
 // ResolveStorageApplyTimeout resolves the convergence budget a request asked
-// for. Zero means the caller expressed no preference and takes the default.
+// for. Zero means the caller named none, and the answer is then unnamed — the
+// budget the resolving end runs a request like that under.
 //
-// It lives beside the field rather than in the server, because both ends have
-// to agree on it: the server bounds the convergence with the answer, and the
-// client waits for that long before giving up. Two copies of this rule would
-// drift into a client that stops waiting for work the server is still doing.
+// The two ends pass different values for it, on purpose. A client passes the
+// operator default and then names the answer in the request it sends, so the
+// wire always carries the budget that client is waiting for. A server passes
+// the budget it boots with: a request that names no budget came from something
+// that could not say how long it can wait, and the boot budget is both the one
+// every such caller has always waited out and the shortest hold on the
+// bootstrap lock the server can offer. Resolving an unnamed request to the
+// operator default instead would hold that lock for an hour on behalf of a
+// caller that gave up on it long before, which is the failure AV-11 exists to
+// prevent.
+//
+// The bounds live beside the field rather than in the server, because both
+// ends have to agree on them: the server bounds the convergence with the
+// answer, and the client waits for that long before giving up. Two copies of
+// this rule would drift into a client that stops waiting for work the server
+// is still doing.
 //
 // Out of range is refused rather than clamped, in both directions. A clamp
 // would answer a different question than the one asked: an operator who names
@@ -126,10 +150,17 @@ const MaxStorageApplyTimeout = DefaultStorageApplyTimeout
 // less, watches the convergence fail at a budget they did not choose and has
 // nothing in the output to tell them why.
 //
+// The unnamed budget is a budget like any other, and answers to the same
+// bounds. It is a constant at every call site today, so refusing one out of
+// range guards a future caller rather than a live one — but this is the one
+// function whose job is to keep a convergence inside MaxStorageApplyTimeout,
+// and a parameter it returned unchecked would be the one way to hand a caller
+// a budget past the maximum.
+//
 // The errors name the budget rather than the field that carried it, since each
 // end spells that field differently and prefixes the refusal with its own name
 // for it.
-func ResolveStorageApplyTimeout(timeoutSeconds int64) (time.Duration, error) {
+func ResolveStorageApplyTimeout(timeoutSeconds int64, unnamed time.Duration) (time.Duration, error) {
 	// Bounded in seconds, before the conversion. A time.Duration counts
 	// nanoseconds, so multiplying an arbitrary wire value by time.Second
 	// overflows past roughly nine billion seconds and wraps — a budget far
@@ -138,10 +169,13 @@ func ResolveStorageApplyTimeout(timeoutSeconds int64) (time.Duration, error) {
 	// handed a budget it never named.
 	const maxSeconds = int64(MaxStorageApplyTimeout / time.Second)
 	switch {
+	case timeoutSeconds == 0 && (unnamed <= 0 || unnamed > MaxStorageApplyTimeout):
+		return 0, fmt.Errorf("the budget for an unnamed convergence must be positive and at most %s, got %s",
+			MaxStorageApplyTimeout, unnamed)
 	case timeoutSeconds == 0:
-		return DefaultStorageApplyTimeout, nil
+		return unnamed, nil
 	case timeoutSeconds < 0:
-		return 0, fmt.Errorf("a convergence budget must be positive, or zero for the default of %s", DefaultStorageApplyTimeout)
+		return 0, fmt.Errorf("a convergence budget must be positive, or zero to name none and run under %s", unnamed)
 	case timeoutSeconds > maxSeconds:
 		return 0, fmt.Errorf("a convergence budget of %s exceeds the maximum of %s; a convergence holds the storage bootstrap lock for its whole budget and cannot yet be stopped, so pods booting in that window will not come up",
 			describeBudgetSeconds(timeoutSeconds), MaxStorageApplyTimeout)

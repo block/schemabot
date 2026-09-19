@@ -39,17 +39,22 @@ func TestStorageApplyOptions_DefaultsToTheOperatorBudgetAndYieldsToACaller(t *te
 	assert.Equal(t, chosen, overridden.convergenceTimeout)
 }
 
-// A non-positive budget is refused before any dialect is dispatched to, rather
-// than read as "no limit". An unbounded convergence holds the storage
-// bootstrap advisory lock on a statement that will never finish, and every pod
-// that boots behind it fails its own lock wait.
-func TestEnsureSchema_RefusesANonPositiveBudget(t *testing.T) {
+// A budget under the minimum is refused before any dialect is dispatched to,
+// rather than read as "no limit" or rounded to one. An unbounded convergence
+// holds the storage bootstrap advisory lock on a statement that will never
+// finish, and every pod that boots behind it fails its own lock wait; a
+// sub-second one is enforced at a coarser granularity than it was named at,
+// and the statement budget derived from it could sit at or above the ceiling
+// it is meant to undercut.
+func TestEnsureSchema_RefusesABudgetUnderTheMinimum(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for name, budget := range map[string]time.Duration{
-		"zero":     0,
-		"negative": -time.Second,
+		"zero":                   0,
+		"negative":               -time.Second,
+		"a millisecond":          time.Millisecond,
+		"just under the minimum": MinConvergenceTimeout - time.Nanosecond,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -59,9 +64,21 @@ func TestEnsureSchema_RefusesANonPositiveBudget(t *testing.T) {
 			err := EnsureSchema("root@tcp(127.0.0.1:1)/schemabot", logger,
 				WithConvergenceTimeout(budget))
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "convergence timeout must be positive")
+			assert.Contains(t, err.Error(), "convergence timeout must be at least 1s")
 		})
 	}
+}
+
+// The shortest budget the wire can name is admitted, so a caller who names it
+// is refused by the database they could not reach, not by the budget check.
+func TestEnsureSchema_AdmitsTheMinimumBudget(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	err := EnsureSchema("root@tcp(127.0.0.1:1)/schemabot", logger,
+		WithConvergenceTimeout(MinConvergenceTimeout))
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "convergence timeout must be at least")
 }
 
 // A convergence that runs out of budget names the budget it actually had. An
