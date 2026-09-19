@@ -1044,6 +1044,62 @@ func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 	return tables
 }
 
+// RenderedTables returns the table changes an operator surface shows and
+// counts. The namespace-level Changes keep one change per table so a keyspace
+// reads as one entry, and that hides what a divergent shard adds: a shard that
+// creates a table its siblings alter, or a second index on one table. So for a
+// namespace with shard rows, those rows are the set, deduplicated by statement
+// in first-seen order so a change uniform across shards appears once, as it
+// renders once. A namespace without shard rows contributes its namespace-level
+// changes as received. A shard-row change that omits its namespace is returned
+// with the namespace filled in, so a shard's change is never attributed to the
+// plan's default database.
+//
+// The PR plan comment walks the same set from its rendered data
+// (keyspaceStatements in pkg/webhook/templates); the two selections must agree
+// for the summaries to.
+func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
+	shardsByNamespace := make(map[string][]*ShardPlanResponse)
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		shardsByNamespace[sp.Namespace] = append(shardsByNamespace[sp.Namespace], sp)
+	}
+
+	var tables []*TableChangeResponse
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		shards, sharded := shardsByNamespace[sc.Namespace]
+		if !sharded {
+			tables = append(tables, sc.TableChanges...)
+			continue
+		}
+		seen := make(map[string]struct{})
+		for _, sp := range shards {
+			for _, t := range sp.Changes {
+				if t == nil {
+					continue
+				}
+				if _, dup := seen[t.DDL]; dup {
+					continue
+				}
+				seen[t.DDL] = struct{}{}
+				if t.Namespace != "" {
+					tables = append(tables, t)
+					continue
+				}
+				withNamespace := *t
+				withNamespace.Namespace = sc.Namespace
+				tables = append(tables, &withNamespace)
+			}
+		}
+	}
+	return tables
+}
+
 // HasChanges reports whether the plan carries any work an apply would execute:
 // table DDL in any namespace, or a VSchema update. Gates that decide whether a
 // plan is actionable must use this rather than counting table changes alone —

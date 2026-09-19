@@ -1161,9 +1161,12 @@ introducing a severity glyph as a literal outside its home package
 ### UX-6: A plan's statement totals agree across surfaces
 
 Every plan summary derives its create, alter, drop, and other DDL totals through one shared
-counter. The CLI and PR comment may style those totals differently, but they report the same
-table-level operations and unclassified statement count. *Enforced:* the shared plan counter and
-summary renderer (`pkg/ui/plan_summary.go`).
+counter, fed from the statements that surface renders — for a sharded namespace, the distinct
+per-shard statements rather than the namespace-level collapse. The CLI and PR comment may style
+those totals differently, but they report the same table-level operations and unclassified
+statement count. *Enforced:* the shared plan counter and summary renderer
+(`pkg/ui/plan_summary.go`); each surface's statement selection (`RenderedTables` in
+`pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`).
 
 ## Recovery (RC)
 

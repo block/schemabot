@@ -443,3 +443,68 @@ func TestErrorResponseRetryAfterPairsTheCodeWithTheDelay(t *testing.T) {
 	assert.False(t, retry)
 	assert.Zero(t, after)
 }
+
+// A sharded namespace collapses to one change per table at the namespace
+// level, so the shard rows are what an operator surface renders and counts:
+// a shard that creates a table its sibling alters adds a change, a change
+// uniform across shards appears once, and every change names its namespace.
+func TestPlanResponse_RenderedTablesUsesShardRowsForAShardedNamespace(t *testing.T) {
+	createUsers := &TableChangeResponse{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "create"}
+	alterUsers := &TableChangeResponse{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email TEXT", ChangeType: "alter"}
+	alterOrders := &TableChangeResponse{TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN note TEXT", ChangeType: "alter"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace:    "commerce",
+			TableChanges: []*TableChangeResponse{createUsers, alterOrders},
+		}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{createUsers, alterOrders}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{alterUsers, alterOrders}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 3)
+	assert.Equal(t, createUsers.DDL, tables[0].DDL)
+	assert.Equal(t, alterOrders.DDL, tables[1].DDL)
+	assert.Equal(t, alterUsers.DDL, tables[2].DDL)
+	for _, tbl := range tables {
+		assert.Equal(t, "commerce", tbl.Namespace, "%s", tbl.DDL)
+	}
+	assert.Empty(t, createUsers.Namespace, "the plan's own change is left as received")
+}
+
+// Without shard rows the namespace-level changes are the rendered set, so an
+// unsharded plan reads exactly as its changes arrived.
+func TestPlanResponse_RenderedTablesIsFlatTablesWithoutShards(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "app_a", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}}},
+			{Namespace: "app_b", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN b INT", ChangeType: "alter"}}},
+		},
+	}
+
+	assert.Equal(t, resp.FlatTables(), resp.RenderedTables())
+}
+
+// Shard rows belong to their own namespace: one sharded namespace does not
+// replace the changes of an unsharded sibling in the same plan.
+func TestPlanResponse_RenderedTablesKeepsUnshardedNamespacesBesideShardedOnes(t *testing.T) {
+	unsharded := &TableChangeResponse{TableName: "audit", DDL: "CREATE TABLE audit (id BIGINT)", ChangeType: "create", Namespace: "lookup"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}}},
+			{Namespace: "lookup", TableChanges: []*TableChangeResponse{unsharded}},
+		},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN b INT", ChangeType: "alter"}}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 3)
+	assert.Equal(t, "ALTER TABLE users ADD COLUMN a INT", tables[0].DDL)
+	assert.Equal(t, "ALTER TABLE users ADD COLUMN b INT", tables[1].DDL)
+	assert.Same(t, unsharded, tables[2])
+}
