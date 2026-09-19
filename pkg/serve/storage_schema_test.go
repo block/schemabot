@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,6 +52,44 @@ func TestStorageSchemaAdapter_DestructivePolicy(t *testing.T) {
 			assert.Equal(t, tc.want, allow)
 		})
 	}
+}
+
+// A request naming no budget runs under the boot's, and one naming a budget
+// runs under exactly that (AV-11). The control plane always names the budget
+// it resolved, so a zero here is a caller reaching the data plane directly
+// that could not say how long it can wait — and the boot budget is the one
+// such a caller has always waited out, where the operator default would hold
+// the bootstrap lock for an hour after it had given up.
+func TestConvergenceBudget_UnnamedRunsUnderTheBootBudget(t *testing.T) {
+	t.Parallel()
+
+	unnamed, err := convergenceBudget(&ternv1.StorageSchemaApplyRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, api.EnsureSchemaTimeout, unnamed)
+
+	named, err := convergenceBudget(&ternv1.StorageSchemaApplyRequest{TimeoutSeconds: 1200})
+	require.NoError(t, err)
+	assert.Equal(t, 20*time.Minute, named)
+}
+
+// An out-of-range budget on the wire is the caller's mistake, refused before
+// the convergence is dispatched and before the storage database is dialed, so
+// nothing runs under a ceiling nobody chose.
+func TestStorageSchemaAdapter_ApplyRefusesAnOutOfRangeBudget(t *testing.T) {
+	t.Parallel()
+
+	const dsn = "root:pw@tcp(127.0.0.1:1)/schemabot"
+	adapter := &storageSchemaAdapter{
+		resolveDSN: func() (string, error) { return dsn, nil },
+		bootTarget: bootTargetFor(t, schema.DialectMySQL, dsn),
+		dialect:    schema.DialectMySQL,
+		logger:     slog.New(slog.DiscardHandler),
+	}
+
+	_, err := adapter.StorageSchemaApply(t.Context(), &ternv1.StorageSchemaApplyRequest{TimeoutSeconds: -1})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+	assert.Contains(t, err.Error(), "must be positive")
 }
 
 // A locally hosted server has no route to a destructive storage bootstrap, so
