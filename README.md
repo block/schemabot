@@ -22,7 +22,7 @@
 
 ---
 
-SchemaBot is declarative and GitOps-driven: describe your database schema in SQL files, and review and apply changes through pull requests or the CLI. It computes the SQL, checks the change, and follows it to completion.
+SchemaBot is declarative and GitOps-driven: SQL files in your repository provide a shared source of truth across environments. It compares those files with the live database, shows the exact change, and applies it through pull requests or the CLI.
 
 ## The PR workflow
 
