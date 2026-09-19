@@ -324,44 +324,7 @@ func extractAlterClause(ddl string) string {
 
 // WritePlanSummary writes the Terraform-style summary line.
 func WritePlanSummary(changes []DDLChange) {
-	creates := 0
-	alters := 0
-	drops := 0
-
-	for _, c := range changes {
-		switch strings.ToUpper(c.ChangeType) {
-		case "CHANGE_TYPE_CREATE", "CREATE":
-			creates++
-		case "CHANGE_TYPE_ALTER", "ALTER":
-			alters++
-		case "CHANGE_TYPE_DROP", "DROP":
-			drops++
-		}
-	}
-
-	var parts []string
-	if creates > 0 {
-		word := "table"
-		if creates > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to create", creates, word))
-	}
-	if alters > 0 {
-		word := "table"
-		if alters > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, word))
-	}
-	if drops > 0 {
-		word := "table"
-		if drops > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, word))
-	}
-
+	parts := ddlSummaryParts(changes)
 	if len(parts) > 0 {
 		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
 	}
@@ -376,42 +339,7 @@ type VSchemaChange struct {
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
 func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
-	creates := 0
-	alters := 0
-	drops := 0
-	for _, c := range ddlChanges {
-		switch strings.ToUpper(c.ChangeType) {
-		case "CHANGE_TYPE_CREATE", "CREATE":
-			creates++
-		case "CHANGE_TYPE_ALTER", "ALTER":
-			alters++
-		case "CHANGE_TYPE_DROP", "DROP":
-			drops++
-		}
-	}
-
-	var parts []string
-	if creates > 0 {
-		word := "table"
-		if creates > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to create", creates, word))
-	}
-	if alters > 0 {
-		word := "table"
-		if alters > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, word))
-	}
-	if drops > 0 {
-		word := "table"
-		if drops > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, word))
-	}
+	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
 		if len(vschemaChanges) > 1 {
@@ -424,6 +352,90 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
 		fmt.Println()
 	}
+}
+
+// ddlSummaryParts builds the create/alter/drop clauses of the plan summary.
+// Statements outside those buckets (indexes, types, extensions, comments)
+// still run, so a mixed plan names them alongside the table counts, and a plan
+// made only of them reports its raw statement total so it never reads as "no
+// changes".
+func ddlSummaryParts(changes []DDLChange) []string {
+	creates := 0
+	alters := 0
+	drops := 0
+	other := 0
+	type tableChange struct {
+		changeType string
+		tableName  string
+	}
+	countedTables := make(map[tableChange]struct{})
+
+	for _, c := range changes {
+		changeType := strings.ToUpper(c.ChangeType)
+		switch changeType {
+		case "CHANGE_TYPE_CREATE", "CREATE":
+			changeType = "CREATE"
+		case "CHANGE_TYPE_ALTER", "ALTER":
+			changeType = "ALTER"
+		case "CHANGE_TYPE_DROP", "DROP":
+			changeType = "DROP"
+		default:
+			other++
+			continue
+		}
+		// Every producer of a DDLChange names its table, so an empty name is
+		// a payload the dedupe cannot judge. It is counted rather than keyed:
+		// merging every nameless change into one would under-report where the
+		// PR comment, whose parser never yields a nameless table change, does
+		// not.
+		if c.TableName != "" {
+			key := tableChange{changeType: changeType, tableName: c.TableName}
+			if _, counted := countedTables[key]; counted {
+				continue
+			}
+			countedTables[key] = struct{}{}
+		}
+		switch changeType {
+		case "CREATE":
+			creates++
+		case "ALTER":
+			alters++
+		case "DROP":
+			drops++
+		}
+	}
+
+	var parts []string
+	if creates > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s to create", creates, pluralizeTable(creates)))
+	}
+	if alters > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, pluralizeTable(alters)))
+	}
+	if drops > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, pluralizeTable(drops)))
+	}
+	if other > 0 && len(parts) > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", other, pluralizeStatement(other)))
+	}
+	if len(parts) == 0 && other > 0 {
+		parts = append(parts, fmt.Sprintf("%d DDL %s", other, pluralizeStatement(other)))
+	}
+	return parts
+}
+
+func pluralizeTable(n int) string {
+	if n == 1 {
+		return "table"
+	}
+	return "tables"
+}
+
+func pluralizeStatement(n int) string {
+	if n == 1 {
+		return "statement"
+	}
+	return "statements"
 }
 
 // WriteOptions writes the options section if any flags are set.

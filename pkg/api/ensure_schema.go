@@ -49,6 +49,17 @@ import (
 // that budget too, down to its own floor.
 const EnsureSchemaTimeout = 5 * time.Minute
 
+// MinConvergenceTimeout is the shortest budget a convergence may run under. It
+// is one whole second because that is the granularity the budget is honored
+// at: the wire names a budget in whole seconds, and the coarsest lock wait an
+// engine offers rounds up to whole seconds, so a shorter budget would be
+// reported as one thing and enforced as another. It is also the shortest
+// ceiling every statement budget derived from it stays strictly under; a
+// ceiling that cannot be undercut in whole milliseconds cannot be bounded at
+// all, and a budget that has stopped bounding is the one failure this
+// constant exists to refuse.
+const MinConvergenceTimeout = time.Second
+
 // EnsureSchemaOption customizes EnsureSchema behavior.
 type EnsureSchemaOption func(*ensureSchemaOptions)
 
@@ -118,10 +129,12 @@ func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 
 // WithConvergenceTimeout bounds one whole convergence — the advisory-lock wait,
 // the diff taken under it, and the DDL — replacing the boot budget
-// EnsureSchemaTimeout. A non-positive duration is refused rather than read as
-// "no limit": a convergence with no ceiling holds the advisory lock forever on a
-// statement that will never finish, and every pod that boots behind it fails its
-// own lock wait.
+// EnsureSchemaTimeout. A duration under MinConvergenceTimeout is refused rather
+// than rounded: a non-positive one would read as "no limit", and a convergence
+// with no ceiling holds the advisory lock forever on a statement that will never
+// finish, so every pod that boots behind it fails its own lock wait; a
+// sub-second one would be enforced at a granularity coarser than it was named
+// at, and report a ceiling it did not run under.
 //
 // Raise it only for a convergence somebody is watching. The budget is what
 // bounds how long this call can keep booting pods out of service, so the
@@ -145,8 +158,8 @@ func WithConvergenceTimeout(d time.Duration) EnsureSchemaOption {
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
 	o := newEnsureSchemaOptions(opts...)
-	if o.convergenceTimeout <= 0 {
-		return fmt.Errorf("converge storage schema: convergence timeout must be positive, got %s", o.convergenceTimeout)
+	if o.convergenceTimeout < MinConvergenceTimeout {
+		return fmt.Errorf("converge storage schema: convergence timeout must be at least %s, got %s", MinConvergenceTimeout, o.convergenceTimeout)
 	}
 	switch o.dialect {
 	case schema.DialectMySQL:

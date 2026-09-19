@@ -4270,9 +4270,14 @@ type StorageSchemaApplyRequest struct {
 	// convergence to a person rather than to a control plane.
 	Caller string `protobuf:"bytes,2,opt,name=caller,proto3" json:"caller,omitempty"`
 	// TimeoutSeconds bounds the whole convergence: the advisory-lock wait, the
-	// diff taken under it, and the DDL. Zero means the serving instance's
-	// default for an operator-requested convergence, which is already far above
-	// the budget a booting pod uses. Raise it only to finish work a boot cannot,
+	// diff taken under it, and the DDL. Zero means the caller named no budget,
+	// and the serving instance then runs the convergence under the budget it
+	// boots with rather than under an operator's: a caller that could not name
+	// a budget is one whose wait the serving instance cannot know, and the boot
+	// budget is the one every such caller has always waited out. A control
+	// plane names the budget it resolved on every request, so a convergence
+	// runs under the far larger operator default only because a caller asked
+	// for it and is waiting that long. Raise it only to finish work a boot cannot,
 	// such as an index build over a storage table with a long history: the
 	// convergence holds the bootstrap advisory lock for its whole budget, and a
 	// pod booting in that window fails its own lock wait and does not come up.
