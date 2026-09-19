@@ -4,7 +4,17 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestDDLSummaryParts_DeduplicatesTableChanges(t *testing.T) {
+	changes := []DDLChange{
+		{ChangeType: "ALTER", TableName: "users", DDL: "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY(`id`, `tenant_id`)"},
+		{ChangeType: "ALTER", TableName: "orders", DDL: "ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)"},
+		{ChangeType: "ALTER", TableName: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` text"},
+	}
+	require.Equal(t, []string{"2 tables to alter"}, ddlSummaryParts(changes))
+}
 
 // The CLI plan summary counts every statement the plan will run, matching the
 // PR comment: statements outside the create/alter/drop buckets are named in a

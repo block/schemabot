@@ -364,17 +364,37 @@ func ddlSummaryParts(changes []DDLChange) []string {
 	alters := 0
 	drops := 0
 	other := 0
+	type tableChange struct {
+		changeType string
+		tableName  string
+	}
+	countedTables := make(map[tableChange]struct{})
 
 	for _, c := range changes {
-		switch strings.ToUpper(c.ChangeType) {
+		changeType := strings.ToUpper(c.ChangeType)
+		switch changeType {
 		case "CHANGE_TYPE_CREATE", "CREATE":
-			creates++
+			changeType = "CREATE"
 		case "CHANGE_TYPE_ALTER", "ALTER":
-			alters++
+			changeType = "ALTER"
 		case "CHANGE_TYPE_DROP", "DROP":
-			drops++
+			changeType = "DROP"
 		default:
 			other++
+			continue
+		}
+		key := tableChange{changeType: changeType, tableName: c.TableName}
+		if _, counted := countedTables[key]; counted {
+			continue
+		}
+		countedTables[key] = struct{}{}
+		switch changeType {
+		case "CREATE":
+			creates++
+		case "ALTER":
+			alters++
+		case "DROP":
+			drops++
 		}
 	}
 

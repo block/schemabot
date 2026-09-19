@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // SummarizeChanges powers the aggregate check's Change column. It must never
@@ -27,6 +28,53 @@ func TestSummarizeChanges(t *testing.T) {
 			}},
 		}
 		assert.Equal(t, "2 creates, 1 alter, 1 drop", SummarizeChanges(data))
+	})
+
+	t.Run("deduplicates alters by table", func(t *testing.T) {
+		data := PlanCommentData{
+			Database:     "testapp",
+			DatabaseType: "mysql",
+			IsMySQL:      true,
+			Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{
+				"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY(`id`, `tenant_id`)",
+				"ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)",
+				"ALTER TABLE `orders` ADD COLUMN `notes` text",
+			}}},
+		}
+		require.Equal(t, "2 alters", SummarizeChanges(data))
+	})
+
+	t.Run("counts rejected statements as other", func(t *testing.T) {
+		data := PlanCommentData{Database: "app", DatabaseType: "mysql", IsMySQL: true,
+			Changes: []KeyspaceChangeData{{Keyspace: "app", Statements: []string{
+				"ALTER TABLE `orders` ADD COLUMN `a` text", "THIS IS NOT SQL AT ALL",
+			}}}}
+		require.Contains(t, RenderPlanComment(data), "**1** table to alter, 1 other DDL statement")
+		require.Equal(t, "1 alter, 1 other DDL statement", SummarizeChanges(data))
+	})
+
+	t.Run("counts drop and create separately for one table", func(t *testing.T) {
+		data := PlanCommentData{DatabaseType: "mysql", IsMySQL: true, Changes: []KeyspaceChangeData{{
+			Keyspace: "app", Statements: []string{"DROP TABLE `orders`", "CREATE TABLE `orders` (`id` int) ENGINE=InnoDB"},
+		}}}
+		require.Equal(t, "1 create, 1 drop", SummarizeChanges(data))
+	})
+
+	t.Run("counts the same table in separate keyspaces", func(t *testing.T) {
+		data := PlanCommentData{DatabaseType: "vitess", Changes: []KeyspaceChangeData{
+			{Keyspace: "ks1", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `a` text"}},
+			{Keyspace: "ks2", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `a` text"}},
+		}}
+		require.Equal(t, "2 alters", SummarizeChanges(data))
+	})
+
+	t.Run("names unbucketed DDL alongside a vschema update", func(t *testing.T) {
+		data := PlanCommentData{DatabaseType: "vitess", Changes: []KeyspaceChangeData{{
+			Keyspace: "app", VSchemaChanged: true, VSchemaDiff: "+ x",
+			Statements: []string{"CREATE VIEW v AS SELECT 1", "TRUNCATE TABLE t"},
+		}}}
+		require.Contains(t, RenderPlanComment(data), "2 DDL statements, **1** vschema update")
+		require.Equal(t, "2 DDL statements · 1 vschema update", SummarizeChanges(data))
 	})
 
 	t.Run("counts PostgreSQL DDL under its own grammar", func(t *testing.T) {

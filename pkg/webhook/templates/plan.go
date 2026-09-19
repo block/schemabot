@@ -860,10 +860,9 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 	if err != nil {
 		slog.Warn("plan summary cannot classify statements; the summary will report the raw DDL statement total instead of create/alter/drop counts",
 			"database_type", databaseType, "error", err)
-		for _, ks := range changes {
-			other += keyspaceStatementCount(ks)
-		}
-		return 0, 0, 0, other
+		// The callers' raw-total fallback carries the count when classification
+		// is unavailable.
+		return 0, 0, 0, 0
 	}
 	for _, ks := range changes {
 		countedTables := make(map[tableChangeKey]struct{})
@@ -906,6 +905,8 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 
 // tableChangeKey identifies one table-level change within a keyspace so the
 // summary counts a table once however many divergent statements target it.
+// The parser's bare relation name is sufficient because each keyspace is one
+// namespace; PostgreSQL DDL is unqualified and MySQL-family keyspaces are databases.
 type tableChangeKey struct {
 	stmtType ddl.StatementType
 	table    string
