@@ -71,12 +71,23 @@ func TestFormatDDL(t *testing.T) {
 				");",
 		},
 		{
-			name:  "backslash literal remains intact in formatted output",
+			// The MySQL parser resolves the \b escape to a backspace once; the
+			// canonical form carries the character itself and round-trips, so
+			// the statement formats with the comma still inside the literal.
+			name:  "backslash escape in default literal is resolved once and the statement formats",
 			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\b, c')",
 			expected: "CREATE TABLE `t` (\n" +
 				"    `id` int,\n" +
 				"    `note` varchar(10) DEFAULT 'a\b, c'\n" +
 				");",
+		},
+		{
+			// A literal holding a backslash character canonicalizes to a form
+			// the parser reads back differently, so the round-trip guard keeps
+			// the raw input. Display only; the applied DDL is never this string.
+			name:     "literal containing a backslash character falls back to the raw input",
+			input:    "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c')",
+			expected: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c');",
 		},
 		{
 			name:  "CREATE TABLE with indexes formatted",
