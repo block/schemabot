@@ -5,6 +5,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
 )
 
 // TestApplyOptionsFromMapRoundTrip verifies that user-facing apply options can
@@ -102,6 +104,14 @@ func TestPlanBlockedApplyError(t *testing.T) {
 		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "blocked"}}},
 	}}
 	require.EqualError(t, noReason.BlockedApplyError(), `stored plan plan-no-reason contains a blocked change for table "users": the engine refuses this statement`)
+
+	twoCauses := &Plan{PlanIdentifier: "plan-two-causes", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "blocked", ModeReason: engine.JoinBlockedCauses([]string{
+			"requires privileges unavailable to the engine",
+			"table exceeds the native-safe size ceiling",
+		})}}},
+	}}
+	require.EqualError(t, twoCauses.BlockedApplyError(), "stored plan plan-two-causes contains a blocked change for table \"users\": \n- requires privileges unavailable to the engine\n- table exceeds the native-safe size ceiling")
 
 	clean := &Plan{PlanIdentifier: "plan-clean", Namespaces: map[string]*NamespacePlanData{
 		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "direct"}}},

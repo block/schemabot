@@ -383,6 +383,9 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 					stepTier = tier
 				}
 			}
+			// Verdict reasons quote the table name, a planner-sourced
+			// identifier, so the reserved cause separator is neutralized
+			// before the reason becomes one cause of the verdict.
 			changes = append(changes, engine.TableChange{
 				Table:         table,
 				Operation:     operation,
@@ -390,7 +393,7 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				IsUnsafe:      statement.Destructive,
 				UnsafeReason:  destructiveReason(statement.Destructive, table),
 				ExecutionMode: stepMode,
-				ModeReason:    stepReason,
+				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 			})
 			tiers = append(tiers, stepTier)
 		}
@@ -618,8 +621,9 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	// characters but not whitespace runs, so the composed reason is collapsed
 	// to one line as a whole; the Markdown surfaces that render it escape
 	// their own delimiters at the rendering boundary, so the name reaches the
-	// operator as the relation it is.
-	reason := singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
+	// operator as the relation it is. The blocked-cause separator is the one
+	// delimiter decoded before rendering, so it is neutralized here.
+	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
 		if err := blockRewriteSteps(changes, reason); err != nil {
@@ -683,8 +687,9 @@ func blockRewriteSteps(changes []engine.TableChange, reason string) error {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
-			if !strings.Contains(changes[i].ModeReason, reason) {
-				changes[i].ModeReason += clauseSeparator + reason
+			causes := engine.BlockedCauses(changes[i].ModeReason)
+			if !slices.Contains(causes, reason) {
+				changes[i].ModeReason = engine.JoinBlockedCauses(append(causes, reason))
 			}
 			continue
 		}
@@ -998,9 +1003,11 @@ func blockChangesAtTier(changes []engine.TableChange, tiers []preflight.Tier, ti
 // and format characters (including bidi overrides usable for visual spoofing)
 // are stripped, whitespace runs — including newlines — collapse to one space,
 // and the table cell separator is neutralized so a crafted identifier cannot
-// break comment layout.
+// break comment layout. The blocked-cause separator is neutralized for the
+// same reason: an identifier carrying it would otherwise decode as causes the
+// engine never issued.
 func sanitizeReasonText(s string) string {
-	return strings.ReplaceAll(singleLine(s), "|", "/")
+	return engine.SanitizeBlockedCause(strings.ReplaceAll(singleLine(s), "|", "/"))
 }
 
 // maxStatementMetadataLen bounds the statement text carried in progress
