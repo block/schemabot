@@ -150,6 +150,13 @@ const MaxStorageApplyTimeout = DefaultStorageApplyTimeout
 // less, watches the convergence fail at a budget they did not choose and has
 // nothing in the output to tell them why.
 //
+// The unnamed budget is a budget like any other, and answers to the same
+// bounds. It is a constant at every call site today, so refusing one out of
+// range guards a future caller rather than a live one — but this is the one
+// function whose job is to keep a convergence inside MaxStorageApplyTimeout,
+// and a parameter it returned unchecked would be the one way to hand a caller
+// a budget past the maximum.
+//
 // The errors name the budget rather than the field that carried it, since each
 // end spells that field differently and prefixes the refusal with its own name
 // for it.
@@ -162,6 +169,9 @@ func ResolveStorageApplyTimeout(timeoutSeconds int64, unnamed time.Duration) (ti
 	// handed a budget it never named.
 	const maxSeconds = int64(MaxStorageApplyTimeout / time.Second)
 	switch {
+	case timeoutSeconds == 0 && (unnamed <= 0 || unnamed > MaxStorageApplyTimeout):
+		return 0, fmt.Errorf("the budget for an unnamed convergence must be positive and at most %s, got %s",
+			MaxStorageApplyTimeout, unnamed)
 	case timeoutSeconds == 0:
 		return unnamed, nil
 	case timeoutSeconds < 0:

@@ -325,6 +325,10 @@ func TestPostgresBootstrapDDLBudgetNeverDerivesADisabledBudget(t *testing.T) {
 		{name: "a roomy ceiling keeps the margin below it", ceiling: 5 * time.Minute, want: 5*time.Minute - margin},
 		{name: "a ceiling just above the margin still subtracts", ceiling: margin + 10*time.Second, want: 10 * time.Second},
 		{name: "a ceiling exactly the floor above the margin keeps the floor", ceiling: margin + floor, want: floor},
+		// Between the margin and the margin plus the floor, the subtraction
+		// is positive but shorter than the floor, and the floor wins — this
+		// is the one range where the two branches disagree.
+		{name: "a ceiling less than the floor above the margin keeps the floor", ceiling: margin + 3*time.Second, want: floor},
 		{name: "a ceiling at the margin would derive a disable", ceiling: margin, want: floor},
 		{name: "a ceiling under the margin would derive a negative", ceiling: 12 * time.Second, want: floor},
 		{name: "a ceiling at the floor halves rather than matching it", ceiling: floor, want: floor / 2},

@@ -42,6 +42,52 @@ func TestResolveStorageApplyTimeout_HonorsARequestedBudget(t *testing.T) {
 	assert.Equal(t, 90*time.Second, budget)
 }
 
+// The unnamed budget answers to the same bounds as a named one. Every call
+// site passes a constant inside them today, so this guards the next caller:
+// the resolver is the one place that keeps a convergence under the maximum,
+// and a parameter it handed back unchecked would be the one way past it.
+func TestResolveStorageApplyTimeout_RefusesAnUnnamedBudgetOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	for name, unnamed := range map[string]time.Duration{
+		"zero":              0,
+		"negative":          -5 * time.Minute,
+		"above the maximum": MaxStorageApplyTimeout + time.Second,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			budget, err := ResolveStorageApplyTimeout(0, unnamed)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "budget for an unnamed convergence")
+			assert.Zero(t, budget)
+		})
+	}
+}
+
+// A named budget is judged on its own: the unnamed budget only matters to a
+// request that names none, so a caller that named one inside the range is not
+// refused for a default it never used.
+func TestResolveStorageApplyTimeout_ANamedBudgetIgnoresTheUnnamedBudget(t *testing.T) {
+	t.Parallel()
+
+	budget, err := ResolveStorageApplyTimeout(90, MaxStorageApplyTimeout+time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 90*time.Second, budget)
+}
+
+// The refusal of a negative budget names the budget a zero would have run
+// under, and each end resolves against a different one. An operator who sees
+// the message on the server should read the boot budget there, not the hour
+// their own client would have waited.
+func TestResolveStorageApplyTimeout_ARefusalNamesTheUnnamedBudget(t *testing.T) {
+	t.Parallel()
+
+	_, err := ResolveStorageApplyTimeout(-1, 90*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "run under 1m30s")
+}
+
 // Out of range is refused, never clamped. An operator quietly given a smaller
 // budget than they asked for watches the convergence fail at a ceiling they
 // did not choose, with nothing in the output to explain it.
