@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -503,7 +504,8 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	)
 
 	// Fetch current schema from database (use database from DSN, not req.Database)
-	currentSchema, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database)
+	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	currentSchema, withheld, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
@@ -511,9 +513,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	for i, ts := range currentSchema {
 		e.logger.Debug("current schema table", "index", i, "stmt", ts.Schema[:min(200, len(ts.Schema))])
 	}
+	exemptTables := exemptWithheldTables(ignored, req, database, withheld)
 
 	// Build list of desired table schemas from all namespaces
 	var desiredSchemas []table.TableSchema
+	declaredByNamespace := make(map[string][]string, len(req.SchemaFiles))
 	for namespace, ns := range req.SchemaFiles {
 		for filename, content := range ns.Files {
 			stmts, err := ddl.SplitStatements(content)
@@ -530,7 +534,18 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 					return nil, fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)
 				}
 				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: ct.TableName, Schema: stmt})
+				declaredByNamespace[namespace] = append(declaredByNamespace[namespace], ct.TableName)
 			}
+		}
+	}
+
+	// A table the config withholds that a schema file also declares is a
+	// contradiction the diff below would resolve as a CREATE TABLE for a table
+	// that already exists. Refuse in namespace order so the error names the
+	// same namespace on every run.
+	for _, namespace := range slices.Sorted(maps.Keys(declaredByNamespace)) {
+		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
+			return nil, err
 		}
 	}
 
@@ -556,9 +571,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	defer target.close()
 
 	if !plan.HasChanges() {
+		// The exemption travels on a no-changes plan too: this is exactly where
+		// a reviewer needs to tell a withheld live table from an unchanged one.
 		return &engine.PlanResult{
-			PlanID:    engine.NewPlanID(),
-			NoChanges: true,
+			PlanID:       engine.NewPlanID(),
+			NoChanges:    true,
+			ExemptTables: exemptTables,
 		}, nil
 	}
 
@@ -689,7 +707,27 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		// the target and continue it or destroy it. Disclose which, so that is
 		// known before anyone confirms rather than after the copy is gone.
 		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes, req.GroupedExecution),
+		ExemptTables:   exemptTables,
 	}, nil
+}
+
+// exemptWithheldTables builds the plan's ignore_tables disclosure. A withheld
+// table has no declaring file, so the file-based attribution the table changes
+// use cannot place it in a namespace: with one namespace in the request it
+// belongs to that namespace, and with several the unit being diffed is the
+// database itself, which is what the disclosure then names.
+func exemptWithheldTables(ignored engine.IgnoredTables, req *engine.PlanRequest, database string, withheld []string) []*engine.ExemptTables {
+	namespace := database
+	if len(req.SchemaFiles) == 1 {
+		for ns := range req.SchemaFiles {
+			namespace = ns
+		}
+	}
+	exemption := ignored.Exemption(namespace, withheld)
+	if exemption == nil {
+		return nil
+	}
+	return []*engine.ExemptTables{exemption}
 }
 
 // Apply starts executing a schema change plan using Spirit.
@@ -1039,22 +1077,76 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // fetchCurrentSchema retrieves table schemas from the database, filtering out
 // internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables)
 // and archive tables that are maintained outside declarative schema files.
-func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table.TableSchema, error) {
+//
+// ignored withholds the tables the repository's ignore_tables config names. The
+// second return value is what it actually withheld, sorted, for the plan to
+// disclose: the diff never sees these tables, so without the disclosure a
+// withheld table would be indistinguishable from an unchanged one.
+// liveSchemaFilterOptions returns the loader options for a live-schema read.
+//
+// The loader drops an excluded table before reading its definition, so an
+// exclusion moved to this side of it costs one SHOW CREATE TABLE per table it
+// would have dropped — and turns a table that cannot be read into a failed
+// plan, where the loader would never have looked at it. The archive exclusion
+// therefore stays with the loader unless the config names a table the archive
+// convention also excludes, which is the only case where the two orderings
+// disagree about what the plan discloses.
+//
+// The leading-underscore exclusion stays with the loader unconditionally: it
+// discards the names it drops, so an entry naming one cannot be disclosed as
+// withheld from here whatever the ordering.
+func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption {
+	opts := []table.FilterOption{table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement}
+	if !ignored.NamesAny(table.IsArchiveTable) {
+		opts = append(opts, table.WithoutArchiveTables)
+	}
+	return opts
+}
+
+func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) ([]table.TableSchema, []string, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open target database: %w", err)
+		return nil, nil, fmt.Errorf("open target database: %w", err)
 	}
 	defer utils.CloseAndLog(db)
 
 	// Open only parsed the DSN; this ping is the first dial, so it is where the
 	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
+		return nil, nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithoutArchiveTables, table.WithStrippedAutoIncrement)
+	tables, err := table.LoadSchemaFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
 	if err != nil {
-		return nil, fmt.Errorf("load schema: %w", err)
+		return nil, nil, fmt.Errorf("load schema: %w", err)
 	}
-	return tables, nil
+
+	// The archive-naming exclusion is applied here when the loader was not
+	// asked for it, so that the config's own entries are matched against the
+	// target's catalog first. An entry naming a table the archive convention
+	// also excludes is then disclosed as withheld, the same as on every other
+	// engine, instead of being reported as an entry that matched no live table
+	// because another exclusion reached it first. When the loader did apply it
+	// this pass finds nothing, since it is the same predicate.
+	kept := make([]table.TableSchema, 0, len(tables))
+	var withheld []string
+	for _, ts := range tables {
+		if ignored.Withholds(ts.Name) {
+			withheld = append(withheld, ts.Name)
+			continue
+		}
+		if table.IsArchiveTable(ts.Name) {
+			continue
+		}
+		kept = append(kept, ts)
+	}
+	slices.Sort(withheld)
+	if len(withheld) > 0 {
+		// The plan discloses this too; the log is where an operator tracing
+		// "why does the plan not mention table X" finds the answer without a
+		// plan comment in front of them.
+		e.logger.Info("live tables withheld from the plan by ignore_tables",
+			"database", database, "tables", withheld)
+	}
+	return kept, withheld, nil
 }
