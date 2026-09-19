@@ -30,6 +30,18 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 [Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
+## From your terminal
+
+**Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
+
+<img src="./assets/cli-plan-apply.gif" width="800" alt="Plan and apply a schema change through the CLI">
+
+**Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
+
+<img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
+
+[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
+
 Block runs SchemaBot for the majority of its production schema changes, including MySQL tables spanning terabytes and Vitess databases with hundreds of shards.
 
 ## Your policies, enforced
@@ -62,18 +74,6 @@ The wizard connects to your MySQL or PostgreSQL database, imports its schema int
 Want to try SchemaBot with demo databases? See the [examples guide](./examples/README.md).
 
 To run the PR workflow for your team, deploy the server from [Releases](#releases) (binary, container image, or Helm chart), then follow [docs/github-app-setup.md](./docs/github-app-setup.md) to wire up GitHub and [docs/configuration.md](./docs/configuration.md) for the server config. [`schemabot onboard`](./docs/github-app-setup.md#6-add-schemabotyaml-config-to-your-repository) pulls a live database's schema into a new declarative schema directory against that server, so you start from your real tables rather than writing them out by hand.
-
-## From your terminal
-
-**Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
-
-<img src="./assets/cli-plan-apply.gif" width="800" alt="Plan and apply a schema change through the CLI">
-
-**Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
-
-<img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
-
-[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
 ## Supported databases
 
