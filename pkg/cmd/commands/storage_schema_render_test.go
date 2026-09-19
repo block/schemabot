@@ -613,3 +613,118 @@ func TestOutputStorageSchemaPlan_SummarizesInTables(t *testing.T) {
 	assert.Contains(t, out, "📋 Plan: 1 table to create, 1 table to alter")
 	assert.Contains(t, out, "COLUMN driver", "every statement is still printed")
 }
+
+// A plan taken while another instance is converging says so, above the
+// statements it changes the meaning of. The lists cannot say it themselves: a
+// statement a convergence is working on stays out of the live catalog until it
+// finishes with it, so a database being converged diffs exactly like one
+// nobody has touched.
+func TestOutputStorageSchemaPlan_SaysAConvergenceIsRunning(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:             "mysql",
+		Database:            "schemabot",
+		Host:                "db-1.example",
+		SchemaSource:        "the schema embedded in v1.4.0",
+		ConvergenceInFlight: true,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "alter_table", DDL: "ALTER TABLE `applies` ADD COLUMN `caller` varchar(255) NOT NULL DEFAULT ''"},
+		},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", nil))
+	})
+
+	assert.Contains(t, out, glyph.Attention+" A storage convergence is already running against schemabot on db-1.example.")
+	assert.Contains(t, out, "MySQL scopes the bootstrap lock to the server",
+		"a server-wide lock cannot say the holder is converging the database named beside it")
+	assert.Contains(t, out, "Re-run this once it finishes")
+	assert.Less(t, strings.Index(out, "A storage convergence is already running"), strings.Index(out, "~ applies"),
+		"the notice has to be read before the statements it qualifies")
+}
+
+// PostgreSQL scopes advisory locks to the database, so there the holder is
+// converging the database the line names and there is nothing to qualify. The
+// sentence MySQL needs would be false here: it would send an operator looking
+// for a run on another database of the same server, which on this dialect
+// could not be holding this lock.
+func TestOutputStorageSchemaPlan_PostgresDoesNotQualifyTheLockScope(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:             "postgres",
+		Database:            "schemabot",
+		Host:                "storage.db.example",
+		ConvergenceInFlight: true,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "checks", Operation: "create_table", DDL: "CREATE TABLE checks (id bigint PRIMARY KEY)"},
+		},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", nil))
+	})
+
+	assert.Contains(t, out, "A storage convergence is already running against schemabot on storage.db.example.")
+	assert.NotContains(t, out, "scopes the bootstrap lock to the server")
+	assert.NotContains(t, out, "another database on the same server")
+}
+
+// An apply is told what it costs it, not what it costs a plan: it is about to
+// sit on the bootstrap lock behind the run already in progress.
+func TestOutputStorageSchemaPlan_ApplySaysItWillWaitOnTheLock(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:             "postgres",
+		Database:            "schemabot",
+		ConvergenceInFlight: true,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "checks", Operation: "create_table", DDL: "CREATE TABLE checks (id bigint PRIMARY KEY)"},
+		},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, true, "storage apply", nil))
+	})
+
+	assert.Contains(t, out, "waits on the storage bootstrap lock")
+	assert.NotContains(t, out, "Re-run this once it finishes",
+		"an apply is not being asked to come back and look again")
+}
+
+// A convergence still holding the lock is worth saying over a report that
+// found nothing outstanding — that pairing is exactly what an operator whose
+// session dropped is looking at, and the converged line alone would read as
+// their run having finished.
+func TestOutputStorageSchemaPlan_ConvergedStillSaysAConvergenceIsRunning(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:             "mysql",
+		Database:            "schemabot",
+		Converged:           true,
+		ConvergenceInFlight: true,
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", nil))
+	})
+
+	assert.Contains(t, out, "A storage convergence is already running")
+	assert.Contains(t, out, "✓ No schema changes detected.")
+}
+
+// Nothing is printed when no convergence is reported. The field is false both
+// when the database is idle and when the probe could not answer, so a line
+// rendered off the negative would state "nothing is running" on a report that
+// only failed to find out — on the surface an operator reads to decide whether
+// it is safe to start their own run.
+func TestOutputStorageSchemaPlan_SaysNothingWhenNoConvergenceIsReported(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:   "mysql",
+		Database:  "schemabot",
+		Converged: true,
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", nil))
+	})
+
+	assert.NotContains(t, strings.ToLower(out), "convergence",
+		"an unknown answer must not render as an idle database")
+}

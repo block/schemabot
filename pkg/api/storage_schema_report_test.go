@@ -107,3 +107,29 @@ func TestStorageSchemaReportRemainingCount(t *testing.T) {
 	assert.True(t, converged.Converged())
 	assert.Equal(t, 0, converged.remainingCount())
 }
+
+// A probe that could not read the lock logs a warning, and the warning has to
+// say which storage database went unread: one instance reports on its own
+// storage and on every data plane's, so a line without the identifiers names
+// none of them.
+func TestStorageSchemaReportLogAttrs(t *testing.T) {
+	t.Parallel()
+	report := &StorageSchemaReport{
+		Dialect:  schema.DialectPostgres,
+		Database: "schemabot",
+		Host:     "storage.db.example",
+	}
+	assert.Equal(t, []any{
+		"dialect", schema.DialectPostgres,
+		"database", "schemabot",
+		"host", "storage.db.example",
+	}, report.logAttrs())
+}
+
+// A server that does not report a hostname leaves the key off rather than
+// logging an empty one, which would read as a host nobody can look up.
+func TestStorageSchemaReportLogAttrs_OmitsAnUnreportedHost(t *testing.T) {
+	t.Parallel()
+	report := &StorageSchemaReport{Dialect: schema.DialectMySQL, Database: "schemabot"}
+	assert.NotContains(t, report.logAttrs(), "host")
+}

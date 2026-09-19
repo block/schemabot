@@ -43,9 +43,10 @@ const StorageSchemaPlanTimeout = 30 * time.Second
 
 // PlanStorageSchema reports the storage DDL outstanding between a desired
 // schema and the live storage database at dsn. It is strictly read-only: it
-// opens connections, reads the catalog, and computes a diff. It executes no
-// DDL, takes no advisory lock, and writes nothing, so it is safe to run at any
-// time, including against a database an apply is converging right now.
+// opens connections, reads the catalog, computes a diff, and reads whether the
+// bootstrap lock is held. It executes no DDL, takes no lock, and writes
+// nothing, so it is safe to run at any time, including against a database an
+// apply is converging right now — which is the case it exists to describe.
 //
 // desired is the schema to compare against; nil is the embedded schema of this
 // binary, which is what a boot would converge to. A caller deploying a later
@@ -80,6 +81,13 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 	if err != nil {
 		return nil, err
 	}
+	// Read after the diff, not before. The diff is the slow half, and a lock
+	// taken while it ran is one this report should carry: an operator about to
+	// act on these statements needs to know somebody else is already running
+	// them, and a stale false is the reading that costs them a silent hour
+	// waiting on a lock.
+	report.ConvergenceInFlight = storageConvergenceInFlight(ctx, dsn, report, logger)
+
 	// The differs themselves stay quiet — the MySQL one is handed a discarding
 	// handler so Spirit's planning chatter does not read as a schema change
 	// engine running — so this is the one place a diff leaves a server-side
@@ -93,6 +101,7 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 		"destructive_count", len(report.Destructive),
 		"manual_count", len(report.Manual),
 		"destructive_allowed", report.DestructiveAllowed,
+		"convergence_in_flight", report.ConvergenceInFlight,
 	)
 	return report, nil
 }

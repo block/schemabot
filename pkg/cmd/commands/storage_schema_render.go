@@ -78,6 +78,11 @@ func storageSchemaEngineLabel(dialect string) string {
 // the disposition of the ones that will not simply run, the summary, and any
 // hint naming the next step.
 func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
+	// Before the statements, because it changes how they should be read, and
+	// before the converged short-circuit, because a convergence still finishing
+	// up is worth saying over a report that found nothing outstanding.
+	writeStorageConvergenceInFlight(report, isApply)
+
 	if report.Converged {
 		// No hints under a converged plan: every one of them names a next step,
 		// and there is no next step to take.
@@ -251,6 +256,50 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 	return writeStorageSchemaBody(remaining, true, rerun, []string{
 		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual remediation blocks everything else until it is resolved.",
 	})
+}
+
+// writeStorageConvergenceInFlight says that somebody else is converging this
+// storage right now, when the report says so.
+//
+// Only the positive is printed. The report's false covers both "nobody is
+// converging" and "the question could not be answered", and a line announcing
+// an idle database would state the second as the first — on the one surface an
+// operator reads to decide whether it is safe to start their own run.
+//
+// What it costs them to not know differs by command, so each says its own
+// consequence: a plan read a database mid-convergence and will read differently
+// in a minute, while an apply is about to sit on a lock for as long as the run
+// ahead of it takes.
+func writeStorageConvergenceInFlight(report *apitypes.StorageSchemaReport, isApply bool) {
+	if !report.ConvergenceInFlight {
+		return
+	}
+	consequence := "A statement a convergence is working on is absent from the live catalog until it finishes with it, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left."
+	if isApply {
+		consequence = "This run waits on the storage bootstrap lock until that one finishes or its budget runs out, and may then find nothing left to do."
+	}
+	fmt.Printf("%s A storage convergence is already running against %s.%s %s\n\n",
+		glyph.Attention, storageSchemaHeaderDatabase(report), storageConvergenceLockScope(report.Dialect), consequence)
+}
+
+// storageConvergenceLockScope qualifies which database the convergence that
+// was detected is actually converging, on the dialect where the lock cannot
+// say.
+//
+// MySQL scopes a named lock to the server rather than to the database the
+// session is connected to, so two instances whose storage lives on one server
+// read each other's convergence here. The consequence above holds either way —
+// this run waits behind that one — but the database named beside it may not be
+// the one being converged, and an operator who goes looking for the run needs
+// that before they start looking in the wrong place.
+//
+// PostgreSQL advisory locks are per-database, so there the holder is
+// converging this database and there is nothing to qualify.
+func storageConvergenceLockScope(dialect string) string {
+	if schema.Dialect(dialect) != schema.DialectMySQL {
+		return ""
+	}
+	return " MySQL scopes the bootstrap lock to the server, so the run holding it may be converging another database on the same server."
 }
 
 func writeStorageSchemaHints(hints []string) {
