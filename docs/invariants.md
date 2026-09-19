@@ -1300,9 +1300,14 @@ Whether the engine will refuse a statement, or route it to direct execution (a M
 execution mode), is recorded on the plan using the engine's own checks rather than a
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
 direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
-estimate is trusted only in the blocking direction: an estimate alone never approves. *Enforced:*
-plan-time execution verdicts and apply-time verdict gates (`pkg/engine`); the direct-execution
-size bound ([direct-execution.md](direct-execution.md)).
+estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
+belongs to the target that will run the statement: a deployment that applies a plan it did not
+plan itself re-plans against its own live schema and judges the apply on that verdict, not the
+planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`); the whole-plan
+blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
+path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
+the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`); the
+direct-execution size bound ([direct-execution.md](direct-execution.md)).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 
