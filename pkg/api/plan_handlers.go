@@ -1653,6 +1653,8 @@ func buildApplyTask(
 		Shard:          shard,
 		DDL:            ddlChange.DDL,
 		DDLAction:      ddlChange.Operation,
+		ExecutionMode:  ddlChange.ExecutionMode,
+		ModeReason:     ddlChange.ModeReason,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}

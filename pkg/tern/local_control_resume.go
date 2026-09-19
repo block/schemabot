@@ -2093,6 +2093,28 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	grouped := c.usesGroupedApply(apply, options)
+	// Task rows carry the admitting deployment's verdict, allowing a resumed
+	// drive to fail closed without trusting whichever plan it loaded. The
+	// apply is terminal from here, so the start request that admitted this
+	// claim is settled and the observer posts the summary now; nothing later
+	// re-claims a failed apply to do either.
+	if err := blockedTaskError(activeTasks); err != nil {
+		c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
+		// A multi-operation drive owns only its operation; the operator's
+		// projection settles the parent, resolves pending control requests,
+		// and posts the terminal summary. failApplyWithTasks already logged
+		// the suppressed settle.
+		if suppressParent {
+			return nil
+		}
+		if startRequested {
+			if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
+				return failErr
+			}
+		}
+		c.notifyTerminalObserver(apply, tasks)
+		return nil
+	}
 	// A revert-phase task is settled only by reattaching to the engine that
 	// holds its revert window or is unwinding it, and only the grouped drive
 	// reattaches. Revert-phase states come only from an engine whose database

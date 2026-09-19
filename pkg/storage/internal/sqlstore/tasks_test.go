@@ -340,6 +340,8 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 		DDLAction:      "ALTER",
 		Throttled:      true,
 		ThrottleReason: "replica-lag 12s > 10s",
+		ExecutionMode:  "blocked",
+		ModeReason:     "requires privileges unavailable to the engine",
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	})
@@ -350,6 +352,8 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	require.NotNil(t, got)
 	assert.True(t, got.Throttled)
 	assert.Equal(t, "replica-lag 12s > 10s", got.ThrottleReason)
+	assert.Equal(t, "blocked", got.ExecutionMode)
+	assert.Equal(t, "requires privileges unavailable to the engine", got.ModeReason)
 
 	got.Throttled = false
 	got.ThrottleReason = ""

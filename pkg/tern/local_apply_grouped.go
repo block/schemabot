@@ -1692,6 +1692,8 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, logger *slog.Logge
 			Shard:            sh.Shard,
 			DDL:              table.DDL,
 			DDLAction:        table.DDLAction,
+			ExecutionMode:    table.ExecutionMode,
+			ModeReason:       table.ModeReason,
 			State:            state.NormalizeShardStatus(sh.State),
 			RowsCopied:       sh.RowsCopied,
 			RowsTotal:        sh.RowsTotal,

@@ -168,6 +168,8 @@ A deployment that did not plan locally re-plans the dispatched changes against
 its own live schema and judges admission on its own engine's verdict, so a
 statement another deployment's target could run is still refused where this
 one cannot run it.
+That admitting deployment's verdict travels on each task row, and every fresh
+or resumed drive refuses a blocked row before handing work to the engine.
 
 ## Iconography reference
 

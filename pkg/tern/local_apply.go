@@ -909,6 +909,13 @@ func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
 }
 
 func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+	// Admission normally refuses this work first. The admitting deployment's
+	// verdict also travels on each row so a drive loading work from a peer or
+	// prior build fails closed without relying on the plan it happens to hold.
+	if err := blockedTaskError(tasks); err != nil {
+		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
+		return
+	}
 	if c.usesGroupedApply(apply, options) {
 		c.runWithRecovery(ctx, apply, tasks, func() {
 			c.executeGroupedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
@@ -919,6 +926,20 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 	c.runWithRecovery(ctx, apply, tasks, func() {
 		c.executeApplySequential(ctx, apply, tasks, plan, options)
 	})
+}
+
+func blockedTaskError(tasks []*storage.Task) error {
+	for _, task := range tasks {
+		if task == nil || !task.EngineBlocked() {
+			continue
+		}
+		reason := task.ModeReason
+		if reason == "" {
+			reason = "the engine refuses this statement"
+		}
+		return fmt.Errorf("stored task %s contains a blocked change for table %q: %s", task.TaskIdentifier, task.TableName, reason)
+	}
+	return nil
 }
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with

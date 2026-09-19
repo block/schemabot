@@ -109,6 +109,12 @@ func TestPlanBlockedApplyError(t *testing.T) {
 	require.NoError(t, clean.BlockedApplyError())
 }
 
+func TestTaskEngineBlocked(t *testing.T) {
+	assert.True(t, (Task{ExecutionMode: "BLOCKED"}).EngineBlocked())
+	assert.False(t, (Task{ExecutionMode: "direct"}).EngineBlocked())
+	assert.False(t, (Task{}).EngineBlocked())
+}
+
 // TestReleasesPausedRollout verifies the one-way release latch semantics: a
 // pending or completed release request releases a paused rollout, while a
 // failed release, any non-release operation, and a nil request do not (the
