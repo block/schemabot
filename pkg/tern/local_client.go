@@ -2119,8 +2119,18 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 	// schema and refuse unless it exactly matches the dispatched (reviewed) DDL,
 	// keeping unreviewed DDL from being applied. The comparison is shard-aware: a
 	// shard-scoped dispatch is checked against the re-plan restricted to its shard.
-	if err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles); err != nil {
+	//
+	// The same re-plan supplies this deployment's execution-mode verdicts. The
+	// dispatch is built from task rows and carries none, and the verdict is a
+	// property of this target (its table sizes, its grants), not of the
+	// reviewed text — so without stamping it here the materialized plan would
+	// pass the blocked-step admission gate no matter what this engine decided.
+	verdicts, err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles)
+	if err != nil {
 		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
+	}
+	if err := c.stampLocalVerdicts(namespaces, verdicts); err != nil {
+		return nil, fmt.Errorf("materialize plan %s: local verdicts: %w", req.PlanId, err)
 	}
 
 	target := req.Target

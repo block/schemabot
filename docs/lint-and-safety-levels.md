@@ -164,6 +164,10 @@ comment and again on the locked apply comment, and any apply command is
 rejected up front while they are present. Local apply admission re-checks the
 whole stored plan before creating or attaching apply work, so a dispatch for
 one table or shard cannot partially apply a plan whose other step is blocked.
+A deployment that did not plan locally re-plans the dispatched changes against
+its own live schema and judges admission on its own engine's verdict, so a
+statement another deployment's target could run is still refused where this
+one cannot run it.
 
 ## Iconography reference
 
