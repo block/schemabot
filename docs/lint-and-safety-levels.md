@@ -86,8 +86,31 @@ drops, invisible-index-before-drop) never fire on a pull. A clean pull audit
 means the existing schema is well-shaped, not that any particular change to it
 is safe: the safety gates above still apply when you plan one.
 
-The linters parse MySQL-family DDL only, so a lint request against any other
-dialect is rejected rather than reporting a misleadingly clean audit.
+The rules are dialect-specific. On the MySQL family the audit runs Spirit's
+schema-shape linters. On PostgreSQL it runs the rules that have a PostgreSQL
+analog, and every finding is a warning, since a pulled table is existing
+schema:
+
+- `primary_key` — no primary key, or a key column whose type is not `bigint`
+  or `uuid`. Serial types are judged by the integer they store; a type is
+  matched by its full spelling, so `bigint[]` and a user type named
+  `custom.bigint` are not `bigint`.
+- `has_float` — `real`, `double precision`, `float(n)`.
+- `name_case` — a quoted table name that is not lowercase.
+- `redundant_indexes` — a btree index whose key columns are a leading prefix
+  of another index or the primary key, or a duplicate of one; a `UNIQUE` key
+  is reported only when a `UNIQUE` key or the primary key covers exactly the
+  same columns, since dropping it otherwise drops a constraint. Partial,
+  expression, `INCLUDE`, and non-btree indexes serve queries a plain index
+  cannot and are left out of the comparison.
+
+The MySQL rules with no PostgreSQL counterpart are not approximated:
+`allow_charset` and `allow_engine` (no per-table charset or storage engine),
+`reserved_words`, `has_timestamp`, `zero_date`, and `datetime_index_position`.
+`has_foreign_key` is not run on PostgreSQL either: a table with a foreign key
+is refused at pull time, so no entry the audit sees can carry one. A lint
+request against a database of any other type is rejected rather than
+reporting a misleadingly clean audit.
 
 ## What "unsafe" means
 
