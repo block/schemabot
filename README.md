@@ -53,7 +53,7 @@ Review the proposed SQL before it runs. Configure who can apply it and which env
 | **Require a review before apply** | Enable the [review gate](./docs/configuration.md#review-gate) to require approval from a configured reviewer before PR changes run. The author's own approval does not count |
 | **Prove the change in earlier environments** | Set the [promotion order](./docs/pre-merge-workflow.md#promotion-order), such as staging → production. PR applies are blocked until the earlier environment's check passes |
 | **Keep destructive changes explicit** | Lint findings flag unsafe changes. Applying them requires acknowledgment of the exact plan; a changed plan needs a new acknowledgment |
-| **Merge what is already live** | Configure SchemaBot's checks as [required checks](./docs/github-app-setup.md). They pass when the managed live schema matches the PR, so unfinished changes cannot merge |
+| **Merge what is already live** | Configure SchemaBot's checks as [required checks](./docs/check-runs.md#branch-protection-setup). They pass when the managed live schema matches the PR, so unfinished changes cannot merge |
 
 These are PR workflow gates. Direct CLI and API calls use [server permissions](./docs/auth.md); they do not require PR review or enforce promotion order.
 
@@ -71,10 +71,10 @@ make demo
 
 The demo builds SchemaBot, starts local MySQL and Vitess databases, applies the sample schemas, and seeds data. SchemaBot's API is then available at `http://localhost:13370`.
 
-**Make your first change.** In `examples/mysql/schema/testapp/users.sql`, add this line before the table's closing parenthesis, with a comma after the preceding definition:
+**Make your first change.** In `examples/mysql/schema/testapp/users.sql`, add this line immediately after the `email` column:
 
 ```sql
-    phone VARCHAR(20) DEFAULT NULL
+    `phone` VARCHAR(20) DEFAULT NULL,
 ```
 
 Review the plan against the demo's staging database:
