@@ -2,12 +2,25 @@ package api
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 )
+
+func TestBuildApplyTaskCopiesExecutionVerdict(t *testing.T) {
+	change := storage.TableChange{
+		Namespace: "testdb", Table: "orders", Operation: "alter",
+		ExecutionMode: "blocked", ModeReason: "requires privileges unavailable to the engine",
+	}
+	task := buildApplyTask(&storage.Plan{ID: 7, DatabaseType: storage.DatabaseTypeMySQL}, change, "production", storage.ApplyOptions{}, "", time.Now())
+
+	assert.Equal(t, "blocked", task.ExecutionMode)
+	assert.Equal(t, "requires privileges unavailable to the engine", task.ModeReason)
+}
 
 // TestPullNamespaces exercises the API-boundary pull gate: requested
 // namespaces must be well-formed, concrete, unique, and not reserved for the

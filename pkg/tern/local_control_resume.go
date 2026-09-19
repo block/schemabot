@@ -2093,6 +2093,12 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	grouped := c.usesGroupedApply(apply, options)
+	// Task rows carry the admitting deployment's verdict, allowing a resumed
+	// drive to fail closed without trusting whichever plan it loaded.
+	if err := blockedTaskError(activeTasks); err != nil {
+		c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
+		return nil
+	}
 	// A revert-phase task is settled only by reattaching to the engine that
 	// holds its revert window or is unwinding it, and only the grouped drive
 	// reattaches. Revert-phase states come only from an engine whose database

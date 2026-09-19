@@ -2529,6 +2529,8 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			Shard:          scope.shard,
 			DDL:            ddlChange.DDL,
 			DDLAction:      ddlChange.Operation,
+			ExecutionMode:  ddlChange.ExecutionMode,
+			ModeReason:     ddlChange.ModeReason,
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
