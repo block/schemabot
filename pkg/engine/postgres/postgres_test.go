@@ -425,7 +425,7 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 		},
 	}
 
-	changes, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
+	changes, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, "")
 	require.NoError(t, err)
 	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
@@ -489,6 +489,123 @@ func TestBlockMissingPrivilegesChecksOnlyTheCreateTierOnBlockedGreenfieldPlan(t 
 	assert.Equal(t, []preflight.Tier{preflight.TierCreateTable}, checked)
 	assert.Equal(t, "creation shape verdict"+clauseSeparator+classifyRefusal(privilegeErr, report.Table).detail, changes[0].ModeReason)
 	assert.Equal(t, "depends on the create", changes[1].ModeReason)
+}
+
+// TestTableChangesDerivesTiersForBlockedSteps proves a step the planner
+// already blocked still carries the tier its statement needs, so the privilege
+// gate can name the grant the operator will also need; a blocked step whose
+// shape the engine does not execute carries no tier at all.
+func TestTableChangesDerivesTiersForBlockedSteps(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := true
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "ALTER TABLE public.users ALTER COLUMN email TYPE bigint", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
+		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
+		{SQL: "DROP INDEX public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
+	}
+
+	changes, tiers, _, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 3)
+	for _, change := range changes {
+		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	}
+	assert.Equal(t, []preflight.Tier{preflight.TierAlterInPlace, preflight.TierIndexBuild, tierUnderived}, tiers)
+}
+
+// TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan runs the planner's
+// blocked verdicts through the same rendering the engine uses and proves the
+// privilege gate probes each blocked step's own tier: an operator whose role
+// lacks owner membership sees that grant beside the planner's refusal on
+// every step that needs it, while a step whose shape has no tier is neither
+// probed nor annotated.
+func TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := true
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "ALTER TABLE public.users ALTER COLUMN email TYPE bigint", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
+		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
+		{SQL: "DROP INDEX public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
+	}
+	changes, tiers, _, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	plannerReasons := []string{changes[0].ModeReason, changes[1].ModeReason, changes[2].ModeReason}
+
+	// Owner membership is the ladder's first rung, so every tier above it
+	// fails the same way.
+	privilegeErr := &preflight.PrivilegeError{
+		Tier:  preflight.TierAlterInPlace,
+		Check: "pg_has_role(schemabot, app_owner, 'USAGE')",
+		Grant: `GRANT "app_owner" TO "schemabot" WITH INHERIT TRUE`,
+	}
+	var checked []preflight.Tier
+	checkTier := func(_ context.Context, _ *pgxpool.Pool, _ pgplan.Report, tier preflight.Tier, _ string) error {
+		checked = append(checked, tier)
+		return privilegeErr
+	}
+
+	changes, err = blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, []preflight.Tier{preflight.TierAlterInPlace, preflight.TierIndexBuild}, checked)
+	grant := classifyRefusal(privilegeErr, report.Table).detail
+	assert.Equal(t, plannerReasons[0]+clauseSeparator+grant, changes[0].ModeReason)
+	assert.Equal(t, plannerReasons[1]+clauseSeparator+grant, changes[1].ModeReason)
+	assert.Equal(t, plannerReasons[2], changes[2].ModeReason)
+}
+
+// TestBlockMissingPrivilegesNamesSchemaCreateOnPlannerBlockedGreenfieldPlan
+// proves that when the planner refuses a CREATE TABLE's shape and the table
+// does not exist yet, the create step is still probed at the create tier so
+// a missing schema CREATE grant is named beside the shape refusal, while the
+// index that depends on the table is left alone.
+func TestBlockMissingPrivilegesNamesSchemaCreateOnPlannerBlockedGreenfieldPlan(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "widgets"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets PARTITION OF public.gadgets FOR VALUES IN (1)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRefuse, Cause: executor.CreateShapePartitionOf},
+		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
+	}
+	changes, tiers, _, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Equal(t, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, tiers)
+	plannerReasons := []string{changes[0].ModeReason, changes[1].ModeReason}
+
+	privilegeErr := &preflight.PrivilegeError{Tier: preflight.TierCreateTable, Check: "has_schema_privilege(schemabot, public, 'CREATE')", Grant: `GRANT CREATE ON SCHEMA "public" TO "schemabot"`}
+	var checked []preflight.Tier
+	checkTier := func(_ context.Context, _ *pgxpool.Pool, _ pgplan.Report, tier preflight.Tier, _ string) error {
+		checked = append(checked, tier)
+		return privilegeErr
+	}
+
+	changes, err = blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, []preflight.Tier{preflight.TierCreateTable}, checked)
+	assert.Equal(t, plannerReasons[0]+clauseSeparator+classifyRefusal(privilegeErr, report.Table).detail, changes[0].ModeReason)
+	assert.Equal(t, plannerReasons[1], changes[1].ModeReason)
+}
+
+func TestBlockMissingPrivilegesRejectsExecutableStepWithoutTier(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"}}
+
+	_, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{tierUnderived}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "carries no privilege tier")
 }
 
 func TestBlockMissingPrivilegesKeepsFullyBlockedReasonsWhenPrivilegesPresent(t *testing.T) {
@@ -590,7 +707,7 @@ func TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent(t *testing.T) {
 		},
 	}
 
-	_, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
+	_, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
 }

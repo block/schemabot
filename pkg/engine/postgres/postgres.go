@@ -323,13 +323,20 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	return result, nil
 }
 
+// tierUnderived marks a step whose privilege tier could not be derived: its
+// statement is a shape the engine does not execute, so the step is blocked
+// and there is no access to probe on its behalf. It sits below preflight's
+// lowest rung so it can never match a checked tier.
+const tierUnderived preflight.Tier = -1
+
 // tableChanges renders the report's statements as planned table changes and
 // derives each step's privilege tier alongside them. The returned slices are
 // parallel: tiers[i] is the access changes[i] needs from the engine role,
-// including when an earlier verdict already blocked that step. unrecognized
-// carries one entry per statement whose verdict is a placeholder for planner
-// vocabulary this build does not map, for the caller to log with the plan's
-// identifiers.
+// including when an earlier verdict already blocked that step, so a later
+// gate can name the grant a blocked step will also need; a blocked step whose
+// shape has no tier carries tierUnderived. unrecognized carries one entry per
+// statement whose verdict is a placeholder for planner vocabulary this build
+// does not map, for the caller to log with the plan's identifiers.
 func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
 	// Each statement's verdict is derived once and reused for both the
 	// greenfield decision and the rendering, so a placeholder verdict is
@@ -367,21 +374,22 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				table = report.Table
 			}
 			stepMode, stepReason := mode, reason
-			var stepTier preflight.Tier
-			if stepMode == "" {
-				// The apply path derives a privilege tier for every statement
-				// it executes, and that derivation refuses shapes outside the
-				// native-safe set. Run the same authority here so the verdict
-				// the operator reviews matches what the engine will do,
-				// instead of emitting an executable plan that deterministically
-				// fails at apply.
-				tier, tierErr := preflight.RequiredTier([]string{sql})
-				if tierErr != nil {
-					stepMode = engine.ExecutionModeBlocked
-					stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
-				} else {
-					stepTier = tier
-				}
+			// The apply path derives a privilege tier for every statement it
+			// executes, and that derivation refuses shapes outside the
+			// native-safe set. Run the same authority here, for blocked steps
+			// too: an executable step whose shape it refuses becomes a blocked
+			// verdict that matches what the engine will do, instead of an
+			// executable plan that deterministically fails at apply, and a
+			// step the planner already blocked keeps the tier the privilege
+			// gate needs to name the grant the operator will also need.
+			stepTier := tierUnderived
+			tier, tierErr := preflight.RequiredTier([]string{sql})
+			switch {
+			case tierErr == nil:
+				stepTier = tier
+			case stepMode == "":
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
 			}
 			changes = append(changes, engine.TableChange{
 				Table:         table,
@@ -553,19 +561,17 @@ func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, da
 	// Executable steps are always checked. On a plan every gate has already
 	// refused, the blocked steps' tiers are checked too, so a grant the
 	// operator will also need is named in the same verdict rather than after
-	// the planner refusal is fixed. A blocked dependent of an absent table is
-	// the exception: probing a table that does not exist yet can only answer
-	// "table not found", which names nothing the operator can provision.
+	// the planner refusal is fixed.
 	greenfield := isGreenfieldTable(report)
 	required := make(map[preflight.Tier]bool)
 	for i, change := range changes {
 		switch {
 		case change.ExecutionMode == "":
-			required[tiers[i]] = true
-		case fullyBlocked && change.ExecutionMode == engine.ExecutionModeBlocked:
-			if greenfield && tiers[i] != preflight.TierCreateTable {
-				continue
+			if tiers[i] == tierUnderived {
+				return nil, fmt.Errorf("verify privileges for table %q: executable statement %q carries no privilege tier", report.Table, change.DDL)
 			}
+			required[tiers[i]] = true
+		case fullyBlocked && change.ExecutionMode == engine.ExecutionModeBlocked && blockedTierIsProbeable(tiers[i], greenfield):
 			required[tiers[i]] = true
 		}
 	}
@@ -608,6 +614,19 @@ func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, da
 		return changes, nil
 	}
 	return changes, nil
+}
+
+// blockedTierIsProbeable reports whether a blocked step's tier can be checked
+// against the target on a plan every gate has already refused. A step whose
+// shape has no tier has no access to probe. On a table the planner proved
+// absent, only the CREATE TABLE tier states facts the target can answer:
+// probing an absent table for any other tier can only say "table not found",
+// which names nothing the operator can provision.
+func blockedTierIsProbeable(tier preflight.Tier, greenfield bool) bool {
+	if tier == tierUnderived {
+		return false
+	}
+	return !greenfield || tier == preflight.TierCreateTable
 }
 
 // blockOversizedTable applies the native-safe table size ceiling to executable

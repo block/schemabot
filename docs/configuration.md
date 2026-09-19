@@ -830,11 +830,15 @@ statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
 existing data, and a table that does not exist yet has none.
 
 Every engine gate still runs when an earlier gate has already blocked all of a
-table's steps. Missing privileges and an oversized table are appended as
-independent causes to the affected blocked verdicts, so all known remedies are
-visible in the same plan comment. If a diagnostic privilege or size lookup
-fails, the existing blocked verdict remains blocked and the operational failure
-is logged instead of adding a cause the gate could not verify.
+table's steps. A missing grant is appended to each blocked step whose statement
+needs that access, and an oversized table to each blocked rewrite step, as
+independent causes, so every remedy the gates can name is visible in the same
+plan comment. Two blocked steps are not probed: a statement whose shape the
+engine does not execute has no access to check, and a step that depends on a
+table the plan itself creates can only be answered "table not found". If a
+diagnostic privilege or size lookup fails, the existing blocked verdict remains
+blocked and the operational failure is logged instead of adding a cause the
+gate could not verify.
 
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
