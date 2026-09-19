@@ -425,7 +425,7 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 		},
 	}
 
-	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
+	changes, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
 	require.NoError(t, err)
 	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
@@ -433,21 +433,123 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 	assert.Contains(t, changes[1].ModeReason, "depends on the statement that creates it")
 }
 
-// TestBlockMissingPrivilegesSkipsFullyBlockedPlans proves the privilege check
-// never touches the target when the plan carries no executable steps: a
-// blocked verdict already withholds apply, so there is no access to verify.
-func TestBlockMissingPrivilegesSkipsFullyBlockedPlans(t *testing.T) {
+func TestBlockMissingPrivilegesAppendsCauseToFullyBlockedPlan(t *testing.T) {
+	privilegeErr := &preflight.PrivilegeError{
+		Tier:  preflight.TierAlterInPlace,
+		Check: "pg_has_role(schemabot, app_owner, 'USAGE')",
+		Grant: `GRANT "app_owner" TO "schemabot" WITH INHERIT TRUE`,
+		Hint:  `if the owner is an administrative role, transfer the table instead: ALTER TABLE "public"."users" OWNER TO <role>`,
+	}
+	checkTier := func(context.Context, *pgxpool.Pool, pgplan.Report, preflight.Tier, string) error {
+		return privilegeErr
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	changes := []engine.TableChange{
+		{Table: "users", DDL: "ALTER TABLE public.users DROP COLUMN legacy", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refused a table rewrite"},
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refused a lock shape"},
+	}
+	tiers := []preflight.Tier{preflight.TierAlterInPlace, preflight.TierAlterInPlace}
+	reason := classifyRefusal(privilegeErr, report.Table).detail
+
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, "planner refused a table rewrite"+clauseSeparator+reason, changes[0].ModeReason)
+	assert.Equal(t, "planner refused a lock shape"+clauseSeparator+reason, changes[1].ModeReason)
+	assert.Equal(t, changes[0].ModeReason, sanitizeReasonText(changes[0].ModeReason), "the combined reason must render whole rather than being clamped")
+	assert.Greater(t, len(changes[0].ModeReason), maxStatementMetadataLen)
+}
+
+// TestBlockMissingPrivilegesChecksOnlyTheCreateTierOnBlockedGreenfieldPlan
+// proves that on a fully blocked plan for a table the target does not have,
+// only the CREATE TABLE tier is probed: a privilege probe against an absent
+// table can only answer "table not found", so the dependents keep their
+// verdicts and the create step alone gains the missing-grant cause.
+func TestBlockMissingPrivilegesChecksOnlyTheCreateTierOnBlockedGreenfieldPlan(t *testing.T) {
+	privilegeErr := &preflight.PrivilegeError{Tier: preflight.TierCreateTable, Check: "has_schema_privilege(schemabot, public, 'CREATE')", Grant: `GRANT CREATE ON SCHEMA "public" TO "schemabot"`}
+	var checked []preflight.Tier
+	checkTier := func(_ context.Context, _ *pgxpool.Pool, _ pgplan.Report, tier preflight.Tier, _ string) error {
+		checked = append(checked, tier)
+		return privilegeErr
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	exists := false
+	report.TableExists = &exists
+	changes := []engine.TableChange{
+		{Table: "users", DDL: "CREATE TABLE public.users (id bigint PRIMARY KEY)", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "creation shape verdict"},
+		{Table: "users", DDL: "CREATE INDEX CONCURRENTLY idx_users_email ON public.users (email)", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "depends on the create"},
+	}
+	tiers := []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}
+
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, []preflight.Tier{preflight.TierCreateTable}, checked)
+	assert.Equal(t, "creation shape verdict"+clauseSeparator+classifyRefusal(privilegeErr, report.Table).detail, changes[0].ModeReason)
+	assert.Equal(t, "depends on the create", changes[1].ModeReason)
+}
+
+func TestBlockMissingPrivilegesKeepsFullyBlockedReasonsWhenPrivilegesPresent(t *testing.T) {
+	checkTier := func(context.Context, *pgxpool.Pool, pgplan.Report, preflight.Tier, string) error { return nil }
 	report := pgplan.NewReport(pgplan.SourceDiff)
 	report.Table = "users"
-	changes := []engine.TableChange{{
-		Table:         "users",
-		DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
-		ExecutionMode: engine.ExecutionModeBlocked,
-	}}
+	want := []engine.TableChange{{Table: "users", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refusal"}}
+	changes := append([]engine.TableChange(nil), want...)
 
-	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0}, "")
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierAlterInPlace}, "", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes)
+}
+
+func TestBlockMissingPrivilegesKeepsFullyBlockedReasonsWhenCheckFails(t *testing.T) {
+	checkTier := func(context.Context, *pgxpool.Pool, pgplan.Report, preflight.Tier, string) error {
+		return errors.New("catalog unavailable")
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	want := []engine.TableChange{{Table: "users", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refusal"}}
+	changes := append([]engine.TableChange(nil), want...)
+
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierAlterInPlace}, "", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes)
+}
+
+func TestBlockMissingPrivilegesDoesNotAppendCauseTwice(t *testing.T) {
+	privilegeErr := &preflight.PrivilegeError{Tier: preflight.TierAlterInPlace, Check: "has_table_privilege", Grant: "GRANT app_owner TO schemabot"}
+	checkTier := func(context.Context, *pgxpool.Pool, pgplan.Report, preflight.Tier, string) error { return privilegeErr }
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{Table: "users", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refusal"}}
+	tiers := []preflight.Tier{preflight.TierAlterInPlace}
+
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "", checkTier)
+	require.NoError(t, err)
+	want := changes[0].ModeReason
+	changes, err = blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes[0].ModeReason)
+}
+
+func TestBlockMissingPrivilegesBlocksExecutableStepInMixedPlan(t *testing.T) {
+	privilegeErr := &preflight.PrivilegeError{Tier: preflight.TierAlterInPlace, Check: "has_table_privilege", Grant: "GRANT app_owner TO schemabot"}
+	checkTier := func(context.Context, *pgxpool.Pool, pgplan.Report, preflight.Tier, string) error { return privilegeErr }
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"},
+		{Table: "users", DDL: "ALTER TABLE public.users DROP COLUMN legacy", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refusal"},
+	}
+	tiers := []preflight.Tier{preflight.TierAlterInPlace, preflight.TierAlterInPlace}
+
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "", checkTier)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Equal(t, classifyRefusal(privilegeErr, report.Table).detail, changes[0].ModeReason)
+	assert.Equal(t, "planner refusal", changes[1].ModeReason)
 }
 
 // TestBlockMissingPrivilegesRequiresTargetTable proves a report that carries
@@ -461,7 +563,7 @@ func TestBlockMissingPrivilegesRequiresTargetTable(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{preflight.TierAlterInPlace}, "")
+	_, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierAlterInPlace}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
 }
@@ -488,7 +590,7 @@ func TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent(t *testing.T) {
 		},
 	}
 
-	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
+	_, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{0, preflight.TierIndexBuild}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
 }
@@ -578,7 +680,7 @@ func TestBlockMissingPrivilegesRequiresMatchingTiers(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, nil, "")
+	_, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, nil, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "privilege tiers")
 }

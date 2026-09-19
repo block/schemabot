@@ -829,11 +829,12 @@ statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
 `CREATE TABLE` does not consult the ceiling: the gate bounds rewrites of
 existing data, and a table that does not exist yet has none.
 
-The size check still runs when an earlier gate has already blocked the table's
-rewrite steps. An oversized table's blocked verdict then carries both causes,
-so both remedies are visible in the same plan comment. If that diagnostic size
-lookup fails, the existing blocked verdict remains blocked and the operational
-failure is logged instead of adding an unknown-size cause.
+Every engine gate still runs when an earlier gate has already blocked all of a
+table's steps. Missing privileges and an oversized table are appended as
+independent causes to the affected blocked verdicts, so all known remedies are
+visible in the same plan comment. If a diagnostic privilege or size lookup
+fails, the existing blocked verdict remains blocked and the operational failure
+is logged instead of adding a cause the gate could not verify.
 
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
