@@ -274,6 +274,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		HeadSHA:           &schemaResult.HeadSHA,
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		IgnoreTables:      schemaResult.IgnoreTables,
 		SourceTrusted:     true,
 		// The copy disclosure in the comment this plan becomes is what the
 		// operator confirms, and the apply re-checks its own re-plan against

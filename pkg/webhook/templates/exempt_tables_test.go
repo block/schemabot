@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -192,4 +193,84 @@ func TestRenderMultiEnvPlanComment_ExemptTablesOnlyInOneEnv(t *testing.T) {
 	})
 	assert.Equal(t, 1, strings.Count(out, "exempt from the undeclared-table verdict"))
 	assert.Contains(t, out, "ℹ️ **Staging**: tables in namespace `app`")
+}
+
+func exemptTableNames(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("events_2026_%02d", i+1)
+	}
+	return names
+}
+
+// A namespace exempting more tables than read comfortably inline leads with
+// its count and folds the names, so the disclosure stays one line tall above
+// the plan while every withheld name stays reachable.
+func TestRenderPlanComment_ManyExemptTablesCollapse(t *testing.T) {
+	tables := exemptTableNames(exemptTablesInlineLimit + 1)
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: tables, Reason: "ignore_tables"}}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, fmt.Sprintf(
+		"<summary>ℹ️ %d tables in namespace <code>app</code> exempt from the undeclared-table verdict (ignore_tables)</summary>", len(tables)))
+	for _, name := range tables {
+		assert.Contains(t, out, "`"+name+"`")
+	}
+	assert.NotContains(t, out, "ℹ️ Tables in namespace `app` exempt")
+}
+
+// The count rides on the <summary>, which GitHub renders without expanding
+// the block: that a plan withheld tables, and how many, survives a reviewer's
+// first read of the comment even when the names are folded away.
+func TestRenderPlanComment_CollapsedExemptCountVisibleUnexpanded(t *testing.T) {
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: exemptTableNames(9), Reason: "ignore_tables"}}
+	summary, _, found := strings.Cut(RenderPlanComment(data), "</summary>")
+	require.True(t, found)
+	assert.Contains(t, summary, "9 tables in namespace <code>app</code> exempt")
+}
+
+// The fold is for lists long enough to wall the comment. A list at the limit
+// still reads inline, where it costs a reviewer nothing to see.
+func TestRenderPlanComment_ExemptTablesAtLimitStayInline(t *testing.T) {
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: exemptTableNames(exemptTablesInlineLimit), Reason: "ignore_tables"}}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (ignore\\_tables): `events_2026_01`")
+	assert.NotContains(t, out, "exempt from the undeclared-table verdict (ignore_tables)</summary>")
+}
+
+// The folded header is HTML rather than markdown, so a namespace or reason
+// carrying markup is escaped as HTML: neither can close the <summary> early
+// or open a tag of its own.
+func TestRenderPlanComment_CollapsedExemptHeaderEscapesAsHTML(t *testing.T) {
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{
+		Namespace: "app<img src=x>",
+		Tables:    exemptTableNames(exemptTablesInlineLimit + 1),
+		Reason:    "archive <b>naming</b>",
+	}}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "<code>app&lt;img src=x&gt;</code>")
+	assert.Contains(t, out, "(archive &lt;b&gt;naming&lt;/b&gt;)</summary>")
+	assert.NotContains(t, out, "<img src=x>")
+}
+
+// A long list folds under its environment heading too, so one environment's
+// wide exemption cannot wall the all-clean multi-environment comment.
+func TestRenderMultiEnvPlanComment_ManyExemptTablesCollapsePerEnv(t *testing.T) {
+	staging := exemptPlanData()
+	staging.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: exemptTableNames(7), Reason: "ignore_tables"}}
+	production := exemptPlanData()
+	production.Environment = "production"
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	assert.Contains(t, out, "<summary>ℹ️ <b>Staging</b>: 7 tables in namespace <code>app</code> exempt from the undeclared-table verdict (ignore_tables)</summary>")
+	assert.Contains(t, out, "ℹ️ **Production**: tables in namespace `app` exempt")
 }

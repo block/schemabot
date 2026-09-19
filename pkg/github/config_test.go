@@ -1331,3 +1331,18 @@ func TestFetchSchemaFilesFromTreeFailsClosedWhenSubtreeAlsoTruncated(t *testing.
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }
+
+func TestSchemabotConfigParsesIgnoreTables(t *testing.T) {
+	yamlData := `
+database: testdb
+type: mysql
+ignore_tables:
+  - flyway_schema_history
+  - legacy_audit_log
+`
+	var config SchemabotConfig
+	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
+	decoder.KnownFields(true)
+	require.NoError(t, decoder.Decode(&config))
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, config.IgnoreTables)
+}

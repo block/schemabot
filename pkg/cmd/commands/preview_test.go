@@ -9,8 +9,8 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 )
 
-// TestPreviewPlanDisclosuresSelectIndividually verifies the two plan-comment
-// disclosure previews are selectable on their own, not only inside the "all"
+// TestPreviewPlanDisclosuresSelectIndividually verifies each plan-comment
+// disclosure preview is selectable on its own, not only inside the "all"
 // listings, so an operator checking a rendering can ask for just that one.
 func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 	tests := []struct {
@@ -19,6 +19,9 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 	}{
 		{templates.PreviewCommentPlanIgnoredNamespaces, "excluded from this plan by `ignore_namespaces`"},
 		{templates.PreviewCommentPlanExemptTables, "exempt from the undeclared-table verdict"},
+		// The reason is engine prose, so it is escaped like any other: the
+		// underscore renders as itself and cannot start emphasis.
+		{templates.PreviewCommentPlanIgnoreTables, `(ignore\_tables): ` + "`flyway_schema_history`"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.previewType), func(t *testing.T) {

@@ -110,3 +110,26 @@ func TestLoadCLIConfig_RejectsIgnoreNamespacePaths(t *testing.T) {
 	assert.Nil(t, cfg)
 	assert.Contains(t, err.Error(), "not a path")
 }
+
+func TestLoadCLIConfig_ParsesIgnoreTables(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nignore_tables:\n  - flyway_schema_history\n  - legacy_audit_log\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, cfg.IgnoreTables)
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, cfg.PlanExclusions().Tables)
+	assert.Nil(t, cfg.PlanExclusions().Namespaces)
+}
+
+func TestLoadCLIConfig_RejectsIgnoreTablePaths(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nignore_tables:\n  - app/flyway_schema_history\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.Contains(t, err.Error(), "not a path")
+}
