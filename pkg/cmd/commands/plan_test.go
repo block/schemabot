@@ -448,6 +448,8 @@ func TestWriteSQLChanges(t *testing.T) {
 	assert.Contains(t, plainOutput, "DROP TABLE", "Expected DROP TABLE DDL")
 }
 
+// The plan summary counts tables, not statements: the rows here name distinct
+// tables so each one is a table to create, alter, or drop.
 func TestWritePlanSummary(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -457,55 +459,63 @@ func TestWritePlanSummary(t *testing.T) {
 		{
 			name: "single create",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
+				{ChangeType: "CREATE", TableName: "users"},
 			},
 			expected: "1 table to create",
 		},
 		{
 			name: "multiple creates",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
-				{ChangeType: "CREATE"},
+				{ChangeType: "CREATE", TableName: "users"},
+				{ChangeType: "CREATE", TableName: "orders"},
 			},
 			expected: "2 tables to create",
 		},
 		{
 			name: "single alter",
 			changes: []templates.DDLChange{
-				{ChangeType: "ALTER"},
+				{ChangeType: "ALTER", TableName: "users"},
 			},
 			expected: "1 table to alter",
 		},
 		{
 			name: "multiple alters",
 			changes: []templates.DDLChange{
-				{ChangeType: "ALTER"},
-				{ChangeType: "ALTER"},
+				{ChangeType: "ALTER", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "orders"},
 			},
 			expected: "2 tables to alter",
 		},
 		{
+			name: "repeated alters on one table",
+			changes: []templates.DDLChange{
+				{ChangeType: "ALTER", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "users"},
+			},
+			expected: "1 table to alter",
+		},
+		{
 			name: "single drop",
 			changes: []templates.DDLChange{
-				{ChangeType: "DROP"},
+				{ChangeType: "DROP", TableName: "legacy"},
 			},
 			expected: "1 table to drop",
 		},
 		{
 			name: "multiple drops",
 			changes: []templates.DDLChange{
-				{ChangeType: "DROP"},
-				{ChangeType: "DROP"},
-				{ChangeType: "DROP"},
+				{ChangeType: "DROP", TableName: "legacy"},
+				{ChangeType: "DROP", TableName: "archive"},
+				{ChangeType: "DROP", TableName: "staging_copy"},
 			},
 			expected: "3 tables to drop",
 		},
 		{
 			name: "mixed changes",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
-				{ChangeType: "ALTER"},
-				{ChangeType: "DROP"},
+				{ChangeType: "CREATE", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "orders"},
+				{ChangeType: "DROP", TableName: "legacy"},
 			},
 			expected: "1 table to create, 1 table to alter, 1 table to drop",
 		},

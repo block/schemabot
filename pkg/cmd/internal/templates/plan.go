@@ -383,11 +383,18 @@ func ddlSummaryParts(changes []DDLChange) []string {
 			other++
 			continue
 		}
-		key := tableChange{changeType: changeType, tableName: c.TableName}
-		if _, counted := countedTables[key]; counted {
-			continue
+		// Every producer of a DDLChange names its table, so an empty name is
+		// a payload the dedupe cannot judge. It is counted rather than keyed:
+		// merging every nameless change into one would under-report where the
+		// PR comment, whose parser never yields a nameless table change, does
+		// not.
+		if c.TableName != "" {
+			key := tableChange{changeType: changeType, tableName: c.TableName}
+			if _, counted := countedTables[key]; counted {
+				continue
+			}
+			countedTables[key] = struct{}{}
 		}
-		countedTables[key] = struct{}{}
 		switch changeType {
 		case "CREATE":
 			creates++

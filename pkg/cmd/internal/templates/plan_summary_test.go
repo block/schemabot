@@ -16,6 +16,19 @@ func TestDDLSummaryParts_DeduplicatesTableChanges(t *testing.T) {
 	require.Equal(t, []string{"2 tables to alter"}, ddlSummaryParts(changes))
 }
 
+// A change without a table name cannot be judged a duplicate of anything, so
+// it is counted on its own rather than merged with every other nameless
+// change. A named table alongside them still dedupes as usual.
+func TestDDLSummaryParts_CountsNamelessChangesWithoutMerging(t *testing.T) {
+	changes := []DDLChange{
+		{ChangeType: "ALTER"},
+		{ChangeType: "ALTER"},
+		{ChangeType: "ALTER", TableName: "orders"},
+		{ChangeType: "ALTER", TableName: "orders"},
+	}
+	require.Equal(t, []string{"3 tables to alter"}, ddlSummaryParts(changes))
+}
+
 // The CLI plan summary counts every statement the plan will run, matching the
 // PR comment: statements outside the create/alter/drop buckets are named in a
 // mixed plan and a plan made only of them reports its raw total, so an

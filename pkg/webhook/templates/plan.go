@@ -852,9 +852,10 @@ func SummarizeChanges(data PlanCommentData) string {
 // (keyspaceStatements), so a sharded keyspace is counted from its per-shard
 // changes. The create/alter/drop counts are per table: when shards diverge,
 // one table can render two different ALTER statements, and it is still one
-// table to alter. A database type with no registered parser, a statement its
-// parser rejects, or a recognized statement outside the table buckets
-// contributes to other so the summary stays complete.
+// table to alter. A statement the parser rejects or a recognized statement
+// outside the table buckets contributes to other so the summary stays
+// complete. A database type with no registered parser yields no counts at
+// all, and the callers' raw-total fallback carries the statement count.
 func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops, other int) {
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
 	if err != nil {
