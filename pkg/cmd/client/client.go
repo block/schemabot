@@ -157,14 +157,22 @@ func StorageSchemaPlan(ctx context.Context, endpoint string, req apitypes.Storag
 // operator timeout: a convergence is the one operator call whose duration the
 // caller chooses, so a fixed client deadline would abandon exactly the runs
 // that asked for longer.
+//
+// A request naming no budget is given the operator default here and sent with
+// it named, the way an empty Caller is filled in: the wire then always carries
+// the budget this client is about to wait for, and the server never has to
+// guess it. A server that receives no budget runs the boot's instead, which is
+// far shorter than the wait below — so leaving the field empty would have the
+// server stop at a ceiling this client never reported.
 func StorageSchemaApply(ctx context.Context, endpoint string, req apitypes.StorageSchemaApplyRequest) (*apitypes.StorageSchemaApplyResponse, error) {
 	if req.Caller == "" {
 		req.Caller = GenerateCLIOwner()
 	}
-	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds)
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds, apitypes.DefaultStorageApplyTimeout)
 	if err != nil {
 		return nil, err
 	}
+	req.TimeoutSeconds = int64(budget / time.Second)
 	var result apitypes.StorageSchemaApplyResponse
 	if err := doPostIntoWithClient(ctx, clientForBudget(budget), endpoint, "/api/storage/schema/apply", req, &result); err != nil {
 		return nil, err

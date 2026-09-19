@@ -10,10 +10,10 @@ import (
 )
 
 // A PostgreSQL plan classifies and renders its DDL under the PostgreSQL
-// grammar: the summary counts every statement — including ones whose column
-// types only exist in PostgreSQL — and the DDL block shows the statements in
-// their own dialect's canonical form rather than reformatted under the MySQL
-// grammar's quoting rules. The multi-clause ALTER is parseable under both
+// grammar: the summary counts every table — including ones whose column types
+// only exist in PostgreSQL, and once for the table two ALTERs target — and
+// the DDL block shows the statements in their own dialect's canonical form
+// rather than reformatted under the MySQL grammar's quoting rules. The multi-clause ALTER is parseable under both
 // grammars, so its rendering pins the dialect routing: PostgreSQL's canonical
 // form keeps bare identifiers where the MySQL formatter would backtick them.
 func TestRenderPlanComment_PostgresDialect(t *testing.T) {
@@ -31,7 +31,7 @@ func TestRenderPlanComment_PostgresDialect(t *testing.T) {
 		}},
 	})
 
-	assert.Contains(t, out, "📋 **Plan**: **1** table to create, **2** tables to alter")
+	assert.Contains(t, out, "📋 **Plan**: **1** table to create, **1** table to alter")
 	assert.Contains(t, out, "uuid")
 	assert.Contains(t, out, "jsonb")
 	assert.Contains(t, out, "timestamptz")

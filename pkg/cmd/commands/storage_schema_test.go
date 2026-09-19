@@ -317,11 +317,12 @@ func TestStorageApplyCmd_ConvergesAConvergedCatalogToo(t *testing.T) {
 }
 
 // An operator's --timeout reaches the target as the budget it bounds the
-// convergence with, and an unset flag sends nothing so the target applies its
-// own default. This is what lets a convergence outlive the budget a booting pod
-// runs under: the ceiling is the caller's to name, and a command that dropped
-// the flag on the way to the wire would silently hand back a boot's answer to
-// "too slow".
+// convergence with, and an unset flag names the operator default on the wire
+// rather than sending nothing. Both ends then agree on the ceiling by
+// construction: a target handed no budget runs the convergence under the one a
+// booting pod gets, which is not the wait the command told the operator it
+// would hold for. This is what lets a convergence outlive the boot budget: the
+// ceiling is the caller's to name, on every path.
 func TestStorageApplyCmd_CarriesTheOperatorBudgetToTheTarget(t *testing.T) {
 	converged := &apitypes.StorageSchemaReport{
 		Dialect:      "mysql",
@@ -345,8 +346,8 @@ func TestStorageApplyCmd_CarriesTheOperatorBudgetToTheTarget(t *testing.T) {
 		cmd := StorageApplyCmd{AutoApprove: true}
 		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: defaultEndpoint}))
 	})
-	assert.Zero(t, unset.TimeoutSeconds,
-		"an unset flag leaves the budget to the target rather than pinning it from the CLI")
+	assert.Equal(t, int64(apitypes.DefaultStorageApplyTimeout/time.Second), unset.TimeoutSeconds,
+		"an unset flag names the operator default on the wire so the target runs under the wait the client holds for")
 }
 
 // A budget beyond what the target will accept is refused at the CLI, before a
