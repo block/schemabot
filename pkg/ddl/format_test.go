@@ -63,6 +63,33 @@ func TestFormatDDL(t *testing.T) {
 				");",
 		},
 		{
+			name:  "CREATE TABLE comma in default literal",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` varchar(10) DEFAULT 'x, y'\n" +
+				");",
+		},
+		{
+			// The MySQL parser resolves the \b escape to a backspace once; the
+			// canonical form carries the character itself and round-trips, so
+			// the statement formats with the comma still inside the literal.
+			name:  "backslash escape in default literal is resolved once and the statement formats",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\b, c')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` varchar(10) DEFAULT 'a\b, c'\n" +
+				");",
+		},
+		{
+			// A literal holding a backslash character canonicalizes to a form
+			// the parser reads back differently, so the round-trip guard keeps
+			// the raw input. Display only; the applied DDL is never this string.
+			name:     "literal containing a backslash character falls back to the raw input",
+			input:    "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c')",
+			expected: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c');",
+		},
+		{
 			name:  "CREATE TABLE with indexes formatted",
 			input: "CREATE TABLE users (id INT, name VARCHAR(255), INDEX idx_name (name)) ENGINE=InnoDB",
 			expected: "CREATE TABLE `users` (\n" +
@@ -131,6 +158,41 @@ func TestFormatDDL(t *testing.T) {
 			expected: "CREATE TABLE `t4` (`id` bigint NOT NULL) ENGINE InnoDB,\n  COMMENT 'do not PARTITION BY hand';",
 		},
 		{
+			name:  "COMMENT with doubled quote and PARTITION BY before the clause",
+			input: "CREATE TABLE `t4` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='don''t PARTITION BY hand' PARTITION BY HASH (`id`) PARTITIONS 2",
+			expected: "CREATE TABLE `t4` (`id` bigint NOT NULL) ENGINE InnoDB,\n" +
+				"  COMMENT 'don''t PARTITION BY hand'\n" +
+				"  PARTITION BY HASH (`id`) PARTITIONS 2;",
+		},
+		{
+			name:  "type words inside a column COMMENT literal keep their case",
+			input: "CREATE TABLE t (id INT, note TEXT COMMENT 'stored as INT, not TEXT')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` text COMMENT 'stored as INT, not TEXT'\n" +
+				");",
+		},
+		{
+			name:  "backticked identifiers that spell a type keep their case",
+			input: "CREATE TABLE `DATE` (`INT` INT, `TEXT` TEXT DEFAULT NULL)",
+			expected: "CREATE TABLE `DATE` (\n" +
+				"    `INT` int,\n" +
+				"    `TEXT` text DEFAULT NULL\n" +
+				");",
+		},
+		{
+			name:     "table COMMENT with doubled quote and a type word",
+			input:    "CREATE TABLE `t` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='it''s a VARCHAR(255) thing'",
+			expected: "CREATE TABLE `t` (`id` bigint NOT NULL) ENGINE InnoDB,\n  COMMENT 'it''s a VARCHAR(255) thing';",
+		},
+		{
+			name:  "ALTER clauses with type words in identifier and literal",
+			input: "ALTER TABLE `t` ADD COLUMN `INT` INT COMMENT 'was a BIGINT, then TEXT', ADD COLUMN `b` TIMESTAMP DEFAULT CURRENT_TIMESTAMP()",
+			expected: "ALTER TABLE `t`\n" +
+				"    ADD COLUMN `INT` int COMMENT 'was a BIGINT, then TEXT',\n" +
+				"    ADD COLUMN `b` timestamp DEFAULT current_timestamp();",
+		},
+		{
 			name:  "non-ASCII COMMENT before PARTITION BY",
 			input: "CREATE TABLE `t5` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='ılık ıslak' PARTITION BY HASH (`id`) PARTITIONS 2",
 			expected: "CREATE TABLE `t5` (`id` bigint NOT NULL) ENGINE InnoDB,\n" +
@@ -164,6 +226,101 @@ func TestFormatDDL(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := FormatDDL(tt.input)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestFormatCreateTableQuotedContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:  "comma in default literal",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y')",
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				"    note varchar(10) DEFAULT 'x, y'\n" +
+				")",
+		},
+		{
+			name:  "check list and literal default",
+			input: "CREATE TABLE t (c text CHECK (c IN ('a','b')), note varchar(10) DEFAULT 'x, y')",
+			expected: "CREATE TABLE t (\n" +
+				"    c text CHECK (c IN ('a','b')),\n" +
+				"    note varchar(10) DEFAULT 'x, y'\n" +
+				")",
+		},
+		{
+			name:  "parentheses and comma in comment literal",
+			input: "CREATE TABLE t (id int COMMENT 'see (a) and (b), then c', note text)",
+			expected: "CREATE TABLE t (\n" +
+				"    id int COMMENT 'see (a) and (b), then c',\n" +
+				"    note text\n" +
+				")",
+		},
+		{
+			name:  "doubled quote and comma in literal",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'it''s, ok')",
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				"    note varchar(10) DEFAULT 'it''s, ok'\n" +
+				")",
+		},
+		{
+			name:  "backslash before the closing quote is content",
+			input: `CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\', c int)`,
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				`    note varchar(10) DEFAULT 'a\',` + "\n" +
+				"    c int\n" +
+				")",
+		},
+		{
+			name:  "backslash followed by doubled quote",
+			input: `CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\''b, (c', c int)`,
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				`    note varchar(10) DEFAULT 'a\''b, (c',` + "\n" +
+				"    c int\n" +
+				")",
+		},
+		{
+			name:  "escape string literal with doubled quote",
+			input: `CREATE TABLE t (id int, note text DEFAULT E'a\\''b, (c', c int)`,
+			expected: "CREATE TABLE t (\n" +
+				"    id int,\n" +
+				`    note text DEFAULT E'a\\''b, (c',` + "\n" +
+				"    c int\n" +
+				")",
+		},
+		{
+			name:     "unterminated literal",
+			input:    "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y)",
+			expected: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'x, y)",
+		},
+		{
+			name:  "backtick identifier with punctuation",
+			input: "CREATE TABLE `t(a` (`id` int, `note,value` text)",
+			expected: "CREATE TABLE `t(a` (\n" +
+				"    `id` int,\n" +
+				"    `note,value` text\n" +
+				")",
+		},
+		{
+			name:  "double quoted identifier with punctuation",
+			input: `CREATE TABLE "t(a" ("id" int, "note,value" text)`,
+			expected: "CREATE TABLE \"t(a\" (\n" +
+				"    \"id\" int,\n" +
+				"    \"note,value\" text\n" +
+				")",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, formatCreateTable(tt.input))
 		})
 	}
 }
@@ -429,6 +586,21 @@ func TestSplitAlterClauses(t *testing.T) {
 				"ALTER TABLE `t` ADD INDEX `idx`(`a`, `b`, `c`)",
 			},
 		},
+		{
+			name:  "clause keyword inside a literal not split",
+			input: "ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD y (', ADD INDEX `b`(`b`)",
+			expected: []string{
+				"ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD y ('",
+				"ADD INDEX `b`(`b`)",
+			},
+		},
+		{
+			name:  "unterminated literal left whole",
+			input: "ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD INDEX `b`(`b`)",
+			expected: []string{
+				"ALTER TABLE `t` ADD COLUMN `note` varchar(10) DEFAULT 'x, ADD INDEX `b`(`b`)",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -472,12 +644,47 @@ func TestFormatDDLForDialect(t *testing.T) {
 			");", got)
 	})
 
+	t.Run("postgres escape-string literal remains intact in formatted output", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"CREATE TABLE t (id int, note text DEFAULT E'a\\b, c')")
+		assert.Equal(t, "CREATE TABLE t (\n"+
+			"    id int,\n"+
+			"    note text DEFAULT 'a\b, c'\n"+
+			");", got)
+	})
+
+	t.Run("postgres dollar-quoted literal remains intact in formatted output", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			`CREATE TABLE t (id int, note text DEFAULT $$x, (y$$)`)
+		assert.Equal(t, "CREATE TABLE t (\n"+
+			"    id int,\n"+
+			"    note text DEFAULT 'x, (y'\n"+
+			");", got)
+	})
+
 	t.Run("postgres multi-clause ALTER renders one clause per line", func(t *testing.T) {
 		got := FormatDDLForDialect(schema.DialectPostgres,
 			"alter table users add column a integer, add column b text")
 		assert.Equal(t, "ALTER TABLE users\n"+
 			"    ADD COLUMN a int,\n"+
 			"    ADD COLUMN b text;", got)
+	})
+
+	t.Run("postgres quoted identifiers with punctuation stay whole", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			`CREATE TABLE "t(a" ("id" int, "note,value" text)`)
+		assert.Equal(t, "CREATE TABLE \"t(a\" (\n"+
+			"    id int,\n"+
+			"    \"note,value\" text\n"+
+			");", got)
+	})
+
+	t.Run("postgres ALTER splits clauses around quoted names and literals", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			`ALTER TABLE "Orders" ADD COLUMN "INT" text DEFAULT 'a, (b', ADD COLUMN "x,y" int`)
+		assert.Equal(t, "ALTER TABLE \"Orders\"\n"+
+			"    ADD COLUMN \"INT\" text DEFAULT 'a, (b',\n"+
+			"    ADD COLUMN \"x,y\" int;", got)
 	})
 
 	t.Run("postgres DROP COLUMN keeps the explicit COLUMN keyword", func(t *testing.T) {
