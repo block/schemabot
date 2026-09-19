@@ -9,27 +9,83 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A request that names no budget takes the operator default, not the budget a
-// booting pod runs under. This is the whole point of the field existing: the
-// deliberate path and the boot path answer "too slow" differently, because a
-// pod converging is a pod not yet serving and an operator at a terminal is
-// nobody's outage.
-func TestResolveStorageApplyTimeout_ZeroTakesTheOperatorDefault(t *testing.T) {
+// A request that names no budget runs under whatever the resolving side hands
+// in as the unnamed budget — the boot budget on a server, the operator default
+// in a client — rather than under a value this function chooses. The two ends
+// of a request agree on the ceiling because the client names the one it waits
+// for; a server left to pick its own would answer "too slow" differently from
+// the caller holding the terminal.
+func TestResolveStorageApplyTimeout_ZeroRunsUnderTheUnnamedBudget(t *testing.T) {
 	t.Parallel()
 
-	budget, err := ResolveStorageApplyTimeout(0)
-	require.NoError(t, err)
-	assert.Equal(t, DefaultStorageApplyTimeout, budget)
+	for name, unnamed := range map[string]time.Duration{
+		"a server's boot budget":      90 * time.Second,
+		"a client's operator default": DefaultStorageApplyTimeout,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			budget, err := ResolveStorageApplyTimeout(0, unnamed)
+			require.NoError(t, err)
+			assert.Equal(t, unnamed, budget)
+		})
+	}
 }
 
-// A budget the caller names is honored exactly, so a command can report the
-// ceiling it is running under and be right.
+// A budget the caller names is honored exactly, never replaced by the unnamed
+// budget, so a command can report the ceiling it is running under and be right.
 func TestResolveStorageApplyTimeout_HonorsARequestedBudget(t *testing.T) {
 	t.Parallel()
 
-	budget, err := ResolveStorageApplyTimeout(90)
+	budget, err := ResolveStorageApplyTimeout(90, DefaultStorageApplyTimeout)
 	require.NoError(t, err)
 	assert.Equal(t, 90*time.Second, budget)
+}
+
+// The unnamed budget answers to the same bounds as a named one. Every call
+// site passes a constant inside them today, so this guards the next caller:
+// the resolver is the one place that keeps a convergence under the maximum,
+// and a parameter it handed back unchecked would be the one way past it.
+func TestResolveStorageApplyTimeout_RefusesAnUnnamedBudgetOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	for name, unnamed := range map[string]time.Duration{
+		"zero":              0,
+		"negative":          -5 * time.Minute,
+		"above the maximum": MaxStorageApplyTimeout + time.Second,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			budget, err := ResolveStorageApplyTimeout(0, unnamed)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "budget for an unnamed convergence")
+			assert.Zero(t, budget)
+		})
+	}
+}
+
+// A named budget is judged on its own: the unnamed budget only matters to a
+// request that names none, so a caller that named one inside the range is not
+// refused for a default it never used.
+func TestResolveStorageApplyTimeout_ANamedBudgetIgnoresTheUnnamedBudget(t *testing.T) {
+	t.Parallel()
+
+	budget, err := ResolveStorageApplyTimeout(90, MaxStorageApplyTimeout+time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 90*time.Second, budget)
+}
+
+// The refusal of a negative budget names the budget a zero would have run
+// under, and each end resolves against a different one. An operator who sees
+// the message on the server should read the boot budget there, not the hour
+// their own client would have waited.
+func TestResolveStorageApplyTimeout_ARefusalNamesTheUnnamedBudget(t *testing.T) {
+	t.Parallel()
+
+	_, err := ResolveStorageApplyTimeout(-1, 90*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "run under 1m30s")
 }
 
 // Out of range is refused, never clamped. An operator quietly given a smaller
@@ -62,7 +118,7 @@ func TestResolveStorageApplyTimeout_RefusesOutOfRange(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := ResolveStorageApplyTimeout(tc.seconds)
+			_, err := ResolveStorageApplyTimeout(tc.seconds, DefaultStorageApplyTimeout)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.message)
 		})

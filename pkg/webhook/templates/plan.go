@@ -552,21 +552,33 @@ func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithV
 }
 
 // keyspaceStatementCount counts a keyspace's DDL statements for the summary and
-// the no-changes short-circuit. It prefers the collapsed namespace-level
-// Statements; when those are absent but the keyspace carries per-shard changes,
-// it counts the distinct statements across shards, so a sharded plan whose only
-// DDL is per-shard is never miscounted as "no changes".
+// the no-changes short-circuit.
 func keyspaceStatementCount(ks KeyspaceChangeData) int {
-	if len(ks.Statements) > 0 {
-		return len(ks.Statements)
+	return len(keyspaceStatements(ks))
+}
+
+// keyspaceStatements returns the DDL statements the plan comment renders for a
+// keyspace, which is the set every summary count walks. A sharded keyspace
+// renders its per-shard changes, so those are authoritative: the collapsed
+// namespace-level Statements can omit a statement confined to one shard, and
+// counting from them would drop it from the summary while the DDL block shows
+// it. The per-shard statements are deduplicated in first-seen order so a
+// uniform change across shards counts once, as it renders once.
+func keyspaceStatements(ks KeyspaceChangeData) []string {
+	if len(ks.Shards) == 0 {
+		return ks.Statements
 	}
 	seen := make(map[string]struct{})
+	var statements []string
 	for _, sh := range ks.Shards {
 		for _, stmt := range sh.Statements {
-			seen[stmt] = struct{}{}
+			if _, dup := seen[stmt]; !dup {
+				seen[stmt] = struct{}{}
+				statements = append(statements, stmt)
+			}
 		}
 	}
-	return len(seen)
+	return statements
 }
 
 func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithVSchema int) {
@@ -580,7 +592,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	// Count statement types (Terraform-style: X to create, Y to alter, Z to drop)
-	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
+	creates, alters, drops, other := countStatementTypes(data.Changes, data.DatabaseType)
 
 	var parts []string
 	if creates > 0 {
@@ -592,14 +604,17 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("**%d** %s to drop", drops, pluralize("table", drops)))
 	}
-	// Last-resort total: when nothing classified as create/alter/drop — a plan
-	// of only index or rename DDL, or per-shard-only DDL that
-	// countStatementTypes does not walk — report the raw statement total so
-	// the plan never reads as "no changes", and report it before the vschema
-	// clause so a vschema update never hides DDL the plan will run. A mixed
-	// plan with a non-zero typed count renders only the typed counts, so its
-	// untyped statements are not reflected here; SummarizeChanges shares this
-	// behavior, keeping the two surfaces in agreement.
+	// Statements outside the create/alter/drop buckets (types, extensions,
+	// comments, indexes) still run, so a mixed plan names them alongside the
+	// table counts rather than letting the typed counts imply they are all
+	// there is.
+	if other > 0 && len(parts) > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", other, pluralize("statement", other)))
+	}
+	// A plan with no create/alter/drop at all — only unbucketed DDL, or a
+	// dialect with no parser to classify it — reports the raw statement total
+	// so it never reads as "no changes", and reports it before the vschema
+	// clause so a vschema update never hides DDL the plan will run.
 	if len(parts) == 0 && totalStatements > 0 {
 		parts = append(parts, fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements)))
 	}
@@ -795,7 +810,7 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 // create/alter/drop and vschema counting is identical to the plan comment's
 // summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
-	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
+	creates, alters, drops, other := countStatementTypes(data.Changes, data.DatabaseType)
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
 	var parts []string
@@ -808,12 +823,16 @@ func SummarizeChanges(data PlanCommentData) string {
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("%d %s", drops, pluralize("drop", drops)))
 	}
+	// Mirrors the plan comment: unbucketed DDL in a mixed plan is named next
+	// to the typed counts so the Change column agrees with the comment.
+	if other > 0 && len(parts) > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", other, pluralize("statement", other)))
+	}
 	ddlSummary := strings.Join(parts, ", ")
 
-	// Fallback matching the plan comment: statements that classify as none of
-	// create/alter/drop — or per-shard-only DDL that countStatementTypes does not
-	// walk — still count. Report the raw statement total so the Change column
-	// never implies "no changes" for a plan that has them.
+	// A plan with no create/alter/drop at all — only unbucketed DDL, or a
+	// dialect with no parser to classify it — reports the raw statement total
+	// so the Change column never implies "no changes".
 	if ddlSummary == "" && totalStatements > 0 {
 		ddlSummary = fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements))
 	}
@@ -828,33 +847,51 @@ func SummarizeChanges(data PlanCommentData) string {
 	return ddlSummary
 }
 
-// countStatementTypes counts CREATE, ALTER, and DROP statements across all
+// countStatementTypes counts CREATE, ALTER, DROP, and other statements across all
 // keyspaces with each dialect's parser, counting a valid greenfield create set
-// as one create. A database type with no
-// registered parser, or a statement its parser rejects, contributes nothing
-// to the typed counts — the callers' raw statement-total fallbacks keep the
-// summary honest — and each case is logged so a miscounted summary is
-// triageable from server logs.
-func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops int) {
+// as one create. It walks the statements the comment renders
+// (keyspaceStatements), so a sharded keyspace is counted from its per-shard
+// changes. The create/alter/drop counts are per table: when shards diverge,
+// one table can render two different ALTER statements, and it is still one
+// table to alter. A statement the parser rejects or a recognized statement
+// outside the table buckets contributes to other so the summary stays
+// complete. A database type with no registered parser yields no counts at
+// all, and the callers' raw-total fallback carries the statement count.
+func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops, other int) {
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
 	if err != nil {
-		slog.Warn("plan summary cannot classify statements; the summary will report raw statement totals instead of create/alter/drop counts",
+		slog.Warn("plan summary cannot classify statements; the summary will report the raw DDL statement total instead of create/alter/drop counts",
 			"database_type", databaseType, "error", err)
-		return 0, 0, 0
+		// The callers' raw-total fallback carries the count when classification
+		// is unavailable.
+		return 0, 0, 0, 0
 	}
 	for _, ks := range changes {
-		for _, stmt := range ks.Statements {
-			stmtType, _, classifyErr := parser.Classify(stmt)
+		countedTables := make(map[tableChangeKey]struct{})
+		for _, stmt := range keyspaceStatements(ks) {
+			stmtType, table, classifyErr := parser.Classify(stmt)
 			if classifyErr != nil {
 				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
 				if createSetErr != nil {
 					slog.Warn("plan summary could not classify a statement or parse it as a supported create set; it is left out of the create/alter/drop counts",
 						"database_type", databaseType, "keyspace", ks.Keyspace,
 						"classify_error", classifyErr, "create_set_error", createSetErr)
+					other++
 					continue
 				}
-				stmtType = createSet.Type
+				stmtType, table = createSet.Type, createSet.Table
 			}
+			switch stmtType {
+			case ddl.StatementCreateTable, ddl.StatementAlterTable, ddl.StatementDropTable:
+			default:
+				other++
+				continue
+			}
+			key := tableChangeKey{stmtType: stmtType, table: table}
+			if _, counted := countedTables[key]; counted {
+				continue
+			}
+			countedTables[key] = struct{}{}
 			switch stmtType {
 			case ddl.StatementCreateTable:
 				creates++
@@ -866,6 +903,15 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 		}
 	}
 	return
+}
+
+// tableChangeKey identifies one table-level change within a keyspace so the
+// summary counts a table once however many divergent statements target it.
+// The parser's bare relation name is sufficient because each keyspace is one
+// namespace; PostgreSQL DDL is unqualified and MySQL-family keyspaces are databases.
+type tableChangeKey struct {
+	stmtType ddl.StatementType
+	table    string
 }
 
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {

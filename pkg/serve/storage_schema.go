@@ -186,23 +186,9 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 	if err != nil {
 		return nil, err
 	}
-	// The budget comes from the request, not from ctx, and the distinction is
-	// the safe one: the convergence is the startup bootstrap, which bounds
-	// itself and takes no context, so once the DDL starts a caller hanging up
-	// does not stop it. A convergence is a sequence of statements against
-	// SchemaBot's own storage, and abandoning it part-way would leave the schema
-	// between two releases with nobody watching; running it out leaves a state
-	// the next plan can describe. Only the plans either side of it observe ctx,
-	// so a caller that disconnects stops waiting for an answer rather than
-	// stopping the work.
-	//
-	// An absent or out-of-range budget is the control plane's to reject before
-	// it gets here, but this is a server boundary and the field arrives over the
-	// wire, so it is re-checked rather than trusted: a data plane reached
-	// directly must not convert a caller's zero into an unbounded lock hold.
-	budget, err := apitypes.ResolveStorageApplyTimeout(req.GetTimeoutSeconds())
+	budget, err := convergenceBudget(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", tern.ErrInvalidStorageSchemaRequest, err)
+		return nil, err
 	}
 	opts = append(opts, api.WithConvergenceTimeout(budget))
 	planned, remaining, err := api.ApplyStorageSchema(ctx, dsn, a.logger, opts...)
@@ -224,6 +210,33 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 		Planned:   api.StorageSchemaReportProto(planned),
 		Remaining: api.StorageSchemaReportProto(remaining),
 	}, nil
+}
+
+// convergenceBudget resolves the budget one convergence runs under from the
+// request that asked for it.
+//
+// The budget comes from the request, not from ctx, and the distinction is the
+// safe one: the convergence is the startup bootstrap, which bounds itself and
+// takes no context, so once the DDL starts a caller hanging up does not stop
+// it. A convergence is a sequence of statements against SchemaBot's own
+// storage, and abandoning it part-way would leave the schema between two
+// releases with nobody watching; running it out leaves a state the next plan
+// can describe. Only the plans either side of it observe ctx, so a caller that
+// disconnects stops waiting for an answer rather than stopping the work.
+//
+// An out-of-range budget is the control plane's to reject before it gets
+// here, but this is a server boundary and the field arrives over the wire, so
+// it is re-checked rather than trusted. The control plane always names the
+// budget it resolved, so a zero here is a caller that could not name one, and
+// it runs under the boot budget: a data plane reached directly must not
+// convert a caller's zero into an hour-long lock hold on behalf of a caller
+// that may have stopped waiting long before (AV-11).
+func convergenceBudget(req *ternv1.StorageSchemaApplyRequest) (time.Duration, error) {
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.GetTimeoutSeconds(), api.EnsureSchemaTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", tern.ErrInvalidStorageSchemaRequest, err)
+	}
+	return budget, nil
 }
 
 // target resolves the storage DSN and the bootstrap options for one call, and
