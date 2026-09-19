@@ -1267,7 +1267,7 @@ func (s *Service) createStoredApply(
 	applyOpts := storage.ApplyOptionsFromMap(options)
 	// Blocked changes reject before unsafe changes because no opt-in can make a
 	// statement the engine refuses executable.
-	if err := rejectBlockedStoredPlan(plan); err != nil {
+	if err := plan.BlockedApplyError(); err != nil {
 		return nil, 0, err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
@@ -1380,25 +1380,6 @@ func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.Ap
 		return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
 	}
 	return nil
-}
-
-// rejectBlockedStoredPlan refuses to queue an apply for a plan carrying an
-// engine-blocked change. A blocked verdict means the engine deterministically
-// refuses the statement, and the drive layer rebuilds engine requests from
-// task rows that do not carry the verdict — so the only place the verdict can
-// reliably gate execution is before the apply is queued. There is no opt-in:
-// the schema change itself must be rewritten and re-planned.
-func rejectBlockedStoredPlan(plan *storage.Plan) error {
-	blocked := plan.BlockedChanges()
-	if len(blocked) == 0 {
-		return nil
-	}
-	change := blocked[0]
-	reason := change.ModeReason
-	if reason == "" {
-		reason = "the engine refuses this statement"
-	}
-	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", plan.PlanIdentifier, change.Table, reason)
 }
 
 // applyTaskChanges returns the per-table DDL changes that become apply tasks.

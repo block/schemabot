@@ -5,6 +5,7 @@ package api
 import (
 	"bytes"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -42,6 +43,11 @@ func requireStorageTables(t *testing.T, db *sql.DB) {
 			"storage table %q missing after bootstrap", table)
 	}
 }
+
+// bootDDLBudget is the per-statement DDL budget a boot derives, which is what
+// these tests exercise: the budget follows the convergence's own ceiling, and a
+// boot's ceiling is EnsureSchemaTimeout.
+var bootDDLBudget = postgresBootstrapDDLBudget(EnsureSchemaTimeout)
 
 // A fresh PostgreSQL storage database bootstraps to the full storage schema:
 // every embedded schema file's table exists afterwards, so the server can
@@ -84,6 +90,75 @@ func TestEnsureSchemaPostgres_ConvergesMissingColumn(t *testing.T) {
 	columns, err := postgresTableColumns(ctx, db, "applies")
 	require.NoError(t, err)
 	assert.True(t, columns["caller"])
+}
+
+// A convergence changes the shape of SchemaBot's storage and nothing else in
+// it: it records no row about itself in the database it is converging. That is
+// what lets one implementation serve both a boot against a database with no
+// schema at all — where a table to record into does not exist yet — and a
+// deliberate convergence an operator asked for.
+//
+// The census reads the live catalog rather than a list of tables, so a table
+// added to the embedded schema is covered the day it lands rather than when
+// someone remembers this test.
+func TestEnsureSchemaPostgres_RecordsNothingInTheStorageItConverges(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+
+	// Rows for a spurious write to be visible against.
+	for i := range 3 {
+		_, err := db.ExecContext(ctx,
+			"INSERT INTO settings (setting_key, setting_value) VALUES ($1, $2)",
+			fmt.Sprintf("census-key-%d", i), fmt.Sprintf("census-value-%d", i))
+		require.NoError(t, err, "seed settings row %d", i)
+	}
+	before := postgresStorageRowCensus(t, db)
+
+	// Drift that makes the convergence do real DDL rather than exercise the
+	// no-op path.
+	_, err := db.ExecContext(ctx, "ALTER TABLE applies DROP COLUMN caller")
+	require.NoError(t, err, "introduce drift on applies")
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	columns, err := postgresTableColumns(ctx, db, "applies")
+	require.NoError(t, err)
+	require.True(t, columns["caller"],
+		"the convergence must have run the DDL whose side effects this test measures")
+
+	assert.Equal(t, before, postgresStorageRowCensus(t, db),
+		"a convergence must not add, remove, or lose a row in the storage it converges")
+}
+
+// postgresStorageRowCensus counts the rows in every table the storage database
+// holds.
+func postgresStorageRowCensus(t *testing.T, db *sql.DB) map[string]int64 {
+	t.Helper()
+
+	rows, err := db.QueryContext(t.Context(),
+		"SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+	require.NoError(t, err, "list storage tables")
+	var tables []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name), "scan table name")
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Err(), "iterate storage tables")
+	require.NoError(t, rows.Close(), "close table listing")
+	require.NotEmpty(t, tables, "a converged storage database has tables to count")
+
+	census := make(map[string]int64, len(tables))
+	for _, table := range tables {
+		var count int64
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			fmt.Sprintf("SELECT COUNT(*) FROM %q", table)).Scan(&count),
+			"count rows in %s", table)
+		census[table] = count
+	}
+	return census
 }
 
 // Startup tolerates columns unknown to the running binary so an older binary
@@ -238,7 +313,7 @@ func TestEnsureSchemaPostgres_RefusesManualRemediationWithoutWaitingForLock(t *t
 	// Hold the EnsureSchema advisory lock the way a leading pod would, for
 	// the rest of the test; a bootstrap that queued for it could not return
 	// before EnsureSchemaTimeout.
-	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{})
+	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{}, EnsureSchemaTimeout)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(lockConn)
 
@@ -441,7 +516,7 @@ func TestEnsureSchemaPostgres_WaitsForAdvisoryLock(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Hold the EnsureSchema advisory lock the way a leading pod would.
-	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{})
+	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{}, EnsureSchemaTimeout)
 	require.NoError(t, err)
 
 	done := make(chan error, 1)
@@ -595,12 +670,12 @@ func TestExecPostgresChanges_ClassifiesCancelledStatement(t *testing.T) {
 		ddl:       "SET statement_timeout = '50ms'; SELECT pg_sleep(5);",
 	}}
 
-	execErr := execPostgresChanges(t.Context(), db, "cancelled_change", changes, logger)
+	execErr := execPostgresChanges(t.Context(), db, "cancelled_change", changes, logger, bootDDLBudget)
 	require.Error(t, execErr)
 
 	// The rendered error names the budget the convergence set, so an operator
 	// can compare it against how long the statement actually ran.
-	assert.ErrorContains(t, execErr, postgresBootstrapDDLStatementTimeout.String())
+	assert.ErrorContains(t, execErr, bootDDLBudget.String())
 	var pgErr *pgconn.PgError
 	require.ErrorAs(t, execErr, &pgErr, "the server's own error must stay reachable")
 	assert.Equal(t, "57014", pgErr.Code)
@@ -693,11 +768,11 @@ func TestExecPostgresChanges_RaisesStatementTimeoutForDDL(t *testing.T) {
 		ddl: `CREATE TABLE ddl_budget_probe AS
 		      SELECT setting AS observed FROM pg_settings WHERE name = 'statement_timeout'`,
 	}
-	require.NoError(t, execPostgresChanges(t.Context(), db, "ddl_budget_probe", []postgresSchemaChange{probe}, logger))
+	require.NoError(t, execPostgresChanges(t.Context(), db, "ddl_budget_probe", []postgresSchemaChange{probe}, logger, bootDDLBudget))
 
 	var observed string
 	require.NoError(t, admin.QueryRowContext(t.Context(), "SELECT observed FROM ddl_budget_probe").Scan(&observed))
-	assert.Equal(t, strconv.FormatInt(postgresBootstrapDDLStatementTimeout.Milliseconds(), 10), observed)
+	assert.Equal(t, strconv.FormatInt(bootDDLBudget.Milliseconds(), 10), observed)
 
 	// The raise is transaction-local: the pooled connection goes back to its
 	// ordinary query budget rather than carrying the DDL budget into later use.

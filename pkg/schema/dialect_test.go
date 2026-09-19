@@ -28,12 +28,15 @@ func TestIsReservedPullNamespaceForDialect(t *testing.T) {
 		{name: "sys on mysql", dialect: DialectMySQL, namespace: "sys", want: true},
 		{name: "rdsmon on mysql", dialect: DialectMySQL, namespace: "rdsmon", want: true},
 		{name: "dbadmin on mysql", dialect: DialectMySQL, namespace: "dbadmin", want: true},
+		{name: "slow_query_log on mysql", dialect: DialectMySQL, namespace: "slow_query_log", want: true},
 		{name: "polt on mysql", dialect: DialectMySQL, namespace: "polt", want: true},
 		{name: "tmp on mysql", dialect: DialectMySQL, namespace: "tmp", want: true},
 		{name: "topo on mysql", dialect: DialectMySQL, namespace: "topo", want: true},
 		{name: "uppercase innodb on mysql", dialect: DialectMySQL, namespace: "INNODB", want: true},
+		{name: "uppercase slow_query_log on mysql", dialect: DialectMySQL, namespace: "SLOW_QUERY_LOG", want: true},
 		{name: "mysql db on postgres", dialect: DialectPostgres, namespace: "mysql", want: false},
 		{name: "innodb on postgres", dialect: DialectPostgres, namespace: "innodb", want: false},
+		{name: "slow_query_log on postgres", dialect: DialectPostgres, namespace: "slow_query_log", want: false},
 
 		// Postgres system schemas are reserved on Postgres but not on MySQL.
 		{name: "pg_catalog on postgres", dialect: DialectPostgres, namespace: "pg_catalog", want: true},

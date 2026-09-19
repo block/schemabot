@@ -39,7 +39,7 @@ func TestStorageSchemaFromFiles_Validation(t *testing.T) {
 			name:        "no files at all",
 			description: "the schema files in ./empty",
 			files:       map[string]string{},
-			wantErr:     "would report every existing storage table as surplus",
+			wantErr:     "would propose dropping every existing storage table",
 		},
 		{
 			name:        "a path instead of a file name",

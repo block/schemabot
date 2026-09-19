@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -20,23 +21,32 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
-// EnsureSchemaTimeout bounds the whole EnsureSchema operation: acquiring the
-// advisory lock, planning, and applying the storage schema change to
-// completion. SchemaBot's storage tables are small, but Spirit applies an
-// *online* DDL, and on Aurora that carries fixed overhead (binlog subscription,
-// checksum, cutover MDL, and throttler poll loops) that can exceed a minute even
-// for a tiny table. Trailing pods also wait up to this long on the advisory lock
-// while the leader applies, then see no changes. Too short a value cancels the
-// apply mid-copy ("failed to read chunk data: context canceled") and leaves
-// storage uninitialized.
+// EnsureSchemaTimeout bounds a convergence nobody asked for: the one a pod runs
+// on the way up. It covers acquiring the advisory lock, planning, and applying
+// the storage schema change to completion. SchemaBot's storage tables are small,
+// but Spirit applies an *online* DDL, and on Aurora that carries fixed overhead
+// (binlog subscription, checksum, cutover MDL, and throttler poll loops) that can
+// exceed a minute even for a tiny table. Trailing pods also wait up to this long
+// on the advisory lock while the leader applies, then see no changes. Too short a
+// value cancels the apply mid-copy ("failed to read chunk data: context
+// canceled") and leaves storage uninitialized.
+//
+// It is short on purpose, and the reason is availability rather than DDL cost: a
+// pod converging is a pod not yet serving, and one holding the advisory lock is
+// every other pod not yet serving either. A boot must therefore give up and
+// report rather than wait out work of unbounded length — which is why a
+// convergence an operator asked for does not use this value. That one has
+// somebody watching it and no deployment waiting on it, so it names its own
+// budget through WithConvergenceTimeout, defaulting to
+// DefaultStorageApplyTimeout.
 //
 // The same constant bounds the PostgreSQL bootstrap flow — its existence
 // checks, advisory-lock wait, and transactional table creation — so tuning it
 // for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits. It is
-// also the base of a fourth derivation: postgresBootstrapDDLStatementTimeout
-// subtracts a margin from it to bound one convergence DDL statement
-// server-side, so lowering this shortens that budget too, down to its own
-// floor.
+// also the base of a fourth derivation on the boot path:
+// postgresBootstrapDDLBudget subtracts a margin from the effective budget to
+// bound one convergence DDL statement server-side, so lowering this shortens
+// that budget too, down to its own floor.
 const EnsureSchemaTimeout = 5 * time.Minute
 
 // EnsureSchemaOption customizes EnsureSchema behavior.
@@ -45,6 +55,11 @@ type EnsureSchemaOption func(*ensureSchemaOptions)
 type ensureSchemaOptions struct {
 	allowDestructive bool
 	dialect          schema.Dialect
+	// convergenceTimeout bounds one whole convergence: the lock wait, the
+	// diff under it, and the DDL. It defaults to EnsureSchemaTimeout, the
+	// budget a boot needs, so a caller that never considered the question
+	// converges the way a pod does.
+	convergenceTimeout time.Duration
 	// postgresStatementTimeout bounds a single ordinary query on the
 	// PostgreSQL bootstrap's connection. Zero disables the budget explicitly;
 	// negative means "not set", leaving the platform's ambient value in place.
@@ -55,12 +70,19 @@ type ensureSchemaOptions struct {
 }
 
 // WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
-// destructive DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN)
-// against the storage database. It defaults to false: destructive statements
-// are refused while the remaining non-destructive statements still apply. A
-// mixed ALTER TABLE is split so its safe clauses execute and only the
-// destructive clauses — plus any clause that cannot run without them, such
-// as the ADD PRIMARY KEY behind a refused DROP PRIMARY KEY — are refused.
+// destructive DDL against the storage database — any statement the plan's own
+// linters report an error against, which for the storage schema means one that
+// loses data (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) and one
+// that removes an index. It defaults to false: those statements are refused
+// while the rest of the diff still applies. A mixed ALTER carrying an additive
+// clause beside a drop runs the addition and withholds the drop, so a pod never
+// starts missing a column its own binary needs.
+//
+// This is the only way to have the bootstrap execute one of those statements,
+// so removing a table, column, or index from the embedded schema on purpose
+// means setting this flag or running the DDL by hand. That is the
+// intended trade: a surplus index left in place costs write throughput, while
+// one dropped out from under the fleet's live queries costs availability.
 // Wire this from StorageConfig.AllowDestructiveSchemaChanges.
 func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
@@ -84,7 +106,7 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // bootstrap issues — its catalog reads and existence checks. It deliberately
 // does not bound the two statement classes the bootstrap runs that are
 // expected to be slow: convergence DDL raises the budget per transaction to
-// postgresBootstrapDDLStatementTimeout, and the advisory-lock wait runs with
+// postgresBootstrapDDLBudget's value, and the advisory-lock wait runs with
 // no statement budget at all. A zero duration disables the budget explicitly
 // rather than inheriting the platform's, and a negative one leaves the
 // platform's value in place. Unset, the budget is
@@ -92,6 +114,22 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // PostgresConfig.StatementTimeoutOrDefault.
 func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.postgresStatementTimeout = d }
+}
+
+// WithConvergenceTimeout bounds one whole convergence — the advisory-lock wait,
+// the diff taken under it, and the DDL — replacing the boot budget
+// EnsureSchemaTimeout. A non-positive duration is refused rather than read as
+// "no limit": a convergence with no ceiling holds the advisory lock forever on a
+// statement that will never finish, and every pod that boots behind it fails its
+// own lock wait.
+//
+// Raise it only for a convergence somebody is watching. The budget is what
+// bounds how long this call can keep booting pods out of service, so the
+// deliberate path trades that availability for the ability to finish work a boot
+// could not — an index build over a storage table with a long history, say.
+// Wire it from DefaultStorageApplyTimeout unless an operator named a value.
+func WithConvergenceTimeout(d time.Duration) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.convergenceTimeout = d }
 }
 
 // EnsureSchema converges SchemaBot's own storage schema at startup, routing to
@@ -107,6 +145,9 @@ func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
 	o := newEnsureSchemaOptions(opts...)
+	if o.convergenceTimeout <= 0 {
+		return fmt.Errorf("converge storage schema: convergence timeout must be positive, got %s", o.convergenceTimeout)
+	}
 	switch o.dialect {
 	case schema.DialectMySQL:
 		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
@@ -129,18 +170,22 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 // under the lock to confirm changes are still needed (another pod may have
 // applied them while we waited for the lock).
 //
-// Destructive statements in the diff (DROP TABLE, or an ALTER TABLE containing
-// DROP COLUMN) are refused unless WithAllowDestructiveSchemaChanges(true) is
-// set. A mixed ALTER TABLE is split so its safe clauses (an ADD COLUMN the
-// starting binary needs) still execute and only its destructive clauses are
-// refused. The remaining non-destructive statements apply,
-// and startup proceeds — a deliberate exception to fail-closed, because
-// failing here would crash-loop every pod running an older binary during a
-// rolling deploy or rollback where a storage table or column was legitimately
-// removed. The invariant is that an old binary can never destroy newer schema
-// state: the surplus table or column stays in place until an operator opts in.
+// Destructive statements in the diff — those the plan's linters report an error
+// against, which for the storage schema means losing data (DROP TABLE, or an
+// ALTER TABLE containing DROP COLUMN) or removing an index — are refused unless
+// WithAllowDestructiveSchemaChanges(true) is set. A statement carrying an
+// addition beside a drop runs the addition, so a pod never starts missing a
+// column its own binary needs. The statements and clauses that were not refused
+// apply, and startup proceeds — a deliberate exception to fail-closed, because failing
+// here would crash-loop every pod running an older binary during a rolling
+// deploy or rollback where storage state was legitimately removed. The
+// invariant is that an old binary can never destroy newer schema state: the
+// surplus table, column, or index stays in place until an operator opts in.
 func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
+	// Built from Background rather than from a caller's context: a convergence
+	// that has started must run to a state the next diff can describe, so a
+	// caller hanging up stops it waiting for the answer, never the DDL.
+	ctx, cancel := context.WithTimeout(context.Background(), o.convergenceTimeout)
 	defer cancel()
 
 	// Diagnostic preamble: log the actual database target and current state
@@ -222,7 +267,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	// Changes or stale Spirit tables detected — acquire advisory lock to
 	// serialize cleanup and Spirit execution across pods.
-	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, locker)
+	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, locker, o.convergenceTimeout)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
@@ -255,14 +300,11 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	changes := planResult.Changes
 	if !o.allowDestructive {
-		allowed, refused, err := partitionDestructiveChanges(changes)
-		if err != nil {
-			return fmt.Errorf("classify storage schema changes: %w", err)
-		}
+		allowed, refused := partitionDestructiveChanges(changes)
 		for _, r := range refused {
-			scope, message, attrs := r.refusalTelemetry()
+			message, attrs := r.refusalTelemetry()
 			logger.Warn(message, attrs...)
-			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation), scope)
+			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation))
 		}
 		if len(allowed) == 0 {
 			logger.Warn("all planned storage schema changes are destructive and refused; storage schema left unchanged",
@@ -310,7 +352,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 			// ("...context canceled"); name the timeout instead so the cause
 			// is clear from the message line alone.
 			if ctx.Err() != nil {
-				return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+				return ensureSchemaTimeoutError(ctx, o.convergenceTimeout, len(tableChanges), logger)
 			}
 			return fmt.Errorf("check progress: %w", err)
 		}
@@ -334,7 +376,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 		select {
 		case <-ctx.Done():
-			return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+			return ensureSchemaTimeoutError(ctx, o.convergenceTimeout, len(tableChanges), logger)
 		case <-ticker.C:
 		}
 	}
@@ -346,41 +388,49 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	return nil
 }
 
-// ensureSchemaTimeoutError builds and logs the error returned when
-// EnsureSchemaTimeout fires before the storage schema change completes. Spirit
+// ensureSchemaTimeoutError builds and logs the error returned when the
+// convergence budget fires before the storage schema change completes. Spirit
 // cancels the online DDL mid-apply and storage stays uninitialized, so the
-// message names the timeout and the most likely cause (a backend throttling the
+// message names the budget and the most likely cause (a backend throttling the
 // online DDL) instead of surfacing a bare "context canceled" from the driver.
-func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
-	logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+//
+// budget is the one this convergence actually ran under, not the boot
+// constant: a convergence an operator asked for runs under a longer one, and a
+// failure reporting a budget it did not have sends them looking for a timeout
+// that never fired.
+func ensureSchemaTimeoutError(ctx context.Context, budget time.Duration, ddlCount int, logger *slog.Logger) error {
+	logger.Error("storage schema change did not complete within the convergence budget; SchemaBot storage will not initialize",
 		"database", storageSchemaNamespace,
-		"timeout", EnsureSchemaTimeout,
+		"timeout", budget,
 		"ddl_count", ddlCount,
 	)
 	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
-		EnsureSchemaTimeout, ddlCount, ctx.Err())
+		budget, ddlCount, ctx.Err())
 }
 
-// refusedStorageChange is a planned storage-schema statement EnsureSchema
-// refused to execute, with the reason it was classified as unsafe.
+// refusedStorageChange is storage-schema DDL EnsureSchema refused to execute,
+// with the reason the plan classified its statement as unsafe.
 type refusedStorageChange struct {
-	change engine.TableChange
-	reason string
-	// splitFrom is the combined ALTER TABLE statement the refused clauses
-	// were split out of; empty when the whole statement was refused.
-	splitFrom string
-	// splitErr is the error that prevented partitioning an unsafe ALTER into
-	// safe and destructive clauses; when set, the statement was refused whole
-	// so no clause of it executed.
+	// change carries the DDL that did not run. That is the whole planned
+	// statement, or only its withheld clauses when the clauses that add were
+	// split out and executed.
+	change  engine.TableChange
+	reason  string
+	partial bool
+	// splitErr records why a gated ALTER could not be reduced to the clauses
+	// that only add, which is why the whole statement was refused rather than
+	// part of it. It is nil for every other refusal.
 	splitErr error
 }
 
 // refusalTelemetry returns the operator-facing telemetry for one refusal: the
-// metrics scope saying whether any of the statement still ran, the warning to
-// log, and its structured attributes. A split refusal carries the combined
-// ALTER its destructive clauses were split out of; a whole refusal of an
-// unsplittable ALTER carries the error that prevented the split.
-func (r refusedStorageChange) refusalTelemetry() (scope, message string, attrs []any) {
+// warning to log, and its structured attributes. The DDL is what did not run,
+// so it narrows to the withheld clauses on a statement that was split.
+func (r refusedStorageChange) refusalTelemetry() (message string, attrs []any) {
+	message = "refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it"
+	if r.partial {
+		message = "withholding the destructive clauses of a storage-schema change; the statement's additions ran and its removals did not — set storage.allow_destructive_schema_changes: true to run them"
+	}
 	attrs = []any{
 		"database", storageSchemaNamespace,
 		"table", r.change.Table,
@@ -388,97 +438,97 @@ func (r refusedStorageChange) refusalTelemetry() (scope, message string, attrs [
 		"reason", r.reason,
 		"ddl", r.change.DDL,
 	}
-	switch {
-	case r.splitErr != nil:
-		return metrics.StorageSchemaRefusalWhole,
-			"refusing an unsafe storage-schema ALTER whole because its clauses could not be partitioned; no clause of it will run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-			append(attrs, "split_error", r.splitErr)
-	case r.splitFrom != "":
-		return metrics.StorageSchemaRefusalSplit,
-			"refusing destructive clauses of a mixed storage-schema ALTER; the destructive clauses will not run, the safe clauses still execute, and startup continues — set storage.allow_destructive_schema_changes: true to allow them",
-			append(attrs, "split_from_ddl", r.splitFrom)
-	default:
-		return metrics.StorageSchemaRefusalWhole,
-			"refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-			attrs
+	if r.splitErr != nil {
+		attrs = append(attrs, "split_error", r.splitErr)
 	}
+	return message, attrs
 }
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
-// statements safe to execute and the unsafe statements to refuse, using
-// Spirit's unsafe vocabulary (ddl.UnsafeStatement). The vocabulary is
-// Spirit's, not a local list: every statement its UnsafeLinter flags as
-// destroying data — dropping a table, column, partition, or primary key,
-// truncating or coalescing partitions, discarding a tablespace — is refused,
-// while structural statements that lose nothing (DROP INDEX, renames) are
-// allowed. A statement Spirit's parser cannot classify fails startup rather
-// than executing unclassified: a classification failure can land on a
-// statement the starting binary needs — an additive ALTER in a syntax a
-// bumped parser trips on — and skipping it would trade a loud startup
-// failure for a missing column at query time. The Spirit diff emits an
-// unsafe statement when the live storage database holds a table or column the
-// starting binary's embedded schema does not declare — during a rolling
-// deploy or rollback that surplus state usually belongs to a newer binary,
-// not to a removal the operator intended. Spirit's diff emits one combined
-// ALTER per table, so an unsafe ALTER that also carries additive clauses is
-// split (ddl.SplitUnsafeAlter): the safe clauses the starting binary needs
-// still execute, and only the destructive clauses are refused. Clauses that
-// cannot run without a refused clause (the ADD PRIMARY KEY half of a
-// primary-key change) are refused with it, so the executed remainder is
-// always independently runnable. A split that cannot be performed falls back
-// to refusing the statement whole rather than failing startup — the opposite
-// disposition from a classification failure, because a split failure only
-// ever happens on a statement already classified unsafe: the starting binary
-// demonstrably does not need it, so refusing it whole is the established
-// answer, and it executes strictly less than any split would, so the failed
-// split cannot widen what the bootstrap executes. Startup survives it, where
-// failing would crash-loop every pod whose pending ALTER the splitter cannot
-// partition.
-func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
+// statements safe to execute and the unsafe statements to refuse, on the
+// verdict the plan already carries.
+//
+// That verdict is the engine's, not this package's. Planning runs Spirit's
+// linter registry over the diff alongside the live schema it was diffed
+// against, and marks a change unsafe when any linter reports an error against
+// it. Re-deriving a verdict here from the statement text would answer a
+// narrower question than the plan already answered, and would answer it without
+// the live schema — so a statement the plan knows is unsafe would execute
+// because this package's vocabulary did not recognize it. Whatever the registry
+// errors on is what the bootstrap refuses, which is how the operator-facing
+// plan surface and the boot that follows it stay in agreement.
+//
+// The bootstrap's exposure is availability, not data loss alone. An index the
+// fleet's live queries plan around is as load-bearing as a column: dropping it
+// destroys no rows and completes in milliseconds because it is metadata-only,
+// and it can still take the storage database down. The registry's error set
+// spans both, so the same gate covers both.
+//
+// The verdict is per statement and Spirit's diff emits one combined ALTER per
+// table, so a gated statement is reduced to the clauses that only add a schema
+// object: those execute and the rest is withheld. The bootstrap exists to give
+// the starting binary the tables, columns, and indexes it needs to run at all,
+// and withholding an addition because it was bundled with a removal leaves a
+// pod serving traffic against storage missing a column its own queries name.
+// Nothing is gained by the bundling: the addition is the same statement's other
+// half, not a consequence of the removal.
+//
+// The reduction is structural, not a second safety verdict. Which clauses add
+// is a closed question about clause shapes (see ddl.SplitAdditiveAlter);
+// whether the statement is gated at all stays the registry's answer. A gated
+// statement that cannot be reduced — a DROP TABLE has no clauses, and an ALTER
+// whose every clause is withheld has nothing left — is refused whole, as is one
+// the parser cannot partition, which is the fail-closed direction.
+//
+// The diff emits an unsafe statement when the live storage database holds a
+// table, column, or index the starting binary's embedded schema does not
+// declare. During a rolling deploy or rollback that surplus state
+// usually belongs to a newer binary, not to a removal the operator intended.
+func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange) {
 	for _, sc := range changes {
 		kept := sc
 		kept.TableChanges = nil
 		for _, tc := range sc.TableChanges {
-			unsafe, reason, err := ddl.UnsafeStatement(tc.DDL)
-			if err != nil {
-				return nil, nil, fmt.Errorf("classify storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
-			}
-			if !unsafe {
+			if !tc.IsUnsafe {
 				kept.TableChanges = append(kept.TableChanges, tc)
 				continue
 			}
-			if tc.Operation == ddl.StatementAlterTable {
-				safeDDL, unsafeDDL, splitErr := ddl.SplitUnsafeAlter(tc.DDL)
-				if splitErr != nil {
-					// Refusing the statement whole executes strictly less
-					// than any split would, so the failed split cannot widen
-					// what the bootstrap executes — and startup proceeds,
-					// which is the reason this path exists. The caller logs
-					// the fallback with the split error.
-					refused = append(refused, refusedStorageChange{change: tc, reason: reason, splitErr: splitErr})
-					continue
-				}
-				if safeDDL != "" {
-					// A mixed ALTER: execute the clauses that lose nothing and
-					// refuse only the destructive remainder. The caller logs the
-					// refusal with the destructive clauses' exact DDL.
-					keptChange := tc
-					keptChange.DDL = safeDDL
-					kept.TableChanges = append(kept.TableChanges, keptChange)
-					refusedChange := tc
-					refusedChange.DDL = unsafeDDL
-					refused = append(refused, refusedStorageChange{change: refusedChange, reason: reason, splitFrom: tc.DDL})
-					continue
-				}
+			// The caller logs every refusal below with its DDL and reason.
+			additive, withheld, err := ddl.SplitAdditiveAlter(tc.DDL)
+			switch {
+			case errors.Is(err, ddl.ErrNotAlterTable):
+				// A statement with no clauses — a DROP TABLE — is all or nothing.
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
+				continue
+			case err != nil:
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason, splitErr: err})
+				continue
+			case additive == "":
+				// Every clause was withheld, so the statement is refused whole
+				// rather than reported as a split that ran nothing.
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
+				continue
 			}
-			// The caller logs each refusal with the exact DDL and reason.
-			refused = append(refused, refusedStorageChange{change: tc, reason: reason})
+
+			addition := tc
+			addition.DDL = additive
+			addition.IsUnsafe = false
+			addition.UnsafeReason = ""
+			kept.TableChanges = append(kept.TableChanges, addition)
+
+			withheldChange := tc
+			withheldChange.DDL = withheld
+			refused = append(refused, refusedStorageChange{
+				change:  withheldChange,
+				reason:  tc.UnsafeReason,
+				partial: true,
+			})
 		}
 		if len(kept.TableChanges) > 0 {
 			allowed = append(allowed, kept)
 		}
 	}
-	return allowed, refused, nil
+	return allowed, refused
 }
 
 // flatTableChanges returns all table changes across the given schema changes.
@@ -626,7 +676,7 @@ const ensureSchemaLockName = "schemabot_ensure_schema"
 // dialect's bootstrapper needs its own lock helper alongside its
 // namedlock.Locker. Returns the connection holding the lock — the lock is
 // released when the connection is closed.
-func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
+func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker, wait time.Duration) (*sql.Conn, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -639,9 +689,13 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 		return nil, fmt.Errorf("get connection: %w", err)
 	}
 
-	// Wait up to the full timeout for the lock — a trailing pod must outwait the
-	// leader's schema change, after which it re-plans and finds no changes.
-	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
+	// Wait up to this convergence's whole budget for the lock — a trailing pod
+	// must outwait the leader's schema change, after which it re-plans and finds
+	// no changes. A pod waits out a boot; it does not wait out an operator's
+	// longer convergence, whose budget is its own and larger. That pod gives up
+	// at its own ceiling and reports the contention by name, which is the
+	// intended trade: converge ahead of a roll, not during one.
+	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, wait)
 	if err != nil {
 		utils.CloseAndLog(conn)
 		// The overall EnsureSchema deadline expires before the server-side

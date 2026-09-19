@@ -314,22 +314,28 @@ clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handle
 ### AV-9: SchemaBot never destroys its own storage to start
 
 Every convergence of SchemaBot's own storage — at startup, or on an operator's command — is additive
-unless destroying storage state was explicitly permitted, and decides before it writes. Nothing
-about which surface asked changes that: an operator's command runs the bootstrap rather than a
-second implementation of it, converges the schema of the binary running it, and cannot narrow the
-permission a deployment already granted. On MySQL a destructive statement (a `DROP TABLE`, or an
-`ALTER TABLE` carrying a `DROP COLUMN`) is refused unless destructive storage changes are explicitly
-allowed, and a statement whose destructive clauses cannot be partitioned out is refused *whole*.
-Refusing the whole statement runs strictly less than any split of it, so the fallback can never
-widen what the bootstrap executes, and startup continues on the safe remainder. On PostgreSQL the
+unless destroying storage state was explicitly permitted, and decides before it writes. Additivity
+is the whole rule: a statement that loses data and one that removes a schema object without losing
+any are both refusals, because the exposure is the fleet reading that storage, not the rows alone.
+Nothing about which surface asked changes that: an operator's command runs the
+bootstrap rather than a second implementation of it, converges the schema of the binary running it,
+and cannot narrow the permission a deployment already granted. On MySQL such a statement is refused
+unless destructive storage changes are explicitly allowed, and the verdict is the one the plan
+already carries, read rather than re-derived, so the boot refuses exactly what the operator-facing
+plan flagged. The verdict is per statement and the differ emits one combined statement per table, so
+a flagged statement is reduced to the clauses that only add a schema object: those run and the rest
+does not. A clause that cannot run until a withheld clause has run waits with it, and a statement
+left with nothing to add is refused entire. Startup continues either way. On PostgreSQL the
 convergence is additive-only and gates on the entire drift set before touching anything, so a change
 needing manual remediation aborts the pass rather than leaving storage half-converged. *Breaks if
 violated:* the first instance of a rolling deploy drops state the rest of the fleet is still
-reading. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
-`pkg/api/ensure_schema_postgres.go`), which the operator-facing storage schema surface calls rather
-than reimplements (`pkg/api/storage_schema.go`); the instance's own storage is the only target a
-remote caller can address, and the deployment's permission is only ever widened, in the adapter that
-answers for it (`pkg/serve/storage_schema.go`).
+reading: a table, a column, or an index the fleet's live queries plan around. *Enforced:* the
+per-dialect bootstrappers (`pkg/api/ensure_schema.go`, `pkg/api/ensure_schema_postgres.go`), over
+the unsafe verdict the engine's plan reports (`pkg/engine/spirit/spirit.go`) and the clause
+partition that reduces a flagged statement to its additions (`pkg/ddl/additive.go`), which the
+operator-facing storage schema surface reads rather than reimplements (`pkg/api/storage_schema.go`);
+the instance's own storage is the only target a remote caller can address, and the deployment's
+permission is only ever widened, in the adapter that answers for it (`pkg/serve/storage_schema.go`).
 
 ### AV-10: Anything the PR can do, the CLI can do
 
@@ -362,6 +368,46 @@ registered comment commands and requires each one to have a CLI command of the s
 justified exemption naming the CLI capability that covers it. That test mechanizes the spelling
 half only: a CLI command whose behavior drifted from its comment counterpart still passes, so the
 capability half above remains a convention.
+
+### AV-11: A storage convergence is bounded by what its caller can afford to wait
+
+Every convergence of SchemaBot's own storage runs under a positive, finite budget covering the
+whole pass — the bootstrap lock wait, the diff taken under it, and the DDL — and the budget
+follows the path that asked rather than being one figure for both. A convergence an instance runs
+to start is bounded by what a start can wait: it is not yet serving, and while it holds the
+bootstrap lock no other instance can start either, so that budget is short and a caller naming
+none inherits it. A convergence an operator asked for is bounded by what that operator can wait,
+which is longer, because nothing is blocked on it but the person who ran it. Neither is unbounded,
+and a budget named outside the permitted range is refused rather than clamped, so no surface
+reports a budget it did not get. *Breaks if violated:* a convergence that cannot finish holds the
+bootstrap lock for as long as it runs, and every instance booting behind it fails its own lock
+wait — converging storage takes down the fleet's ability to start. *Enforced:* the shared entry
+point, which refuses a non-positive budget before dispatching to a dialect and carries it into
+both bootstrappers' contexts and both lock waits (`pkg/api/ensure_schema.go`,
+`pkg/api/ensure_schema_postgres.go`); the operator path's own default, seeded in front of a
+caller's options (`pkg/api/storage_schema.go`); and the bounds both ends of the wire resolve
+against (`apitypes.ResolveStorageApplyTimeout`), applied at the CLI before a request is sent and
+again in the adapter that answers it (`pkg/serve/storage_schema.go`).
+
+### AV-12: A storage convergence records nothing in the storage it converges
+
+Converging SchemaBot's own storage changes that storage's shape and nothing else in it. The
+convergence writes no row about itself — no audit entry, no apply record, no progress marker —
+whichever surface asked for it. The target is the one database that cannot be assumed to be there:
+on a first boot it holds no schema at all, so a table to record into does not exist yet, and
+during a convergence its tables are the ones being rewritten, so a write about the convergence
+lands in something mid-change. A path that records its own progress is therefore a path that
+converges a fresh database only until the recording fails, and one whose failure to write becomes
+a failure to converge. *Breaks if violated:* the bootstrap stops being runnable against an empty
+database, which is every instance's first start. *Enforced:* by construction, in that the
+convergence entry points take a connection string rather than a store and nothing on the path
+reaches one (`pkg/api/ensure_schema.go`, `pkg/api/ensure_schema_postgres.go`,
+`pkg/api/storage_schema.go`, `pkg/serve/storage_schema.go`); and behaviorally by
+`TestEnsureSchema_RecordsNothingInTheStorageItConverges` and
+`TestEnsureSchemaPostgres_RecordsNothingInTheStorageItConverges`, which converge a seeded database
+and require the row count of every table in the live catalog to come through unchanged — read
+from the catalog rather than a list, so a table added to the embedded schema is covered without
+anyone extending the test.
 
 ## Merge gate (MG)
 
@@ -1254,9 +1300,14 @@ Whether the engine will refuse a statement, or route it to direct execution (a M
 execution mode), is recorded on the plan using the engine's own checks rather than a
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
 direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
-estimate is trusted only in the blocking direction: an estimate alone never approves. *Enforced:*
-plan-time execution verdicts and apply-time verdict gates (`pkg/engine`); the direct-execution
-size bound ([direct-execution.md](direct-execution.md)).
+estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
+belongs to the target that will run the statement: a deployment that applies a plan it did not
+plan itself re-plans against its own live schema and judges the apply on that verdict, not the
+planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`); the whole-plan
+blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
+path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
+the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`); the
+direct-execution size bound ([direct-execution.md](direct-execution.md)).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 

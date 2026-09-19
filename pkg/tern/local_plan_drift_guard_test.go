@@ -428,7 +428,7 @@ func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
 	}
 
 	pg := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypePostgres}}
-	ms, err := pg.driftMultisetFromPlanResult(planResult(), false, "")
+	ms, _, err := pg.driftMultisetFromPlanResult(planResult(), false, "")
 	require.NoError(t, err)
 	require.Len(t, ms, 1)
 	for key := range ms {
@@ -438,7 +438,7 @@ func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
 	}
 
 	my := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypeMySQL}}
-	_, err = my.driftMultisetFromPlanResult(planResult(), false, "")
+	_, _, err = my.driftMultisetFromPlanResult(planResult(), false, "")
 	require.Error(t, err, "PostgreSQL-only DDL must not parse under a MySQL-typed client")
 	assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
 }

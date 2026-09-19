@@ -1,6 +1,11 @@
 package postgres
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"strconv"
 	"testing"
 
@@ -9,6 +14,7 @@ import (
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -521,9 +527,8 @@ func TestConcurrentIndexStatement(t *testing.T) {
 
 // TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds proves the size
 // verdict lands only on the steps it is about: a step an earlier gate already
-// blocked keeps that gate's reason, so an operator missing a grant is not told
-// to shrink the table instead, and a concurrent index build stays executable
-// under its own bound while the native step beside it is blocked.
+// blocked keeps that gate's reason before the appended size cause, and a
+// concurrent index build stays executable under its own bound.
 func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) {
 	changes := []engine.TableChange{
 		{
@@ -538,11 +543,15 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) 
 
 	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Equal(t, "privilege verdict", changes[0].ModeReason)
+	assert.Equal(t, "privilege verdict; size verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 	assert.Empty(t, changes[2].ExecutionMode)
 	assert.Empty(t, changes[2].ModeReason)
+
+	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
+	assert.Equal(t, "privilege verdict; size verdict", changes[0].ModeReason)
+	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
 
 // TestBlockRewriteStepsFailsClosedOnUnparseableStep proves an executable step
@@ -595,20 +604,150 @@ func TestBlockChangesAtTier(t *testing.T) {
 		"an existing verdict must never be overwritten")
 }
 
-// A fully blocked plan does not need a table-size answer. The nil pool proves
-// the guard returns before catalog access while preserving the prior verdict.
-func TestBlockOversizedTableSkipsFullyBlockedPlans(t *testing.T) {
+func TestBlockOversizedTableAppendsSizeCauseToPrivilegeBlocks(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"},
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN phone text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"},
+	}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	want := `missing ALTER privilege; statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`
+	assert.Equal(t, want, changes[0].ModeReason)
+	assert.Equal(t, want, changes[1].ModeReason)
+}
+
+func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"},
+		{Table: "users", DDL: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing CREATE privilege"},
+	}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Contains(t, changes[0].ModeReason, "; statement for table")
+	assert.Equal(t, "missing CREATE privilege", changes[1].ModeReason)
+}
+
+func TestBlockOversizedTableKeepsBlockedReasonsWhenLookupFails(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, errors.New("permission denied")
+	}
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(originalLogger) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, "missing ALTER privilege", changes[0].ModeReason)
+	assert.Contains(t, logs.String(), "level=WARN")
+	assert.Contains(t, logs.String(), "existing blocked plan verdicts remain unchanged")
+}
+
+// A table the plan leaves untouched has no step a size verdict could land on,
+// so the gate must not spend a catalog round trip on it.
+func TestBlockOversizedTableSkipsUntouchedTable(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		t.Fatal("size lookup must not run for a table with no planned steps")
+		return preflight.PreflightedTable{}, nil
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, nil, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Empty(t, changes)
+}
+
+// When every step is already blocked, a refusal about the table itself rather
+// than its size has nothing executable left to block; the existing verdicts
+// stand and the refusal is logged so the catalog answer is not lost.
+func TestBlockOversizedTableLogsNonSizeRefusalOnFullyBlockedPlan(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, fmt.Errorf("%w: public.users has relkind %q", preflight.ErrNotTable, "v")
+	}
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(originalLogger) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "missing ALTER privilege"}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, "missing ALTER privilege", changes[0].ModeReason)
+	assert.Contains(t, logs.String(), "level=WARN")
+	assert.Contains(t, logs.String(), "size check refused the table")
+	assert.Contains(t, logs.String(), "database=orders_db")
+	assert.Contains(t, logs.String(), "refusal=not-a-table")
+}
+
+func TestBlockOversizedTableKeepsFullyBlockedPlanWhenStepCannotBeClassified(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "users"
+	want := []engine.TableChange{{
+		Table:         "users",
+		DDL:           "ALTER TABLE public.users ADD COLUMN email text; ALTER TABLE public.users ADD COLUMN phone text",
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    "earlier gate verdict",
+	}}
+	changes := append([]engine.TableChange(nil), want...)
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes)
+}
+
+func TestBlockOversizedTableFailsWhenExecutableStepCannotBeClassified(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
 	report := pgplan.NewReport(pgplan.SourceDiff)
 	report.Table = "users"
 	changes := []engine.TableChange{{
-		Table:         "users",
-		DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
-		ExecutionMode: engine.ExecutionModeBlocked,
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text; ALTER TABLE public.users ADD COLUMN phone text",
 	}}
 
-	changes, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
+	_, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
+}
+
+func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"}}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Equal(t, `statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`, changes[0].ModeReason)
 }
 
 // An executable step without a named target fails the plan closed because a
@@ -620,9 +759,28 @@ func TestBlockOversizedTableRequiresTargetTable(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
+	_, err := blockOversizedTable(t.Context(), nil, "orders_db", report, changes, 1)
 	require.Error(t, err)
 	assert.EqualError(t, err, "plan report carries executable steps but names no target table")
+}
+
+func TestBlockOversizedTableKeepsFullyBlockedPlanWithoutTargetTable(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		t.Fatal("size lookup must not run without a target table")
+		return preflight.PreflightedTable{}, nil
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	want := []engine.TableChange{{
+		Table:         "users",
+		DDL:           "ALTER TABLE public.users ADD COLUMN email text",
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    "earlier gate verdict",
+	}}
+	changes := append([]engine.TableChange(nil), want...)
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes)
 }
 
 // An operational size-check failure fails the plan closed instead of leaving
@@ -635,7 +793,7 @@ func TestBlockOversizedTableFailsClosedOnCheckError(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	_, err := blockOversizedTable(t.Context(), nil, report, changes, -1)
+	_, err := blockOversizedTable(t.Context(), nil, "orders_db", report, changes, -1)
 	require.Error(t, err)
 	assert.EqualError(t, err, `check size for table "users": size limit must be positive, got -1`)
 }

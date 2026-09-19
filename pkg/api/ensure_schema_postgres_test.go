@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
@@ -256,19 +257,30 @@ func TestPostgresExpectationsFor_EmbeddedFiles(t *testing.T) {
 	}
 }
 
-// The bootstrap DDL budget is derived from EnsureSchemaTimeout, and that
-// derivation is what makes it safe: it can only end a statement the overall
-// deadline was going to end anyway. If it ever crept above the overall
+// The bootstrap DDL budget is derived from the convergence's own ceiling, and
+// that derivation is what makes it safe: it can only end a statement the
+// overall deadline was going to end anyway. If it ever crept above the overall
 // deadline it would stop bounding anything; if it were set independently it
-// could start failing statements that converge today.
-func TestPostgresBootstrapDDLBudgetStaysUnderEnsureSchemaTimeout(t *testing.T) {
+// could start failing statements that converge today. Both ceilings are
+// checked, because the two paths no longer share one.
+func TestPostgresBootstrapDDLBudgetStaysUnderItsCeiling(t *testing.T) {
 	t.Parallel()
 
-	assert.Positive(t, postgresBootstrapDDLStatementTimeout)
-	assert.Less(t, postgresBootstrapDDLStatementTimeout, EnsureSchemaTimeout,
-		"the DDL budget must expire before the overall bootstrap deadline so the failure names a budget")
-	assert.Greater(t, postgresBootstrapDDLStatementTimeout, DefaultPostgresStatementTimeout,
-		"bootstrap DDL must get a longer budget than an ordinary storage query")
+	for name, ceiling := range map[string]time.Duration{
+		"boot":     EnsureSchemaTimeout,
+		"operator": apitypes.DefaultStorageApplyTimeout,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			budget := postgresBootstrapDDLBudget(ceiling)
+			assert.Positive(t, budget)
+			assert.Less(t, budget, ceiling,
+				"the DDL budget must expire before the overall deadline so the failure names a budget")
+			assert.Greater(t, budget, DefaultPostgresStatementTimeout,
+				"bootstrap DDL must get a longer budget than an ordinary storage query")
+		})
+	}
 }
 
 // A budget of 0 disables statement_timeout rather than making it strict, so
@@ -279,23 +291,23 @@ func TestPostgresBootstrapDDLBudgetStaysUnderEnsureSchemaTimeout(t *testing.T) {
 func TestPostgresBootstrapDDLBudgetNeverDerivesADisabledBudget(t *testing.T) {
 	t.Parallel()
 
-	const margin = 15 * time.Second
-	const floor = 5 * time.Second
+	const margin = postgresBootstrapDDLTimeoutMargin
+	const floor = postgresBootstrapDDLFloor
 
 	for _, tc := range []struct {
 		name    string
 		ceiling time.Duration
 		want    time.Duration
 	}{
-		{name: "a roomy ceiling keeps the margin below it", ceiling: 5 * time.Minute, want: 4*time.Minute + 45*time.Second},
-		{name: "a ceiling just above the margin still subtracts", ceiling: 25 * time.Second, want: 10 * time.Second},
+		{name: "a roomy ceiling keeps the margin below it", ceiling: 5 * time.Minute, want: 5*time.Minute - margin},
+		{name: "a ceiling just above the margin still subtracts", ceiling: margin + 10*time.Second, want: 10 * time.Second},
 		{name: "a ceiling at the margin would derive a disable", ceiling: margin, want: floor},
-		{name: "a ceiling under the margin would derive a negative", ceiling: 5 * time.Second, want: floor},
+		{name: "a ceiling under the margin would derive a negative", ceiling: floor, want: floor},
 		{name: "a zero ceiling cannot disable the budget", ceiling: 0, want: floor},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := postgresBootstrapDDLBudget(tc.ceiling, margin, floor)
+			got := postgresBootstrapDDLBudget(tc.ceiling)
 			assert.Equal(t, tc.want, got)
 			assert.Positive(t, got, "a derived budget of 0 or less disables statement_timeout")
 		})
