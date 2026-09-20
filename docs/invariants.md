@@ -1158,6 +1158,17 @@ and its rules (`pkg/glyph`), the shared bar and its colors (`pkg/ui`), the share
 introducing a severity glyph as a literal outside its home package
 (`pkg/analyzers/severityglyphs`, `scripts/lint-fix.sh`).
 
+### UX-6: A plan's statement totals agree across surfaces
+
+Every plan summary derives its create, alter, drop, and other DDL totals through one shared
+counter, fed from the statements that surface renders — for a sharded namespace, the distinct
+per-shard statements rather than the namespace-level collapse. The CLI and PR comment may style
+those totals differently, but they report the same table-level operations and unclassified
+statement count. *Enforced:* the shared plan counter and summary renderer
+(`pkg/ui/plan_summary.go`); each surface's statement selection (`RenderedTables` in
+`pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`), and the
+multi-environment CLI deduplication fingerprint (`planFingerprint` in `pkg/cmd/commands/plan.go`).
+
 ## Recovery (RC)
 
 ### RC-1: Nothing is orphaned
@@ -1303,7 +1314,8 @@ direct execution's table-size bound, a table whose size cannot be measured is bl
 estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
-planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`); the whole-plan
+planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
+privilege and size gates in `pkg/engine/postgres/postgres.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`); the

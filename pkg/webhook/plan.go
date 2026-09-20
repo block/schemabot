@@ -929,9 +929,12 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		if len(shard.Statements) == 0 {
 			if len(sp.Changes) > 0 {
 				// The shard reported changes but none produced usable DDL — the
-				// plan is incomplete for this shard. Surface it as an error rather
-				// than dropping the shard, which would silently hide the divergent
-				// state this view exists to show.
+				// plan is incomplete for this shard. Surface it as an error so the
+				// omission is never silent. The shard is left out of the keyspace's
+				// shard list, so when every shard of a keyspace lands here,
+				// keyspaceStatements reads the keyspace as unsharded and the
+				// adjacent summary comes from the namespace-level view; the error
+				// beside it is what tells the operator so.
 				malformedShardErrors = append(malformedShardErrors, fmt.Sprintf(
 					"shard %q in keyspace %q reported %d change(s) with no DDL — plan is incomplete for this shard",
 					sp.Shard, sp.Namespace, len(sp.Changes)))

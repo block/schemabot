@@ -731,12 +731,27 @@ const postgresDDLLockTimeout = 10 * time.Second
 // The subtraction must stay positive. Once the ceiling reaches the margin it
 // yields a budget of 0, which PostgreSQL reads as *disabled* rather than as
 // very short — the budget would silently cease to exist instead of becoming
-// strict, the one failure this whole mechanism exists to prevent. The floor
-// keeps a shrunken ceiling deriving a short budget instead. It is reachable,
-// because the ceiling is a caller's value: a convergence asked to run in ten
-// seconds gets the floor, not a disabled budget.
+// strict, the one failure this whole mechanism exists to prevent. A ceiling
+// too short to hold the margin therefore derives a short budget instead: the
+// floor, or half the ceiling when the ceiling is shorter than twice the floor.
+// The halving is what keeps the budget strictly under the ceiling at every
+// length a caller can name, so that the first statement's failure names a
+// budget rather than arriving as a bare cancellation — a fixed floor sits at
+// or above the shortest ceilings and would bound nothing under them. Both
+// cases are reachable, because the ceiling is a caller's value: a convergence
+// asked to run in ten seconds gets the floor, and one asked to run in four
+// gets two.
+//
+// The ceiling is one EnsureSchema admitted, so it is at least
+// MinConvergenceTimeout. That lower bound is what lets the halving be the
+// whole story: statement_timeout is set in whole milliseconds, and half of any
+// admissible ceiling is hundreds of them — strictly under the ceiling, and
+// nowhere near the 0 that disables the budget.
 func postgresBootstrapDDLBudget(ceiling time.Duration) time.Duration {
-	return max(ceiling-postgresBootstrapDDLTimeoutMargin, postgresBootstrapDDLFloor)
+	if budget := ceiling - postgresBootstrapDDLTimeoutMargin; budget >= postgresBootstrapDDLFloor {
+		return budget
+	}
+	return min(postgresBootstrapDDLFloor, ceiling/2)
 }
 
 const (
@@ -751,7 +766,8 @@ const (
 // transaction — each is metadata-only after the manual-remediation gate — and
 // each index builds in its own transaction. Plain CREATE INDEX holds a SHARE
 // lock for the full build and blocks writes; lock_timeout bounds only the wait
-// to acquire that lock, while EnsureSchemaTimeout bounds the build itself.
+// to acquire that lock, while ddlBudget — derived from the convergence's own
+// ceiling — bounds the build itself.
 // CREATE INDEX CONCURRENTLY cannot run inside these transactions, so the write
 // block is the accepted cost. Cross-transaction atomicity is unnecessary: a
 // startup killed between transactions leaves additive drift the next run
@@ -930,11 +946,12 @@ func verifyStorageSessionAffinity(ctx context.Context, db *sql.DB, locker namedl
 //
 // The connection also runs with statement_timeout explicitly disabled.
 // Acquiring the lock means blocking inside SELECT pg_advisory_lock() until the
-// leader finishes its bootstrap — up to EnsureSchemaTimeout. A statement
-// budget shorter than that wait, whether SchemaBot's own or one the platform
-// imposed at the role or database level, would cancel a trailing pod's
-// legitimate queue and fail its startup while the leader was still converging
-// normally. Disabling the budget is not an unbounded wait: the wait is bounded
+// leader finishes its bootstrap — up to the convergence's whole budget, which
+// is the wait this call is handed. A statement budget shorter than that wait,
+// whether SchemaBot's own or one the platform imposed at the role or database
+// level, would cancel a trailing pod's legitimate queue and fail its startup
+// while the leader was still converging normally. Disabling the budget is not
+// an unbounded wait: the wait is bounded
 // server-side by the lock_timeout namedlock scopes to the acquisition, and
 // client-side by ctx.
 func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker, wait time.Duration) (*sql.Conn, error) {

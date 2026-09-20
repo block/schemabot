@@ -205,7 +205,11 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 	if !s.authorizeStorageSchemaOperation(w, r, storageSchemaApplyOperation) {
 		return
 	}
-	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds)
+	// A request naming no budget runs under the boot's. SchemaBot's own client
+	// always names one, so this is a caller that could not — and the boot
+	// budget is the one such a caller can wait out, where the operator default
+	// would hold the bootstrap lock for an hour after it had given up.
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds, EnsureSchemaTimeout)
 	if err != nil {
 		s.logger.Warn("rejecting storage schema convergence because its timeout is out of range",
 			"deployment", req.Deployment, "environment", req.Environment,
