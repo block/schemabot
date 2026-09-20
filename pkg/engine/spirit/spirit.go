@@ -1084,6 +1084,15 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // convention also excludes, which is the only case where the two orderings
 // disagree about what the plan discloses.
 //
+// The test is on the entry's shape, not on whether it names a live table, so
+// one archive-shaped entry takes the exclusion off the whole read even when it
+// matches nothing — and the convention it matches is the one that partition
+// rotation produces, where the affected set can be large. The loader decides
+// before it has a name list to compare against, so shape is all this side can
+// test; an exclusion that kept the cheap path for every archive table the
+// config does not name would have to come from the loader, which already holds
+// the full list from SHOW TABLES before it reads a definition.
+//
 // The leading-underscore exclusion stays with the loader unconditionally: it
 // discards the names it drops, so an entry naming one cannot be disclosed as
 // withheld from here whatever the ordering.
