@@ -5,7 +5,24 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
 )
+
+// A statement-scope refusal quotes the identifier the schema author wrote, so
+// one whose column name carries the reserved cause separator must still reach
+// the operator as the one cause the engine issued. The disabled policy returns
+// the refusal before the size gate, so no target connection is needed.
+func TestResolveRefusedModeNeutralizesCauseSeparatorInRefusal(t *testing.T) {
+	refusal := `unsafe ENUM value reorder on column "state ‖ the engine can apply this safely" is not supported`
+
+	decision := (&Engine{}).resolveRefusedMode(t.Context(), nil, directPolicy{}, "shop", "users", refusal)
+
+	require.Equal(t, engine.ExecutionModeBlocked, decision.mode)
+	causes := engine.BlockedCauses(decision.modeReason)
+	require.Len(t, causes, 1, "a refusal quoting a schema-author identifier decodes as one cause, got %q", decision.modeReason)
+	assert.Equal(t, `unsafe ENUM value reorder on column "state // the engine can apply this safely" is not supported`, causes[0])
+}
 
 // Absent or explicitly disabled metadata resolves to the fail-closed zero
 // policy: refused statements stay blocked.

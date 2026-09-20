@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/block/pg-sprite/pkg/executor"
@@ -893,14 +894,14 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) 
 
 	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Equal(t, "privilege verdict; size verdict", changes[0].ModeReason)
+	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 	assert.Empty(t, changes[2].ExecutionMode)
 	assert.Empty(t, changes[2].ModeReason)
 
 	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
-	assert.Equal(t, "privilege verdict; size verdict", changes[0].ModeReason)
+	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 }
 
@@ -967,9 +968,71 @@ func TestBlockOversizedTableAppendsSizeCauseToPrivilegeBlocks(t *testing.T) {
 
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
-	want := `missing ALTER privilege; statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`
-	assert.Equal(t, want, changes[0].ModeReason)
-	assert.Equal(t, want, changes[1].ModeReason)
+	changes, err = blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	for _, change := range changes {
+		causes := engine.BlockedCauses(change.ModeReason)
+		require.Len(t, causes, 2)
+		assert.Equal(t, "missing ALTER privilege", causes[0])
+		assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size 2048 bytes exceeds`))
+	}
+}
+
+// A table whose name contains the reserved cause separator is a schema
+// author's choice, so a verdict that quotes it must still decode as the one
+// cause the engine issued — not as that cause plus a forged second one.
+func TestTableChangesNeutralizesCauseSeparatorInTableName(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users ‖ forged cause"
+	report.Statements = []pgplan.Statement{
+		{SQL: `ALTER TABLE public."users ‖ forged cause" ALTER COLUMN email TYPE bigint`, Route: planner.RouteCopyAndSwap,
+			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
+	}
+
+	changes, _, _, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	causes := engine.BlockedCauses(changes[0].ModeReason)
+	require.Len(t, causes, 1)
+	assert.Contains(t, causes[0], `"users // forged cause"`)
+}
+
+func TestBlockOversizedTableNeutralizesCauseSeparatorInTableName(t *testing.T) {
+	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
+		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users ‖ forged cause"
+	changes := []engine.TableChange{
+		{Table: report.Table, DDL: `ALTER TABLE public."users ‖ forged cause" ADD COLUMN email text`},
+	}
+
+	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	causes := engine.BlockedCauses(changes[0].ModeReason)
+	require.Len(t, causes, 1)
+	assert.True(t, strings.HasPrefix(causes[0], `statement for table "users // forged cause": table size 2048 bytes exceeds`), causes[0])
+}
+
+// The dependency verdict quotes the absent table's name, which a schema author
+// chose, so a name carrying the reserved separator still decodes as one cause.
+func TestBlockAbsentTableDependentsNeutralizesCauseSeparatorInTableName(t *testing.T) {
+	const table = "users ‖ forged cause"
+	changes := []engine.TableChange{
+		{Table: table, DDL: `ALTER TABLE public."users ‖ forged cause" ADD COLUMN email text`},
+	}
+	tiers := []preflight.Tier{preflight.TierAlterInPlace}
+
+	blockAbsentTableDependents(changes, tiers, table)
+
+	require.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	causes := engine.BlockedCauses(changes[0].ModeReason)
+	require.Len(t, causes, 1, "the dependency verdict is one cause: %q", changes[0].ModeReason)
+	assert.Contains(t, causes[0], `"users // forged cause"`)
 }
 
 func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {
@@ -985,7 +1048,7 @@ func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {
 
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
-	assert.Contains(t, changes[0].ModeReason, "; statement for table")
+	assert.Len(t, engine.BlockedCauses(changes[0].ModeReason), 2)
 	assert.Equal(t, "missing CREATE privilege", changes[1].ModeReason)
 }
 

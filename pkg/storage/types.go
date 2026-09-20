@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -667,6 +668,11 @@ func (p *Plan) BlockedApplyError() error {
 	reason := change.ModeReason
 	if reason == "" {
 		reason = "the engine refuses this statement"
+	}
+	// Independent causes are listed one per line so an operator fixing the
+	// first is not surprised by the second on the next attempt.
+	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
 	}
 	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
 }
