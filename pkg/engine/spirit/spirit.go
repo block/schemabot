@@ -1074,14 +1074,6 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 	return state
 }
 
-// fetchCurrentSchema retrieves table schemas from the database, filtering out
-// internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables)
-// and archive tables that are maintained outside declarative schema files.
-//
-// ignored withholds the tables the repository's ignore_tables config names. The
-// second return value is what it actually withheld, sorted, for the plan to
-// disclose: the diff never sees these tables, so without the disclosure a
-// withheld table would be indistinguishable from an unchanged one.
 // liveSchemaFilterOptions returns the loader options for a live-schema read.
 //
 // The loader drops an excluded table before reading its definition, so an
@@ -1103,6 +1095,14 @@ func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption 
 	return opts
 }
 
+// fetchCurrentSchema retrieves table schemas from the database, filtering out
+// internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables)
+// and archive tables that are maintained outside declarative schema files.
+//
+// ignored withholds the tables the repository's ignore_tables config names. The
+// second return value is what it actually withheld, sorted, for the plan to
+// disclose: the diff never sees these tables, so without the disclosure a
+// withheld table would be indistinguishable from an unchanged one.
 func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) ([]table.TableSchema, []string, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {

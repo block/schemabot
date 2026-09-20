@@ -187,8 +187,16 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTableWhateverTheCase(t *testing.
 // against the target's catalog before that exclusion reaches it, so the plan
 // reports it as withheld by the config — the same answer every other engine
 // gives — rather than as an entry that matched no live table.
+//
+// A second archive table the config does not name shares the target, because
+// the entry takes the archive exclusion off the loader for the whole read: the
+// unnamed one comes back from the loader and must still be excluded by its
+// name, undisclosed, exactly as it was before the entry existed.
 func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
-	const archiveTable = "executions_archive_2024"
+	const (
+		archiveTable        = "executions_archive_2024"
+		unnamedArchiveTable = "audit_log_archive_2019"
+	)
 
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -197,12 +205,14 @@ func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 	require.NoError(t, err, "create executions")
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `"+archiveTable+"` (id INT PRIMARY KEY)")
 	require.NoError(t, err, "create archive table")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `"+unnamedArchiveTable+"` (id INT PRIMARY KEY)")
+	require.NoError(t, err, "create the archive table the config does not name")
 
 	files := testSchemaFiles(map[string]string{
 		"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY, name VARCHAR(100))`,
 	})
 
-	// Without the entry the archive table is excluded by its name alone: not
+	// Without the entry both archive tables are excluded by name alone: not
 	// dropped, and not disclosed.
 	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
 		Database:    "testdb",
@@ -210,7 +220,7 @@ func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
 	require.NoError(t, err, "Plan()")
-	assert.Empty(t, droppedTables(result), "the archive table is not proposed for DROP TABLE")
+	assert.Empty(t, droppedTables(result), "the archive tables are not proposed for DROP TABLE")
 	assert.Empty(t, result.ExemptTables, "the archive exclusion is the engine's own and is not disclosed here")
 
 	result, err = New(Config{}).Plan(t.Context(), &engine.PlanRequest{
@@ -220,7 +230,8 @@ func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 		IgnoreTables: []string{archiveTable},
 	})
 	require.NoError(t, err, "Plan()")
-	assert.Empty(t, droppedTables(result), "the withheld table is still not proposed for DROP TABLE")
+	assert.Empty(t, droppedTables(result),
+		"neither the withheld table nor the unnamed archive table is proposed for DROP TABLE")
 	assertWithheld(t, result, "testdb", archiveTable)
 }
 
