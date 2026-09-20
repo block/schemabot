@@ -547,9 +547,11 @@ only the optional capabilities listed as implemented below. This table maps
 the interface contract to the behavior described in [Control
 operations](#control-operations), [Unsupported workflow
 features](#unsupported-workflow-features), and [Failure and
-recovery](#failure-and-recovery). The optional-interface inventory is kept
-complete by the conformance registry in
-[`pkg/engine/enginetest/enginetest_test.go`](../pkg/engine/enginetest/enginetest_test.go).
+recovery](#failure-and-recovery). The optional-interface rows are pinned by
+`TestOptionalCapabilitySet` in
+[`pkg/engine/postgres/postgres_test.go`](../pkg/engine/postgres/postgres_test.go),
+which records one verdict per optional interface and fails when package
+`engine` declares one this table does not classify.
 
 | Interface / method | PostgreSQL behavior | Why | Where |
 |---|---|---|---|
@@ -568,7 +570,7 @@ complete by the conformance registry in
 | `engine.DeferredCutoverSignalChecker.DeferredCutoverSignalExists` | Not applicable; not implemented | Direct DDL has no deferred cutover gate or durable table-swap signal. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
-| `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Not applicable; not implemented | PostgreSQL does not create copy tables owned by this engine; cancellation handles any invalid concurrent index before settling instead of leaving a generic artifact set to release later. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Not applicable; not implemented | PostgreSQL does not create copy tables owned by this engine; cancellation attempts to remove any invalid concurrent index before settling, and a removal that fails is named in the terminal summary for operator follow-up rather than deferred to a generic artifact release. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 
 ## Failure and recovery

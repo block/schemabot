@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strconv"
 	"testing"
 
@@ -20,6 +21,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/enginetest"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -1221,24 +1223,32 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 		"the package helper resolves the engine's declaration")
 }
 
+// TestOptionalCapabilitySet is the engine capability mapping in
+// docs/postgresql.md as code: one verdict per optional interface package
+// engine declares. The inventory scan fails the test when package engine
+// gains an optional interface this table does not classify, so the doc's
+// table and the engine's method set cannot drift apart unnoticed.
 func TestOptionalCapabilitySet(t *testing.T) {
-	eng := any(New())
+	verdicts := map[reflect.Type]bool{
+		reflect.TypeFor[engine.Drainer]():                         true,
+		reflect.TypeFor[engine.ShutdownHalter]():                  true,
+		reflect.TypeFor[engine.SynchronousWorkRegistration]():     true,
+		reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
+		reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,
+		reflect.TypeFor[engine.CancelledArtifactReleaser]():       false,
+		reflect.TypeFor[engine.ControlResumeValidator]():          false,
+	}
 
-	_, implementsDrainer := eng.(engine.Drainer)
-	_, implementsShutdownHalter := eng.(engine.ShutdownHalter)
-	_, implementsDeferredCutoverSignalChecker := eng.(engine.DeferredCutoverSignalChecker)
-	_, implementsExternallyAuthoritativeProgress := eng.(engine.ExternallyAuthoritativeProgress)
-	_, implementsSynchronousWorkRegistration := eng.(engine.SynchronousWorkRegistration)
-	_, implementsCancelledArtifactReleaser := eng.(engine.CancelledArtifactReleaser)
-	_, implementsControlResumeValidator := eng.(engine.ControlResumeValidator)
-
-	assert.True(t, implementsDrainer)
-	assert.True(t, implementsShutdownHalter)
-	assert.False(t, implementsDeferredCutoverSignalChecker)
-	assert.False(t, implementsExternallyAuthoritativeProgress)
-	assert.True(t, implementsSynchronousWorkRegistration)
-	assert.False(t, implementsCancelledArtifactReleaser)
-	assert.False(t, implementsControlResumeValidator)
+	inventory := enginetest.OptionalCapabilities(t)
+	engineType := reflect.TypeOf(New())
+	for typ, implements := range verdicts {
+		assert.True(t, inventory[typ.Name()],
+			"verdict names %s, which package engine no longer declares as an optional interface", typ.Name())
+		delete(inventory, typ.Name())
+		assert.Equal(t, implements, engineType.Implements(typ), "PostgreSQL engine verdict for %s", typ.Name())
+	}
+	assert.Empty(t, inventory,
+		"optional engine capabilities without a PostgreSQL verdict; add the verdict here and its row to the capability mapping in docs/postgresql.md")
 }
 
 // A zero ceiling means unset and adopts the default, so a zero-valued client
