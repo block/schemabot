@@ -262,8 +262,28 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
-		files := sortedKeys(ns.Files)
+		// The rollback baseline is the whole live namespace, so a table that
+		// cannot be rendered as a desired schema (foreign keys, inheritance,
+		// unlogged) leaves the capture incomplete. RV-7 then refuses rollback
+		// for this plan rather than reconstructing the originals; the plan
+		// itself still proceeds, because rollback capability is not a
+		// precondition for reviewing or applying the change.
+		originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, false)
+		if err != nil {
+			return nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+		}
 		schemaChange := engine.SchemaChange{Namespace: namespace}
+		if len(renderErrors) == 0 {
+			schemaChange.OriginalFiles = make(map[string]string, len(originalTables))
+			for table, content := range originalTables {
+				schemaChange.OriginalFiles[table+".sql"] = content
+			}
+			schemaChange.OriginalFilesCaptured = true
+		} else {
+			slog.Warn("PostgreSQL plan could not capture the whole namespace as rollback originals; the plan proceeds rollback-incapable",
+				"namespace", namespace, "unrenderable_tables", len(renderErrors), "error", errors.Join(renderErrors...))
+		}
+		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
 			desired, err := pgstatement.ParseDesired(ns.Files[filename])

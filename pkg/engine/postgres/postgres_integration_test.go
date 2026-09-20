@@ -243,6 +243,76 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
+// Planning captures the canonical live schema for rollback, including an
+// explicitly empty baseline when every declared table is new.
+func TestEnginePlanCapturesOriginalFiles(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	const originalAccounts = "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    \"name\" text NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n"
+
+	tests := []struct {
+		name          string
+		database      string
+		setup         string
+		schemaFiles   schema.SchemaFiles
+		expectedFiles map[string]map[string]string
+	}{
+		{
+			name:     "alter existing table",
+			database: "plan_original_alter_test",
+			setup:    "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			schemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}}},
+			expectedFiles: map[string]map[string]string{"public": {"users.sql": originalUsers}},
+		},
+		{
+			name:     "new table in empty namespace",
+			database: "plan_original_empty_test",
+			setup:    "CREATE SCHEMA app",
+			schemaFiles: schema.SchemaFiles{"app": {Files: map[string]string{
+				"events.sql": "CREATE TABLE events (id bigint PRIMARY KEY)",
+			}}},
+			expectedFiles: map[string]map[string]string{"app": {}},
+		},
+		{
+			name:     "mixed namespaces",
+			database: "plan_original_mixed_test",
+			setup:    "CREATE SCHEMA app; CREATE TABLE app.accounts (id bigint PRIMARY KEY, name text NOT NULL); CREATE SCHEMA fresh",
+			schemaFiles: schema.SchemaFiles{
+				"app": {Files: map[string]string{
+					"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY, name text NOT NULL, active boolean)",
+					"events.sql":   "CREATE TABLE events (id bigint PRIMARY KEY)",
+				}},
+				"fresh": {Files: map[string]string{
+					"jobs.sql": "CREATE TABLE jobs (id bigint PRIMARY KEY)",
+				}},
+			},
+			expectedFiles: map[string]map[string]string{
+				"app":   {"accounts.sql": originalAccounts},
+				"fresh": {},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			_, err := db.ExecContext(t.Context(), tt.setup)
+			require.NoError(t, err)
+
+			result, err := New().Plan(t.Context(), &engine.PlanRequest{
+				Database: tt.database, SchemaFiles: tt.schemaFiles, Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Changes, len(tt.expectedFiles))
+			for _, change := range result.Changes {
+				assert.True(t, change.OriginalFilesCaptured)
+				assert.Equal(t, tt.expectedFiles[change.Namespace], change.OriginalFiles)
+			}
+		})
+	}
+}
+
 // TestEnginePlanPrivilegeRefusal proves a role that cannot alter an oversized
 // target gets one blocked verdict with the privilege cause followed by the
 // size cause, so the operator can address both findings from one plan.
@@ -530,6 +600,9 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
 	require.Len(t, result.Changes, 1)
 	assert.Equal(t, "public", result.Changes[0].Namespace)
+	assert.False(t, result.Changes[0].OriginalFilesCaptured,
+		"a namespace with tables that cannot be rendered as a desired schema plans rollback-incapable rather than not at all")
+	assert.Nil(t, result.Changes[0].OriginalFiles)
 	require.Len(t, result.ExemptTables, 1)
 	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
 	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)

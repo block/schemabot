@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
@@ -115,44 +116,13 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		// accountable for, so a pulled baseline declares exactly what a later
 		// plan would otherwise report as undeclared. Partitions and
 		// extension-owned tables have no file of their own and are left out.
-		tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
+		pulled := &ternv1.PulledNamespace{Tables: make(map[string]string)}
+		tables, tableErrors, err := renderPostgresTables(ctx, pool, namespace, true)
 		if err != nil {
-			return nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
+			return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 		}
-		pulled := &ternv1.PulledNamespace{Tables: make(map[string]string, len(tables))}
-		for _, table := range tables {
-			if err := ctx.Err(); err != nil {
-				return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
-			}
-			objects, err := pullUnmodeledTableObjects(ctx, pool, namespace, table)
-			if err != nil {
-				if isContextError(err) {
-					return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
-				}
-				return nil, err
-			}
-			if err := unmodeledTableObjectsError(namespace, table, objects); err != nil {
-				renderErrors = append(renderErrors, err)
-				continue
-			}
-			model, err := schemadiff.Introspect(ctx, pool, namespace, table)
-			if err != nil {
-				if isContextError(err) {
-					return nil, fmt.Errorf("pull PostgreSQL database %q: introspect schema %q table %q: %w", e.pullDatabase, namespace, table, err)
-				}
-				renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: introspect: %w", namespace, table, err))
-				continue
-			}
-			content, err := schemadiff.Render(model)
-			if err != nil {
-				if isContextError(err) {
-					return nil, fmt.Errorf("pull PostgreSQL database %q: render schema %q table %q: %w", e.pullDatabase, namespace, table, err)
-				}
-				renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: render: %w", namespace, table, err))
-				continue
-			}
-			pulled.Tables[table] = content
-		}
+		maps.Copy(pulled.Tables, tables)
+		renderErrors = append(renderErrors, tableErrors...)
 		response.Namespaces[namespace] = pulled
 		response.TableCount += int32(len(pulled.Tables))
 	}
@@ -160,6 +130,53 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		return nil, fmt.Errorf("pull PostgreSQL database %q refused incomplete baseline: %w", e.pullDatabase, err)
 	}
 	return response, nil
+}
+
+// renderPostgresTables uses pg-sprite's managed-table enumeration and
+// canonical renderer for every PostgreSQL baseline SchemaBot captures.
+func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, inspectUnmodeled bool) (map[string]string, []error, error) {
+	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
+	}
+	rendered := make(map[string]string, len(tables))
+	var renderErrors []error
+	for _, table := range tables {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if inspectUnmodeled {
+			objects, err := pullUnmodeledTableObjects(ctx, pool, namespace, table)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := unmodeledTableObjectsError(namespace, table, objects); err != nil {
+				renderErrors = append(renderErrors, err)
+				continue
+			}
+		}
+		// A cancelled or expired context is the caller's outcome, not one
+		// table's: it ends the whole capture instead of being recorded as a
+		// per-table render failure and carried on past.
+		model, err := schemadiff.Introspect(ctx, pool, namespace, table)
+		if err != nil {
+			if isContextError(err) {
+				return nil, nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
+			}
+			renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: introspect: %w", namespace, table, err))
+			continue
+		}
+		content, err := schemadiff.Render(model)
+		if err != nil {
+			if isContextError(err) {
+				return nil, nil, fmt.Errorf("render schema %q table %q: %w", namespace, table, err)
+			}
+			renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: render: %w", namespace, table, err))
+			continue
+		}
+		rendered[table] = content
+	}
+	return rendered, renderErrors, nil
 }
 
 // pullNamespaces discovers every non-reserved schema by default. Callers use
