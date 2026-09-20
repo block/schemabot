@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
@@ -116,12 +115,11 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		// accountable for, so a pulled baseline declares exactly what a later
 		// plan would otherwise report as undeclared. Partitions and
 		// extension-owned tables have no file of their own and are left out.
-		pulled := &ternv1.PulledNamespace{Tables: make(map[string]string)}
 		tables, tableErrors, err := renderPostgresTables(ctx, pool, namespace, true)
 		if err != nil {
 			return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 		}
-		maps.Copy(pulled.Tables, tables)
+		pulled := &ternv1.PulledNamespace{Tables: tables}
 		renderErrors = append(renderErrors, tableErrors...)
 		response.Namespaces[namespace] = pulled
 		response.TableCount += int32(len(pulled.Tables))

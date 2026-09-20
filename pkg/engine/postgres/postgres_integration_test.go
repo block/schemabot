@@ -266,15 +266,6 @@ func TestEnginePlanCapturesOriginalFiles(t *testing.T) {
 			expectedFiles: map[string]map[string]string{"public": {"users.sql": originalUsers}},
 		},
 		{
-			name:     "new table in empty namespace",
-			database: "plan_original_empty_test",
-			setup:    "CREATE SCHEMA app",
-			schemaFiles: schema.SchemaFiles{"app": {Files: map[string]string{
-				"events.sql": "CREATE TABLE events (id bigint PRIMARY KEY)",
-			}}},
-			expectedFiles: map[string]map[string]string{"app": {}},
-		},
-		{
 			name:     "mixed namespaces",
 			database: "plan_original_mixed_test",
 			setup:    "CREATE SCHEMA app; CREATE TABLE app.accounts (id bigint PRIMARY KEY, name text NOT NULL); CREATE SCHEMA fresh",
