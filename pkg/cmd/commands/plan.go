@@ -104,23 +104,26 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return writeJSON(allResults)
 	}
 
-	// Disclose config-driven exclusions once per distinct resolution — the
-	// lists only differ between environments when entries use $ENV.
-	disclosed := make(map[string]bool)
+	// Disclose config-driven exclusions once per distinct resolution. The two
+	// disclosures dedupe independently: ignore_namespaces resolves from config
+	// alone and differs between environments only when entries use $ENV, while
+	// an ignore_tables entry resolves against each target's live schema and can
+	// withhold a table in one environment and match nothing in another. Keying
+	// both on one string would reprint the namespaces notice for every
+	// environment whose tables happened to differ.
+	disclosedNamespaces := make(map[string]bool)
+	unmatchedTablesByEnv := make(map[string][]string, len(environments))
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]
 		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
-		// An ignore_tables entry resolves against the live schema, so it can
-		// withhold a table in one environment and match nothing in another.
-		unmatchedTables := schema.UnmatchedIgnoreTables(cfg.IgnoreTables, allResults[env].WithheldTables())
-		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",") + "|" + strings.Join(unmatchedTables, ",")
-		if disclosed[key] {
-			continue
+		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",")
+		if !disclosedNamespaces[key] {
+			disclosedNamespaces[key] = true
+			templates.WriteIgnoredNamespaces(ignored, unmatched)
 		}
-		disclosed[key] = true
-		templates.WriteIgnoredNamespaces(ignored, unmatched)
-		templates.WriteUnmatchedIgnoreTables(unmatchedTables)
+		unmatchedTablesByEnv[env] = schema.UnmatchedIgnoreTables(cfg.IgnoreTables, allResults[env].WithheldTables())
 	}
+	templates.WriteMultiEnvUnmatchedIgnoreTables(environments, unmatchedTablesByEnv)
 
 	// Human-readable output for all environments
 	outputMultiEnvPlanResult(allResults, cfg.Database, cfg.SchemaDir)
