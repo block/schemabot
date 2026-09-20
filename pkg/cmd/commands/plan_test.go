@@ -198,6 +198,25 @@ func TestPlanFingerprint_DifferentPlans(t *testing.T) {
 	assert.NotEqual(t, fp1, fp2, "Expected different fingerprints for different plans")
 }
 
+func TestPlanFingerprint_IncludesShardOnlyStatements(t *testing.T) {
+	const baseDDL = "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	base := &apitypes.TableChangeResponse{Namespace: "commerce", TableName: "users", DDL: baseDDL, ChangeType: "ALTER"}
+	shardOnly := &apitypes.TableChangeResponse{Namespace: "commerce", TableName: "users", DDL: baseDDL + ", ADD INDEX idx_email (email)", ChangeType: "ALTER"}
+	plan := func(extra bool) *apitypes.PlanResponse {
+		changes := []*apitypes.TableChangeResponse{base}
+		if extra {
+			changes = append(changes, shardOnly)
+		}
+		return &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{Namespace: "commerce", TableChanges: []*apitypes.TableChangeResponse{base}}},
+			Shards:  []*apitypes.ShardPlanResponse{{Namespace: "commerce", Shard: "-80", Changes: changes}},
+		}
+	}
+
+	assert.Equal(t, planFingerprint(plan(false)), planFingerprint(plan(false)))
+	assert.NotEqual(t, planFingerprint(plan(false)), planFingerprint(plan(true)))
+}
+
 func TestPlanFingerprint_VSchemaOnlyPlans(t *testing.T) {
 	vschemaOnly := func(diff string) *apitypes.PlanResponse {
 		return &apitypes.PlanResponse{

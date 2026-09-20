@@ -103,11 +103,11 @@ func TestSummarizeChanges(t *testing.T) {
 				},
 			}},
 		}
-		creates, alters, drops, other := countStatementTypes(data.Changes, data.DatabaseType)
-		assert.Equal(t, 1, creates)
-		assert.Zero(t, alters)
-		assert.Zero(t, drops)
-		assert.Zero(t, other)
+		counts := countStatementTypes(data.Changes, data.DatabaseType)
+		assert.Equal(t, 1, counts.Created)
+		assert.Zero(t, counts.Altered)
+		assert.Zero(t, counts.Dropped)
+		assert.Zero(t, counts.Other)
 	})
 
 	t.Run("does not count a MySQL create index as a table change", func(t *testing.T) {
@@ -115,11 +115,11 @@ func TestSummarizeChanges(t *testing.T) {
 			Keyspace:   "orders",
 			Statements: []string{"CREATE INDEX `i` ON `t` (`v`)"},
 		}}
-		creates, alters, drops, other := countStatementTypes(changes, "mysql")
-		assert.Zero(t, creates)
-		assert.Zero(t, alters)
-		assert.Zero(t, drops)
-		assert.Equal(t, 1, other)
+		counts := countStatementTypes(changes, "mysql")
+		assert.Zero(t, counts.Created)
+		assert.Zero(t, counts.Altered)
+		assert.Zero(t, counts.Dropped)
+		assert.Equal(t, 1, counts.Other)
 	})
 
 	tests := []struct {
