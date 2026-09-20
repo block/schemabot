@@ -48,6 +48,7 @@ func previewCommentAllOutput() {
 		{"PLAN COMMENT (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
+		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE, TWO CAUSES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlockedPostgres()) }},
 		{"PLAN COMMENT (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"PLAN COMMENT (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
 		{"PLAN COMMENT (EXISTING COPY DISCARDED, APPLYING)", func() {
@@ -157,6 +158,7 @@ func previewCommentPlanAllOutput() {
 		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
+		{"POSTGRES PLAN (ENGINE-BLOCKED CHANGE, TWO CAUSES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlockedPostgres()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"MYSQL PLAN (CHANGE ATTRIBUTED TO ANOTHER PR)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanAttributedChange()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
