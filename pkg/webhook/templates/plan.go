@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -1165,11 +1166,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
-		} else {
-			fmt.Fprintf(sb, "- %s\n", table)
-		}
+		writeEngineReasonItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
@@ -1230,13 +1227,31 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
-		} else {
-			fmt.Fprintf(sb, "- %s\n", table)
-		}
+		writeEngineReasonItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\n" + footer + "\n\n")
+}
+
+// writeEngineReasonItem keeps one cause in the established one-line shape and
+// gives each additional independent cause its own nested Markdown bullet. A
+// cause is judged empty after sanitization, so a reason made only of
+// characters the sanitizer strips falls back to the bare table line instead of
+// a dangling colon.
+func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
+	causes := make([]string, 0)
+	for _, cause := range engine.BlockedCauses(reason) {
+		if cause = SanitizeInlineError(cause); cause != "" {
+			causes = append(causes, cause)
+		}
+	}
+	if len(causes) == 0 {
+		fmt.Fprintf(sb, "- %s\n", table)
+		return
+	}
+	fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(causes[0]))
+	for _, cause := range causes[1:] {
+		fmt.Fprintf(sb, "  - %s\n", escapeInlineMarkdown(cause))
+	}
 }
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -4167,6 +4168,38 @@ func TestExecuteApplyRejectsBlockedStoredPlan(t *testing.T) {
 	assert.Zero(t, applyID)
 	assert.Contains(t, err.Error(), "blocked change")
 	assert.Contains(t, err.Error(), "cannot be executed safely as written")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
+func TestExecuteApplyListsIndependentBlockedCauses(t *testing.T) {
+	plan := executeApplyTestPlan()
+	change := &plan.Namespaces["testdb"].Tables[0]
+	change.ExecutionMode = engine.ExecutionModeBlocked
+	change.ModeReason = engine.JoinBlockedCauses([]string{
+		"planner requires a rewrite; choose a supported statement",
+		"table exceeds the native-safe size ceiling; use an online path",
+	})
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), ":\n- planner requires a rewrite; choose a supported statement\n- table exceeds the native-safe size ceiling; use an online path")
 	assert.Nil(t, applies.apply)
 	assert.Empty(t, tasks.tasks)
 }

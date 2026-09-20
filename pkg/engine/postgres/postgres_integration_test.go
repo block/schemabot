@@ -341,12 +341,11 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		"the reason must carry the exact provisioning statement")
 	assert.Contains(t, change.ModeReason, "pg_has_role(plan_limited,",
 		"the reason must carry the exact failed catalog check")
-	privilegeAt := strings.Index(change.ModeReason, "in-place ALTER TABLE")
-	sizeAt := strings.Index(change.ModeReason, `statement for table "users": table size`)
-	assert.Greater(t, sizeAt, privilegeAt, "the size cause must follow the privilege cause")
-	assert.Equal(t, 1, strings.Count(change.ModeReason, `statement for table "users": table size`))
-	assert.Contains(t, change.ModeReason, "; statement for table",
-		"independent causes must use the package's sentence separator")
+	causes := engine.BlockedCauses(change.ModeReason)
+	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
+	assert.Contains(t, causes[0], "in-place ALTER TABLE", "the privilege cause comes first")
+	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size`),
+		"the size cause follows the privilege cause: %q", causes[1])
 }
 
 // TestEnginePlanPrivilegeRefusalPerTier proves a privilege gap blocks only
