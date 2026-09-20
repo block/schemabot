@@ -85,6 +85,88 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 	require.NoError(t, svcB.Close())
 }
 
+// A PostgreSQL driver restart while a concurrent index build is parked leaves
+// an invalid catalog entry, then a fresh driver recovers that abandoned entry
+// and completes the apply with exactly one valid index.
+func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) {
+	const indexName = "users_email_idx"
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	fixture.schema += "\nCREATE INDEX users_email_idx ON users (email);\n"
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+
+	// An older writer makes CREATE INDEX CONCURRENTLY wait after committing
+	// its invalid catalog entry, giving shutdown a deterministic in-flight
+	// build to halt rather than relying on table size or timing.
+	writer, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Rollback() })
+	_, err = writer.ExecContext(t.Context(), "INSERT INTO public.users (id, email) VALUES (1, 'held@example.com')")
+	require.NoError(t, err)
+
+	svcA := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    dsn,
+	})
+	plan, err := svcA.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.False(t, plan.HasBlockedChanges())
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	assert.Empty(t, plan.Changes[0].TableChanges[0].ExecutionMode,
+		"PostgreSQL routes CREATE INDEX to its concurrent executor inside the native-safe path")
+
+	_, _, err = svcA.ExecuteApply(t.Context(), api.ApplyRequest{
+		PlanID:      plan.PlanID,
+		Environment: "staging",
+		Caller:      "integration-test",
+	})
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		count, valid := postgresIndexState(t, db, "users", indexName)
+		assert.Equal(c, 1, count, "the in-flight build must have created exactly one catalog entry")
+		assert.False(c, valid, "the in-flight concurrent build must still be invalid")
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+
+	// Close stops the driver, calls HaltForShutdown on the PostgreSQL engine,
+	// and waits for the parked backend to exit before returning.
+	require.NoError(t, svcA.Close())
+	count, valid := postgresIndexState(t, db, "users", indexName)
+	assert.Equal(t, 1, count)
+	assert.False(t, valid, "shutdown must leave the interrupted build's index invalid for recovery")
+	require.NoError(t, writer.Rollback())
+
+	svcB := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType:         string(fixture.config.Type),
+		targetDSN:            dsn,
+		preserveDurableState: true,
+		skipOperator:         true,
+	})
+	interrupted, err := findFixtureApply(t, svcB, fixture.config.Database)
+	require.NoError(t, err)
+	require.NotNil(t, interrupted)
+	svcB.StartOperator(t.Context())
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, getErr := findFixtureApply(t, svcB, fixture.config.Database)
+		if !assert.NoError(c, getErr) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		assert.True(c, state.IsState(apply.State, state.Apply.Completed),
+			"recovered apply not completed yet, state=%s", apply.State)
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+
+	count, valid = postgresIndexState(t, db, "users", indexName)
+	assert.Equal(t, 1, count, "recovery must not leave a duplicate index")
+	assert.True(t, valid, "the recovered index must be valid")
+	tasks, err := svcB.Storage().Tasks().GetByApplyID(t.Context(), interrupted.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Completed), "task state=%s", tasks[0].State)
+	assert.Empty(t, tasks[0].ErrorMessage, "a recovered build completes without an error message")
+	require.NoError(t, svcB.Close())
+}
+
 // A stop accepted while a PostgreSQL apply is running resolves as a terminal
 // decline once the driver consumes it: the engine's reason is stored for the
 // operator, the request does not remain pending for another claim, and the
@@ -282,6 +364,18 @@ func postgresColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
 		table, column).Scan(&exists)
 	require.NoError(t, err)
 	return exists
+}
+
+func postgresIndexState(t *testing.T, db *sql.DB, table, index string) (int, bool) {
+	t.Helper()
+	var count int
+	var valid bool
+	err := db.QueryRowContext(t.Context(), `SELECT count(*), coalesce(bool_and(i.indisvalid), false)
+		FROM pg_index i
+		JOIN pg_class idx ON idx.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1) AND idx.relname = $2`, "public."+table, index).Scan(&count, &valid)
+	require.NoError(t, err)
+	return count, valid
 }
 
 // applyIsSettled reports whether the drive has finished deciding the apply's
