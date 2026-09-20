@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -102,4 +103,33 @@ func TestInitConnectionFileAndPrivateStorage(t *testing.T) {
 	require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(home, ".schemabot", "credentials")))
 	_, err = saveInitConnection("local", "shop", "dev", "application", dsn)
 	require.ErrorContains(t, err, "not a symlink")
+}
+
+func TestInitConnectionScreenStates(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop"}, "default", io.Discard)
+	wizardKey(m, tea.KeyEnter)
+	m.input.SetValue("mysql://demo:secret@127.0.0.1:13361/shop")
+	wizardKey(m, tea.KeyEnter)
+	checking := stripANSI(m.View())
+	require.Contains(t, checking, "Checking connection")
+	require.NotContains(t, checking, "enter continue")
+	require.NotContains(t, checking, "unencrypted")
+	m.Update(initConnectionMsg{generation: m.generation, err: fmt.Errorf("could not connect: connection refused")})
+	failed := stripANSI(m.View())
+	require.Contains(t, failed, "Couldn’t connect.")
+	require.Contains(t, failed, "enter retry")
+	require.NotContains(t, failed, "VPN")
+	require.NotContains(t, failed, "enter continue")
+	require.Less(t, strings.Index(failed, "Couldn’t connect"), strings.Index(failed, "enter retry"))
+	wizardKey(m, tea.KeyEnter)
+	require.Empty(t, m.err)
+	require.True(t, m.checkingConnection)
+	require.NotContains(t, stripANSI(m.View()), "Couldn’t connect")
+	m.Update(initConnectionMsg{generation: m.generation})
+	connected := stripANSI(m.View())
+	require.Contains(t, connected, "✓ Connected")
+	require.Contains(t, connected, "enter continue")
+	require.NotContains(t, connected, "retry")
+	require.NotContains(t, connected, "secret")
 }

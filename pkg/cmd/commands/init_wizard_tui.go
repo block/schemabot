@@ -317,7 +317,7 @@ func (m *initWizard) contentView() string {
 		if m.step == 0 {
 			b.WriteString(bold.Render("Let’s bring your database into SchemaBot.") + "\n\n")
 			b.WriteString(wrap.Render("We’ll turn your live schema into files and verify they match. Your application’s tables and existing files stay untouched.") + "\n\n")
-		} else {
+		} else if m.step != 3 && m.step != 4 {
 			b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
 		}
 		if m.step == 3 || m.step == 4 {
@@ -327,7 +327,7 @@ func (m *initWizard) contentView() string {
 		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(f.hint)) + "\n\n")
 		switch {
 		case m.step == 0:
-			for _, engine := range []struct{ key, label, detail string }{{"mysql", "MySQL", "Online schema changes with Spirit"}, {"postgres", "PostgreSQL", "Schema changes with pg-sprite"}} {
+			for _, engine := range []struct{ key, label, detail string }{{"mysql", "MySQL", "Schema changes with Spirit"}, {"postgres", "PostgreSQL", "Schema changes with pg-sprite"}} {
 				line := "  " + engine.label
 				if f.value == engine.key {
 					line = blue.Render("› " + engine.label)
@@ -402,7 +402,7 @@ func (m *initWizard) View() string {
 	if len(lines) > m.height-2 {
 		available := m.height - 4
 		offset := min(m.scroll, len(lines)-available)
-		content = strings.Join(lines[offset:offset+available], "\n") + "\n" + wrap.Render("  pgup/pgdown scroll · enter continue · esc cancel")
+		content = strings.Join(lines[offset:offset+available], "\n") + "\n" + wrap.Render("  pgup/pgdown scroll · esc cancel")
 	}
 	return "\n" + content + "\n"
 }

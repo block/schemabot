@@ -52,6 +52,7 @@ type initConnectionMsg struct {
 }
 
 func (m *initWizard) checkConnection() tea.Cmd {
+	m.err = ""
 	m.checkingConnection = true
 	m.connectionChecked = false
 	m.generation++

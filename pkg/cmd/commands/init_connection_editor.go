@@ -9,6 +9,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type initConnectionEditor struct {
@@ -186,6 +187,10 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 
 func (m *initWizard) connectionEditorView() string {
 	e := m.connectionEditor
+	muted := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#59636E", Dark: "#9DA7B3"})
+	accent := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"}).Bold(true)
+	success := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1A7F37", Dark: "#7EE787"})
+	failure := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#CF222E", Dark: "#FF7B72"})
 	var b strings.Builder
 	switch e.mode {
 	case "menu":
@@ -207,11 +212,15 @@ func (m *initWizard) connectionEditorView() string {
 			if i == e.choice {
 				prefix = "› "
 			}
-			b.WriteString(prefix + option + "\n")
+			line := prefix + option
+			if i == e.choice {
+				line = accent.Render(line)
+			}
+			b.WriteString(line + "\n")
 		}
-		b.WriteString("\n↑/↓ choose · enter continue · shift+tab back · esc cancel")
+		b.WriteString("\n" + muted.Render("↑/↓ choose · enter continue · shift+tab back · esc cancel"))
 	case "paste":
-		b.WriteString("Paste your connection string. Input is hidden.\n\n" + m.input.View() + "\n\nWe’ll ask before saving it outside your project.")
+		b.WriteString("Paste your connection string. Input is hidden.\n\n" + m.input.View())
 	case "details":
 		labels := []string{"Host", "Port", "Database", "Username", "Password (hidden; Enter for none)"}
 		b.WriteString(labels[e.detail] + "\n\n" + m.input.View())
@@ -220,21 +229,27 @@ func (m *initWizard) connectionEditorView() string {
 	case "ready":
 		b.WriteString(m.connectionSummary)
 	}
-	if e.mode != "menu" {
-		if m.checkingConnection {
+	if e.mode == "menu" {
+		return b.String()
+	}
+	help := "enter continue · shift+tab edit · esc cancel"
+	if e.mode == "ready" || e.mode == "reference" {
+		switch {
+		case m.checkingConnection:
 			b.WriteString("\n\n" + m.spinner.View() + " Checking connection…")
+			help = "shift+tab edit · esc cancel"
+		case m.err != "":
+			b.WriteString("\n\n" + failure.Render(initConnectionFailure(m.err)))
+			help = "enter retry · shift+tab edit · esc cancel"
+		case m.connectionChecked:
+			b.WriteString("\n\n" + success.Render("✓ Connected"))
+		default:
+			help = "enter check connection · shift+tab edit · esc cancel"
 		}
-		if m.connectionChecked {
-			b.WriteString("\n\n✓ Connected")
-		}
-		if strings.HasPrefix(m.input.Value(), "draft:") {
-			b.WriteString("\n\nAfter confirmation, save in a private, unencrypted file\nunder ~/.schemabot/credentials, outside your project.")
-		}
-		b.WriteString("\n\nenter continue · shift+tab edit · esc cancel")
+	} else if m.err != "" {
+		b.WriteString("\n\n" + failure.Render(m.err))
 	}
-	if m.err != "" {
-		b.WriteString("\n\n" + m.err + "\nPrivate network? Connect your VPN or tunnel, then retry.")
-	}
+	b.WriteString("\n\n" + muted.Render(help))
 	return b.String()
 }
 
@@ -243,4 +258,18 @@ func initConnectionLabel(ref string) string {
 		return "Entered connection (save in a private local file)"
 	}
 	return initTerminalText(ref)
+}
+
+// Keep the immediate recovery action visible without repeating driver details.
+func initConnectionFailure(message string) string {
+	switch {
+	case strings.Contains(message, "connection refused"):
+		return "Couldn’t connect. Check that the database is running and the host and port are correct."
+	case strings.Contains(message, "hostname could not be resolved"):
+		return "Couldn’t find that host. Check the address and your network connection."
+	case strings.Contains(message, "timed out"):
+		return "The connection timed out. Check the address and network access, then retry."
+	default:
+		return message
+	}
 }
