@@ -1,6 +1,7 @@
 package lint
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -367,6 +368,106 @@ func TestLintPostgresSchema_UnlintableEntries(t *testing.T) {
 			assert.Nil(t, results)
 		})
 	}
+}
+
+func TestLintPostgresSchema_IntervalTypeSpelling(t *testing.T) {
+	results, err := lintOnePostgresEntry(t, "CREATE TABLE t (\n"+
+		"    span interval hour to minute NOT NULL,\n"+
+		"    CONSTRAINT t_pkey PRIMARY KEY (span)\n);\n")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Contains(t, results[0].Message, `uses "interval"`)
+	assert.NotContains(t, results[0].Message, "3072")
+}
+
+func TestLintPostgresSchema_NonBtreeIndexNotRedundant(t *testing.T) {
+	base := "CREATE TABLE docs (id bigint NOT NULL, a bigint, b bigint, CONSTRAINT docs_pkey PRIMARY KEY (id));\n"
+	results, err := lintOnePostgresEntry(t, base+"CREATE INDEX docs_a_gin ON docs USING gin (a);\nCREATE INDEX docs_ab_idx ON docs (a, b);")
+	require.NoError(t, err)
+	assert.Empty(t, results)
+
+	results, err = lintOnePostgresEntry(t, base+"CREATE INDEX docs_a_idx ON docs (a);\nCREATE INDEX docs_ab_idx ON docs (a, b);")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "redundant_indexes", results[0].Linter)
+}
+
+func TestLintPostgresSchema_UniquePrefixKeepsItsConstraint(t *testing.T) {
+	results, err := lintOnePostgresEntry(t, `CREATE TABLE t (id bigint PRIMARY KEY, a bigint, b bigint);
+CREATE UNIQUE INDEX t_a_key ON t (a);
+CREATE UNIQUE INDEX t_ab_key ON t (a, b);`)
+	require.NoError(t, err)
+	assert.Empty(t, results, "dropping UNIQUE (a) would drop single-column uniqueness")
+}
+
+func TestLintPostgresSchema_NullsOrdering(t *testing.T) {
+	results, err := lintOnePostgresEntry(t, `CREATE TABLE t (id bigint PRIMARY KEY, a bigint, b bigint);
+CREATE INDEX t_a_desc ON t (a DESC);
+CREATE INDEX t_ab_desc ON t (a DESC NULLS FIRST, b);`)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Contains(t, results[0].Message, `"a DESC"`)
+
+	results, err = lintOnePostgresEntry(t, `CREATE TABLE t (id bigint PRIMARY KEY, a bigint, b bigint);
+CREATE INDEX t_a_first ON t (a NULLS FIRST);
+CREATE INDEX t_ab ON t (a, b);`)
+	require.NoError(t, err)
+	assert.Empty(t, results)
+}
+
+func TestLintPostgresSchema_ConstraintAndIndexCarveOuts(t *testing.T) {
+	tests := map[string]string{
+		"unique nulls not distinct": `CREATE TABLE t (id bigint PRIMARY KEY, a bigint, CONSTRAINT t_a_key UNIQUE NULLS NOT DISTINCT (a)); CREATE INDEX t_a_idx ON t (a);`,
+		"unique include":            `CREATE TABLE t (id bigint PRIMARY KEY, a bigint, b bigint, CONSTRAINT t_a_key UNIQUE (a) INCLUDE (b)); CREATE INDEX t_a_idx ON t (a);`,
+		"expression":                `CREATE TABLE t (id bigint PRIMARY KEY, a text, b text); CREATE INDEX t_lower_idx ON t (lower(a)); CREATE INDEX t_ab_idx ON t (a, b);`,
+		"collation":                 `CREATE TABLE t (id bigint PRIMARY KEY, a text, b text); CREATE INDEX t_collate_idx ON t (a COLLATE "C"); CREATE INDEX t_ab_idx ON t (a, b);`,
+		"opclass":                   `CREATE TABLE t (id bigint PRIMARY KEY, a text, b text); CREATE INDEX t_opclass_idx ON t (a text_pattern_ops); CREATE INDEX t_ab_idx ON t (a, b);`,
+	}
+	for name, ddl := range tests {
+		t.Run(name, func(t *testing.T) {
+			results, err := lintOnePostgresEntry(t, ddl)
+			require.NoError(t, err)
+			assert.Empty(t, results)
+		})
+	}
+}
+
+func TestLintPostgresSchema_AllowedTypeDetails(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AllowedPostgresPKTypes = "character varying(36)"
+	for _, tc := range []struct {
+		ddl  string
+		pass bool
+	}{
+		{`CREATE TABLE t (id character varying(36) PRIMARY KEY);`, true},
+		{`CREATE TABLE t (id character varying(64) PRIMARY KEY);`, false},
+		{`CREATE TABLE t (id character varying PRIMARY KEY);`, false},
+	} {
+		results, err := NewWithConfig(cfg).LintPostgresSchema(map[string]string{"t": tc.ddl})
+		require.NoError(t, err)
+		assert.Equal(t, tc.pass, len(results) == 0)
+	}
+
+	cfg.AllowedPostgresPKTypes = "BIGINT,UUID"
+	results, err := NewWithConfig(cfg).LintPostgresSchema(map[string]string{"t": `CREATE TABLE t (id bigint PRIMARY KEY);`})
+	require.NoError(t, err)
+	assert.Empty(t, results)
+	assert.Equal(t, []string{"bigint", "uuid"}, splitCSV("bigint,,uuid"))
+}
+
+func TestLintPostgresSchema_FloatGrammarAndSortTieBreak(t *testing.T) {
+	for _, spelling := range []string{"real", "double precision", "float(24)"} {
+		results, err := lintOnePostgresEntry(t, fmt.Sprintf(`CREATE TABLE t (id %s PRIMARY KEY);`, spelling))
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+		assert.Equal(t, []string{"has_float", "primary_key"}, []string{results[0].Linter, results[1].Linter})
+	}
+	assert.False(t, postgresColumnType{Schema: "custom", Name: "float8"}.isFloat())
+}
+
+func TestLintPostgresSchema_EmptyAllowedPostgresPKTypesFails(t *testing.T) {
+	_, err := NewWithConfig(Config{}).LintPostgresSchema(map[string]string{"t": `CREATE TABLE t (id bigint PRIMARY KEY);`})
+	require.EqualError(t, err, "postgres lint: at least one allowed primary key type must be configured")
 }
 
 // lintOnePostgresEntry lints a single pulled table entry with the default

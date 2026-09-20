@@ -57,6 +57,9 @@ func (e *UnlintableTableError) Error() string {
 // regardless of map order.
 func (l *Linter) LintPostgresSchema(tables map[string]string) ([]Result, error) {
 	allowedPKTypes := splitCSV(l.config.AllowedPostgresPKTypes)
+	if len(allowedPKTypes) == 0 {
+		return nil, fmt.Errorf("postgres lint: at least one allowed primary key type must be configured")
+	}
 	ignored := make(map[string]bool, len(l.config.IgnoreTables))
 	for _, name := range l.config.IgnoreTables {
 		ignored[name] = true
@@ -240,11 +243,15 @@ func parsePostgresColumnType(typeName *pgproto.TypeName) postgresColumnType {
 		t.Name = names[len(names)-1].GetString_().GetSval()
 	}
 	t.Array = len(typeName.GetArrayBounds()) > 0
+	// Interval typmods begin with an internal field mask that has no useful SQL
+	// spelling in audit messages, so report the unmodified type name.
+	if strings.EqualFold(t.Name, "interval") && t.Schema == "" {
+		return t
+	}
 	for _, mod := range typeName.GetTypmods() {
 		ival, ok := mod.GetAConst().GetVal().(*pgproto.A_Const_Ival)
 		if !ok {
-			// A non-integer modifier (interval field masks) has no SQL
-			// spelling worth reconstructing; name the type without it.
+			// Modifiers without an integer SQL spelling are omitted from messages.
 			t.Mods = nil
 			break
 		}
@@ -331,7 +338,6 @@ func (t postgresColumnType) allowed(allowed []string) bool {
 	}
 	full := t.display()
 	for _, candidate := range allowed {
-		candidate = strings.TrimSpace(candidate)
 		if strings.EqualFold(candidate, stored) || strings.EqualFold(candidate, full) {
 			return true
 		}
@@ -339,15 +345,15 @@ func (t postgresColumnType) allowed(allowed []string) bool {
 	return false
 }
 
-// isFloat reports whether the column is a binary floating point type (real,
-// double precision, float(n)). numeric/decimal are exact and pass; a user
-// type that happens to be named float8 in its own schema is not the built-in.
+// isFloat reports whether the grammar-folded column type is binary floating
+// point. numeric/decimal are exact and pass; a user type that happens to be
+// named float8 in its own schema is not the built-in.
 func (t postgresColumnType) isFloat() bool {
 	if t.Schema != "" {
 		return false
 	}
 	switch strings.ToLower(t.Name) {
-	case "float4", "float8", "real", "float":
+	case "float4", "float8":
 		return true
 	}
 	return false
@@ -395,11 +401,7 @@ func lintPostgresRedundantIndexes(create *pgproto.CreateStmt, indexStmts []*pgpr
 	indexes := postgresTableIndexes(create, indexStmts)
 
 	var results []Result
-	reportedRedundant := make(map[int]bool)
 	for i, index := range indexes {
-		if reportedRedundant[i] {
-			continue
-		}
 		for j, other := range indexes {
 			if i == j || !postgresIndexRedundantTo(index, other) {
 				continue
@@ -410,7 +412,7 @@ func lintPostgresRedundantIndexes(create *pgproto.CreateStmt, indexStmts []*pgpr
 				Message:  postgresRedundancyMessage(index, other),
 				Severity: "warning",
 			})
-			reportedRedundant[i] = true
+			// Report an index against the first index that covers it.
 			break
 		}
 	}
