@@ -22,7 +22,7 @@ var initVariable = regexp.MustCompile(`^env:[A-Za-z_][A-Za-z0-9_]*$`)
 type initField struct{ label, hint, value string }
 
 // The wizard edits a private draft. Only explicit confirmation copies it back;
-// initialize remains the sole registration and verification path (AZ-6).
+// initialize remains the sole registration and verification path (AZ-7, AZ-8, AZ-9).
 type initWizard struct {
 	connectionEditor                         initConnectionEditor
 	draftConnections                         map[string]string
@@ -87,8 +87,14 @@ func (m *initWizard) loadField() {
 	m.scroll = 0
 	m.connectionChecked = false
 	if m.step >= len(m.fields) {
-		entries, err := os.ReadDir(m.fields[6].value)
-		m.hasExistingSchema = err == nil && len(entries) > 0
+		reuse, err := initSchemaReuse(m.fields[6].value)
+		if err != nil {
+			m.step = 6
+			m.loadField()
+			m.err = err.Error()
+			return
+		}
+		m.hasExistingSchema = reuse
 		m.input.Blur()
 		return
 	}
@@ -217,9 +223,6 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.fields[m.step].value = m.input.Value()
 				}
 				m.step--
-				if m.step == 4 && !m.explicitNamespaces {
-					m.step = 3
-				}
 				m.err = ""
 				m.loadField()
 			}
@@ -369,10 +372,10 @@ func (m *initWizard) contentView() string {
 			b.WriteString(wrap.Render(m.notice) + "\n\n")
 		}
 		b.WriteString(bold.Render("Your database") + "\n")
-		b.WriteString(wrap.Render(m.fields[1].value+" · "+m.fields[0].value+" · "+m.fields[2].value) + "\n")
+		b.WriteString(wrap.Render(initTerminalText(m.fields[1].value+" · "+m.fields[0].value+" · "+m.fields[2].value)) + "\n")
 		b.WriteString(wrap.Render("Namespaces: "+initTerminalText(m.fields[5].value)) + "\n\n")
 		b.WriteString(bold.Render("Your schema files") + "\n")
-		b.WriteString(wrap.Render(m.fields[6].value+" · profile "+m.fields[7].value) + "\n\n")
+		b.WriteString(wrap.Render(initTerminalText(m.fields[6].value+" · profile "+m.fields[7].value)) + "\n\n")
 		b.WriteString(bold.Render("Connections") + "\n")
 		b.WriteString(wrap.Render("Application: "+initConnectionLabel(m.fields[3].value)) + "\n")
 		if m.integrated {

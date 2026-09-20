@@ -2,6 +2,8 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -60,6 +62,7 @@ func TestInitWizardReviewExistingFilesAndCancel(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "users.sql")
 	require.NoError(t, os.WriteFile(path, []byte("existing"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app\ntype: postgres\n"), 0600))
 	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 	m.step = len(m.fields)
 	m.loadField()
@@ -408,4 +411,101 @@ func TestInitRejectsUnrelatedFilesBeforeReview(t *testing.T) {
 	require.Contains(t, m.err, "schemabot.yaml")
 	require.Contains(t, m.err, root)
 	require.NotContains(t, m.err, ".schemabot-init-")
+}
+
+func TestInitMissingInputsJSONUsesErrorObject(t *testing.T) {
+	cmd := InitCmd{JSON: true}
+	output := captureStdout(func() {
+		require.ErrorIs(t, cmd.collectInputsWithTerminalState(t.Context(), &Globals{}, false, false), ErrSilent)
+	})
+	var response struct {
+		Error   struct{ Code, Message string }
+		Missing []string
+	}
+	require.NoError(t, json.Unmarshal([]byte(output), &response))
+	require.Equal(t, "missing_inputs", response.Error.Code)
+	require.NotEmpty(t, response.Error.Message)
+	require.Contains(t, response.Missing, "database")
+}
+
+func TestInitWizardChecksFolderBeforeReviewAndKeepsStateStepReachable(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitkeep"), nil, 0644))
+	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
+	m.step = len(m.fields)
+	m.loadField()
+	require.Equal(t, 6, m.step)
+	require.Contains(t, m.err, "placeholder")
+	require.NotContains(t, m.View(), "verify them and keep your edits")
+	require.FileExists(t, filepath.Join(root, ".gitkeep"))
+	m.step = 5
+	m.explicitNamespaces = false
+	m.loadField()
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, 4, m.step)
+}
+
+type initBrokenTerminal struct{ started <-chan struct{} }
+
+func (r initBrokenTerminal) Read([]byte) (int, error) {
+	<-r.started
+	return 0, errors.New("terminal failed")
+}
+
+func TestInitTerminalFailureJoinsCleanup(t *testing.T) {
+	started, cleaned := make(chan struct{}), make(chan struct{})
+	_, err := runInitProgress(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+		defer close(cleaned)
+		close(started)
+		<-ctx.Done()
+		return nil, errors.New("initialization incomplete; runtime registration is retained for retry")
+	}, tea.WithInput(initBrokenTerminal{started: started}), tea.WithOutput(io.Discard), tea.WithoutRenderer())
+	require.ErrorContains(t, err, "terminal failed")
+	require.ErrorContains(t, err, "runtime registration is retained for retry")
+	select {
+	case <-cleaned:
+	default:
+		t.Fatal("terminal returned before cleanup")
+	}
+}
+
+type initStartupFailure struct{}
+
+func (initStartupFailure) Run() (tea.Model, error) { return nil, errors.New("terminal startup failed") }
+func (initStartupFailure) Kill()                   {}
+func (initStartupFailure) Send(tea.Msg)            {}
+
+func TestInitTerminalStartupFailureDoesNotInitialize(t *testing.T) {
+	called := false
+	_, err := runInitProgressProgram(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+		called = true
+		return nil, nil
+	}, func(tea.Model) initProgressProgram { return initStartupFailure{} })
+	require.ErrorContains(t, err, "terminal startup failed")
+	require.NotErrorIs(t, err, context.Canceled)
+	require.False(t, called, "setup must not run when the terminal fails before Init")
+}
+
+func TestInitCancelledBeforeWorkReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	called := false
+	result, err := runInitProgress(ctx, func(context.Context, func(string)) (*initResult, error) {
+		called = true
+		return &initResult{}, nil
+	}, tea.WithInput(nil), tea.WithOutput(io.Discard), tea.WithoutRenderer())
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, result)
+	require.False(t, called)
+}
+
+func TestInitReviewEscapesFlagValues(t *testing.T) {
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = len(m.fields)
+	for _, i := range []int{0, 1, 2, 3, 4, 5, 6, 7} {
+		m.fields[i].value = "value\x1b[2J"
+	}
+	view := m.View()
+	require.NotContains(t, view, "\x1b[2J")
+	require.Contains(t, view, `\x1b[2J`)
 }

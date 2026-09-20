@@ -69,11 +69,14 @@ func TestInitEngines(t *testing.T) {
 			missingOutput, missingErr := run("init", "--non-interactive", "--json")
 			require.Error(t, missingErr)
 			var missing struct {
-				Error   string   `json:"error"`
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
 				Missing []string `json:"missing"`
 			}
 			require.NoError(t, json.Unmarshal(missingOutput, &missing))
-			require.Equal(t, "missing_inputs", missing.Error)
+			require.Equal(t, "missing_inputs", missing.Error.Code)
 			require.Contains(t, missing.Missing, "database")
 			args := []string{"init", "--database", "app", "--environment", "development", "--type", engine, "--dsn", "env:INIT_TARGET", "--storage-dsn", "env:INIT_STORAGE", "--schema-dir", root, "--namespace", namespace, "--profile", "project", "--json"}
 			if setup.integrated {
@@ -93,7 +96,7 @@ func TestInitEngines(t *testing.T) {
 				execSQL(t, db, "CREATE DATABASE schemabot")
 				out, err := run(defaultArgs...)
 				require.Error(t, err, string(out))
-				require.Contains(t, string(out), "may already exist")
+				require.Contains(t, string(out), "already exists")
 				require.NoFileExists(t, filepath.Join(manager.Dir, "runtime.yaml"))
 				execSQL(t, db, "DROP DATABASE schemabot")
 			}
@@ -146,10 +149,11 @@ func TestInitEngines(t *testing.T) {
 			require.NoError(t, os.WriteFile(schemaPath, edited, 0600))
 			output, err = run(args...)
 			require.Error(t, err, string(output))
-			require.Contains(t, string(output), "existing files were preserved")
+			require.Contains(t, string(output), "still produce schema changes")
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
+			// Existing schema files are verified automatically, preserving harmless comments.
 			// Reuse must reject a real difference without changing the user's files.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.Error(t, err, string(output))
@@ -157,6 +161,9 @@ func TestInitEngines(t *testing.T) {
 			require.FileExists(t, filepath.Join(root, namespace, "notes.sql"))
 			// Explicit reuse accepts harmless formatting/comments without replacing files.
 			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))
+			output, err = run(args...)
+			require.NoError(t, err, string(output))
+			// The explicit flag remains supported for scripted callers.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.NoError(t, err, string(output))
 			after, err = os.ReadFile(schemaPath)

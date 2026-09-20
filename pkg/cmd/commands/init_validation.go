@@ -40,8 +40,8 @@ func initSchemaReuse(path string) (bool, error) {
 	if len(entries) == 0 {
 		return false, nil
 	}
-	if _, err := LoadCLIConfig(path); err != nil {
-		return false, fmt.Errorf("choose an empty folder or a directory with a valid schemabot.yaml: %w", err)
+	if err := validateInitSchemaDestination(path); err != nil {
+		return false, fmt.Errorf("choose an empty folder or remove placeholder files yourself before retrying; your existing files are preserved: %w", err)
 	}
 	return true, nil
 }

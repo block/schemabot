@@ -36,7 +36,7 @@ type InitCmd struct {
 	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE or file:/absolute/path; startup initializes SchemaBot metadata tables"`
 	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
 	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
-	Runtime        string       `default:"local" hidden:"" help:"Local runtime identity"`
+	Runtime        string       `default:"local" help:"Local runtime identity"`
 	JSON           bool         `name:"json" help:"Return the verified setup result as JSON"`
 }
 
@@ -110,14 +110,13 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if existing, ok := cfg.Profiles[profile]; ok && !reflect.DeepEqual(existing, client.Profile{LocalRuntime: cmd.Runtime}) {
 		return nil, fmt.Errorf("profile %q already has a different connection; choose another --profile", profile)
 	}
-	if _, err := initSchemaReuse(cmd.SchemaDir); err != nil {
-		return nil, err
-	}
-	root, err := filepath.Abs(cmd.SchemaDir)
+	reuse, err := initSchemaReuse(cmd.SchemaDir)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateInitSchemaDestination(root); err != nil {
+	cmd.ReuseSchema = cmd.ReuseSchema || reuse
+	root, err := filepath.Abs(cmd.SchemaDir)
+	if err != nil {
 		return nil, err
 	}
 	// Stage beside the destination so publication remains an atomic rename.
@@ -347,15 +346,15 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 	return result, err
 }
 
+func (cmd *InitCmd) reportProgress(message string) {
+	if cmd.progress != nil {
+		cmd.progress(message)
+	}
+}
+
 func retainedInitError(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return fmt.Errorf("setup cancelled; runtime registration is retained for retry: %w", err)
 	}
 	return fmt.Errorf("initialization incomplete; runtime registration is retained for retry: %w", err)
-}
-
-func (cmd *InitCmd) reportProgress(message string) {
-	if cmd.progress != nil {
-		cmd.progress(message)
-	}
 }

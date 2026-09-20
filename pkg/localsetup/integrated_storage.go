@@ -3,10 +3,14 @@ package localsetup
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/block/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/mysqlconn"
@@ -51,10 +55,33 @@ func PrepareIntegratedStorage(ctx context.Context, manager localruntime.Manager,
 		return fmt.Errorf("could not open the application connection")
 	}
 	defer utils.CloseAndLog(db)
+	if err := db.PingContext(ctx); err != nil {
+		return &setupConnectionError{message: "could not connect to your application server; check the connection and try again", cause: err}
+	}
 	// Deliberately omit IF NOT EXISTS: an existing database may belong to someone
 	// else. Users can explicitly connect to it through standalone setup instead.
 	if _, err := db.ExecContext(ctx, "CREATE DATABASE schemabot"); err != nil {
-		return &setupConnectionError{message: "could not create the schemabot database; it may already exist, or this user may lack permission to create databases. Choose standalone to provide an existing state connection", cause: err}
+		return integratedStorageCreationError(err)
 	}
 	return nil
+}
+
+func integratedStorageCreationError(err error) error {
+	message := "could not create the schemabot database"
+	var my *mysql.MySQLError
+	var pg *pgconn.PgError
+	exists, denied := false, false
+	if errors.As(err, &my) {
+		exists = my.Number == 1007
+		denied = my.Number == 1044 || my.Number == 1045 || my.Number == 1142
+	} else if errors.As(err, &pg) {
+		exists = pg.Code == "42P04"
+		denied = pg.Code == "42501"
+	}
+	if exists {
+		message = "the schemabot database already exists, possibly from an earlier setup attempt; if it is yours, choose standalone and connect to it to continue. Existing databases are never adopted automatically"
+	} else if denied {
+		message = "this user cannot create the schemabot database; ask for a separate state database, then choose standalone to connect to it"
+	}
+	return &setupConnectionError{message: message, cause: err}
 }

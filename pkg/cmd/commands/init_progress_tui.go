@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -71,20 +72,65 @@ func (cmd *InitCmd) initializeWithUI(ctx context.Context, g *Globals) (*initResu
 	if !cmd.interactive {
 		return cmd.initialize(ctx, g)
 	}
+	return runInitProgress(ctx, func(runCtx context.Context, report func(string)) (*initResult, error) {
+		cmd.progress = report
+		defer func() { cmd.progress = nil }()
+		return cmd.initialize(runCtx, g)
+	}, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+}
+
+type initProgressProgram interface {
+	Run() (tea.Model, error)
+	Send(tea.Msg)
+	Kill()
+}
+
+func runInitProgress(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), options ...tea.ProgramOption) (*initResult, error) {
+	options = append(options, tea.WithoutSignalHandler())
+	return runInitProgressProgram(ctx, initialize, func(model tea.Model) initProgressProgram {
+		return tea.NewProgram(model, options...)
+	})
+}
+
+func runInitProgressProgram(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), newProgram func(tea.Model) initProgressProgram) (*initResult, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	m := &initProgress{spinner: s, cancel: cancel, width: 72}
-	// The program stays alive until initialization returns, including after cancel,
-	// so cleanup finishes before the terminal is returned to the shell.
-	p := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout), tea.WithoutSignalHandler())
-	cmd.progress = func(stage string) { p.Send(initStageMsg(stage)) }
-	defer func() { cmd.progress = nil }()
-	m.run = func() tea.Msg { r, err := cmd.initialize(runCtx, g); return initFinishedMsg{r, err} }
-	if _, err := p.Run(); err != nil {
-		return nil, err
+	p := newProgram(m)
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	var outcome initFinishedMsg
+	initialized := false
+	// Own cleanup outside Bubble Tea, but begin work only after its Init
+	// command runs. A terminal startup failure must not register a runtime.
+	go func() {
+		defer close(finished)
+		select {
+		case <-runCtx.Done():
+			outcome.err = runCtx.Err()
+			return
+		case <-started:
+		}
+		if err := runCtx.Err(); err != nil {
+			outcome.err = err
+			return
+		}
+		initialized = true
+		outcome.result, outcome.err = initialize(runCtx, func(stage string) { p.Send(initStageMsg(stage)) })
+	}()
+	m.run = func() tea.Msg { close(started); <-finished; return outcome }
+	_, runErr := p.Run()
+	cancel()
+	p.Kill()
+	<-finished
+	if runErr != nil {
+		if !initialized && ctx.Err() == nil {
+			return nil, fmt.Errorf("run setup display: %w", runErr)
+		}
+		return outcome.result, errors.Join(fmt.Errorf("run setup display: %w", runErr), outcome.err)
 	}
 	if m.finished == nil {
 		return nil, fmt.Errorf("setup interrupted")
