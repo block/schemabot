@@ -472,19 +472,28 @@ type NamespacePlanData struct {
 	// keys and the rendered VSchema diff apply-time display shows.
 	Metadata map[string]string `json:"metadata,omitempty"`
 
-	// WithheldTables are the live tables the plan's ignore_tables config kept
-	// out of the planner's view, and which are therefore absent from
-	// OriginalFiles. A re-plan of a stored plan — a rollback, a resume — must
-	// withhold the same tables, or the tables it never captured would come back
-	// as DROP TABLE proposals, the inverse of the exclusion the repository
-	// asked for.
+	// IgnoreTables is the ignore_tables config the plan was reviewed under: the
+	// entries the planner was asked to withhold, not the subset that matched a
+	// live table here. A re-plan of a stored plan — a rollback, a resume, a
+	// member's drift check — must be asked to withhold the same entries, or a
+	// table this plan never captured comes back as a DROP TABLE proposal, the
+	// inverse of the exclusion the repository asked for.
+	//
+	// The whole list is kept rather than the matched subset because the plan
+	// travels to targets this one never read. An entry that matches nothing on
+	// the deployment that planned still names a table a member holds, and a
+	// member re-planning under the narrower subset would propose dropping it
+	// and then fail its own drift check against a plan that can never match.
+	//
+	// It is the plan's record and not the repository's live config, so editing
+	// schemabot.yaml between plan and apply cannot move an apply-time verdict.
 	//
 	// The exclusions are the plan's, not the namespace's: ignore_tables applies
 	// to every namespace a plan covers, and plan_data is namespace-keyed with
 	// no plan-level slot, so every stored namespace carries the same list and
-	// Plan.WithheldTables reads their union. A re-plan that rebuilds only some
+	// Plan.IgnoreTables reads their union. A re-plan that rebuilds only some
 	// of the plan's namespaces therefore still withholds all of them.
-	WithheldTables []string `json:"withheld_tables,omitempty"`
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
@@ -596,17 +605,13 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 	return result
 }
 
-// WithheldTables returns, in sorted order, every live table the plan's
-// ignore_tables config withheld from the planner, across all namespaces. A
-// re-plan of a stored plan passes these back so the tables it withheld once
-// stay withheld: they were never captured in the plan's original files, so a
-// re-plan that saw them would propose dropping them.
-// RecordWithheldTables stores the plan's ignore_tables exclusions on every
-// namespace it carries, so a re-plan of this plan — a rollback, a resume —
-// withholds the same tables instead of proposing to drop the tables the plan
-// never captured. plan_data is namespace-keyed with no plan-level slot, which
-// is why every namespace carries the whole list; WithheldTables reads it back.
-func (p *Plan) RecordWithheldTables(tables []string) {
+// RecordIgnoreTables stores the ignore_tables config the plan was reviewed
+// under on every namespace it carries, so a re-plan of this plan — a rollback,
+// a resume, a member's drift check — is asked to withhold the same entries
+// instead of proposing to drop the tables the plan never captured. plan_data is
+// namespace-keyed with no plan-level slot, which is why every namespace carries
+// the whole list; IgnoreTables reads it back.
+func (p *Plan) RecordIgnoreTables(tables []string) {
 	if p == nil || len(tables) == 0 {
 		return
 	}
@@ -617,11 +622,16 @@ func (p *Plan) RecordWithheldTables(tables []string) {
 		if nsData == nil {
 			continue
 		}
-		nsData.WithheldTables = slices.Clone(normalized)
+		nsData.IgnoreTables = slices.Clone(normalized)
 	}
 }
 
-func (p *Plan) WithheldTables() []string {
+// IgnoreTables returns, in sorted order, the ignore_tables entries the plan was
+// reviewed under, across all namespaces. A re-plan of a stored plan passes
+// these back so the tables this plan withheld stay withheld: they were never
+// captured in the plan's original files, so a re-plan that saw them would
+// propose dropping them.
+func (p *Plan) IgnoreTables() []string {
 	if p == nil {
 		return nil
 	}
@@ -630,7 +640,7 @@ func (p *Plan) WithheldTables() []string {
 		if nsData == nil {
 			continue
 		}
-		tables = append(tables, nsData.WithheldTables...)
+		tables = append(tables, nsData.IgnoreTables...)
 	}
 	sort.Strings(tables)
 	return slices.Compact(tables)

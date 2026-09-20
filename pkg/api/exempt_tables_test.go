@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/stretchr/testify/assert"
@@ -61,10 +63,10 @@ func TestPlanResponseWithheldTables(t *testing.T) {
 
 // The repository's ignore_tables travels to the data plane on the plan request
 // — the tables live on the target, so the planner is the only thing that can
-// withhold them — and the tables it reports withholding are recorded on the
-// stored plan, so a rollback or resume re-plan withholds the same ones instead
-// of proposing to drop the tables the plan never captured.
-func TestExecutePlanCarriesIgnoreTablesAndRecordsWhatWasWithheld(t *testing.T) {
+// withhold them — and the reviewed list is recorded on the stored plan, so a
+// rollback, a resume, or a member's drift check is asked for the same
+// exclusions instead of proposing to drop the tables the plan never captured.
+func TestExecutePlanCarriesIgnoreTablesAndRecordsTheReviewedConfig(t *testing.T) {
 	plans := &capturingPlanStore{}
 	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
 		PlanId: "plan-ignore-tables",
@@ -114,8 +116,10 @@ func TestExecutePlanCarriesIgnoreTablesAndRecordsWhatWasWithheld(t *testing.T) {
 		"only the config's own exclusions answer whether a configured entry matched anything")
 
 	require.NotNil(t, plans.created)
-	assert.Equal(t, []string{"flyway_schema_history"}, plans.created.WithheldTables(),
-		"the re-plan of this stored plan withholds the same tables")
+	assert.Equal(t, []string{"flyway_schema_history", "never_existed"}, plans.created.IgnoreTables(),
+		"the stored plan keeps the reviewed config, not the subset that matched here: "+
+			"an entry this target lacks still names a table a member target holds, and a member "+
+			"re-planning under the narrower subset would propose dropping it")
 }
 
 // An entry that withheld nothing while the plan proposes dropping the very
@@ -209,4 +213,122 @@ func TestExecutePlanKeepsPlanningWhenAnUnmatchedEntryIsNotDropped(t *testing.T) 
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.NotNil(t, plans.created, "the plan is stored and the unmatched entry is reported, not refused")
+}
+
+// rollbackSourcePlanStore answers the rollback's source-plan lookup and
+// captures the rollback plan it stores.
+type rollbackSourcePlanStore struct {
+	capturingPlanStore
+	source *storage.Plan
+}
+
+func (s *rollbackSourcePlanStore) GetByID(context.Context, int64) (*storage.Plan, error) {
+	return s.source, nil
+}
+
+// newRollbackExemptService wires a service whose rollback re-plan is answered
+// by resp, against a completed apply whose source plan was reviewed under an
+// ignore_tables config.
+func newRollbackExemptService(plans storage.PlanStore, resp *ternv1.PlanResponse) (*Service, *storage.Apply) {
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply_rollback", PlanID: 10,
+		Database: "payments", DatabaseType: storage.DatabaseTypeMySQL,
+		Repository: "org/repo", PullRequest: 7, Environment: "staging",
+		Deployment: DefaultDeployment, State: state.Apply.Completed,
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type:         storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
+			},
+		},
+		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
+	}
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": &mockTernClient{planResp: resp},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return svc, apply
+}
+
+// rollbackSourcePlan is a completed apply's plan, reviewed under an
+// ignore_tables config. Its captured original files never included the
+// withheld table, which is why the rollback must be asked to withhold it again.
+func rollbackSourcePlan() *storage.Plan {
+	plan := &storage.Plan{
+		ID: 10, PlanIdentifier: "plan_source", Database: "payments",
+		DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+		Deployment: DefaultDeployment, Target: "payments-staging-target",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				OriginalFiles:         map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"},
+				OriginalFilesCaptured: true,
+			},
+		},
+	}
+	plan.RecordIgnoreTables([]string{"flyway_schema_history"})
+	return plan
+}
+
+// A rollback re-plans the source plan's captured files against the live target,
+// so it needs the same exclusions — and its own stored plan needs them too: a
+// resume or a further rollback reads them back off that row, and a row that
+// forgot them re-plans the withheld tables as drops.
+func TestExecuteRollbackPlanCarriesAndRecordsTheReviewedIgnoreTables(t *testing.T) {
+	plans := &rollbackSourcePlanStore{source: rollbackSourcePlan()}
+	svc, apply := newRollbackExemptService(plans, &ternv1.PlanResponse{
+		PlanId: "plan_rollback",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "payments",
+			TableChanges: []*ternv1.TableChange{{
+				TableName: "users", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				Ddl: "ALTER TABLE `users` DROP COLUMN `note`",
+			}},
+		}},
+		ExemptTables: []*ternv1.ExemptTables{{
+			Namespace: "payments",
+			Tables:    []string{"flyway_schema_history"},
+			Reason:    apitypes.ExemptReasonIgnoreTables,
+		}},
+	})
+
+	resp, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	client := svc.ternClients[DefaultDeployment+"/staging"].(*mockTernClient)
+	require.NotNil(t, client.planReq)
+	assert.Equal(t, []string{"flyway_schema_history"}, client.planReq.GetIgnoreTables(),
+		"the rollback re-plan withholds what the source plan was reviewed under")
+
+	require.NotNil(t, plans.created)
+	assert.Equal(t, []string{"flyway_schema_history"}, plans.created.IgnoreTables(),
+		"the rollback's own stored plan keeps them for a re-plan of itself")
+}
+
+// The refusal that protects a reviewed plan protects a rollback plan the same
+// way. A data plane that discards the exclusion answers a rollback with a drop
+// of the withheld table, and storing that plan would surface it for review as
+// an ordinary drop.
+func TestExecuteRollbackPlanRefusesADropOfAWithheldTable(t *testing.T) {
+	plans := &rollbackSourcePlanStore{source: rollbackSourcePlan()}
+	svc, apply := newRollbackExemptService(plans, &ternv1.PlanResponse{
+		PlanId: "plan_rollback_unhonored",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "payments",
+			TableChanges: []*ternv1.TableChange{{
+				TableName: "flyway_schema_history", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+				Ddl: "DROP TABLE `flyway_schema_history`",
+			}},
+		}},
+	})
+
+	_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ignore_tables withholds")
+	assert.Contains(t, err.Error(), "flyway_schema_history")
+	assert.True(t, IsTerminalControlError(err),
+		"the same data plane answers every retry the same way, so the failure must not be re-driven")
+	assert.Nil(t, plans.created, "a rollback plan that would drop a withheld table is not stored")
 }

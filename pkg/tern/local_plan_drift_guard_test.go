@@ -117,7 +117,7 @@ func TestDriftGuard_WithheldTablesTravelToTheReplan(t *testing.T) {
 // check that let it through. A rollback or resume on this deployment reads what
 // was withheld back off the stored plan, and a plan that forgot it re-plans the
 // withheld tables as drops.
-func TestDriftGuard_MaterializedPlanRecordsWithheldTables(t *testing.T) {
+func TestDriftGuard_MaterializedPlanRecordsIgnoreTables(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 11}
 	var shown []string
 	c := newBookkeepingTableDriftClient(store, &shown)
@@ -132,7 +132,7 @@ func TestDriftGuard_MaterializedPlanRecordsWithheldTables(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, store.created)
-	assert.Equal(t, []string{bookkeepingTable}, store.created.WithheldTables(),
+	assert.Equal(t, []string{bookkeepingTable}, store.created.IgnoreTables(),
 		"a later re-plan on this deployment withholds what the reviewed plan withheld")
 }
 

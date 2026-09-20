@@ -863,39 +863,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
-	// A configured entry that withheld nothing is a typo, a case mismatch, or a
-	// stale entry for a table that no longer exists — the table it names is
-	// fully reconciled, so surface it rather than letting the config imply an
-	// exclusion that is not happening.
-	if unmatched := schema.UnmatchedIgnoreTables(req.IgnoreTables, withheldTablesFromProto(resp.ExemptTables)); len(unmatched) > 0 {
-		s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
-			"database", req.Database,
-			"environment", req.Environment,
-			"deployment", deployment,
-			"repository", req.Repository,
-			"pull_request", prInt,
-			"unmatched_entries", unmatched,
-		)
-		// An entry the plan did not withhold and whose exact name it proposes
-		// dropping is not a typo: the target holds that table, so the exclusion
-		// reached a data plane that did not apply it — one that predates the
-		// field and discarded it. Every other unmatched shape names a table
-		// that is not there to drop, so this one is unambiguous, and letting it
-		// through would turn a reviewed exclusion into the drop it was written
-		// to prevent.
-		if dropped := plannedDropsAmong(resp.Changes, unmatched); len(dropped) > 0 {
-			s.logger.Error("plan proposes dropping tables that ignore_tables withholds",
-				"database", req.Database,
-				"environment", req.Environment,
-				"deployment", deployment,
-				"repository", req.Repository,
-				"pull_request", prInt,
-				"tables", dropped,
-			)
-			return nil, nil, fmt.Errorf(
-				"plan for deployment %q proposes dropping table(s) %s that ignore_tables withholds: the target holds them, so the exclusion did not reach the planner and the plan is refused rather than reviewed as a drop; upgrade the deployment's data plane to a build that honors ignore_tables",
-				deployment, strings.Join(dropped, ", "))
-		}
+	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
+		return nil, nil, err
 	}
 
 	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
@@ -979,6 +948,57 @@ type storedPlanRoute struct {
 	Target       string
 }
 
+// refuseDropsOfWithheldTables refuses a plan that proposes dropping a table the
+// request asked to withhold. Every path that turns a PlanRequest into a stored
+// plan runs it, the rollback re-plan included: a rollback is planned against
+// the same target by the same data plane, so a build that discards the
+// exclusion answers it the same way, and the refusal is only worth anything
+// where the plan would otherwise be stored and surfaced for review.
+//
+// A configured entry that withheld nothing is ordinarily a typo, a case
+// mismatch, or a stale entry for a table that no longer exists — the table it
+// names is fully reconciled, so it is surfaced as a warning rather than letting
+// the config imply an exclusion that is not happening. But an entry the plan
+// did not withhold and whose exact name it proposes dropping is not a typo: the
+// target holds that table, so the exclusion reached a data plane that did not
+// apply it — one that predates the field and discarded it. Every other
+// unmatched shape names a table that is not there to drop, so this one is
+// unambiguous, and letting it through would turn a reviewed exclusion into the
+// drop it was written to prevent.
+func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.PlanResponse, deployment string) error {
+	unmatched := schema.UnmatchedIgnoreTables(req.IgnoreTables, withheldTablesFromProto(resp.ExemptTables))
+	if len(unmatched) == 0 {
+		return nil
+	}
+	var prInt int
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
+	}
+	s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
+		"database", req.Database,
+		"environment", req.Environment,
+		"deployment", deployment,
+		"repository", req.Repository,
+		"pull_request", prInt,
+		"unmatched_entries", unmatched,
+	)
+	dropped := plannedDropsAmong(resp.Changes, unmatched)
+	if len(dropped) == 0 {
+		return nil
+	}
+	s.logger.Error("plan proposes dropping tables that ignore_tables withholds",
+		"database", req.Database,
+		"environment", req.Environment,
+		"deployment", deployment,
+		"repository", req.Repository,
+		"pull_request", prInt,
+		"tables", dropped,
+	)
+	return fmt.Errorf(
+		"plan for deployment %q proposes dropping table(s) %s that ignore_tables withholds: the target holds them, so the exclusion did not reach the planner and the plan is refused rather than reviewed as a drop; upgrade the deployment's data plane to a build that honors ignore_tables",
+		deployment, strings.Join(dropped, ", "))
+}
+
 func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
 	prInt := 0
 	if req.PullRequest != nil {
@@ -1016,7 +1036,7 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 		HeadSHA:        headSHA,
 		CreatedAt:      time.Now(),
 	}
-	storedPlan.RecordWithheldTables(withheldTablesFromProto(resp.ExemptTables))
+	storedPlan.RecordIgnoreTables(req.IgnoreTables)
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
 		return fmt.Errorf("store plan: %w", err)
 	}
@@ -1806,20 +1826,23 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		SchemaFiles: schemaFiles,
 		Repository:  apply.Repository,
 		PullRequest: &prNumber,
-	}
-	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Database:    req.Database,
-		Type:        req.Type,
-		SchemaFiles: req.SchemaFiles,
-		Repository:  req.Repository,
-		PullRequest: prNumber,
-		Environment: req.Environment,
-		Target:      plan.Target,
 		// The rollback restores the schema the source plan captured, and that
 		// capture never included the tables the plan's ignore_tables withheld.
 		// Withholding them again is what keeps the rollback from proposing to
-		// drop tables the repository asked SchemaBot to leave alone.
-		IgnoreTables: plan.WithheldTables(),
+		// drop tables the repository asked SchemaBot to leave alone, and
+		// carrying them on the request is what puts them on the rollback's own
+		// stored plan, so a re-plan of *that* plan withholds them too.
+		IgnoreTables: plan.IgnoreTables(),
+	}
+	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Database:     req.Database,
+		Type:         req.Type,
+		SchemaFiles:  req.SchemaFiles,
+		Repository:   req.Repository,
+		PullRequest:  prNumber,
+		Environment:  req.Environment,
+		Target:       plan.Target,
+		IgnoreTables: req.IgnoreTables,
 	})
 	if err != nil {
 		// Mirror ExecutePlanProto's transport classification: only remote
@@ -1834,6 +1857,9 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 				Err:        err,
 			}
 		}
+		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
+	}
+	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
 		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)

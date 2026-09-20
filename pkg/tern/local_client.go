@@ -1600,7 +1600,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		HeadSHA:        req.HeadSha,
 		CreatedAt:      time.Now(),
 	}
-	plan.RecordWithheldTables(withheldTablesFromEngine(result.ExemptTables))
+	plan.RecordIgnoreTables(req.GetIgnoreTables())
 	c.logger.Info("Plan: storing plan",
 		"plan_id", result.PlanID,
 		"ddl_change_count", len(ddlChanges),
@@ -2159,11 +2159,12 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 		Namespaces:     namespaces,
 		CreatedAt:      time.Now(),
 	}
-	// The dispatch's record of what the reviewed plan withheld has to survive on
-	// this deployment's own row. The drift check above was handed it directly,
-	// but a later rollback or resume here reads it back off the stored plan, and
-	// a plan that forgot its exclusions re-plans the withheld tables as drops.
-	plan.RecordWithheldTables(req.GetIgnoreTables())
+	// The dispatch's record of the ignore_tables the plan was reviewed under has
+	// to survive on this deployment's own row. The drift check above was handed
+	// it directly, but a later rollback or resume here reads it back off the
+	// stored plan, and a plan that forgot its exclusions re-plans the withheld
+	// tables as drops.
+	plan.RecordIgnoreTables(req.GetIgnoreTables())
 	c.logger.Info("Apply: materializing plan from dispatch request",
 		"plan_id", req.PlanId,
 		"database", c.config.Database,
@@ -2258,26 +2259,6 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 		}
 	}
 	return namespaces, allShardPlans
-}
-
-// withheldTablesFromEngine returns the live tables the plan withheld on the
-// repository's instruction, so the stored plan can record them and a re-plan
-// — a rollback, a resume — withholds the same tables instead of proposing to
-// drop the tables the plan never captured.
-//
-// Only the ignore_tables exemption counts. An engine's own naming conventions
-// are applied on every plan unconditionally, so a re-plan reproduces those
-// without being told.
-func withheldTablesFromEngine(exempt []*engine.ExemptTables) []string {
-	var withheld []string
-	for _, group := range exempt {
-		if group == nil || group.Reason != engine.ExemptReasonIgnoreTables {
-			continue
-		}
-		withheld = append(withheld, group.Tables...)
-	}
-	slices.Sort(withheld)
-	return slices.Compact(withheld)
 }
 
 // namespacesFromApplyRequest rebuilds per-namespace plan data from a dispatch
