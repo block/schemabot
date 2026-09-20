@@ -508,3 +508,76 @@ func TestPlanResponse_RenderedTablesKeepsUnshardedNamespacesBesideShardedOnes(t 
 	assert.Equal(t, "ALTER TABLE users ADD COLUMN b INT", tables[1].DDL)
 	assert.Same(t, unsharded, tables[2])
 }
+
+func TestPlanResponse_RenderedTablesSkipsAChangeWithNoDDL(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace:    "commerce",
+			TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "create"}},
+		}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "create"}}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{{TableName: "orders", DDL: "", ChangeType: "alter"}}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 1)
+	assert.Equal(t, "users", tables[0].TableName)
+}
+
+func TestPlanResponse_RenderedTablesDoesNotMergeChangesWithNoDDL(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{Namespace: "commerce"}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: "", ChangeType: "create"}}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{{TableName: "orders", DDL: "", ChangeType: "alter"}}},
+		},
+	}
+
+	assert.Empty(t, resp.RenderedTables())
+}
+
+func TestPlanResponse_RenderedTablesDedupesWithinANamespaceOnly(t *testing.T) {
+	stmt := "ALTER TABLE users ADD COLUMN a INT"
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "app_a", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+			{Namespace: "app_b", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+		},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "app_a", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+			{Namespace: "app_b", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 2)
+	assert.Equal(t, "app_a", tables[0].Namespace)
+	assert.Equal(t, "app_b", tables[1].Namespace)
+}
+
+func TestPlanResponse_RenderedTablesPreservesExplicitShardNamespace(t *testing.T) {
+	explicit := &TableChangeResponse{Namespace: "reported", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}
+	implicit := &TableChangeResponse{TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN a INT", ChangeType: "alter"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{Namespace: "grouped"}},
+		Shards:  []*ShardPlanResponse{{Namespace: "grouped", Shard: "-80", Changes: []*TableChangeResponse{explicit, implicit}}},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 2)
+	assert.Same(t, explicit, tables[0])
+	assert.Equal(t, "reported", tables[0].Namespace)
+	assert.NotSame(t, implicit, tables[1])
+	assert.Equal(t, "grouped", tables[1].Namespace)
+	assert.Empty(t, implicit.Namespace)
+}
+
+func TestPlanResponse_RenderedTablesHandlesNilInputs(t *testing.T) {
+	var nilResponse *PlanResponse
+	assert.Empty(t, nilResponse.RenderedTables())
+
+	resp := &PlanResponse{Changes: []*SchemaChangeResponse{nil, {Namespace: "app"}}}
+	assert.Empty(t, resp.RenderedTables())
+}

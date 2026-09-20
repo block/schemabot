@@ -786,29 +786,16 @@ func SummarizeChanges(data PlanCommentData) string {
 	counts := countStatementTypes(data.Changes, data.DatabaseType)
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
-	var parts []string
-	if counts.Created > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", counts.Created, pluralize("create", counts.Created)))
-	}
-	if counts.Altered > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", counts.Altered, pluralize("alter", counts.Altered)))
-	}
-	if counts.Dropped > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", counts.Dropped, pluralize("drop", counts.Dropped)))
-	}
-	// Mirrors the plan comment: unbucketed DDL in a mixed plan is named next
-	// to the typed counts so the Change column agrees with the comment.
-	if counts.Other > 0 && len(parts) > 0 {
-		parts = append(parts, fmt.Sprintf("%d other DDL %s", counts.Other, pluralize("statement", counts.Other)))
-	}
+	parts := ui.AssemblePlanSummary(counts, totalStatements,
+		func(count int, op string) string { return fmt.Sprintf("%d %s", count, pluralize(op, count)) },
+		func(count int, other bool) string {
+			prefix := ""
+			if other {
+				prefix = "other "
+			}
+			return fmt.Sprintf("%d %sDDL %s", count, prefix, pluralize("statement", count))
+		})
 	ddlSummary := strings.Join(parts, ", ")
-
-	// A plan with no create/alter/drop at all — only unbucketed DDL, or a
-	// dialect with no parser to classify it — reports the raw statement total
-	// so the Change column never implies "no changes".
-	if ddlSummary == "" && totalStatements > 0 {
-		ddlSummary = fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements))
-	}
 
 	if keyspacesWithVSchema > 0 && !data.IsMySQL {
 		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))

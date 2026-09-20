@@ -78,26 +78,40 @@ func (c *PlanCounts) AddOther() {
 // rawTotal, the caller's raw statement count, so it never reads as
 // "no changes".
 func PlanSummaryParts(counts PlanCounts, rawTotal int, bold bool) []string {
-	var parts []string
-	appendTablePart := func(count int, op string) {
-		if count == 0 {
-			return
-		}
+	tableClause := func(count int, op string) string {
 		formattedCount := fmt.Sprintf("%d", count)
 		if bold {
 			formattedCount = "**" + formattedCount + "**"
 		}
-		parts = append(parts, fmt.Sprintf("%s %s to %s", formattedCount, Pluralize("table", count), op))
+		return fmt.Sprintf("%s %s to %s", formattedCount, Pluralize("table", count), op)
 	}
+	ddlClause := func(count int, other bool) string {
+		prefix := ""
+		if other {
+			prefix = "other "
+		}
+		return fmt.Sprintf("%d %sDDL %s", count, prefix, Pluralize("statement", count))
+	}
+	return AssemblePlanSummary(counts, rawTotal, tableClause, ddlClause)
+}
 
-	appendTablePart(counts.Created, "create")
-	appendTablePart(counts.Altered, "alter")
-	appendTablePart(counts.Dropped, "drop")
+// AssemblePlanSummary applies the shared clause ordering and fallback rules
+// while allowing each surface to supply its own wording.
+func AssemblePlanSummary(counts PlanCounts, rawTotal int, tableClause func(int, string) string, ddlClause func(int, bool) string) []string {
+	var parts []string
+	for _, item := range []struct {
+		count int
+		op    string
+	}{{counts.Created, "create"}, {counts.Altered, "alter"}, {counts.Dropped, "drop"}} {
+		if item.count > 0 {
+			parts = append(parts, tableClause(item.count, item.op))
+		}
+	}
 	if counts.Other > 0 && len(parts) > 0 {
-		parts = append(parts, fmt.Sprintf("%d other DDL %s", counts.Other, Pluralize("statement", counts.Other)))
+		parts = append(parts, ddlClause(counts.Other, true))
 	}
 	if len(parts) == 0 && rawTotal > 0 {
-		parts = append(parts, fmt.Sprintf("%d DDL %s", rawTotal, Pluralize("statement", rawTotal)))
+		parts = append(parts, ddlClause(rawTotal, false))
 	}
 	return parts
 }

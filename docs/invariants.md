@@ -1166,7 +1166,8 @@ per-shard statements rather than the namespace-level collapse. The CLI and PR co
 those totals differently, but they report the same table-level operations and unclassified
 statement count. *Enforced:* the shared plan counter and summary renderer
 (`pkg/ui/plan_summary.go`); each surface's statement selection (`RenderedTables` in
-`pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`).
+`pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`), and the
+multi-environment CLI deduplication fingerprint (`planFingerprint` in `pkg/cmd/commands/plan.go`).
 
 ## Recovery (RC)
 

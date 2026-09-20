@@ -367,7 +367,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	}
 
 	var ddls []string
-	for _, tbl := range result.FlatTables() {
+	for _, tbl := range result.RenderedTables() {
 		ddls = append(ddls, tbl.DDL)
 	}
 	var vschemas []string

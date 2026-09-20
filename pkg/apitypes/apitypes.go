@@ -1053,12 +1053,17 @@ func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 // renders once. A namespace without shard rows contributes its namespace-level
 // changes as received. A shard-row change that omits its namespace is returned
 // with the namespace filled in, so a shard's change is never attributed to the
-// plan's default database.
+// plan's default database. A shard change with no DDL is not rendered because
+// both UX-6 selections must count only statements their surface can show.
+// Results mix aliases and copies; callers must not mutate them.
 //
 // The PR plan comment walks the same set from its rendered data
 // (keyspaceStatements in pkg/webhook/templates); the two selections must agree
 // for the summaries to.
 func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
+	if r == nil {
+		return nil
+	}
 	shardsByNamespace := make(map[string][]*ShardPlanResponse)
 	for _, sp := range r.Shards {
 		if sp == nil {
@@ -1080,7 +1085,7 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 		seen := make(map[string]struct{})
 		for _, sp := range shards {
 			for _, t := range sp.Changes {
-				if t == nil {
+				if t == nil || t.DDL == "" {
 					continue
 				}
 				if _, dup := seen[t.DDL]; dup {
