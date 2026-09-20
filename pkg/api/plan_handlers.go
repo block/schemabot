@@ -75,9 +75,8 @@ func (e *unsupportedPullSchemaError) Error() string {
 }
 
 // unsupportedLintDialectError reports a pull request that asked for linting on
-// a database whose dialect the schema linters cannot parse. Failing the
-// request is deliberate: silently returning zero violations would read as a
-// clean audit.
+// a database whose dialect has no schema-shape audit. Failing the request is
+// deliberate: silently returning zero violations would read as a clean audit.
 type unsupportedLintDialectError struct {
 	DatabaseType string
 }
@@ -285,13 +284,14 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
 	}
-	if req.Lint && schema.DialectForDatabaseType(resolvedTarget.DatabaseType) != schema.DialectMySQL {
+	dialect := schema.DialectForDatabaseType(resolvedTarget.DatabaseType)
+	if req.Lint && !pullLintSupported(dialect) {
 		lintErr := &unsupportedLintDialectError{DatabaseType: resolvedTarget.DatabaseType}
 		span.RecordError(lintErr)
 		span.SetStatus(otelcodes.Error, "lint dialect unsupported")
 		return nil, lintErr
 	}
-	namespaces, err := pullNamespaces(schema.DialectForDatabaseType(resolvedTarget.DatabaseType), req.Namespaces)
+	namespaces, err := pullNamespaces(dialect, req.Namespaces)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
@@ -396,13 +396,20 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		httpResp.App = dbConfig.App
 	}
 	if req.Lint {
-		if err := lintPulledNamespaces(httpResp); err != nil {
+		if err := lintPulledNamespaces(httpResp, dialect); err != nil {
 			span.RecordError(err)
 			span.SetStatus(otelcodes.Error, "lint pulled schema")
 			return nil, err
 		}
 	}
 	return httpResp, nil
+}
+
+// pullLintSupported reports whether a dialect has a schema-shape audit for
+// pulled tables: Spirit's linters for the MySQL family, the PostgreSQL audit
+// in pkg/lint for PostgreSQL.
+func pullLintSupported(dialect schema.Dialect) bool {
+	return dialect == schema.DialectMySQL || dialect == schema.DialectPostgres
 }
 
 // lintPulledNamespaces runs the schema-shape linters (primary key types,
@@ -413,35 +420,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 // a clean pull audit says the existing schema is well-shaped, not that any
 // particular change to it is safe. Results are sorted for a stable response
 // body regardless of table iteration order.
-func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
+func lintPulledNamespaces(resp *apitypes.PullSchemaResponse, dialect schema.Dialect) error {
 	linter := lint.New()
 	for name, ns := range resp.Namespaces {
-		// Every pulled table entry must be a CREATE TABLE statement. The
-		// linters silently pass over other statement kinds, so an entry of
-		// another kind would go unlinted and turn the audit into a partial
-		// result — fail the request instead.
-		for tableName, tableDDL := range ns.Tables {
-			stmtType, _, err := ddl.ClassifyStatement(tableDDL)
-			if err != nil {
-				return &unlintablePulledTableError{
-					Database:  resp.Database,
-					Namespace: name,
-					Table:     tableName,
-					Detail:    fmt.Sprintf("cannot be classified: %v", err),
-				}
-			}
-			if stmtType != ddl.StatementCreateTable {
-				return &unlintablePulledTableError{
-					Database:  resp.Database,
-					Namespace: name,
-					Table:     tableName,
-					Detail:    fmt.Sprintf("is a %s statement, expected CREATE TABLE", stmtType),
-				}
-			}
-		}
-		results, err := linter.LintSchema(ns.Tables)
+		results, err := lintPulledTables(linter, dialect, resp.Database, name, ns.Tables)
 		if err != nil {
-			return fmt.Errorf("lint pulled schema for database %q namespace %q: %w", resp.Database, name, err)
+			return err
 		}
 		violations := make([]*apitypes.LintViolationResponse, 0, len(results))
 		for _, r := range results {
@@ -468,6 +452,58 @@ func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
 		ns.Lint = violations
 	}
 	return nil
+}
+
+// lintPulledTables audits one namespace's tables with the dialect's linter.
+// Every pulled table entry must be a table definition the audit covers in
+// full; an entry of another kind would go unlinted and turn the audit into a
+// partial result, so it fails the request as an unlintablePulledTableError.
+func lintPulledTables(linter *lint.Linter, dialect schema.Dialect, database, namespace string, tables map[string]string) ([]lint.Result, error) {
+	switch dialect {
+	case schema.DialectPostgres:
+		results, err := linter.LintPostgresSchema(tables)
+		if unlintable, ok := errors.AsType[*lint.UnlintableTableError](err); ok {
+			return nil, &unlintablePulledTableError{
+				Database:  database,
+				Namespace: namespace,
+				Table:     unlintable.Table,
+				Detail:    unlintable.Detail,
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lint pulled schema for database %q namespace %q: %w", database, namespace, err)
+		}
+		return results, nil
+	case schema.DialectMySQL:
+		// Spirit's linters silently pass over statement kinds other than
+		// CREATE TABLE, so the kind is checked up front.
+		for tableName, tableDDL := range tables {
+			stmtType, _, err := ddl.ClassifyStatement(tableDDL)
+			if err != nil {
+				return nil, &unlintablePulledTableError{
+					Database:  database,
+					Namespace: namespace,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("cannot be classified: %v", err),
+				}
+			}
+			if stmtType != ddl.StatementCreateTable {
+				return nil, &unlintablePulledTableError{
+					Database:  database,
+					Namespace: namespace,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("is a %s statement, expected CREATE TABLE", stmtType),
+				}
+			}
+		}
+		results, err := linter.LintSchema(tables)
+		if err != nil {
+			return nil, fmt.Errorf("lint pulled schema for database %q namespace %q: %w", database, namespace, err)
+		}
+		return results, nil
+	default:
+		return nil, fmt.Errorf("lint pulled schema for database %q namespace %q: no schema audit for dialect %q", database, namespace, dialect)
+	}
 }
 
 func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, error) {
