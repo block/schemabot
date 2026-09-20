@@ -91,24 +91,26 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) {
 	const indexName = "users_email_idx"
 	fixture := loadPostgresConfigFixture(t, "postgres")
-	fixture.schema += "\nCREATE INDEX users_email_idx ON users (email);\n"
+	fixture.schema += "\nCREATE INDEX " + indexName + " ON users (email);\n"
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
-	require.NoError(t, err)
-
-	// An older writer makes CREATE INDEX CONCURRENTLY wait after committing
-	// its invalid catalog entry, giving shutdown a deterministic in-flight
-	// build to halt rather than relying on table size or timing.
-	writer, err := db.BeginTx(t.Context(), nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = writer.Rollback() })
-	_, err = writer.ExecContext(t.Context(), "INSERT INTO public.users (id, email) VALUES (1, 'held@example.com')")
 	require.NoError(t, err)
 
 	svcA := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
 		databaseType: string(fixture.config.Type),
 		targetDSN:    dsn,
 	})
+
+	// An older writer makes CREATE INDEX CONCURRENTLY wait after committing
+	// its invalid catalog entry, giving shutdown a deterministic in-flight
+	// build to halt rather than relying on table size or timing. Its cleanup
+	// is registered after the service's so it runs first: a build still
+	// parked on a failure path is released before the service tears down.
+	writer, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Rollback() })
+	_, err = writer.ExecContext(t.Context(), "INSERT INTO public.users (id, email) VALUES (1, 'held@example.com')")
+	require.NoError(t, err)
 	plan, err := svcA.ExecutePlan(t.Context(), fixture.planRequest())
 	require.NoError(t, err)
 	require.False(t, plan.HasBlockedChanges())
@@ -124,7 +126,10 @@ func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) 
 	})
 	require.NoError(t, err)
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		count, valid := postgresIndexState(t, db, "users", indexName)
+		count, valid, stateErr := postgresIndexState(t, db, "users", indexName)
+		if !assert.NoError(c, stateErr) {
+			return
+		}
 		assert.Equal(c, 1, count, "the in-flight build must have created exactly one catalog entry")
 		assert.False(c, valid, "the in-flight concurrent build must still be invalid")
 	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
@@ -132,7 +137,8 @@ func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) 
 	// Close stops the driver, calls HaltForShutdown on the PostgreSQL engine,
 	// and waits for the parked backend to exit before returning.
 	require.NoError(t, svcA.Close())
-	count, valid := postgresIndexState(t, db, "users", indexName)
+	count, valid, err := postgresIndexState(t, db, "users", indexName)
+	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 	assert.False(t, valid, "shutdown must leave the interrupted build's index invalid for recovery")
 	require.NoError(t, writer.Rollback())
@@ -156,7 +162,12 @@ func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) 
 			"recovered apply not completed yet, state=%s", apply.State)
 	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
 
-	count, valid = postgresIndexState(t, db, "users", indexName)
+	recovered, err := findFixtureApply(t, svcB, fixture.config.Database)
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	assert.Empty(t, recovered.ErrorMessage, "a recovered apply completes without an error message")
+	count, valid, err = postgresIndexState(t, db, "users", indexName)
+	require.NoError(t, err)
 	assert.Equal(t, 1, count, "recovery must not leave a duplicate index")
 	assert.True(t, valid, "the recovered index must be valid")
 	tasks, err := svcB.Storage().Tasks().GetByApplyID(t.Context(), interrupted.ID)
@@ -366,16 +377,24 @@ func postgresColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
 	return exists
 }
 
-func postgresIndexState(t *testing.T, db *sql.DB, table, index string) (int, bool) {
+// postgresIndexState reports how many catalog entries the table carries under
+// the index name and whether every one of them is valid. A concurrent build
+// registers its entry as invalid before it starts scanning and marks it valid
+// only on success, so the pair distinguishes a build in flight or abandoned
+// (one invalid entry) from one that completed (one valid entry) and from a
+// recovery that duplicated the index (more than one entry). The error is
+// returned rather than asserted so callers polling inside EventuallyWithT can
+// report a transient query failure on their collector.
+func postgresIndexState(t *testing.T, db *sql.DB, table, index string) (count int, valid bool, err error) {
 	t.Helper()
-	var count int
-	var valid bool
-	err := db.QueryRowContext(t.Context(), `SELECT count(*), coalesce(bool_and(i.indisvalid), false)
+	err = db.QueryRowContext(t.Context(), `SELECT count(*), coalesce(bool_and(i.indisvalid), false)
 		FROM pg_index i
 		JOIN pg_class idx ON idx.oid = i.indexrelid
 		WHERE i.indrelid = to_regclass($1) AND idx.relname = $2`, "public."+table, index).Scan(&count, &valid)
-	require.NoError(t, err)
-	return count, valid
+	if err != nil {
+		return 0, false, fmt.Errorf("query index %q state on public.%s: %w", index, table, err)
+	}
+	return count, valid, nil
 }
 
 // applyIsSettled reports whether the drive has finished deciding the apply's
