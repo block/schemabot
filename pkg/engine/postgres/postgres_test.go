@@ -1221,6 +1221,26 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 		"the package helper resolves the engine's declaration")
 }
 
+func TestOptionalCapabilitySet(t *testing.T) {
+	eng := any(New())
+
+	_, implementsDrainer := eng.(engine.Drainer)
+	_, implementsShutdownHalter := eng.(engine.ShutdownHalter)
+	_, implementsDeferredCutoverSignalChecker := eng.(engine.DeferredCutoverSignalChecker)
+	_, implementsExternallyAuthoritativeProgress := eng.(engine.ExternallyAuthoritativeProgress)
+	_, implementsSynchronousWorkRegistration := eng.(engine.SynchronousWorkRegistration)
+	_, implementsCancelledArtifactReleaser := eng.(engine.CancelledArtifactReleaser)
+	_, implementsControlResumeValidator := eng.(engine.ControlResumeValidator)
+
+	assert.True(t, implementsDrainer)
+	assert.True(t, implementsShutdownHalter)
+	assert.False(t, implementsDeferredCutoverSignalChecker)
+	assert.False(t, implementsExternallyAuthoritativeProgress)
+	assert.True(t, implementsSynchronousWorkRegistration)
+	assert.False(t, implementsCancelledArtifactReleaser)
+	assert.False(t, implementsControlResumeValidator)
+}
+
 // A zero ceiling means unset and adopts the default, so a zero-valued client
 // config preserves the stock ceiling instead of disabling the size guard.
 func TestNewWithTableSizeLimitTreatsZeroAsUnset(t *testing.T) {

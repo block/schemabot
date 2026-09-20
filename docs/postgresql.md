@@ -9,6 +9,7 @@
 - [Blocked plans](#blocked-plans)
 - [Apply-time refusals](#apply-time-refusals)
 - [Unsupported workflow features](#unsupported-workflow-features)
+- [Engine capability mapping](#engine-capability-mapping)
 - [Failure and recovery](#failure-and-recovery)
 - [Configuration and credentials](#configuration-and-credentials)
 - [SchemaBot storage](#schemabot-storage)
@@ -538,6 +539,37 @@ Pending drops is a MySQL/Spirit quarantine and cleaner. PostgreSQL plans do not
 gain that behavior from enabling the server-level `pending_drops` block.
 PostgreSQL DDL also has no deferred table-swap phase, so deferred cutover is
 rejected before an apply is queued.
+
+## Engine capability mapping
+
+The PostgreSQL engine implements the required `engine.Engine` interface and
+only the optional capabilities listed as implemented below. This table maps
+the interface contract to the behavior described in [Control
+operations](#control-operations), [Unsupported workflow
+features](#unsupported-workflow-features), and [Failure and
+recovery](#failure-and-recovery). The optional-interface inventory is kept
+complete by the conformance registry in
+[`pkg/engine/enginetest/enginetest_test.go`](../pkg/engine/enginetest/enginetest_test.go).
+
+| Interface / method | PostgreSQL behavior | Why | Where |
+|---|---|---|---|
+| `engine.Engine.Name` | Implemented | Selects the engine with the stable `postgres` identifier. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.Plan` | Implemented | Plans supported PostgreSQL DDL against the live catalog and blocks statements without a safe native route. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.Apply` | Implemented | Starts bounded native DDL or a greenfield create sequence in this process; a concurrent index build runs outside a transaction as PostgreSQL requires. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.Engine.Progress` | Implemented | Reads the apply record held by this engine instance and augments a running concurrent index build from PostgreSQL's progress view. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.Engine.Stop` | Typed decline | A concurrent index build has no resumable midpoint, while other statements commit or fail on their own. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.Cancel` | Implemented for concurrent index builds; typed decline for plain DDL | PostgreSQL can cancel the build backend or its apply context, but plain DDL has no separately managed work to cancel safely. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
+| `engine.Engine.Start` | Typed decline | Stop cannot create a stopped engine phase, so there is nothing to resume. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.Cutover` | Typed decline | DDL changes the target directly; there is no deferred table swap to trigger. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.Revert` | Typed decline | Each successful statement commits directly and creates no revert window. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.SkipRevert` | Typed decline | With no revert window, every committed statement is already permanent. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Drainer.Drain` | Implemented | Recovery must wait for in-process apply goroutines before re-planning, then discard their instance-local progress. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.ShutdownHalter.HaltForShutdown` | Implemented | Shutdown cancels in-process concurrent index builds so they do not keep target resources after this instance stops renewing its lease; bounded plain DDL is allowed to finish. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.DeferredCutoverSignalChecker.DeferredCutoverSignalExists` | Not applicable; not implemented | Direct DDL has no deferred cutover gate or durable table-swap signal. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Not applicable; not implemented | PostgreSQL does not create copy tables owned by this engine; cancellation handles any invalid concurrent index before settling instead of leaving a generic artifact set to release later. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 
 ## Failure and recovery
 
