@@ -406,9 +406,16 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 // a table the target provably does not have are blocked with their dependency
 // on the table's creation as the reason — never with a privilege probe's
 // "table not found", which reads as a re-plan instruction no re-plan can
-// satisfy. The nil pool proves no probe runs.
+// satisfy. Only the CREATE TABLE step's tier is probed, since the schema it
+// asks about exists whether or not the table does.
 func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
+	var checked []preflight.Tier
+	checkTier := func(_ context.Context, _ *pgxpool.Pool, _ pgplan.Report, tier preflight.Tier, _ string) error {
+		checked = append(checked, tier)
+		return nil
+	}
 	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
 	report.Table = "users"
 	exists := false
 	report.TableExists = &exists
@@ -425,8 +432,9 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 		},
 	}
 
-	changes, err := blockMissingPrivileges(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, "")
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, "", checkTier)
 	require.NoError(t, err)
+	assert.Equal(t, []preflight.Tier{preflight.TierCreateTable}, checked)
 	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Contains(t, changes[1].ModeReason, `table "users" does not exist on the target`)
@@ -515,6 +523,9 @@ func TestTableChangesDerivesTiersForBlockedSteps(t *testing.T) {
 		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 	}
 	assert.Equal(t, []preflight.Tier{preflight.TierAlterInPlace, preflight.TierIndexBuild, tierUnderived}, tiers)
+	// The planner's own reason is the specific one, so a step it already
+	// blocked keeps it even when the shape has no tier of its own.
+	assert.Equal(t, `statement for table "users" requires an execution path SchemaBot's PostgreSQL support does not provide yet`, changes[2].ModeReason)
 }
 
 // TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan runs the planner's
@@ -568,20 +579,7 @@ func TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan(t *testing.T) {
 // a missing schema CREATE grant is named beside the shape refusal, while the
 // index that depends on the table is left alone.
 func TestBlockMissingPrivilegesNamesSchemaCreateOnPlannerBlockedGreenfieldPlan(t *testing.T) {
-	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
-	require.NoError(t, err)
-	exists := false
-	report := pgplan.NewReport(pgplan.SourceDiff)
-	report.Schema = "public"
-	report.Table = "widgets"
-	report.TableExists = &exists
-	report.Statements = []pgplan.Statement{
-		{SQL: "CREATE TABLE public.widgets PARTITION OF public.gadgets FOR VALUES IN (1)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRefuse, Cause: executor.CreateShapePartitionOf},
-		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
-	}
-	changes, tiers, _, err := tableChanges(report, parser)
-	require.NoError(t, err)
-	require.Equal(t, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, tiers)
+	report, changes, tiers := plannerBlockedGreenfieldPlan(t, false)
 	plannerReasons := []string{changes[0].ModeReason, changes[1].ModeReason}
 
 	privilegeErr := &preflight.PrivilegeError{Tier: preflight.TierCreateTable, Check: "has_schema_privilege(schemabot, public, 'CREATE')", Grant: `GRANT CREATE ON SCHEMA "public" TO "schemabot"`}
@@ -591,11 +589,144 @@ func TestBlockMissingPrivilegesNamesSchemaCreateOnPlannerBlockedGreenfieldPlan(t
 		return privilegeErr
 	}
 
-	changes, err = blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
 	require.NoError(t, err)
 	assert.Equal(t, []preflight.Tier{preflight.TierCreateTable}, checked)
 	assert.Equal(t, plannerReasons[0]+clauseSeparator+classifyRefusal(privilegeErr, report.Table).detail, changes[0].ModeReason)
 	assert.Equal(t, plannerReasons[1], changes[1].ModeReason)
+}
+
+// plannerBlockedGreenfieldPlan renders a greenfield plan whose CREATE TABLE
+// the planner refused for its shape. The index that depends on the table is
+// blocked by the planner too unless indexExecutable is set, in which case it
+// is left for the privilege gate to judge.
+func plannerBlockedGreenfieldPlan(t *testing.T, indexExecutable bool) (pgplan.Report, []engine.TableChange, []preflight.Tier) {
+	t.Helper()
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "widgets"
+	report.TableExists = &exists
+	index := pgplan.Statement{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable}
+	if indexExecutable {
+		index = pgplan.Statement{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX widgets_id_idx ON public.widgets (id)"}}
+	}
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets PARTITION OF public.gadgets FOR VALUES IN (1)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRefuse, Cause: executor.CreateShapePartitionOf},
+		index,
+	}
+	changes, tiers, _, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Equal(t, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, tiers)
+	return report, changes, tiers
+}
+
+// TestBlockMissingPrivilegesNamesProvisionableRefusalOnPlannerBlockedGreenfieldPlan
+// proves the create-tier probe's other answers reach the operator the same
+// way a missing grant does: a schema the target lacks, or a configured table
+// owner that is not a role there, is something the operator provisions
+// whatever becomes of the shape refusal, so it is named beside that refusal
+// rather than left to the log.
+func TestBlockMissingPrivilegesNamesProvisionableRefusalOnPlannerBlockedGreenfieldPlan(t *testing.T) {
+	for name, checkErr := range map[string]error{
+		"schema absent":     fmt.Errorf("%w: schema public does not exist", preflight.ErrSchemaNotFound),
+		"owner role absent": fmt.Errorf("%w: create owner role %q does not exist", preflight.ErrCreateOwnerNotFound, "app_owner"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			report, changes, tiers := plannerBlockedGreenfieldPlan(t, false)
+			plannerReasons := []string{changes[0].ModeReason, changes[1].ModeReason}
+			var checked []preflight.Tier
+			checkTier := func(_ context.Context, _ *pgxpool.Pool, _ pgplan.Report, tier preflight.Tier, _ string) error {
+				checked = append(checked, tier)
+				return checkErr
+			}
+
+			changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
+			require.NoError(t, err)
+			assert.Equal(t, []preflight.Tier{preflight.TierCreateTable}, checked)
+			assert.Equal(t, plannerReasons[0]+clauseSeparator+classifyRefusal(checkErr, report.Table).detail, changes[0].ModeReason)
+			assert.Equal(t, plannerReasons[1], changes[1].ModeReason)
+		})
+	}
+}
+
+// TestBlockMissingPrivilegesProbesCreateWhenDependentsLeaveNothingExecutable
+// proves a greenfield plan that becomes fully blocked inside the gate — the
+// planner refused the CREATE TABLE and the gate blocked the index for
+// depending on it — is treated like any other fully blocked plan: the create
+// step is still probed at its own tier and the schema grant named beside the
+// shape refusal, so the operator is not sent around again once the shape is
+// fixed.
+func TestBlockMissingPrivilegesProbesCreateWhenDependentsLeaveNothingExecutable(t *testing.T) {
+	report, changes, tiers := plannerBlockedGreenfieldPlan(t, true)
+	require.Empty(t, changes[1].ExecutionMode)
+	plannerReason := changes[0].ModeReason
+
+	privilegeErr := &preflight.PrivilegeError{Tier: preflight.TierCreateTable, Check: "has_schema_privilege(schemabot, public, 'CREATE')", Grant: `GRANT CREATE ON SCHEMA "public" TO "schemabot"`}
+	var checked []preflight.Tier
+	checkTier := func(_ context.Context, _ *pgxpool.Pool, _ pgplan.Report, tier preflight.Tier, _ string) error {
+		checked = append(checked, tier)
+		return privilegeErr
+	}
+
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, tiers, "app_owner", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, []preflight.Tier{preflight.TierCreateTable}, checked)
+	assert.Equal(t, plannerReason+clauseSeparator+classifyRefusal(privilegeErr, report.Table).detail, changes[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Contains(t, changes[1].ModeReason, "depends on the statement that creates it")
+}
+
+// When every step is already blocked, a refusal about the table itself —
+// vanished, or not a table — names nothing the operator can provision, so
+// the existing verdicts stand and the refusal is logged with its
+// classification rather than appended or lost.
+func TestBlockMissingPrivilegesLogsNonProvisionableRefusalOnFullyBlockedPlan(t *testing.T) {
+	for reason, checkErr := range map[string]error{
+		"not-a-table":     fmt.Errorf("%w: public.users has relkind %q", preflight.ErrNotTable, "v"),
+		"table-not-found": fmt.Errorf("%w: public.users", preflight.ErrTableNotFound),
+	} {
+		t.Run(reason, func(t *testing.T) {
+			checkTier := func(context.Context, *pgxpool.Pool, pgplan.Report, preflight.Tier, string) error { return checkErr }
+			var logs bytes.Buffer
+			originalLogger := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(originalLogger) })
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			report := pgplan.NewReport(pgplan.SourceDiff)
+			report.Schema = "public"
+			report.Table = "users"
+			want := []engine.TableChange{{Table: "users", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refusal"}}
+			changes := append([]engine.TableChange(nil), want...)
+
+			changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierAlterInPlace}, "", checkTier)
+			require.NoError(t, err)
+			assert.Equal(t, want, changes)
+			assert.Contains(t, logs.String(), "level=WARN")
+			assert.Contains(t, logs.String(), "privilege check refused the table")
+			assert.Contains(t, logs.String(), "database=orders_db")
+			assert.Contains(t, logs.String(), "refusal="+reason)
+		})
+	}
+}
+
+// TestBlockMissingPrivilegesKeepsFullyBlockedPlanWithoutTarget proves a
+// report that names no target but carries no executable step is returned as
+// it stands: there is nothing to probe and no unnamed table for a probe to
+// ask about, so no verdict changes and no check runs.
+func TestBlockMissingPrivilegesKeepsFullyBlockedPlanWithoutTarget(t *testing.T) {
+	checkTier := func(context.Context, *pgxpool.Pool, pgplan.Report, preflight.Tier, string) error {
+		t.Fatal("no probe may run for a plan that names no target")
+		return nil
+	}
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	want := []engine.TableChange{{Table: "users", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "planner refusal"}}
+	changes := append([]engine.TableChange(nil), want...)
+
+	changes, err := blockMissingPrivilegesWithCheck(t.Context(), nil, "orders_db", report, changes, []preflight.Tier{preflight.TierAlterInPlace}, "", checkTier)
+	require.NoError(t, err)
+	assert.Equal(t, want, changes)
 }
 
 func TestBlockMissingPrivilegesRejectsExecutableStepWithoutTier(t *testing.T) {

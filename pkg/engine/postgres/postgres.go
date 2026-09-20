@@ -509,8 +509,9 @@ func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
 // refusal blocks the steps at its tier; a table-scoped refusal blocks every
 // executable step; any other failure fails the plan — an executable plan
 // must never be produced while the check's answer is unknown. When every step
-// is already blocked, missing access is appended as an independent cause;
-// check failures leave the safe verdicts intact and are logged. Reasons come
+// is already blocked, a refusal the operator answers by provisioning — a
+// grant, a role, a schema — is appended as an independent cause; any other
+// answer leaves the safe verdicts intact and is logged. Reasons come
 // from classifyRefusal, so the same failure carries the same detail at plan
 // and apply time; here it is prefixed with the statement it blocks. The
 // returned slice is the input with verdicts marked.
@@ -557,6 +558,12 @@ func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, da
 		// target can satisfy; every other executable step depends on the
 		// table's creation, so that dependency is its accurate reason.
 		blockAbsentTableDependents(changes, tiers, report.Table)
+		// Blocking the dependents can leave no executable step: a plan whose
+		// CREATE TABLE the planner refused and whose index build was the
+		// only executable work is now blocked throughout, and its create
+		// step is probed below like any other fully blocked plan's, so the
+		// schema grant is named beside the shape refusal here too.
+		fullyBlocked = !hasExecutableChanges(changes)
 	}
 	// Executable steps are always checked. On a plan every gate has already
 	// refused, the blocked steps' tiers are checked too, so a grant the
@@ -585,16 +592,31 @@ func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, da
 		}
 		r := classifyRefusal(err, report.Table)
 		if fullyBlocked {
-			var privilegeErr *preflight.PrivilegeError
-			if r != nil && errors.As(err, &privilegeErr) {
+			// The plan is already safe as it stands, so the probe's answer
+			// can only add to the verdicts, never replace them. A refusal
+			// that names something to provision — a grant, a role, a
+			// schema — is work the operator will have to do anyway, so it
+			// is appended beside the earlier cause. Every other answer goes
+			// to the log: a refusal about the table itself names nothing to
+			// provision on a plan nothing will run, and an operational
+			// failure is not a fact about the target at all.
+			switch {
+			case r != nil && r.provisionable:
 				appendBlockedCauseAtTier(changes, tiers, tier, r.detail)
-				continue
+			case r != nil:
+				slog.Warn("PostgreSQL privilege check refused the table; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"refusal", r.reason,
+					"detail", r.detail)
+			default:
+				slog.Warn("PostgreSQL privilege check failed; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"error", err)
 			}
-			slog.Warn("PostgreSQL privilege check failed; existing blocked plan verdicts remain unchanged",
-				"database", database,
-				"namespace", report.Schema,
-				"table", report.Table,
-				"error", err)
 			continue
 		}
 		if r == nil {

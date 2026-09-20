@@ -478,11 +478,22 @@ func invalidIndexTableSuffix(invalidErr *executor.InvalidIndexError) string {
 // are kept apart so the failed sequence step can be placed between them
 // without parsing the rendered text. detail is the operator-facing line
 // classifyRefusal composes from them — the only field consumers read.
+//
+// provisionable marks a refusal whose remedy is something the operator adds
+// to the target — a grant, a role, a schema — with the plan left as it is.
+// The plan-time gates use it to decide whether a refusal earns a place beside
+// a verdict another gate already gave: a provisionable one names work the
+// operator will have to do anyway, while a refusal about the table itself
+// (vanished, not a table) names nothing to provision and only a re-plan can
+// answer it. It is set by the arms that know their remedy is provisioning
+// and stays false for every other refusal, so a new refusal defaults to the
+// conservative side.
 type refusal struct {
-	reason string
-	cause  string
-	remedy string
-	detail string
+	reason        string
+	cause         string
+	remedy        string
+	detail        string
+	provisionable bool
 }
 
 // classifyRefusal maps pg-sprite's typed refusal inputs to permanent
@@ -591,8 +602,9 @@ func refusalForCause(err error, table string) *refusal {
 			remedy += "; " + privilegeErr.Hint
 		}
 		return &refusal{reason: "insufficient-privileges",
-			cause:  fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
-			remedy: remedy}
+			cause:         fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
+			remedy:        remedy,
+			provisionable: true}
 	}
 	// An invalid-index verdict is decided by its own code, never by the build
 	// failure it wraps — a budget-cancelled concurrent build leaves its own
@@ -675,13 +687,15 @@ func refusalForCause(err error, table string) *refusal {
 		// role: the same environmental class as a missing grant, decided
 		// before anything runs, but with no grantee for a GRANT to name.
 		return &refusal{reason: "insufficient-privileges",
-			cause:  fmt.Sprintf("the configured table owner for %s is not a role on the target", quotedTable(table)),
-			remedy: "create the role or correct the target's table_owner, then re-plan"}
+			cause:         fmt.Sprintf("the configured table owner for %s is not a role on the target", quotedTable(table)),
+			remedy:        "create the role or correct the target's table_owner, then re-plan",
+			provisionable: true}
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
-			cause:  fmt.Sprintf("the schema that would hold table %s does not exist on the target", quotedTable(table)),
-			remedy: "create the schema first"}
+			cause:         fmt.Sprintf("the schema that would hold table %s does not exist on the target", quotedTable(table)),
+			remedy:        "create the schema first",
+			provisionable: true}
 	}
 	r, _ := refusalForOutcome(executor.OutcomeCode(err), table)
 	return r

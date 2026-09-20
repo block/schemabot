@@ -1303,7 +1303,8 @@ direct execution's table-size bound, a table whose size cannot be measured is bl
 estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
-planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`); the whole-plan
+planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
+privilege and size gates in `pkg/engine/postgres/postgres.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`); the

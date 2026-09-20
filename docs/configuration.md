@@ -833,12 +833,19 @@ Every engine gate still runs when an earlier gate has already blocked all of a
 table's steps. A missing grant is appended to each blocked step whose statement
 needs that access, and an oversized table to each blocked rewrite step, as
 independent causes, so every remedy the gates can name is visible in the same
-plan comment. Two blocked steps are not probed: a statement whose shape the
-engine does not execute has no access to check, and a step that depends on a
-table the plan itself creates can only be answered "table not found". If a
-diagnostic privilege or size lookup fails, the existing blocked verdict remains
-blocked and the operational failure is logged instead of adding a cause the
-gate could not verify.
+plan comment. This holds whether the earlier gate was the planner or the
+privilege gate itself: on a table the plan creates, blocking the steps that
+depend on the table can leave nothing executable, and the CREATE TABLE step is
+then probed at its own tier like any other blocked step. Two blocked steps are
+not probed: a statement whose shape the engine does not execute has no access
+to check, and a step that depends on a table the plan itself creates can only
+be answered "table not found". A probe's answer is appended only when it names
+something the operator can provision — a grant, a table owner role the target
+lacks, or a schema that does not exist yet. A refusal about the table itself
+(it vanished, or is not an ordinary table) names nothing to provision on a plan
+nothing will run, and a lookup that fails outright is not a fact about the
+target; in both cases the existing blocked verdict remains blocked and the
+answer is logged instead.
 
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
