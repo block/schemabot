@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
@@ -107,6 +108,59 @@ func TestBuildOnboardWritePlanPreservesExclusions(t *testing.T) {
 	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\nignore_tables:\n  - flyway_schema_history\n", string(config))
 	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, plan.exclusions.Namespaces)
 	assert.Equal(t, []string{"flyway_schema_history"}, plan.exclusions.Tables)
+}
+
+// A pull returns the target's whole catalog, the tables ignore_tables withholds
+// included, so re-onboarding an already-configured repository is where a table
+// can end up both withheld from the planner and declared to it — the
+// contradiction every engine refuses, written into the repo by the rewrite
+// itself, after the files are already on disk.
+func TestBuildOnboardWritePlanDoesNotDeclareAWithheldTable(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  2,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{
+				"users":                 "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history"}})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	assert.FileExists(t, filepath.Join(root, "orders", "users.sql"))
+	assert.NoFileExists(t, filepath.Join(root, "orders", "flyway_schema_history.sql"),
+		"the withheld table is not declared back into the repository it is withheld from")
+	assert.NoFileExists(t, filepath.Join(root, "orders", "schema.sql"),
+		"the namespace still declares a table, so it needs no empty-scope declaration")
+}
+
+// A namespace whose every table is withheld still belongs to the plan, so it
+// keeps its comment-only declaration rather than vanishing from the repository.
+func TestBuildOnboardWritePlanKeepsAFullyWithheldNamespaceExplicit(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"bookkeeping": {Tables: map[string]string{
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history"}})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	assert.NoFileExists(t, filepath.Join(root, "bookkeeping", "flyway_schema_history.sql"))
+	declaration, err := os.ReadFile(filepath.Join(root, "bookkeeping", "schema.sql"))
+	require.NoError(t, err)
+	assert.Equal(t, schema.EmptyNamespaceDeclaration, string(declaration))
 }
 
 // A config with no exclusions emits neither key: an empty list would read as a

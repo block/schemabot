@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"gopkg.in/yaml.v3"
@@ -231,6 +232,14 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	if err := rejectCaseCollisions("namespace", namespaces); err != nil {
 		return nil, err
 	}
+	// A pull answers with the target's whole catalog: the request carries no
+	// exclusions, so a table the config withholds from the planner comes back
+	// like any other. Declaring it would state the contradiction the engines
+	// refuse — a table both withheld from the planner and declared to it — and
+	// re-onboarding an already-configured repository is where that happens,
+	// because the entries it preserves name tables the pull just returned.
+	ignored := engine.NewIgnoredTables(exclusions.Tables)
+
 	for _, namespace := range namespaces {
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
 			return nil, err
@@ -239,18 +248,23 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		if pulled == nil {
 			return nil, fmt.Errorf("pulled namespace %s is empty", namespace)
 		}
-		if len(pulled.Tables) == 0 && len(pulled.Artifacts) == 0 {
-			// Keep empty scope explicit: a comment-only SQL file declares no tables
-			// while preserving the namespace for future plans and version control.
-			files[filepath.Join(namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
-		}
 		tableNames := make([]string, 0, len(pulled.Tables))
 		for tableName := range pulled.Tables {
+			if ignored.Withholds(tableName) {
+				continue
+			}
 			tableNames = append(tableNames, tableName)
 		}
 		sort.Strings(tableNames)
 		if err := rejectCaseCollisions("table in "+namespace, tableNames); err != nil {
 			return nil, err
+		}
+		if len(tableNames) == 0 && len(pulled.Artifacts) == 0 {
+			// Keep empty scope explicit: a comment-only SQL file declares no tables
+			// while preserving the namespace for future plans and version control.
+			// A namespace whose every table is withheld lands here too — the
+			// namespace is still the plan's, it simply declares nothing.
+			files[filepath.Join(namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
 		}
 		for _, tableName := range tableNames {
 			if err := validateRelativePathPart("table", tableName); err != nil {
