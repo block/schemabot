@@ -355,6 +355,32 @@ func TestCallPlanAPI_SendsIgnoredNamespaces(t *testing.T) {
 	assert.NotContains(t, gotReq.SchemaFiles, "local_fixtures")
 }
 
+// ignore_tables cannot be expressed by omission the way ignore_namespaces can
+// — the tables live on the target, not in the repository — so the entries have
+// to reach the server on the request itself or the plan proposes dropping the
+// very tables the config withholds.
+func TestCallPlanAPI_SendsIgnoreTables(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	var gotReq apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0,
+		PlanExclusions{Tables: []string{"flyway_schema_history", "legacy_audit_log"}}, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, gotReq.IgnoreTables)
+	assert.Contains(t, gotReq.SchemaFiles, "payments",
+		"withholding a live table removes nothing from the declared schema")
+}
+
 // A plan made for an apply that will hand the engine every ALTER at once has
 // to say so on the request. The grouping decides what the engine predicts
 // about a copy already on the target, so a plan that leaves it off describes a
