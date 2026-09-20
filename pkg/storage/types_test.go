@@ -111,7 +111,7 @@ func TestPlanBlockedApplyError(t *testing.T) {
 			"table exceeds the native-safe size ceiling",
 		})}}},
 	}}
-	require.EqualError(t, twoCauses.BlockedApplyError(), "stored plan plan-two-causes contains a blocked change for table \"users\": \n- requires privileges unavailable to the engine\n- table exceeds the native-safe size ceiling")
+	require.EqualError(t, twoCauses.BlockedApplyError(), "stored plan plan-two-causes contains a blocked change for table \"users\":\n- requires privileges unavailable to the engine\n- table exceeds the native-safe size ceiling")
 
 	clean := &Plan{PlanIdentifier: "plan-clean", Namespaces: map[string]*NamespacePlanData{
 		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "direct"}}},

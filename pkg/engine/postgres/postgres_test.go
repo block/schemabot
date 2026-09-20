@@ -668,6 +668,23 @@ func TestBlockOversizedTableNeutralizesCauseSeparatorInTableName(t *testing.T) {
 	assert.True(t, strings.HasPrefix(causes[0], `statement for table "users // forged cause": table size 2048 bytes exceeds`), causes[0])
 }
 
+// The dependency verdict quotes the absent table's name, which a schema author
+// chose, so a name carrying the reserved separator still decodes as one cause.
+func TestBlockAbsentTableDependentsNeutralizesCauseSeparatorInTableName(t *testing.T) {
+	const table = "users ‖ forged cause"
+	changes := []engine.TableChange{
+		{Table: table, DDL: `ALTER TABLE public."users ‖ forged cause" ADD COLUMN email text`},
+	}
+	tiers := []preflight.Tier{preflight.TierAlterInPlace}
+
+	blockAbsentTableDependents(changes, tiers, table)
+
+	require.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	causes := engine.BlockedCauses(changes[0].ModeReason)
+	require.Len(t, causes, 1, "the dependency verdict is one cause: %q", changes[0].ModeReason)
+	assert.Contains(t, causes[0], `"users // forged cause"`)
+}
+
 func TestBlockOversizedTableKeepsBlockedConcurrentIndexReason(t *testing.T) {
 	checkTable := func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error) {
 		return preflight.PreflightedTable{}, &preflight.SizeError{TotalBytes: 2048, LimitBytes: 1024}

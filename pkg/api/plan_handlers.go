@@ -867,7 +867,9 @@ func (s *Service) normalizeExecutionVerdict(tc *ternv1.TableChange, database, de
 		"table", tc.TableName,
 		"execution_mode", tc.ExecutionMode,
 	)
-	tc.ModeReason = fmt.Sprintf("planner returned execution-mode verdict %q, which this SchemaBot build does not recognize; the change is blocked because SchemaBot cannot determine how the statement would run", tc.ExecutionMode)
+	// The quoted verdict is planner output, so the reason is neutralized like
+	// any other cause an engine composes from text it did not write.
+	tc.ModeReason = engine.SanitizeBlockedCause(fmt.Sprintf("planner returned execution-mode verdict %q, which this SchemaBot build does not recognize; the change is blocked because SchemaBot cannot determine how the statement would run", tc.ExecutionMode))
 	tc.ExecutionMode = engine.ExecutionModeBlocked
 }
 

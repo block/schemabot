@@ -173,6 +173,21 @@ func TestRenderBlockedChangesApplyRejectedListsIndependentCauses(t *testing.T) {
 	assert.Contains(t, out, "- `users`: planner requires a table rewrite; choose a supported statement\n  - table exceeds the native-safe size ceiling; use an online path\n")
 }
 
+// Every cause is composed from quoted identifiers, so each nested cause is
+// Markdown-escaped exactly as the first one is.
+func TestRenderBlockedChangesApplyRejectedEscapesEveryCause(t *testing.T) {
+	out := RenderBlockedChangesApplyRejected(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		BlockedChanges: []BlockedChangeData{{Table: "users", Reason: engine.JoinBlockedCauses([]string{
+			"planner requires a table rewrite; choose a supported statement",
+			"table `users` exceeds the *native-safe* size ceiling; use an online path",
+		})}},
+	})
+
+	assert.Contains(t, out, "- `users`: planner requires a table rewrite; choose a supported statement\n")
+	assert.Contains(t, out, "  - table \\`users\\` exceeds the \\*native-safe\\* size ceiling; use an online path\n")
+}
+
 // An engine refusal reason is untrusted error text: endpoints are redacted,
 // the reason stays on one line, and Markdown constructs cannot alter rendering.
 func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {

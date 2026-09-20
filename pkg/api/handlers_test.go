@@ -4137,7 +4137,7 @@ func TestExecuteApplyListsIndependentBlockedCauses(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, resp)
 	assert.Zero(t, applyID)
-	assert.Contains(t, err.Error(), ": \n- planner requires a rewrite; choose a supported statement\n- table exceeds the native-safe size ceiling; use an online path")
+	assert.Contains(t, err.Error(), ":\n- planner requires a rewrite; choose a supported statement\n- table exceeds the native-safe size ceiling; use an online path")
 	assert.Nil(t, applies.apply)
 	assert.Empty(t, tasks.tasks)
 }

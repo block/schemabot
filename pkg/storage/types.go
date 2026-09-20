@@ -672,7 +672,7 @@ func (p *Plan) BlockedApplyError() error {
 	// Independent causes are listed one per line so an operator fixing the
 	// first is not surprised by the second on the next attempt.
 	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
-		reason = "\n- " + strings.Join(causes, "\n- ")
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
 	}
 	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
 }

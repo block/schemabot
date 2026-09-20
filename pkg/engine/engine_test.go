@@ -36,6 +36,14 @@ func TestBlockedCauses(t *testing.T) {
 	}
 }
 
+// The decoder's contract does not depend on who encoded the reason: a bare
+// or doubled separator yields no empty cause.
+func TestBlockedCausesDropsEmptyParts(t *testing.T) {
+	assert.Equal(t, []string{"a", "b"}, BlockedCauses("a ‖  ‖ b"))
+	assert.Equal(t, []string{"a"}, BlockedCauses(" ‖ a ‖ "))
+	assert.Empty(t, BlockedCauses(" ‖ "))
+}
+
 func TestState_IsTerminal(t *testing.T) {
 	tests := []struct {
 		state    State
