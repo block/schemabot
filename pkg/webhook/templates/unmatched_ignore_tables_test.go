@@ -48,13 +48,47 @@ func TestRenderPlanComment_UnmatchedIgnoreTablesNamesEveryEntry(t *testing.T) {
 
 // A config whose every entry withheld a table earns no warning, and the
 // comment renders byte-for-byte as if the key were absent — no dangling blank
-// line where the report would have gone.
+// line where the report would have gone. A config with no entries at all
+// arrives as the empty list rather than an absent one, so the two must render
+// identically.
 func TestRenderPlanComment_NoUnmatchedIgnoreTablesNoDisclosure(t *testing.T) {
-	without := PlanCommentData{Database: "testapp", Environment: "staging", IsMySQL: true}
-	with := without
-	with.UnmatchedIgnoreTables = nil
-	assert.Equal(t, RenderPlanComment(without), RenderPlanComment(with))
-	assert.NotContains(t, RenderPlanComment(without), "matched no live table")
+	absent := PlanCommentData{Database: "testapp", Environment: "staging", IsMySQL: true}
+	everyEntryMatched := absent
+	everyEntryMatched.UnmatchedIgnoreTables = []string{}
+	assert.Equal(t, RenderPlanComment(absent), RenderPlanComment(everyEntryMatched))
+	assert.NotContains(t, RenderPlanComment(everyEntryMatched), "matched no live table")
+}
+
+// A config carries as many entries as an operator writes, so a long unmatched
+// list folds behind its count rather than standing as a wall of warnings above
+// the plan. The count and the config key stay on the visible line: a reviewer
+// sees that entries withheld nothing, and how many, without opening anything.
+func TestRenderPlanComment_ManyUnmatchedIgnoreTablesFoldBehindTheirCount(t *testing.T) {
+	data := unmatchedPlanData()
+	data.UnmatchedIgnoreTables = []string{"one", "two", "three", "four", "five", "six"}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "<summary>⚠️ 6 <code>ignore_tables</code> entries matched no live table and withheld nothing</summary>")
+	assert.NotContains(t, out, "matched no live table and withheld nothing\n\n⚠️")
+	for _, entry := range data.UnmatchedIgnoreTables {
+		assert.Contains(t, out, "`"+entry+"`", "every entry is still named inside the collapsed block")
+	}
+}
+
+// The fold is per environment, so an environment whose own list is long folds
+// while the report still attributes it: an operator correcting the config has
+// to know which target left the entries unmatched.
+func TestRenderMultiEnvPlanComment_ManyUnmatchedIgnoreTablesFoldPerEnvironment(t *testing.T) {
+	staging := unmatchedPlanData()
+	staging.UnmatchedIgnoreTables = []string{"one", "two", "three", "four", "five", "six"}
+	production := PlanCommentData{Database: "testapp", Environment: "production", IsMySQL: true}
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	assert.Contains(t, out, "<summary>⚠️ <b>Staging</b>: 6 <code>ignore_tables</code> entries matched no live table and withheld nothing</summary>")
+	assert.Equal(t, 1, strings.Count(out, "matched no live table"))
 }
 
 // Entries are repository config rather than catalog identifiers, so an entry

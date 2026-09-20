@@ -712,9 +712,44 @@ func exemptReason(reason string) string {
 // Entries are repository config rather than catalog names, so they render as
 // code spans they cannot break out of.
 func writeUnmatchedIgnoreTables(sb *strings.Builder, unmatched []string) {
-	for _, entry := range unmatched {
-		fmt.Fprintf(sb, glyph.Attention+" `ignore_tables` entry %s matched no live table and withheld nothing\n\n", inlineCode(entry))
+	writeUnmatchedIgnoreTablesGroup(sb, unmatched, "")
+}
+
+// unmatchedIgnoreTablesInlineLimit caps how many entries earn a warning line of
+// their own. A config carries as many entries as an operator writes, and beyond
+// this the warnings read as a wall standing above the plan they annotate, so the
+// report leads with its count and folds the entries into a collapsed block. The
+// count rides on the visible line either way: a reviewer has to be able to see
+// that entries withheld nothing, and how many, without opening anything.
+const unmatchedIgnoreTablesInlineLimit = 5
+
+// writeUnmatchedIgnoreTablesGroup renders one environment's unmatched-entry
+// report, naming the environment when the caller breaks the report down per
+// environment.
+func writeUnmatchedIgnoreTablesGroup(sb *strings.Builder, unmatched []string, env string) {
+	if len(unmatched) == 0 {
+		return
 	}
+
+	if len(unmatched) <= unmatchedIgnoreTablesInlineLimit {
+		prefix := ""
+		if env != "" {
+			prefix = fmt.Sprintf("**%s**: ", capitalizeFirst(env))
+		}
+		for _, entry := range unmatched {
+			fmt.Fprintf(sb, glyph.Attention+" %s`ignore_tables` entry %s matched no live table and withheld nothing\n\n", prefix, inlineCode(entry))
+		}
+		return
+	}
+
+	// GitHub renders <summary> content as HTML, not markdown, so the folded
+	// header names the config key in a <code> tag and escapes as HTML.
+	prefix := ""
+	if env != "" {
+		prefix = fmt.Sprintf("<b>%s</b>: ", html.EscapeString(capitalizeFirst(env)))
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Attention+" %s%d <code>ignore_tables</code> entries matched no live table and withheld nothing</summary>\n\n%s\n\n</details>\n\n",
+		prefix, len(unmatched), strings.Join(inlineCodeList(unmatched), ", "))
 }
 
 // writeMultiEnvUnmatchedIgnoreTables renders the unmatched-entry report for
@@ -746,10 +781,7 @@ func writeMultiEnvUnmatchedIgnoreTables(sb *strings.Builder, data MultiEnvPlanCo
 		return
 	}
 	for _, env := range data.Environments {
-		for _, entry := range planUnmatchedIgnoreTables(data, env) {
-			fmt.Fprintf(sb, glyph.Attention+" **%s**: `ignore_tables` entry %s matched no live table and withheld nothing\n\n",
-				capitalizeFirst(env), inlineCode(entry))
-		}
+		writeUnmatchedIgnoreTablesGroup(sb, planUnmatchedIgnoreTables(data, env), env)
 	}
 }
 
