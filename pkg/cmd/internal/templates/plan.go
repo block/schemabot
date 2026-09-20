@@ -93,8 +93,12 @@ func WritePlanHeader(data PlanHeaderData) {
 // DDLChange represents a single DDL change with its type.
 type DDLChange struct {
 	ChangeType string // "CREATE", "ALTER", "DROP"
-	TableName  string
-	DDL        string
+	// Namespace is the schema (MySQL/PostgreSQL) or keyspace (Vitess) the
+	// table lives in. It keeps equal table names in two namespaces apart in
+	// the summary counts; callers that render one namespace may leave it empty.
+	Namespace string
+	TableName string
+	DDL       string
 }
 
 // NamespaceChange groups DDL and VSchema changes for a single namespace (keyspace/schema).
@@ -360,82 +364,14 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 // made only of them reports its raw statement total so it never reads as "no
 // changes".
 func ddlSummaryParts(changes []DDLChange) []string {
-	creates := 0
-	alters := 0
-	drops := 0
-	other := 0
-	type tableChange struct {
-		changeType string
-		tableName  string
-	}
-	countedTables := make(map[tableChange]struct{})
-
+	var counts ui.PlanCounts
 	for _, c := range changes {
-		changeType := strings.ToUpper(c.ChangeType)
-		switch changeType {
-		case "CHANGE_TYPE_CREATE", "CREATE":
-			changeType = "CREATE"
-		case "CHANGE_TYPE_ALTER", "ALTER":
-			changeType = "ALTER"
-		case "CHANGE_TYPE_DROP", "DROP":
-			changeType = "DROP"
-		default:
-			other++
-			continue
-		}
-		// Every producer of a DDLChange names its table, so an empty name is
-		// a payload the dedupe cannot judge. It is counted rather than keyed:
-		// merging every nameless change into one would under-report where the
-		// PR comment, whose parser never yields a nameless table change, does
-		// not.
-		if c.TableName != "" {
-			key := tableChange{changeType: changeType, tableName: c.TableName}
-			if _, counted := countedTables[key]; counted {
-				continue
-			}
-			countedTables[key] = struct{}{}
-		}
-		switch changeType {
-		case "CREATE":
-			creates++
-		case "ALTER":
-			alters++
-		case "DROP":
-			drops++
-		}
+		// ChangeType arrives either bare ("ALTER") or with the proto enum
+		// prefix ("CHANGE_TYPE_ALTER"); both name the same operation.
+		op := strings.ToLower(strings.TrimPrefix(strings.ToUpper(c.ChangeType), "CHANGE_TYPE_"))
+		counts.AddTable(c.Namespace, op, c.TableName)
 	}
-
-	var parts []string
-	if creates > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s to create", creates, pluralizeTable(creates)))
-	}
-	if alters > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, pluralizeTable(alters)))
-	}
-	if drops > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, pluralizeTable(drops)))
-	}
-	if other > 0 && len(parts) > 0 {
-		parts = append(parts, fmt.Sprintf("%d other DDL %s", other, pluralizeStatement(other)))
-	}
-	if len(parts) == 0 && other > 0 {
-		parts = append(parts, fmt.Sprintf("%d DDL %s", other, pluralizeStatement(other)))
-	}
-	return parts
-}
-
-func pluralizeTable(n int) string {
-	if n == 1 {
-		return "table"
-	}
-	return "tables"
-}
-
-func pluralizeStatement(n int) string {
-	if n == 1 {
-		return "statement"
-	}
-	return "statements"
+	return ui.PlanSummaryParts(counts, len(changes), false)
 }
 
 // WriteOptions writes the options section if any flags are set.
