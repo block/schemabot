@@ -220,6 +220,40 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="postgres-plan-engineblocked-change-two-causes"></a><strong>Postgres Plan (Engine-blocked Change, Two Causes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE users ALTER COLUMN email TYPE bigint;
+
+ALTER TABLE orders ADD COLUMN notes text;
+```
+
+⛔ **Cannot apply**: 1 change the engine refuses to execute
+- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
+
+An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-directexecution-change"></a><strong>MySQL Plan (Direct-execution Change)</strong></summary>
 
 
@@ -510,16 +544,14 @@ schemabot apply -e staging
 
 ## Schema Change Plan — Staging
 
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+**Database**: `testapp` | **Type**: `PostgreSQL`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
-ALTER TABLE `users`
-    DROP PRIMARY KEY,
-    ADD PRIMARY KEY(`id`, `tenant_id`);
+ALTER TABLE users ALTER COLUMN email TYPE bigint;
 
-ALTER TABLE `orders` ADD COLUMN `notes` text;
+ALTER TABLE orders ADD COLUMN notes text;
 ```
 
 📋 **Plan**: **2** tables to alter
@@ -527,7 +559,8 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ---
 
 **⛔ Apply rejected**: 1 planned change the engine refuses to execute
-- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
+- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
