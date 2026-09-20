@@ -1,8 +1,10 @@
 package mysqlconn
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -10,6 +12,53 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConnectionDSNWarnsForNonVerifyingRDSTLS(t *testing.T) {
+	tests := []struct {
+		name        string
+		host        string
+		tlsMode     string
+		wantWarning bool
+		wantTLS     string
+	}{
+		{name: "disabled TLS on RDS", host: "disabled.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "false", wantWarning: true, wantTLS: "false"},
+		{name: "unverified TLS on RDS", host: "unverified.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "skip-verify", wantWarning: true, wantTLS: "skip-verify"},
+		{name: "preferred TLS on RDS", host: "preferred.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "preferred", wantWarning: true, wantTLS: "preferred"},
+		{name: "implicit verified TLS on RDS", host: "verified.cluster-abc123.us-west-2.rds.amazonaws.com:3306", wantTLS: "rds"},
+		{name: "disabled TLS off RDS", host: "database.example.com:3306", tlsMode: "false", wantTLS: "false"},
+		{name: "verified TLS on RDS", host: "explicit.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "true", wantTLS: "true"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			originalLogger := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(originalLogger) })
+
+			dsn := "schemabot:secret@tcp(" + tt.host + ")/app"
+			if tt.tlsMode != "" {
+				dsn += "?tls=" + tt.tlsMode
+			}
+			got, err := ConnectionDSN(dsn)
+			require.NoError(t, err)
+
+			cfg, err := mysql.ParseDSN(got)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantTLS, cfg.TLSConfig, "the explicit TLS mode must be preserved")
+			if tt.wantWarning {
+				assert.Contains(t, logs.String(), "MySQL RDS connection uses a non-verifying TLS mode; the configured mode is honored for compatibility")
+				assert.Contains(t, logs.String(), "host="+tt.host)
+				assert.Contains(t, logs.String(), "tls_mode="+tt.tlsMode)
+				_, err = ConnectionDSN(dsn)
+				require.NoError(t, err)
+				assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte("MySQL RDS connection uses a non-verifying TLS mode")))
+			} else {
+				assert.Empty(t, logs.String())
+			}
+		})
+	}
+}
 
 func TestConnectionDSN(t *testing.T) {
 	tests := []struct {

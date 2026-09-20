@@ -1,8 +1,11 @@
 package mysqlconn
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/block/mysql"
@@ -11,6 +14,8 @@ import (
 )
 
 var openSQL = sql.Open
+
+var warnedNonVerifyingRDSDSNs sync.Map
 
 // Default transport timeouts for SchemaBot-managed MySQL connections, applied
 // whenever the parsed value is unset — a DSN or option must set a positive
@@ -135,6 +140,7 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse DSN: %w", err)
 	}
+	warnNonVerifyingRDSTLS(dsn, cfg)
 	// An explicit TLS config or a non-RDS host needs no TLS enhancement; apply
 	// the required settings and options directly to the parsed config and
 	// reassemble.
@@ -158,6 +164,29 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 		return "", fmt.Errorf("parse enhanced DSN: %w", err)
 	}
 	return requiredSettingsDSN(enhanced, opts...)
+}
+
+func warnNonVerifyingRDSTLS(dsn string, cfg *mysql.Config) {
+	if !dbconn.IsRDSHost(cfg.Addr) || !isNonVerifyingTLSMode(cfg.TLSConfig) {
+		return
+	}
+	// Hash the DSN so deduplication never retains credentials in memory.
+	if _, loaded := warnedNonVerifyingRDSDSNs.LoadOrStore(sha256.Sum256([]byte(dsn)), struct{}{}); loaded {
+		return
+	}
+	slog.Warn("MySQL RDS connection uses a non-verifying TLS mode; the configured mode is honored for compatibility",
+		"host", cfg.Addr,
+		"tls_mode", cfg.TLSConfig,
+	)
+}
+
+func isNonVerifyingTLSMode(mode string) bool {
+	switch mode {
+	case "false", "skip-verify", "preferred":
+		return true
+	default:
+		return false
+	}
 }
 
 // requiredSettingsDSN applies any caller-supplied options, then default

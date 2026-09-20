@@ -186,6 +186,16 @@ The PostgreSQL shape differs from MySQL in three ways:
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
 
+### TLS posture: MySQL and PostgreSQL
+
+MySQL and PostgreSQL intentionally differ in how they handle explicit weak TLS
+settings for RDS endpoints. A MySQL RDS DSN without a `tls=` parameter defaults
+to verified TLS. For compatibility with existing configurations, an explicit
+`tls=false`, `tls=skip-verify`, or `tls=preferred` remains unchanged; SchemaBot
+logs a warning naming the host because these modes do not verify the server
+certificate. PostgreSQL accepts only `sslmode=verify-full` and has no opt-out;
+CA resolution also fails closed as described above.
+
 ## gRPC Mode
 
 SchemaBot delegates to remote services that implement the Tern proto. This is useful for distributed deployments where schema changes need to run in separate isolated environments.
