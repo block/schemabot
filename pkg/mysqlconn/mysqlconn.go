@@ -1,7 +1,6 @@
 package mysqlconn
 
 import (
-	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -15,7 +14,18 @@ import (
 
 var openSQL = sql.Open
 
-var warnedNonVerifyingRDSDSNs sync.Map
+// nonVerifyingRDSKey identifies one RDS endpoint dialed under one
+// non-verifying TLS mode. The warning is deduplicated on this pair rather than
+// on the DSN so that credential rotation, a different database name, or a
+// different option set against the same endpoint does not re-warn, and so the
+// set holds no credentials and is bounded by the number of endpoints rather
+// than by the number of distinct DSNs a process resolves.
+type nonVerifyingRDSKey struct {
+	addr string
+	mode string
+}
+
+var warnedNonVerifyingRDS sync.Map
 
 // Default transport timeouts for SchemaBot-managed MySQL connections, applied
 // whenever the parsed value is unset — a DSN or option must set a positive
@@ -140,7 +150,6 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse DSN: %w", err)
 	}
-	warnNonVerifyingRDSTLS(dsn, cfg)
 	// An explicit TLS config or a non-RDS host needs no TLS enhancement; apply
 	// the required settings and options directly to the parsed config and
 	// reassemble.
@@ -166,12 +175,19 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	return requiredSettingsDSN(enhanced, opts...)
 }
 
-func warnNonVerifyingRDSTLS(dsn string, cfg *mysql.Config) {
+// warnNonVerifyingRDSTLS logs once per RDS endpoint and TLS mode when the
+// config that is about to be dialed does not verify the server certificate.
+// It is evaluated on the final config, after options have been applied, so a
+// mode weakened by an option is reported the same way as one carried by the
+// DSN. The mode is honored: an operator who spelled out tls=false against an
+// RDS host asked for it, and refusing would turn a compatibility setting into
+// an outage, so the warning is the whole intervention.
+func warnNonVerifyingRDSTLS(cfg *mysql.Config) {
 	if !dbconn.IsRDSHost(cfg.Addr) || !isNonVerifyingTLSMode(cfg.TLSConfig) {
 		return
 	}
-	// Hash the DSN so deduplication never retains credentials in memory.
-	if _, loaded := warnedNonVerifyingRDSDSNs.LoadOrStore(sha256.Sum256([]byte(dsn)), struct{}{}); loaded {
+	key := nonVerifyingRDSKey{addr: cfg.Addr, mode: cfg.TLSConfig}
+	if _, loaded := warnedNonVerifyingRDS.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
 	slog.Warn("MySQL RDS connection uses a non-verifying TLS mode; the configured mode is honored for compatibility",
@@ -201,6 +217,7 @@ func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) (string, error) {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	warnNonVerifyingRDSTLS(cfg)
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultConnectTimeout
 	}
