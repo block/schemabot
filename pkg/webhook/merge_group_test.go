@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -101,7 +102,7 @@ func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "merge_group checks posted")
 
 	got := map[string]checkRunCapture{}
-	for range []int{0, 1} {
+	for range []int{0, 1, 2} {
 		select {
 		case c := <-created:
 			got[c.Name] = c
@@ -110,8 +111,8 @@ func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
 		}
 	}
 
-	require.Len(t, got, 2)
-	for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)"} {
+	require.Len(t, got, 3)
+	for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)", onboardingCheckName} {
 		c, ok := got[name]
 		require.True(t, ok, "expected a check run named %q", name)
 		assert.Equal(t, "mergesha123", c.HeadSHA)
@@ -163,18 +164,26 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	updated := make(chan int64, 4)
 	created := make(chan string, 4)
-	mux.HandleFunc("GET /repos/octocat/hello-world/commits/mergesha123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/mergesha123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		id := int64(7)
+		name := "SchemaBot (production)"
+		if r.URL.Query().Get("check_name") == onboardingCheckName {
+			id = 8
+			name = onboardingCheckName
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"total_count": 1,
 			"check_runs": []map[string]any{
-				{"id": 7, "name": "SchemaBot (production)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+				{"id": id, "name": name, "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
 			},
 		})
 	})
-	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/7", func(w http.ResponseWriter, _ *http.Request) {
-		updated <- 7
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		require.NoError(t, err)
+		updated <- id
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 7})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var c checkRunCapture
@@ -199,12 +208,16 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil))
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	select {
-	case id := <-updated:
-		assert.Equal(t, int64(7), id)
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected the existing check run to be updated")
+	updatedIDs := map[int64]bool{}
+	for range 2 {
+		select {
+		case id := <-updated:
+			updatedIDs[id] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected the existing check runs to be updated")
+		}
 	}
+	assert.Equal(t, map[int64]bool{7: true, 8: true}, updatedIDs)
 
 	select {
 	case name := <-created:
@@ -223,19 +236,20 @@ func TestWebhookMergeGroupSingleAggregateWhenNoEnvScoping(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	select {
-	case c := <-created:
-		assert.Equal(t, "SchemaBot", c.Name)
+	got := map[string]checkRunCapture{}
+	for range 2 {
+		select {
+		case c := <-created:
+			got[c.Name] = c
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for merge_group check run")
+		}
+	}
+	for _, name := range []string{"SchemaBot", onboardingCheckName} {
+		c, ok := got[name]
+		require.True(t, ok, "expected check %q", name)
 		assert.Equal(t, "mergesha123", c.HeadSHA)
 		assert.Equal(t, "success", c.Conclusion)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for merge_group check run")
-	}
-
-	select {
-	case c := <-created:
-		t.Fatalf("expected exactly one aggregate check, got extra: %q", c.Name)
-	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -283,11 +297,16 @@ func TestWebhookMergeGroupLeaderStillPosts(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "merge_group checks posted")
 
-	select {
-	case c := <-created:
-		assert.Equal(t, "SchemaBot (production)", c.Name)
-		assert.Equal(t, "success", c.Conclusion)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the leader's merge_group check run")
+	got := map[string]checkRunCapture{}
+	for range 2 {
+		select {
+		case c := <-created:
+			got[c.Name] = c
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for the leader's merge_group check runs")
+		}
+	}
+	for _, name := range []string{"SchemaBot (production)", onboardingCheckName} {
+		assert.Equal(t, "success", got[name].Conclusion)
 	}
 }

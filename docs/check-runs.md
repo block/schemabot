@@ -203,6 +203,11 @@ subdirectories it owns:
 ```yaml
 database: widgets
 type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
 ```
 
 For Vitess-backed databases, use `type: vitess`:
@@ -216,6 +221,14 @@ A PR that only adds or edits `schemabot.yaml` is still managed work. SchemaBot
 loads the changed config directly, plans the current schema files for each
 configured environment, and publishes the normal aggregate check for the
 discovered database.
+
+SchemaBot also publishes a separate `SchemaBot onboarding` Check Run. Complete,
+commit-pinned base and head discovery decides whether a canonical database
+identity is new; config moves are therefore not onboarding. A new database must
+carry valid `legacy_baseline` metadata, and no commit after its anchor may touch
+a recorded legacy path on the current base branch. Ordinary changes receive a
+successful not-applicable result. The environment checks remain independent:
+the production plan must be freshly empty before the onboarding PR merges.
 
 On the happy path, where the live database already matches the declarative
 schema files (for PostgreSQL, that also means no live table is left

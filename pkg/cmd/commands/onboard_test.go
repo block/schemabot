@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/repoconfig"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -250,6 +251,65 @@ func TestPreservedExclusions(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "preserve ignore_namespaces and ignore_tables")
 	})
+}
+
+func TestResolveOnboardLegacyBaseline(t *testing.T) {
+	commit := "0123456789abcdef0123456789abcdef01234567"
+
+	t.Run("fresh onboarding requires explicit anchor", func(t *testing.T) {
+		baseline, err := resolveOnboardLegacyBaseline(t.TempDir(), "", nil)
+		require.Error(t, err)
+		assert.Nil(t, baseline)
+		assert.Contains(t, err.Error(), "fresh onboarding requires")
+	})
+
+	t.Run("explicit anchor is validated", func(t *testing.T) {
+		baseline, err := resolveOnboardLegacyBaseline(t.TempDir(), commit, []string{"service/db/changes"})
+		require.NoError(t, err)
+		assert.Equal(t, &repoconfig.LegacyBaseline{
+			Version: 1, BaseCommit: commit, LegacyPaths: []string{"service/db/changes"},
+		}, baseline)
+	})
+
+	t.Run("existing anchor is preserved", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte(`database: orders
+type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
+`), 0o644))
+
+		baseline, err := resolveOnboardLegacyBaseline(root, "", nil)
+		require.NoError(t, err)
+		assert.Equal(t, commit, baseline.BaseCommit)
+		assert.Equal(t, []string{"service/db/changes"}, baseline.LegacyPaths)
+	})
+}
+
+func TestBuildOnboardWritePlanWritesLegacyBaseline(t *testing.T) {
+	root := t.TempDir()
+	baseline := &repoconfig.LegacyBaseline{
+		Version: 1, BaseCommit: "0123456789abcdef0123456789abcdef01234567",
+		LegacyPaths: []string{"service/db/changes", "service/db/schema.rb"},
+	}
+	plan, err := buildOnboardWritePlanWithBaseline(root, validPullSchemaResponse(), client.PlanExclusions{}, baseline)
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, `database: orders
+type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
+    - service/db/schema.rb
+`, string(config))
 }
 
 func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
@@ -638,7 +698,7 @@ func TestOnboardConfigYAML_ExclusionsRoundTripThroughQuoting(t *testing.T) {
 		Tables:     []string{"#audit", "flyway_schema_history", "yes"},
 	}
 
-	out, err := onboardConfigYAML("testapp", "mysql", exclusions)
+	out, err := onboardConfigYAML("testapp", "mysql", exclusions, nil)
 	require.NoError(t, err)
 
 	dir := t.TempDir()
@@ -656,7 +716,7 @@ func TestOnboardConfigYAML_ExclusionsRoundTripThroughQuoting(t *testing.T) {
 func TestOnboardConfigYAML_OrdinaryNamesStayUnquoted(t *testing.T) {
 	out, err := onboardConfigYAML("testapp", "mysql", client.PlanExclusions{
 		Tables: []string{"flyway_schema_history"},
-	})
+	}, nil)
 	require.NoError(t, err)
 	assert.Contains(t, out, "ignore_tables:\n  - flyway_schema_history\n")
 }
@@ -664,7 +724,7 @@ func TestOnboardConfigYAML_OrdinaryNamesStayUnquoted(t *testing.T) {
 // An empty exclusion list is omitted: a bare key reads as a configured
 // exclusion of nothing rather than as no configuration at all.
 func TestOnboardConfigYAML_EmptyExclusionsOmitTheirKeys(t *testing.T) {
-	out, err := onboardConfigYAML("testapp", "mysql", client.PlanExclusions{})
+	out, err := onboardConfigYAML("testapp", "mysql", client.PlanExclusions{}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "database: testapp\ntype: mysql\n", out)
 }

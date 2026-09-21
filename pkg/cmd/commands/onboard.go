@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/repoconfig"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"gopkg.in/yaml.v3"
@@ -28,6 +29,8 @@ type OnboardCmd struct {
 	DryRun            bool     `help:"Preview files without writing them" name:"dry-run"`
 	Force             bool     `help:"Overwrite existing generated files"`
 	SkipVerify        bool     `help:"Skip plan verification after writing files" name:"skip-verify"`
+	LegacyBaseCommit  string   `help:"Full base-branch commit through which the generated schema accounts for legacy schema changes" name:"legacy-base-commit"`
+	LegacyPaths       []string `help:"Repository-relative legacy schema path covered by the base commit. Repeat for multiple paths." name:"legacy-path"`
 }
 
 // Run executes the onboard command.
@@ -60,7 +63,11 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
-	plan, err := buildOnboardWritePlan(cmd.SchemaDir, resp, preservedIgnores)
+	legacyBaseline, err := resolveOnboardLegacyBaseline(cmd.SchemaDir, cmd.LegacyBaseCommit, cmd.LegacyPaths)
+	if err != nil {
+		return err
+	}
+	plan, err := buildOnboardWritePlanWithBaseline(cmd.SchemaDir, resp, preservedIgnores, legacyBaseline)
 	if err != nil {
 		return err
 	}
@@ -154,6 +161,44 @@ func preservedExclusions(schemaRoot string) (client.PlanExclusions, error) {
 	return cfg.PlanExclusions(), nil
 }
 
+// resolveOnboardLegacyBaseline requires a reviewed anchor for a new config and
+// preserves it on an ordinary refresh. Passing either flag starts an explicit
+// anchor update and therefore requires the complete pair.
+func resolveOnboardLegacyBaseline(schemaRoot, baseCommit string, legacyPaths []string) (*repoconfig.LegacyBaseline, error) {
+	configPath := filepath.Join(schemaRoot, "schemabot.yaml")
+	_, statErr := os.Stat(configPath)
+	configExists := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("inspect existing schemabot.yaml for legacy_baseline: %w", statErr)
+	}
+
+	if baseCommit == "" && len(legacyPaths) == 0 {
+		if !configExists {
+			return nil, fmt.Errorf("fresh onboarding requires --legacy-base-commit and at least one --legacy-path")
+		}
+		cfg, err := LoadCLIConfig(schemaRoot)
+		if err != nil {
+			return nil, fmt.Errorf("read existing schemabot.yaml to preserve legacy_baseline: %w", err)
+		}
+		if err := cfg.LegacyBaseline.Validate(); err != nil {
+			return nil, fmt.Errorf("existing schemabot.yaml cannot be refreshed without explicit legacy anchor flags: %w", err)
+		}
+		return cfg.LegacyBaseline, nil
+	}
+	if baseCommit == "" || len(legacyPaths) == 0 {
+		return nil, fmt.Errorf("--legacy-base-commit and at least one --legacy-path must be supplied together")
+	}
+	baseline := &repoconfig.LegacyBaseline{
+		Version:     repoconfig.LegacyBaselineVersion,
+		BaseCommit:  baseCommit,
+		LegacyPaths: legacyPaths,
+	}
+	if err := baseline.Validate(); err != nil {
+		return nil, err
+	}
+	return baseline, nil
+}
+
 func onboardPullNamespaces(namespaces []string) ([]string, error) {
 	if len(namespaces) == 0 {
 		return nil, nil
@@ -207,6 +252,10 @@ func onboardOutputNamespace(namespace, environment string, templateEnvSuffix boo
 }
 
 func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse, exclusions client.PlanExclusions) (*onboardWritePlan, error) {
+	return buildOnboardWritePlanWithBaseline(schemaRoot, resp, exclusions, nil)
+}
+
+func buildOnboardWritePlanWithBaseline(schemaRoot string, resp *apitypes.PullSchemaResponse, exclusions client.PlanExclusions, legacyBaseline *repoconfig.LegacyBaseline) (*onboardWritePlan, error) {
 	if strings.TrimSpace(schemaRoot) == "" {
 		return nil, fmt.Errorf("schema root is required")
 	}
@@ -225,7 +274,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
 	}
 	root := filepath.Clean(schemaRoot)
-	configYAML, err := onboardConfigYAML(resp.Database, string(resp.Type), exclusions)
+	configYAML, err := onboardConfigYAML(resp.Database, string(resp.Type), exclusions, legacyBaseline)
 	if err != nil {
 		return nil, err
 	}
@@ -333,10 +382,11 @@ func rejectCaseCollisions(kind string, names []string) error {
 // list is omitted rather than written as a bare key, which would read as a
 // configured exclusion of nothing.
 type onboardConfig struct {
-	Database         string   `yaml:"database"`
-	Type             string   `yaml:"type"`
-	IgnoreNamespaces []string `yaml:"ignore_namespaces,omitempty"`
-	IgnoreTables     []string `yaml:"ignore_tables,omitempty"`
+	Database         string                     `yaml:"database"`
+	Type             string                     `yaml:"type"`
+	IgnoreNamespaces []string                   `yaml:"ignore_namespaces,omitempty"`
+	IgnoreTables     []string                   `yaml:"ignore_tables,omitempty"`
+	LegacyBaseline   *repoconfig.LegacyBaseline `yaml:"legacy_baseline,omitempty"`
 }
 
 // onboardConfigYAML renders the config for a freshly onboarded database. The
@@ -345,7 +395,7 @@ type onboardConfig struct {
 // one opening with a comment marker, say — would otherwise be written bare and
 // read back as something else, silently dropping the exclusion it states and
 // leaving the next plan to propose dropping its table.
-func onboardConfigYAML(database, databaseType string, exclusions client.PlanExclusions) (string, error) {
+func onboardConfigYAML(database, databaseType string, exclusions client.PlanExclusions, legacyBaseline *repoconfig.LegacyBaseline) (string, error) {
 	var b strings.Builder
 	enc := yaml.NewEncoder(&b)
 	enc.SetIndent(2)
@@ -354,6 +404,7 @@ func onboardConfigYAML(database, databaseType string, exclusions client.PlanExcl
 		Type:             databaseType,
 		IgnoreNamespaces: exclusions.Namespaces,
 		IgnoreTables:     exclusions.Tables,
+		LegacyBaseline:   legacyBaseline,
 	}); err != nil {
 		return "", fmt.Errorf("encode schemabot.yaml for database %s: %w", database, err)
 	}

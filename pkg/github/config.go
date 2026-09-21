@@ -10,6 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/repoconfig"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -48,6 +49,10 @@ type SchemabotConfig struct {
 	// catalog, in every namespace the plan covers, and every plan discloses
 	// what it withheld.
 	IgnoreTables []string `yaml:"ignore_tables,omitempty" json:"ignore_tables,omitempty"`
+	// LegacyBaseline is validated only when comparison with the base branch
+	// proves this database is being introduced. Once the config lands it is
+	// historical metadata and must not reactivate onboarding gates.
+	LegacyBaseline *repoconfig.LegacyBaseline `yaml:"legacy_baseline,omitempty" json:"legacy_baseline,omitempty"`
 }
 
 // GetType returns the database type. Type is always set — FetchConfig rejects empty values.
@@ -180,6 +185,67 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 type FindAllConfigsResult struct {
 	ValidConfigs   []DiscoveredConfig
 	InvalidConfigs []InvalidConfigInfo
+}
+
+// IntroducedConfigs compares complete, commit-pinned config discoveries and
+// returns the head configs whose canonical database identity is absent from
+// the base. Config paths do not participate in identity, so moving a config is
+// not mistaken for onboarding. Any invalid or duplicate identity keeps the
+// comparison fail-closed.
+func IntroducedConfigs(base, head *FindAllConfigsResult) ([]DiscoveredConfig, error) {
+	if base == nil || head == nil {
+		return nil, fmt.Errorf("base and head config discovery results are required")
+	}
+	if len(base.InvalidConfigs) > 0 {
+		return nil, invalidDiscoveryError("base", base.InvalidConfigs)
+	}
+	if len(head.InvalidConfigs) > 0 {
+		return nil, invalidDiscoveryError("head", head.InvalidConfigs)
+	}
+
+	baseByDatabase, err := uniqueConfigsByDatabase("base", base.ValidConfigs)
+	if err != nil {
+		return nil, err
+	}
+	headByDatabase, err := uniqueConfigsByDatabase("head", head.ValidConfigs)
+	if err != nil {
+		return nil, err
+	}
+
+	introduced := make([]DiscoveredConfig, 0)
+	for database, cfg := range headByDatabase {
+		if _, existed := baseByDatabase[database]; !existed {
+			introduced = append(introduced, cfg)
+		}
+	}
+	sort.Slice(introduced, func(i, j int) bool {
+		return introduced[i].Config.Database < introduced[j].Config.Database
+	})
+	return introduced, nil
+}
+
+func invalidDiscoveryError(ref string, invalid []InvalidConfigInfo) error {
+	details := make([]string, 0, len(invalid))
+	for _, config := range invalid {
+		details = append(details, fmt.Sprintf("%s: %s", config.Path, config.Error))
+	}
+	sort.Strings(details)
+	return fmt.Errorf("%s contains invalid schemabot.yaml config: %s", ref, strings.Join(details, "; "))
+}
+
+func uniqueConfigsByDatabase(ref string, configs []DiscoveredConfig) (map[string]DiscoveredConfig, error) {
+	byDatabase := make(map[string]DiscoveredConfig, len(configs))
+	for _, cfg := range configs {
+		if cfg.Config == nil {
+			return nil, fmt.Errorf("%s config at %s has no parsed configuration", ref, cfg.Path)
+		}
+		database := cfg.Config.Database
+		if previous, exists := byDatabase[database]; exists {
+			return nil, fmt.Errorf("%s has ambiguous database identity %q at %s and %s", ref, database, previous.Path, cfg.Path)
+		}
+		byDatabase[database] = cfg
+	}
+	return byDatabase, nil
 }
 
 // FindAllConfigs uses the Tree API to discover all schemabot.yaml config files

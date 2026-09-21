@@ -159,6 +159,14 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		h.writeError(w, http.StatusInternalServerError, "failed to post merge_group checks")
 		return
 	}
+	if err := h.postPassingMergeGroupOnboardingCheck(postCtx, client, repo, headSHA); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation: "merge_group_onboarding_check", Repository: repo, Status: "error",
+		})
+		h.logger.Error("failed to post merge_group onboarding check", "repo", repo, "head_sha", headSHA, "error", err)
+		h.writeError(w, http.StatusInternalServerError, "failed to post merge_group onboarding check")
+		return
+	}
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group checks posted"})
 }
@@ -263,6 +271,12 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 			Status:     "error",
 		})
 		return true, fmt.Errorf("post durable merge_group checks for %s@%s: %w", repo, headSHA, err)
+	}
+	if err := h.postPassingMergeGroupOnboardingCheck(ctx, client, repo, headSHA); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation: "merge_group_onboarding_check", Repository: repo, Status: "error",
+		})
+		return true, fmt.Errorf("post durable merge_group onboarding check for %s@%s: %w", repo, headSHA, err)
 	}
 
 	h.logger.Info("durable merge_group checks posted",

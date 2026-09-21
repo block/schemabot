@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"testing"
@@ -1409,6 +1410,91 @@ func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "invalid schemabot.yaml")
 			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestFetchConfigParsesLegacyBaselineWithoutActivatingIt(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", `database: orders
+type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
+`)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	config, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "head")
+
+	require.NoError(t, err)
+	require.NotNil(t, config.LegacyBaseline)
+	assert.Equal(t, 1, config.LegacyBaseline.Version)
+	assert.Equal(t, "0123456789abcdef0123456789abcdef01234567", config.LegacyBaseline.BaseCommit)
+	assert.Equal(t, []string{"service/db/changes"}, config.LegacyBaseline.LegacyPaths)
+}
+
+func TestIntroducedConfigsMatchesDatabaseIdentityAcrossPaths(t *testing.T) {
+	config := func(database, configPath string) DiscoveredConfig {
+		return DiscoveredConfig{
+			Config:    &SchemabotConfig{Database: database, Type: DatabaseTypeMySQL},
+			Path:      configPath,
+			SchemaDir: path.Dir(configPath),
+		}
+	}
+	base := &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{
+		config("orders", "old/schema/schemabot.yaml"),
+		config("billing", "billing/schema/schemabot.yaml"),
+	}}
+	head := &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{
+		config("orders", "new/schema/schemabot.yaml"),
+		config("payments", "payments/schema/schemabot.yaml"),
+	}}
+
+	introduced, err := IntroducedConfigs(base, head)
+
+	require.NoError(t, err)
+	require.Len(t, introduced, 1)
+	assert.Equal(t, "payments", introduced[0].Config.Database)
+}
+
+func TestIntroducedConfigsFailsClosedOnUncertainDiscovery(t *testing.T) {
+	valid := DiscoveredConfig{
+		Config:    &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL},
+		Path:      "schema/schemabot.yaml",
+		SchemaDir: "schema",
+	}
+
+	tests := []struct {
+		name string
+		base *FindAllConfigsResult
+		head *FindAllConfigsResult
+		want string
+	}{
+		{
+			name: "invalid base",
+			base: &FindAllConfigsResult{InvalidConfigs: []InvalidConfigInfo{{Path: "bad/schemabot.yaml", Error: "database is required"}}},
+			head: &FindAllConfigsResult{},
+			want: "base contains invalid",
+		},
+		{
+			name: "duplicate head identity",
+			base: &FindAllConfigsResult{},
+			head: &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{valid, {
+				Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL},
+				Path:   "other/schemabot.yaml", SchemaDir: "other",
+			}}},
+			want: "ambiguous database identity",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			introduced, err := IntroducedConfigs(tt.base, tt.head)
+			require.Error(t, err)
+			assert.Nil(t, introduced)
+			assert.Contains(t, err.Error(), tt.want)
 		})
 	}
 }

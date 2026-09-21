@@ -1070,6 +1070,142 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 	return files, nil
 }
 
+// LegacyPathChange identifies a commit after an onboarding anchor that touched
+// one of the legacy schema paths the declarative baseline claims to cover.
+type LegacyPathChange struct {
+	Commit string
+	Path   string
+	Title  string
+}
+
+// ResolveBranchTip pins a branch name to the commit used by a multi-read
+// comparison. Callers must pass the returned SHA to every subsequent read so a
+// branch advancing midway through discovery cannot mix two base states.
+func (ic *InstallationClient) ResolveBranchTip(ctx context.Context, repo, branch string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	ref, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+branch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", branch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sha := ref.GetObject().GetSHA()
+	if sha == "" {
+		return "", fmt.Errorf("ref heads/%s for %s resolved to no commit", branch, repo)
+	}
+	return sha, nil
+}
+
+const maxLegacyHistoryPages = 100
+
+// LegacyPathChangesSinceAnchor verifies that anchor is an ancestor of baseSHA
+// and returns every later commit that touched a recorded legacy path. The path
+// filtered commit listing observes intermediate edits even when a later commit
+// restores the path's final tree object to its anchored value.
+func (ic *InstallationClient) LegacyPathChangesSinceAnchor(ctx context.Context, repo, anchor, baseSHA string, legacyPaths []string) ([]LegacyPathChange, error) {
+	owner, repoName := splitRepo(repo)
+	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "compare onboarding anchor with base", []any{"repo", repo, "anchor", anchor, "base_sha", baseSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, anchor, baseSHA, &gh.ListOptions{PerPage: 100})
+		if err != nil {
+			return nil, fmt.Errorf("compare commits %s...%s: %w", anchor, baseSHA, classifyGitHubAPIError(err))
+		}
+		return comparison, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	status := comparison.GetStatus()
+	if status != "ahead" && status != "identical" {
+		return nil, fmt.Errorf("legacy anchor %s is not an ancestor of base commit %s (comparison status %q)", anchor, baseSHA, status)
+	}
+	if status == "identical" {
+		return nil, nil
+	}
+
+	rangeCommits := make(map[string]struct{}, comparison.GetTotalCommits())
+	for _, commit := range comparison.Commits {
+		rangeCommits[commit.GetSHA()] = struct{}{}
+	}
+	// CompareCommits can paginate commit entries. Fetch the remaining pages so
+	// membership below never treats an unseen in-range commit as history before
+	// the anchor.
+	for page := 2; len(rangeCommits) < comparison.GetTotalCommits(); page++ {
+		if page > maxLegacyHistoryPages {
+			return nil, fmt.Errorf("legacy anchor range %s...%s exceeds history page limit", anchor, baseSHA)
+		}
+		pageResult, pageErr := retryGitHubUnavailableRead(ctx, ic.logger, "page onboarding anchor comparison", []any{"repo", repo, "anchor", anchor, "base_sha", baseSHA, "page", page}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+			result, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, anchor, baseSHA, &gh.ListOptions{Page: page, PerPage: 100})
+			if err != nil {
+				return nil, fmt.Errorf("compare commits %s...%s page %d: %w", anchor, baseSHA, page, classifyGitHubAPIError(err))
+			}
+			return result, nil
+		})
+		if pageErr != nil {
+			return nil, pageErr
+		}
+		before := len(rangeCommits)
+		for _, commit := range pageResult.Commits {
+			rangeCommits[commit.GetSHA()] = struct{}{}
+		}
+		if len(rangeCommits) == before {
+			return nil, fmt.Errorf("legacy anchor range %s...%s returned incomplete commit history: got %d of %d", anchor, baseSHA, len(rangeCommits), comparison.GetTotalCommits())
+		}
+	}
+
+	var changes []LegacyPathChange
+	for _, legacyPath := range legacyPaths {
+		crossedAnchor := false
+		for page := 1; page <= maxLegacyHistoryPages; page++ {
+			commits, response, listErr := ic.listCommitsForPath(ctx, owner, repoName, repo, baseSHA, legacyPath, page)
+			if listErr != nil {
+				return nil, listErr
+			}
+			for _, commit := range commits {
+				sha := commit.GetSHA()
+				if _, inRange := rangeCommits[sha]; !inRange {
+					crossedAnchor = true
+					break
+				}
+				title, _, _ := strings.Cut(commit.GetCommit().GetMessage(), "\n")
+				changes = append(changes, LegacyPathChange{Commit: sha, Path: legacyPath, Title: title})
+			}
+			if crossedAnchor || response.NextPage == 0 {
+				break
+			}
+			if page == maxLegacyHistoryPages {
+				return nil, fmt.Errorf("legacy path %s history from %s exceeds page limit", legacyPath, baseSHA)
+			}
+		}
+	}
+	return changes, nil
+}
+
+func (ic *InstallationClient) listCommitsForPath(ctx context.Context, owner, repoName, repo, baseSHA, legacyPath string, page int) ([]*gh.RepositoryCommit, *gh.Response, error) {
+	type result struct {
+		commits  []*gh.RepositoryCommit
+		response *gh.Response
+	}
+	readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "list legacy path commits", []any{"repo", repo, "base_sha", baseSHA, "path", legacyPath, "page", page}, func(ctx context.Context) (*result, error) {
+		commits, response, err := ic.client.Repositories.ListCommits(ctx, owner, repoName, &gh.CommitsListOptions{
+			SHA:         baseSHA,
+			Path:        legacyPath,
+			ListOptions: gh.ListOptions{Page: page, PerPage: 100},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list commits for path %s at %s page %d: %w", legacyPath, baseSHA, page, classifyGitHubAPIError(err))
+		}
+		return &result{commits: commits, response: response}, nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return readResult.commits, readResult.response, nil
+}
+
 // SchemaPathsChangedSinceMergeBase reports whether any schema path has a
 // different Git object on the current tip of the PR's base branch than it had
 // at the PR's merge base. Paths may name directories or symlinks. Comparing

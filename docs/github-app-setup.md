@@ -155,7 +155,7 @@ You should see:
 ## 6. Add `schemabot.yaml` Config to Your Repository
 
 You don't have to write the schema directory by hand. Once the database is registered in the
-server config (step 4), `schemabot onboard -d mydb -e staging -s ./schema` pulls the live
+server config (step 4), `schemabot onboard -d mydb -e staging -s ./schema --legacy-base-commit <full-base-sha> --legacy-path <legacy-schema-path>` pulls the live
 schema and generates the whole directory — `schemabot.yaml`, a subdirectory per namespace
 (the schema name on MySQL, the keyspace on Vitess), and one `.sql` file per table — then
 verifies the result plans clean against the source environment. Use `--dry-run` to preview
@@ -178,6 +178,11 @@ my-repo/
 ```yaml
 database: mydb
 type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
 ```
 
 | Field | Required | Description |
@@ -186,6 +191,15 @@ type: mysql
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 | `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
+| `legacy_baseline` | Required while introducing a database config | The full base commit and exact repository-relative legacy schema paths whose supported DDL effects are represented by the declarative files. `schemabot onboard` writes it from `--legacy-base-commit` and repeatable `--legacy-path` flags. |
+
+The `SchemaBot onboarding` Check Run compares complete config sets at the
+current base and PR head. It activates only for database identities absent from
+the base, so moving a config does not reactivate onboarding. For an introduced
+database it fails if the baseline is missing, malformed, no longer an ancestor
+of the base, or if a later base commit touched a recorded legacy path. The
+production SchemaBot plan remains the independent live-convergence gate and
+must be empty before merge.
 
 Environment availability and promotion order are configured on the SchemaBot server.
 

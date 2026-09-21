@@ -100,6 +100,25 @@ func TestLoadCLIConfig_ParsesIgnoreNamespaces(t *testing.T) {
 	assert.Equal(t, []string{"local_fixtures"}, cfg.IgnoreNamespaces)
 }
 
+func TestLoadCLIConfigParsesLegacyBaseline(t *testing.T) {
+	dir := t.TempDir()
+	content := `database: mydb
+type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0o644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.LegacyBaseline)
+	assert.Equal(t, 1, cfg.LegacyBaseline.Version)
+	assert.Equal(t, []string{"service/db/changes"}, cfg.LegacyBaseline.LegacyPaths)
+}
+
 func TestLoadCLIConfig_RejectsIgnoreNamespacePaths(t *testing.T) {
 	dir := t.TempDir()
 	content := "database: mydb\ntype: vitess\nignore_namespaces:\n  - schema/local_fixtures\n"

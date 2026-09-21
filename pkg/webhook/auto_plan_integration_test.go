@@ -86,14 +86,9 @@ func TestE2EAutoPlan(t *testing.T) {
 	}
 
 	// Verify check run was created
-	select {
-	case cr := <-result.checkRuns:
-		assert.Contains(t, cr.Name, "SchemaBot")
-		assert.Equal(t, "completed", cr.Status)
-		assert.Equal(t, "action_required", cr.Conclusion)
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
-	}
+	cr := collectAggregate(t, result.checkRuns, aggregateCheckName)
+	assert.Equal(t, "completed", cr.Status)
+	assert.Equal(t, "action_required", cr.Conclusion)
 }
 
 // A push that only changes non-schema inputs still refreshes SchemaBot checks
@@ -150,14 +145,9 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	select {
-	case cr := <-result.checkRuns:
-		assert.Contains(t, cr.Name, "SchemaBot")
-		assert.Equal(t, "completed", cr.Status)
-		assert.Equal(t, "action_required", cr.Conclusion)
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
-	}
+	cr := collectAggregate(t, result.checkRuns, aggregateCheckName)
+	assert.Equal(t, "completed", cr.Status)
+	assert.Equal(t, "action_required", cr.Conclusion)
 
 	select {
 	case body := <-result.comments:
@@ -458,12 +448,7 @@ func TestE2EAutoPlanSourcePolicyBlocksWithFailingAggregate(t *testing.T) {
 		t.Fatal("timed out waiting for source policy auto-plan comment")
 	}
 
-	var aggregateCheck checkRunCapture
-	select {
-	case aggregateCheck = <-result.checkRuns:
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for source policy aggregate check run")
-	}
+	aggregateCheck := collectAggregate(t, result.checkRuns, aggregateCheckName)
 	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
 	assert.Equal(t, "completed", aggregateCheck.Status)
 	assert.Equal(t, "failure", aggregateCheck.Conclusion)
@@ -579,15 +564,10 @@ func TestE2EReopenedPRAutoPlansCurrentHead(t *testing.T) {
 		t.Fatal("timed out waiting for reopened auto-plan comment")
 	}
 
-	select {
-	case cr := <-result.checkRuns:
-		assert.Equal(t, aggregateCheckName, cr.Name)
-		assert.Equal(t, "abc123", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for reopened auto-plan check run")
-	}
+	cr := collectAggregate(t, result.checkRuns, aggregateCheckName)
+	assert.Equal(t, "abc123", cr.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
 
 	// The stored check state must be tied to the reopened commit SHA, not any
 	// stale SHA from before the PR was closed.
@@ -653,15 +633,10 @@ func TestE2ERetargetedPRAutoPlansAgainstTheNewBase(t *testing.T) {
 		t.Fatal("timed out waiting for retargeted auto-plan comment")
 	}
 
-	select {
-	case cr := <-result.checkRuns:
-		assert.Equal(t, aggregateCheckName, cr.Name)
-		assert.Equal(t, "abc123", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for retargeted auto-plan check run")
-	}
+	cr := collectAggregate(t, result.checkRuns, aggregateCheckName)
+	assert.Equal(t, "abc123", cr.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
 }
 
 // TestE2EAutoPlanIgnoresSchemaFilesTheDefaultBranchAlreadyHolds verifies that a
@@ -703,15 +678,10 @@ func TestE2EAutoPlanIgnoresSchemaFilesTheDefaultBranchAlreadyHolds(t *testing.T)
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	select {
-	case cr := <-result.checkRuns:
-		assert.Equal(t, aggregateCheckName, cr.Name)
-		assert.Equal(t, "abc123", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
-	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the passing aggregate check run")
-	}
+	cr := collectAggregate(t, result.checkRuns, aggregateCheckName)
+	assert.Equal(t, "abc123", cr.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
 
 	select {
 	case body := <-result.comments:
@@ -1152,15 +1122,10 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	case <-time.After(webhookIntegrationCheckRunDeadline):
 		t.Fatal("timed out waiting for no-schema auto-plan discovery")
 	}
-	select {
-	case cr := <-checkRuns:
-		assert.Equal(t, aggregateCheckName, cr.Name)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
-		assert.Equal(t, "abc123", cr.HeadSHA)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for no-schema passing aggregate check run")
-	}
+	cr := collectAggregate(t, checkRuns, aggregateCheckName)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	assert.Equal(t, "abc123", cr.HeadSHA)
 	var check *storage.Check
 	var checkErr error
 	require.Eventually(t, func() bool {
@@ -1282,20 +1247,12 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	seen := map[string]bool{}
-	for i := range 2 {
-		select {
-		case cr := <-checkRuns:
-			seen[cr.Name] = true
-			assert.Equal(t, checkStatusCompleted, cr.Status)
-			assert.Equal(t, checkConclusionFailure, cr.Conclusion)
-			assert.Equal(t, "abc123", cr.HeadSHA)
-		case <-time.After(webhookIntegrationCheckRunDeadline):
-			t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
-		}
+	for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)"} {
+		cr := collectAggregate(t, checkRuns, name)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+		assert.Equal(t, "abc123", cr.HeadSHA)
 	}
-	assert.True(t, seen["SchemaBot (staging)"])
-	assert.True(t, seen["SchemaBot (production)"])
 
 	// Each aggregate stores a machine-readable GitHub-unavailable blocking
 	// reason so operators can distinguish this from a schema/config error.
@@ -1385,24 +1342,16 @@ func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
 
 			require.Equal(t, http.StatusOK, rr.Code)
 
-			seen := map[string]bool{}
-			for i := range 2 {
-				select {
-				case cr := <-checkRuns:
-					seen[cr.Name] = true
-					assert.Equal(t, checkStatusCompleted, cr.Status)
-					assert.Equal(t, checkConclusionFailure, cr.Conclusion)
-					assert.Equal(t, "abc123", cr.HeadSHA)
-					assert.Contains(t, cr.Output.Summary, "more files than GitHub will report for a single pull request",
-						"the check must name the cap that stopped the plan")
-					assert.Contains(t, cr.Output.Summary, "smaller PR",
-						"the check must tell the author how to get a plan")
-				case <-time.After(webhookIntegrationCheckRunDeadline):
-					t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
-				}
+			for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)"} {
+				cr := collectAggregate(t, checkRuns, name)
+				assert.Equal(t, checkStatusCompleted, cr.Status)
+				assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+				assert.Equal(t, "abc123", cr.HeadSHA)
+				assert.Contains(t, cr.Output.Summary, "more files than GitHub will report for a single pull request",
+					"the check must name the cap that stopped the plan")
+				assert.Contains(t, cr.Output.Summary, "smaller PR",
+					"the check must tell the author how to get a plan")
 			}
-			assert.True(t, seen["SchemaBot (staging)"])
-			assert.True(t, seen["SchemaBot (production)"])
 			assert.Positive(t, filePages.Load(), "auto-plan must have listed PR files before failing closed")
 
 			// Each aggregate stores the file-cap blocking reason, so an operator can
@@ -1841,17 +1790,12 @@ func TestE2EAutoPlanFailsWhenConfiguredEnvironmentsAreNotAllowed(t *testing.T) {
 	// The webhook still accepts the PR event asynchronously, but auto-plan posts
 	// a failing aggregate because this service cannot process any environment
 	// configured for the database.
-	select {
-	case cr := <-result.checkRuns:
-		assert.Equal(t, "SchemaBot (sandbox)", cr.Name)
-		assert.Equal(t, "abc123", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionFailure, cr.Conclusion)
-		require.NotNil(t, cr.Output)
-		assert.Equal(t, noAllowedConfiguredEnvironmentsBlock.message, cr.Output.Summary)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for failing aggregate for allowed environment")
-	}
+	cr := collectAggregate(t, result.checkRuns, "SchemaBot (sandbox)")
+	assert.Equal(t, "abc123", cr.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+	require.NotNil(t, cr.Output)
+	assert.Equal(t, noAllowedConfiguredEnvironmentsBlock.message, cr.Output.Summary)
 
 	require.Eventually(t, func() bool {
 		aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
@@ -1910,12 +1854,7 @@ func TestE2EAutoPlanManagedDirMissingConfigBlocks(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	var aggregateCheck checkRunCapture
-	select {
-	case aggregateCheck = <-result.checkRuns:
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for managed-dir-missing-config aggregate check run")
-	}
+	aggregateCheck := collectAggregate(t, result.checkRuns, aggregateCheckName)
 	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
 	assert.Equal(t, "completed", aggregateCheck.Status)
 	assert.Equal(t, "failure", aggregateCheck.Conclusion)
@@ -1994,13 +1933,8 @@ func TestE2EAutoPlanSchemaDirMoveNotBlocked(t *testing.T) {
 
 	// A normal plan-with-changes check, not a fail-closed failure, proves the
 	// move was not mistaken for an unmanaged schema change.
-	select {
-	case cr := <-result.checkRuns:
-		assert.Contains(t, cr.Name, "SchemaBot")
-		assert.Equal(t, "action_required", cr.Conclusion)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for check run")
-	}
+	cr := collectAggregate(t, result.checkRuns, aggregateCheckName)
+	assert.Equal(t, "action_required", cr.Conclusion)
 
 	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
 	require.NoError(t, err)

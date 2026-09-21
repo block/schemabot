@@ -396,6 +396,17 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		return "config discovery failed", missingBase
 	}
 
+	// The onboarding gate is independent of environment planning: it compares
+	// complete config sets at the pinned base and head, then checks any newly
+	// introduced database's recorded legacy paths. A failed gate publishes its
+	// own required Check Run but does not suppress the ordinary environment
+	// plans, which remain useful for diagnosing live convergence.
+	if err := h.runOnboardingGate(ctx, client, repo, pr, headSHA, baseRef); err != nil {
+		h.logger.Error("onboarding gate could not be verified",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
+			"source", source, "delivery_id", deliveryID, "error", err)
+	}
+
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
 	changedFiles, err := client.FetchPRFiles(ctx, repo, pr)

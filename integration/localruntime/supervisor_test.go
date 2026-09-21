@@ -133,14 +133,15 @@ func TestSupervisorEngines(t *testing.T) {
 			}
 			onboardCtx, cancelOnboard := context.WithTimeout(t.Context(), runtimeDeadline)
 			defer cancelOnboard()
-			onboard := exec.CommandContext(onboardCtx, binary, "onboard", "--profile", "alpha", "-d", "app", "-e", "development", "-s", schemaRoot)
+			onboard := exec.CommandContext(onboardCtx, binary, "onboard", "--profile", "alpha", "-d", "app", "-e", "development", "-s", schemaRoot,
+				"--legacy-base-commit", "0123456789abcdef0123456789abcdef01234567", "--legacy-path", "legacy/db/changes")
 			onboard.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=")
 			output, err := onboard.CombinedOutput()
 			require.NoError(t, err, string(output))
 			assert.Contains(t, string(output), "Verified: pulled schema produces no schema changes in the source environment.")
 			config, err := os.ReadFile(filepath.Join(schemaRoot, "schemabot.yaml"))
 			require.NoError(t, err)
-			assert.Equal(t, "database: app\ntype: "+engine+"\n", string(config))
+			assert.Equal(t, "database: app\ntype: "+engine+"\nlegacy_baseline:\n  version: 1\n  base_commit: 0123456789abcdef0123456789abcdef01234567\n  legacy_paths:\n    - \"legacy/db/changes\"\n", string(config))
 			schema, err := os.ReadFile(filepath.Join(schemaRoot, namespace, "widgets.sql"))
 			require.NoError(t, err)
 			assert.Contains(t, string(schema), "widgets")
