@@ -133,6 +133,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 
 	// Set up fake GitHub server that returns NO changed files (simulating revert commit)
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -212,22 +213,14 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	// cleanupStaleChecks marks the plan-only records as success and publishes the
 	// aggregate. The passing-aggregate path should not race ahead while stale
 	// action_required records still exist.
-	deadline := time.After(10 * time.Second)
-	for {
-		select {
-		case cr := <-checkRuns:
-			if cr.Name != aggregateCheckName {
-				continue
-			}
-			assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
-			assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
-			goto aggregatePublished
-		case <-deadline:
-			t.Fatal("timed out waiting for aggregate check run")
-		}
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+		assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for aggregate check run")
 	}
-
-aggregatePublished:
 
 	// Poll for per-database storage records to be updated by cleanupStaleChecks.
 	for _, env := range []string{"staging", "production"} {
@@ -352,10 +345,15 @@ func TestE2ENewHeadPlanPreservesInProgressApplyOwnership(t *testing.T) {
 
 	// The aggregate is re-created on the new commit and stays in_progress
 	// because the apply-owned per-database row still blocks it.
-	cr := collectAggregate(t, result.checkRuns, aggregateCheckName)
-	assert.Equal(t, "abc123", cr.HeadSHA)
-	assert.Equal(t, checkStatusInProgress, cr.Status)
-	assert.Empty(t, cr.Conclusion)
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusInProgress, cr.Status)
+		assert.Empty(t, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for new-head aggregate check run")
+	}
 
 	// The running apply keeps ownership: the new commit's plan result must not
 	// overwrite the in-progress check state or clear the apply ID.
@@ -488,10 +486,15 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	cr := collectAggregate(t, checkRuns, aggregateCheckName)
-	assert.Equal(t, "newsha222", cr.HeadSHA)
-	assert.Equal(t, checkStatusInProgress, cr.Status)
-	assert.Empty(t, cr.Conclusion)
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "newsha222", cr.HeadSHA)
+		assert.Equal(t, checkStatusInProgress, cr.Status)
+		assert.Empty(t, cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for in-progress aggregate check run")
+	}
 
 	installClient := ghclient.NewInstallationClientWithSlug(client, h.logger, "schemabot")
 	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222")
@@ -543,6 +546,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -603,11 +607,19 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Wait for both passing aggregates (staging + production)
-	for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)"} {
-		cr := collectAggregate(t, checkRuns, name)
-		assert.Equal(t, "completed", cr.Status)
-		assert.Equal(t, "success", cr.Conclusion)
+	seen := map[string]bool{}
+	for i := range 2 {
+		select {
+		case cr := <-checkRuns:
+			seen[cr.Name] = true
+			assert.Equal(t, "completed", cr.Status)
+			assert.Equal(t, "success", cr.Conclusion)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for passing aggregate check run %d/2, seen: %v", i+1, seen)
+		}
 	}
+	assert.True(t, seen["SchemaBot (staging)"], "expected SchemaBot (staging) check")
+	assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
 }
 
 // An aggregate participant does not own the required check on a repo — the
@@ -701,6 +713,7 @@ func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -748,10 +761,15 @@ func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "no schema files in PR")
 
-	cr := collectAggregate(t, checkRuns, "SchemaBot (staging)")
-	assert.Equal(t, "abc123", cr.HeadSHA)
-	assert.Equal(t, checkStatusCompleted, cr.Status)
-	assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for rerun aggregate check")
+	}
 }
 
 // TestE2ECheckRunRerequestIgnoresStaleHeadSHA verifies that rerunning an old
@@ -818,6 +836,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -882,9 +901,13 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	cr := collectAggregate(t, checkRuns, "SchemaBot (staging)")
-	assert.Equal(t, "sha1aaa", cr.HeadSHA, "first aggregate should be on the opened SHA")
-	assert.Equal(t, "success", cr.Conclusion)
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "sha1aaa", cr.HeadSHA, "first aggregate should be on the opened SHA")
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for check run on opened event")
+	}
 
 	// Step 2: synchronize with sha2 (force push)
 	currentHead.Store("sha2bbb")
@@ -896,9 +919,13 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	cr = collectAggregate(t, checkRuns, "SchemaBot (staging)")
-	assert.Equal(t, "sha2bbb", cr.HeadSHA, "aggregate must be recreated on the new SHA after synchronize")
-	assert.Equal(t, "success", cr.Conclusion)
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "sha2bbb", cr.HeadSHA, "aggregate must be recreated on the new SHA after synchronize")
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out — aggregate was not recreated on new SHA after synchronize")
+	}
 }
 
 // TestE2EAggregateUpdateSkipsStaleHeadSHA verifies that aggregate updates are
@@ -1149,9 +1176,14 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Should post passing aggregate even though .sql files changed
-	cr := collectAggregate(t, checkRuns, "SchemaBot (staging)")
-	assert.Equal(t, "completed", cr.Status)
-	assert.Equal(t, "success", cr.Conclusion)
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for passing aggregate check run")
+	}
 }
 
 // TestE2EPassingAggregateWithoutAllowedEnvs verifies that when allowed_environments
@@ -1162,6 +1194,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -1222,9 +1255,14 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Single-instance mode posts a global "SchemaBot" passing aggregate
-	cr := collectAggregate(t, checkRuns, "SchemaBot")
-	assert.Equal(t, "completed", cr.Status)
-	assert.Equal(t, "success", cr.Conclusion)
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot", cr.Name)
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for passing aggregate check run")
+	}
 }
 
 // TestE2EFailingAggregateOnPlanError verifies that when a plan fails for all
@@ -1276,9 +1314,14 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	}
 
 	// Should also get a failing aggregate check run
-	cr := collectAggregate(t, result.checkRuns, "SchemaBot (staging)")
-	assert.Equal(t, "completed", cr.Status)
-	assert.Equal(t, "failure", cr.Conclusion)
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "failure", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
 }
 
 // A failing aggregate's summary carries error text that can contain internal

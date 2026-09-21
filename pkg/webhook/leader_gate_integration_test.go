@@ -193,6 +193,7 @@ func TestE2ELeaderPassesOnTrustedSuccessfulParticipant(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -539,16 +540,11 @@ func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		checkName := r.URL.Query().Get("check_name")
-		if checkName != prodCheckName && checkName != stagingCheckName {
-			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
-			return
-		}
 		if checkRunReads.Add(1) <= firstFoldReads {
 			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
 			return
 		}
-		run, ok := runsByName[checkName]
+		run, ok := runsByName[r.URL.Query().Get("check_name")]
 		if !ok {
 			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
 			return

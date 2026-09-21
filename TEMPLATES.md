@@ -664,7 +664,7 @@ SchemaBot found no changes to managed schema files in this PR and no apply-owned
 
 ## ℹ️ No Schema Files Changed
 
-SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
+SchemaBot found no changes to managed schema files in this PR. SchemaBot requested a check refresh on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12). See the checks for merge readiness.
 
 <details>
 <summary>Expected a plan?</summary>

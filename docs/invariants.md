@@ -458,7 +458,8 @@ agreement.
 Config-discovery failure, stored-check-state read failure, head-SHA ambiguity, or an in-flight
 apply must surface as a blocking or absent check, never a passing one. *Breaks if violated:* a PR
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
-publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`).
+publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`);
+onboarding verification before passing PR aggregates (`pkg/webhook/onboarding_gate.go`).
 
 ### MG-2: Absence never passes
 

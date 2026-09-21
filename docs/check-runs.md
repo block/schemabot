@@ -222,13 +222,25 @@ loads the changed config directly, plans the current schema files for each
 configured environment, and publishes the normal aggregate check for the
 discovered database.
 
-SchemaBot also publishes a separate `SchemaBot onboarding` Check Run. Complete,
-commit-pinned base and head discovery decides whether a canonical database
-identity is new; config moves are therefore not onboarding. A new database must
-carry valid `legacy_baseline` metadata, and no commit after its anchor may touch
-a recorded legacy path on the current base branch. Ordinary changes receive a
-successful not-applicable result. The environment checks remain independent:
-the production plan must be freshly empty before the onboarding PR merges.
+Onboarding verification is part of the existing `SchemaBot` or
+`SchemaBot (<environment>)` aggregate Check Runs. No additional required check
+is needed. Before publishing a passing PR aggregate, SchemaBot compares complete,
+commit-pinned base and head config sets to identify newly introduced databases;
+config moves are therefore not onboarding. A new database must carry valid
+`legacy_baseline` metadata, and no commit after its anchor may touch a recorded
+legacy path on the current base branch. Plans, apply completion, and no-schema
+updates cannot publish success without this verification. Aggregate participants
+leave this repository-wide verification to their leader.
+
+SchemaBot re-reads the PR head, base branch name, and actual base branch tip
+before publishing success. A changed base or unavailable read blocks the
+aggregate and schedules a bounded retry. Rerun the existing aggregate check to
+retry after correcting an invalid baseline. Live convergence remains part of the
+environment result: the production plan must be freshly empty before merge.
+
+This is a pre-merge check at publication time. Require branches to be up to date
+before merging to cover base changes after publication. Merge-group checks do
+not re-evaluate onboarding against queued changes.
 
 On the happy path, where the live database already matches the declarative
 schema files (for PostgreSQL, that also means no live table is left

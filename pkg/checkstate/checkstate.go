@@ -73,6 +73,7 @@ const (
 	BlockApplyCancelledAfterTaskCompleted = "apply_cancelled_after_task_completed"
 	BlockConfigDiscoveryUnavailable       = "github_schema_config_discovery_unavailable"
 	BlockConfigDiscoveryFailed            = "schema_config_discovery_failed"
+	BlockOnboardingVerification           = "onboarding_verification"
 	BlockPlanPublishVerificationFailed    = "plan_publish_verification_failed"
 	BlockPRFileCapExceeded                = "pr_file_cap_exceeded"
 	BlockManagedDirMissingConfig          = "managed_dir_missing_config"
@@ -118,6 +119,7 @@ var blockClasses = map[string]blockClass{
 	BlockReviewTimeDeploymentDrift:        blockGuard,
 	BlockConfigDiscoveryUnavailable:       blockGuard,
 	BlockConfigDiscoveryFailed:            blockGuard,
+	BlockOnboardingVerification:           blockGuard,
 	BlockPlanPublishVerificationFailed:    blockGuard,
 	BlockPRFileCapExceeded:                blockGuard,
 	BlockManagedDirMissingConfig:          blockGuard,

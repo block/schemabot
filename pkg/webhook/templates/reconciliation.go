@@ -67,7 +67,7 @@ func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChec
 	if data.GatedOnTenants {
 		fmt.Fprintf(&sb, "SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on %s and will pass once every tenant deployment's own check succeeds.\n", head)
 	} else {
-		fmt.Fprintf(&sb, "SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on %s.\n", head)
+		fmt.Fprintf(&sb, "SchemaBot found no changes to managed schema files in this PR. SchemaBot requested a check refresh on %s. See the checks for merge readiness.\n", head)
 		sb.WriteString("\n<details>\n<summary>Expected a plan?</summary>\n\n")
 		sb.WriteString("A PR plan covers the databases whose schema directories the PR changes. This PR changes none, so no database was compared against its schema directory.\n\n")
 		sb.WriteString("Two cases still need a plan even though the files are already correct:\n\n")

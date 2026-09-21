@@ -599,12 +599,10 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 		var blocked bool
 		select {
 		case checkRun := <-result.checkRuns:
-			if checkRun.Name != aggregateCheckName {
-				continue
-			}
 			require.NotEqual(t, checkConclusionSuccess, checkRun.Conclusion,
 				"close and reopen must not produce a passing check run while the block stands")
-			blocked = checkRun.Conclusion == checkConclusionActionRequired &&
+			blocked = checkRun.Name == aggregateCheckName &&
+				checkRun.Conclusion == checkConclusionActionRequired &&
 				checkRun.HeadSHA == "abc123"
 		case <-deadline:
 			t.Fatal("timed out waiting for blocking aggregate check run after reopen")
@@ -744,12 +742,10 @@ func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
 		var blocked bool
 		select {
 		case checkRun := <-result.checkRuns:
-			if checkRun.Name != aggregateCheckName {
-				continue
-			}
 			require.NotEqual(t, checkConclusionSuccess, checkRun.Conclusion,
 				"unmerged close and reopen must not produce a passing check run while the block stands")
-			blocked = checkRun.Conclusion == checkConclusionActionRequired &&
+			blocked = checkRun.Name == aggregateCheckName &&
+				checkRun.Conclusion == checkConclusionActionRequired &&
 				checkRun.HeadSHA == "abc123"
 		case <-deadline:
 			t.Fatal("timed out waiting for blocking aggregate check run after reopen")

@@ -212,57 +212,70 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 	return result
 }
 
-// TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck exercises the
-// stuck-check rescue flow: a PR has no managed schema changes but its
-// SchemaBot check is missing (for example the PR predates check enablement
-// for the repo, or the check-creating webhook delivery was lost), so branch
-// protection waits on a check nothing will create. A user comments
-// `schemabot plan -e staging` to recover. The command must recreate the
-// aggregate check as passing on the current head and say so in a comment —
-// even in a repository whose recursive tree listing GitHub truncates, since
-// converging the checks for a PR with no schema changes requires no whole-repo
-// config scan.
-func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
-	dbName := "webhook_truncated_repo_converge"
-	svc := setupE2EService(t, dbName)
+// A no-schema plan command recreates the current-head aggregate. A truncated
+// repository requires exhaustive configured schema directories to verify
+// onboarding; without them, the aggregate blocks instead of reporting success.
+func TestE2EPlanCommandOnNoSchemaChangesPRVerifiesOnboarding(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		allowedDirs []string
+		conclusion  string
+	}{
+		{name: "bounded", allowedDirs: []string{"schema"}, conclusion: checkConclusionSuccess},
+		{name: "unbounded", conclusion: checkConclusionFailure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbName := "webhook_truncated_repo_converge_" + tc.name
+			svc := setupE2EService(t, dbName)
+			dbConfig := svc.Config().Databases[dbName]
+			dbConfig.AllowedDirs = tc.allowedDirs
+			svc.Config().Databases[dbName] = dbConfig
 
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
+			mux := http.NewServeMux()
+			registerExistingRepository(t, mux)
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
 
-	client := gh.NewClient(nil)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	result := setupFakeGitHubForPlanOnTruncatedRepo(t, mux, nil, schemabotConfig, dbName)
-	h := newE2EHandlerWithConfigDirHints(t, svc, client)
+			schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+			result := setupFakeGitHubForPlanOnTruncatedRepo(t, mux, nil, schemabotConfig, dbName)
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+onboardingBaseSHA, func(w http.ResponseWriter, _ *http.Request) {
+				require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
+					Entries: []*gh.TreeEntry{{Path: new("schema/schemabot.yaml"), Type: new("blob"), SHA: new("config-blob")}},
+				}))
+			})
+			h := newE2EHandlerWithConfigDirHints(t, svc, client)
 
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot plan -e staging",
-		isPR:    true,
-	}, nil)
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: "schemabot plan -e staging",
+				isPR:    true,
+			}, nil)
 
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code)
 
-	select {
-	case body := <-result.comments:
-		assert.Contains(t, body, "No Schema Files Changed")
-		assert.Contains(t, body, "abc123")
-		assert.NotContains(t, body, "truncated repository tree")
-		assert.NotContains(t, body, "Plan Failed")
-	case <-time.After(30 * time.Second):
-		t.Fatal(`timed out waiting for the "No Schema Files Changed" comment`)
-	}
+			select {
+			case body := <-result.comments:
+				assert.Contains(t, body, "No Schema Files Changed")
+				assert.Contains(t, body, "abc123")
+				assert.NotContains(t, body, "truncated repository tree")
+				assert.NotContains(t, body, "Plan Failed")
+			case <-time.After(30 * time.Second):
+				t.Fatal(`timed out waiting for the "No Schema Files Changed" comment`)
+			}
 
-	select {
-	case cr := <-result.checkRuns:
-		assert.Contains(t, cr.Name, "SchemaBot")
-		assert.Equal(t, "completed", cr.Status)
-		assert.Equal(t, "success", cr.Conclusion)
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for passing check run")
+			select {
+			case cr := <-result.checkRuns:
+				assert.Contains(t, cr.Name, "SchemaBot")
+				assert.Equal(t, "completed", cr.Status)
+				assert.Equal(t, tc.conclusion, cr.Conclusion)
+			case <-time.After(30 * time.Second):
+				t.Fatal("timed out waiting for aggregate check run")
+			}
+		})
 	}
 }
 

@@ -579,7 +579,7 @@ func TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates(t *testing.T
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "No Schema Files Changed")
-		assert.Contains(t, body, "refreshed as passing")
+		assert.Contains(t, body, "requested a check refresh")
 		assert.Contains(t, body, "abc123")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for check refresh comment")
@@ -657,7 +657,7 @@ func TestE2EPlanScopedToOneEnvironmentBlocksOnOtherEnvironmentApply(t *testing.T
 	case body := <-result.comments:
 		assert.Contains(t, body, "Schema Change Reconciliation Required")
 		assert.Contains(t, body, "production")
-		assert.NotContains(t, body, "refreshed as passing")
+		assert.NotContains(t, body, "requested a check refresh")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for reconciliation comment")
 	}

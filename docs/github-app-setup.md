@@ -193,13 +193,19 @@ legacy_baseline:
 | `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
 | `legacy_baseline` | Required while introducing a database config | The full base commit and exact repository-relative legacy schema paths whose supported DDL effects are represented by the declarative files. `schemabot onboard` writes it from `--legacy-base-commit` and repeatable `--legacy-path` flags. |
 
-The `SchemaBot onboarding` Check Run compares complete config sets at the
-current base and PR head. It activates only for database identities absent from
-the base, so moving a config does not reactivate onboarding. For an introduced
-database it fails if the baseline is missing, malformed, no longer an ancestor
-of the base, or if a later base commit touched a recorded legacy path. The
-production SchemaBot plan remains the independent live-convergence gate and
-must be empty before merge.
+The existing SchemaBot aggregate Check Runs compare complete config sets at the
+current base and PR head before publishing success. Onboarding verification
+activates only for database identities absent from the base, so moving a config
+does not reactivate it. For an introduced database, the aggregate fails if the
+baseline is missing, malformed, no longer an ancestor of the base, or if a later
+base commit touched a recorded legacy path. The base branch tip is checked again
+before success; a changed or unreadable tip blocks and triggers a bounded retry.
+The production plan must also be empty before merge.
+
+Keep the existing required aggregate checks; no separate onboarding check is
+needed. Rerun an aggregate to retry verification. Require branches to be up to
+date before merging so a later base change cannot reuse an earlier passing
+result. Merge-group checks do not verify onboarding against queued changes.
 
 Environment availability and promotion order are configured on the SchemaBot server.
 

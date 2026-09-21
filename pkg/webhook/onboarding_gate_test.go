@@ -3,14 +3,18 @@ package webhook
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
@@ -26,6 +30,11 @@ func registerOnboardingDiscovery(t *testing.T, mux *http.ServeMux, baseConfig, h
 			Ref: new("refs/heads/main"), Object: &gh.GitObject{Type: new("commit"), SHA: new(onboardingBaseSHA)},
 		}))
 	})
+	registerOnboardingConfigs(t, mux, baseConfig, headConfig)
+}
+
+func registerOnboardingConfigs(t *testing.T, mux *http.ServeMux, baseConfig, headConfig string) {
+	t.Helper()
 	registerTree := func(ref, config string) {
 		mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+ref, func(w http.ResponseWriter, _ *http.Request) {
 			entries := []map[string]any{}
@@ -134,4 +143,146 @@ legacy_baseline:
 	assert.Contains(t, result.summary, "`bbbbbbbbbbbb`")
 	assert.Contains(t, result.summary, "`service/db/changes`")
 	assert.Contains(t, result.summary, "add legacy index")
+}
+
+// Ordinary fold fixtures describe repositories with no newly introduced configs.
+// Specific onboarding tests override these subtree routes with exact routes.
+func registerExistingRepository(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{Object: &gh.GitObject{SHA: new(onboardingBaseSHA)}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{}}))
+	})
+}
+
+func TestOnboardingGatesEveryPassingAggregate(t *testing.T) {
+	for _, perEnvironment := range []bool{false, true} {
+		for _, noSchema := range []bool{false, true} {
+			t.Run(fmt.Sprintf("per_environment=%t/no_schema=%t", perEnvironment, noSchema), func(t *testing.T) {
+				cfg := nonAggregateConfig()
+				if perEnvironment {
+					cfg.AllowedEnvironments = []string{"staging", "production"}
+				}
+				store := &foldCheckStore{}
+				h, mux, client := newFoldHandler(t, cfg, store)
+				serveHeadSHA(t, mux, onboardingHeadSHA)
+				registerOnboardingDiscovery(t, mux, "", "database: orders\ntype: mysql\n")
+				serveCheckRunCreate(t, mux)
+				serveParticipantCheckRunsEmpty(t, mux, onboardingHeadSHA)
+				if !noSchema {
+					for _, env := range []string{"staging", "production"} {
+						store.byPR = append(store.byPR, &storage.Check{
+							Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: onboardingHeadSHA,
+							Environment: env, DatabaseType: "mysql", DatabaseName: "orders",
+							Status: checkStatusCompleted, Conclusion: checkConclusionSuccess,
+						})
+					}
+				}
+				for range 2 {
+					store.upserted = nil
+					if noSchema {
+						require.NoError(t, h.postPassingAggregatesOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA))
+					} else {
+						_, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA)
+						require.NoError(t, err)
+					}
+					require.Len(t, store.upserted, len(h.aggregateCheckTargetsForRepo("octocat/hello-world")))
+					for _, check := range store.upserted {
+						assert.Equal(t, checkConclusionFailure, check.Conclusion)
+						assert.Equal(t, onboardingVerificationBlock.blockingReason, check.BlockingReason)
+						assert.Contains(t, check.ErrorMessage, "legacy_baseline is required")
+					}
+					// A subsequent plan/apply fold must re-verify the stored block.
+					store.get = store.upserted[0]
+				}
+			})
+		}
+	}
+}
+
+func TestOnboardingBaseFreshnessAndRetry(t *testing.T) {
+	for _, introduced := range []bool{false, true} {
+		for _, readFailure := range []bool{false, true} {
+			t.Run(fmt.Sprintf("introduced=%t/read_failure=%t", introduced, readFailure), func(t *testing.T) {
+				store := &foldCheckStore{}
+				h, mux, client := newFoldHandler(t, nonAggregateConfig(), store)
+				serveHeadSHA(t, mux, onboardingHeadSHA)
+				config := "database: orders\ntype: mysql\n"
+				baseConfig := config
+				if introduced {
+					baseConfig = ""
+					config += "legacy_baseline:\n  version: 1\n  base_commit: " + onboardingBaseSHA + "\n  legacy_paths:\n    - db/changes\n"
+				}
+				registerOnboardingConfigs(t, mux, baseConfig, config)
+				mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+onboardingBaseSHA+"..."+onboardingBaseSHA, func(w http.ResponseWriter, _ *http.Request) {
+					require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("identical")}))
+				})
+				var recovered atomic.Bool
+				var reads atomic.Int32
+				mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+					sha := onboardingBaseSHA
+					if reads.Add(1) > 1 && !recovered.Load() {
+						if readFailure {
+							http.Error(w, "private upstream error", http.StatusForbidden)
+							return
+						}
+						sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+					}
+					require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{Object: &gh.GitObject{SHA: &sha}}))
+				})
+				var published []checkRunCapture
+				mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+					var body checkRunCapture
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+					published = append(published, body)
+					require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
+				})
+				serveParticipantCheckRunsEmpty(t, mux, onboardingHeadSHA)
+
+				err := h.postPassingAggregatesOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA)
+				require.Error(t, err)
+				require.Len(t, published, 1)
+				assert.Equal(t, aggregateCheckName, published[0].Name)
+				assert.Equal(t, checkConclusionFailure, published[0].Conclusion)
+				require.Len(t, store.upserted, 1)
+				assert.Equal(t, onboardingVerificationBlock.blockingReason, store.upserted[0].BlockingReason)
+				assert.NotContains(t, store.upserted[0].ErrorMessage, "private upstream error")
+
+				// A no-schema retry has no database rows; its stored guard must
+				// still drive a fresh evaluation and clear only after verification.
+				store.get = store.upserted[0]
+				store.byPR = []*storage.Check{store.get}
+				recovered.Store(true)
+				followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA)
+				require.NoError(t, err)
+				assert.Equal(t, aggregateFoldClearParticipantRefoldBudget, followUp)
+				require.Len(t, published, 2)
+				assert.Equal(t, checkConclusionSuccess, published[1].Conclusion)
+				require.Len(t, store.upserted, 2)
+				assert.Empty(t, store.upserted[1].BlockingReason)
+			})
+		}
+	}
+}
+
+func TestOnboardingDoesNotPublishAfterHeadMoves(t *testing.T) {
+	store := &foldCheckStore{}
+	h, mux, client := newFoldHandler(t, &api.ServerConfig{}, store)
+	registerOnboardingDiscovery(t, mux, "", "")
+	var reads atomic.Int32
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		sha := onboardingHeadSHA
+		if reads.Add(1) > 1 {
+			sha = "new-head"
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": sha}, "base": map[string]any{"ref": "main"},
+		}))
+	})
+	// A successful gate would attempt an unregistered check-run write and fail.
+	err := h.upsertAggregateCheckRunOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA, nil, aggregateCheckName, aggregateSentinel)
+	require.NoError(t, err)
+	assert.Empty(t, store.upserted)
 }
