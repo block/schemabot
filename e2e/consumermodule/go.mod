@@ -38,7 +38,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 // indirect
 	github.com/block/pg-sprite v0.3.3 // indirect
-	github.com/block/spirit v0.17.1-0.20260911050857-16c62ef306a1 // indirect
+	github.com/block/spirit v0.17.1-0.20260919205507-7d229daeef76 // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -108,7 +108,7 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
