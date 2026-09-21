@@ -217,6 +217,40 @@ func TestEnsureSchemaPostgres_ConvergesMissingUniqueIndex(t *testing.T) {
 	assert.Equal(t, postgresLiveIndex{unique: true, valid: true}, indexes["idx_settings_setting_key"])
 }
 
+// A table is not converged in one transaction, and what a stopped convergence
+// tells the operator depends on that. A table's column changes commit
+// together, then each of its indexes commits on its own, so a run that ends
+// part-way through a table leaves the batches that already committed in place
+// and rolls back only the one in flight.
+//
+// The message an operator reads has to say that, because the alternative sends
+// them to a half-converged table believing it untouched. Here the third batch
+// fails outright, which ends the table's convergence the same way a stop does
+// and without depending on where a cancellation happens to land.
+func TestApplyPostgresTableChanges_EarlierBatchesOfAStoppedTableStayCommitted(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+
+	err := applyPostgresTableChanges(ctx, db, "apply_logs", []postgresSchemaChange{
+		{operation: postgresOpAddColumn, object: "stop_probe", ddl: "ALTER TABLE apply_logs ADD COLUMN stop_probe TEXT"},
+		{operation: postgresOpCreateIndex, object: "idx_apply_logs_stop_probe", ddl: "CREATE INDEX idx_apply_logs_stop_probe ON apply_logs (stop_probe)"},
+		{operation: postgresOpCreateIndex, object: "idx_apply_logs_absent", ddl: "CREATE INDEX idx_apply_logs_absent ON apply_logs (column_that_does_not_exist)"},
+	}, logger, bootDDLBudget)
+	require.Error(t, err)
+
+	assert.True(t, testutil.PostgresColumnExists(t, db, "public", "apply_logs", "stop_probe"),
+		"the column batch committed before the failure and is still applied")
+	indexes, err := postgresTableIndexes(ctx, db, "apply_logs")
+	require.NoError(t, err)
+	assert.Contains(t, indexes, "idx_apply_logs_stop_probe",
+		"an index that committed in its own transaction survives a later batch failing")
+	assert.NotContains(t, indexes, "idx_apply_logs_absent",
+		"the batch in flight rolled back whole")
+}
+
 // Startup refuses automatic convergence when the desired missing column is
 // NOT NULL without a DEFAULT and gives the operator a safe remediation.
 func TestEnsureSchemaPostgres_RejectsMissingNotNullColumnWithoutDefault(t *testing.T) {

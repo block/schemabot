@@ -191,7 +191,13 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 		return nil, err
 	}
 	opts = append(opts, api.WithConvergenceTimeout(budget))
-	planned, remaining, err := api.ApplyStorageSchema(ctx, dsn, a.logger, opts...)
+	// ApplyStorageSchema cancels its convergence when its context is cancelled
+	// — that is what lets an operator at a terminal stop a run they are
+	// watching. This context is a request's, and cancelling it means the
+	// connection dropped, not that anyone decided anything. Stripping the
+	// cancellation is what keeps a lost TCP connection from taking a table
+	// copy with it; the budget above is still what bounds the run.
+	planned, remaining, err := api.ApplyStorageSchema(context.WithoutCancel(ctx), dsn, a.logger, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("converge storage schema (dialect %s): %w", a.dialect, err)
 	}
@@ -216,13 +222,18 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 // request that asked for it.
 //
 // The budget comes from the request, not from ctx, and the distinction is the
-// safe one: the convergence is the startup bootstrap, which bounds itself and
-// takes no context, so once the DDL starts a caller hanging up does not stop
-// it. A convergence is a sequence of statements against SchemaBot's own
+// safe one. A convergence is a sequence of statements against SchemaBot's own
 // storage, and abandoning it part-way would leave the schema between two
 // releases with nobody watching; running it out leaves a state the next plan
-// can describe. Only the plans either side of it observe ctx, so a caller that
-// disconnects stops waiting for an answer rather than stopping the work.
+// can describe.
+//
+// ApplyStorageSchema does observe a context, which is what lets an operator at
+// a terminal stop a run they are watching. That authority is not this caller's
+// to pass on: a request context is cancelled by a dropped connection, which is
+// not a decision anyone made about the storage every instance depends on, so
+// the call site strips the cancellation before handing ctx over. For a
+// convergence reached over the wire the budget is what ends it, and a caller
+// that disconnects stops waiting for an answer rather than stopping the work.
 //
 // An out-of-range budget is the control plane's to reject before it gets
 // here, but this is a server boundary and the field arrives over the wire, so

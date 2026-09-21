@@ -79,8 +79,8 @@ Four consequences worth holding onto:
   converging ahead of a roll take on work a boot could not have finished at all,
   an index over a table with a long history being the usual one. `--timeout`
   lowers that ceiling for a run that should fail fast and cannot raise it,
-  because a convergence cannot yet be stopped once it starts and the lock it
-  holds is what a booting pod waits on. Work too slow even for an hour is
+  because the lock a convergence holds for its whole budget is what a booting
+  pod waits on. Work too slow even for an hour is
   [created by hand](#pre-creating-indexes-on-a-long-lived-database) instead.
 - **A converged storage costs one diff.** Steps 1 and 2 run without the lock, so
   the overwhelmingly common case, a pod booting against storage that already
@@ -288,8 +288,8 @@ since the only thing waiting on it is the operator. That is what makes
 converging ahead of a roll worth doing: the work a boot would have timed out on
 is exactly the work this finishes. `--timeout` lowers that ceiling for a run
 that should fail fast and cannot raise it, because a convergence holds the
-advisory lock for its whole budget and cannot yet be stopped once it starts, so
-an hour is the longest a mistake can keep pods from booting.
+advisory lock for its whole budget, so an hour is the longest a mistake can
+keep pods from booting.
 
 A run that finds nothing outstanding is still worth taking, because the
 bootstrap converges more than the catalog. On MySQL it clears the schema change
@@ -359,6 +359,25 @@ drop, while an operator at a terminal is exactly who should decide.
 
 A convergence over a table with a long history is the one that matters and the
 one that takes time. Here is what to know before you start one.
+
+**You can stop one you are running yourself.** Ctrl-C stops a convergence
+`--dsn` or `--config` started, because that command *is* the convergence:
+stopping it stops the DDL. Stopping is safe by construction rather than by
+luck: statements that had already finished stay finished, the one in flight is
+cancelled and what it was building is reclaimed, and the ones after it never
+ran. What that leaves is what the next `storage plan` reports, never something
+to infer from how far the run got.
+
+Nothing else can stop one, and the case to know is `--deployment`. That command
+is at a terminal too, but the convergence is running on the deployment rather
+than in front of you, and Ctrl-C only hangs up on it: the run carries on under
+its budget and holds the bootstrap lock for as long as it needs. Read it as
+having stopped and the next step is the one that hurts: the lock is still held,
+so rolling pods leaves them unable to come up, and a second apply waits out its
+own budget behind the run you thought you ended. A convergence an instance runs
+to start cannot be interrupted at all. In both cases the reason is the same:
+losing a connection, or never having been the connection, is not a decision
+about the storage every instance depends on (AV-13).
 
 **A plan says when one is already running.** A convergence is invisible in a
 diff: a statement it is working on is absent from the live catalog until it

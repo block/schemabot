@@ -3,6 +3,8 @@
 package api
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -16,7 +18,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	seedutil "github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -358,7 +362,7 @@ func TestDiffStorageSchemaMySQL_ReportsAConvergenceInFlight(t *testing.T) {
 // the same thing. An operator reading two deployments' reports gets the same
 // answer to the same question whichever family the storage runs on.
 func TestDiffStorageSchemaPostgres_ReportsAConvergenceInFlight(t *testing.T) {
-	dsn, db := startPostgresStorage(t)
+	dsn, _ := startPostgresStorage(t)
 	logger := storageSchemaTestLogger()
 	postgres := WithDialect(schema.DialectPostgres)
 	require.NoError(t, EnsureSchema(dsn, logger, postgres))
@@ -367,15 +371,7 @@ func TestDiffStorageSchemaPostgres_ReportsAConvergenceInFlight(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, report.ConvergenceInFlight, "nothing is converging this database")
 
-	conn, err := db.Conn(t.Context())
-	require.NoError(t, err)
-	acquired, err := namedlock.Postgres{}.Acquire(t.Context(), conn, ensureSchemaLockName, 5*time.Second)
-	require.NoError(t, err)
-	require.True(t, acquired, "hold the bootstrap lock")
-	t.Cleanup(func() {
-		_, _ = namedlock.Postgres{}.Release(t.Context(), conn, ensureSchemaLockName)
-		_ = conn.Close()
-	})
+	holdPostgresBootstrapLock(t, dsn)
 
 	report, err = PlanStorageSchema(t.Context(), dsn, nil, logger, postgres)
 	require.NoError(t, err)
@@ -534,4 +530,217 @@ func TestDiffStorageSchema_UnsupportedDialectFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), "sqlite")
 	assert.Contains(t, err.Error(), string(schema.DialectMySQL))
 	assert.Contains(t, err.Error(), string(schema.DialectPostgres))
+}
+
+// An operator watching a convergence can stop it, and the whole point is that
+// it stops rather than running on out of sight. The case here is the one that
+// makes an operator reach for Ctrl-C: a second convergence queued behind a
+// first, waiting on the bootstrap lock for as long as the run ahead of it
+// takes. Stopping returns promptly, says nothing was changed, and does not
+// name a budget — none fired.
+func TestApplyStorageSchemaMySQL_StopsWhenItsCallerStops(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	// Drift the schema, so the run reaches the lock rather than short-circuiting
+	// on a converged catalog.
+	_, err := db.ExecContext(t.Context(), "ALTER TABLE `applies` DROP COLUMN `deployment`")
+	require.NoError(t, err)
+
+	// A convergence already in progress: the lock is held by somebody else for
+	// the whole of this test.
+	holdMySQLBootstrapLock(t, sdb.DSN)
+
+	ctx, stop := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ApplyStorageSchema(ctx, sdb.DSN, logger)
+		done <- err
+	}()
+
+	// Stop it once it is demonstrably on the lock rather than still diffing.
+	// Waiting for the waiter itself, instead of for a duration chosen to be
+	// longer than a diff, is what keeps the test from stopping a run that had
+	// not got there yet on a slow machine — which would pass while proving
+	// nothing.
+	waitForEnsureSchemaLockWaiter(t, db, sdb.Name)
+	stop()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "a stopped convergence is not a successful one")
+		assert.Contains(t, err.Error(), "this run changed nothing")
+		assert.NotContains(t, err.Error(), "timed out",
+			"an operator stopping a run must not be told a budget expired")
+	case <-time.After(storageConvergenceStopDeadline):
+		t.Fatal("a stopped convergence must return rather than wait out its budget")
+	}
+
+	// It stopped before taking the lock, so the drift it was going to fix is
+	// still there and nothing half-ran.
+	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "deployment"))
+}
+
+// A stop that arrives while the DDL is running stops the DDL, not only the
+// operator's wait for it. This is the window a stop almost always lands in:
+// the convergence polls the engine in-process, so the loop spends all of its
+// time blocked between polls, and returning from there without cancelling the
+// engine would release the bootstrap lock and leave a table copy running
+// against the storage database under a convergence nobody is watching any
+// more (AV-13).
+func TestApplyStorageSchemaMySQL_StopsTheSchemaChangeItStarted(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	// Seed before the drift, so the rows are indexed on the way in rather than
+	// by the statement under test.
+	seedutil.SeedRows(t, sdb.DSN, "`applies`",
+		"apply_identifier, lock_id, plan_id, database_name, database_type, repository, pull_request, environment, engine, state, options",
+		"CONCAT('seed-', seq), 0, 0, 'seed', 'mysql', 'example/repo', 0, 'development', 'spirit', 'queued', '{}'",
+		storageConvergenceCopyRows)
+
+	// An index the embedded schema declares, dropped. Converging it back is an
+	// ADD INDEX, which always copies the table rather than running instantly,
+	// so the convergence has a copy in flight for the stop to land inside.
+	_, err := db.ExecContext(t.Context(), "ALTER TABLE `applies` DROP INDEX `idx_completed_at_state`")
+	require.NoError(t, err)
+
+	ctx, stop := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ApplyStorageSchema(ctx, sdb.DSN, logger)
+		done <- err
+	}()
+
+	// The shadow table is the copy: Spirit creates it, alters it, and fills it,
+	// so its appearance is the convergence being somewhere inside the DDL
+	// rather than still diffing or waiting on the lock.
+	require.Eventually(t, func() bool {
+		return testutil.TableExists(t, db, sdb.Name, "_applies_new")
+	}, storageConvergenceStopDeadline, 100*time.Millisecond,
+		"expected the convergence to start copying the table")
+	stop()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "a stopped convergence is not a successful one")
+		assert.Contains(t, err.Error(), "storage schema convergence stopped")
+		assert.NotContains(t, err.Error(), "did not complete within",
+			"an operator stopping a run must not be told a budget expired")
+	case <-time.After(storageConvergenceStopDeadline):
+		t.Fatal("a stopped convergence must return rather than run its copy to completion")
+	}
+
+	// The copy went with the stop. A shadow table still standing here is a
+	// copy still running: the stop released the bootstrap lock, so nothing is
+	// serializing it against the next pod to boot.
+	assert.False(t, testutil.TableExists(t, db, sdb.Name, "_applies_new"),
+		"stopping the convergence must cancel the schema change, not just stop waiting for it")
+
+	// And it stopped before cutting over, so the index it was adding is still
+	// missing — which is what the next plan will say.
+	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "applies", "idx_completed_at_state"))
+}
+
+// storageConvergenceCopyRows is how many rows the stop-mid-copy test puts in
+// the table it has converged. It is sized so the copy is still running when
+// the stop arrives: a table that copies faster than the test can cancel it
+// would pass by finishing rather than by stopping.
+const storageConvergenceCopyRows = 300_000
+
+// The PostgreSQL twin. The lock is the same lock and the stop means the same
+// thing, so an operator gets the same answer whichever family their storage
+// runs on.
+func TestApplyStorageSchemaPostgres_StopsWhenItsCallerStops(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	logger := storageSchemaTestLogger()
+	postgres := WithDialect(schema.DialectPostgres)
+	require.NoError(t, EnsureSchema(dsn, logger, postgres))
+
+	_, err := db.ExecContext(t.Context(), `ALTER TABLE applies DROP COLUMN caller`)
+	require.NoError(t, err)
+
+	holdPostgresBootstrapLock(t, dsn)
+
+	ctx, stop := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ApplyStorageSchema(ctx, dsn, logger, postgres)
+		done <- err
+	}()
+
+	waitForPostgresBootstrapLockWaiter(t, db)
+	stop()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "this run changed nothing")
+		assert.NotContains(t, err.Error(), "timed out")
+	case <-time.After(storageConvergenceStopDeadline):
+		t.Fatal("a stopped convergence must return rather than wait out its budget")
+	}
+
+	columns, err := postgresTableColumns(t.Context(), db, "applies")
+	require.NoError(t, err)
+	assert.False(t, columns["caller"])
+}
+
+// storageConvergenceStopDeadline bounds how long a stopped convergence may
+// take to return. It is generous against the stop itself and tiny against the
+// budget the run would otherwise sit on the lock for, which is the difference
+// these tests exist to prove.
+const storageConvergenceStopDeadline = 20 * time.Second
+
+// holdPostgresBootstrapLock takes the storage bootstrap's advisory lock on a
+// dedicated session, the way a converging pod holds it, and releases it when
+// the test ends.
+//
+// It holds the lock on its own pool for the reason its MySQL twin does: the
+// lock lives on a session, closing a pooled connection only returns that
+// session to the pool, and cleanup has no live context to release the lock by
+// name on. Closing the pool behind the returned connection ends the session,
+// which is what the release actually is.
+func holdPostgresBootstrapLock(t *testing.T, dsn string) {
+	t.Helper()
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err, "open the lock holder's own pool")
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	acquired, err := namedlock.Postgres{}.Acquire(t.Context(), conn, ensureSchemaLockName, 5*time.Second)
+	require.NoError(t, err)
+	require.True(t, acquired, "hold the bootstrap lock")
+	// Registered after the pool's close so it runs before it, returning the
+	// session for that close to end.
+	t.Cleanup(func() { utils.CloseAndLog(conn) })
+}
+
+// waitForPostgresBootstrapLockWaiter blocks until a session other than this
+// one is waiting on an advisory lock in the database db is connected to. It is
+// the PostgreSQL counterpart of waitForEnsureSchemaLockWaiter: a convergence
+// queued behind the holder blocks in pg_advisory_lock, which the server
+// reports as an ungranted advisory row.
+//
+// Advisory locks are per-database here, so the database predicate is the
+// connection rather than a name to match — unlike MySQL, where the
+// server-wide PROCESSLIST would show every other test's waiter too.
+func waitForPostgresBootstrapLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var count int
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(t.Context(),
+			`SELECT COUNT(*) FROM pg_locks
+			  WHERE locktype = 'advisory'
+			    AND NOT granted
+			    AND pid <> pg_backend_pid()
+			    AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+		).Scan(&count)
+		require.NoError(t, err)
+		return count > 0
+	}, storageConvergenceStopDeadline, 100*time.Millisecond,
+		"expected the convergence to be waiting on the bootstrap advisory lock, waiter count: %d", count)
 }
