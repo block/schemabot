@@ -52,6 +52,10 @@ func (h *Handler) evaluateOnboardingGateAtBase(ctx context.Context, client *ghcl
 	for _, discovered := range introduced {
 		database := discovered.Config.Database
 		baseline := discovered.Config.LegacyBaseline
+		if baseline == nil {
+			h.logger.Debug("skipping optional legacy verification because no baseline is configured", "repo", repo, "database", database, "head_sha", headSHA)
+			continue
+		}
 		if err := baseline.Validate(); err != nil {
 			failures = append(failures, fmt.Sprintf("- `%s` (`%s`): %s", database, discovered.Path, err))
 			continue
@@ -75,8 +79,15 @@ func (h *Handler) evaluateOnboardingGateAtBase(ctx context.Context, client *ghcl
 		sort.Strings(failures)
 		return onboardingGateFailure(
 			"Onboarding legacy baseline is stale or invalid",
-			strings.Join(failures, "\n")+"\n\nRefresh the declarative schema from the current base and advance `legacy_baseline.base_commit` in the same commit.",
+			strings.Join(failures, "\n")+"\n\nCorrect invalid `legacy_baseline` metadata. If the legacy source changed, refresh the declarative schema from the current base and advance `legacy_baseline.base_commit` in the same commit.",
 		), nil
+	}
+	if len(verified) == 0 {
+		return onboardingGateResult{
+			conclusion: checkConclusionSuccess,
+			title:      "Onboarding gate not applicable",
+			summary:    "Not applicable: no introduced database configures legacy verification.",
+		}, nil
 	}
 	sort.Strings(verified)
 	return onboardingGateResult{

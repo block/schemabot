@@ -277,9 +277,7 @@ If your repository already has schema files, use that directory. Otherwise,
 run `onboard` from your repository root to create a new `schema` directory:
 
 ```console
-$ schemabot onboard -d shop -e staging -s ./schema \
-    --legacy-base-commit 0123456789abcdef0123456789abcdef01234567 \
-    --legacy-path service/db/changes
+$ schemabot onboard -d shop -e staging -s ./schema
 Pulled 1 tables from shop/staging.
 Wrote declarative schema files:
   schema/schemabot.yaml
@@ -297,10 +295,17 @@ DDL. It refuses to overwrite existing files by default. Keep the complete
 schema for the namespaces you manage: omitting an existing table can propose
 a drop. See [namespace scope](namespaces.md) for shared databases.
 
-The legacy baseline records which base commit and former schema paths were
-reconciled into the generated files. A refresh preserves an existing baseline
-unless both anchor flags are supplied; advance it only after reconciling every
-later supported DDL effect into the same generated schema.
+Legacy verification is optional. To enable it while replacing an existing schema
+change workflow, supply both `--legacy-base-commit <full-base-sha>` and one or more
+`--legacy-path <repository-relative-path>` flags. The generated `legacy_baseline`
+records the base commit and former schema paths reconciled into the generated
+files. GitHub verification requires each path to exist at that anchor and no
+later base commit to touch it.
+
+A refresh preserves an existing baseline unless both anchor flags are supplied;
+advance it only after reconciling every later supported DDL effect into the same
+generated schema. New and existing configs without a baseline need no legacy
+flags or metadata backfill.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
@@ -316,11 +321,6 @@ For this example, `schema/schemabot.yaml` contains:
 ```yaml
 database: shop
 type: mysql
-legacy_baseline:
-  version: 1
-  base_commit: 0123456789abcdef0123456789abcdef01234567
-  legacy_paths:
-    - service/db/changes
 ```
 
 For the one-table example, edit `schema/shop/orders.sql` to include the new

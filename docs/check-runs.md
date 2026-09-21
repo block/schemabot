@@ -203,11 +203,6 @@ subdirectories it owns:
 ```yaml
 database: widgets
 type: mysql
-legacy_baseline:
-  version: 1
-  base_commit: 0123456789abcdef0123456789abcdef01234567
-  legacy_paths:
-    - service/db/changes
 ```
 
 For Vitess-backed databases, use `type: vitess`:
@@ -222,15 +217,32 @@ loads the changed config directly, plans the current schema files for each
 configured environment, and publishes the normal aggregate check for the
 discovered database.
 
+When replacing a legacy schema change workflow, opt into legacy verification by
+adding this optional metadata to the introduced config:
+
+```yaml
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
+```
+
+Configs without `legacy_baseline` use normal SchemaBot checks. Existing databases
+need no metadata backfill.
+
 Onboarding verification is part of the existing `SchemaBot` or
 `SchemaBot (<environment>)` aggregate Check Runs. No additional required check
 is needed. Before publishing a passing PR aggregate, SchemaBot compares complete,
 commit-pinned base and head config sets to identify newly introduced databases;
-config moves are therefore not onboarding. A new database must carry valid
-`legacy_baseline` metadata, and no commit after its anchor may touch a recorded
-legacy path on the current base branch. Plans, apply completion, and no-schema
-updates cannot publish success without this verification. Aggregate participants
-leave this repository-wide verification to their leader.
+config moves are therefore not onboarding. For new databases that supply
+`legacy_baseline`, the metadata must be valid, each path must exist at the anchor,
+and no commit after the anchor may touch a recorded legacy path on the current
+base branch. Existence is checked at the anchor even when it equals the current
+base, so the onboarding PR itself can remove the old files. Plans, apply
+completion, and no-schema updates cannot publish success without this opted-in
+verification. Aggregate participants leave this repository-wide verification to
+their leader.
 
 SchemaBot re-reads the PR head, base branch name, and actual base branch tip
 before publishing success. A changed base or unavailable read blocks the

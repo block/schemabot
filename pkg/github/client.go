@@ -1102,10 +1102,11 @@ func (ic *InstallationClient) ResolveBranchTip(ctx context.Context, repo, branch
 
 const maxLegacyHistoryPages = 100
 
-// LegacyPathChangesSinceAnchor verifies that anchor is an ancestor of baseSHA
-// and returns every later commit that touched a recorded legacy path. The path
-// filtered commit listing observes intermediate edits even when a later commit
-// restores the path's final tree object to its anchored value.
+// LegacyPathChangesSinceAnchor verifies that anchor is an ancestor of baseSHA,
+// that each recorded path exists at anchor, and returns every later commit that
+// touched a recorded legacy path. The path-filtered commit listing observes
+// intermediate edits even when a later commit restores the path's final tree
+// object to its anchored value.
 func (ic *InstallationClient) LegacyPathChangesSinceAnchor(ctx context.Context, repo, anchor, baseSHA string, legacyPaths []string) ([]LegacyPathChange, error) {
 	owner, repoName := splitRepo(repo)
 	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "compare onboarding anchor with base", []any{"repo", repo, "anchor", anchor, "base_sha", baseSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
@@ -1121,6 +1122,19 @@ func (ic *InstallationClient) LegacyPathChangesSinceAnchor(ctx context.Context, 
 	status := comparison.GetStatus()
 	if status != "ahead" && status != "identical" {
 		return nil, fmt.Errorf("legacy anchor %s is not an ancestor of base commit %s (comparison status %q)", anchor, baseSHA, status)
+	}
+	levelCache := make(map[string][]TreeEntry)
+	for _, legacyPath := range legacyPaths {
+		objectSHA, objectType, found, err := ic.resolveGitObjectSHA(ctx, repo, anchor, legacyPath, levelCache)
+		if err != nil {
+			return nil, fmt.Errorf("verify legacy path %s at anchor %s: %w", legacyPath, anchor, err)
+		}
+		if !found {
+			return nil, fmt.Errorf("legacy path %s does not exist at anchor %s", legacyPath, anchor)
+		}
+		if objectSHA == "" || (objectType != "blob" && objectType != "tree") {
+			return nil, fmt.Errorf("legacy path %s at anchor %s must resolve to a file or directory", legacyPath, anchor)
+		}
 	}
 	if status == "identical" {
 		return nil, nil

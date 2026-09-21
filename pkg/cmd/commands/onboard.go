@@ -161,9 +161,9 @@ func preservedExclusions(schemaRoot string) (client.PlanExclusions, error) {
 	return cfg.PlanExclusions(), nil
 }
 
-// resolveOnboardLegacyBaseline requires a reviewed anchor for a new config and
-// preserves it on an ordinary refresh. Passing either flag starts an explicit
-// anchor update and therefore requires the complete pair.
+// resolveOnboardLegacyBaseline opts into legacy verification when both anchor
+// flags are supplied and preserves existing metadata on an ordinary refresh.
+// Passing either flag requires the complete pair.
 func resolveOnboardLegacyBaseline(schemaRoot, baseCommit string, legacyPaths []string) (*repoconfig.LegacyBaseline, error) {
 	configPath := filepath.Join(schemaRoot, "schemabot.yaml")
 	_, statErr := os.Stat(configPath)
@@ -174,11 +174,14 @@ func resolveOnboardLegacyBaseline(schemaRoot, baseCommit string, legacyPaths []s
 
 	if baseCommit == "" && len(legacyPaths) == 0 {
 		if !configExists {
-			return nil, fmt.Errorf("fresh onboarding requires --legacy-base-commit and at least one --legacy-path")
+			return nil, nil
 		}
 		cfg, err := LoadCLIConfig(schemaRoot)
 		if err != nil {
 			return nil, fmt.Errorf("read existing schemabot.yaml to preserve legacy_baseline: %w", err)
+		}
+		if cfg.LegacyBaseline == nil {
+			return nil, nil
 		}
 		if err := cfg.LegacyBaseline.Validate(); err != nil {
 			return nil, fmt.Errorf("existing schemabot.yaml cannot be refreshed without explicit legacy anchor flags: %w", err)

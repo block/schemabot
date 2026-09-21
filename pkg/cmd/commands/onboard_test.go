@@ -256,11 +256,32 @@ func TestPreservedExclusions(t *testing.T) {
 func TestResolveOnboardLegacyBaseline(t *testing.T) {
 	commit := "0123456789abcdef0123456789abcdef01234567"
 
-	t.Run("fresh onboarding requires explicit anchor", func(t *testing.T) {
+	t.Run("fresh onboarding without legacy verification", func(t *testing.T) {
 		baseline, err := resolveOnboardLegacyBaseline(t.TempDir(), "", nil)
-		require.Error(t, err)
+		require.NoError(t, err)
 		assert.Nil(t, baseline)
-		assert.Contains(t, err.Error(), "fresh onboarding requires")
+	})
+
+	t.Run("refresh without metadata needs no backfill", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: orders\ntype: mysql\n"), 0o644))
+		baseline, err := resolveOnboardLegacyBaseline(root, "", nil)
+		require.NoError(t, err)
+		assert.Nil(t, baseline)
+	})
+
+	t.Run("partial flags are rejected", func(t *testing.T) {
+		_, err := resolveOnboardLegacyBaseline(t.TempDir(), commit, nil)
+		require.ErrorContains(t, err, "must be supplied together")
+		_, err = resolveOnboardLegacyBaseline(t.TempDir(), "", []string{"db/changes"})
+		require.ErrorContains(t, err, "must be supplied together")
+	})
+
+	t.Run("invalid existing metadata is not silently removed", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: orders\ntype: mysql\nlegacy_baseline: {}\n"), 0o644))
+		_, err := resolveOnboardLegacyBaseline(root, "", nil)
+		require.ErrorContains(t, err, "legacy_baseline.version")
 	})
 
 	t.Run("explicit anchor is validated", func(t *testing.T) {

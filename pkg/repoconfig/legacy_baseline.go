@@ -15,8 +15,8 @@ var fullCommitSHA = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 
 // LegacyBaseline records the base-branch commit through which a declarative
 // schema accounts for changes under its former schema paths. It is historical
-// metadata after onboarding; callers validate it only while the database's
-// schemabot.yaml is being introduced.
+// metadata after onboarding; callers validate it only when provided while the
+// database's schemabot.yaml is being introduced.
 type LegacyBaseline struct {
 	Version     int      `yaml:"version" json:"version"`
 	BaseCommit  string   `yaml:"base_commit" json:"base_commit"`

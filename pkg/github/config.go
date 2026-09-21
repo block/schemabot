@@ -49,9 +49,9 @@ type SchemabotConfig struct {
 	// catalog, in every namespace the plan covers, and every plan discloses
 	// what it withheld.
 	IgnoreTables []string `yaml:"ignore_tables,omitempty" json:"ignore_tables,omitempty"`
-	// LegacyBaseline is validated only when comparison with the base branch
-	// proves this database is being introduced. Once the config lands it is
-	// historical metadata and must not reactivate onboarding gates.
+	// LegacyBaseline opts into legacy verification when comparison with the
+	// base branch proves this database is being introduced. Once the config
+	// lands it is historical metadata and must not reactivate onboarding gates.
 	LegacyBaseline *repoconfig.LegacyBaseline `yaml:"legacy_baseline,omitempty" json:"legacy_baseline,omitempty"`
 }
 

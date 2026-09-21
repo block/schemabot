@@ -155,7 +155,7 @@ You should see:
 ## 6. Add `schemabot.yaml` Config to Your Repository
 
 You don't have to write the schema directory by hand. Once the database is registered in the
-server config (step 4), `schemabot onboard -d mydb -e staging -s ./schema --legacy-base-commit <full-base-sha> --legacy-path <legacy-schema-path>` pulls the live
+server config (step 4), `schemabot onboard -d mydb -e staging -s ./schema` pulls the live
 schema and generates the whole directory — `schemabot.yaml`, a subdirectory per namespace
 (the schema name on MySQL, the keyspace on Vitess), and one `.sql` file per table — then
 verifies the result plans clean against the source environment. Use `--dry-run` to preview
@@ -178,11 +178,6 @@ my-repo/
 ```yaml
 database: mydb
 type: mysql
-legacy_baseline:
-  version: 1
-  base_commit: 0123456789abcdef0123456789abcdef01234567
-  legacy_paths:
-    - service/db/changes
 ```
 
 | Field | Required | Description |
@@ -191,15 +186,18 @@ legacy_baseline:
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 | `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
-| `legacy_baseline` | Required while introducing a database config | The full base commit and exact repository-relative legacy schema paths whose supported DDL effects are represented by the declarative files. `schemabot onboard` writes it from `--legacy-base-commit` and repeatable `--legacy-path` flags. |
+| `legacy_baseline` | No | Opts into legacy verification while introducing a database config. Records the full base commit and exact repository-relative legacy schema paths whose supported DDL effects are represented by the declarative files. `schemabot onboard` writes it when both `--legacy-base-commit` and repeatable `--legacy-path` flags are supplied. |
 
 The existing SchemaBot aggregate Check Runs compare complete config sets at the
 current base and PR head before publishing success. Onboarding verification
-activates only for database identities absent from the base, so moving a config
-does not reactivate it. For an introduced database, the aggregate fails if the
-baseline is missing, malformed, no longer an ancestor of the base, or if a later
-base commit touched a recorded legacy path. The base branch tip is checked again
-before success; a changed or unreadable tip blocks and triggers a bounded retry.
+activates only for database identities absent from the base that supply
+`legacy_baseline`, so moving a config does not reactivate it. Omit that optional
+metadata when legacy verification is not needed; existing databases need no
+metadata backfill. For an introduced database with a baseline, the aggregate
+fails if the metadata is malformed, the anchor is no longer an ancestor of the
+base, a recorded path does not exist at the anchor, or a later base commit
+touched a recorded path. The base branch tip is checked again before success;
+a changed or unreadable tip blocks and triggers a bounded retry.
 The production plan must also be empty before merge.
 
 Keep the existing required aggregate checks; no separate onboarding check is
