@@ -396,6 +396,20 @@ func TestStorageSchemaAdapter_DesiredSchemaAcceptsASuppliedSchema(t *testing.T) 
 	assert.Len(t, desired.Files, 1)
 }
 
+// A schema named with no files to go with it is an invalid request, and it is
+// refused in this adapter because the tern gRPC server reaches it without
+// passing the HTTP API's validation. Defaulting to the embedded schema here
+// would converge it successfully, so a caller that asked for one release's
+// schema would have another's run against its storage and be told it worked.
+func TestStorageSchemaAdapter_DesiredSchemaRefusesANameWithNoFiles(t *testing.T) {
+	adapter := &storageSchemaAdapter{version: "v1.2.3", dialect: schema.DialectMySQL, logger: slog.New(slog.DiscardHandler)}
+
+	_, err := adapter.desiredSchema(nil, "the schema files of release v1.4.0", "converge")
+	require.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest,
+		"a source with no files must be an invalid request, not a silent convergence of the embedded schema")
+	assert.Contains(t, err.Error(), "without schema_files")
+}
+
 // An unusable supplied schema is refused before anything reads a database. A
 // file set that cannot be read as one .sql file per table would otherwise diff
 // as a storage database full of surplus tables.

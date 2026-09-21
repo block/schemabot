@@ -82,21 +82,29 @@ func EmbeddedStorageSchema(version string) *StorageSchemaSource {
 //
 // What it does not do is establish that a readable set is *complete*, because
 // nothing here can: a set is a map, and a map has no way to say what is
-// missing from it. An incomplete set diffs cleanly and reports the tables it
-// omits as surplus, and a convergence can consume a supplied set, so the
-// question of what happens to those tables is a real one rather than a
-// hypothetical.
+// missing from it. A convergence can consume a supplied set, so what an
+// incomplete one costs is a real question rather than a hypothetical, and the
+// two dialects answer it differently enough to be worth stating separately.
 //
-// Three things answer it, and none of them is this validation. The two
-// selectors that reach here produce a complete set by construction — a
-// directory listing and a release listing, each an error if it fetches
-// partially. A statement that would drop a storage table is destructive, and a
-// convergence refuses destructive statements unless destroying storage state
-// was explicitly permitted (AV-9). And a convergence to a schema the running
-// binary does not carry is confirmed by an operator who is shown those
-// statements first. So an incomplete set costs a report that overstates what is
-// surplus, and it takes a separate, explicit permission before it costs a
-// table.
+// What both rest on is that the selectors reaching here produce a complete set
+// by construction — a directory listing and a release listing, each an error
+// if it fetches partially. Assembling a partial set means going around them,
+// through the API.
+//
+// On MySQL an omitted table is reported as surplus, which is a statement that
+// would drop it. That is destructive, so it is refused unless destroying
+// storage state was explicitly permitted (AV-9), and a convergence to a schema
+// the running binary does not carry is confirmed by an operator who is shown
+// those statements first. An incomplete set therefore costs a report that
+// overstates what is surplus, and it takes a separate, explicit permission
+// before it costs a table.
+//
+// On PostgreSQL the convergence is additive-only and walks only the tables the
+// set supplies, so an omitted table is not reported at all. Nothing is dropped,
+// and the cost is the other way round: a set missing most of a release's files
+// can plan as converged, so a caller assembling its own files is answering for
+// the completeness of what it sent. The selectors are what make that answer
+// true for every operator-facing path.
 func StorageSchemaFromFiles(description string, files map[string]string) (*StorageSchemaSource, error) {
 	description = strings.TrimSpace(description)
 	if description == "" {

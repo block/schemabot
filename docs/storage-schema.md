@@ -358,7 +358,6 @@ not, so a maintenance script keyed on the status gets them right:
 | a change needs manual remediation, so nothing ran | non-zero |
 | the target could not be read, or the DDL failed | non-zero |
 
-<<<<<<< HEAD
 Both non-zero refusals mean the same thing: nothing converged, and a person has
 to decide something before anything does. A script keyed on the status can
 therefore treat them alike and re-read the plan for which one it hit. Under
@@ -489,11 +488,6 @@ runs out, and being told that beats discovering it by sitting there.
 The line only ever appears when a convergence is detected. Its absence is not a
 statement that the database is idle: the same read answers "nothing running"
 and "could not tell", so a plan never claims the second as the first.
-=======
-Under `--json` a refusal comes back in the shape a convergence does, so nothing
-has to be re-read to learn which statements were refused: nothing ran, so the
-planned and the remaining halves of the report are the same.
->>>>>>> 00d0a351 (fix(cli): answer a refused storage convergence in JSON, and resolve its target once)
 
 ## Converging a release before it rolls
 
@@ -510,9 +504,11 @@ otherwise converge it is the one that cannot start until it is.
 
 It is confirmed at a terminal, and `--auto-approve` is refused with it. Naming a
 release substitutes files the answering binary never carried, so until that
-release is deployed the fleet's own boots converge the difference back, and the
-confirmation's notice says what that costs: a pre-applied table or column
-survives those boots, **an index does not** ([What is never
+release is deployed the fleet boots against storage holding more than it
+declares, and the confirmation's notice says what that costs: every one of those
+boots refuses the removals and logs them, so the pre-applied state survives and
+the fleet warns about it until the deploy. A release from before indexes were
+protected is the exception ([What is never
 automatic](#what-is-never-automatic)). Converge close to the deploy, re-run
 `storage plan` just before it, and leave unattended runs to a job with no
 selector, which converges the answering binary's own schema.

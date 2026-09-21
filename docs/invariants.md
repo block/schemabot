@@ -321,8 +321,8 @@ Nothing about which surface asked changes that: an operator's command runs the b
 a second implementation of it, and cannot narrow the permission a deployment already granted. Which
 schema a convergence runs is the operator's to name, so that the storage a release needs can be in
 place before the first pod of it starts; naming one supplies the files the bootstrap computes from
-and nothing else, and is confirmed by a person, never unattended. On MySQL such a statement is
-refused unless destructive storage changes are explicitly allowed, and the verdict is the one the plan
+and nothing else, and every gate above applies to it unchanged. On MySQL such a statement is refused
+unless destructive storage changes are explicitly allowed, and the verdict is the one the plan
 already carries, read rather than re-derived, so the boot refuses exactly what the operator-facing
 plan flagged. The verdict is per statement and the differ emits one combined statement per table, so
 a flagged statement is reduced to the clauses that only add a schema object: those run and the rest
@@ -338,8 +338,9 @@ partition that reduces a flagged statement to its additions (`pkg/ddl/additive.g
 operator-facing storage schema surface reads rather than reimplements (`pkg/api/storage_schema.go`);
 the instance's own storage is the only target a remote caller can address, and the deployment's
 permission is only ever widened, in the adapter that answers for it (`pkg/serve/storage_schema.go`);
-the confirmation a named schema is converged behind and its refusal to run unattended
-(`pkg/cmd/commands/storage_schema.go`).
+and a named schema is refused apart from the files it names on every transport that carries one
+(`pkg/serve/storage_schema.go`), with the CLI additionally converging one only behind a confirmation
+it refuses to skip (`pkg/cmd/commands/storage_schema.go`).
 
 ### AV-10: Anything the PR can do, the CLI can do
 

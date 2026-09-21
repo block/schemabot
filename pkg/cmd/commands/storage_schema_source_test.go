@@ -68,12 +68,14 @@ func TestRefuseInsecureRedirect(t *testing.T) {
 		return request
 	}
 
-	err := refuseInsecureRedirect(withToken("http://api.example/repos"), nil)
+	planning := refuseInsecureRedirect(false)
+
+	err := planning(withToken("http://api.example/repos"), nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing a redirect to http://api.example")
 	assert.Contains(t, err.Error(), "the token would follow it in plaintext")
 
-	require.NoError(t, refuseInsecureRedirect(withToken("https://api.example/repos"), nil))
+	require.NoError(t, planning(withToken("https://api.example/repos"), nil))
 
 	// Without a token there is nothing to protect on the wire, so a plaintext
 	// mirror is left alone — it is how a public release is fetched with no
@@ -83,7 +85,7 @@ func TestRefuseInsecureRedirect(t *testing.T) {
 	anonymous, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://api.example/repos", nil)
 	require.NoError(t, err)
 	stderr := captureStderr(t, func() {
-		require.NoError(t, refuseInsecureRedirect(anonymous, nil))
+		require.NoError(t, planning(anonymous, nil))
 	})
 	assert.Contains(t, stderr, "read from http://api.example over plaintext")
 
@@ -92,16 +94,33 @@ func TestRefuseInsecureRedirect(t *testing.T) {
 	secure, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.example/repos", nil)
 	require.NoError(t, err)
 	assert.Empty(t, captureStderr(t, func() {
-		require.NoError(t, refuseInsecureRedirect(secure, nil))
+		require.NoError(t, planning(secure, nil))
 	}))
 
 	var chain []*http.Request
 	for range maxStorageSchemaRedirects {
 		chain = append(chain, anonymous)
 	}
-	err = refuseInsecureRedirect(anonymous, chain)
+	err = planning(anonymous, chain)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "stopped after 10 redirects")
+
+	// A convergence holds every hop to the rule its configured base URL was
+	// held to. Checking only the URL the operator typed would leave the policy
+	// bypassable by the remote end: an https base that redirects to plaintext
+	// supplies the DDL that runs against SchemaBot's own storage, over a
+	// channel anything on the path can rewrite.
+	converging := refuseInsecureRedirect(true)
+	err = converging(anonymous, nil)
+	require.Error(t, err, "a plaintext hop must fail a convergence closed, not warn it")
+	assert.Contains(t, err.Error(), "refusing to converge a release redirected to http://api.example")
+
+	// The carve-out is the same one the base URL gets: a mirror on the
+	// loopback interface has no network path for anything to sit on.
+	loopback, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://127.0.0.1:8080/repos", nil)
+	require.NoError(t, err)
+	require.NoError(t, converging(loopback, nil), "a loopback hop has no network path to protect")
+	require.NoError(t, converging(secure, nil))
 }
 
 // A command that names no release asks the target about its own embedded

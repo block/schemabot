@@ -725,6 +725,65 @@ func TestStorageApplyCmd_SendsTheNamedSchemaToConverge(t *testing.T) {
 		"the operator is told the deployed release will converge the difference back")
 }
 
+// A named schema has to be confirmed at a terminal, so --json cannot be paired
+// with --auto-approve to get a clean stream. The two therefore have to coexist
+// on one run: the person is asked on stderr and the program reading stdout
+// gets the response and nothing else. Printing the human plan or the prompt to
+// stdout would make `storage apply --schema-dir … --json` unparseable, which
+// is the only machine-readable form a cross-release convergence has.
+func TestStorageApplyCmd_NamedSchemaKeepsJSONParseable(t *testing.T) {
+	dir := storageSchemaCheckoutDir(t)
+	report := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:      "v1.4.0",
+		SchemaSource: "the schema files in " + dir,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "create_table", DDL: "CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"},
+		},
+	}
+	converged := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version: "v1.4.0", SchemaSource: "the schema files in " + dir,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/storage/schema/plan":
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaPlanResponse{Report: report}))
+		case "/api/storage/schema/apply":
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaApplyResponse{
+				Planned: report, Remaining: converged,
+			}))
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	answerPrompt(t, "yes")
+	cmd := StorageApplyCmd{
+		storageSchemaSourceFlags: storageSchemaSourceFlags{SchemaDir: dir},
+		JSON:                     true,
+	}
+	var out string
+	stderr := captureStderr(t, func() {
+		out = captureStdout(func() {
+			require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: server.URL, Version: "v1.4.0"}))
+		})
+	})
+
+	var decoded apitypes.StorageSchemaApplyResponse
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded),
+		"stdout has to parse as the convergence response on its own: %q", out)
+	require.NotNil(t, decoded.Planned)
+	assert.Equal(t, "the schema files in "+dir, decoded.Planned.SchemaSource)
+
+	assert.Contains(t, stderr, "This is not the schema v1.4.0 converges on boot",
+		"the operator is still told what converging another release's schema costs")
+	assert.Contains(t, stderr, "Only 'yes' will be accepted")
+}
+
 // A convergence resolves its release as a convergence, not as a diff. The two
 // read the same files over the same path, but only one of them runs them: a
 // release read over plaintext is a report to distrust for a plan and a hazard
@@ -752,13 +811,15 @@ func TestStorageApplyCmd_RefusesAReleaseReadOverPlaintext(t *testing.T) {
 	assert.NotContains(t, routes, "/api/storage/schema/apply", "nothing converges on a refused release")
 }
 
-// The notice under a cross-release convergence states the one consequence an
-// operator cannot see in the plan: the deployed release converges the
-// difference back, and it does so asymmetrically. A surplus table or column is
-// refused as destructive and survives; a surplus index loses no data, so that
-// release's own bootstrap removes it without asking. A pre-applied index
-// therefore has a shelf life measured in pod restarts, which is invisible in
-// a plan that shows only what the storage needs.
+// The notice under a cross-release convergence states the consequences an
+// operator cannot see in the plan. The deployed release refuses to drop what
+// it does not declare, so what was applied here survives its pods and each of
+// their boots logs a refused destructive change for it — a fleet warning about
+// work that was done on purpose, which needs saying before it is read as an
+// incident. A release from before indexes were protected is the exception.
+// What the notice actually predicts about a surplus index is pinned against a
+// real convergence and boot by
+// TestApplyStorageSchemaMySQL_PreAppliedIndexSurvivesTheRunningRelease.
 func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{
 		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
@@ -769,8 +830,9 @@ func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
 	named := storageSchemaConfirmation(report, true)
 	assert.Contains(t, named, "Converging schemabot on db-1.example (mysql) to the schema files of release v1.5.0 in block/schemabot")
 	assert.Contains(t, named, "This is not the schema v1.4.0 converges on boot")
-	assert.Contains(t, named, "refused as destructive and stays")
-	assert.Contains(t, named, "an index loses no")
+	assert.Contains(t, named, "refuses to drop what it does not declare")
+	assert.Contains(t, named, "logs a refused destructive change")
+	assert.Contains(t, named, "indexes were protected is the exception")
 	assert.Contains(t, named, "storage plan")
 	assert.Contains(t, named, "Only 'yes' will be accepted")
 
@@ -779,7 +841,7 @@ func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
 		"a convergence of the answering binary's own schema has no cross-release consequence to state")
 	assert.Contains(t, own, "Only 'yes' will be accepted")
 
-	// A report with no version still states the asymmetry; the release it
+	// A report with no version still states the consequences; the release it
 	// names is the one that answered, which is all the operator needs to know
 	// they are ahead of it.
 	unversioned := storageSchemaConfirmation(&apitypes.StorageSchemaReport{

@@ -527,6 +527,61 @@ func TestDiffStorageSchemaMySQL_DiffsAgainstASuppliedSchema(t *testing.T) {
 		"a pre-applied column survives a boot of the release that does not declare it")
 }
 
+// An operator converges a later release's schema ahead of its roll, and that
+// schema declares an index the deployed release does not. This is the case the
+// confirmation's notice makes a prediction about, so the prediction is checked
+// here against what a boot of the deployed release actually does: it refuses
+// the drop and leaves the index in place, exactly as it does for a table or a
+// column, and it says so in the log every time a pod starts. An operator told
+// the opposite would schedule the deploy window around an index that was never
+// at risk, and one not told about the logging would read a fleet warning on
+// every boot as an incident.
+func TestApplyStorageSchemaMySQL_PreAppliedIndexSurvivesTheRunningRelease(t *testing.T) {
+	const preAppliedIndex = "idx_release_caller_created"
+	preAppliedColumns := []string{"caller", "created_at"}
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
+
+	// The next release's schema: the running one, plus an index on one table.
+	files, err := storageSchemaFilesForTest()
+	require.NoError(t, err)
+	const lastKey = "KEY `idx_completed_at_state` (`completed_at`,`state`)"
+	require.Contains(t, files["applies.sql"], lastKey, "the fixture this test appends to has moved")
+	files["applies.sql"] = strings.Replace(files["applies.sql"], lastKey,
+		lastKey+",\n  KEY `"+preAppliedIndex+"` (`caller`,`created_at`)", 1)
+	desired, err := StorageSchemaFromFiles("the schema files of release v1.4.0", files)
+	require.NoError(t, err)
+
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, desired, storageSchemaTestLogger())
+	require.NoError(t, err)
+	require.True(t, remaining.Converged(), "outstanding against the supplied schema after converging it: %v", statementTables(remaining.Outstanding))
+	require.Equal(t, preAppliedColumns, testutil.IndexColumns(t, db, sdb.Name, "applies", preAppliedIndex),
+		"the named schema's index has to be on the database, or the convergence ran the embedded files instead")
+
+	// Against the running release the index is now surplus, and the drop that
+	// would remove it is refused rather than outstanding.
+	running, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.Empty(t, running.Outstanding, "nothing about the running schema runs automatically here: %v", statementTables(running.Outstanding))
+	surplus := statementFor(t, running.Destructive, "applies")
+	assert.Contains(t, surplus.DDL, "DROP INDEX")
+	assert.Contains(t, surplus.DDL, preAppliedIndex)
+
+	// So every pod of the deployed release leaves it in place, and logs the
+	// refusal naming it, until the release that declares it rolls (AV-9).
+	var logBuf syncBuffer
+	bootLogger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(sdb.DSN, bootLogger), "a boot of the running release must not fail on a surplus index")
+	assert.Equal(t, preAppliedColumns, testutil.IndexColumns(t, db, sdb.Name, "applies", preAppliedIndex),
+		"a pre-applied index survives a boot of the release that does not declare it, like a pre-applied column")
+
+	logs := logBuf.String()
+	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, preAppliedIndex,
+		"the refusal has to name the index, or an operator cannot tell which object the fleet is warning about")
+}
+
 // The PostgreSQL bootstrap converges the schema it is given too, which the
 // MySQL test cannot show for it: the two dialects read their files and compute
 // their drift in separate code, so a source that reached one and not the other

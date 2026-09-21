@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -166,8 +167,20 @@ func (a *storageSchemaAdapter) StorageSchemaPlan(ctx context.Context, req *ternv
 //
 // operation names what the files are for, so the log line says whether a
 // supplied schema was read for a diff or run against the database.
+//
+// A name with no files to go with it is refused here rather than at a
+// transport, because the tern gRPC server reaches this adapter without passing
+// the HTTP API's validation, and this is the one half of that pair the
+// defaulting below would swallow: it would resolve to the embedded schema and
+// converge it, running one release's schema for a caller that named another's.
+// Files with no name are refused by StorageSchemaFromFiles, which cannot
+// attribute a report without one.
 func (a *storageSchemaAdapter) desiredSchema(files map[string]string, schemaSource, operation string) (*api.StorageSchemaSource, error) {
 	if len(files) == 0 {
+		if strings.TrimSpace(schemaSource) != "" {
+			return nil, fmt.Errorf("%w: schema_source %q was sent without schema_files: with no files this server's own embedded schema would run and be reported under that name; send the files, or drop schema_source to use the embedded schema",
+				tern.ErrInvalidStorageSchemaRequest, schemaSource)
+		}
 		return api.EmbeddedStorageSchema(a.version), nil
 	}
 	desired, err := api.StorageSchemaFromFiles(schemaSource, files)

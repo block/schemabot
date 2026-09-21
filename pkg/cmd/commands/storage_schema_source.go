@@ -259,7 +259,7 @@ func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect sch
 		return nil, err
 	}
 
-	client := &http.Client{CheckRedirect: refuseInsecureRedirect}
+	client := &http.Client{CheckRedirect: refuseInsecureRedirect(converging)}
 	listing, err := listReleaseSchemaFiles(ctx, client, repo, tag, directory)
 	if err != nil {
 		return nil, err
@@ -292,25 +292,39 @@ func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect sch
 // is what actually travels: net/http copies it onto the redirect request — and
 // drops it when the destination is a different host — before consulting this
 // policy, so its presence here is exactly the question of whether this hop
-// carries the token. A fetch with no token is left alone; an unauthenticated
-// public release has nothing to protect on the wire.
-func refuseInsecureRedirect(request *http.Request, via []*http.Request) error {
-	if len(via) >= maxStorageSchemaRedirects {
-		return fmt.Errorf("stopped after %d redirects fetching release schema files", maxStorageSchemaRedirects)
-	}
-	if request.Header.Get("Authorization") == "" {
-		// Nothing to leak on this hop, so it is followed. The schema still
-		// arrives over whatever channel the redirect chose, though, and the
-		// warning on the configured base URL cannot speak for a host the
-		// operator never named — so the downgrade says so here instead of
-		// passing silently.
-		warnPlaintextSchemaSource(request.URL)
+// carries the token.
+//
+// A hop with no token has nothing to protect on the wire, but it still decides
+// which channel the files arrive over, so it is held to the rule the
+// configured base URL was held to rather than left alone: a convergence
+// refuses a plaintext destination and a diff is warned about one. Guarding the
+// base URL alone would leave the policy in the hands of the remote end, which
+// can redirect an https base wherever it likes.
+func refuseInsecureRedirect(converging bool) func(*http.Request, []*http.Request) error {
+	return func(request *http.Request, via []*http.Request) error {
+		if len(via) >= maxStorageSchemaRedirects {
+			return fmt.Errorf("stopped after %d redirects fetching release schema files", maxStorageSchemaRedirects)
+		}
+		if request.Header.Get("Authorization") == "" {
+			// Nothing to leak on this hop, but the files still arrive over
+			// whatever channel the redirect chose, and the check on the
+			// configured base URL cannot speak for a host the operator never
+			// named. So the channel is held to the same rule here that the
+			// base URL was held to: a convergence refuses it, a diff is warned
+			// that its report is unverified.
+			if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
+				if converging {
+					return fmt.Errorf("refusing to converge a release redirected to %s://%s: %w; anything on the network path can change the schema files before they arrive, and a convergence runs whatever arrives against SchemaBot's own storage", request.URL.Scheme, request.URL.Host, err)
+				}
+				warnPlaintextSchemaSource(request.URL)
+			}
+			return nil
+		}
+		if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
+			return fmt.Errorf("refusing a redirect to %s://%s: %w; the redirect stays on the same host, so the token would follow it in plaintext", request.URL.Scheme, request.URL.Host, err)
+		}
 		return nil
 	}
-	if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
-		return fmt.Errorf("refusing a redirect to %s://%s: %w; the redirect stays on the same host, so the token would follow it in plaintext", request.URL.Scheme, request.URL.Host, err)
-	}
-	return nil
 }
 
 // maxStorageSchemaRedirects matches the ceiling net/http applies when a client

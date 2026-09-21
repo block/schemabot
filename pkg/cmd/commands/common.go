@@ -139,7 +139,25 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 
 // confirmAction prompts the user for "yes" confirmation. Returns true if confirmed.
 func confirmAction(prompt, cancelMsg string) (bool, error) {
-	fmt.Print(prompt)
+	return confirmActionOn(os.Stdout, prompt, cancelMsg)
+}
+
+// confirmActionOn is confirmAction with the prompt written somewhere other than
+// stdout. A command asked for machine-readable output owes stdout to the
+// program reading it, and still has to ask a person before it converges, so the
+// conversation goes to stderr and the answer stays parseable.
+func confirmActionOn(out io.Writer, prompt, cancelMsg string) (bool, error) {
+	// A prompt nobody can be shown is not a prompt, so a write that fails is
+	// an error rather than an unanswered question read from stdin anyway.
+	if _, err := fmt.Fprint(out, prompt); err != nil {
+		return false, fmt.Errorf("write confirmation prompt: %w", err)
+	}
+	cancelled := func() error {
+		if _, err := fmt.Fprintln(out, cancelMsg); err != nil {
+			return fmt.Errorf("write cancellation notice: %w", err)
+		}
+		return nil
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
@@ -158,8 +176,7 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 
 	select {
 	case <-sigCh:
-		fmt.Println(cancelMsg)
-		return false, nil
+		return false, cancelled()
 	case r := <-resultCh:
 		// EOF with data is valid (e.g., echo -n yes | schemabot apply)
 		if r.err != nil && !errors.Is(r.err, io.EOF) {
@@ -167,12 +184,10 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 		}
 		response := strings.TrimSpace(strings.ToLower(r.response))
 		if errors.Is(r.err, io.EOF) && response == "" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		if response != "yes" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		return true, nil
 	}

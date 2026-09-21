@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -371,8 +372,11 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	}
 	// With --auto-approve the convergence's own planned report says what ran,
 	// so the plan is printed after the fact instead — unless the gate stops the
-	// run, which prints it itself.
-	if !cmd.AutoApprove {
+	// run, which prints it itself. A --json run gets no human plan at all: the
+	// response carries the same report, and stdout belongs to the program
+	// reading it. Naming a schema forces the attended path, so this is the only
+	// thing keeping `storage apply --release … --json` parseable.
+	if !cmd.AutoApprove && !cmd.JSON {
 		if err := outputStorageSchemaPlan(report, true, cmd.rerunWithAllowUnsafe(), nil); err != nil {
 			return err
 		}
@@ -394,7 +398,14 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	}
 
 	if !cmd.AutoApprove {
-		confirmed, err := confirmAction(
+		// The prompt is a conversation with a person, so under --json it goes
+		// to the terminal rather than into the stream being parsed.
+		prompts := io.Writer(os.Stdout)
+		if cmd.JSON {
+			prompts = os.Stderr
+		}
+		confirmed, err := confirmActionOn(
+			prompts,
 			storageSchemaConfirmation(report, cmd.namedSource() != ""),
 			"\nApply cancelled.",
 		)
@@ -607,25 +618,23 @@ func storageSchemaConfirmation(report *apitypes.StorageSchemaReport, namedSchema
 	return fmt.Sprintf("\n%sDo you want to apply these changes to %s? Only 'yes' will be accepted: ", notice, label)
 }
 
-// crossReleaseStorageNotice states the one consequence of converging a schema
-// the deployed release does not carry, which an operator has no other way to
-// find out.
+// crossReleaseStorageNotice states the consequences of converging a schema the
+// deployed release does not carry, which an operator has no other way to find
+// out.
 //
-// The convergence is safe and it is also not permanent, and the two facts are
-// not in tension: the gates that make it safe are the same ones that make part
-// of it revert. A boot of the deployed release diffs this schema against its
-// own and converges the difference, so anything surplus to it is a statement
-// that release's bootstrap will run — and that bootstrap refuses to drop a
-// table or a column while a statement that loses no data is one it runs
-// without asking. So a pre-applied column or table survives every pod restart
-// until the release that declares it is deployed, and a pre-applied index does
-// not survive the next one.
+// A boot of the deployed release diffs this schema against its own, so
+// everything converged here that the deployed release does not declare is a
+// removal its bootstrap has to decide about. It refuses all of them — a table,
+// a column, and an index alike — so the pre-applied state survives every pod
+// restart, and each of those boots logs a refused destructive change for it.
+// The steady state between this command and the deploy is therefore a fleet
+// that keeps warning about the work an operator did on purpose, which reads
+// like an incident to anyone who was not told to expect it.
 //
-// That asymmetry is the whole reason this notice exists. It is invisible in the
-// plan, which shows what the storage needs and not what will undo it, and the
-// failure it produces is silent: an index put in place ahead of a deploy to
-// keep a query from falling over is gone by the time the deploy happens, with
-// nothing in the plan or the convergence having said so.
+// The protection lives in the binary that is booting, so a release from before
+// indexes were protected is the exception: its boots still converge a
+// pre-created index away, silently as far as the plan is concerned. The plan
+// shows what the storage needs, never what will undo it.
 func crossReleaseStorageNotice(report *apitypes.StorageSchemaReport) string {
 	running := "the release answering this command"
 	if version := strings.TrimSpace(report.Version); version != "" {
@@ -633,11 +642,13 @@ func crossReleaseStorageNotice(report *apitypes.StorageSchemaReport) string {
 	}
 	return fmt.Sprintf(`Converging %s to %s.
 
-  This is not the schema %s converges on boot, so until that release is
-  deployed, every pod that boots %s converges the difference back. A table or a
-  column it finds surplus is refused as destructive and stays; an index loses no
-  data, so it is removed without asking. Converge close to the deploy, and re-run
-  `+"`storage plan`"+` just before it to confirm what you applied is still there.
+  This is not the schema %s converges on boot. Until that release is deployed,
+  every pod that boots %s refuses to drop what it does not declare, so the
+  tables, columns and indexes applied here survive — and every one of those
+  boots logs a refused destructive change for them. A release from before
+  indexes were protected is the exception: its boots converge a surplus index
+  away. Re-run `+"`storage plan`"+` just before the deploy to confirm what you
+  applied is still there.
 
 `, storageSchemaDatabaseLabel(report), report.SchemaSource, running, running)
 }
