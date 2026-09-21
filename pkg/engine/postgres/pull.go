@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/schemadiff"
+	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -115,7 +117,7 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		// accountable for, so a pulled baseline declares exactly what a later
 		// plan would otherwise report as undeclared. Partitions and
 		// extension-owned tables have no file of their own and are left out.
-		tables, tableErrors, err := renderPostgresTables(ctx, pool, namespace, true)
+		tables, tableErrors, err := renderPostgresTables(ctx, pool, namespace, pulledBaseline)
 		if err != nil {
 			return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 		}
@@ -130,9 +132,37 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 	return response, nil
 }
 
+// baselinePolicy says which live tables a rendered baseline must carry and
+// which it must refuse, beyond what pg-sprite's renderer refuses on its own.
+// The two baselines SchemaBot renders answer those questions differently
+// because they are read by different parties.
+type baselinePolicy struct {
+	// refuseUnmodeledObjects refuses a table that carries objects the
+	// declarative format does not represent — a trigger, a policy, a comment
+	// — even though the renderer would happily render its columns and
+	// indexes without them.
+	refuseUnmodeledObjects bool
+	// skipArchiveTables leaves archive-named tables out of the baseline, the
+	// same tables the plan exempts from the undeclared-table verdict.
+	skipArchiveTables bool
+}
+
+// pulledBaseline becomes the owner's declared schema, so a table the format
+// would describe incompletely is refused rather than written down without
+// its trigger or comment, and every table the plan would hold a file
+// accountable for is present, archive tables included.
+var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true}
+
+// rollbackBaseline is read only by a rollback re-plan, which manages the
+// same table set the forward plan did. Objects the differ cannot see are
+// left in place by any apply and by any rollback, so they cost the
+// namespace nothing; an archive table sits outside management on both
+// plans, so its shape — renderable or not — is not the baseline's concern.
+var rollbackBaseline = baselinePolicy{skipArchiveTables: true}
+
 // renderPostgresTables uses pg-sprite's managed-table enumeration and
 // canonical renderer for every PostgreSQL baseline SchemaBot captures.
-func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, inspectUnmodeled bool) (map[string]string, []error, error) {
+func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
 	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
@@ -143,7 +173,13 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace str
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		if inspectUnmodeled {
+		if policy.skipArchiveTables && spirittable.IsArchiveTable(table) {
+			slog.Debug("PostgreSQL archive table is outside management and left out of the rendered baseline",
+				"namespace", namespace,
+				"table", table)
+			continue
+		}
+		if policy.refuseUnmodeledObjects {
 			objects, err := pullUnmodeledTableObjects(ctx, pool, namespace, table)
 			if err != nil {
 				return nil, nil, err

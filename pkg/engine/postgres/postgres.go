@@ -331,15 +331,22 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 }
 
 // captureOriginalFiles renders the live namespace as the plan's rollback
-// baseline, keyed by schema file name. The baseline is the whole namespace,
-// so a table that cannot be rendered as a desired schema (foreign keys,
-// inheritance, unlogged) leaves the capture incomplete: captured is then
-// false and RV-7 refuses rollback for this plan rather than reconstructing
+// baseline, keyed by schema file name. The baseline is every managed table
+// in the namespace except the archive tables the plan exempts, so it is
+// complete or it is nothing: one table pg-sprite's renderer refuses — each
+// shape it refuses is named by one of its ErrUnrenderable errors, foreign
+// keys on either side and inheritance among them — leaves captured false,
+// and RV-7 then refuses rollback for this plan rather than reconstructing
 // the originals. The plan itself still proceeds, because rollback capability
 // is not a precondition for reviewing or applying the change. Only a failure
-// to read the namespace at all is an error.
+// to read the namespace at all is an error, and a cancelled context is that
+// failure rather than one table's, so a plan interrupted mid-capture is
+// never recorded as rollback-incapable.
+//
+// The render introspects every managed table in the namespace, changed or
+// not, so its cost grows with the namespace rather than with the change.
 func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string) (files map[string]string, captured bool, err error) {
-	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, false)
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline)
 	if err != nil {
 		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}
