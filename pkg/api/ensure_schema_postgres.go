@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
@@ -153,12 +154,20 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 
 	applyStart := time.Now()
 	ddlBudget := postgresBootstrapDDLBudget(o.convergenceTimeout)
+	// Progress here is counted in statements finished, because that is what
+	// this convergence knows. Each table's changes run inside one transaction
+	// that either lands or rolls back, so there is no partial state to report
+	// — but which table is in flight is the answer an operator waiting on a
+	// long CREATE INDEX is actually after.
+	totalChanges := drift.changeCount()
+	var doneChanges int
 	for _, table := range tables {
 		changes := drift[table]
 		if len(changes) == 0 {
 			logger.Debug("storage table already converged", "table", table)
 			continue
 		}
+		o.report(postgresConvergenceProgress(table, postgresConvergenceRunning, doneChanges, totalChanges))
 		tableStart := time.Now()
 		if err := applyPostgresTableChanges(ctx, db, table, changes, logger, ddlBudget); err != nil {
 			// A statement killed by the overall deadline surfaces as a context
@@ -207,6 +216,8 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 			}
 			return fmt.Errorf("converge storage table %q: %w", table, err)
 		}
+		doneChanges += len(changes)
+		o.report(postgresConvergenceProgress(table, postgresConvergenceComplete, doneChanges, totalChanges))
 	}
 	logger.Info("storage schema applied successfully",
 		"database", database,
@@ -218,6 +229,35 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 		return fmt.Errorf("validate converged storage tables: %w", err)
 	}
 	return nil
+}
+
+// The phases a PostgreSQL convergence reports a table in. There is no third:
+// each table's changes run in one transaction, so a table is either being
+// converged or converged, never partway.
+//
+// The finished one is the shared terminal state rather than a word of this
+// dialect's own. A reader of these observations has to be able to tell that a
+// subject is finished without knowing which dialect produced it — that is what
+// decides whether there is anything left to report about it — and a dialect
+// spelling the end differently makes that a lookup table instead of a check.
+const (
+	postgresConvergenceRunning  = "running"
+	postgresConvergenceComplete = string(engine.StateCompleted)
+)
+
+// postgresConvergenceProgress is one observation of the per-table convergence,
+// counted in statements rather than tables: a convergence creating one table
+// and adding six columns to another is not half done when the first lands.
+func postgresConvergenceProgress(table, state string, done, total int) StorageConvergenceProgress {
+	p := StorageConvergenceProgress{
+		DDLCount: total,
+		State:    state,
+		Tables:   []StorageConvergenceTableProgress{{Table: table, State: state}},
+	}
+	if total > 0 {
+		p.Percent = done * 100 / total
+	}
+	return p
 }
 
 // The additive convergence's change kinds. Every producer tags a change with

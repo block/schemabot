@@ -14,11 +14,13 @@ import (
 	"time"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	seedutil "github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
@@ -743,4 +745,130 @@ func waitForPostgresBootstrapLockWaiter(t *testing.T, db *sql.DB) {
 		return count > 0
 	}, storageConvergenceStopDeadline, 100*time.Millisecond,
 		"expected the convergence to be waiting on the bootstrap advisory lock, waiter count: %d", count)
+}
+
+// A convergence an operator is watching reports itself as it runs. Without it
+// the command is silent between the plan and the answer, which on a storage
+// database with any history is the whole of a long index build — and a blank
+// terminal is what gets a run killed that was about to finish.
+func TestApplyStorageSchemaMySQL_ReportsProgressToAWatchingCaller(t *testing.T) {
+	sdb, _ := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+
+	var observed []StorageConvergenceProgress
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, logger,
+		WithConvergenceProgress(func(p StorageConvergenceProgress) { observed = append(observed, p) }))
+	require.NoError(t, err)
+	require.True(t, remaining.Converged())
+
+	require.NotEmpty(t, observed, "a convergence that ran DDL must have said so")
+	for _, p := range observed {
+		assert.NotEmpty(t, p.State, "an observation with no state says nothing an operator can read")
+		assert.Positive(t, p.DDLCount, "an observation names how much work the run is doing")
+	}
+	assert.Equal(t, string(engine.StateCompleted), observed[len(observed)-1].State,
+		"the last thing an operator sees is the run finishing")
+}
+
+// The per-table lines are the ones an operator watches through a long copy,
+// and the phase on them is the engine's own word passed through rather than a
+// rendering of it — so an alert written against one keeps matching.
+//
+// It takes a real table copy to see any of this. A convergence over a fresh
+// database only creates tables, and creates report no per-table progress at
+// all, which leaves the whole per-table path unexercised by a run that looks
+// like it covers it.
+func TestApplyStorageSchemaMySQL_ReportsTheEnginesOwnPerTableVocabulary(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	// Seeded before the drift, so the rows are indexed on the way in rather
+	// than by the statement under test.
+	seedutil.SeedRows(t, sdb.DSN, "`applies`",
+		"apply_identifier, lock_id, plan_id, database_name, database_type, repository, pull_request, environment, engine, state, options",
+		"CONCAT('seed-', seq), 0, 0, 'seed', 'mysql', 'example/repo', 0, 'development', 'spirit', 'queued', '{}'",
+		storageConvergenceCopyRows)
+
+	// Converging a dropped index back is an ADD INDEX, which always copies the
+	// table rather than running instantly, so there is a copy to report on.
+	_, err := db.ExecContext(t.Context(), "ALTER TABLE `applies` DROP INDEX `idx_completed_at_state`")
+	require.NoError(t, err)
+
+	var observed []StorageConvergenceProgress
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, logger,
+		WithConvergenceProgress(func(p StorageConvergenceProgress) { observed = append(observed, p) }))
+	require.NoError(t, err)
+	require.True(t, remaining.Converged())
+
+	states := map[string]bool{}
+	for _, p := range observed {
+		for _, tp := range p.Tables {
+			if tp.Table == "applies" && tp.State != "" {
+				states[tp.State] = true
+			}
+		}
+	}
+	require.NotEmpty(t, states, "a convergence that copied a table must report that table's phases")
+
+	// Taken from the engine's own enum rather than listed here, so a state it
+	// gains is in the set the moment it exists. A phase outside it is
+	// SchemaBot inventing a word for something the engine already named,
+	// which is how a documented status an operator matches on comes to be one
+	// no line ever carries.
+	enginePhases := map[string]bool{string(engine.StateCompleted): true}
+	for s := status.Initial; s <= status.ErrCleanup; s++ {
+		enginePhases[s.String()] = true
+	}
+	require.NotContains(t, enginePhases, "unknown",
+		"the range must cover the enum; String() falling through would make this assertion vacuous")
+	for phase := range states {
+		assert.True(t, enginePhases[phase],
+			"per-table phase %q is not one the engine names; phases are passed through rather than translated", phase)
+	}
+	assert.True(t, states["copyRows"],
+		"a table copy of this size is observed mid-copy, under the engine's name for that phase")
+}
+
+// The PostgreSQL convergence has no engine polling behind it, so it reports
+// what it does know: which table it is about to converge, and how much of the
+// drift set is behind it. That is the answer an operator waiting on a long
+// CREATE INDEX is after, and it is the honest one — each table runs in one
+// transaction, so there is no partial state to report.
+func TestApplyStorageSchemaPostgres_ReportsProgressToAWatchingCaller(t *testing.T) {
+	dsn, _ := startPostgresStorage(t)
+	logger := storageSchemaTestLogger()
+	postgres := WithDialect(schema.DialectPostgres)
+
+	var observed []StorageConvergenceProgress
+	_, remaining, err := ApplyStorageSchema(t.Context(), dsn, logger, postgres,
+		WithConvergenceProgress(func(p StorageConvergenceProgress) { observed = append(observed, p) }))
+	require.NoError(t, err)
+	require.True(t, remaining.Converged())
+
+	require.NotEmpty(t, observed)
+	named := make(map[string]bool)
+	for _, p := range observed {
+		require.Len(t, p.Tables, 1, "a PostgreSQL observation is about the one table in flight")
+		named[p.Tables[0].Table] = true
+		assert.Contains(t, []string{postgresConvergenceRunning, postgresConvergenceComplete}, p.State)
+	}
+	tables, _, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	for _, table := range tables {
+		assert.True(t, named[table], "every table the convergence created should have been reported: %s", table)
+	}
+	assert.Equal(t, 100, observed[len(observed)-1].Percent,
+		"the last observation of a clean convergence is the whole drift set behind it")
+
+	// Every dialect ends a table with the same word, so a reader of these
+	// observations can tell a finished subject from a running one without
+	// knowing which dialect produced it. That is what decides whether there is
+	// anything left to report about it, and a per-dialect spelling would make
+	// it a lookup table instead of a check.
+	last := observed[len(observed)-1]
+	assert.True(t, engine.State(last.State).IsTerminal(),
+		"a converged run ends in the shared terminal state, not a spelling of this dialect's own: %q", last.State)
+	assert.True(t, engine.State(last.Tables[0].State).IsTerminal(),
+		"and so does the table it ended on: %q", last.Tables[0].State)
 }

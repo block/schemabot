@@ -360,6 +360,67 @@ drop, while an operator at a terminal is exactly who should decide.
 A convergence over a table with a long history is the one that matters and the
 one that takes time. Here is what to know before you start one.
 
+**It reports itself as it goes.** A convergence `--dsn` or `--config` started
+prints what the engine reports, in the same log mode `schemabot apply --output
+log` prints: logfmt lines, immediately on a transition, and a heartbeat while a
+copy is moving, the first after two seconds and then every ten. Progress goes
+to stderr, so `--json` output stays parseable.
+
+```console
+$ schemabot storage apply --dsn "$SCHEMABOT_STORAGE_DSN"
+...
+Do you want to apply these changes to schemabot on db-1.example (mysql)? Only 'yes' will be accepted: yes
+15:04:05 Table started table=applies status=copyRows progress=1%
+15:04:07 Copying rows table=applies progress=3% rows_copied=180,224
+15:04:17 Copying rows table=applies progress=24% rows_copied=1,203,441
+15:04:27 Copying rows table=applies progress=58% rows_copied=2,941,088
+15:04:39 Table checksum table=applies duration=34s progress=100% rows_copied=5,084,117
+15:04:45 Table cutOver table=applies duration=40s progress=100% rows_copied=5,084,117
+15:04:47 Table completed table=applies duration=42s progress=100% rows_copied=5,084,117
+✓ Ran 1 statement against schemabot on db-1.example. Nothing is outstanding.
+```
+
+`status=` and the transition messages carry the engine's own word for the
+phase, passed through rather than translated — `copyRows`, `checksum`,
+`cutOver` on MySQL. An alert matching on them is matching what the engine
+calls things, which is the vocabulary that stays true when SchemaBot's
+rendering changes. The one word every dialect shares is the last one:
+`completed` ends a table on all of them, so "is this finished" is a match
+against one string rather than a table of per-dialect spellings.
+
+A table stops reporting once it is finished. A convergence keeps polling until
+the last of its work is done, so a table that completed early is still in every
+observation until the end of the run — but it has nothing left to say, and a
+heartbeat for it would insist a finished table is still copying rows.
+
+What is missing from a line is a measurement the dialect never took, not a
+zero. PostgreSQL converges a table per transaction, so it knows which table it
+is on and how much of the run is behind it but nothing about how far into the
+one in flight. Its lines carry `converged=` — the share of the run that is
+done — and no `progress=` or row counts:
+
+```console
+$ schemabot storage apply --dsn "$SCHEMABOT_STORAGE_DSN"
+...
+15:04:08 Table started table=applies status=running
+15:04:11 Table completed table=applies duration=3s converged=33%
+15:04:12 Table started table=apply_logs status=running converged=33%
+15:04:15 Table completed table=apply_logs duration=3s converged=66%
+15:04:16 Table started table=settings status=running converged=66%
+15:04:19 Table completed table=settings duration=3s converged=100%
+✓ Ran 3 statements against schemabot on db-1.example. Nothing is outstanding.
+```
+
+The two percentages are deliberately different keys. `progress=` counts rows
+within one table; `converged=` counts statements within the run. One key
+carrying both denominators is how an alert written against one silently
+matches the other.
+
+`--deployment` prints none. That convergence is reached over the API, which
+answers once, when it is done, and there is nothing to stream through a single
+response. A run you want to watch is a run you point at the storage database
+directly.
+
 **You can stop one you are running yourself.** Ctrl-C stops a convergence
 `--dsn` or `--config` started, because that command *is* the convergence:
 stopping it stops the DDL. Stopping is safe by construction rather than by
