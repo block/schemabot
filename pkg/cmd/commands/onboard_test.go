@@ -139,6 +139,45 @@ func TestBuildOnboardWritePlanDoesNotDeclareAWithheldTable(t *testing.T) {
 		"the namespace still declares a table, so it needs no empty-scope declaration")
 }
 
+// Withholding is exact so an entry never withholds a table it does not name,
+// but the engines refuse a declared-and-ignored table with case folded. An
+// entry that differs from the live table only in case therefore survives the
+// filter, and onboard would write the very file every later plan refuses.
+// Onboard refuses first, before anything is on disk, so the operator is never
+// left holding a repository no plan accepts.
+func TestBuildOnboardWritePlanRefusesACaseDifferingEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry string
+		live  string
+	}{
+		{"entry folds down to the live table", "databasechangelog", "DATABASECHANGELOG"},
+		{"entry folds up to the live table", "Flyway_Schema_History", "flyway_schema_history"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			_, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database:    "orders",
+				Type:        "mysql",
+				Environment: "production",
+				TableCount:  2,
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"orders": {Tables: map[string]string{
+						"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+						tc.live: "CREATE TABLE `" + tc.live + "` (`id` bigint NOT NULL);\n",
+					}},
+				},
+			}, client.PlanExclusions{Tables: []string{tc.entry}})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.entry)
+			assert.Contains(t, err.Error(), "is also declared by a schema file in namespace \"orders\"")
+			assert.NoDirExists(t, filepath.Join(root, "orders"),
+				"the refusal lands before anything reaches disk")
+		})
+	}
+}
+
 // A namespace whose every table is withheld still belongs to the plan, so it
 // keeps its comment-only declaration rather than vanishing from the repository.
 func TestBuildOnboardWritePlanKeepsAFullyWithheldNamespaceExplicit(t *testing.T) {
@@ -424,25 +463,92 @@ func TestOnboardWritePlanStrayFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Namespace directory absent (dry run before any write): nothing to scan.
-	strays, err := plan.strayFiles()
+	strays, withheldStrays, err := plan.strayFiles()
 	require.NoError(t, err)
 	assert.Empty(t, strays)
+	assert.Empty(t, withheldStrays)
 
 	require.NoError(t, plan.write())
-	strays, err = plan.strayFiles()
+	strays, withheldStrays, err = plan.strayFiles()
 	require.NoError(t, err)
 	assert.Empty(t, strays)
+	assert.Empty(t, withheldStrays)
 
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "legacy_bak.sql"), []byte("CREATE TABLE `legacy_bak` (`id` bigint NOT NULL);\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{}"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "README.md"), []byte("docs"), 0o644))
 
 	// MySQL planning never reads vschema.json, so only the table file is stray.
-	strays, err = plan.strayFiles()
+	strays, withheldStrays, err = plan.strayFiles()
 	require.NoError(t, err)
 	assert.Equal(t, []string{
 		filepath.Join(root, "orders", "legacy_bak.sql"),
 	}, strays)
+	assert.Empty(t, withheldStrays, "no entry withholds legacy_bak")
+}
+
+// Adding an ignore_tables entry to an already-onboarded repository leaves the
+// table's old schema file behind: the rewrite stops writing it but never
+// deletes it. That file is not the ordinary stray, whose table is absent from
+// the target and whose remedy is to restore it. This table is present and
+// deliberately unmanaged, so the file states the contradiction the engines
+// refuse and deleting it is the only fix. Reporting it under the ordinary
+// warning would send the operator to restore a table that never left.
+func TestOnboardWritePlanSeparatesAWithheldTablesLeftoverFile(t *testing.T) {
+	root := t.TempDir()
+	pulled := &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{
+				"users":                 "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}
+	before, err := buildOnboardWritePlan(root, pulled, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, before.write())
+	require.FileExists(t, filepath.Join(root, "orders", "flyway_schema_history.sql"))
+
+	after, err := buildOnboardWritePlan(root, pulled, client.PlanExclusions{Tables: []string{"flyway_schema_history"}})
+	require.NoError(t, err)
+	require.NoError(t, after.write())
+
+	strays, withheldStrays, err := after.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays, "the leftover file is not an absent table to restore")
+	assert.Equal(t, []string{filepath.Join(root, "orders", "flyway_schema_history.sql")}, withheldStrays)
+}
+
+// Onboard prints the server's unfiltered table count, so a table missing from
+// the written files has no stated reason unless onboard says what it withheld.
+// A typo'd entry has the same problem in reverse: it withholds nothing and
+// stays invisible until the next plan. Every other ignore_tables surface
+// discloses both, and onboard records the same two lists.
+func TestBuildOnboardWritePlanRecordsWhatItWithheldAndWhatMatchedNothing(t *testing.T) {
+	plan, err := buildOnboardWritePlan(t.TempDir(), &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  2,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{
+				"users":                 "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history", "legacy_audit_log"}})
+	require.NoError(t, err)
+
+	require.Len(t, plan.withheld, 1)
+	assert.Equal(t, "orders", plan.withheld[0].Namespace)
+	assert.Equal(t, []string{"flyway_schema_history"}, plan.withheld[0].Tables)
+	assert.Equal(t, apitypes.ExemptReasonIgnoreTables, plan.withheld[0].Reason)
+	assert.Equal(t, []string{"legacy_audit_log"},
+		schema.UnmatchedIgnoreTables(plan.exclusions.Tables, plan.withheldTables()),
+		"the entry naming no live table here is the one worth reporting")
 }
 
 // For Vitess, vschema.json is a schema input: a leftover copy the pull did not
@@ -463,9 +569,10 @@ func TestOnboardWritePlanStrayFilesFlagsVSchemaForVitess(t *testing.T) {
 
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{\"sharded\": true}"), 0o644))
 
-	strays, err := plan.strayFiles()
+	strays, withheldStrays, err := plan.strayFiles()
 	require.NoError(t, err)
 	assert.Equal(t, []string{filepath.Join(root, "orders", "vschema.json")}, strays)
+	assert.Empty(t, withheldStrays)
 }
 
 func validPullSchemaResponse() *apitypes.PullSchemaResponse {

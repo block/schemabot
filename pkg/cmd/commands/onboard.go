@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -85,11 +86,13 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 			}
 			fmt.Printf("  %s\n", path)
 		}
-		strays, strayErr := plan.strayFiles()
+		strays, withheldStrays, strayErr := plan.strayFiles()
 		if strayErr != nil {
 			return strayErr
 		}
+		plan.printExclusionDisclosure()
 		printStrayFileWarning(strays)
+		printWithheldStrayFileWarning(withheldStrays)
 		return nil
 	}
 
@@ -100,11 +103,13 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	for _, path := range plan.paths() {
 		fmt.Printf("  %s\n", path)
 	}
-	strays, strayErr := plan.strayFiles()
+	strays, withheldStrays, strayErr := plan.strayFiles()
 	if strayErr != nil {
 		return strayErr
 	}
+	plan.printExclusionDisclosure()
 	printStrayFileWarning(strays)
+	printWithheldStrayFileWarning(withheldStrays)
 	if !cmd.SkipVerify {
 		fmt.Println()
 		fmt.Println("Verifying pulled schema against the source environment...")
@@ -128,6 +133,23 @@ type onboardWritePlan struct {
 	// exclusions an operator configured, and plan verification excludes the
 	// same namespaces and withholds the same tables a real plan would.
 	exclusions client.PlanExclusions
+	// withheld names the live tables ignore_tables kept out of the written
+	// files, by namespace. Onboard discloses them the way plan and apply
+	// disclose a plan's exemptions, and tells a stray file describing an
+	// absent table from one describing a table the config withholds.
+	withheld []*apitypes.ExemptTablesResponse
+}
+
+// withheldTables returns every table ignore_tables withheld from this plan,
+// across namespaces and sorted, for reporting the entries that withheld
+// nothing.
+func (p *onboardWritePlan) withheldTables() []string {
+	var tables []string
+	for _, group := range p.withheld {
+		tables = append(tables, group.Tables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
 }
 
 // preservedExclusions returns the ignore_namespaces and ignore_tables of an
@@ -239,6 +261,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	// re-onboarding an already-configured repository is where that happens,
 	// because the entries it preserves name tables the pull just returned.
 	ignored := engine.NewIgnoredTables(exclusions.Tables)
+	var withheldGroups []*apitypes.ExemptTablesResponse
 
 	for _, namespace := range namespaces {
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
@@ -249,8 +272,10 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			return nil, fmt.Errorf("pulled namespace %s is empty", namespace)
 		}
 		tableNames := make([]string, 0, len(pulled.Tables))
+		var withheld []string
 		for tableName := range pulled.Tables {
 			if ignored.Withholds(tableName) {
+				withheld = append(withheld, tableName)
 				continue
 			}
 			tableNames = append(tableNames, tableName)
@@ -258,6 +283,24 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		sort.Strings(tableNames)
 		if err := rejectCaseCollisions("table in "+namespace, tableNames); err != nil {
 			return nil, err
+		}
+		// The filter above is exact, because an entry must never withhold a
+		// table it does not name, while the engines refuse a declared-and-
+		// ignored table with case folded. A live DATABASECHANGELOG under an
+		// entry spelling it databasechangelog therefore survives the filter
+		// and lands in a file that every later plan refuses. Refusing here,
+		// against the tables about to be declared and with the engines' own
+		// predicate, leaves the operator with no repository rather than one
+		// no plan accepts.
+		if err := ignored.RefuseDeclared(namespace, tableNames); err != nil {
+			return nil, err
+		}
+		if group := ignored.Exemption(namespace, withheld); group != nil {
+			withheldGroups = append(withheldGroups, &apitypes.ExemptTablesResponse{
+				Namespace: group.Namespace,
+				Tables:    group.Tables,
+				Reason:    group.Reason,
+			})
 		}
 		if len(tableNames) == 0 && len(pulled.Artifacts) == 0 {
 			// Keep empty scope explicit: a comment-only SQL file declares no tables
@@ -277,7 +320,13 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		}
 	}
 
-	return &onboardWritePlan{root: root, databaseType: resp.Type, files: files, exclusions: exclusions}, nil
+	return &onboardWritePlan{
+		root:         root,
+		databaseType: resp.Type,
+		files:        files,
+		exclusions:   exclusions,
+		withheld:     withheldGroups,
+	}, nil
 }
 
 // Generated paths must remain distinct on case-insensitive filesystems too.
@@ -373,12 +422,15 @@ func (p *onboardWritePlan) checkConflicts(force bool) error {
 }
 
 // strayFiles returns schema files in the pulled namespace directories that
-// this pull did not write. The pull covers every table in each pulled
-// namespace, so a leftover table file there describes a table absent in the
-// target, and a leftover vschema.json (Vitess) proposes a VSchema the target
-// doesn't have: verification will fail on either as a spurious change, and an
-// onboard PR would propose applying it.
-func (p *onboardWritePlan) strayFiles() ([]string, error) {
+// this pull did not write, split by why. The pull covers every table in each
+// pulled namespace, so a leftover table file there describes a table absent in
+// the target, and a leftover vschema.json (Vitess) proposes a VSchema the
+// target doesn't have: verification will fail on either as a spurious change,
+// and an onboard PR would propose applying it. The second list is the leftover
+// files for tables ignore_tables withholds, whose table is present on the
+// target and whose remedy is the opposite one.
+func (p *onboardWritePlan) strayFiles() (strays, withheldStrays []string, err error) {
+	withheldTableFiles := p.withheldTableFilePaths()
 	planned := make(map[string]struct{}, len(p.files))
 	namespaceDirs := make(map[string]struct{})
 	for relativePath := range p.files {
@@ -387,17 +439,16 @@ func (p *onboardWritePlan) strayFiles() ([]string, error) {
 			namespaceDirs[dir] = struct{}{}
 		}
 	}
-	var strays []string
 	for dir := range namespaceDirs {
 		path := filepath.Join(p.root, dir)
-		entries, err := os.ReadDir(path)
-		if err != nil {
+		entries, readErr := os.ReadDir(path)
+		if readErr != nil {
 			// A namespace directory that doesn't exist yet (dry run before any
 			// write) has nothing to scan.
-			if os.IsNotExist(err) {
+			if os.IsNotExist(readErr) {
 				continue
 			}
-			return nil, fmt.Errorf("scan namespace directory %s for stray files: %w", path, err)
+			return nil, nil, fmt.Errorf("scan namespace directory %s for stray files: %w", path, readErr)
 		}
 		for _, entry := range entries {
 			if entry.IsDir() {
@@ -415,12 +466,41 @@ func (p *onboardWritePlan) strayFiles() ([]string, error) {
 			}
 			relativePath := filepath.Join(dir, name)
 			if _, ok := planned[relativePath]; !ok {
+				if withheldTableFiles[relativePath] {
+					withheldStrays = append(withheldStrays, filepath.Join(p.root, relativePath))
+					continue
+				}
 				strays = append(strays, filepath.Join(p.root, relativePath))
 			}
 		}
 	}
 	sort.Strings(strays)
-	return strays, nil
+	sort.Strings(withheldStrays)
+	return strays, withheldStrays, nil
+}
+
+// printExclusionDisclosure reports what ignore_tables kept out of the written
+// files, and which entries kept out nothing. Onboard prints the server's own
+// unfiltered table count, so without this the operator diffing the output
+// against the catalog sees tables missing with no stated reason, and a typo'd
+// entry stays invisible until the next plan. Every other ignore_tables surface
+// discloses both.
+func (p *onboardWritePlan) printExclusionDisclosure() {
+	templates.WriteExemptTables(p.withheld)
+	templates.WriteUnmatchedIgnoreTables(schema.UnmatchedIgnoreTables(p.exclusions.Tables, p.withheldTables()))
+}
+
+// withheldTableFilePaths returns the file each withheld table would have been
+// written to. A repository onboarded before an entry was added still carries
+// those files, and they are strays this pull deliberately did not write.
+func (p *onboardWritePlan) withheldTableFilePaths() map[string]bool {
+	paths := make(map[string]bool)
+	for _, group := range p.withheld {
+		for _, table := range group.Tables {
+			paths[filepath.Join(group.Namespace, table+".sql")] = true
+		}
+	}
+	return paths
 }
 
 func printStrayFileWarning(strays []string) {
@@ -433,6 +513,23 @@ func printStrayFileWarning(strays []string) {
 		fmt.Printf("  %s\n", path)
 	}
 	fmt.Println("Delete the stray files, or restore the missing tables or VSchema in the target before onboarding.")
+}
+
+// printWithheldStrayFileWarning reports leftover files for tables ignore_tables
+// now withholds. The table is on the target and deliberately unmanaged, so the
+// generic stray remedy, restore it in the target, is the wrong instruction:
+// the file states the contradiction the engines refuse, and deleting it is the
+// only fix.
+func printWithheldStrayFileWarning(strays []string) {
+	if len(strays) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("%sWarning:%s the schema root declares tables that ignore_tables withholds. A table cannot be both withheld from the planner and declared to it, so every plan will refuse this repository until these files are gone:\n", templates.ANSIYellow, templates.ANSIReset)
+	for _, path := range strays {
+		fmt.Printf("  %s\n", path)
+	}
+	fmt.Println("Delete these files, or remove the ignore_tables entries that withhold them.")
 }
 
 func fileStatusForDryRun(path string) (exists bool, statErr error) {
@@ -482,9 +579,12 @@ func verifyOnboardPlan(endpoint, database, environment string, plan *onboardWrit
 		return fmt.Errorf("verify pulled schema for database %s environment %s: %w", database, environment, err)
 	}
 	if validateErr := validateOnboardPlanResult(planResult, database, environment); validateErr != nil {
-		strays, strayErr := plan.strayFiles()
+		strays, withheldStrays, strayErr := plan.strayFiles()
 		if strayErr != nil {
 			return errors.Join(validateErr, strayErr)
+		}
+		if len(withheldStrays) > 0 {
+			return fmt.Errorf("%w\nschema files declaring tables that ignore_tables withholds (delete them, or remove the entries that withhold them):\n  %s", validateErr, strings.Join(withheldStrays, "\n  "))
 		}
 		if len(strays) > 0 {
 			return fmt.Errorf("%w\nstray schema files not written by this pull (delete them, or restore the missing tables or VSchema in the target):\n  %s", validateErr, strings.Join(strays, "\n  "))
