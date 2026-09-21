@@ -31,6 +31,36 @@ func TestRenderPlanComment_DriftCleanShowsUniformLine(t *testing.T) {
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "Same plan on all 3 deployments")
 	assert.Contains(t, out, "eu, au, us")
+	assert.NotContains(t, out, "matches the reviewed plan")
+}
+
+// A clean rollup where one deployment will refuse a change at apply still
+// confirms the plan is uniform, then names each deployment with its blocked
+// count so a reviewer knows which deployment admission will refuse.
+func TestRenderPlanComment_DriftCleanNamesBlockedDeployments(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match", Blocked: 1},
+				{Deployment: "us", Class: "match"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "Same plan on all 3 deployments")
+	assert.Contains(t, out, "`eu` (primary) ✅ matches the reviewed plan\n")
+	assert.Contains(t, out, "`au` ✅ matches the reviewed plan · blocked: 1\n")
+	assert.Contains(t, out, "`us` ✅ matches the reviewed plan\n")
+	assert.NotContains(t, out, "`eu` (primary) ✅ matches the reviewed plan · blocked:")
 }
 
 // A diverged deployment is named with a compact change summary, and an errored
@@ -63,6 +93,32 @@ func TestRenderPlanComment_DriftNotCleanListsDeployments(t *testing.T) {
 	assert.Contains(t, out, "`us`")
 	assert.Contains(t, out, "could not verify")
 	assert.Contains(t, out, "diff failed; see server logs")
+}
+
+// A deployment that both diverged and will refuse changes shows both facts, with
+// the refusal count before the drift detail so the sanitized detail stays the
+// trailing clause. The same ordering holds on the could-not-verify line.
+func TestRenderPlanComment_DriftNotCleanShowsBlockedCounts(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    false,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "diverged", Blocked: 2, Detail: "1 unexpected change(s) vs the reviewed plan"},
+				{Deployment: "us", Class: "errored", Blocked: 3, Detail: "diff failed; see server logs"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "`au` ⚠️ diverged · blocked: 2 — 1 unexpected change(s) vs the reviewed plan\n")
+	assert.Contains(t, out, "`us` ❌ could not verify · blocked: 3 — diff failed; see server logs\n")
 }
 
 // Drift on a non-primary deployment must surface even when the reviewed primary
