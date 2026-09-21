@@ -556,14 +556,25 @@ func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
 // then held at the query that resolves its relation until the render cancels
 // it: a render that keeps its remaining introspections running after a
 // sibling's hard failure never cancels them, so the hold outlives the
-// deadline and is reported as such rather than deadlocking the test.
+// deadline and is reported as such rather than deadlocking the test. The
+// dropped table's own resolve is held until one sibling is at that hold, so
+// the failure always finds an introspection in flight to cancel: a render
+// that took tables one at a time would fail on the dropped table before any
+// sibling began, and the cancellation the test is named for would go
+// unexercised while every assertion still passed.
 type tableDroppedAfterListing struct {
-	table    string
-	drop     func()
-	deadline context.Context
-	queries  atomic.Int32
-	begins   atomic.Int32
-	timedOut atomic.Bool
+	table       string
+	drop        func()
+	deadline    context.Context
+	queries     atomic.Int32
+	begins      atomic.Int32
+	timedOut    atomic.Bool
+	siblingHeld chan struct{}
+	holdOne     sync.Once
+}
+
+func newTableDroppedAfterListing(table string, deadline context.Context, drop func()) *tableDroppedAfterListing {
+	return &tableDroppedAfterListing{table: table, deadline: deadline, drop: drop, siblingHeld: make(chan struct{})}
 }
 
 func (d *tableDroppedAfterListing) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
@@ -571,9 +582,19 @@ func (d *tableDroppedAfterListing) TraceQueryStart(ctx context.Context, _ *pgx.C
 		d.begins.Add(1)
 		return ctx
 	}
-	if !d.resolvesAnotherTable(data.Args) {
+	table, resolves := d.resolvesTable(data.Args)
+	if !resolves {
 		return ctx
 	}
+	if table == d.table {
+		select {
+		case <-d.siblingHeld:
+		case <-d.deadline.Done():
+			d.timedOut.Store(true)
+		}
+		return ctx
+	}
+	d.holdOne.Do(func() { close(d.siblingHeld) })
 	select {
 	case <-ctx.Done():
 	case <-d.deadline.Done():
@@ -582,14 +603,14 @@ func (d *tableDroppedAfterListing) TraceQueryStart(ctx context.Context, _ *pgx.C
 	return ctx
 }
 
-// resolvesAnotherTable recognizes the introspection query that looks a table
-// up by schema and name, for every table but the dropped one.
-func (d *tableDroppedAfterListing) resolvesAnotherTable(args []any) bool {
+// resolvesTable recognizes the introspection query that looks a table up by
+// schema and name, and reports which table it resolves.
+func (d *tableDroppedAfterListing) resolvesTable(args []any) (table string, ok bool) {
 	if len(args) != 2 {
-		return false
+		return "", false
 	}
-	table, ok := args[1].(string)
-	return ok && table != d.table
+	table, ok = args[1].(string)
+	return table, ok
 }
 
 func (d *tableDroppedAfterListing) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
@@ -616,10 +637,10 @@ func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *test
 
 	deadline, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
 	defer cancel()
-	dropped := &tableDroppedAfterListing{table: "a_dropped", deadline: deadline, drop: func() {
+	dropped := newTableDroppedAfterListing("a_dropped", deadline, func() {
 		_, err := db.ExecContext(deadline, `DROP TABLE app.a_dropped`)
 		assert.NoError(t, err)
-	}}
+	})
 	poolCfg, err := pgxpool.ParseConfig(dsn)
 	require.NoError(t, err)
 	poolCfg.MaxConns = int32(baselineIntrospectionConcurrency * 2)
@@ -635,7 +656,10 @@ func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *test
 	assert.ErrorContains(t, err, `introspect schema "app" table "a_dropped"`)
 	assert.Nil(t, rendered)
 	assert.Nil(t, renderErrors)
-	assert.LessOrEqual(t, int(dropped.begins.Load()), baselineIntrospectionConcurrency,
+	begins := int(dropped.begins.Load())
+	assert.Greater(t, begins, 1,
+		"a sibling introspection must be in flight when the dropped table's read fails, or the cancellation goes unexercised")
+	assert.LessOrEqual(t, begins, baselineIntrospectionConcurrency,
 		"a sibling's hard failure must cancel the introspections still in flight and start no more; only the first wave may have begun")
 }
 
