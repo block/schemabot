@@ -190,14 +190,19 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 				// Stopped by the operator watching it, which only the deliberate
 				// path can do. No budget is named, because none fired — naming
 				// one sends them looking for a timeout that did not happen.
-				// Each table converges in its own transaction, so the one in
-				// flight rolled back whole and the tables before it stand.
+				//
+				// A table is not one transaction. Its column changes commit
+				// together and each of its indexes commits on its own, so a
+				// stop rolls back the batch in flight and leaves every batch
+				// that already committed — including earlier batches of this
+				// same table. Saying the table is untouched would send an
+				// operator to a half-converged one believing it clean.
 				logger.Warn("storage schema convergence stopped by its caller",
 					"database", database,
 					"table", table,
 					"elapsed", time.Since(applyStart),
 				)
-				return fmt.Errorf("converge storage table %q: convergence stopped; its own statements rolled back and the tables converged before it are still converged, so plan the storage schema again to see what is left: %w",
+				return fmt.Errorf("converge storage table %q: convergence stopped; the batch in flight rolled back whole, and changes to this table that had already committed are still applied, as is every table converged before it, so plan the storage schema again to see what is left: %w",
 					table, err)
 			}
 			return fmt.Errorf("converge storage table %q: %w", table, err)

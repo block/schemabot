@@ -360,17 +360,24 @@ drop, while an operator at a terminal is exactly who should decide.
 A convergence over a table with a long history is the one that matters and the
 one that takes time. Here is what to know before you start one.
 
-**You can stop it.** Ctrl-C stops a convergence you started from a terminal,
-and stopping is safe by construction rather than by luck: statements that had
-already finished stay finished, the one in flight is cancelled and what it was
-building is reclaimed, and the ones after it never ran. What that leaves is
-what the next `storage plan` reports, never something to infer from how far the
-run got.
+**You can stop one you are running yourself.** Ctrl-C stops a convergence
+`--dsn` or `--config` started, because that command *is* the convergence:
+stopping it stops the DDL. Stopping is safe by construction rather than by
+luck: statements that had already finished stay finished, the one in flight is
+cancelled and what it was building is reclaimed, and the ones after it never
+ran. What that leaves is what the next `storage plan` reports, never something
+to infer from how far the run got.
 
-Nothing else can stop one. A convergence an instance runs to start cannot be
-interrupted at all, and one reached over the API survives the connection
-dropping, because losing a connection is not a decision about the storage every
-instance depends on (AV-13).
+Nothing else can stop one, and the case to know is `--deployment`. That command
+is at a terminal too, but the convergence is running on the deployment rather
+than in front of you, and Ctrl-C only hangs up on it: the run carries on under
+its budget and holds the bootstrap lock for as long as it needs. Read it as
+having stopped and the next step is the one that hurts: the lock is still held,
+so rolling pods leaves them unable to come up, and a second apply waits out its
+own budget behind the run you thought you ended. A convergence an instance runs
+to start cannot be interrupted at all. In both cases the reason is the same:
+losing a connection, or never having been the connection, is not a decision
+about the storage every instance depends on (AV-13).
 
 **A plan says when one is already running.** A convergence is invisible in a
 diff: a statement it is working on is absent from the live catalog until it
