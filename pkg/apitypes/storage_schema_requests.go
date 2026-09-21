@@ -110,14 +110,17 @@ const DefaultStorageApplyTimeout = time.Hour
 // and does not come up.
 //
 // It sits at the default rather than above it, so a request can lower the
-// budget but not raise it, and the reason is that a convergence cannot yet be
-// stopped. The context is built from Background so that a caller hanging up
-// cannot abandon a table copy half-done, which means the only thing that ends a
-// running convergence early is the budget itself. At five minutes that was
-// nobody's problem; a mistake self-healed before it was worth reacting to. An
-// hour of held lock is already the outer edge of what an operator should be
-// unable to take back, and it is the trade that buys work a boot cannot finish.
-// Raising this belongs with the ability to stop a convergence, not before it.
+// budget but not raise it, and the reason is who can end the run this bounds.
+// An operator watching a convergence in their own terminal can stop it, but
+// this is the ceiling on a budget that arrives in a request, and a convergence
+// answering one runs with its caller's cancellation stripped: a dropped
+// connection must not abandon a table copy half-done, so nothing the caller
+// does afterwards ends it. For that run the budget is still the only thing
+// that does. At five minutes that was nobody's problem; a mistake self-healed
+// before it was worth reacting to. An hour of held lock is already the outer
+// edge of what a caller should be unable to take back, and it is the trade
+// that buys work a boot cannot finish. Raising this belongs with a way to stop
+// a convergence the caller is not sitting in front of, not before it.
 //
 // A request naming more is refused rather than silently clamped, so a command
 // never reports a budget it did not get.
@@ -177,7 +180,7 @@ func ResolveStorageApplyTimeout(timeoutSeconds int64, unnamed time.Duration) (ti
 	case timeoutSeconds < 0:
 		return 0, fmt.Errorf("a convergence budget must be positive, or zero to name none and run under %s", unnamed)
 	case timeoutSeconds > maxSeconds:
-		return 0, fmt.Errorf("a convergence budget of %s exceeds the maximum of %s; a convergence holds the storage bootstrap lock for its whole budget and cannot yet be stopped, so pods booting in that window will not come up",
+		return 0, fmt.Errorf("a convergence budget of %s exceeds the maximum of %s; a convergence holds the storage bootstrap lock for its whole budget, so pods booting in that window will not come up",
 			describeBudgetSeconds(timeoutSeconds), MaxStorageApplyTimeout)
 	}
 	return time.Duration(timeoutSeconds) * time.Second, nil

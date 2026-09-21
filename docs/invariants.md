@@ -427,7 +427,10 @@ answering a remote convergence strips cancellation from the request's context be
 (`pkg/serve/storage_schema.go`); behaviorally by
 `TestApplyStorageSchemaMySQL_StopsWhenItsCallerStops` and
 `TestApplyStorageSchemaPostgres_StopsWhenItsCallerStops`, which stop a queued convergence and
-require it to return having changed nothing rather than wait out its budget.
+require it to return having changed nothing rather than wait out its budget, and in the other
+direction by `TestStorageSchemaAdapter_ADroppedConnectionDoesNotStopTheConvergence`, which hands the
+adapter an already-cancelled request context and requires the failure that comes back to be
+something other than that cancellation.
 
 ## Merge gate (MG)
 
