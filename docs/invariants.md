@@ -1322,7 +1322,11 @@ planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; f
 privilege and size gates in `pkg/engine/postgres/postgres.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
-the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`); the
+the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying
+that admitting deployment's verdict at creation (`pkg/tern/local_client.go`,
+`pkg/tern/local_plan_drift.go`), and fresh and resumed
+drives refusing blocked rows before engine hand-off, a resumed drive first tightening each row to
+its own re-plan's verdict (`pkg/tern/local_apply.go`, `pkg/tern/local_control_resume.go`); the
 direct-execution size bound ([direct-execution.md](direct-execution.md)).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored

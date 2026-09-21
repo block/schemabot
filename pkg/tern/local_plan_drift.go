@@ -217,12 +217,15 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 // re-derives a task's statement.
 //
 // The verdict becomes this target's, so the admission gate judges the plan as
-// this target would run it. The dispatch never carries a verdict today (task
-// rows have no field for one), but if a future dispatch arrives already
-// blocked that refusal is kept: a verdict is only ever tightened here, never
-// relaxed, and a change kept blocked keeps the reviewed text it will never
-// run. Every materialized change has a re-planned counterpart because the
-// drift comparison already required the two multisets to match key for key.
+// this target would run it. A dispatch carries no verdict by design: it is
+// built from task rows, and the task-to-wire conversion leaves the
+// execution-mode fields out because they travel one way, out of the engine
+// that judged them (see tablechange_convert.go). Should a dispatch
+// nevertheless arrive already blocked, that refusal is kept: a verdict is only
+// ever tightened here, never relaxed, and a change kept blocked keeps the
+// reviewed text it will never run. Every materialized change has a re-planned
+// counterpart because the drift comparison already required the two multisets
+// to match key for key.
 func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.NamespacePlanData, replanned replannedChanges) error {
 	parser, err := c.statementParser()
 	if err != nil {

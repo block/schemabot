@@ -191,6 +191,13 @@ A deployment that did not plan locally re-plans the dispatched changes against
 its own live schema and judges admission on its own engine's verdict, so a
 statement another deployment's target could run is still refused where this
 one cannot run it.
+That admitting deployment's verdict travels on each task row. A fresh drive
+refuses a blocked row before handing work to the engine; a resumed drive first
+re-plans, tightens each row to a blocked verdict the re-plan now reaches, and
+then refuses the same way. The one drive that reattaches without that check is
+recovery of an apply parked at its cutover barrier: the copy is complete and the
+engine already holds the cutover signal, so refusing there would strand the
+shadow table rather than prevent a statement from running.
 
 ## Iconography reference
 

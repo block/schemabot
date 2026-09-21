@@ -1,7 +1,9 @@
 package tern
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,6 +15,59 @@ import (
 )
 
 const localBlockedReason = "requires privileges unavailable to the engine"
+
+func TestBuildDispatchTasksCopiesAsymmetricVerdicts(t *testing.T) {
+	plan := &storage.Plan{ID: 7, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	scope := dispatchScope{ddlChanges: []storage.TableChange{
+		{Namespace: "testdb", Table: "orders", DDL: "ALTER TABLE orders ADD COLUMN note text", Operation: "alter", ExecutionMode: "blocked", ModeReason: localBlockedReason},
+		{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE users ADD COLUMN note text", Operation: "alter", ExecutionMode: "direct"},
+	}}
+
+	tasks := buildDispatchTasks(plan, scope, "production", storage.EngineSpirit, []byte("{}"), time.Now())
+	require.Len(t, tasks, 2)
+	assert.Equal(t, "blocked", tasks[0].ExecutionMode)
+	assert.Equal(t, localBlockedReason, tasks[0].ModeReason)
+	assert.Equal(t, "direct", tasks[1].ExecutionMode)
+	assert.Empty(t, tasks[1].ModeReason)
+}
+
+// A shard-scoped dispatch is built from task rows, so its changes arrive with
+// no execution verdict. The rows it creates must still carry the admitting
+// deployment's verdict, which lives on the stored plan — per shard where the
+// plan judged shards separately — so a drive that later loads those rows
+// judges the same verdict the plan gate did.
+func TestBlockedTaskError(t *testing.T) {
+	require.NoError(t, blockedTaskError(nil))
+	require.NoError(t, blockedTaskError([]*storage.Task{{ExecutionMode: "direct"}}))
+
+	tasks := []*storage.Task{
+		{TaskIdentifier: "task-direct", TableName: "users", ExecutionMode: "direct"},
+		{TaskIdentifier: "task-orders", TableName: "orders", ExecutionMode: "BLOCKED", ModeReason: localBlockedReason},
+		{TaskIdentifier: "task-later", TableName: "payments", ExecutionMode: "blocked", ModeReason: "later reason"},
+	}
+	require.EqualError(t, blockedTaskError(tasks), `stored task task-orders contains a blocked change for table "orders": `+localBlockedReason)
+
+	require.EqualError(t, blockedTaskError([]*storage.Task{{TaskIdentifier: "task-fallback", TableName: "orders", ExecutionMode: "blocked"}}),
+		`stored task task-fallback contains a blocked change for table "orders": the engine refuses this statement`)
+
+	// Independent causes render one per line, exactly as the whole-plan
+	// refusal renders them, so an operator sees every cause on the first
+	// attempt rather than the raw encoded separator.
+	multiCause := engine.JoinBlockedCauses([]string{"requires privileges unavailable to the engine", "table size could not be measured"})
+	tasks = []*storage.Task{{TaskIdentifier: "task-multi", TableName: "orders", ExecutionMode: "blocked", ModeReason: multiCause}}
+	taskErr := blockedTaskError(tasks)
+	require.EqualError(t, taskErr,
+		"stored task task-multi contains a blocked change for table \"orders\":\n- requires privileges unavailable to the engine\n- table size could not be measured")
+	assert.NotContains(t, taskErr.Error(), "‖")
+	planErr := (&storage.Plan{PlanIdentifier: "plan-multi", Namespaces: map[string]*storage.NamespacePlanData{
+		"testdb": {Tables: []storage.TableChange{{Table: "orders", ExecutionMode: "blocked", ModeReason: multiCause}}},
+	}}).BlockedApplyError()
+	require.Error(t, planErr)
+	assert.Equal(t,
+		strings.TrimPrefix(planErr.Error(), `stored plan plan-multi contains a blocked change for table "orders"`),
+		strings.TrimPrefix(taskErr.Error(), `stored task task-multi contains a blocked change for table "orders"`),
+		"row and plan refusals render the same causes the same way")
+}
 
 // alterUsersEmailDispatch is the dispatch a non-primary deployment receives for
 // the reviewed ALTER: built from task rows, so it carries no execution-mode

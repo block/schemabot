@@ -535,6 +535,33 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey][]string {
 	return out
 }
 
+// replanStatementKey identifies one re-planned statement on one
+// (namespace, shard, table): the unit a re-plan's execution verdict is about.
+type replanStatementKey struct {
+	shardTableKey
+	ddl string
+}
+
+// replanBlockedStatements indexes the statements a re-plan refuses, by
+// statement, to the reason it refuses them. The verdict belongs to the target
+// that will run the statement, and a resume re-plan is the freshest verdict
+// that target has given: a table that fit the direct-execution bound when the
+// row was admitted can have grown past it, a grant can have been revoked. A
+// statement the same re-plan lists more than once is refused if any listing
+// refuses it.
+func replanBlockedStatements(result *engine.PlanResult) map[replanStatementKey]string {
+	out := make(map[replanStatementKey]string)
+	for _, sc := range result.Changes {
+		for _, tc := range sc.TableChanges {
+			if !strings.EqualFold(tc.ExecutionMode, engine.ExecutionModeBlocked) {
+				continue
+			}
+			out[replanStatementKey{shardTableKey{namespace: sc.Namespace, shard: sc.ShardName(), table: tc.Table}, tc.DDL}] = tc.ModeReason
+		}
+	}
+	return out
+}
+
 // replanTargetSchema re-plans the reviewed schema set against the live target
 // and indexes the remaining changes by (namespace, shard, table), so callers
 // can look up whether each task's table still needs its change.
@@ -625,7 +652,9 @@ func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.
 
 // replanResult holds the result of replanAndFilterTasks.
 type replanResult struct {
-	// ActiveTasks are tasks that still need changes (DDLs updated from re-plan).
+	// ActiveTasks are tasks that still need changes. Each carries the DDL the
+	// re-plan would now run and, where the re-plan refuses that statement,
+	// the blocked verdict it reached.
 	ActiveTasks []*storage.Task
 	// CompletedCount is the number of tasks marked completed (no longer in diff).
 	CompletedCount int64
@@ -646,6 +675,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 	// task is reconciled against its own namespace and shard rather than conflated
 	// with same-named tables in other keyspaces or on other shards.
 	replanDDL := replanShardTableDDL(replanOut)
+	blockedStatements := replanBlockedStatements(replanOut)
 
 	// Partition tasks: already-done vs still-needed
 	now := time.Now()
@@ -723,6 +753,18 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 				continue
 			}
 			task.DDL = ddl
+			// The row keeps the verdict it was admitted with unless this
+			// re-plan refuses the statement now: a verdict is only ever
+			// tightened here, never relaxed, so the resumed drive's blocked-row
+			// gate judges what this target says today rather than a verdict
+			// frozen at admission.
+			key := replanStatementKey{shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}, ddl}
+			if reason, blocked := blockedStatements[key]; blocked && !task.EngineBlocked() {
+				c.logger.Warn("resume re-plan now refuses a task's statement; the resumed drive will refuse the row",
+					append(task.LogAttrs(), "mode_reason", reason)...)
+				task.ExecutionMode = engine.ExecutionModeBlocked
+				task.ModeReason = reason
+			}
 			activeTasks = append(activeTasks, task)
 		}
 	}
@@ -2093,6 +2135,29 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	grouped := c.usesGroupedApply(apply, options)
+	// Task rows carry the admitting deployment's verdict, tightened to the
+	// re-plan's where this target refuses the statement now, allowing a
+	// resumed drive to fail closed without trusting whichever plan it loaded.
+	// The apply is terminal from here, so the start request that admitted this
+	// claim is settled and the observer posts the summary now; nothing later
+	// re-claims a failed apply to do either.
+	if err := blockedTaskError(activeTasks); err != nil {
+		c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
+		// A multi-operation drive owns only its operation; the operator's
+		// projection settles the parent, resolves pending control requests,
+		// and posts the terminal summary. failApplyWithTasks already logged
+		// the suppressed settle.
+		if suppressParent {
+			return nil
+		}
+		if startRequested {
+			if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
+				return failErr
+			}
+		}
+		c.notifyTerminalObserver(apply, tasks)
+		return nil
+	}
 	// A revert-phase task is settled only by reattaching to the engine that
 	// holds its revert window or is unwinding it, and only the grouped drive
 	// reattaches. Revert-phase states come only from an engine whose database

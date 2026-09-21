@@ -2538,6 +2538,8 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			Shard:          scope.shard,
 			DDL:            ddlChange.DDL,
 			DDLAction:      ddlChange.Operation,
+			ExecutionMode:  ddlChange.ExecutionMode,
+			ModeReason:     ddlChange.ModeReason,
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -2824,8 +2826,10 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	// A blocked step is refused before the conflict check and before any apply
 	// or task row exists: no opt-in makes a statement the engine refuses
-	// executable, and task rows do not carry the verdict, so admission is the
-	// last place the whole plan can be judged.
+	// executable, and admission is the only place the whole plan is judged at
+	// once. Each task row then carries the admitting deployment's verdict for
+	// its own statement, so a drive that later claims the apply refuses a
+	// blocked row without trusting whichever plan it loaded.
 	if err := plan.BlockedApplyError(); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,

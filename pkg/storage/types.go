@@ -1458,7 +1458,12 @@ type Task struct {
 	Throttled bool
 	// ThrottleReason names the signal pausing the work, for display (e.g.
 	// "replica-lag 5s >= 2s"). Empty when Throttled is false.
-	ThrottleReason  string
+	ThrottleReason string
+	// ExecutionMode is the admitting deployment's execution verdict, copied
+	// from the plan change that deployment judged when this task was created.
+	ExecutionMode string
+	// ModeReason is the admitting deployment's reason for ExecutionMode.
+	ModeReason      string
 	CutoverAttempts int // Number of cutover attempts for this shard
 
 	// Execution flags
@@ -1470,6 +1475,12 @@ type Task struct {
 	UpdatedAt   time.Time
 	StartedAt   *time.Time
 	CompletedAt *time.Time
+}
+
+// EngineBlocked reports whether the admitting deployment marked this task's
+// statement blocked by the engine.
+func (t Task) EngineBlocked() bool {
+	return strings.EqualFold(t.ExecutionMode, "blocked")
 }
 
 // TaskFilter specifies criteria for listing tasks.
