@@ -25,10 +25,8 @@ const undoAcquireUnlockTimeout = 5 * time.Second
 
 // Postgres implements Locker with PostgreSQL session-level advisory locks
 // (pg_advisory_lock / pg_advisory_unlock). Like MySQL's GET_LOCK, the lock is
-// bound to the connection's session and is server-wide (advisory lock keys are
-// shared across every database of the instance), so callers must pass the same
-// *sql.Conn to Acquire and Release and keep it open for as long as the lock is
-// held.
+// bound to the connection's session, so callers must pass the same *sql.Conn
+// to Acquire and Release and keep it open for as long as the lock is held.
 //
 // That binding is a property of the connection, not of this type: it holds
 // against a PostgreSQL server, and against a pooler that gives a client its
@@ -133,8 +131,11 @@ func (Postgres) Release(ctx context.Context, conn *sql.Conn, name string) (bool,
 // restrict to the current backend: the holder is expected to be some other
 // instance entirely.
 //
-// The lock is session-level and cluster-wide, and the read is scoped to this
-// database, matching where every SchemaBot advisory lock is taken.
+// The read is scoped to the current database, matching the scope the lock
+// itself has. Dropping that filter would report a convergence of an unrelated
+// database on the same cluster as a convergence of this one, and the caller
+// that renders the answer suppresses its "may be another database" caveat on
+// this dialect precisely because the lock cannot mean that here.
 func (Postgres) HeldByAnySession(ctx context.Context, conn *sql.Conn, name string) (bool, error) {
 	classID, objID := advisoryLockCatalogKey(advisoryLockKey(name))
 	const query = `SELECT EXISTS (
