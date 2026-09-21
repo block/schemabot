@@ -150,7 +150,7 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTable(t *testing.T) {
 	require.Error(t, err, "Plan() must refuse a table that is both withheld and declared")
 	assert.Contains(t, err.Error(), flywayTable)
 	assert.Contains(t, err.Error(), "ignore_tables")
-	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
 }
 
 // Whether a declaration and a differently-cased entry name one table is the
@@ -177,9 +177,9 @@ func TestEngine_Plan_IgnoreTablesRefusesDeclaredTableWhateverTheCase(t *testing.
 		IgnoreTables: []string{flywayTable},
 	})
 	require.Error(t, err, "Plan() must refuse a declaration that differs from the entry only by case")
-	assert.Contains(t, err.Error(), `"flyway_schema_history" (declared as "Flyway_Schema_History")`,
+	assert.Contains(t, err.Error(), `"flyway_schema_history" (the file spells it "Flyway_Schema_History")`,
 		"the error names both spellings so an operator can find the entry they wrote")
-	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
 }
 
 // The planner excludes a table whose name follows the archive convention on
