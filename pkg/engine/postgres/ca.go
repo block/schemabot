@@ -33,9 +33,12 @@ const (
 
 // caCertPath resolves the credentials' CA reference to the bundle path
 // pg-sprite's pool trusts. An absent reference and the embedded RDS bundle
-// both resolve to no path: pg-sprite auto-verifies RDS/Aurora endpoints with
-// its embedded bundle when no path is set, and non-RDS targets keep whatever
-// trust their DSN asked for. A reference the engine cannot honor is refused —
+// both resolve to no path: the pool then keeps the trust the normalized DSN
+// asks for. pg-sprite honors any sslmode the DSN spells out and only supplies
+// its own RDS verify-full default when the DSN names none, so the sslmode
+// SchemaBot injects for RDS targets is what the pool dials with; a verifying
+// sslmode with no sslrootcert is completed with the embedded RDS bundle on
+// both connection paths. A reference the engine cannot honor is refused —
 // an unrecognized CA must never silently downgrade to a different trust root.
 // A file reference must be absolute: a relative path would resolve against
 // the server's working directory and could name an unintended file. A file
@@ -100,10 +103,10 @@ func spritePoolConfig(dsn, caPath string) (dbconn.Config, error) {
 // validationRootCAs builds the postgresconn options that pin the validation
 // connection to the bundle a file: reference names — the same path handed to
 // the pg-sprite pool, so the two connection paths cannot verify against
-// different roots. With no bundle path there is nothing to pin: the
-// validation connection keeps the trust its DSN and the connection layer
-// provide, and the pg-sprite pool applies its own RDS auto-trust. A bundle
-// that cannot be read or parsed is refused here, before any dial.
+// different roots. With no bundle path there is nothing to pin: both the
+// validation connection and the pg-sprite pool keep the trust the normalized
+// DSN and the connection layer provide. A bundle that cannot be read or
+// parsed is refused here, before any dial.
 func validationRootCAs(caPath string) ([]postgresconn.Option, error) {
 	if caPath == "" {
 		return nil, nil

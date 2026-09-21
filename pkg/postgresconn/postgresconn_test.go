@@ -1,6 +1,7 @@
 package postgresconn
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/url"
 	"os"
@@ -223,6 +225,157 @@ func TestWithRootCAsClearsFallbacks(t *testing.T) {
 // prefer encrypt without verifying, and disable negotiates no TLS — except
 // that require with an explicit sslrootcert is upgraded by pgx to verify-ca
 // semantics, matching libpq.
+const nonVerifyingRDSWarning = "PostgreSQL RDS connection does not authenticate the server; the configured sslmode is honored for compatibility"
+
+// captureWarnings routes the default logger into a buffer for the test and
+// clears the per-process warning set so the test observes the first warning
+// for its endpoints regardless of test order or -count.
+func captureWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	warnedNonVerifyingRDS.Clear()
+	t.Cleanup(func() {
+		slog.SetDefault(originalLogger)
+		warnedNonVerifyingRDS.Clear()
+	})
+	return &logs
+}
+
+// openWithoutDialing runs a DSN through Open, which resolves the config and
+// builds the pool without dialing, and closes the pool it returns.
+func openWithoutDialing(t *testing.T, dsn string, opts ...Option) {
+	t.Helper()
+	db, err := Open(dsn, opts...)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+}
+
+// A dial against an RDS endpoint that does not authenticate the server is
+// announced once, naming the endpoint, what the transport does prove, and
+// whether the posture came from the DSN or from SchemaBot's own default for
+// an RDS host with no sslmode. Postures that verify the server, and non-RDS
+// hosts in any posture, are dialed silently.
+func TestOpenWarnsWhenRDSConnectionDoesNotVerify(t *testing.T) {
+	caPath := writeSelfSignedCA(t)
+	tests := []struct {
+		name     string
+		dsn      string
+		wantWarn bool
+		wantAttr []string
+	}{
+		{
+			name:     "injected default sslmode=require encrypts without verifying",
+			dsn:      "postgres://schemabot:secret@default.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app",
+			wantWarn: true,
+			wantAttr: []string{
+				`host=default.cluster-abc123.us-west-2.rds.amazonaws.com:5432`,
+				`tls="encrypted, unverified"`,
+				`sslmode_source="schemabot default sslmode=require"`,
+			},
+		},
+		{
+			name:     "explicit sslmode=require is the DSN's posture",
+			dsn:      "postgres://schemabot:secret@explicit.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=require",
+			wantWarn: true,
+			wantAttr: []string{`tls="encrypted, unverified"`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "explicit sslmode=disable negotiates no TLS",
+			dsn:      "postgres://schemabot:secret@plain.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=disable",
+			wantWarn: true,
+			wantAttr: []string{`tls=none`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "keyword DSN is judged the same way",
+			dsn:      "host=Keyword.cluster-abc123.us-west-2.rds.amazonaws.com port=5433 user=schemabot password=secret dbname=app",
+			wantWarn: true,
+			wantAttr: []string{`host=keyword.cluster-abc123.us-west-2.rds.amazonaws.com:5433`},
+		},
+		{
+			name: "verify-full authenticates against the embedded roots",
+			dsn:  "postgres://schemabot:secret@full.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=verify-full",
+		},
+		{
+			name: "require with an sslrootcert authenticates through the verifier",
+			dsn:  "postgres://schemabot:secret@rootcert.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=require&sslrootcert=" + url.QueryEscape(caPath),
+		},
+		{
+			name: "a non-RDS host is not SchemaBot's to judge",
+			dsn:  "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=require",
+		},
+		{
+			name: "a GovCloud endpoint is outside the RDS bundle and not recognized",
+			dsn:  "postgres://schemabot:secret@gov.cluster-abc123.us-gov-west-1.rds.amazonaws.com:5432/app",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+			openWithoutDialing(t, tt.dsn)
+			if !tt.wantWarn {
+				assert.NotContains(t, logs.String(), nonVerifyingRDSWarning)
+				return
+			}
+			assert.Contains(t, logs.String(), nonVerifyingRDSWarning)
+			for _, attr := range tt.wantAttr {
+				assert.Contains(t, logs.String(), attr)
+			}
+			openWithoutDialing(t, tt.dsn)
+			assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "the same endpoint and posture warns once")
+		})
+	}
+}
+
+// The warning is keyed on the endpoint and the posture, not the DSN: rotated
+// credentials and another database on the same endpoint share one warning,
+// while a weaker posture on the same endpoint and the same posture on another
+// endpoint each warn on their own. The reloadable storage pool resolves its
+// DSN through the same path, so a reload of the same endpoint is silent and a
+// fresh endpoint is announced.
+func TestNonVerifyingRDSTLSWarningDedupesPerEndpointAndPosture(t *testing.T) {
+	logs := captureWarnings(t)
+	const host = "shared.cluster-abc123.us-west-2.rds.amazonaws.com:5432"
+
+	for _, dsn := range []string{
+		"postgres://schemabot:secret@" + host + "/app",
+		"postgres://schemabot:rotated@" + host + "/app",
+		"postgres://schemabot:secret@" + host + "/other?sslmode=require",
+	} {
+		openWithoutDialing(t, dsn, WithConnectTimeout(5*time.Second))
+	}
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "one endpoint and posture warns once across DSNs")
+
+	openWithoutDialing(t, "postgres://schemabot:secret@"+host+"/app?sslmode=disable")
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a weaker posture on the same endpoint warns again")
+	assert.Contains(t, logs.String(), "tls=none")
+
+	original := getConnector
+	t.Cleanup(func() { getConnector = original })
+	getConnector = func(pgx.ConnConfig) driver.Connector { return nil }
+	_, err := resolveConnector("postgres://schemabot:secret@" + host + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a credential reload of a warned endpoint is silent")
+
+	const other = "other.cluster-abc123.us-west-2.rds.amazonaws.com:5432"
+	_, err = resolveConnector("postgres://schemabot:secret@" + other + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a second endpoint in the same posture warns on its own")
+	assert.Contains(t, logs.String(), "host="+other)
+}
+
+// Judging a DSN is not dialing it: a caller that asks whether the transport
+// verifies, in order to refuse when it does not, must not also be told the
+// connection is weak.
+func TestVerifiesServerCertificateDoesNotWarn(t *testing.T) {
+	logs := captureWarnings(t)
+	verifies, err := VerifiesServerCertificate("postgres://schemabot:secret@judged.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app")
+	require.NoError(t, err)
+	assert.False(t, verifies)
+	assert.Empty(t, logs.String())
+}
+
 func TestVerifiesServerCertificate(t *testing.T) {
 	base := "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode="
 	tests := []struct {
