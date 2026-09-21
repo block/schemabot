@@ -614,7 +614,10 @@ clears it does not.
 
 The review-time rollup also shows each deployment's blocked change count. This
 is informational beside drift: blocked verdicts do not make matching change
-sets diverge, while apply admission still refuses them on that deployment.
+sets diverge, while apply admission still refuses them on that deployment. The
+count is read from the same representation drift compares, so a sharded
+namespace counts once per shard, and a deployment whose plan could not be
+computed or compared shows no count rather than one read from an unusable plan.
 
 It reads state and never writes: recreating a missing Check Run is
 `checks backfill` below, and clearing a `reconciliation_owed` row means

@@ -129,7 +129,7 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 	// nsShardChanges: namespace has a shard row carrying table changes, so the
 	// shard rows are the authoritative representation for it.
 	nsInShards := map[string]bool{}
-	nsShardChanges := map[string]bool{}
+	nsShardChanges := namespacesCarriedByShards(cs.Shards)
 	for _, sp := range cs.Shards {
 		if sp == nil {
 			return nil, nil, fmt.Errorf("nil shard plan")
@@ -139,9 +139,6 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			return nil, nil, fmt.Errorf("shard plan for namespace %q has an empty shard name", sp.Namespace)
 		}
 		nsInShards[sp.Namespace] = true
-		if len(sp.Changes) > 0 {
-			nsShardChanges[sp.Namespace] = true
-		}
 		for _, tc := range sp.Changes {
 			key, err := driftKeyForTableChange(parser, sp.Namespace, shard, tc)
 			if err != nil {
@@ -193,6 +190,45 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 		}
 	}
 	return ms, vschema, nil
+}
+
+// namespacesCarriedByShards reports the namespaces with at least one shard row
+// carrying table changes. For those namespaces the shard rows are the
+// authoritative representation and the namespace-collapsed Changes view is a
+// lossy duplicate of them, so any walk over a change set that must count each
+// change once skips the collapsed view for exactly this set.
+func namespacesCarriedByShards(shards []*ternv1.ShardPlan) map[string]bool {
+	carried := map[string]bool{}
+	for _, sp := range shards {
+		if sp != nil && len(sp.Changes) > 0 {
+			carried[sp.Namespace] = true
+		}
+	}
+	return carried
+}
+
+// AuthoritativeTableChanges returns every table change in the change set once,
+// read from its authoritative representation: the shard rows for a namespace
+// they carry, the collapsed Changes view for every other namespace. This is
+// the same representation rule the drift comparison counts by, so a total
+// derived from this walk agrees with the change count drift reports. Nil rows
+// are skipped; malformed shapes are the comparison's concern and fail there.
+func (cs ChangeSet) AuthoritativeTableChanges() []*ternv1.TableChange {
+	carried := namespacesCarriedByShards(cs.Shards)
+	var out []*ternv1.TableChange
+	for _, sp := range cs.Shards {
+		if sp == nil {
+			continue
+		}
+		out = append(out, sp.Changes...)
+	}
+	for _, sc := range cs.Changes {
+		if sc == nil || carried[sc.Namespace] {
+			continue
+		}
+		out = append(out, sc.TableChanges...)
+	}
+	return out
 }
 
 // driftKeyForTableChange builds the multiset key for a proto table change,

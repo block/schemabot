@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/engine"
-	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
@@ -125,7 +124,6 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			DatabaseType: d.DatabaseType,
 			Deployment:   d.Deployment,
 			Target:       d.Target,
-			Blocked:      countBlockedChanges(d.Changes, d.Shards),
 		}
 		switch {
 		case d.Err != nil:
@@ -178,32 +176,28 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 				entry.Class = DeploymentMatch
 			}
 		}
+		// A blocked count is only as trustworthy as the plan it is read from. An
+		// errored entry's plan is the one the rollup just declared unusable, so
+		// it publishes no count rather than a precise-looking number a reviewer
+		// would read as a real refusal total.
+		if entry.Class != DeploymentErrored {
+			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
+		}
 		entries[i] = entry
 	}
 
 	return PlanRollup{Entries: entries, Clean: clean}, nil
 }
 
-func countBlockedChanges(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan) int {
+// countBlockedChanges counts the table changes the target's engine will refuse
+// at apply. It walks the change set's authoritative representation so a
+// sharded namespace, which the plan carries both collapsed and per shard, is
+// counted once per shard the same way the drift comparison counts it.
+func countBlockedChanges(cs tern.ChangeSet) int {
 	blocked := 0
-	for _, change := range changes {
-		if change == nil {
-			continue
-		}
-		for _, table := range change.TableChanges {
-			if table.GetExecutionMode() == engine.ExecutionModeBlocked {
-				blocked++
-			}
-		}
-	}
-	for _, shard := range shards {
-		if shard == nil {
-			continue
-		}
-		for _, table := range shard.Changes {
-			if table.GetExecutionMode() == engine.ExecutionModeBlocked {
-				blocked++
-			}
+	for _, table := range cs.AuthoritativeTableChanges() {
+		if table.GetExecutionMode() == engine.ExecutionModeBlocked {
+			blocked++
 		}
 	}
 	return blocked

@@ -1318,6 +1318,55 @@ schemabot apply -e production
 
 ✅ **Same plan on all 3 deployments** (eu, au, us).
 
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="deployment-drift-clean-blocked"></a><strong>Deployment Drift (Clean, Blocked)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **Same plan on all 3 deployments** (eu, au, us).
+
 - `eu` (primary) ✅ matches the reviewed plan
 - `au` ✅ matches the reviewed plan · blocked: 1
 - `us` ✅ matches the reviewed plan

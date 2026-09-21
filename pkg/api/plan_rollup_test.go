@@ -10,6 +10,8 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 func rollupAlterUsers(ddl string) *ternv1.SchemaChange {
@@ -110,23 +112,67 @@ func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
 		assert.Equal(t, 2, rollup.Entries[1].Blocked)
 	})
 
-	t.Run("per shard", func(t *testing.T) {
-		shards := func(mode string) []*ternv1.ShardPlan {
-			return []*ternv1.ShardPlan{{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{
-				TableName: "users", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp", ExecutionMode: mode,
-			}}}, {Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{{
-				TableName: "users", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp", ExecutionMode: mode,
-			}}}}
+	// A sharded namespace is carried twice by the plan: once collapsed on
+	// Changes and once per shard on Shards. The count must agree with the number
+	// of changes the drift comparison sees in the same set, so the expectation
+	// is derived from CompareChangeSets rather than fixed by hand.
+	t.Run("sharded namespace counted once per shard", func(t *testing.T) {
+		table := func(mode string) *ternv1.TableChange {
+			return &ternv1.TableChange{
+				TableName: "users", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				Namespace: "testapp", ExecutionMode: mode,
+			}
 		}
-		diffs := []DeploymentPlanDiff{rollupDeployment("eu"), rollupDeployment("au")}
-		diffs[0].Shards = shards("")
-		diffs[1].Shards = shards(engine.ExecutionModeBlocked)
+		sharded := func(mode string) DeploymentPlanDiff {
+			d := rollupDeployment("", &ternv1.SchemaChange{Namespace: "testapp", TableChanges: []*ternv1.TableChange{table(mode)}})
+			d.Shards = []*ternv1.ShardPlan{
+				{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{table(mode)}},
+				{Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{table(mode)}},
+			}
+			return d
+		}
+		diffs := []DeploymentPlanDiff{sharded(""), sharded(engine.ExecutionModeBlocked)}
+		diffs[0].Deployment, diffs[0].Target = "eu", "eu"
+		diffs[1].Deployment, diffs[1].Target = "au", "au"
+
+		drift, err := tern.CompareChangeSets(schema.DialectForDatabaseType("vitess"),
+			tern.ChangeSet{Changes: diffs[1].Changes, Shards: diffs[1].Shards}, tern.ChangeSet{})
+		require.NoError(t, err)
+		require.Len(t, drift.MissingFromCandidate, 2, "drift counts one change per shard")
 
 		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 		require.NoError(t, err)
 		assert.True(t, rollup.Clean)
 		assert.Equal(t, 0, rollup.Entries[0].Blocked)
-		assert.Equal(t, 2, rollup.Entries[1].Blocked)
+		assert.Equal(t, len(drift.MissingFromCandidate), rollup.Entries[1].Blocked)
+	})
+
+	// An errored deployment's plan is the one the rollup declared unusable, so
+	// no count is published from it.
+	t.Run("errored deployment publishes no count", func(t *testing.T) {
+		errored := rollupDeployment("au", change(true))
+		errored.Err = fmt.Errorf("deployment unreachable")
+		diffs := []DeploymentPlanDiff{rollupDeployment("eu", change(false)), errored}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		require.NoError(t, err)
+		assert.False(t, rollup.Clean)
+		assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+		assert.Equal(t, 0, rollup.Entries[1].Blocked)
+	})
+
+	// A diverged deployment's own plan was computed, so its refusal count is
+	// still reported beside the divergence.
+	t.Run("diverged deployment keeps its count", func(t *testing.T) {
+		diverged := rollupDeployment("au", change(true))
+		diverged.Changes[0].TableChanges[0].Ddl = "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)"
+		diffs := []DeploymentPlanDiff{rollupDeployment("eu", change(false)), diverged}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		require.NoError(t, err)
+		assert.False(t, rollup.Clean)
+		assert.Equal(t, DeploymentDiverged, rollup.Entries[1].Class)
+		assert.Equal(t, 1, rollup.Entries[1].Blocked)
 	})
 
 	t.Run("primary blocked", func(t *testing.T) {

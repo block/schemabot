@@ -95,6 +95,32 @@ func TestRenderPlanComment_DriftNotCleanListsDeployments(t *testing.T) {
 	assert.Contains(t, out, "diff failed; see server logs")
 }
 
+// A deployment that both diverged and will refuse changes shows both facts, with
+// the refusal count before the drift detail so the sanitized detail stays the
+// trailing clause. The same ordering holds on the could-not-verify line.
+func TestRenderPlanComment_DriftNotCleanShowsBlockedCounts(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    false,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "diverged", Blocked: 2, Detail: "1 unexpected change(s) vs the reviewed plan"},
+				{Deployment: "us", Class: "errored", Blocked: 3, Detail: "diff failed; see server logs"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "`au` ⚠️ diverged · blocked: 2 — 1 unexpected change(s) vs the reviewed plan\n")
+	assert.Contains(t, out, "`us` ❌ could not verify · blocked: 3 — diff failed; see server logs\n")
+}
+
 // Drift on a non-primary deployment must surface even when the reviewed primary
 // plan is a clean no-op: the change is a no-op only on the primary, so hiding
 // the drift behind the no-changes short-circuit would let a diverged deployment
