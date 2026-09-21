@@ -12,6 +12,7 @@ import (
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/block/schemabot/pkg/postgresconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -160,57 +161,118 @@ var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true}
 // plans, so its shape — renderable or not — is not the baseline's concern.
 var rollbackBaseline = baselinePolicy{skipArchiveTables: true}
 
+// baselineIntrospectionConcurrency caps how many tables a baseline render
+// introspects at once. Each introspection is one read-only transaction of
+// catalog queries against the target, so the render's wall time otherwise
+// grows with the namespace one round trip at a time; a small cap recovers
+// most of that without turning a large namespace into a burst of catalog
+// load the target did not size for.
+const baselineIntrospectionConcurrency = 8
+
+// baselineIntrospectionLimit bounds the render's concurrency by the pool as
+// well as the cap: an introspection holds one pooled connection for its whole
+// transaction, so more goroutines than connections would only queue on
+// acquire.
+func baselineIntrospectionLimit(pool *pgxpool.Pool) int {
+	return max(1, min(baselineIntrospectionConcurrency, int(pool.Config().MaxConns)))
+}
+
+// renderedTable is one table's outcome from a baseline render: its canonical
+// content, or the reason the baseline cannot carry it. The render records the
+// latter and carries on, so a namespace's full list of refused tables reaches
+// the caller in one pass.
+type renderedTable struct {
+	content   string
+	renderErr error
+}
+
 // renderPostgresTables uses pg-sprite's managed-table enumeration and
-// canonical renderer for every PostgreSQL baseline SchemaBot captures.
+// canonical renderer for every PostgreSQL baseline SchemaBot captures. Tables
+// are introspected concurrently, bounded by baselineIntrospectionLimit, and
+// the result is assembled in listing order so the rendered set and the
+// refusals read the same regardless of which introspection finished first.
+//
+// A per-table refusal — objects the format cannot carry, a shape the
+// renderer refuses — is recorded against that table and the render carries
+// on. A failure to read the catalog at all, and a cancelled or expired
+// context, are the caller's outcome rather than one table's: either ends the
+// whole render with an error instead of being recorded as a per-table
+// failure and carried on past.
 func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
 	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
 	}
-	rendered := make(map[string]string, len(tables))
-	var renderErrors []error
-	for _, table := range tables {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
+	results := make([]*renderedTable, len(tables))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(baselineIntrospectionLimit(pool))
+	for i, table := range tables {
 		if policy.skipArchiveTables && spirittable.IsArchiveTable(table) {
 			slog.Debug("PostgreSQL archive table is outside management and left out of the rendered baseline",
 				"namespace", namespace,
 				"table", table)
 			continue
 		}
-		if policy.refuseUnmodeledObjects {
-			objects, err := pullUnmodeledTableObjects(ctx, pool, namespace, table)
+		g.Go(func() error {
+			result, err := renderPostgresTable(gctx, pool, namespace, table, policy)
 			if err != nil {
-				return nil, nil, err
+				return err
 			}
-			if err := unmodeledTableObjectsError(namespace, table, objects); err != nil {
-				renderErrors = append(renderErrors, err)
-				continue
-			}
+			results[i] = result
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
+	}
+	rendered := make(map[string]string, len(tables))
+	var renderErrors []error
+	for i, table := range tables {
+		result := results[i]
+		switch {
+		case result == nil:
+			// An archive table the policy left out.
+		case result.renderErr != nil:
+			renderErrors = append(renderErrors, result.renderErr)
+		default:
+			rendered[table] = result.content
 		}
-		// A cancelled or expired context is the caller's outcome, not one
-		// table's: it ends the whole capture instead of being recorded as a
-		// per-table render failure and carried on past.
-		model, err := schemadiff.Introspect(ctx, pool, namespace, table)
-		if err != nil {
-			if isContextError(err) {
-				return nil, nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
-			}
-			renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: introspect: %w", namespace, table, err))
-			continue
-		}
-		content, err := schemadiff.Render(model)
-		if err != nil {
-			if isContextError(err) {
-				return nil, nil, fmt.Errorf("render schema %q table %q: %w", namespace, table, err)
-			}
-			renderErrors = append(renderErrors, fmt.Errorf("schema %q table %q: render: %w", namespace, table, err))
-			continue
-		}
-		rendered[table] = content
 	}
 	return rendered, renderErrors, nil
+}
+
+// renderPostgresTable renders one table for a baseline. A refusal the
+// baseline must report per table comes back in the result; an error that
+// ends the whole render — a catalog read failure or a cancelled or expired
+// context — comes back as the error.
+func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, table string, policy baselinePolicy) (*renderedTable, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if policy.refuseUnmodeledObjects {
+		objects, err := pullUnmodeledTableObjects(ctx, pool, namespace, table)
+		if err != nil {
+			return nil, err
+		}
+		if err := unmodeledTableObjectsError(namespace, table, objects); err != nil {
+			return &renderedTable{renderErr: err}, nil
+		}
+	}
+	model, err := schemadiff.Introspect(ctx, pool, namespace, table)
+	if err != nil {
+		if isContextError(err) {
+			return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
+		}
+		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: introspect: %w", namespace, table, err)}, nil
+	}
+	content, err := schemadiff.Render(model)
+	if err != nil {
+		if isContextError(err) {
+			return nil, fmt.Errorf("render schema %q table %q: %w", namespace, table, err)
+		}
+		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: render: %w", namespace, table, err)}, nil
+	}
+	return &renderedTable{content: content}, nil
 }
 
 // pullNamespaces discovers every non-reserved schema by default. Callers use

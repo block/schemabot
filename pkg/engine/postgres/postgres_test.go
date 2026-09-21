@@ -1493,6 +1493,34 @@ func TestJoinForeignKeysFailsClosedOnSkew(t *testing.T) {
 	}
 }
 
+// A baseline render never runs more introspections than the pool can hold
+// connections for, and never more than the cap, whichever is smaller.
+func TestBaselineIntrospectionLimitIsBoundedByPoolAndCap(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxConns int32
+		want     int
+	}{
+		{name: "pool smaller than cap", maxConns: 2, want: 2},
+		{name: "pool equal to cap", maxConns: baselineIntrospectionConcurrency, want: baselineIntrospectionConcurrency},
+		{name: "pool larger than cap", maxConns: baselineIntrospectionConcurrency * 4, want: baselineIntrospectionConcurrency},
+		{name: "single-connection pool", maxConns: 1, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := pgxpool.ParseConfig("postgres://baseline@localhost:1/limit_test")
+			require.NoError(t, err)
+			cfg.MaxConns = tt.maxConns
+			cfg.MinConns = 0
+			pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+			require.NoError(t, err)
+			defer pool.Close()
+
+			assert.Equal(t, tt.want, baselineIntrospectionLimit(pool))
+		})
+	}
+}
+
 func TestPullNamespacesRejectsReservedSchema(t *testing.T) {
 	_, err := pullNamespaces(t.Context(), nil, "pg_catalog")
 	require.Error(t, err)
