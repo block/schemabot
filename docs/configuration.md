@@ -18,6 +18,7 @@
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
+- [Target TLS Posture](#target-tls-posture)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -185,31 +186,6 @@ The PostgreSQL shape differs from MySQL in three ways:
   When omitted, an RDS endpoint defaults to the embedded bundle and a non-RDS
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
-
-### TLS posture: MySQL and PostgreSQL
-
-MySQL and PostgreSQL differ in what SchemaBot injects for an RDS endpoint and
-in how an explicit weak setting is surfaced. Both apply only to endpoints in
-the commercial AWS partition (`*.rds.amazonaws.com`, any letter case); GovCloud
-and China endpoints are not recognized as RDS, because the embedded root
-bundle does not cover them, so their DSNs must spell out TLS explicitly.
-
-A MySQL RDS DSN without a `tls=` parameter defaults to verified TLS against
-the embedded RDS root bundle. For compatibility with existing configurations,
-an explicit `tls=false`, `tls=skip-verify`, or `tls=preferred` is honored as
-written; SchemaBot logs a warning naming the host and mode, once per endpoint
-and mode for the life of the process, because these modes do not verify the
-server certificate. The warning is evaluated on the final connection settings,
-so a mode weakened by the embedding program's connection options is reported
-the same way as one carried by the DSN.
-
-A PostgreSQL RDS DSN without an explicit `sslmode` gets `sslmode=require`
-injected, which encrypts the connection but does not by itself authenticate
-the server. An explicit `sslmode`, including `disable`, is honored as written
-and does not log a warning. Certificate verification (`sslmode=verify-full` or
-`verify-ca`) is required only where a trust setting depends on it: a pinned
-CA bundle under a non-verifying `sslmode` is refused at CA resolution, as
-described above, rather than silently never consulted.
 
 ## gRPC Mode
 
@@ -913,6 +889,39 @@ session pooler or directly at the database.
 Schema changes are unaffected. They run under limits pg-sprite sets on the
 target database. The bootstrap raises the limit for its own schema DDL, where
 an index build legitimately outruns a query.
+
+## Target TLS Posture
+
+This section is about a target DSN configured directly — `dsn` in a database
+entry, or the resolved value of a raw secret — not about a target assembled by
+`dsn_from`, whose transport settings are fixed by its own allowlist (see
+[PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets)). For a direct
+DSN, MySQL and PostgreSQL differ in what SchemaBot injects for an RDS endpoint
+and in how an explicit weak setting is surfaced. Both apply only to endpoints
+in the commercial AWS partition (`*.rds.amazonaws.com`, any letter case);
+GovCloud and China endpoints are not recognized as RDS, because the embedded
+root bundle does not cover them, so their DSNs must spell out TLS explicitly.
+
+A MySQL RDS DSN without a `tls=` parameter defaults to verified TLS against
+the embedded RDS root bundle. For compatibility with existing configurations,
+a `tls=` value that does not authenticate the server — `false`, `skip-verify`,
+`preferred`, or a config registered with the Go MySQL driver that skips
+certificate verification without installing its own — is honored as written;
+SchemaBot logs a warning naming the host and mode, once per endpoint and mode
+for the life of the process. The judgement is made on the TLS settings the
+driver resolves for the final DSN, so a mode weakened by the embedding
+program's connection options is reported the same way as one carried by the
+DSN, and a registered config is judged by what it verifies rather than by its
+name.
+
+A PostgreSQL RDS DSN without an explicit `sslmode` gets `sslmode=require`
+injected, which encrypts the connection but does not by itself authenticate
+the server. An explicit `sslmode`, including `disable`, is honored as written
+and does not log a warning. Certificate verification (`sslmode=verify-full` or
+`verify-ca`) is required only where a trust setting depends on it: a pinned
+CA bundle under a non-verifying `sslmode` is refused at CA resolution, as
+described under [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets),
+rather than silently never consulted.
 
 ## PlanetScale mTLS
 

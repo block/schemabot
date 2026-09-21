@@ -2,8 +2,11 @@ package mysqlconn
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -116,6 +119,68 @@ func TestNonVerifyingRDSTLSWarningDedupesPerEndpointAndMode(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a different mode on the same endpoint warns again")
 	assert.Contains(t, logs.String(), "tls_mode=skip-verify")
+
+	const other = "other.cluster-abc123.us-west-2.rds.amazonaws.com:3306"
+	_, err = ConnectionDSN("schemabot:secret@tcp(" + other + ")/app?tls=false")
+	require.NoError(t, err)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a second endpoint in the same mode warns on its own")
+	assert.Contains(t, logs.String(), "host="+other)
+}
+
+// A tls= value that names a config registered with the Go MySQL driver is
+// judged by what that config verifies, not by its name: encryption without
+// server authentication warns like skip-verify does, while a config that
+// authenticates the server — through the default verification or through its
+// own peer verifier — does not, whatever it is called.
+func TestConnectionDSNJudgesRegisteredTLSConfigsByWhatTheyVerify(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      *tls.Config
+		wantWarning bool
+	}{
+		{
+			name:        "encrypts without authenticating the server",
+			config:      &tls.Config{InsecureSkipVerify: true},
+			wantWarning: true,
+		},
+		{
+			name:        "authenticates the server with the default verification",
+			config:      &tls.Config{RootCAs: x509.NewCertPool()},
+			wantWarning: false,
+		},
+		{
+			name: "authenticates the chain through its own peer verifier",
+			config: &tls.Config{
+				InsecureSkipVerify:    true,
+				VerifyPeerCertificate: func([][]byte, [][]*x509.Certificate) error { return nil },
+			},
+			wantWarning: false,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+			configName := fmt.Sprintf("registered-%d", i)
+			require.NoError(t, mysql.RegisterTLSConfig(configName, tt.config))
+			t.Cleanup(func() { mysql.DeregisterTLSConfig(configName) })
+
+			host := fmt.Sprintf("registered%d.cluster-abc123.us-west-2.rds.amazonaws.com:3306", i)
+			got, err := ConnectionDSN("schemabot:secret@tcp(" + host + ")/app?tls=" + configName)
+			require.NoError(t, err)
+			cfg, err := mysql.ParseDSN(got)
+			require.NoError(t, err)
+			assert.Equal(t, configName, cfg.TLSConfig, "the registered name must be preserved")
+
+			if !tt.wantWarning {
+				assert.Empty(t, logs.String())
+				return
+			}
+			assert.Contains(t, logs.String(), nonVerifyingRDSWarning)
+			assert.Contains(t, logs.String(), "host="+host)
+			assert.Contains(t, logs.String(), "tls_mode="+configName)
+		})
+	}
 }
 
 func TestConnectionDSN(t *testing.T) {

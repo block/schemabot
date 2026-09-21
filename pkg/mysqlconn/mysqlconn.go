@@ -1,6 +1,7 @@
 package mysqlconn
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -175,34 +176,45 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	return requiredSettingsDSN(enhanced, opts...)
 }
 
-// warnNonVerifyingRDSTLS logs once per RDS endpoint and TLS mode when the
-// config that is about to be dialed does not verify the server certificate.
-// It is evaluated on the final config, after options have been applied, so a
-// mode weakened by an option is reported the same way as one carried by the
-// DSN. The mode is honored: an operator who spelled out tls=false against an
-// RDS host asked for it, and refusing would turn a compatibility setting into
-// an outage, so the warning is the whole intervention.
-func warnNonVerifyingRDSTLS(cfg *mysql.Config) {
-	if !dbconn.IsRDSHost(cfg.Addr) || !isNonVerifyingTLSMode(cfg.TLSConfig) {
-		return
+// warnNonVerifyingRDSTLS logs once per RDS endpoint and TLS mode when the DSN
+// about to be dialed does not authenticate the server certificate. The
+// judgement is made on the TLS config the Go MySQL driver resolves from that
+// DSN, not on the spelling of its tls= value: the driver's inline modes, a
+// name registered with mysql.RegisterTLSConfig, and the trust store it injects
+// for an RDS host with no tls= at all are all judged by what they verify. A
+// config that skips the default verification but installs its own peer
+// verifier authenticates the server and does not warn. The mode is honored:
+// an operator who spelled out tls=false against an RDS host asked for it, and
+// refusing would turn a compatibility setting into an outage, so the warning
+// is the whole intervention.
+func warnNonVerifyingRDSTLS(dsn string) error {
+	resolved, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("resolve TLS config of the DSN to dial: %w", err)
 	}
-	key := nonVerifyingRDSKey{addr: cfg.Addr, mode: cfg.TLSConfig}
+	if !dbconn.IsRDSHost(resolved.Addr) || verifiesServerCertificate(resolved.TLS) {
+		return nil
+	}
+	key := nonVerifyingRDSKey{addr: resolved.Addr, mode: resolved.TLSConfig}
 	if _, loaded := warnedNonVerifyingRDS.LoadOrStore(key, struct{}{}); loaded {
-		return
+		return nil
 	}
 	slog.Warn("MySQL RDS connection uses a non-verifying TLS mode; the configured mode is honored for compatibility",
-		"host", cfg.Addr,
-		"tls_mode", cfg.TLSConfig,
+		"host", resolved.Addr,
+		"tls_mode", resolved.TLSConfig,
 	)
+	return nil
 }
 
-func isNonVerifyingTLSMode(mode string) bool {
-	switch mode {
-	case "false", "skip-verify", "preferred":
-		return true
-	default:
+// verifiesServerCertificate reports whether a resolved TLS config
+// authenticates the server: either through the default chain and hostname
+// verification, or through a custom peer verifier installed in its place. A
+// nil config is a plaintext connection.
+func verifiesServerCertificate(tc *tls.Config) bool {
+	if tc == nil {
 		return false
 	}
+	return !tc.InsecureSkipVerify || tc.VerifyPeerCertificate != nil
 }
 
 // requiredSettingsDSN applies any caller-supplied options, then default
@@ -217,7 +229,6 @@ func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) (string, error) {
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	warnNonVerifyingRDSTLS(cfg)
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultConnectTimeout
 	}
@@ -245,7 +256,11 @@ func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) (string, error) {
 	// values and refuses to interpolate under charsets where escaping is
 	// unsafe.
 	cfg.InterpolateParams = true
-	return cfg.FormatDSN(), nil
+	dsn := cfg.FormatDSN()
+	if err := warnNonVerifyingRDSTLS(dsn); err != nil {
+		return "", err
+	}
+	return dsn, nil
 }
 
 func tlsModeForHost(addr string) (string, bool) {
