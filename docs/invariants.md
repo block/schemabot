@@ -1276,8 +1276,8 @@ statement, and every statement it still lists is the reviewed DDL of another tas
 apply operation on that table that is neither terminal nor in a revert phase — one that will
 still run it forward. A statement the re-plan still lists that only a terminal or revert-phase
 sibling was reviewed with refuses the resume instead, since nothing will run it forward.
-*Enforced:* `verifyMaterializedPlanMatchesLiveSchema` on the apply path
-(`pkg/tern/local_plan_drift.go`, called from `pkg/tern/local_client.go`);
+*Enforced:* `verifyMaterializedPlanMatchesLiveSchema` and `stampReplannedChanges` on the apply
+path (`pkg/tern/local_plan_drift.go`, called from `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
 path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
