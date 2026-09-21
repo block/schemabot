@@ -25,7 +25,14 @@ package enginetest
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -293,4 +300,64 @@ func requirePermanent(t *testing.T, operation string, err error) {
 		"a %s of a change the backend has no record of must be permanent — retrying can never make the change appear, got: %v", operation, err)
 	assert.False(t, engine.IsAlreadyCompleted(err),
 		"a %s of a nonexistent change must not read as already-completed — nothing landed, got: %v", operation, err)
+}
+
+// OptionalCapabilities names every exported optional interface package engine
+// declares, read from its source so the inventory cannot drift from the
+// package. An engine's capability test walks this set against its own verdict
+// table, so a capability added to package engine fails that test until the
+// engine records whether it implements it.
+func OptionalCapabilities(t *testing.T) map[string]bool {
+	t.Helper()
+	interfaces := exportedInterfaces(t, enginePackageDir(t))
+	delete(interfaces, "Engine")
+	return interfaces
+}
+
+// enginePackageDir resolves package engine's source directory from this
+// file's location, so the scan does not depend on the working directory of
+// the test that runs it.
+func enginePackageDir(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	require.True(t, ok, "resolve the enginetest source location")
+	return filepath.Dir(filepath.Dir(file))
+}
+
+// exportedInterfaces detects exported interface declarations written as named
+// type definitions. Interface type aliases are outside its syntactic scope.
+func exportedInterfaces(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	interfaces := make(map[string]bool)
+	for _, file := range parsePackageFiles(t, dir, "engine", false) {
+		ast.Inspect(file, func(node ast.Node) bool {
+			spec, ok := node.(*ast.TypeSpec)
+			if ok && spec.Name.IsExported() {
+				if _, ok := spec.Type.(*ast.InterfaceType); ok {
+					interfaces[spec.Name.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	return interfaces
+}
+
+func parsePackageFiles(t *testing.T, dir, packageName string, includeTests bool) []*ast.File {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	files := make([]*ast.File, 0, len(entries))
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || (!includeTests && strings.HasSuffix(entry.Name(), "_test.go")) {
+			continue
+		}
+		file, err := parser.ParseFile(fileSet, filepath.Join(dir, entry.Name()), nil, 0)
+		require.NoError(t, err)
+		if file.Name.Name == packageName {
+			files = append(files, file)
+		}
+	}
+	return files
 }

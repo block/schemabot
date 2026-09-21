@@ -1354,9 +1354,11 @@ as its first verb and rides past that gate. *Enforced:* dialect resolution at th
 
 ### RV-7: Rollback needs the originals
 
-Rollback requires the original schema files captured at apply time. If artifact capture failed,
-rollback is refused rather than reconstructed. *Enforced:* rollback preconditions on stored
-artifacts (`pkg/storage/internal/sqlstore/plans.go`).
+Rollback requires the original schema files captured at plan time. If artifact capture failed,
+rollback is refused rather than reconstructed. *Enforced:* the stored plan's capture precondition
+(`Plan.HasOriginalFilesCapture` in `pkg/storage/types.go`), checked when the rollback source is
+resolved (`pkg/api/control_handlers.go`) and again per namespace when the rollback's schema files
+are assembled (`pkg/api/plan_handlers.go`).
 
 ### RV-8: The plan sees the whole schema, or nothing
 
