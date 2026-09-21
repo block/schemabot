@@ -213,6 +213,8 @@ type DeploymentDriftEntry struct {
 	Primary    bool
 	// Class is "match", "diverged", or "errored".
 	Class string
+	// Blocked is the number of changes this deployment will refuse at apply.
+	Blocked int
 	// Detail is a short human explanation for a diverged or errored deployment;
 	// empty for a match.
 	Detail string
@@ -1098,9 +1100,10 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
-// line when every deployment matches the reviewed plan, or a per-deployment
-// breakdown naming which deployments diverged or could not be verified. It is a
-// no-op for a nil rollup (single-target database or drift not evaluated).
+// line when every deployment matches the reviewed plan and none will refuse a
+// change, or a per-deployment breakdown naming which deployments diverged,
+// could not be verified, or carry changes blocked at apply. It is a no-op for a
+// nil rollup (single-target database or drift not evaluated).
 func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	if drift == nil {
 		return
@@ -1114,10 +1117,12 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	if drift.Clean {
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
 			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
-		return
+		if !anyDeploymentBlocked(drift.Deployments) {
+			return
+		}
+	} else {
+		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
 	}
-
-	sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
 	for _, d := range drift.Deployments {
 		name := "`" + d.Deployment + "`"
 		if d.Primary {
@@ -1125,14 +1130,32 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		}
 		switch d.Class {
 		case "match":
-			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan\n", name)
+			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan%s\n", name, blockedSuffix(d.Blocked))
 		case "diverged":
-			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s\n", name, driftDetailSuffix(d.Detail))
+			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s%s\n", name, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
 		default:
-			fmt.Fprintf(sb, "- %s "+glyph.Failed+" could not verify%s\n", name, driftDetailSuffix(d.Detail))
+			fmt.Fprintf(sb, "- %s "+glyph.Failed+" could not verify%s%s\n", name, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
 		}
 	}
 	sb.WriteString("\n")
+}
+
+func anyDeploymentBlocked(deployments []DeploymentDriftEntry) bool {
+	for _, d := range deployments {
+		if d.Blocked > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// blockedSuffix renders a deployment's blocked change count as a trailing
+// clause, or an empty string when the deployment refuses nothing.
+func blockedSuffix(blocked int) string {
+	if blocked == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" · blocked: %d", blocked)
 }
 
 // driftDetailSuffix renders a deployment's drift detail as a trailing clause, or

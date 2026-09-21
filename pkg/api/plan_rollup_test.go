@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 )
@@ -74,6 +75,72 @@ func TestRollupDeploymentDiffs_AllMatchIsClean(t *testing.T) {
 	for _, e := range rollup.Entries {
 		assert.Equal(t, DeploymentMatch, e.Class, "deployment %q", e.Deployment)
 	}
+}
+
+func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
+	const statement = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	change := func(blocked bool) *ternv1.SchemaChange {
+		result := rollupAlterUsers(statement)
+		if blocked {
+			result.TableChanges[0].ExecutionMode = engine.ExecutionModeBlocked
+		}
+		return result
+	}
+
+	t.Run("secondary blocked", func(t *testing.T) {
+		secondary := change(true)
+		secondary.TableChanges = append(secondary.TableChanges, &ternv1.TableChange{
+			TableName:     "users",
+			Ddl:           statement,
+			ChangeType:    ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			Namespace:     "testapp",
+			ExecutionMode: engine.ExecutionModeBlocked,
+		})
+		primary := change(false)
+		primary.TableChanges = append(primary.TableChanges, rollupAlterUsers(statement).TableChanges[0])
+		diffs := []DeploymentPlanDiff{
+			rollupDeployment("eu", primary),
+			rollupDeployment("au", secondary),
+		}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		require.NoError(t, err)
+		assert.True(t, rollup.Clean)
+		assert.Equal(t, 0, rollup.Entries[0].Blocked)
+		assert.Equal(t, 2, rollup.Entries[1].Blocked)
+	})
+
+	t.Run("per shard", func(t *testing.T) {
+		shards := func(mode string) []*ternv1.ShardPlan {
+			return []*ternv1.ShardPlan{{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{
+				TableName: "users", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp", ExecutionMode: mode,
+			}}}, {Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{{
+				TableName: "users", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp", ExecutionMode: mode,
+			}}}}
+		}
+		diffs := []DeploymentPlanDiff{rollupDeployment("eu"), rollupDeployment("au")}
+		diffs[0].Shards = shards("")
+		diffs[1].Shards = shards(engine.ExecutionModeBlocked)
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		require.NoError(t, err)
+		assert.True(t, rollup.Clean)
+		assert.Equal(t, 0, rollup.Entries[0].Blocked)
+		assert.Equal(t, 2, rollup.Entries[1].Blocked)
+	})
+
+	t.Run("primary blocked", func(t *testing.T) {
+		diffs := []DeploymentPlanDiff{
+			rollupDeployment("eu", change(true)),
+			rollupDeployment("au", change(false)),
+		}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		require.NoError(t, err)
+		assert.True(t, rollup.Clean)
+		assert.Equal(t, 1, rollup.Entries[0].Blocked)
+		assert.Equal(t, 0, rollup.Entries[1].Blocked)
+	})
 }
 
 // A deployment that would plan different DDL than was reviewed is diverged, and

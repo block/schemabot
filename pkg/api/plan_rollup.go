@@ -3,6 +3,8 @@ package api
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
@@ -46,8 +48,11 @@ type DeploymentRollupEntry struct {
 	Target       string
 
 	Class DeploymentClassification
-	Diff  tern.ChangeSetDiff
-	Err   error
+	// Blocked is informational beside drift classification. It does not affect
+	// Clean: apply admission separately refuses changes blocked by the target.
+	Blocked int
+	Diff    tern.ChangeSetDiff
+	Err     error
 }
 
 // PlanRollup aggregates every deployment's review-time classification for a
@@ -120,6 +125,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			DatabaseType: d.DatabaseType,
 			Deployment:   d.Deployment,
 			Target:       d.Target,
+			Blocked:      countBlockedChanges(d.Changes, d.Shards),
 		}
 		switch {
 		case d.Err != nil:
@@ -176,4 +182,29 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 	}
 
 	return PlanRollup{Entries: entries, Clean: clean}, nil
+}
+
+func countBlockedChanges(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan) int {
+	blocked := 0
+	for _, change := range changes {
+		if change == nil {
+			continue
+		}
+		for _, table := range change.TableChanges {
+			if table.GetExecutionMode() == engine.ExecutionModeBlocked {
+				blocked++
+			}
+		}
+	}
+	for _, shard := range shards {
+		if shard == nil {
+			continue
+		}
+		for _, table := range shard.Changes {
+			if table.GetExecutionMode() == engine.ExecutionModeBlocked {
+				blocked++
+			}
+		}
+	}
+	return blocked
 }

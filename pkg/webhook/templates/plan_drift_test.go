@@ -31,6 +31,36 @@ func TestRenderPlanComment_DriftCleanShowsUniformLine(t *testing.T) {
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "Same plan on all 3 deployments")
 	assert.Contains(t, out, "eu, au, us")
+	assert.NotContains(t, out, "matches the reviewed plan")
+}
+
+// A clean rollup where one deployment will refuse a change at apply still
+// confirms the plan is uniform, then names each deployment with its blocked
+// count so a reviewer knows which deployment admission will refuse.
+func TestRenderPlanComment_DriftCleanNamesBlockedDeployments(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match", Blocked: 1},
+				{Deployment: "us", Class: "match"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "Same plan on all 3 deployments")
+	assert.Contains(t, out, "`eu` (primary) ✅ matches the reviewed plan\n")
+	assert.Contains(t, out, "`au` ✅ matches the reviewed plan · blocked: 1\n")
+	assert.Contains(t, out, "`us` ✅ matches the reviewed plan\n")
+	assert.NotContains(t, out, "`eu` (primary) ✅ matches the reviewed plan · blocked:")
 }
 
 // A diverged deployment is named with a compact change summary, and an errored

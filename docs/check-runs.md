@@ -612,6 +612,10 @@ deployments match, so it reads as a guard rather than as a reconciliation.
 Calling it a reconciliation would tell an operator that the one action that
 clears it does not.
 
+The review-time rollup also shows each deployment's blocked change count. This
+is informational beside drift: blocked verdicts do not make matching change
+sets diverge, while apply admission still refuses them on that deployment.
+
 It reads state and never writes: recreating a missing Check Run is
 `checks backfill` below, and clearing a `reconciliation_owed` row means
 reconciling the target environment, not running a command.

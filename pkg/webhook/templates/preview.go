@@ -516,7 +516,7 @@ func PreviewCommentPlanDriftClean() string {
 			Clean:    true,
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "eu", Primary: true, Class: "match"},
-				{Deployment: "au", Class: "match"},
+				{Deployment: "au", Class: "match", Blocked: 1},
 				{Deployment: "us", Class: "match"},
 			},
 		},

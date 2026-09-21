@@ -1318,6 +1318,10 @@ schemabot apply -e production
 
 ✅ **Same plan on all 3 deployments** (eu, au, us).
 
+- `eu` (primary) ✅ matches the reviewed plan
+- `au` ✅ matches the reviewed plan · blocked: 1
+- `us` ✅ matches the reviewed plan
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
