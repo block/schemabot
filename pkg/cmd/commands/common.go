@@ -142,6 +142,26 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 	return confirmActionOn(os.Stdout, prompt, cancelMsg)
 }
 
+// writeToTerminal runs fn with the human-facing renderers writing to stderr
+// instead of stdout, when the command was asked for machine-readable output.
+// With divert false it just runs fn, so a caller can wrap unconditionally.
+//
+// A command under --json owes stdout to the program reading it, and still owes
+// a person at the terminal everything they are being asked to approve. Those
+// are two audiences, not a choice between them: the plan goes to one and the
+// response to the other. The renderers print through fmt.Print, which resolves
+// os.Stdout per call, so pointing it at stderr for the duration is what moves
+// them; nothing writes the response until after it is restored.
+func writeToTerminal(divert bool, fn func() error) error {
+	if !divert {
+		return fn()
+	}
+	restore := os.Stdout
+	os.Stdout = os.Stderr
+	defer func() { os.Stdout = restore }()
+	return fn()
+}
+
 // confirmActionOn is confirmAction with the prompt written somewhere other than
 // stdout. A command asked for machine-readable output owes stdout to the
 // program reading it, and still has to ask a person before it converges, so the

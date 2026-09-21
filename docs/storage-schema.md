@@ -505,13 +505,19 @@ otherwise converge it is the one that cannot start until it is.
 It is confirmed at a terminal, and `--auto-approve` is refused with it. Naming a
 release substitutes files the answering binary never carried, so until that
 release is deployed the fleet boots against storage holding more than it
-declares, and the confirmation's notice says what that costs: every one of those
-boots refuses the removals and logs them, so the pre-applied state survives and
-the fleet warns about it until the deploy. A release from before indexes were
-protected is the exception ([What is never
-automatic](#what-is-never-automatic)). Converge close to the deploy, re-run
-`storage plan` just before it, and leave unattended runs to a job with no
-selector, which converges the answering binary's own schema.
+declares, and the confirmation's notice says what that costs for this
+deployment. On MySQL every one of those boots refuses the removals and logs
+them, so the pre-applied state survives and the fleet warns about it until the
+deploy; a release from before indexes were protected is the exception ([What is
+never automatic](#what-is-never-automatic)). On PostgreSQL the boots never
+compute a removal at all, so the state survives unremarked. A deployment that
+has set
+[`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes)
+is the case to watch: its boots converge destructively, so what you pre-apply is
+dropped by the next pod to start, and this belongs in the deploy rather than
+ahead of it. Converge close to the deploy, re-run `storage plan` just before it,
+and leave unattended runs to a job with no selector, which converges the
+answering binary's own schema.
 
 The convergence gets no more permission than a boot: a statement that would drop
 a storage table or column is refused as it is at startup, and a PostgreSQL

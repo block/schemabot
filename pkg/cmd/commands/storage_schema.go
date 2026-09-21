@@ -372,12 +372,14 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	}
 	// With --auto-approve the convergence's own planned report says what ran,
 	// so the plan is printed after the fact instead — unless the gate stops the
-	// run, which prints it itself. A --json run gets no human plan at all: the
-	// response carries the same report, and stdout belongs to the program
-	// reading it. Naming a schema forces the attended path, so this is the only
-	// thing keeping `storage apply --release … --json` parseable.
-	if !cmd.AutoApprove && !cmd.JSON {
-		if err := outputStorageSchemaPlan(report, true, cmd.rerunWithAllowUnsafe(), nil); err != nil {
+	// run, which prints it itself. Under --json it goes to the terminal rather
+	// than into the stream being parsed: the statements are what the person at
+	// the prompt is being asked to approve, so the one thing this must never do
+	// is skip them.
+	if !cmd.AutoApprove {
+		if err := writeToTerminal(cmd.JSON, func() error {
+			return outputStorageSchemaPlan(report, true, cmd.rerunWithAllowUnsafe(), nil)
+		}); err != nil {
 			return err
 		}
 	}
@@ -398,8 +400,6 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	}
 
 	if !cmd.AutoApprove {
-		// The prompt is a conversation with a person, so under --json it goes
-		// to the terminal rather than into the stream being parsed.
 		prompts := io.Writer(os.Stdout)
 		if cmd.JSON {
 			prompts = os.Stderr
@@ -413,6 +413,12 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 			return err
 		}
 		if !confirmed {
+			// A decline is an outcome a program has to be able to read, and it
+			// leaves the database exactly as the plan found it — the same shape
+			// a refusal answers with, for the same reason.
+			if cmd.JSON {
+				return encodeStorageSchemaConvergence(report, report)
+			}
 			return nil
 		}
 	}
@@ -624,33 +630,53 @@ func storageSchemaConfirmation(report *apitypes.StorageSchemaReport, namedSchema
 //
 // A boot of the deployed release diffs this schema against its own, so
 // everything converged here that the deployed release does not declare is a
-// removal its bootstrap has to decide about. It refuses all of them — a table,
-// a column, and an index alike — so the pre-applied state survives every pod
-// restart, and each of those boots logs a refused destructive change for it.
-// The steady state between this command and the deploy is therefore a fleet
-// that keeps warning about the work an operator did on purpose, which reads
-// like an incident to anyone who was not told to expect it.
-//
-// The protection lives in the binary that is booting, so a release from before
-// indexes were protected is the exception: its boots still converge a
-// pre-created index away, silently as far as the plan is concerned. The plan
-// shows what the storage needs, never what will undo it.
+// removal its bootstrap has to decide about. What it decides is the whole
+// content of this notice, and it is not one answer: it depends on whether the
+// deployment permits destructive storage changes, and on the dialect. The plan
+// carries both, and shows what the storage needs rather than what will undo
+// it, so neither is visible to an operator reading it.
 func crossReleaseStorageNotice(report *apitypes.StorageSchemaReport) string {
 	running := "the release answering this command"
 	if version := strings.TrimSpace(report.Version); version != "" {
 		running = version
 	}
-	return fmt.Sprintf(`Converging %s to %s.
+	return fmt.Sprintf("Converging %s to %s.\n\n%s\n\n", storageSchemaDatabaseLabel(report), report.SchemaSource,
+		crossReleaseConsequence(report, running))
+}
 
-  This is not the schema %s converges on boot. Until that release is deployed,
+// crossReleaseConsequence is what the deployed release does to the state this
+// convergence leaves behind, for the deployment and dialect the report
+// describes.
+func crossReleaseConsequence(report *apitypes.StorageSchemaReport, running string) string {
+	// A deployment that has permitted destructive storage changes converges
+	// them, so the surplus this leaves is dropped rather than refused. The
+	// convergence is still worth running as part of a deploy; what it is not is
+	// something to do in advance, which is the reason an operator reaches for
+	// it.
+	if report.DestructiveAllowed {
+		return fmt.Sprintf(`  This is not the schema %s converges on boot, and this deployment permits
+  destructive storage changes — so it will not leave what is applied here in
+  place. The next pod to boot %s drops the tables, columns and indexes its own
+  schema does not declare, which is every one of them until that release is
+  deployed. Converge as part of the deploy rather than ahead of it.`, running, running)
+	}
+	// PostgreSQL's bootstrap is additive-only: it walks what its own schema
+	// declares and never computes a removal, so surplus state is not refused so
+	// much as never considered. There is no refusal to log, and no release with
+	// a gap to warn about.
+	if schema.Dialect(report.Dialect) == schema.DialectPostgres {
+		return fmt.Sprintf(`  This is not the schema %s converges on boot. Until that release is deployed,
+  every pod that boots %s converges only what its own schema adds, so the
+  tables, columns and indexes applied here survive untouched — and the boot
+  says nothing about them, because it never considers removing them.`, running, running)
+	}
+	return fmt.Sprintf(`  This is not the schema %s converges on boot. Until that release is deployed,
   every pod that boots %s refuses to drop what it does not declare, so the
   tables, columns and indexes applied here survive — and every one of those
   boots logs a refused destructive change for them. A release from before
   indexes were protected is the exception: its boots converge a surplus index
   away. Re-run `+"`storage plan`"+` just before the deploy to confirm what you
-  applied is still there.
-
-`, storageSchemaDatabaseLabel(report), report.SchemaSource, running, running)
+  applied is still there.`, running, running)
 }
 
 // storageSchemaConvergenceOutcome is whether a convergence counts as having

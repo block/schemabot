@@ -727,10 +727,11 @@ func TestStorageApplyCmd_SendsTheNamedSchemaToConverge(t *testing.T) {
 
 // A named schema has to be confirmed at a terminal, so --json cannot be paired
 // with --auto-approve to get a clean stream. The two therefore have to coexist
-// on one run: the person is asked on stderr and the program reading stdout
-// gets the response and nothing else. Printing the human plan or the prompt to
-// stdout would make `storage apply --schema-dir … --json` unparseable, which
-// is the only machine-readable form a cross-release convergence has.
+// on one run, and the person and the program are separate audiences rather
+// than a choice: the statements being approved and the prompt go to the
+// terminal, and stdout carries the response and nothing else. Neither half may
+// be dropped to serve the other — an operator asked to type yes to DDL that
+// was printed nowhere is the worse failure of the two.
 func TestStorageApplyCmd_NamedSchemaKeepsJSONParseable(t *testing.T) {
 	dir := storageSchemaCheckoutDir(t)
 	report := &apitypes.StorageSchemaReport{
@@ -779,9 +780,57 @@ func TestStorageApplyCmd_NamedSchemaKeepsJSONParseable(t *testing.T) {
 	require.NotNil(t, decoded.Planned)
 	assert.Equal(t, "the schema files in "+dir, decoded.Planned.SchemaSource)
 
+	assert.Contains(t, stripANSI(stderr), "CREATE TABLE `applies`",
+		"the person answering the prompt has to be shown the statements they are approving")
 	assert.Contains(t, stderr, "This is not the schema v1.4.0 converges on boot",
 		"the operator is still told what converging another release's schema costs")
 	assert.Contains(t, stderr, "Only 'yes' will be accepted")
+}
+
+// Declining is an outcome, not an absence of one. Under --json a wrapper reads
+// stdout to find out what happened, and an empty stream is indistinguishable
+// from a crash that exited 0 — so a decline answers in the same shape a
+// refusal does, with both halves of the report equal because nothing ran.
+func TestStorageApplyCmd_DeclinedJSONConvergenceAnswersInJSON(t *testing.T) {
+	dir := storageSchemaCheckoutDir(t)
+	report := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:      "v1.4.0",
+		SchemaSource: "the schema files in " + dir,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "create_table", DDL: "CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"},
+		},
+	}
+
+	var routes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routes = append(routes, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaPlanResponse{Report: report}))
+	}))
+	t.Cleanup(server.Close)
+
+	answerPrompt(t, "no")
+	cmd := StorageApplyCmd{
+		storageSchemaSourceFlags: storageSchemaSourceFlags{SchemaDir: dir},
+		JSON:                     true,
+	}
+	var out string
+	captureStderr(t, func() {
+		out = captureStdout(func() {
+			require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: server.URL, Version: "v1.4.0"}))
+		})
+	})
+
+	assert.NotContains(t, routes, "/api/storage/schema/apply", "nothing converges after a decline")
+
+	var decoded apitypes.StorageSchemaApplyResponse
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded),
+		"a decline has to be readable on stdout, not an empty stream: %q", out)
+	require.NotNil(t, decoded.Planned)
+	require.NotNil(t, decoded.Remaining)
+	assert.Len(t, decoded.Remaining.Outstanding, 1,
+		"nothing ran, so everything the plan found is still outstanding")
 }
 
 // A convergence resolves its release as a convergence, not as a diff. The two
@@ -849,6 +898,43 @@ func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
 	}, true)
 	assert.Contains(t, unversioned, "the release answering this command")
 	assert.NotContains(t, unversioned, "schema  converges", "an empty version must not leave a gap in the sentence")
+}
+
+// What the deployed release does with the surplus this convergence leaves is
+// not one answer, and a notice that gives one is wrong for every deployment it
+// does not describe. A deployment permitting destructive storage changes drops
+// the pre-applied state instead of keeping it, which inverts the advice to
+// converge ahead of the deploy. PostgreSQL keeps it for a different reason —
+// its bootstrap never computes a removal — so it logs no refusal to grep for
+// and has no release with an index gap to warn about.
+func TestStorageSchemaConfirmation_CrossReleaseNoticePerDeployment(t *testing.T) {
+	report := func(dialect string, destructiveAllowed bool) *apitypes.StorageSchemaReport {
+		return &apitypes.StorageSchemaReport{
+			Dialect: dialect, Database: "schemabot", Host: "db-1.example",
+			Version:            "v1.4.0",
+			SchemaSource:       "the schema files of release v1.5.0 in block/schemabot",
+			DestructiveAllowed: destructiveAllowed,
+		}
+	}
+
+	permitted := storageSchemaConfirmation(report("mysql", true), true)
+	assert.Contains(t, permitted, "this deployment permits")
+	assert.Contains(t, permitted, "drops the tables, columns and indexes its own",
+		"a deployment that converges destructively undoes what was applied here")
+	assert.Contains(t, permitted, "Converge as part of the deploy rather than ahead of it.")
+	assert.NotContains(t, permitted, "refuses to drop what it does not declare",
+		"the refusal the notice normally relies on is exactly what this deployment has turned off")
+
+	// PostgreSQL permitting destructive changes reads the same way: the
+	// dialect decides how the surplus survives, not whether it does.
+	assert.Contains(t, storageSchemaConfirmation(report("postgres", true), true), "this deployment permits")
+
+	postgres := storageSchemaConfirmation(report("postgres", false), true)
+	assert.Contains(t, postgres, "converges only what its own schema adds")
+	assert.NotContains(t, postgres, "logs a refused destructive change",
+		"an additive-only bootstrap computes no removal, so there is no refusal to log or to grep for")
+	assert.NotContains(t, postgres, "indexes were protected",
+		"the index gap is a MySQL release history, and PostgreSQL has no such window")
 }
 
 // Destructive statements the target has permitted are not gated: the report
