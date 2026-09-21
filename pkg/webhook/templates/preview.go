@@ -523,6 +523,33 @@ func PreviewCommentPlanDriftClean() string {
 	})
 }
 
+// PreviewCommentPlanDriftCleanBlocked renders a plan comment whose review-time
+// drift rollup confirmed the reviewed plan on every deployment while one
+// deployment carries a change its target will refuse at apply: the uniform
+// clean line followed by a per-deployment breakdown naming that deployment.
+func PreviewCommentPlanDriftCleanBlocked() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match", Blocked: 1},
+				{Deployment: "us", Class: "match"},
+			},
+		},
+	})
+}
+
 // PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift
 // rollup found deployments that no longer match the reviewed plan: a
 // per-deployment breakdown naming the matching, diverged, and errored targets.
