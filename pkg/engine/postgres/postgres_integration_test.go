@@ -550,6 +550,95 @@ func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
 		"the render must overlap introspections for the cap to be exercised at all")
 }
 
+// tableDroppedAfterListing removes one table from the namespace the moment
+// the render's table listing has returned, so the listing names a table that
+// introspection can no longer find. Every other table's introspection is
+// then held at the query that resolves its relation until the render cancels
+// it: a render that keeps its remaining introspections running after a
+// sibling's hard failure never cancels them, so the hold outlives the
+// deadline and is reported as such rather than deadlocking the test.
+type tableDroppedAfterListing struct {
+	table    string
+	drop     func()
+	deadline context.Context
+	queries  atomic.Int32
+	begins   atomic.Int32
+	timedOut atomic.Bool
+}
+
+func (d *tableDroppedAfterListing) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		d.begins.Add(1)
+		return ctx
+	}
+	if !d.resolvesAnotherTable(data.Args) {
+		return ctx
+	}
+	select {
+	case <-ctx.Done():
+	case <-d.deadline.Done():
+		d.timedOut.Store(true)
+	}
+	return ctx
+}
+
+// resolvesAnotherTable recognizes the introspection query that looks a table
+// up by schema and name, for every table but the dropped one.
+func (d *tableDroppedAfterListing) resolvesAnotherTable(args []any) bool {
+	if len(args) != 2 {
+		return false
+	}
+	table, ok := args[1].(string)
+	return ok && table != d.table
+}
+
+func (d *tableDroppedAfterListing) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+	if d.queries.Add(1) == 1 {
+		d.drop()
+	}
+}
+
+// A table the listing named but introspection cannot find is a schema that
+// changed under the render, not a shape of that table: the render ends with
+// the introspection failure instead of recording it as one table's refusal
+// and assembling a baseline around it, and the failure cancels the
+// introspections still in flight rather than letting the render finish
+// reading a namespace it already knows it cannot report consistently.
+func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_dropped_test")
+	var ddl strings.Builder
+	ddl.WriteString("CREATE SCHEMA app; CREATE TABLE app.a_dropped (id bigint PRIMARY KEY);")
+	for i := range baselineIntrospectionConcurrency * 2 {
+		fmt.Fprintf(&ddl, "CREATE TABLE app.t%02d (id bigint PRIMARY KEY);", i)
+	}
+	_, err := db.ExecContext(t.Context(), ddl.String())
+	require.NoError(t, err)
+
+	deadline, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	dropped := &tableDroppedAfterListing{table: "a_dropped", deadline: deadline, drop: func() {
+		_, err := db.ExecContext(deadline, `DROP TABLE app.a_dropped`)
+		assert.NoError(t, err)
+	}}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = int32(baselineIntrospectionConcurrency * 2)
+	poolCfg.ConnConfig.Tracer = dropped
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", rollbackBaseline)
+	assert.False(t, dropped.timedOut.Load(),
+		"the sibling introspections must be cancelled by the failure; a render that lets them run holds them to the deadline")
+	require.ErrorIs(t, err, schemadiff.ErrTableNotFound)
+	assert.ErrorContains(t, err, `introspect schema "app" table "a_dropped"`)
+	assert.Nil(t, rendered)
+	assert.Nil(t, renderErrors)
+	assert.LessOrEqual(t, int(dropped.begins.Load()), baselineIntrospectionConcurrency,
+		"a sibling's hard failure must cancel the introspections still in flight and start no more; only the first wave may have begun")
+}
+
 // A baseline render introspects tables concurrently, and the baseline it
 // assembles does not depend on which introspection finished first: the
 // rendered set and the per-table refusals come back in table-listing order
