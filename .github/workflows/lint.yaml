@@ -108,9 +108,9 @@ jobs:
           restore-keys: go-${{ runner.os }}-
       - name: golangci-lint (${{ matrix.name }})
         if: needs.changes.outputs.code == 'true'
-        uses: golangci/golangci-lint-action@0a35821d5c230e903fcfe077583637dea1b27b47 # ratchet:golangci/golangci-lint-action@v9.0.0
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.11.4
+          version: v2.13.2
           args: ${{ matrix.args }}
           working-directory: ${{ matrix.dir || '.' }}
           # The action's built-in config-verify downloads the config JSON
@@ -124,9 +124,9 @@ jobs:
       # relying on the lint step above leaving it there as a side effect.
       - name: golangci-lint (install for config verify)
         if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
-        uses: golangci/golangci-lint-action@0a35821d5c230e903fcfe077583637dea1b27b47 # ratchet:golangci/golangci-lint-action@v9.0.0
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.11.4
+          version: v2.13.2
           install-only: true
       # Validate .golangci.yaml against the vendored schema so the check is
       # hermetic (no remote fetch). The vendored file must be refreshed when
