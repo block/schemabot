@@ -117,9 +117,6 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	if cmd.Output != OutputFormatJSON {
 		templates.WriteIgnoredNamespaces(ignoredNamespaces,
 			schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces))
-		// The operator about to reconcile the target is the one who most needs
-		// to know which live tables the plan was not shown.
-		templates.WriteExemptTables(planResult.ExemptTables)
 	}
 
 	// Validate engine-specific options
@@ -148,6 +145,13 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// Check if there are any changes (DDL or VSchema)
 	if !planResult.HasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")
+		// Apply returns here without rendering a plan body, so this is the one
+		// place an operator whose target has nothing to reconcile learns which
+		// live tables the plan was not shown. Every other path reaches the
+		// body, which discloses them on both of its own branches.
+		if cmd.Output != OutputFormatJSON {
+			templates.WriteExemptTables(planResult.ExemptTables)
+		}
 		return nil
 	}
 
