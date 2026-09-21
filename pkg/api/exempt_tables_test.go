@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -166,7 +167,8 @@ func TestExecutePlanRefusesADropOfAWithheldTable(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), "ignore_tables withholds")
-	assert.Contains(t, err.Error(), "honors ignore_tables", "the error names the remedy")
+	assert.Contains(t, err.Error(), "Upgrade that deployment to a build that supports ignore_tables",
+		"the error names the remedy")
 	assert.Nil(t, plans.created, "a plan that would drop a withheld table is not stored")
 }
 
@@ -230,6 +232,13 @@ func (s *rollbackSourcePlanStore) GetByID(context.Context, int64) (*storage.Plan
 // by resp, against a completed apply whose source plan was reviewed under an
 // ignore_tables config.
 func newRollbackExemptService(plans storage.PlanStore, resp *ternv1.PlanResponse) (*Service, *storage.Apply) {
+	return newRollbackExemptServiceWithClient(plans, &mockTernClient{planResp: resp})
+}
+
+// newRollbackExemptServiceWithClient is newRollbackExemptService for a rollback
+// whose re-plan is answered by something other than a plan, such as an engine
+// refusal.
+func newRollbackExemptServiceWithClient(plans storage.PlanStore, client tern.Client) (*Service, *storage.Apply) {
 	apply := &storage.Apply{
 		ID: 1, ApplyIdentifier: "apply_rollback", PlanID: 10,
 		Database: "payments", DatabaseType: storage.DatabaseTypeMySQL,
@@ -246,7 +255,7 @@ func newRollbackExemptService(plans storage.PlanStore, resp *ternv1.PlanResponse
 		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
 	}
 	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
-		DefaultDeployment + "/staging": &mockTernClient{planResp: resp},
+		DefaultDeployment + "/staging": client,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return svc, apply
 }
@@ -304,6 +313,45 @@ func TestExecuteRollbackPlanCarriesAndRecordsTheReviewedIgnoreTables(t *testing.
 	require.NotNil(t, plans.created)
 	assert.Equal(t, []string{"flyway_schema_history"}, plans.created.IgnoreTables(),
 		"the rollback's own stored plan keeps them for a re-plan of itself")
+}
+
+// A rollback re-plans schema files the recorded ignore_tables were never
+// checked against, so an engine can refuse a contradiction the reviewed plan
+// never had. That refusal tells the operator to edit the entry, which does
+// nothing here: the rollback reads the entries frozen on the source plan, so
+// the same edit leaves the same refusal. The failure says where the entries
+// came from, so nobody spends the outage editing config.
+func TestExecuteRollbackPlanSaysItsIgnoreTablesCameFromThePlan(t *testing.T) {
+	plans := &rollbackSourcePlanStore{source: rollbackSourcePlan()}
+	svc, apply := newRollbackExemptServiceWithClient(plans, &mockTernClient{
+		planErr: engine.NewIgnoredTables([]string{"flyway_schema_history"}).
+			RefuseDeclared("payments", []string{"flyway_schema_history"}),
+	})
+
+	_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Remove the entry or the schema file",
+		"the engine's own refusal still reaches the operator")
+	assert.Contains(t, err.Error(), "This rollback uses the plan's recorded ignore_tables, not schemabot.yaml",
+		"the remedy above it points at a config edit that cannot change a frozen record")
+	assert.True(t, IsTerminalControlError(err))
+	assert.Nil(t, plans.created)
+}
+
+// A rollback whose source plan recorded nothing has no provenance to explain,
+// so its failures read as the engine wrote them.
+func TestExecuteRollbackPlanWithoutIgnoreTablesAddsNoNote(t *testing.T) {
+	source := rollbackSourcePlan()
+	source.Namespaces["payments"].IgnoreTables = nil
+	plans := &rollbackSourcePlanStore{source: source}
+	svc, apply := newRollbackExemptServiceWithClient(plans,
+		&mockTernClient{planErr: errors.New("plan the restored schema: target unreachable")})
+
+	_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "recorded ignore_tables")
 }
 
 // The refusal that protects a reviewed plan protects a rollback plan the same

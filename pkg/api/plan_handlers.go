@@ -994,9 +994,24 @@ func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.Plan
 		"pull_request", prInt,
 		"tables", dropped,
 	)
+	if len(dropped) == 1 {
+		return fmt.Errorf(
+			"the plan from deployment %q proposes dropping %q, which ignore_tables withholds. That deployment's planner never saw the exclusion, so the plan is refused rather than reviewed as a drop. Upgrade that deployment to a build that supports ignore_tables",
+			deployment, dropped[0])
+	}
 	return fmt.Errorf(
-		"plan for deployment %q proposes dropping table(s) %s that ignore_tables withholds: the target holds them, so the exclusion did not reach the planner and the plan is refused rather than reviewed as a drop; upgrade the deployment's data plane to a build that honors ignore_tables",
-		deployment, strings.Join(dropped, ", "))
+		"the plan from deployment %q proposes dropping %s, which ignore_tables withholds. That deployment's planner never saw the exclusion, so the plan is refused rather than reviewed as drops. Upgrade that deployment to a build that supports ignore_tables",
+		deployment, quotedTableList(dropped))
+}
+
+// quotedTableList renders table names for an operator-facing message, quoted
+// so a name with a space or a trailing character reads as one name.
+func quotedTableList(names []string) string {
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, fmt.Sprintf("%q", name))
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
@@ -1857,7 +1872,8 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 				Err:        err,
 			}
 		}
-		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
+		return nil, terminalControlf("rollback plan for database %q (%s): %w%s",
+			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))
 	}
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
 		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
@@ -1879,6 +1895,21 @@ func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bo
 	return plan.Database == apply.Database &&
 		plan.DatabaseType == apply.DatabaseType &&
 		plan.Environment == apply.Environment
+}
+
+// recordedIgnoreTablesNote qualifies a failed rollback re-plan with where its
+// exclusions came from. The rollback restores a snapshot the entries were never
+// checked against, so an engine can refuse a contradiction the reviewed plan
+// never had — and its remedy, removing the entry, reads as a config edit. The
+// entries are the source plan's frozen record, so that edit changes nothing and
+// the operator's way out is a pull request that restores the schema. Empty when
+// the plan recorded none, which is every rollback of a plan that withheld
+// nothing.
+func recordedIgnoreTablesNote(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	return ". This rollback uses the plan's recorded ignore_tables, not schemabot.yaml"
 }
 
 func rollbackSchemaFiles(plan *storage.Plan) (map[string]*ternv1.SchemaFiles, error) {
