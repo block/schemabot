@@ -171,10 +171,13 @@ func WithConvergenceProgress(fn func(StorageConvergenceProgress)) EnsureSchemaOp
 // StorageConvergenceProgress is one observation of a convergence in flight.
 //
 // The fields are the ones every dialect can fill. What a dialect cannot say it
-// leaves empty rather than inventing: PostgreSQL converges each table in a
-// transaction and knows which one it is on but not how far into it, so its
-// observations carry the table and no percentage — which is the honest answer,
-// and is still the one thing an operator watching a long CREATE INDEX needs.
+// leaves empty rather than inventing, and the two percentages are where that
+// matters: PostgreSQL converges each table in a transaction and knows which
+// one it is on but not how far into it, so it fills Percent — how much of the
+// run is behind it — and leaves the table's own Percent at zero. A consumer
+// that reads only the table's gets nothing from this dialect, which is the
+// honest answer to a question it never measured rather than an absence of
+// measurement.
 type StorageConvergenceProgress struct {
 	// DDLCount is how many statements this convergence is running in total.
 	DDLCount int
@@ -193,8 +196,9 @@ type StorageConvergenceProgress struct {
 // StorageConvergenceTableProgress is one table's share of a convergence.
 type StorageConvergenceTableProgress struct {
 	Table string
-	// State is the engine's own name for the table's phase — copying, ready,
-	// complete. A dialect without per-table phases leaves it empty.
+	// State is the engine's own name for the table's phase, passed through
+	// rather than translated, so it is the engine's vocabulary an operator
+	// sees and matches on. A dialect without per-table phases leaves it empty.
 	State string
 	// Percent is how far this table's statement has got, 0 to 100.
 	Percent int

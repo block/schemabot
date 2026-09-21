@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -767,6 +768,66 @@ func TestApplyStorageSchemaMySQL_ReportsProgressToAWatchingCaller(t *testing.T) 
 	}
 	assert.Equal(t, string(engine.StateCompleted), observed[len(observed)-1].State,
 		"the last thing an operator sees is the run finishing")
+}
+
+// The per-table lines are the ones an operator watches through a long copy,
+// and the phase on them is the engine's own word passed through rather than a
+// rendering of it — so an alert written against one keeps matching.
+//
+// It takes a real table copy to see any of this. A convergence over a fresh
+// database only creates tables, and creates report no per-table progress at
+// all, which leaves the whole per-table path unexercised by a run that looks
+// like it covers it.
+func TestApplyStorageSchemaMySQL_ReportsTheEnginesOwnPerTableVocabulary(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	// Seeded before the drift, so the rows are indexed on the way in rather
+	// than by the statement under test.
+	seedutil.SeedRows(t, sdb.DSN, "`applies`",
+		"apply_identifier, lock_id, plan_id, database_name, database_type, repository, pull_request, environment, engine, state, options",
+		"CONCAT('seed-', seq), 0, 0, 'seed', 'mysql', 'example/repo', 0, 'development', 'spirit', 'queued', '{}'",
+		storageConvergenceCopyRows)
+
+	// Converging a dropped index back is an ADD INDEX, which always copies the
+	// table rather than running instantly, so there is a copy to report on.
+	_, err := db.ExecContext(t.Context(), "ALTER TABLE `applies` DROP INDEX `idx_completed_at_state`")
+	require.NoError(t, err)
+
+	var observed []StorageConvergenceProgress
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, logger,
+		WithConvergenceProgress(func(p StorageConvergenceProgress) { observed = append(observed, p) }))
+	require.NoError(t, err)
+	require.True(t, remaining.Converged())
+
+	states := map[string]bool{}
+	for _, p := range observed {
+		for _, tp := range p.Tables {
+			if tp.Table == "applies" && tp.State != "" {
+				states[tp.State] = true
+			}
+		}
+	}
+	require.NotEmpty(t, states, "a convergence that copied a table must report that table's phases")
+
+	// Taken from the engine's own enum rather than listed here, so a state it
+	// gains is in the set the moment it exists. A phase outside it is
+	// SchemaBot inventing a word for something the engine already named,
+	// which is how a documented status an operator matches on comes to be one
+	// no line ever carries.
+	enginePhases := map[string]bool{string(engine.StateCompleted): true}
+	for s := status.Initial; s <= status.ErrCleanup; s++ {
+		enginePhases[s.String()] = true
+	}
+	require.NotContains(t, enginePhases, "unknown",
+		"the range must cover the enum; String() falling through would make this assertion vacuous")
+	for phase := range states {
+		assert.True(t, enginePhases[phase],
+			"per-table phase %q is not one the engine names; phases are passed through rather than translated", phase)
+	}
+	assert.True(t, states["copyRows"],
+		"a table copy of this size is observed mid-copy, under the engine's name for that phase")
 }
 
 // The PostgreSQL convergence has no engine polling behind it, so it reports
