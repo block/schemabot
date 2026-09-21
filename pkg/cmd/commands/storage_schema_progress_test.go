@@ -20,9 +20,9 @@ func clockedPrinter(out *strings.Builder, now *time.Time) *storageProgressPrinte
 }
 
 // The convergence polls ten times a second and mostly sees the same thing.
-// One line per poll is a scrollback nobody reads, so an observation that says
-// what the last one said prints nothing.
-func TestStorageProgressPrinter_RepeatsPrintOnce(t *testing.T) {
+// One line per poll is a scrollback nobody reads, so a burst of polls inside
+// one heartbeat window is one line however much or little has changed.
+func TestStorageProgressPrinter_RepeatsPrintOnceWithinAHeartbeat(t *testing.T) {
 	var out strings.Builder
 	clock := time.Now()
 	printer := clockedPrinter(&out, &clock)
@@ -34,7 +34,41 @@ func TestStorageProgressPrinter_RepeatsPrintOnce(t *testing.T) {
 	}
 
 	assert.Equal(t, 1, strings.Count(out.String(), "progress=40%"),
-		"twenty identical polls are one thing happening, and one line")
+		"twenty polls inside the first heartbeat window are one thing happening, and one line")
+}
+
+// A copy whose numbers stop moving is the case the operator most needs a line
+// for. Spirit freezes RowsCopied for the whole checksum phase, and the
+// throttler holds a copy without changing anything an observation can see, so
+// an observation identical to the last one is not nothing happening — it is a
+// long-running thing still happening.
+//
+// Suppressing it would make the terminal go silent for minutes on exactly the
+// run this command exists to narrate, which is when somebody kills a
+// convergence that was about to finish. Only the heartbeat interval decides
+// what prints, so a stall reports itself at log mode's own cadence.
+func TestStorageProgressPrinter_AStalledCopyKeepsHeartbeating(t *testing.T) {
+	var out strings.Builder
+	clock := time.Now()
+	printer := clockedPrinter(&out, &clock)
+
+	// The numbers never move: the copy is done and the checksum is running.
+	frozen := api.StorageConvergenceProgress{
+		State:  "checksum",
+		Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "checksum", Percent: 100, RowsCopied: 5_084_117}},
+	}
+	for range 600 {
+		printer.observe(frozen)
+		clock = clock.Add(100 * time.Millisecond)
+	}
+
+	// One minute of a frozen checksum: the first heartbeat at two seconds and
+	// then one every ten, on top of the line announcing the table.
+	beats := strings.Count(out.String(), "Copying rows")
+	assert.Equal(t, 6, beats, "a stalled copy reports itself every heartbeat interval rather than going silent")
+	assert.Equal(t, 1, strings.Count(out.String(), "Table started"), "the subject is still announced once")
+	assert.Equal(t, 7, strings.Count(out.String(), "rows_copied=5,084,117"),
+		"every line carries the frozen count — the announcement and all six heartbeats; that it has not moved is the news")
 }
 
 // Rows copied moves on every poll, so a line per change would be a line per
@@ -116,13 +150,20 @@ func TestStorageProgressPrinter_EmitsLogfmt(t *testing.T) {
 			}},
 			want: []string{"Table started", "table=applies", "status=copying", "progress=62%", "rows_copied=1,203,441"},
 		},
+		// A dialect that converges a table per transaction knows which table
+		// it is on and how much of the run is behind it, but nothing about how
+		// far into the one in flight. The measurement it did take is printed,
+		// under a key that says which measurement it is: `progress` counts
+		// rows within one table on the other dialect, and one key meaning two
+		// denominators is how an alert written against one silently matches
+		// the other.
 		"a dialect with no partial state": {
 			observations: []api.StorageConvergenceProgress{{
 				State:   "running",
 				Percent: 50,
 				Tables:  []api.StorageConvergenceTableProgress{{Table: "checks", State: "running"}},
 			}},
-			want:   []string{"Table started", "table=checks", "status=running"},
+			want:   []string{"Table started", "table=checks", "status=running", "converged=50%"},
 			absent: []string{"progress=", "rows_copied="},
 		},
 		"the convergence before any table progress exists": {

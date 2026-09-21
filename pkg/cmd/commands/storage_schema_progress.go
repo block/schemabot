@@ -3,7 +3,6 @@ package commands
 import (
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -44,7 +43,6 @@ type storageProgressPrinter struct {
 // what decides whether the next observation is worth a line.
 type storageProgressSubjectLog struct {
 	status     string
-	detail     string
 	startedAt  time.Time
 	lastEmit   time.Time
 	heartbeats int
@@ -85,14 +83,13 @@ func (p *storageProgressPrinter) observe(o api.StorageConvergenceProgress) {
 // a transition, a heartbeat, or nothing that has moved since the last line.
 func (p *storageProgressPrinter) observeSubject(s storageProgressSubject) {
 	now := p.now()
-	detail := strings.Join(s.kvs, " ")
 
 	last, seen := p.subjects[s.table]
 	if !seen {
 		last = &storageProgressSubjectLog{startedAt: now}
 		p.subjects[s.table] = last
 		p.emit(now, s, s.announcement())
-		last.status, last.detail, last.lastEmit = s.status, detail, now
+		last.status, last.lastEmit = s.status, now
 		return
 	}
 
@@ -103,17 +100,21 @@ func (p *storageProgressPrinter) observeSubject(s storageProgressSubject) {
 		// run, so it prints whatever the heartbeat interval says.
 		p.emit(now, s, append(s.transition(), "duration", ui.FormatHumanDuration(now.Sub(last.startedAt))))
 		last.heartbeats = 0
-	case detail == last.detail:
-		// Nothing moved. Ten polls a second that say the same thing are one
-		// thing happening, and it has already been said.
-		return
 	case now.Sub(last.lastEmit) < last.heartbeatInterval():
+		// Ten polls a second are one thing happening, and the interval is what
+		// collapses them into one line. It is deliberately the only thing that
+		// does. Suppressing an observation for saying what the last one said
+		// would silence the copy whose numbers have stopped moving — a table
+		// in checksum, or one the throttler is holding — and that is the
+		// moment the line confirming it is still alive is worth the most.
+		// `apply --output log`, the surface this one matches, heartbeats on
+		// elapsed time alone for the same reason.
 		return
 	default:
 		p.emit(now, s, s.heartbeat())
 		last.heartbeats++
 	}
-	last.status, last.detail, last.lastEmit = s.status, detail, now
+	last.status, last.lastEmit = s.status, now
 }
 
 func (p *storageProgressPrinter) emit(now time.Time, s storageProgressSubject, kvs []string) {
@@ -214,8 +215,18 @@ func storageProgressSubjects(o api.StorageConvergenceProgress) []storageProgress
 			continue
 		}
 		s := storageProgressSubject{table: t.Table, status: t.State}
-		if t.Percent > 0 {
+		switch {
+		case t.Percent > 0:
 			s.kvs = append(s.kvs, "progress", fmt.Sprintf("%d%%", t.Percent))
+		case o.Percent > 0:
+			// The dialect knows which table it is on but not how far into it,
+			// so the only measurement it took is how much of the run is
+			// behind it. That is worth printing — an operator waiting out a
+			// long CREATE INDEX is asking exactly it — but not under
+			// `progress`, which on the other dialect counts rows within this
+			// one table. Two denominators under one key is how an alert
+			// written against one of them silently matches the other.
+			s.kvs = append(s.kvs, "converged", fmt.Sprintf("%d%%", o.Percent))
 		}
 		if t.RowsCopied > 0 {
 			s.kvs = append(s.kvs, "rows_copied", ui.FormatNumber(t.RowsCopied))
