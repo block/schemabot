@@ -109,23 +109,27 @@ func TestMaterializedPlanKeepsDispatchedBlockedVerdict(t *testing.T) {
 // When the re-plan holds the same change twice with different verdicts, the
 // blocked one wins regardless of order: admitting a plan one copy would refuse
 // is the failure the gate exists to prevent.
-func TestDriftVerdictsRecordBlockedWins(t *testing.T) {
+func TestReplannedChangesRecordBlockedWins(t *testing.T) {
 	key := driftChangeKey{namespace: "testapp", table: "users", operation: "alter", ddl: "ALTER TABLE users ADD COLUMN email varchar(255)"}
+	statement := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	blocked := replannedChange{ddl: statement, mode: engine.ExecutionModeBlocked, reason: localBlockedReason}
+	direct := replannedChange{ddl: statement, mode: engine.ExecutionModeDirect, reason: "direct"}
+	unjudged := replannedChange{ddl: statement}
 
-	blockedFirst := driftVerdicts{byChange: map[driftChangeKey]driftVerdict{}}
-	blockedFirst.record(key, engine.ExecutionModeBlocked, localBlockedReason)
-	blockedFirst.record(key, "", "")
-	assert.Equal(t, driftVerdict{mode: engine.ExecutionModeBlocked, reason: localBlockedReason}, blockedFirst.byChange[key])
+	blockedFirst := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	blockedFirst.record(key, blocked)
+	blockedFirst.record(key, unjudged)
+	assert.Equal(t, blocked, blockedFirst.byChange[key])
 
-	blockedLast := driftVerdicts{byChange: map[driftChangeKey]driftVerdict{}}
-	blockedLast.record(key, engine.ExecutionModeDirect, "direct")
-	blockedLast.record(key, engine.ExecutionModeBlocked, localBlockedReason)
-	assert.Equal(t, driftVerdict{mode: engine.ExecutionModeBlocked, reason: localBlockedReason}, blockedLast.byChange[key])
+	blockedLast := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	blockedLast.record(key, direct)
+	blockedLast.record(key, blocked)
+	assert.Equal(t, blocked, blockedLast.byChange[key])
 
-	neitherBlocked := driftVerdicts{byChange: map[driftChangeKey]driftVerdict{}}
-	neitherBlocked.record(key, engine.ExecutionModeDirect, "direct")
-	neitherBlocked.record(key, "", "")
-	assert.Equal(t, driftVerdict{mode: engine.ExecutionModeDirect, reason: "direct"}, neitherBlocked.byChange[key], "the first non-blocked verdict stands")
+	neitherBlocked := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	neitherBlocked.record(key, direct)
+	neitherBlocked.record(key, unjudged)
+	assert.Equal(t, direct, neitherBlocked.byChange[key], "the first non-blocked change stands")
 }
 
 // A blocked verdict on one shard's copy of a table already seen on another

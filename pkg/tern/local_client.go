@@ -2120,17 +2120,26 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 	// keeping unreviewed DDL from being applied. The comparison is shard-aware: a
 	// shard-scoped dispatch is checked against the re-plan restricted to its shard.
 	//
-	// The same re-plan supplies this deployment's execution-mode verdicts. The
-	// dispatch is built from task rows and carries none, and the verdict is a
-	// property of this target (its table sizes, its grants), not of the
-	// reviewed text — so without stamping it here the materialized plan would
-	// pass the blocked-step admission gate no matter what this engine decided.
-	verdicts, err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles)
+	// The same re-plan supplies the changes as this target will run them: the
+	// statement its own engine emitted (qualified with this target's physical
+	// schema where the engine qualifies at all) and its execution-mode
+	// verdict. The dispatch is built from task rows, which carry the primary's
+	// text and no verdict, and both are properties of this target (its schema
+	// names, its table sizes, its grants) rather than of the reviewed text —
+	// so without stamping them here the materialized plan would name the
+	// primary's schema and pass the blocked-step admission gate no matter what
+	// this engine decided. The stamping is not conditioned on the engine: every
+	// deployment stores the text its own engine emitted, so the stored bytes
+	// differ from the reviewed text wherever the two engines spell the same
+	// change differently (quoting, whitespace, qualification), and every
+	// operator surface that reads a deployment's plan or task rows shows that
+	// deployment's rendering.
+	replanned, err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
 	}
-	if err := c.stampLocalVerdicts(namespaces, verdicts); err != nil {
-		return nil, fmt.Errorf("materialize plan %s: local verdicts: %w", req.PlanId, err)
+	if err := c.stampReplannedChanges(namespaces, replanned); err != nil {
+		return nil, fmt.Errorf("materialize plan %s: re-planned changes: %w", req.PlanId, err)
 	}
 
 	target := req.Target
@@ -2783,7 +2792,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				ErrorMessage: "plan not found",
 			}, nil
 		}
-		scope, err := deriveDispatchScope(plan, req)
+		scope, err := c.dispatchScopeForApply(plan, req)
 		if err != nil {
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 		}
@@ -2809,7 +2818,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	scope, err := deriveDispatchScope(plan, req)
+	scope, err := c.dispatchScopeForApply(plan, req)
 	if err != nil {
 		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 	}
