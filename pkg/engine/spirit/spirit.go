@@ -1134,8 +1134,8 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 	// asked for it, so that the config's own entries are matched against the
 	// target's catalog first. An entry naming a table the archive convention
 	// also excludes is then disclosed as withheld, the same as on every other
-	// engine, instead of being reported as an entry that matched no live table
-	// because another exclusion reached it first. When the loader did apply it
+	// engine, instead of counting as an entry that withheld nothing because
+	// another exclusion reached it first. When the loader did apply it
 	// this pass finds nothing, since it is the same predicate.
 	kept := make([]table.TableSchema, 0, len(tables))
 	var withheld []string

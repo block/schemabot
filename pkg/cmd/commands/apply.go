@@ -117,7 +117,6 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	if cmd.Output != OutputFormatJSON {
 		templates.WriteIgnoredNamespaces(ignoredNamespaces,
 			schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces))
-		templates.WriteUnmatchedIgnoreTables(schema.UnmatchedIgnoreTables(cfg.IgnoreTables, planResult.WithheldTables()))
 		// The operator about to reconcile the target is the one who most needs
 		// to know which live tables the plan was not shown.
 		templates.WriteExemptTables(planResult.ExemptTables)

@@ -104,15 +104,10 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return writeJSON(allResults)
 	}
 
-	// Disclose config-driven exclusions once per distinct resolution. The two
-	// disclosures dedupe independently: ignore_namespaces resolves from config
-	// alone and differs between environments only when entries use $ENV, while
-	// an ignore_tables entry resolves against each target's live schema and can
-	// withhold a table in one environment and match nothing in another. Keying
-	// both on one string would reprint the namespaces notice for every
-	// environment whose tables happened to differ.
+	// Disclose ignore_namespaces once per distinct resolution: entries resolve
+	// from config alone and differ between environments only when they use
+	// $ENV, so several environments usually share one notice.
 	disclosedNamespaces := make(map[string]bool)
-	unmatchedTablesByEnv := make(map[string][]string, len(environments))
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]
 		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
@@ -121,9 +116,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 			disclosedNamespaces[key] = true
 			templates.WriteIgnoredNamespaces(ignored, unmatched)
 		}
-		unmatchedTablesByEnv[env] = schema.UnmatchedIgnoreTables(cfg.IgnoreTables, allResults[env].WithheldTables())
 	}
-	templates.WriteMultiEnvUnmatchedIgnoreTables(environments, unmatchedTablesByEnv)
 
 	// Human-readable output for all environments
 	outputMultiEnvPlanResult(allResults, cfg.Database, cfg.SchemaDir)

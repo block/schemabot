@@ -13,7 +13,6 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/routing"
-	sbschema "github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -908,7 +907,6 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		// anything. Comparing what was configured against what the plan
 		// reports withholding is the only way a reviewer learns that an entry
 		// is misspelled, case-mismatched, or stale.
-		UnmatchedIgnoreTables: sbschema.UnmatchedIgnoreTables(schema.IgnoreTables, planResp.WithheldTables()),
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {

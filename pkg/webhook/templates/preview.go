@@ -112,7 +112,6 @@ func PreviewCommentPlanIgnoreTables() string {
 			Tables:    []string{"flyway_schema_history"},
 			Reason:    "ignore_tables",
 		}},
-		UnmatchedIgnoreTables: []string{"alembic_verison"},
 	})
 }
 

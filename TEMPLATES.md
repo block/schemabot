@@ -152,8 +152,6 @@ schemabot apply -e staging
 
 ℹ️ Tables in namespace `testapp` exempt from the undeclared-table verdict (ignore\_tables): `flyway_schema_history`
 
-⚠️ `ignore_tables` entry `alembic_verison` matched no live table and withheld nothing
-
 
 </details>
 

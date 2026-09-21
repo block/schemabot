@@ -480,14 +480,11 @@ func (p *onboardWritePlan) strayFiles() (strays, withheldStrays []string, err er
 }
 
 // printExclusionDisclosure reports what ignore_tables kept out of the written
-// files, and which entries kept out nothing. Onboard prints the server's own
-// unfiltered table count, so without this the operator diffing the output
-// against the catalog sees tables missing with no stated reason, and a typo'd
-// entry stays invisible until the next plan. Every other ignore_tables surface
-// discloses both.
+// files. Onboard prints the server's own unfiltered table count, so without
+// this an operator diffing the output against the catalog sees tables missing
+// with no stated reason.
 func (p *onboardWritePlan) printExclusionDisclosure() {
 	templates.WriteExemptTables(p.withheld)
-	templates.WriteUnmatchedIgnoreTables(schema.UnmatchedIgnoreTables(p.exclusions.Tables, p.withheldTables()))
 }
 
 // withheldTableFilePaths returns the file each withheld table would have been

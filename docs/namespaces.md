@@ -317,6 +317,8 @@ an error asking for a namespace-free DSN or removal of `ignore_namespaces`.
 
 Some live tables exist in a managed namespace but are not SchemaBot's to manage: a schema-versioning tool's bookkeeping table, a table owned by a third-party framework, a one-off table an operator created by hand. No file declares them, so every one is planned as `DROP TABLE`, and that unsafe change blocks the merge until someone reaches for `--allow-unsafe`, which un-blocks every other drop in the plan too.
 
+Temporary tables are the same case with a schedule attached: a backfill's working copy, a staging table a nightly job creates and drops, anything a process leaves on the target between runs. Whether the plan sees one depends on when it runs, so without an entry the same branch plans a drop on one push and nothing on the next. An entry covers both, since it withholds the table when it is there and is silent when it is not.
+
 List such tables under `ignore_tables` in `schemabot.yaml`:
 
 ```yaml
@@ -335,7 +337,7 @@ An ignored table is withheld from the planner's view of the live schema. The pla
 - Entries are bare table names, not paths. An entry containing `/` or `\` is rejected when the config is loaded. Patterns are not supported, so a set of time-partitioned tables needs one entry per table.
 - Entries are not namespace-qualified, so an entry applies to every namespace the plan covers. A name that occurs in two namespaces is withheld in both, and there is no way to scope an entry to one of them.
 - `$ENV` substitution does **not** apply. Namespace entries substitute `$ENV` because namespace *directories* are environment-suffixed; table names are not.
-- Matching is exact and case-sensitive. An entry that matches no live table withholds nothing; the plan proceeds and the unmatched entry is reported (on the PR plan comment, in the CLI, and in a server-side log) so a typo or stale entry is visible.
+- Matching is exact and case-sensitive. An entry that matches no live table withholds nothing and the plan proceeds, without comment: an entry naming a table that is not always on the target is the ordinary case, not a mistake, and it is indistinguishable from a typo. The server logs unmatched entries, and the rule below refuses the one shape where an unmatched entry is dangerous.
 - A table that is both ignored and declared by a schema file is an error. Either choice is wrong: withholding it leaves the declaring file unreconciled, and honoring the file manages a table the config says to leave alone. Remove the entry or delete the declaring file.
 - That error is the one place case is not significant. Identifiers fold to lower case wherever a database stores them that way, so `Orders` in a file and `orders` in the config are a contradiction there and two distinct tables elsewhere. Withholding stays exact, because an entry must never withhold a table it does not name; a contradiction is refused whatever the case, because letting a real one through costs an apply that fails part way. The error names every entry that folds to the declared name, since a config that spells one table several ways is resolved only by removing all of them.
 - An entry that withheld nothing while the plan proposes dropping the very table it names is refused, not reported. The only way to reach that shape is a deployment whose data plane predates `ignore_tables` and discarded the field, and reviewing it as a drop would undo the exclusion through the change it was written to prevent.
@@ -349,11 +351,7 @@ Every plan that withheld tables says so: the PR plan comment renders an
 `ℹ️ Tables in namespace … exempt from the undeclared-table verdict (ignore_tables): …`
 line under the plan summary (also on "no changes" results, so a withheld table
 is distinguishable from a declared one), and the CLI prints the same disclosure
-for `plan` and `apply`. An entry that withheld nothing is reported the same way,
-as a `⚠️ ignore_tables entry … matched no live table and withheld nothing` line:
-a reviewer reading the pull request cannot see the target's catalog, so without
-it a misspelled entry would look like a working one. A multi-environment plan
-names the environment when the environments disagree.
+for `plan` and `apply`.
 When reviewing a PR that *introduces* an `ignore_tables` entry, the disclosure
 plus the config diff is the review surface: the plan stops seeing that table
 from this PR onward.

@@ -3,7 +3,6 @@ package templates
 
 import (
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 
@@ -442,58 +441,6 @@ func WriteIgnoredNamespaces(ignored, unmatched []string) {
 	if len(ignored) > 0 || len(unmatched) > 0 {
 		fmt.Println()
 	}
-}
-
-// WriteUnmatchedIgnoreTables disclosure: an ignore_tables entry that withheld
-// nothing (typo, case mismatch, or a table already dropped) is reported, so an
-// operator is not left believing a table is withheld when the plan is free to
-// propose dropping it. The tables an entry did withhold are disclosed by
-// WriteExemptTables, which names the same config key as its reason.
-func WriteUnmatchedIgnoreTables(unmatched []string) {
-	if len(unmatched) == 0 {
-		return
-	}
-	for _, entry := range unmatched {
-		fmt.Printf(glyph.Attention+"  ignore_tables entry %q matched no live table and withheld nothing\n", entry)
-	}
-	fmt.Println()
-}
-
-// WriteMultiEnvUnmatchedIgnoreTables reports unmatched entries across a plan of
-// several environments. An entry resolves against each target's own catalog, so
-// it can withhold a table in one environment and match nothing in another: when
-// the environments agree the shared lines print once, and otherwise each line
-// names the environment it belongs to, because an operator reading "matched no
-// live table" needs to know which target is being described before they can
-// decide whether the entry is a typo or simply not needed there.
-func WriteMultiEnvUnmatchedIgnoreTables(environments []string, byEnv map[string][]string) {
-	anyUnmatched := false
-	identical := true
-	var first []string
-	for i, env := range environments {
-		unmatched := byEnv[env]
-		if len(unmatched) > 0 {
-			anyUnmatched = true
-		}
-		if i == 0 {
-			first = unmatched
-		} else if !slices.Equal(unmatched, first) {
-			identical = false
-		}
-	}
-	if !anyUnmatched {
-		return
-	}
-	if identical {
-		WriteUnmatchedIgnoreTables(first)
-		return
-	}
-	for _, env := range environments {
-		for _, entry := range byEnv[env] {
-			fmt.Printf(glyph.Attention+"  %s: ignore_tables entry %q matched no live table and withheld nothing\n", env, entry)
-		}
-	}
-	fmt.Println()
 }
 
 // WriteExemptTables disclosure: one line per namespace whose live tables the
