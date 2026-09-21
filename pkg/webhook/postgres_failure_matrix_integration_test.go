@@ -86,8 +86,9 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 }
 
 // A PostgreSQL driver restart while a concurrent index build is parked leaves
-// an invalid catalog entry, then a fresh driver recovers that abandoned entry
-// and completes the apply with exactly one valid index.
+// an invalid catalog entry and a running apply with no live lease, then a
+// fresh driver claims that apply, recovers the abandoned entry, and completes
+// the apply with one valid index and no invalid entry left on the table.
 func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) {
 	const indexName = "users_email_idx"
 	fixture := loadPostgresConfigFixture(t, "postgres")
@@ -117,7 +118,7 @@ func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) 
 	require.Len(t, plan.Changes, 1)
 	require.Len(t, plan.Changes[0].TableChanges, 1)
 	assert.Empty(t, plan.Changes[0].TableChanges[0].ExecutionMode,
-		"PostgreSQL routes CREATE INDEX to its concurrent executor inside the native-safe path")
+		"CREATE INDEX must take the native-safe path, not a blocked or direct one")
 
 	_, _, err = svcA.ExecuteApply(t.Context(), api.ApplyRequest{
 		PlanID:      plan.PlanID,
@@ -152,6 +153,12 @@ func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) 
 	interrupted, err := findFixtureApply(t, svcB, fixture.config.Database)
 	require.NoError(t, err)
 	require.NotNil(t, interrupted)
+	// A graceful shutdown leaves the halted apply where the next driver can
+	// claim it: still running, with its lease released rather than settled.
+	assert.True(t, state.IsState(interrupted.State, state.Apply.Running),
+		"a halted build must leave its apply running for re-claim, state=%s", interrupted.State)
+	assert.False(t, interrupted.HasFreshLease(time.Now()),
+		"a stopped driver must not hold a live lease on the apply it halted")
 	svcB.StartOperator(t.Context())
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		apply, getErr := findFixtureApply(t, svcB, fixture.config.Database)
@@ -168,8 +175,11 @@ func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) 
 	assert.Empty(t, recovered.ErrorMessage, "a recovered apply completes without an error message")
 	count, valid, err = postgresIndexState(t, db, "users", indexName)
 	require.NoError(t, err)
-	assert.Equal(t, 1, count, "recovery must not leave a duplicate index")
+	assert.Equal(t, 1, count, "the recovered index must exist under its declared name")
 	assert.True(t, valid, "the recovered index must be valid")
+	invalid, err := postgresInvalidIndexCount(t, db, "users")
+	require.NoError(t, err)
+	assert.Zero(t, invalid, "recovery must leave no invalid index on the table under any name")
 	tasks, err := svcB.Storage().Tasks().GetByApplyID(t.Context(), interrupted.ID)
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
@@ -377,14 +387,17 @@ func postgresColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
 	return exists
 }
 
-// postgresIndexState reports how many catalog entries the table carries under
-// the index name and whether every one of them is valid. A concurrent build
-// registers its entry as invalid before it starts scanning and marks it valid
-// only on success, so the pair distinguishes a build in flight or abandoned
-// (one invalid entry) from one that completed (one valid entry) and from a
-// recovery that duplicated the index (more than one entry). The error is
-// returned rather than asserted so callers polling inside EventuallyWithT can
-// report a transient query failure on their collector.
+// postgresIndexState reports whether the table carries a catalog entry under
+// the index name and whether it is valid. Index names are unique within a
+// schema, so the count is zero or one. A concurrent build registers its entry
+// as invalid before it starts scanning and marks it valid only on success, so
+// the pair distinguishes a build in flight or abandoned (one invalid entry)
+// from one that completed (one valid entry) and from one that never
+// registered (none). An abandoned entry that recovery renamed but could not
+// drop lives under another name and is invisible here; use
+// postgresInvalidIndexCount to rule that out. The error is returned rather
+// than asserted so callers polling inside EventuallyWithT can report a
+// transient query failure on their collector.
 func postgresIndexState(t *testing.T, db *sql.DB, table, index string) (count int, valid bool, err error) {
 	t.Helper()
 	err = db.QueryRowContext(t.Context(), `SELECT count(*), coalesce(bool_and(i.indisvalid), false)
@@ -395,6 +408,23 @@ func postgresIndexState(t *testing.T, db *sql.DB, table, index string) (count in
 		return 0, false, fmt.Errorf("query index %q state on public.%s: %w", index, table, err)
 	}
 	return count, valid, nil
+}
+
+// postgresInvalidIndexCount reports how many invalid index entries the table
+// carries under any name. Recovery quarantines an abandoned concurrent build
+// under a generated name before dropping it, and a drop it could not complete
+// leaves that entry behind beside the rebuilt index, so a zero count is what
+// shows the target needs no operator follow-up.
+func postgresInvalidIndexCount(t *testing.T, db *sql.DB, table string) (int, error) {
+	t.Helper()
+	var count int
+	err := db.QueryRowContext(t.Context(), `SELECT count(*)
+		FROM pg_index i
+		WHERE i.indrelid = to_regclass($1) AND NOT i.indisvalid`, "public."+table).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count invalid indexes on public.%s: %w", table, err)
+	}
+	return count, nil
 }
 
 // applyIsSettled reports whether the drive has finished deciding the apply's
