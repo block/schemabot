@@ -1269,15 +1269,19 @@ recovery paths (`pkg/webhook/comment_observer.go`, `pkg/webhook/handler.go`).
 
 A deployment applying a plan reviewed elsewhere independently re-derives the change set and
 compares it immediately before each per-task engine apply. Drift fails closed, including DDL it
-cannot parse, and recomputed deltas are never applied silently. A task may settle as completed
-without SchemaBot running its reviewed DDL only on evidence from the reviewed target: the
-resume re-plan of the reviewed schema set against the live target no longer lists the task's
+cannot parse, and recomputed deltas are never applied silently. The statement a deployment runs
+is its own rendering of a reviewed change, and only of one the comparison has proven the same
+change as the reviewed one under canonicalization: what may differ is the spelling a target
+gives the same change, never the change itself. A task may settle as completed without
+SchemaBot running its reviewed DDL only on evidence from the reviewed target: the resume
+re-plan of the reviewed schema set against the live target no longer lists the task's
 statement, and every statement it still lists is the reviewed DDL of another task of the same
 apply operation on that table that is neither terminal nor in a revert phase — one that will
 still run it forward. A statement the re-plan still lists that only a terminal or revert-phase
 sibling was reviewed with refuses the resume instead, since nothing will run it forward.
-*Enforced:* `verifyMaterializedPlanMatchesLiveSchema` on the apply path
-(`pkg/tern/local_plan_drift.go`, called from `pkg/tern/local_client.go`);
+*Enforced:* `verifyMaterializedPlanMatchesLiveSchema`, `stampReplannedChanges` and
+`dispatchScopeForApply` on the apply path (`pkg/tern/local_plan_drift.go`, called from
+`pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
 path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
@@ -1319,7 +1323,8 @@ privilege and size gates in `pkg/engine/postgres/postgres.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying
-that admitting deployment's verdict at creation (`pkg/tern/local_client.go`), and fresh and resumed
+that admitting deployment's verdict at creation (`pkg/tern/local_client.go`,
+`pkg/tern/local_plan_drift.go`), and fresh and resumed
 drives refusing blocked rows before engine hand-off, a resumed drive first tightening each row to
 its own re-plan's verdict (`pkg/tern/local_apply.go`, `pkg/tern/local_control_resume.go`); the
 direct-execution size bound ([direct-execution.md](direct-execution.md)).
@@ -1357,9 +1362,11 @@ as its first verb and rides past that gate. *Enforced:* dialect resolution at th
 
 ### RV-7: Rollback needs the originals
 
-Rollback requires the original schema files captured at apply time. If artifact capture failed,
-rollback is refused rather than reconstructed. *Enforced:* rollback preconditions on stored
-artifacts (`pkg/storage/internal/sqlstore/plans.go`).
+Rollback requires the original schema files captured at plan time. If artifact capture failed,
+rollback is refused rather than reconstructed. *Enforced:* the stored plan's capture precondition
+(`Plan.HasOriginalFilesCapture` in `pkg/storage/types.go`), checked when the rollback source is
+resolved (`pkg/api/control_handlers.go`) and again per namespace when the rollback's schema files
+are assembled (`pkg/api/plan_handlers.go`).
 
 ### RV-8: The plan sees the whole schema, or nothing
 

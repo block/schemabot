@@ -36,84 +36,6 @@ func TestBuildDispatchTasksCopiesAsymmetricVerdicts(t *testing.T) {
 // deployment's verdict, which lives on the stored plan — per shard where the
 // plan judged shards separately — so a drive that later loads those rows
 // judges the same verdict the plan gate did.
-func TestDeriveDispatchScopeStampsShardScopedChangesWithPlanVerdict(t *testing.T) {
-	ordersDDL := "ALTER TABLE `orders` ADD COLUMN note text"
-	usersDDL := "ALTER TABLE `users` ADD COLUMN note text"
-	plan := &storage.Plan{
-		ID: 7, Database: "testdb", DatabaseType: storage.DatabaseTypeVitess,
-		Namespaces: map[string]*storage.NamespacePlanData{
-			"commerce": {Tables: []storage.TableChange{
-				{Namespace: "commerce", Table: "orders", DDL: ordersDDL, Operation: "alter", ExecutionMode: "online", ModeReason: "namespace-level verdict"},
-				{Namespace: "commerce", Table: "users", DDL: usersDDL, Operation: "alter", ExecutionMode: "direct", ModeReason: "fits the direct-execution bound"},
-			}},
-		},
-		Shards: []storage.ShardPlan{
-			{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{
-				{Table: "orders", DDL: ordersDDL, Operation: "alter", ExecutionMode: "direct", ModeReason: "small on this shard"},
-			}},
-			{Namespace: "commerce", Shard: "80-", Changes: []storage.TableChange{
-				{Table: "orders", DDL: ordersDDL, Operation: "alter", ExecutionMode: "online", ModeReason: "large on this shard"},
-			}},
-		},
-	}
-	dispatch := func(shard string, changes ...*ternv1.TableChange) *ternv1.ApplyRequest {
-		return &ternv1.ApplyRequest{PlanId: "plan-shards", TargetShards: []string{shard}, DdlChanges: changes}
-	}
-	orders := &ternv1.TableChange{Namespace: "commerce", TableName: "orders", Ddl: ordersDDL, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}
-	users := &ternv1.TableChange{Namespace: "commerce", TableName: "users", Ddl: "  " + usersDDL + "\n", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}
-
-	t.Run("the dispatched shard's own verdict wins over the namespace-level one", func(t *testing.T) {
-		scope, err := deriveDispatchScope(plan, dispatch("80-", orders))
-		require.NoError(t, err)
-		require.Len(t, scope.ddlChanges, 1)
-		assert.Equal(t, "online", scope.ddlChanges[0].ExecutionMode)
-		assert.Equal(t, "large on this shard", scope.ddlChanges[0].ModeReason)
-		assert.Empty(t, scope.verdictless)
-
-		scope, err = deriveDispatchScope(plan, dispatch("-80", orders))
-		require.NoError(t, err)
-		assert.Equal(t, "direct", scope.ddlChanges[0].ExecutionMode)
-		assert.Equal(t, "small on this shard", scope.ddlChanges[0].ModeReason)
-	})
-
-	t.Run("a table the plan judged only at namespace level takes that verdict, whitespace aside", func(t *testing.T) {
-		scope, err := deriveDispatchScope(plan, dispatch("-80", users))
-		require.NoError(t, err)
-		require.Len(t, scope.ddlChanges, 1)
-		assert.Equal(t, "direct", scope.ddlChanges[0].ExecutionMode)
-		assert.Equal(t, "fits the direct-execution bound", scope.ddlChanges[0].ModeReason)
-		assert.Empty(t, scope.verdictless)
-	})
-
-	t.Run("a dispatch that arrives blocked keeps its refusal", func(t *testing.T) {
-		blocked := &ternv1.TableChange{Namespace: "commerce", TableName: "orders", Ddl: ordersDDL, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
-			ExecutionMode: engine.ExecutionModeBlocked, ModeReason: localBlockedReason}
-		scope, err := deriveDispatchScope(plan, dispatch("-80", blocked))
-		require.NoError(t, err)
-		assert.Equal(t, engine.ExecutionModeBlocked, scope.ddlChanges[0].ExecutionMode)
-		assert.Equal(t, localBlockedReason, scope.ddlChanges[0].ModeReason)
-	})
-
-	t.Run("a statement the plan does not hold is reported, not stamped", func(t *testing.T) {
-		unknown := &ternv1.TableChange{Namespace: "commerce", TableName: "orders", Ddl: "ALTER TABLE `orders` DROP COLUMN note", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}
-		scope, err := deriveDispatchScope(plan, dispatch("-80", unknown))
-		require.NoError(t, err)
-		assert.Empty(t, scope.ddlChanges[0].ExecutionMode)
-		require.Len(t, scope.verdictless, 1)
-		assert.Equal(t, "orders", scope.verdictless[0].Table)
-	})
-
-	t.Run("the stamped verdict reaches the task row", func(t *testing.T) {
-		scope, err := deriveDispatchScope(plan, dispatch("80-", orders))
-		require.NoError(t, err)
-		tasks := buildDispatchTasks(plan, scope, "production", storage.EnginePlanetScale, []byte("{}"), time.Now())
-		require.Len(t, tasks, 1)
-		assert.Equal(t, "80-", tasks[0].Shard)
-		assert.Equal(t, "online", tasks[0].ExecutionMode)
-		assert.Equal(t, "large on this shard", tasks[0].ModeReason)
-	})
-}
-
 func TestBlockedTaskError(t *testing.T) {
 	require.NoError(t, blockedTaskError(nil))
 	require.NoError(t, blockedTaskError([]*storage.Task{{ExecutionMode: "direct"}}))
@@ -242,23 +164,27 @@ func TestMaterializedPlanKeepsDispatchedBlockedVerdict(t *testing.T) {
 // When the re-plan holds the same change twice with different verdicts, the
 // blocked one wins regardless of order: admitting a plan one copy would refuse
 // is the failure the gate exists to prevent.
-func TestDriftVerdictsRecordBlockedWins(t *testing.T) {
+func TestReplannedChangesRecordBlockedWins(t *testing.T) {
 	key := driftChangeKey{namespace: "testapp", table: "users", operation: "alter", ddl: "ALTER TABLE users ADD COLUMN email varchar(255)"}
+	statement := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	blocked := replannedChange{ddl: statement, mode: engine.ExecutionModeBlocked, reason: localBlockedReason}
+	direct := replannedChange{ddl: statement, mode: engine.ExecutionModeDirect, reason: "direct"}
+	unjudged := replannedChange{ddl: statement}
 
-	blockedFirst := driftVerdicts{byChange: map[driftChangeKey]driftVerdict{}}
-	blockedFirst.record(key, engine.ExecutionModeBlocked, localBlockedReason)
-	blockedFirst.record(key, "", "")
-	assert.Equal(t, driftVerdict{mode: engine.ExecutionModeBlocked, reason: localBlockedReason}, blockedFirst.byChange[key])
+	blockedFirst := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	blockedFirst.record(key, blocked)
+	blockedFirst.record(key, unjudged)
+	assert.Equal(t, blocked, blockedFirst.byChange[key])
 
-	blockedLast := driftVerdicts{byChange: map[driftChangeKey]driftVerdict{}}
-	blockedLast.record(key, engine.ExecutionModeDirect, "direct")
-	blockedLast.record(key, engine.ExecutionModeBlocked, localBlockedReason)
-	assert.Equal(t, driftVerdict{mode: engine.ExecutionModeBlocked, reason: localBlockedReason}, blockedLast.byChange[key])
+	blockedLast := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	blockedLast.record(key, direct)
+	blockedLast.record(key, blocked)
+	assert.Equal(t, blocked, blockedLast.byChange[key])
 
-	neitherBlocked := driftVerdicts{byChange: map[driftChangeKey]driftVerdict{}}
-	neitherBlocked.record(key, engine.ExecutionModeDirect, "direct")
-	neitherBlocked.record(key, "", "")
-	assert.Equal(t, driftVerdict{mode: engine.ExecutionModeDirect, reason: "direct"}, neitherBlocked.byChange[key], "the first non-blocked verdict stands")
+	neitherBlocked := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	neitherBlocked.record(key, direct)
+	neitherBlocked.record(key, unjudged)
+	assert.Equal(t, direct, neitherBlocked.byChange[key], "the first non-blocked change stands")
 }
 
 // A blocked verdict on one shard's copy of a table already seen on another

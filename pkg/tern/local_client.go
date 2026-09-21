@@ -2120,17 +2120,26 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 	// keeping unreviewed DDL from being applied. The comparison is shard-aware: a
 	// shard-scoped dispatch is checked against the re-plan restricted to its shard.
 	//
-	// The same re-plan supplies this deployment's execution-mode verdicts. The
-	// dispatch is built from task rows and carries none, and the verdict is a
-	// property of this target (its table sizes, its grants), not of the
-	// reviewed text — so without stamping it here the materialized plan would
-	// pass the blocked-step admission gate no matter what this engine decided.
-	verdicts, err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles)
+	// The same re-plan supplies the changes as this target will run them: the
+	// statement its own engine emitted (qualified with this target's physical
+	// schema where the engine qualifies at all) and its execution-mode
+	// verdict. The dispatch is built from task rows, which carry the primary's
+	// text and no verdict, and both are properties of this target (its schema
+	// names, its table sizes, its grants) rather than of the reviewed text —
+	// so without stamping them here the materialized plan would name the
+	// primary's schema and pass the blocked-step admission gate no matter what
+	// this engine decided. The stamping is not conditioned on the engine: every
+	// deployment stores the text its own engine emitted, so the stored bytes
+	// differ from the reviewed text wherever the two engines spell the same
+	// change differently (quoting, whitespace, qualification), and every
+	// operator surface that reads a deployment's plan or task rows shows that
+	// deployment's rendering.
+	replanned, err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
 	}
-	if err := c.stampLocalVerdicts(namespaces, verdicts); err != nil {
-		return nil, fmt.Errorf("materialize plan %s: local verdicts: %w", req.PlanId, err)
+	if err := c.stampReplannedChanges(namespaces, replanned); err != nil {
+		return nil, fmt.Errorf("materialize plan %s: re-planned changes: %w", req.PlanId, err)
 	}
 
 	target := req.Target
@@ -2423,63 +2432,6 @@ type dispatchScope struct {
 	shard              string
 	finalizer          bool
 	finalizerNamespace string
-	// verdictless names the shard-scoped changes the stored plan holds no
-	// statement for, so their task rows carry only the verdict the dispatch
-	// arrived with. Callers that create rows log these.
-	verdictless []storage.TableChange
-}
-
-// stampDispatchVerdictsFromPlan copies the stored plan's execution verdict
-// onto each shard-scoped change and returns the changes it found no plan
-// statement for. A shard-scoped dispatch carries the statement text but not a
-// verdict — it is built from task rows, which the wire form deliberately
-// strips it from — while the plan this deployment admitted the dispatch
-// against holds the verdict its own engine reached for that statement. Rows
-// built from the stamped changes therefore carry the admitting deployment's
-// verdict, exactly as whole-plan rows do, instead of whatever the wire said.
-//
-// The plan's own change for the dispatch's shard is preferred, since a
-// sharded plan can judge the same statement differently per shard; a plan
-// that keys only by namespace supplies the namespace-level verdict. A verdict
-// is only tightened, never relaxed: a dispatch that arrives already blocked
-// keeps its refusal. Statements are matched by text, which is the same text
-// on both sides — the plan's rows are what the dispatch was built from, or
-// the plan was materialized from the dispatch itself.
-func stampDispatchVerdictsFromPlan(plan *storage.Plan, shard string, changes []storage.TableChange) []storage.TableChange {
-	type statementKey struct{ namespace, table, ddl string }
-	keyOf := func(tc storage.TableChange) statementKey {
-		return statementKey{tc.Namespace, tc.Table, strings.TrimSpace(tc.DDL)}
-	}
-	verdicts := make(map[statementKey]storage.TableChange)
-	for _, tc := range plan.FlatDDLChanges() {
-		verdicts[keyOf(tc)] = tc
-	}
-	for _, sp := range plan.Shards {
-		if sp.Shard != shard {
-			continue
-		}
-		for _, tc := range sp.Changes {
-			if tc.Namespace == "" {
-				tc.Namespace = sp.Namespace
-			}
-			verdicts[keyOf(tc)] = tc
-		}
-	}
-	var verdictless []storage.TableChange
-	for i := range changes {
-		tc := &changes[i]
-		planned, ok := verdicts[keyOf(*tc)]
-		if !ok {
-			verdictless = append(verdictless, *tc)
-			continue
-		}
-		if tc.EngineBlocked() {
-			continue
-		}
-		tc.ExecutionMode = planned.ExecutionMode
-		tc.ModeReason = planned.ModeReason
-	}
-	return verdictless
 }
 
 // deriveDispatchScope determines a dispatch request's scope. A sharded
@@ -2518,7 +2470,6 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 		}
 		scope.shard = shard
 		scope.ddlChanges = scoped
-		scope.verdictless = stampDispatchVerdictsFromPlan(plan, shard, scoped)
 		return scope, nil
 	}
 	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
@@ -2564,24 +2515,6 @@ func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationK
 		return operationKey, storage.ApplyOperationKindGroupFinalizer, nil
 	}
 	return "", "", nil
-}
-
-// logVerdictlessDispatchChanges warns, before task rows are created, about
-// each shard-scoped change whose statement the stored plan does not hold. The
-// plan gate already admitted the plan, so the apply proceeds; the warning is
-// what tells an operator that these rows carry the dispatch's verdict rather
-// than this deployment's.
-func (c *LocalClient) logVerdictlessDispatchChanges(plan *storage.Plan, scope dispatchScope) {
-	for _, tc := range scope.verdictless {
-		c.logger.Warn("Apply: stored plan holds no statement for a shard-scoped change; its task row will carry the dispatched verdict, not this deployment's",
-			"plan_id", plan.PlanIdentifier,
-			"database", c.config.Database,
-			"namespace", tc.Namespace,
-			"shard", scope.shard,
-			"table", tc.Table,
-			"execution_mode", tc.ExecutionMode,
-		)
-	}
 }
 
 // buildDispatchTasks constructs the task rows for a dispatch scope's DDL
@@ -2778,7 +2711,6 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
 	now := time.Now()
-	c.logVerdictlessDispatchChanges(plan, scope)
 	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
 	operation := &storage.ApplyOperation{
 		Deployment:    c.config.Database,
@@ -2862,7 +2794,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				ErrorMessage: "plan not found",
 			}, nil
 		}
-		scope, err := deriveDispatchScope(plan, req)
+		scope, err := c.dispatchScopeForApply(plan, req)
 		if err != nil {
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 		}
@@ -2888,7 +2820,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	scope, err := deriveDispatchScope(plan, req)
+	scope, err := c.dispatchScopeForApply(plan, req)
 	if err != nil {
 		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 	}
@@ -3026,7 +2958,6 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	c.logVerdictlessDispatchChanges(plan, scope)
 	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
 
 	operationKey, operationKind, err := operationIdentityForDispatch(scope)

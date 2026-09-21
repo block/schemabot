@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -241,6 +243,174 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Contains(t, change.DDL, "CREATE TABLE public.users")
 	assert.Empty(t, change.ExecutionMode, "a greenfield create the role can run must plan executable")
 	assert.Empty(t, change.ModeReason)
+}
+
+// Planning captures the canonical live schema for rollback, including an
+// explicitly empty baseline when every declared table is new.
+func TestEnginePlanCapturesOriginalFiles(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	const originalAccounts = "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    \"name\" text NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n"
+
+	tests := []struct {
+		name          string
+		database      string
+		setup         string
+		schemaFiles   schema.SchemaFiles
+		expectedFiles map[string]map[string]string
+	}{
+		{
+			name:     "alter existing table",
+			database: "plan_original_alter_test",
+			setup:    "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			schemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}}},
+			expectedFiles: map[string]map[string]string{"public": {"users.sql": originalUsers}},
+		},
+		{
+			name:     "mixed namespaces",
+			database: "plan_original_mixed_test",
+			setup:    "CREATE SCHEMA app; CREATE TABLE app.accounts (id bigint PRIMARY KEY, name text NOT NULL); CREATE SCHEMA fresh",
+			schemaFiles: schema.SchemaFiles{
+				"app": {Files: map[string]string{
+					"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY, name text NOT NULL, active boolean)",
+					"events.sql":   "CREATE TABLE events (id bigint PRIMARY KEY)",
+				}},
+				"fresh": {Files: map[string]string{
+					"jobs.sql": "CREATE TABLE jobs (id bigint PRIMARY KEY)",
+				}},
+			},
+			expectedFiles: map[string]map[string]string{
+				"app":   {"accounts.sql": originalAccounts},
+				"fresh": {},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			_, err := db.ExecContext(t.Context(), tt.setup)
+			require.NoError(t, err)
+
+			result, err := New().Plan(t.Context(), &engine.PlanRequest{
+				Database: tt.database, SchemaFiles: tt.schemaFiles, Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Changes, len(tt.expectedFiles))
+			for _, change := range result.Changes {
+				assert.True(t, change.OriginalFilesCaptured)
+				assert.Equal(t, tt.expectedFiles[change.Namespace], change.OriginalFiles)
+			}
+		})
+	}
+}
+
+// A pull refuses a namespace whose tables carry objects the declarative
+// format cannot represent, because those files become the owner's declared
+// schema. A rollback baseline is declared by nobody, and the differ cannot
+// see those objects in either direction, so plan capture keeps the namespace
+// and the plan stays rollback-capable.
+func TestEnginePlanCapturesNamespaceWithUnmodeledObjects(t *testing.T) {
+	const originalAccounts = "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n"
+
+	dsn, db := testutil.StartPostgres(t, "plan_unmodeled_capture_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_unmodeled_capture_test",
+		SchemaFiles: schema.SchemaFiles{"app": {Files: map[string]string{
+			"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY, email text)",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	assert.True(t, result.Changes[0].OriginalFilesCaptured,
+		"a trigger and a comment are invisible to the renderer and to the differ, so they do not cost the namespace its rollback baseline")
+	assert.Equal(t, map[string]string{"accounts.sql": originalAccounts}, result.Changes[0].OriginalFiles)
+}
+
+// An archive table is exempt from the undeclared-table verdict, so it sits
+// outside management on the forward plan and on any rollback re-plan. Its
+// shape is therefore not the rollback baseline's concern: an archive table
+// the renderer refuses neither appears in the baseline nor costs the
+// namespace its rollback capability.
+func TestEnginePlanCaptureLeavesExemptArchiveTablesOutOfBaseline(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+
+	dsn, db := testutil.StartPostgres(t, "plan_archive_capture_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY, note text COLLATE "C")`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_archive_capture_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.ExemptTables, 1)
+	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
+	assert.True(t, result.Changes[0].OriginalFilesCaptured,
+		"a table the planner refuses to manage must not decide whether the namespace can be rolled back")
+	assert.Equal(t, map[string]string{"users.sql": originalUsers}, result.Changes[0].OriginalFiles,
+		"the baseline declares exactly the tables a rollback re-plan would manage")
+}
+
+// cancelAfterFirstQuery cancels the capture's context as soon as its table
+// listing has returned, so every introspection that follows runs against a
+// cancelled context.
+type cancelAfterFirstQuery struct {
+	cancel  context.CancelFunc
+	queries atomic.Int32
+}
+
+func (c *cancelAfterFirstQuery) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+
+func (c *cancelAfterFirstQuery) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+	if c.queries.Add(1) == 1 {
+		c.cancel()
+	}
+}
+
+// A context cancelled part-way through the capture is the plan's outcome,
+// not one table's: the capture returns the cancellation as an error instead
+// of recording the namespace as rollback-incapable, so a plan interrupted by
+// a shutdown is never stored looking like a namespace that holds an
+// unrenderable table.
+func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_cancel_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public")
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, captured)
+	assert.Nil(t, files)
 }
 
 // TestEnginePlanPrivilegeRefusal proves a role that cannot alter an oversized
@@ -529,6 +699,9 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
 	require.Len(t, result.Changes, 1)
 	assert.Equal(t, "public", result.Changes[0].Namespace)
+	assert.False(t, result.Changes[0].OriginalFilesCaptured,
+		"a namespace with tables that cannot be rendered as a desired schema plans rollback-incapable rather than not at all")
+	assert.Nil(t, result.Changes[0].OriginalFiles)
 	require.Len(t, result.ExemptTables, 1)
 	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
 	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)

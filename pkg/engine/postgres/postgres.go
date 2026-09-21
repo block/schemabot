@@ -262,8 +262,8 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
-		files := sortedKeys(ns.Files)
 		schemaChange := engine.SchemaChange{Namespace: namespace}
+		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
 			desired, err := pgstatement.ParseDesired(ns.Files[filename])
@@ -315,12 +315,57 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			})
 		}
 		if len(schemaChange.TableChanges) > 0 {
+			// Only a namespace with changes needs a rollback baseline, so
+			// the render is paid once per changed namespace rather than for
+			// every namespace the schema files declare.
+			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace)
+			if err != nil {
+				return nil, err
+			}
 			result.Changes = append(result.Changes, schemaChange)
 		}
 	}
 	result.NoChanges = len(result.Changes) == 0
 	result.PlanID = engine.NewPlanID()
 	return result, nil
+}
+
+// captureOriginalFiles renders the live namespace as the plan's rollback
+// baseline, keyed by schema file name. The baseline is every managed table
+// in the namespace except the archive tables the plan exempts, so it is
+// complete or it is nothing: one table pg-sprite's renderer refuses — each
+// shape it refuses is named by one of its ErrUnrenderable errors, foreign
+// keys on either side and inheritance among them — leaves captured false,
+// and RV-7 then refuses rollback for this plan rather than reconstructing
+// the originals. The plan itself still proceeds, because rollback capability
+// is not a precondition for reviewing or applying the change. Only a failure
+// to read the namespace at all is an error, and a cancelled context is that
+// failure rather than one table's, so a plan interrupted mid-capture is
+// never recorded as rollback-incapable.
+//
+// The render introspects every managed table in the namespace, changed or
+// not, so its cost grows with the namespace rather than with the change.
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string) (files map[string]string, captured bool, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline)
+	if err != nil {
+		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+	}
+	if len(renderErrors) > 0 {
+		// One representative cause is enough to start triage; the count says
+		// how far the namespace is from a complete baseline without the log
+		// line growing with the number of unrenderable tables.
+		slog.Warn("PostgreSQL plan could not capture the whole namespace as rollback originals; the plan proceeds rollback-incapable",
+			"database", database,
+			"namespace", namespace,
+			"unrenderable_tables", len(renderErrors),
+			"first_error", renderErrors[0])
+		return nil, false, nil
+	}
+	files = make(map[string]string, len(originalTables))
+	for table, content := range originalTables {
+		files[table+".sql"] = content
+	}
+	return files, true, nil
 }
 
 // tierUnderived marks a step whose privilege tier could not be derived: its
