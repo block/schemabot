@@ -8,12 +8,15 @@ package postgresconn
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -37,6 +40,29 @@ import (
 var getConnector func(pgx.ConnConfig) driver.Connector = defaultConnector
 
 func defaultConnector(cfg pgx.ConnConfig) driver.Connector { return stdlib.GetConnector(cfg) }
+
+// nonVerifyingRDSKey identifies one RDS endpoint dialed under one
+// non-verifying TLS posture. The warning is deduplicated on this pair rather
+// than on the DSN so that credential rotation, a different database name, or
+// a different option set against the same endpoint does not re-warn, and so
+// the set holds no credentials and is bounded by the number of endpoints
+// rather than by the number of distinct DSNs a process resolves.
+type nonVerifyingRDSKey struct {
+	addr    string
+	posture string
+}
+
+var warnedNonVerifyingRDS sync.Map
+
+// TLS postures a dialed config can hold without authenticating the server.
+// They are derived from the resolved config rather than from the sslmode's
+// spelling: pgx folds sslmode, sslrootcert, and the libpq environment into
+// one TLS config, and that config is what the dial proves.
+const (
+	tlsPostureNone              = "none"
+	tlsPostureUnverified        = "encrypted, unverified"
+	tlsPosturePlaintextFallback = "plaintext fallback"
+)
 
 // Option customizes the parsed PostgreSQL config before the pool is opened.
 // Options are applied in connectionConfig, so they flow through Open,
@@ -218,11 +244,127 @@ func WithRootCAs(roots *x509.CertPool) Option {
 // global CA bundle. Options customize the parsed config (for example
 // WithConnectTimeout) before the pool is opened.
 func Open(dsn string, opts ...Option) (*sql.DB, error) {
-	cfg, err := connectionConfig(dsn, opts...)
+	cfg, err := dialConfig(dsn, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return sql.OpenDB(stdlib.GetConnector(*cfg)), nil
+}
+
+// dialConfig resolves the config a SchemaBot-managed connection dials with
+// and announces a non-verifying RDS posture on the way. It is the config
+// behind every dial path, and only the dial paths: VerifiesServerCertificate
+// judges a DSN without dialing it, and a caller that judges in order to
+// refuse must not be told the connection is weak as well.
+func dialConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
+	cfg, err := connectionConfig(dsn, opts...)
+	if err != nil {
+		return nil, err
+	}
+	warnNonVerifyingRDSTLS(cfg, dsn)
+	return cfg, nil
+}
+
+// WarnNonVerifyingRDSTLS judges and announces the resolved transport posture
+// without dialing. It is for connection paths that consume ConnectionDSN but
+// build their own pool.
+func WarnNonVerifyingRDSTLS(dsn string) error {
+	cfg, err := connectionConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("judge PostgreSQL RDS TLS posture: %w", err)
+	}
+	warnNonVerifyingRDSTLS(cfg, dsn)
+	return nil
+}
+
+// warnNonVerifyingRDSTLS logs once per RDS endpoint and TLS posture when the
+// config about to be dialed does not authenticate the server certificate.
+// The judgement is made on the resolved TLS config, the same predicate
+// VerifiesServerCertificate applies: verify-full and chain-only modes such as
+// verify-ca count as authentication for this warning, while require, prefer,
+// allow, and disable do not. The posture is honored rather
+// than refused. An explicit sslmode against an RDS host was asked for, and
+// SchemaBot's own default for an RDS host with no sslmode is require, so
+// refusing either would turn a compatibility setting into an outage; the
+// warning names which of the two produced the posture so the remedy — an
+// explicit sslmode=verify-full — is aimed at the right place.
+func warnNonVerifyingRDSTLS(cfg *pgx.ConnConfig, dsn string) {
+	host := strings.ToLower(cfg.Host)
+	if !dbconn.IsRDSHost(host) || resolvedConfigVerifiesServer(cfg) {
+		return
+	}
+	key := nonVerifyingRDSKey{
+		addr:    net.JoinHostPort(host, strconv.Itoa(int(cfg.Port))),
+		posture: tlsPosture(cfg),
+	}
+	if _, loaded := warnedNonVerifyingRDS.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	source := "dsn"
+	if sslmodeInjected(dsn) {
+		source = "schemabot default sslmode=require"
+	}
+	slog.Warn("PostgreSQL RDS connection does not authenticate the server; the configured sslmode is honored for compatibility",
+		"host", key.addr,
+		"tls", key.posture,
+		"sslmode_source", source,
+	)
+}
+
+// sslmodeInjected reports whether normalizing dsn added the RDS default
+// sslmode, so the DSN itself named no sslmode for the host it dials.
+func sslmodeInjected(dsn string) bool {
+	normalized, err := ConnectionDSN(dsn)
+	return err == nil && normalized != dsn
+}
+
+// tlsPosture names what a non-verifying resolved config proves. Any plaintext
+// fallback takes precedence because the eventual channel may be unencrypted.
+func tlsPosture(cfg *pgx.ConnConfig) string {
+	hasTLS := cfg.TLSConfig != nil
+	hasPlaintext := cfg.TLSConfig == nil
+	for _, fallback := range cfg.Fallbacks {
+		if fallback.TLSConfig == nil {
+			hasPlaintext = true
+		} else {
+			hasTLS = true
+		}
+	}
+	if hasPlaintext && hasTLS {
+		return tlsPosturePlaintextFallback
+	}
+	if !hasTLS {
+		return tlsPostureNone
+	}
+	return tlsPostureUnverified
+}
+
+// resolvedConfigVerifiesServer reports whether every connection attempt the
+// config can make authenticates the server. pgx expresses sslmode=prefer and
+// sslmode=allow as a primary TLS config plus fallbacks that swap TLS for
+// plaintext or the reverse, so a config authenticates only when the primary
+// and each fallback do.
+func resolvedConfigVerifiesServer(cfg *pgx.ConnConfig) bool {
+	if !verifiesServerCertificate(cfg.TLSConfig) {
+		return false
+	}
+	for _, fallback := range cfg.Fallbacks {
+		if !verifiesServerCertificate(fallback.TLSConfig) {
+			return false
+		}
+	}
+	return true
+}
+
+// verifiesServerCertificate reports whether a resolved TLS config
+// authenticates the server: the standard chain-and-hostname verification is
+// on, or pgx installed its own verifier in place of it (sslmode=verify-ca,
+// and require with an sslrootcert). No TLS config is no authentication.
+func verifiesServerCertificate(tc *tls.Config) bool {
+	if tc == nil {
+		return false
+	}
+	return !tc.InsecureSkipVerify || tc.VerifyPeerCertificate != nil
 }
 
 // OpenReloadable opens a connection pool whose credentials survive rotation
@@ -271,7 +413,7 @@ func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (
 // half of the reloadable pool: it runs once at open and once per reload, never
 // per dial.
 func resolveConnector(dsn string, opts ...Option) (driver.Connector, error) {
-	cfg, err := connectionConfig(dsn, opts...)
+	cfg, err := dialConfig(dsn, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -408,11 +550,7 @@ func VerifiesServerCertificate(dsn string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	tc := cfg.TLSConfig
-	if tc == nil {
-		return false, nil
-	}
-	return !tc.InsecureSkipVerify || tc.VerifyPeerCertificate != nil, nil
+	return verifiesServerCertificate(cfg.TLSConfig), nil
 }
 
 // hasRuntimeParam reports whether params carries key under PostgreSQL's
