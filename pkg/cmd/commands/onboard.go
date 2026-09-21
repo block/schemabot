@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 
@@ -138,18 +137,6 @@ type onboardWritePlan struct {
 	// disclose a plan's exemptions, and tells a stray file describing an
 	// absent table from one describing a table the config withholds.
 	withheld []*apitypes.ExemptTablesResponse
-}
-
-// withheldTables returns every table ignore_tables withheld from this plan,
-// across namespaces and sorted, for reporting the entries that withheld
-// nothing.
-func (p *onboardWritePlan) withheldTables() []string {
-	var tables []string
-	for _, group := range p.withheld {
-		tables = append(tables, group.Tables...)
-	}
-	sort.Strings(tables)
-	return slices.Compact(tables)
 }
 
 // preservedExclusions returns the ignore_namespaces and ignore_tables of an

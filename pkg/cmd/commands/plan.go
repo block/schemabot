@@ -107,15 +107,16 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	// Disclose ignore_namespaces once per distinct resolution: entries resolve
 	// from config alone and differ between environments only when they use
 	// $ENV, so several environments usually share one notice.
-	disclosedNamespaces := make(map[string]bool)
+	disclosed := make(map[string]bool)
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]
 		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
 		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",")
-		if !disclosedNamespaces[key] {
-			disclosedNamespaces[key] = true
-			templates.WriteIgnoredNamespaces(ignored, unmatched)
+		if disclosed[key] {
+			continue
 		}
+		disclosed[key] = true
+		templates.WriteIgnoredNamespaces(ignored, unmatched)
 	}
 
 	// Human-readable output for all environments

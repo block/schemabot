@@ -524,10 +524,9 @@ func TestOnboardWritePlanSeparatesAWithheldTablesLeftoverFile(t *testing.T) {
 
 // Onboard prints the server's unfiltered table count, so a table missing from
 // the written files has no stated reason unless onboard says what it withheld.
-// A typo'd entry has the same problem in reverse: it withholds nothing and
-// stays invisible until the next plan. Every other ignore_tables surface
-// discloses both, and onboard records the same two lists.
-func TestBuildOnboardWritePlanRecordsWhatItWithheldAndWhatMatchedNothing(t *testing.T) {
+// It records the exemption the way a plan carries one, so the disclosure reads
+// the same on both surfaces.
+func TestBuildOnboardWritePlanRecordsWhatItWithheld(t *testing.T) {
 	plan, err := buildOnboardWritePlan(t.TempDir(), &apitypes.PullSchemaResponse{
 		Database:    "orders",
 		Type:        "mysql",
@@ -546,9 +545,6 @@ func TestBuildOnboardWritePlanRecordsWhatItWithheldAndWhatMatchedNothing(t *test
 	assert.Equal(t, "orders", plan.withheld[0].Namespace)
 	assert.Equal(t, []string{"flyway_schema_history"}, plan.withheld[0].Tables)
 	assert.Equal(t, apitypes.ExemptReasonIgnoreTables, plan.withheld[0].Reason)
-	assert.Equal(t, []string{"legacy_audit_log"},
-		schema.UnmatchedIgnoreTables(plan.exclusions.Tables, plan.withheldTables()),
-		"the entry naming no live table here is the one worth reporting")
 }
 
 // For Vitess, vschema.json is a schema input: a leftover copy the pull did not

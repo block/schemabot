@@ -901,12 +901,6 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		DatabaseType:      schema.Type,
 		IsMySQL:           schema.Type == "mysql",
 		IgnoredNamespaces: schema.IgnoredNamespaces,
-
-		// An ignore_tables entry resolves against this environment's live
-		// schema, so the config alone cannot say whether it withheld
-		// anything. Comparing what was configured against what the plan
-		// reports withholding is the only way a reviewer learns that an entry
-		// is misspelled, case-mismatched, or stale.
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {

@@ -90,12 +90,9 @@ func PreviewCommentPlanExemptTables() string {
 // config withholds a live table nothing declares. The plan is clean, which is
 // where the disclosures carry the most: they are the only evidence on the
 // comment that the table was seen and deliberately left alone rather than
-// missed.
-//
-// Both halves of the config's effect render, because a reviewer needs to tell
-// them apart: the table an entry withheld, named with the config key the
-// decision is recorded in, and the entry that withheld nothing — whose table,
-// if it exists at all, is still being reconciled.
+// missed. The disclosure names the config key the decision is recorded in, so
+// a reviewer can tell a table the config withheld from one an engine exempted
+// for reasons of its own.
 func PreviewCommentPlanIgnoreTables() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
