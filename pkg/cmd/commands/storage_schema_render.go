@@ -78,11 +78,6 @@ func storageSchemaEngineLabel(dialect string) string {
 // the disposition of the ones that will not simply run, the summary, and any
 // hint naming the next step.
 func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
-	// Before the statements, because it changes how they should be read, and
-	// before the converged short-circuit, because a convergence still finishing
-	// up is worth saying over a report that found nothing outstanding.
-	writeStorageConvergenceInFlight(report, isApply)
-
 	if report.Converged {
 		// No hints under a converged plan: every one of them names a next step,
 		// and there is no next step to take.
@@ -212,6 +207,15 @@ func storageSchemaSummaryTables(changes []templates.DDLChange) []templates.DDLCh
 // outputStorageSchemaPlan prints a storage plan the way `plan` prints one.
 func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
 	writeStorageSchemaHeader(report, isApply)
+	// Before the statements, because it changes how they should be read, and
+	// before the body's converged short-circuit, because a convergence still
+	// finishing up is worth saying over a report that found nothing
+	// outstanding.
+	//
+	// This entry point renders a report before anything has run, which is what
+	// makes the waiting variant true here: on the apply path the run being
+	// described is the one that is about to queue behind the holder.
+	writeStorageConvergenceInFlight(report, isApply)
 	return writeStorageSchemaBody(report, isApply, rerun, hints)
 }
 
@@ -222,6 +226,13 @@ func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool,
 // withPlan prints the plan that ran, for the unattended path where no preview
 // was shown before it. The planned report is that plan, so printing it after
 // the fact costs nothing and leaves every run self-describing.
+//
+// Neither report is rendered with the in-flight notice the plan path writes.
+// The planned report carries the lock as it was read before this run started,
+// and by the time anything here prints, whatever wait that implied is over —
+// announcing it above the count of what ran would tell an operator they are
+// about to queue for a lock they already queued for. The re-read below says
+// the live version of the same fact instead.
 func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
 	if withPlan {
 		writeStorageSchemaHeader(planned, true)
@@ -253,6 +264,11 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 		// is the only new fact and the refusal below it is not.
 		return nil
 	}
+	// The re-read happened after this run released the lock, so a lock held now
+	// is somebody else's and what follows is a catalog read mid-convergence.
+	// That is the plan's reading of the fact, not the apply's: this run is
+	// finished and waits for nothing.
+	writeStorageConvergenceInFlight(remaining, false)
 	return writeStorageSchemaBody(remaining, true, rerun, []string{
 		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual remediation blocks everything else until it is resolved.",
 	})
@@ -266,16 +282,22 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 // an idle database would state the second as the first — on the one surface an
 // operator reads to decide whether it is safe to start their own run.
 //
-// What it costs them to not know differs by command, so each says its own
-// consequence: a plan read a database mid-convergence and will read differently
-// in a minute, while an apply is about to sit on a lock for as long as the run
-// ahead of it takes.
-func writeStorageConvergenceInFlight(report *apitypes.StorageSchemaReport, isApply bool) {
+// What it costs them to not know differs, so each caller says its own
+// consequence. willWait picks between the two, and it asks about this run
+// rather than about which command is running: a report rendered before a
+// convergence starts belongs to a run that is about to sit on the lock for as
+// long as the run ahead of it takes, while every other report — a plan, and
+// the re-read taken after a convergence has already returned — only says that
+// the catalog was read mid-convergence and will read differently in a minute.
+//
+// An apply renders reports of both kinds, which is why the distinction cannot
+// be drawn from the command.
+func writeStorageConvergenceInFlight(report *apitypes.StorageSchemaReport, willWait bool) {
 	if !report.ConvergenceInFlight {
 		return
 	}
 	consequence := "A statement a convergence is working on is absent from the live catalog until it finishes with it, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left."
-	if isApply {
+	if willWait {
 		consequence = "This run waits on the storage bootstrap lock until that one finishes or its budget runs out, and may then find nothing left to do."
 	}
 	fmt.Printf("%s A storage convergence is already running against %s.%s %s\n\n",

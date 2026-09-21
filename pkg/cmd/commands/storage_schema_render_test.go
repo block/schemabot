@@ -709,6 +709,72 @@ func TestOutputStorageSchemaPlan_ConvergedStillSaysAConvergenceIsRunning(t *test
 	assert.Contains(t, out, "✓ No schema changes detected.")
 }
 
+// The lock another run held when this one started is not news once this one
+// has finished. The planned report is rendered after the convergence returns,
+// so the notice it carries describes a wait that is already over — printing it
+// above the count of what ran would tell an operator they are about to queue
+// for a lock they have already queued for and been given.
+func TestOutputStorageSchemaConvergence_DoesNotReplayTheWaitItAlreadyServed(t *testing.T) {
+	planned := &apitypes.StorageSchemaReport{
+		Dialect:             "mysql",
+		Database:            "schemabot",
+		Host:                "db-1.example",
+		SchemaSource:        "the schema embedded in v1.4.0",
+		ConvergenceInFlight: true,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "alter_table", DDL: "ALTER TABLE `applies` ADD COLUMN `caller` varchar(255) NOT NULL DEFAULT ''"},
+		},
+	}
+	remaining := &apitypes.StorageSchemaReport{Dialect: "mysql", Database: "schemabot", Host: "db-1.example", Converged: true}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, true, "storage apply --allow-unsafe"))
+	})
+
+	assert.Contains(t, out, "✓ Ran 1 statement against schemabot on db-1.example. Nothing is outstanding.")
+	assert.NotContains(t, out, "waits on the storage bootstrap lock",
+		"the run being described has already finished waiting")
+	assert.NotContains(t, out, "A storage convergence is already running",
+		"the lock this reports was read before the run that just completed")
+}
+
+// The re-read taken after a convergence is a live look at the database, so a
+// lock held at that point is somebody else's and the statements it returned
+// may understate what is outstanding. That is the plan's reading of the fact,
+// not the apply's: this run is finished and waits for nothing.
+func TestOutputStorageSchemaConvergence_SaysWhenTheReReadFoundAConvergence(t *testing.T) {
+	planned := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "alter_table", DDL: "ALTER TABLE `applies` ADD COLUMN `caller` varchar(255) NOT NULL DEFAULT ''"},
+			{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+		},
+	}
+	remaining := &apitypes.StorageSchemaReport{
+		Dialect:             "mysql",
+		Database:            "schemabot",
+		Host:                "db-1.example",
+		ConvergenceInFlight: true,
+		Destructive: []apitypes.StorageSchemaStatement{
+			{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+		},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, false, "storage apply --allow-unsafe"))
+	})
+
+	assert.Contains(t, out, "A storage convergence is already running against schemabot on db-1.example.")
+	assert.Contains(t, out, "Re-run this once it finishes")
+	assert.NotContains(t, out, "waits on the storage bootstrap lock",
+		"this run is over; the convergence now holding the lock is another one")
+	assert.Less(t, strings.Index(out, "A storage convergence is already running"), strings.Index(out, "stale_state"),
+		"the notice qualifies the statements under it, so it is read first")
+}
+
 // Nothing is printed when no convergence is reported. The field is false both
 // when the database is idle and when the probe could not answer, so a line
 // rendered off the negative would state "nothing is running" on a report that
