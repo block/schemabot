@@ -127,6 +127,15 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		Type:        c.config.Type,
 		Environment: req.Environment,
 		Target:      req.Target,
+		// The re-plan must be asked to withhold what the reviewed plan was
+		// asked to withhold. A withheld table has no declaring file, so a
+		// re-plan that sees it proposes dropping it — a change the reviewed
+		// DDL cannot contain, which would fail this guard on every apply of a
+		// plan that withheld anything. The dispatch carries the whole config
+		// the plan was reviewed under rather than the subset that matched
+		// where it was planned, so an entry naming a table only this
+		// deployment holds withholds it here too.
+		IgnoreTables: req.GetIgnoreTables(),
 	}, c.config.Database, schemaFiles)
 	if err != nil {
 		return replannedChanges{}, fmt.Errorf("recompute local plan: %w", err)

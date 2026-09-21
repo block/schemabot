@@ -120,7 +120,7 @@ func TestWithholdIgnoredTablesRefusesDeclaredTable(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), `namespace "commerce"`)
-	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
 
 	assert.Equal(t, []string{"flyway_schema_history"}, tableSchemaNames(currentSchema["commerce"]),
 		"a refused plan leaves the live schema as it found it")
@@ -142,7 +142,7 @@ func TestWithholdIgnoredTablesRefusesDeclaredTableWhateverTheCase(t *testing.T) 
 	_, err := New(nil).withholdIgnoredTables(
 		engine.NewIgnoredTables(req.IgnoreTables), req, []string{"commerce"}, currentSchema)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `"flyway_schema_history" (declared as "Flyway_Schema_History")`)
+	assert.Contains(t, err.Error(), `"flyway_schema_history" (the file spells it "Flyway_Schema_History")`)
 
 	assert.Equal(t, []string{"flyway_schema_history"}, tableSchemaNames(currentSchema["commerce"]),
 		"a refused plan leaves the live schema as it found it")

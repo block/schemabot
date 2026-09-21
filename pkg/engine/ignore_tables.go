@@ -103,7 +103,9 @@ func (i IgnoredTables) NamesAny(match func(string) bool) bool {
 // The error names every entry that folds to the declared name, not just the
 // first: a config that spells one table two ways is resolved only by removing
 // both, so naming one would send an operator to make a change that leaves the
-// plan failing for the same reason.
+// plan failing for the same reason. It names them rather than saying how many,
+// and its remedy points at the entries it just listed, so an operator reading
+// the error alone knows exactly what to delete.
 //
 // declared is the tables the namespace's schema files declare.
 func (i IgnoredTables) RefuseDeclared(namespace string, declared []string) error {
@@ -120,7 +122,7 @@ func (i IgnoredTables) RefuseDeclared(namespace string, declared []string) error
 		for _, entry := range spellings {
 			collision := fmt.Sprintf("%q", entry)
 			if entry != table {
-				collision = fmt.Sprintf("%q (declared as %q)", entry, table)
+				collision = fmt.Sprintf("%q (the file spells it %q)", entry, table)
 			}
 			if seen[collision] {
 				continue
@@ -133,8 +135,13 @@ func (i IgnoredTables) RefuseDeclared(namespace string, declared []string) error
 		return nil
 	}
 	slices.Sort(collisions)
+	if len(collisions) == 1 {
+		return fmt.Errorf(
+			"ignore_tables entry %s is also declared by a schema file in namespace %q. Remove the entry or the schema file",
+			collisions[0], namespace)
+	}
 	return fmt.Errorf(
-		"ignore_tables withholds table(s) %s that schema files in namespace %q also declare: a table cannot be both withheld from the planner and declared to it, so the plan would propose creating a table that already exists or would manage a table the config says to leave alone; remove every ignore_tables entry named here or delete the declaring schema file",
+		"ignore_tables entries %s are also declared by schema files in namespace %q. Remove the entries or the schema files",
 		strings.Join(collisions, ", "), namespace)
 }
 

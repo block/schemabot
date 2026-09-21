@@ -42,7 +42,7 @@ func TestIgnoredTablesRefuseDeclared(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"flyway_schema_history"`)
 	assert.Contains(t, err.Error(), `namespace "app"`)
-	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
+	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
 	assert.NotContains(t, err.Error(), "users")
 
 	// Every colliding table is named, sorted and deduplicated, so one plan
@@ -63,13 +63,13 @@ func TestIgnoredTablesRefuseDeclaredIgnoresCase(t *testing.T) {
 
 	err := ignored.RefuseDeclared("app", []string{"Flyway_Schema_History"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `"flyway_schema_history" (declared as "Flyway_Schema_History")`)
-	assert.Contains(t, err.Error(), "remove every ignore_tables entry named here or delete the declaring schema file")
+	assert.Contains(t, err.Error(), `"flyway_schema_history" (the file spells it "Flyway_Schema_History")`)
+	assert.Contains(t, err.Error(), "Remove the entry or the schema file")
 
-	// An exact collision reads as one name, not as a table declared as itself.
+	// An exact collision reads as one name, not as an entry respelled as itself.
 	err = ignored.RefuseDeclared("app", []string{"flyway_schema_history"})
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "declared as")
+	assert.NotContains(t, err.Error(), "the file spells it")
 
 	// Ignoring case in the refusal does not widen what an entry withholds: a
 	// differently-cased live table stays visible to the plan, and the entry
@@ -90,13 +90,13 @@ func TestIgnoredTablesRefuseDeclaredNamesEverySpelling(t *testing.T) {
 
 	err := ignored.RefuseDeclared("app", []string{"Orders"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `"ORDERS" (declared as "Orders")`)
+	assert.Contains(t, err.Error(), `"ORDERS" (the file spells it "Orders")`)
 	assert.Contains(t, err.Error(), `"Orders"`)
-	assert.Contains(t, err.Error(), `"orders" (declared as "Orders")`)
+	assert.Contains(t, err.Error(), `"orders" (the file spells it "Orders")`)
 
 	// Only the entry spelled as the file declares it reads as one name; the
 	// other two are reported against the spelling that collided with them.
-	assert.Equal(t, 2, strings.Count(err.Error(), "declared as"))
+	assert.Equal(t, 2, strings.Count(err.Error(), "the file spells it"))
 
 	// Each of the three still withholds only the table it names.
 	assert.True(t, ignored.Withholds("orders"))

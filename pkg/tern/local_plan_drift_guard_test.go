@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -48,6 +49,112 @@ func TestDriftGuard_MatchMaterializes(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, int64(5), got.ID)
+}
+
+// bookkeepingTable is a live table no schema file declares, the shape
+// ignore_tables exists for.
+const bookkeepingTable = "flyway_schema_history"
+
+// replanWithoutWithheldTable is a re-plan against a deployment whose live schema
+// holds an undeclared bookkeeping table beside the reviewed ALTER. Naming that
+// table in the request withholds it from the planner; leaving it out is the
+// difference between a re-plan that reproduces the reviewed DDL and one that
+// also proposes dropping the table.
+func replanWithoutWithheldTable(ignore []string) *engine.PlanResult {
+	result := alterUsersEmailPlan()
+	if slices.Contains(ignore, bookkeepingTable) {
+		return result
+	}
+	result.Changes[0].TableChanges = append(result.Changes[0].TableChanges, engine.TableChange{
+		Table:     bookkeepingTable,
+		Operation: ddl.StatementDropTable,
+		DDL:       "DROP TABLE `" + bookkeepingTable + "`",
+	})
+	return result
+}
+
+// newBookkeepingTableDriftClient returns a materialize client whose re-plan sees
+// that undeclared live table and records the exclusions it was shown.
+func newBookkeepingTableDriftClient(store storage.PlanStore, shown *[]string) *LocalClient {
+	c := newPlanMaterializeClient(store)
+	c.config.TargetDSN = "user:pass@tcp(127.0.0.1:3306)/testapp"
+	c.spiritEngine = fakePlanEngine{
+		planFn: func(_ context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+			*shown = req.IgnoreTables
+			return replanWithoutWithheldTable(req.IgnoreTables), nil
+		},
+	}
+	return c
+}
+
+// A plan that withheld a live table from the planner records what it withheld,
+// and the dispatch carries that record. The drift guard's re-plan has to be
+// shown the same exclusions: the withheld table has no declaring schema file, so
+// a re-plan that sees it proposes dropping it — a change the reviewed DDL cannot
+// contain — and the guard would refuse every apply of such a plan on a
+// deployment that never planned locally.
+func TestDriftGuard_WithheldTablesTravelToTheReplan(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 9}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:       "plan_withheld",
+		IgnoreTables: []string{bookkeepingTable},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, int64(9), got.ID)
+	assert.Equal(t, []string{bookkeepingTable}, shown,
+		"the re-plan is shown the plan's own record of what it withheld")
+}
+
+// The materialized row has to carry the exclusions too, not just the drift
+// check that let it through. A rollback or resume on this deployment reads what
+// was withheld back off the stored plan, and a plan that forgot it re-plans the
+// withheld tables as drops.
+func TestDriftGuard_MaterializedPlanRecordsIgnoreTables(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 11}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:       "plan_withheld",
+		IgnoreTables: []string{bookkeepingTable},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, store.created)
+	assert.Equal(t, []string{bookkeepingTable}, store.created.IgnoreTables(),
+		"a later re-plan on this deployment withholds what the reviewed plan withheld")
+}
+
+// The exclusion comes from the dispatched plan's record and from nowhere else: a
+// dispatch that withheld nothing gets a re-plan that sees the whole live schema,
+// so the drop the reviewed DDL does not carry is drift and fails closed.
+func TestDriftGuard_NoWithheldRecordStillSeesTheWholeSchema(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 10}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId: "plan_exposed",
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "local schema has drifted from the reviewed plan")
+	assert.Contains(t, err.Error(), bookkeepingTable)
+	assert.Empty(t, shown, "nothing was withheld, so the re-plan is shown no exclusions")
 }
 
 // Whitespace and quoting differences between the recomputed DDL and the reviewed

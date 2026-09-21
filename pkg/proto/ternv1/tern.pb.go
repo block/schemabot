@@ -1077,8 +1077,15 @@ type PlanRequest struct {
 	// disclosing a discard rather than promising a resume the apply will not
 	// perform.
 	GroupedExecution *bool `protobuf:"varint,12,opt,name=grouped_execution,json=groupedExecution,proto3,oneof" json:"grouped_execution,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Live tables the repository's ignore_tables config withholds from the
+	// planner, so a table no schema file declares is not proposed for
+	// DROP TABLE. Matched exactly and case-sensitively against the target's own
+	// catalog, in every namespace the plan covers. The engine discloses what it
+	// actually withheld through exempt_tables on the response, and refuses a
+	// table the config withholds that a schema file also declares.
+	IgnoreTables  []string `protobuf:"bytes,13,rep,name=ignore_tables,json=ignoreTables,proto3" json:"ignore_tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1186,6 +1193,13 @@ func (x *PlanRequest) GetGroupedExecution() bool {
 		return *x.GroupedExecution
 	}
 	return false
+}
+
+func (x *PlanRequest) GetIgnoreTables() []string {
+	if x != nil {
+		return x.IgnoreTables
+	}
+	return nil
 }
 
 // TableChange represents a DDL change to a table.
@@ -1952,8 +1966,20 @@ type ApplyRequest struct {
 	// first operation can never terminalize the apply while sibling dispatches
 	// are still on their way. Empty means this dispatch is the whole generation.
 	GenerationOperationKeys []string `protobuf:"bytes,12,rep,name=generation_operation_keys,json=generationOperationKeys,proto3" json:"generation_operation_keys,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// The ignore_tables config the reviewed plan was planned under, as the plan
+	// recorded it: every entry the planner was asked to withhold, not the subset
+	// that matched a live table where the plan was made. A deployment that
+	// materializes this dispatch re-plans against its own live schema to prove
+	// the reviewed DDL is what it would independently produce; without the same
+	// entries that re-plan sees a withheld table again and proposes dropping it,
+	// so it would refuse an apply that matches the plan exactly. The whole list
+	// travels because a member holds tables the planning target does not: an
+	// entry that matched nothing there still has to withhold here. The plan's
+	// own record travels rather than the current config, so the comparison is
+	// against what was reviewed.
+	IgnoreTables  []string `protobuf:"bytes,13,rep,name=ignore_tables,json=ignoreTables,proto3" json:"ignore_tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ApplyRequest) Reset() {
@@ -2066,6 +2092,13 @@ func (x *ApplyRequest) GetIdempotencyKey() string {
 func (x *ApplyRequest) GetGenerationOperationKeys() []string {
 	if x != nil {
 		return x.GenerationOperationKeys
+	}
+	return nil
+}
+
+func (x *ApplyRequest) GetIgnoreTables() []string {
+	if x != nil {
+		return x.IgnoreTables
 	}
 	return nil
 }
@@ -4490,7 +4523,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\x93\x04\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xb8\x04\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -4506,7 +4539,8 @@ const file_tern_proto_rawDesc = "" +
 	" \x01(\tR\n" +
 	"schemaPath\x12-\n" +
 	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x120\n" +
-	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x1aT\n" +
+	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x12#\n" +
+	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
@@ -4577,7 +4611,7 @@ const file_tern_proto_rawDesc = "" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
 	"\x0flint_violations\x18\x03 \x03(\v2\x16.tern.v1.LintViolationR\x0elintViolations\x12\x16\n" +
 	"\x06errors\x18\x04 \x03(\tR\x06errors\x12*\n" +
-	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\"\x85\x05\n" +
+	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\"\xaa\x05\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
 	"\aoptions\x18\x02 \x03(\v2\".tern.v1.ApplyRequest.OptionsEntryR\aoptions\x12I\n" +
@@ -4592,7 +4626,8 @@ const file_tern_proto_rawDesc = "" +
 	"\rtarget_shards\x18\n" +
 	" \x03(\tR\ftargetShards\x12'\n" +
 	"\x0fidempotency_key\x18\v \x01(\tR\x0eidempotencyKey\x12:\n" +
-	"\x19generation_operation_keys\x18\f \x03(\tR\x17generationOperationKeys\x1a:\n" +
+	"\x19generation_operation_keys\x18\f \x03(\tR\x17generationOperationKeys\x12#\n" +
+	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x1a:\n" +
 	"\fOptionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aT\n" +

@@ -1600,6 +1600,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		HeadSHA:        req.HeadSha,
 		CreatedAt:      time.Now(),
 	}
+	plan.RecordIgnoreTables(req.GetIgnoreTables())
 	c.logger.Info("Plan: storing plan",
 		"plan_id", result.PlanID,
 		"ddl_change_count", len(ddlChanges),
@@ -1858,6 +1859,7 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 		PullRequest:      int(req.PullRequest),
 		Credentials:      creds,
 		GroupedExecution: groupedExecution,
+		IgnoreTables:     req.GetIgnoreTables(),
 	})
 }
 
@@ -2157,6 +2159,12 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 		Namespaces:     namespaces,
 		CreatedAt:      time.Now(),
 	}
+	// The dispatch's record of the ignore_tables the plan was reviewed under has
+	// to survive on this deployment's own row. The drift check above was handed
+	// it directly, but a later rollback or resume here reads it back off the
+	// stored plan, and a plan that forgot its exclusions re-plans the withheld
+	// tables as drops.
+	plan.RecordIgnoreTables(req.GetIgnoreTables())
 	c.logger.Info("Apply: materializing plan from dispatch request",
 		"plan_id", req.PlanId,
 		"database", c.config.Database,

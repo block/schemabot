@@ -2388,6 +2388,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			// No TargetShards: the VSchema is namespace-level, not per shard.
 			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 			GenerationOperationKeys: scope.generationOperationKeys(),
+			IgnoreTables:            plan.IgnoreTables(),
 		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
@@ -3212,6 +3213,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		TargetShards:            targetShards,
 		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 		GenerationOperationKeys: scope.generationOperationKeys(),
+		IgnoreTables:            plan.IgnoreTables(),
 	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
