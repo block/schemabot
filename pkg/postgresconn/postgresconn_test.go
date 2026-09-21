@@ -220,11 +220,6 @@ func TestWithRootCAsClearsFallbacks(t *testing.T) {
 	assert.Empty(t, cfg.Fallbacks)
 }
 
-// TestVerifiesServerCertificate pins which sslmodes actually authenticate the
-// server: verify-full and verify-ca consult the trust roots, require and
-// prefer encrypt without verifying, and disable negotiates no TLS — except
-// that require with an explicit sslrootcert is upgraded by pgx to verify-ca
-// semantics, matching libpq.
 const nonVerifyingRDSWarning = "PostgreSQL RDS connection does not authenticate the server; the configured sslmode is honored for compatibility"
 
 // captureWarnings routes the default logger into a buffer for the test and
@@ -286,6 +281,18 @@ func TestOpenWarnsWhenRDSConnectionDoesNotVerify(t *testing.T) {
 			dsn:      "postgres://schemabot:secret@plain.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=disable",
 			wantWarn: true,
 			wantAttr: []string{`tls=none`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "sslmode=prefer retains a plaintext fallback",
+			dsn:      "postgres://schemabot:secret@prefer.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=prefer",
+			wantWarn: true,
+			wantAttr: []string{`tls="plaintext fallback"`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "sslmode=allow starts in plaintext",
+			dsn:      "postgres://schemabot:secret@allow.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=allow",
+			wantWarn: true,
+			wantAttr: []string{`tls="plaintext fallback"`, `sslmode_source=dsn`},
 		},
 		{
 			name:     "keyword DSN is judged the same way",
@@ -376,6 +383,11 @@ func TestVerifiesServerCertificateDoesNotWarn(t *testing.T) {
 	assert.Empty(t, logs.String())
 }
 
+// TestVerifiesServerCertificate pins which sslmodes actually authenticate the
+// server: verify-full and verify-ca consult the trust roots, require and
+// prefer encrypt without verifying, and disable negotiates no TLS — except
+// that require with an explicit sslrootcert is upgraded by pgx to verify-ca
+// semantics, matching libpq.
 func TestVerifiesServerCertificate(t *testing.T) {
 	base := "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode="
 	tests := []struct {

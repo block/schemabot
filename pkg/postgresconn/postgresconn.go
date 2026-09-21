@@ -59,8 +59,9 @@ var warnedNonVerifyingRDS sync.Map
 // spelling: pgx folds sslmode, sslrootcert, and the libpq environment into
 // one TLS config, and that config is what the dial proves.
 const (
-	tlsPostureNone       = "none"
-	tlsPostureUnverified = "encrypted, unverified"
+	tlsPostureNone              = "none"
+	tlsPostureUnverified        = "encrypted, unverified"
+	tlsPosturePlaintextFallback = "plaintext fallback"
 )
 
 // Option customizes the parsed PostgreSQL config before the pool is opened.
@@ -260,35 +261,47 @@ func dialConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	warnNonVerifyingRDSTLS(cfg, sslmodeInjected(dsn))
+	warnNonVerifyingRDSTLS(cfg, dsn)
 	return cfg, nil
+}
+
+// WarnNonVerifyingRDSTLS judges and announces the resolved transport posture
+// without dialing. It is for connection paths that consume ConnectionDSN but
+// build their own pool.
+func WarnNonVerifyingRDSTLS(dsn string) error {
+	cfg, err := connectionConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("judge PostgreSQL RDS TLS posture: %w", err)
+	}
+	warnNonVerifyingRDSTLS(cfg, dsn)
+	return nil
 }
 
 // warnNonVerifyingRDSTLS logs once per RDS endpoint and TLS posture when the
 // config about to be dialed does not authenticate the server certificate.
 // The judgement is made on the resolved TLS config, the same predicate
-// VerifiesServerCertificate applies: verify-full and verify-ca authenticate,
-// require with an sslrootcert authenticates through pgx's verifier, and
-// require, prefer, allow, and disable do not. The posture is honored rather
+// VerifiesServerCertificate applies: verify-full and chain-only modes such as
+// verify-ca count as authentication for this warning, while require, prefer,
+// allow, and disable do not. The posture is honored rather
 // than refused. An explicit sslmode against an RDS host was asked for, and
 // SchemaBot's own default for an RDS host with no sslmode is require, so
 // refusing either would turn a compatibility setting into an outage; the
 // warning names which of the two produced the posture so the remedy — an
 // explicit sslmode=verify-full — is aimed at the right place.
-func warnNonVerifyingRDSTLS(cfg *pgx.ConnConfig, injected bool) {
+func warnNonVerifyingRDSTLS(cfg *pgx.ConnConfig, dsn string) {
 	host := strings.ToLower(cfg.Host)
-	if !dbconn.IsRDSHost(host) || verifiesServerCertificate(cfg.TLSConfig) {
+	if !dbconn.IsRDSHost(host) || resolvedConfigVerifiesServer(cfg) {
 		return
 	}
 	key := nonVerifyingRDSKey{
 		addr:    net.JoinHostPort(host, strconv.Itoa(int(cfg.Port))),
-		posture: tlsPosture(cfg.TLSConfig),
+		posture: tlsPosture(cfg),
 	}
 	if _, loaded := warnedNonVerifyingRDS.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
 	source := "dsn"
-	if injected {
+	if sslmodeInjected(dsn) {
 		source = "schemabot default sslmode=require"
 	}
 	slog.Warn("PostgreSQL RDS connection does not authenticate the server; the configured sslmode is honored for compatibility",
@@ -305,13 +318,42 @@ func sslmodeInjected(dsn string) bool {
 	return err == nil && normalized != dsn
 }
 
-// tlsPosture names what a non-verifying resolved TLS config does prove: an
-// encrypted channel to an unauthenticated peer, or no TLS at all.
-func tlsPosture(tc *tls.Config) string {
-	if tc == nil {
+// tlsPosture names what a non-verifying resolved config proves. Any plaintext
+// fallback takes precedence because the eventual channel may be unencrypted.
+func tlsPosture(cfg *pgx.ConnConfig) string {
+	hasTLS := cfg.TLSConfig != nil
+	hasPlaintext := cfg.TLSConfig == nil
+	for _, fallback := range cfg.Fallbacks {
+		if fallback.TLSConfig == nil {
+			hasPlaintext = true
+		} else {
+			hasTLS = true
+		}
+	}
+	if hasPlaintext && hasTLS {
+		return tlsPosturePlaintextFallback
+	}
+	if !hasTLS {
 		return tlsPostureNone
 	}
 	return tlsPostureUnverified
+}
+
+// resolvedConfigVerifiesServer reports whether every connection attempt the
+// config can make authenticates the server. pgx expresses sslmode=prefer and
+// sslmode=allow as a primary TLS config plus fallbacks that swap TLS for
+// plaintext or the reverse, so a config authenticates only when the primary
+// and each fallback do.
+func resolvedConfigVerifiesServer(cfg *pgx.ConnConfig) bool {
+	if !verifiesServerCertificate(cfg.TLSConfig) {
+		return false
+	}
+	for _, fallback := range cfg.Fallbacks {
+		if !verifiesServerCertificate(fallback.TLSConfig) {
+			return false
+		}
+	}
+	return true
 }
 
 // verifiesServerCertificate reports whether a resolved TLS config

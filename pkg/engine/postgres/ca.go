@@ -34,11 +34,16 @@ const (
 // caCertPath resolves the credentials' CA reference to the bundle path
 // pg-sprite's pool trusts. An absent reference and the embedded RDS bundle
 // both resolve to no path: the pool then keeps the trust the normalized DSN
-// asks for. pg-sprite honors any sslmode the DSN spells out and only supplies
-// its own RDS verify-full default when the DSN names none, so the sslmode
-// SchemaBot injects for RDS targets is what the pool dials with; a verifying
-// sslmode with no sslrootcert is completed with the embedded RDS bundle on
-// both connection paths. A reference the engine cannot honor is refused —
+// asks for. pg-sprite honors an sslmode the DSN spells as `sslmode=` and only
+// supplies its own RDS verify-full default when it sees none, so the sslmode
+// SchemaBot injects for RDS targets is what the pool dials with. That match
+// holds for the common DSN shapes and not for every one: a keyword DSN that
+// spells the mode with spaces around `=` is explicit to SchemaBot but not to
+// pg-sprite, and the two RDS host checks differ on letter case and on
+// partitions outside the commercial `rds.amazonaws.com` suffix. Both layers
+// complete verify-full without an sslrootcert with the embedded RDS bundle;
+// verify-ca carries pgx's own verifier and is left to the roots the DSN
+// names. A reference the engine cannot honor is refused —
 // an unrecognized CA must never silently downgrade to a different trust root.
 // A file reference must be absolute: a relative path would resolve against
 // the server's working directory and could name an unintended file. A file
@@ -93,6 +98,9 @@ func ConnectionOptions(creds *engine.Credentials) ([]postgresconn.Option, error)
 // DSN's own settings apply. Routing every pool through one constructor keeps
 // the dial sites from drifting apart in what they trust.
 func spritePoolConfig(dsn, caPath string) (dbconn.Config, error) {
+	if err := postgresconn.WarnNonVerifyingRDSTLS(dsn); err != nil {
+		return dbconn.Config{}, fmt.Errorf("judge PostgreSQL DSN for pg-sprite pool: %w", err)
+	}
 	normalized, err := postgresconn.ConnectionDSN(dsn)
 	if err != nil {
 		return dbconn.Config{}, fmt.Errorf("normalize PostgreSQL DSN for pg-sprite pool: %w", err)
