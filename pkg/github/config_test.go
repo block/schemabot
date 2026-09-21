@@ -1381,8 +1381,8 @@ ignore_tables:
 // The exclusion keys are validated where the config is read, not where it is
 // used: an entry that cannot match — one carrying whitespace the target's
 // catalog can never spell — withholds nothing, and matching is exact, so the
-// table it names would stay exposed to the undeclared-table verdict with only
-// a warning to say so. Both keys are covered here because the validation is
+// table it names would still be planned as a drop with only a warning to say
+// so. Both keys are covered here because the validation is
 // the fetch's, and a call that goes missing from it is invisible to the
 // validators' own tests.
 func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {

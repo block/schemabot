@@ -631,8 +631,7 @@ func TestOnboardRetainsEmptyNamespacesAndRejectsCaseCollisions(t *testing.T) {
 // A table name the target's catalog allows but YAML would reinterpret has to
 // survive the write. Written bare, a name opening with a comment marker is
 // read back as a comment: the config would state an exclusion that no longer
-// loads, and the table it names would face the undeclared-table verdict on
-// the next plan.
+// loads, and the next plan would propose dropping the table it names.
 func TestOnboardConfigYAML_ExclusionsRoundTripThroughQuoting(t *testing.T) {
 	exclusions := client.PlanExclusions{
 		Namespaces: []string{"#reporting", "app"},

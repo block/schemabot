@@ -344,7 +344,7 @@ type onboardConfig struct {
 // the target's catalog: a name that needs YAML quoting to survive a load —
 // one opening with a comment marker, say — would otherwise be written bare and
 // read back as something else, silently dropping the exclusion it states and
-// leaving its table exposed to the undeclared-table verdict.
+// leaving the next plan to propose dropping its table.
 func onboardConfigYAML(database, databaseType string, exclusions client.PlanExclusions) (string, error) {
 	var b strings.Builder
 	enc := yaml.NewEncoder(&b)
