@@ -315,6 +315,15 @@ type PlanRequest struct {
 	// and the re-plan an apply runs predicts the shape it is actually about to
 	// use.
 	GroupedExecution bool
+
+	// IgnoreTables lists the live tables the repository's ignore_tables config
+	// withholds from the planner, so a table no schema file declares is not
+	// proposed for DROP TABLE. Entries are matched exactly and case-sensitively
+	// against the target's own catalog, in every namespace the plan covers.
+	// Every engine honors the list, discloses what it actually withheld through
+	// ExemptTables, and refuses a table the config withholds that a schema file
+	// also declares (see IgnoredTables).
+	IgnoreTables []string
 }
 
 // PlanResult contains the computed schema change plan.
