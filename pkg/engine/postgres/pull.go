@@ -195,10 +195,12 @@ type renderedTable struct {
 //
 // A per-table refusal — objects the format cannot carry, a shape the
 // renderer refuses — is recorded against that table and the render carries
-// on. A failure to read the catalog at all, and a cancelled or expired
-// context, are the caller's outcome rather than one table's: either ends the
-// whole render with an error instead of being recorded as a per-table
-// failure and carried on past.
+// on. Any failure to read the catalog — a table the listing named that
+// introspection cannot find or resolve, a query that fails, a cancelled or
+// expired context — is the caller's outcome rather than one table's: it ends
+// the whole render with an error, and cancels the introspections still in
+// flight, instead of being recorded as a per-table refusal and carried on
+// past.
 func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
 	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
@@ -250,9 +252,13 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace str
 }
 
 // renderPostgresTable renders one table for a baseline. A refusal the
-// baseline must report per table comes back in the result; an error that
-// ends the whole render — a catalog read failure or a cancelled or expired
-// context — comes back as the error.
+// baseline must report per table — objects the format cannot carry, a shape
+// the renderer refuses — comes back in the result. Every other failure comes
+// back as the error and ends the whole render: a table the listing named
+// that introspection cannot read is not a shape of that table, it is a
+// catalog the render could not read consistently, and a baseline assembled
+// past it would misreport a connection failure or a concurrent schema change
+// as a refusal of one table.
 func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, table string, policy baselinePolicy) (*renderedTable, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -268,10 +274,7 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 	}
 	model, err := schemadiff.Introspect(ctx, pool, namespace, table)
 	if err != nil {
-		if isContextError(err) {
-			return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
-		}
-		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: introspect: %w", namespace, table, err)}, nil
+		return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
 	}
 	content, err := schemadiff.Render(model)
 	if err != nil {
@@ -359,8 +362,4 @@ func unmodeledTableObjectsError(namespace, table string, objects unmodeledTableO
 		return nil
 	}
 	return fmt.Errorf("schema %q table %q carries objects the declarative format does not represent: %s", namespace, table, strings.Join(kinds, ", "))
-}
-
-func isContextError(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

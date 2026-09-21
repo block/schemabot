@@ -333,15 +333,19 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // captureOriginalFiles renders the live namespace as the plan's rollback
 // baseline, keyed by schema file name. The baseline is every managed table
 // in the namespace except the archive tables the plan exempts, so it is
-// complete or it is nothing: one table pg-sprite's renderer refuses — each
-// shape it refuses is named by one of its ErrUnrenderable errors, foreign
-// keys on either side and inheritance among them — leaves captured false,
-// and RV-7 then refuses rollback for this plan rather than reconstructing
-// the originals. The plan itself still proceeds, because rollback capability
-// is not a precondition for reviewing or applying the change. Only a failure
-// to read the namespace at all is an error, and a cancelled context is that
-// failure rather than one table's, so a plan interrupted mid-capture is
-// never recorded as rollback-incapable.
+// complete or it is nothing, and the two ways it can fall short end
+// differently. A table the engine read but pg-sprite's renderer refuses —
+// each shape it refuses is named by one of its ErrUnrenderable errors,
+// foreign keys on either side and inheritance among them — leaves captured
+// false, and RV-7 then refuses rollback for this plan rather than
+// reconstructing the originals; the plan itself still proceeds, because
+// rollback capability is not a precondition for reviewing or applying the
+// change. A table the engine could not read — the listing named it and
+// introspection cannot find or resolve it, a catalog query fails, the
+// context is cancelled — is an error that ends the plan, whether it is one
+// table's read or the namespace's: a catalog that could not be read
+// consistently is not one to plan against, and a plan interrupted
+// mid-capture is never recorded as rollback-incapable.
 //
 // The render introspects every managed table in the namespace, changed or
 // not, so its cost grows with the namespace rather than with the change; the
