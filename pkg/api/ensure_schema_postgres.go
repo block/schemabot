@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
@@ -233,9 +234,15 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 // The phases a PostgreSQL convergence reports a table in. There is no third:
 // each table's changes run in one transaction, so a table is either being
 // converged or converged, never partway.
+//
+// The finished one is the shared terminal state rather than a word of this
+// dialect's own. A reader of these observations has to be able to tell that a
+// subject is finished without knowing which dialect produced it — that is what
+// decides whether there is anything left to report about it — and a dialect
+// spelling the end differently makes that a lookup table instead of a check.
 const (
 	postgresConvergenceRunning  = "running"
-	postgresConvergenceComplete = "complete"
+	postgresConvergenceComplete = string(engine.StateCompleted)
 )
 
 // postgresConvergenceProgress is one observation of the per-table convergence,

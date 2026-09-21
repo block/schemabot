@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -88,7 +89,17 @@ func (p *storageProgressPrinter) observeSubject(s storageProgressSubject) {
 	if !seen {
 		last = &storageProgressSubjectLog{startedAt: now}
 		p.subjects[s.table] = last
-		p.emit(now, s, s.announcement())
+		if s.finished() {
+			// The subject was already finished the first time a poll saw it:
+			// an instant DDL, or a copy that fit between two polls. Announcing
+			// it as started would say it began after it ended, and no
+			// transition can correct that later, because a terminal state is
+			// the last one there is. It gets the event it is actually in, and
+			// no duration, since nothing ever observed it running.
+			p.emit(now, s, s.transition())
+		} else {
+			p.emit(now, s, s.announcement())
+		}
 		last.status, last.lastEmit = s.status, now
 		return
 	}
@@ -100,6 +111,14 @@ func (p *storageProgressPrinter) observeSubject(s storageProgressSubject) {
 		// run, so it prints whatever the heartbeat interval says.
 		p.emit(now, s, append(s.transition(), "duration", ui.FormatHumanDuration(now.Sub(last.startedAt))))
 		last.heartbeats = 0
+	case s.finished():
+		// Reported terminal once already. A convergence keeps polling until
+		// every subject is done, so a table that finished early is still in
+		// every observation until the last one — and heartbeating it would
+		// spend the rest of the run insisting a finished table is still
+		// copying rows. There is nothing left to confirm about a subject the
+		// engine has let go of.
+		return
 	case now.Sub(last.lastEmit) < last.heartbeatInterval():
 		// Ten polls a second are one thing happening, and the interval is what
 		// collapses them into one line. It is deliberately the only thing that
@@ -158,6 +177,14 @@ func (s storageProgressSubject) announcement() []string {
 		kvs = append(kvs, "status", s.status)
 	}
 	return kvs
+}
+
+// finished reports whether the engine has said this subject is done, in
+// whichever way it finished. It is asked of the engine's own state rather than
+// of a percentage, because a copy sits at 100% through its whole checksum and
+// is not finished at all.
+func (s storageProgressSubject) finished() bool {
+	return engine.State(s.status).IsTerminal()
 }
 
 // transition puts the new state in the message, which is where log mode reads

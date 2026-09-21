@@ -71,6 +71,68 @@ func TestStorageProgressPrinter_AStalledCopyKeepsHeartbeating(t *testing.T) {
 		"every line carries the frozen count — the announcement and all six heartbeats; that it has not moved is the news")
 }
 
+// A convergence polls until the last of its work is done, and every
+// observation until then still carries the tables that finished early. Those
+// have nothing left to report: a heartbeat for one would spend the rest of the
+// run insisting a finished table is still copying rows.
+func TestStorageProgressPrinter_AFinishedTableStopsReporting(t *testing.T) {
+	var out strings.Builder
+	clock := time.Now()
+	printer := clockedPrinter(&out, &clock)
+
+	observation := func(status string, percent int) api.StorageConvergenceProgress {
+		return api.StorageConvergenceProgress{
+			State:  status,
+			Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: status, Percent: percent, RowsCopied: 5_084_117}},
+		}
+	}
+	printer.observe(observation("copyRows", 50))
+	clock = clock.Add(time.Second)
+	printer.observe(observation("completed", 100))
+
+	// Forty more seconds of the convergence finishing its other work.
+	for range 400 {
+		clock = clock.Add(100 * time.Millisecond)
+		printer.observe(observation("completed", 100))
+	}
+
+	got := stripANSI(out.String())
+	assert.Equal(t, 1, strings.Count(got, "Table completed"),
+		"the table reports its completion once")
+	assert.NotContains(t, got, "Copying rows",
+		"a table the engine has let go of must not keep claiming it is copying rows")
+	assert.Equal(t, 2, strings.Count(got, "\n"),
+		"the whole table is two lines: it started, and it finished")
+}
+
+// A change the engine finishes between two polls — an instant DDL, or a copy
+// small enough to fit in 100ms — is terminal the first time it is ever seen.
+// Announcing it as started would say it began after it ended, and no
+// transition can correct that afterwards, because a terminal state is the last
+// one there is.
+func TestStorageProgressPrinter_ATableFinishedBeforeItWasSeenReportsItsCompletion(t *testing.T) {
+	var out strings.Builder
+	clock := time.Now()
+	printer := clockedPrinter(&out, &clock)
+
+	for range 300 {
+		printer.observe(api.StorageConvergenceProgress{
+			State:  "completed",
+			Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "completed", Percent: 100}},
+		})
+		clock = clock.Add(100 * time.Millisecond)
+	}
+
+	got := stripANSI(out.String())
+	assert.Contains(t, got, "Table completed table=applies",
+		"the subject is reported in the state it is actually in")
+	assert.NotContains(t, got, "Table started",
+		"a table that was over before it was seen never started as far as this run can tell")
+	assert.NotContains(t, got, "duration=",
+		"nothing observed it running, so there is no duration to claim")
+	assert.Equal(t, 1, strings.Count(got, "\n"), "and it is one line, not a heartbeat for the rest of the run")
+}
+
 // Rows copied moves on every poll, so a line per change would be a line per
 // poll under a different name. Changes that are only numbers wait out the
 // heartbeat interval — the first one briefly, for early confirmation, and the
@@ -173,10 +235,10 @@ func TestStorageProgressPrinter_EmitsLogfmt(t *testing.T) {
 		},
 		"a transition carries how long the subject has been running": {
 			observations: []api.StorageConvergenceProgress{
-				{Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "copying"}}},
-				{Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "complete", Percent: 100}}},
+				{Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "copyRows"}}},
+				{Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "completed", Percent: 100}}},
 			},
-			want: []string{"Table complete", "table=applies", "duration=", "progress=100%"},
+			want: []string{"Table completed", "table=applies", "duration=", "progress=100%"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -231,15 +293,15 @@ func TestStorageProgressPrinter_TracksEachTableSeparately(t *testing.T) {
 		State: "copying",
 		Tables: []api.StorageConvergenceTableProgress{
 			{Table: "applies", State: "copying"},
-			{Table: "checks", State: "complete"},
+			{Table: "checks", State: "completed"},
 		},
 	})
 
 	got := stripANSI(out.String())
 	assert.Contains(t, got, "Table started table=applies")
 	assert.Contains(t, got, "Table started table=checks")
-	assert.Contains(t, got, "Table complete table=checks")
-	assert.NotContains(t, got, "Table complete table=applies")
+	assert.Contains(t, got, "Table completed table=checks")
+	assert.NotContains(t, got, "Table completed table=applies")
 }
 
 // A line carries a time and no zone, so the two log-mode surfaces have to

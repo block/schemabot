@@ -384,7 +384,14 @@ Do you want to apply these changes to schemabot on db-1.example (mysql)? Only 'y
 phase, passed through rather than translated — `copyRows`, `checksum`,
 `cutOver` on MySQL. An alert matching on them is matching what the engine
 calls things, which is the vocabulary that stays true when SchemaBot's
-rendering changes.
+rendering changes. The one word every dialect shares is the last one:
+`completed` ends a table on all of them, so "is this finished" is a match
+against one string rather than a table of per-dialect spellings.
+
+A table stops reporting once it is finished. A convergence keeps polling until
+the last of its work is done, so a table that completed early is still in every
+observation until the end of the run — but it has nothing left to say, and a
+heartbeat for it would insist a finished table is still copying rows.
 
 What is missing from a line is a measurement the dialect never took, not a
 zero. PostgreSQL converges a table per transaction, so it knows which table it
@@ -395,9 +402,12 @@ done — and no `progress=` or row counts:
 ```console
 $ schemabot storage apply --dsn "$SCHEMABOT_STORAGE_DSN"
 ...
-15:04:08 Table started table=applies status=converging
-15:04:11 Table started table=apply_logs status=converging converged=33%
-15:04:14 Table started table=settings status=converging converged=66%
+15:04:08 Table started table=applies status=running
+15:04:11 Table completed table=applies duration=3s converged=33%
+15:04:12 Table started table=apply_logs status=running converged=33%
+15:04:15 Table completed table=apply_logs duration=3s converged=66%
+15:04:16 Table started table=settings status=running converged=66%
+15:04:19 Table completed table=settings duration=3s converged=100%
 ✓ Ran 3 statements against schemabot on db-1.example. Nothing is outstanding.
 ```
 

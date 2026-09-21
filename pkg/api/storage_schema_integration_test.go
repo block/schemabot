@@ -860,4 +860,15 @@ func TestApplyStorageSchemaPostgres_ReportsProgressToAWatchingCaller(t *testing.
 	}
 	assert.Equal(t, 100, observed[len(observed)-1].Percent,
 		"the last observation of a clean convergence is the whole drift set behind it")
+
+	// Every dialect ends a table with the same word, so a reader of these
+	// observations can tell a finished subject from a running one without
+	// knowing which dialect produced it. That is what decides whether there is
+	// anything left to report about it, and a per-dialect spelling would make
+	// it a lookup table instead of a check.
+	last := observed[len(observed)-1]
+	assert.True(t, engine.State(last.State).IsTerminal(),
+		"a converged run ends in the shared terminal state, not a spelling of this dialect's own: %q", last.State)
+	assert.True(t, engine.State(last.Tables[0].State).IsTerminal(),
+		"and so does the table it ended on: %q", last.Tables[0].State)
 }
