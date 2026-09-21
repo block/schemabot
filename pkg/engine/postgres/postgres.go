@@ -344,7 +344,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // never recorded as rollback-incapable.
 //
 // The render introspects every managed table in the namespace, changed or
-// not, so its cost grows with the namespace rather than with the change.
+// not, so its cost grows with the namespace rather than with the change; the
+// introspections run concurrently within the pool's ceiling, so the wall
+// time grows more slowly than the table count does.
 func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string) (files map[string]string, captured bool, err error) {
 	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline)
 	if err != nil {

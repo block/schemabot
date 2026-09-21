@@ -916,12 +916,23 @@ name.
 
 A PostgreSQL RDS DSN without an explicit `sslmode` gets `sslmode=require`
 injected, which encrypts the connection but does not by itself authenticate
-the server. An explicit `sslmode`, including `disable`, is honored as written
-and does not log a warning. Certificate verification (`sslmode=verify-full` or
-`verify-ca`) is required only where a trust setting depends on it: a pinned
-CA bundle under a non-verifying `sslmode` is refused at CA resolution, as
-described under [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets),
-rather than silently never consulted.
+the server. An explicit `sslmode`, including `disable`, is honored as written.
+Either way, a connection to an RDS endpoint that does not authenticate the
+server logs a warning naming the endpoint, what the transport does prove
+(`encrypted, unverified` or `none`), and whether the posture came from the DSN
+or from SchemaBot's injected default, once per endpoint and posture for the
+life of the process. The judgement is made on the TLS settings pgx resolves
+for the DSN it dials, so `sslmode=require` with an `sslrootcert` — which pgx
+verifies through the named roots — does not warn. To authenticate an RDS
+server, set `sslmode=verify-full` explicitly; without an `sslrootcert`, the
+embedded RDS root bundle is used. The same DSN is handed to the engine's
+data-plane pool, which honors the injected `sslmode=require` rather than
+applying its own RDS default, so the warning describes both connections.
+Certificate verification is also required where a trust setting depends on
+it: a pinned CA bundle under a non-verifying `sslmode` is refused at CA
+resolution, as described under
+[PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets), rather than
+silently never consulted.
 
 ## PlanetScale mTLS
 
