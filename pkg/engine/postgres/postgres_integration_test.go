@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"maps"
 	"net/url"
 	"slices"
@@ -32,7 +33,10 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
-const postgresApplyDeadline = 10 * time.Second
+const (
+	postgresApplyDeadline               = 10 * time.Second
+	introspectionCapObservationDeadline = 250 * time.Millisecond
+)
 
 // TestEnginePullSchema exports every ordinary table in a requested schema as
 // an independently parseable declarative file, including constraints and
@@ -370,6 +374,28 @@ func TestEnginePlanCaptureLeavesExemptArchiveTablesOutOfBaseline(t *testing.T) {
 		"the baseline declares exactly the tables a rollback re-plan would manage")
 }
 
+// A cancellation that arrives after listing an all-archive namespace still
+// ends the baseline capture, even though no managed table needs introspection.
+func TestRenderPostgresTablesLeavesExemptArchiveTablesOutOfBaselineAfterCancellation(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_archive_cancel_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(ctx, pool, "public", rollbackBaseline)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, rendered)
+	assert.Nil(t, renderErrors)
+}
+
 // cancelAfterFirstQuery cancels the capture's context as soon as its table
 // listing has returned, so every introspection that follows runs against a
 // cancelled context.
@@ -451,6 +477,79 @@ func (r *introspectionRendezvous) TraceQueryStart(ctx context.Context, _ *pgx.Co
 
 func (r *introspectionRendezvous) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
+type introspectionCeiling struct {
+	mu        sync.Mutex
+	inFlight  int
+	peak      int
+	breached  chan struct{}
+	breachOne sync.Once
+}
+
+func (c *introspectionCeiling) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		return ctx
+	}
+	c.mu.Lock()
+	c.inFlight++
+	c.peak = max(c.peak, c.inFlight)
+	over := c.inFlight > baselineIntrospectionConcurrency
+	c.mu.Unlock()
+	if over {
+		c.breachOne.Do(func() { close(c.breached) })
+	}
+	timer := time.NewTimer(introspectionCapObservationDeadline)
+	defer timer.Stop()
+	select {
+	case <-c.breached:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	c.mu.Lock()
+	c.inFlight--
+	c.mu.Unlock()
+	return ctx
+}
+
+func (c *introspectionCeiling) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (c *introspectionCeiling) observedPeak() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peak
+}
+
+// A baseline render uses the configured concurrency cap even when the pool
+// has enough connections and the namespace has enough tables to exceed it.
+func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_cap_test")
+	var ddl strings.Builder
+	ddl.WriteString("CREATE SCHEMA app;")
+	for i := range baselineIntrospectionConcurrency * 2 {
+		fmt.Fprintf(&ddl, "CREATE TABLE app.t%02d (id bigint PRIMARY KEY);", i)
+	}
+	_, err := db.ExecContext(t.Context(), ddl.String())
+	require.NoError(t, err)
+
+	ceiling := &introspectionCeiling{breached: make(chan struct{})}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = int32(baselineIntrospectionConcurrency * 2)
+	poolCfg.ConnConfig.Tracer = ceiling
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "app", rollbackBaseline)
+	require.NoError(t, err)
+	assert.Empty(t, renderErrors)
+	assert.Len(t, rendered, baselineIntrospectionConcurrency*2)
+	peak := ceiling.observedPeak()
+	assert.LessOrEqual(t, peak, baselineIntrospectionConcurrency,
+		"introspections in flight at once must never exceed the cap")
+	assert.Greater(t, peak, 1,
+		"the render must overlap introspections for the cap to be exercised at all")
+}
+
 // A baseline render introspects tables concurrently, and the baseline it
 // assembles does not depend on which introspection finished first: the
 // rendered set and the per-table refusals come back in table-listing order
@@ -483,9 +582,9 @@ func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T)
 	defer pool.Close()
 
 	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", pulledBaseline)
-	require.NoError(t, err)
 	assert.False(t, rendezvous.timedOut.Load(),
 		"two introspections must be in flight at once; a render that takes tables one at a time never reaches the second BEGIN")
+	require.NoError(t, err)
 
 	assert.ElementsMatch(t, []string{"a_accounts", "c_customers", "e_events"}, slices.Collect(maps.Keys(rendered)))
 	assert.Contains(t, rendered["c_customers"], `"name" text NOT NULL`)

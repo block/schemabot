@@ -172,7 +172,8 @@ const baselineIntrospectionConcurrency = 8
 // baselineIntrospectionLimit bounds the render's concurrency by the pool as
 // well as the cap: an introspection holds one pooled connection for its whole
 // transaction, so more goroutines than connections would only queue on
-// acquire.
+// acquire. MaxConns honors pool_max_conns when the DSN sets it; otherwise
+// pgxpool defaults it from the process CPU count.
 func baselineIntrospectionLimit(pool *pgxpool.Pool) int {
 	return max(1, min(baselineIntrospectionConcurrency, int(pool.Config().MaxConns)))
 }
@@ -203,16 +204,20 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace str
 	if err != nil {
 		return nil, nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
 	}
-	results := make([]*renderedTable, len(tables))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(baselineIntrospectionLimit(pool))
-	for i, table := range tables {
+	managedTables := make([]string, 0, len(tables))
+	for _, table := range tables {
 		if policy.skipArchiveTables && spirittable.IsArchiveTable(table) {
 			slog.Debug("PostgreSQL archive table is outside management and left out of the rendered baseline",
 				"namespace", namespace,
 				"table", table)
 			continue
 		}
+		managedTables = append(managedTables, table)
+	}
+	results := make([]*renderedTable, len(managedTables))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(baselineIntrospectionLimit(pool))
+	for i, table := range managedTables {
 		g.Go(func() error {
 			result, err := renderPostgresTable(gctx, pool, namespace, table, policy)
 			if err != nil {
@@ -225,13 +230,16 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace str
 	if err := g.Wait(); err != nil {
 		return nil, nil, err
 	}
-	rendered := make(map[string]string, len(tables))
+	if err := ctx.Err(); err != nil {
+		return nil, nil, fmt.Errorf("render PostgreSQL tables in schema %q: %w", namespace, err)
+	}
+	rendered := make(map[string]string, len(managedTables))
 	var renderErrors []error
-	for i, table := range tables {
+	for i, table := range managedTables {
 		result := results[i]
 		switch {
 		case result == nil:
-			// An archive table the policy left out.
+			return nil, nil, fmt.Errorf("render PostgreSQL table %q in schema %q produced no result", table, namespace)
 		case result.renderErr != nil:
 			renderErrors = append(renderErrors, result.renderErr)
 		default:
@@ -267,9 +275,6 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 	}
 	content, err := schemadiff.Render(model)
 	if err != nil {
-		if isContextError(err) {
-			return nil, fmt.Errorf("render schema %q table %q: %w", namespace, table, err)
-		}
 		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: render: %w", namespace, table, err)}, nil
 	}
 	return &renderedTable{content: content}, nil
