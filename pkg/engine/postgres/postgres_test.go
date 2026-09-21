@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -1286,25 +1288,29 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 		"the package helper resolves the engine's declaration")
 }
 
-// TestOptionalCapabilitySet is the engine capability mapping in
-// docs/postgresql.md as code: one verdict per optional interface package
-// engine declares. The inventory scan fails the test when package engine
-// gains an optional interface this table does not classify, so the doc's
-// table and the engine's method set cannot drift apart unnoticed.
-func TestOptionalCapabilitySet(t *testing.T) {
-	verdicts := map[reflect.Type]bool{
-		reflect.TypeFor[engine.Drainer]():                         true,
-		reflect.TypeFor[engine.ShutdownHalter]():                  true,
-		reflect.TypeFor[engine.SynchronousWorkRegistration]():     true,
-		reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
-		reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,
-		reflect.TypeFor[engine.CancelledArtifactReleaser]():       false,
-		reflect.TypeFor[engine.ControlResumeValidator]():          false,
-	}
+// optionalCapabilityVerdicts records, per optional interface package engine
+// declares, whether the PostgreSQL engine implements it. The engine capability
+// mapping in docs/postgresql.md states the same verdicts in prose.
+var optionalCapabilityVerdicts = map[reflect.Type]bool{
+	reflect.TypeFor[engine.Drainer]():                         true,
+	reflect.TypeFor[engine.ShutdownHalter]():                  true,
+	reflect.TypeFor[engine.SynchronousWorkRegistration]():     true,
+	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
+	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,
+	reflect.TypeFor[engine.CancelledArtifactReleaser]():       false,
+	reflect.TypeFor[engine.ControlResumeValidator]():          false,
+}
 
+// TestOptionalCapabilitySet checks the recorded verdicts against the engine's
+// method set and against the optional interfaces package engine declares: a
+// verdict the engine does not hold fails, and so does an optional interface
+// without a verdict, so the verdict table cannot drift from package engine
+// unnoticed. Whether docs/postgresql.md agrees with the verdicts is checked
+// separately by TestCapabilityMappingMatchesEngine.
+func TestOptionalCapabilitySet(t *testing.T) {
 	inventory := enginetest.OptionalCapabilities(t)
 	engineType := reflect.TypeOf(New())
-	for typ, implements := range verdicts {
+	for typ, implements := range optionalCapabilityVerdicts {
 		assert.True(t, inventory[typ.Name()],
 			"verdict names %s, which package engine no longer declares as an optional interface", typ.Name())
 		delete(inventory, typ.Name())
@@ -1312,6 +1318,68 @@ func TestOptionalCapabilitySet(t *testing.T) {
 	}
 	assert.Empty(t, inventory,
 		"optional engine capabilities without a PostgreSQL verdict; add the verdict here and its row to the capability mapping in docs/postgresql.md")
+}
+
+// TestCapabilityMappingMatchesEngine reads the engine capability mapping table
+// in docs/postgresql.md and checks its verdict column against the engine: an
+// optional interface's row must say "Implemented" exactly when the engine
+// implements it and "Not applicable; not implemented" otherwise, and every
+// method of the required engine.Engine interface must have a row. The Why and
+// Where columns are prose and are not checked.
+func TestCapabilityMappingMatchesEngine(t *testing.T) {
+	rows := capabilityMappingRows(t)
+
+	for typ, implements := range optionalCapabilityVerdicts {
+		prefix := "engine." + typ.Name() + "."
+		var matched []string
+		for method, verdict := range rows {
+			if strings.HasPrefix(method, prefix) {
+				matched = append(matched, method)
+				if implements {
+					assert.True(t, strings.HasPrefix(verdict, "Implemented"),
+						"docs/postgresql.md row %s says %q but the engine implements %s", method, verdict, typ.Name())
+				} else {
+					assert.True(t, strings.HasPrefix(verdict, "Not applicable; not implemented"),
+						"docs/postgresql.md row %s says %q but the engine does not implement %s", method, verdict, typ.Name())
+				}
+			}
+		}
+		assert.NotEmpty(t, matched, "docs/postgresql.md has no capability mapping row for %s", typ.Name())
+	}
+
+	engineType := reflect.TypeFor[engine.Engine]()
+	for method := range engineType.Methods() {
+		method := "engine.Engine." + method.Name
+		assert.Contains(t, rows, method, "docs/postgresql.md has no capability mapping row for %s", method)
+	}
+}
+
+// capabilityMappingRows returns the engine capability mapping table from
+// docs/postgresql.md keyed by the interface method in its first column, with
+// the PostgreSQL behavior column as the value.
+func capabilityMappingRows(t *testing.T) map[string]string {
+	t.Helper()
+
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "postgresql.md"))
+	require.NoError(t, err)
+
+	rows := make(map[string]string)
+	inSection := false
+	for line := range strings.SplitSeq(string(doc), "\n") {
+		if strings.HasPrefix(line, "## ") {
+			inSection = line == "## Engine capability mapping"
+			continue
+		}
+		if !inSection || !strings.HasPrefix(line, "| `engine.") {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		require.GreaterOrEqual(t, len(cells), 4, "capability mapping row has too few columns: %s", line)
+		method := strings.Trim(strings.TrimSpace(cells[1]), "`")
+		rows[method] = strings.TrimSpace(cells[2])
+	}
+	require.NotEmpty(t, rows, "no engine capability mapping rows found in docs/postgresql.md")
+	return rows
 }
 
 // A zero ceiling means unset and adopts the default, so a zero-valued client
