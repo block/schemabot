@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	cmdclient "github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Storage schema commands answer, and then close, the one question a deploy
@@ -550,7 +551,7 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 		// run's result is what stdout carries — under --json that is a
 		// document a caller parses, and a progress line in the middle of it is
 		// not a progress line, it is a parse error.
-		progress := newStorageProgressPrinter(os.Stderr)
+		progress := newStorageProgressPrinter(os.Stderr, ui.SupportsColors(os.Stderr))
 		plannedReport, remainingReport, err := api.ApplyStorageSchema(ctx, target.dsn, logger,
 			append(target.ensureSchemaOptions(cmd.AllowUnsafe),
 				api.WithConvergenceTimeout(budget),

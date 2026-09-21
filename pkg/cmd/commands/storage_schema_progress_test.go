@@ -14,7 +14,7 @@ import (
 // clockedPrinter is a printer over a clock a test moves by hand, so the
 // heartbeat intervals can be exercised without any test waiting for them.
 func clockedPrinter(out *strings.Builder, now *time.Time) *storageProgressPrinter {
-	p := newStorageProgressPrinter(out)
+	p := newStorageProgressPrinter(out, false)
 	p.now = func() time.Time { return *now }
 	return p
 }
@@ -206,8 +206,36 @@ func TestStorageProgressPrinter_TracksEachTableSeparately(t *testing.T) {
 func TestNewStorageProgressPrinter_StampsInUTC(t *testing.T) {
 	t.Parallel()
 
-	printer := newStorageProgressPrinter(&strings.Builder{})
+	printer := newStorageProgressPrinter(&strings.Builder{}, false)
 
 	assert.Equal(t, time.UTC, printer.now().Location(),
 		"a host outside UTC would otherwise print a different clock than apply --output log for the same instant")
+}
+
+// Progress goes to stderr so that stdout stays a document a caller can parse,
+// which makes redirecting it to a file the obvious thing to do with it. A file
+// is not a terminal, and escape bytes in one are noise no operator asked for —
+// so the stream being written to is what decides, not stdout's terminal-ness
+// and not an assumption that a person is watching.
+func TestNewStorageProgressPrinter_LeavesEscapesOutOfARedirectedStream(t *testing.T) {
+	t.Parallel()
+
+	var plain strings.Builder
+	printer := newStorageProgressPrinter(&plain, false)
+	printer.observe(api.StorageConvergenceProgress{
+		State:  "copyRows",
+		Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "copyRows", Percent: 12}},
+	})
+
+	assert.NotContains(t, plain.String(), "\x1b[", "a redirected stream gets the line without escapes")
+	assert.Contains(t, plain.String(), "table=applies", "and it is otherwise the same line")
+	assert.Contains(t, plain.String(), "progress=12%")
+
+	var colored strings.Builder
+	terminal := newStorageProgressPrinter(&colored, true)
+	terminal.observe(api.StorageConvergenceProgress{
+		State:  "copyRows",
+		Tables: []api.StorageConvergenceTableProgress{{Table: "applies", State: "copyRows", Percent: 12}},
+	})
+	assert.Contains(t, colored.String(), "\x1b[", "a terminal still gets color")
 }

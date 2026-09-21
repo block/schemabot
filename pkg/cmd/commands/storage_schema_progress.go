@@ -31,6 +31,7 @@ import (
 // which is the only caller the option promises.
 type storageProgressPrinter struct {
 	out      io.Writer
+	colors   bool
 	now      func() time.Time
 	subjects map[string]*storageProgressSubjectLog
 	// stopped is set once a write fails. There is nobody to report a terminal
@@ -59,9 +60,10 @@ func (s *storageProgressSubjectLog) heartbeatInterval() time.Duration {
 	return logHeartbeatDefault
 }
 
-func newStorageProgressPrinter(out io.Writer) *storageProgressPrinter {
+func newStorageProgressPrinter(out io.Writer, colors bool) *storageProgressPrinter {
 	return &storageProgressPrinter{
-		out: out,
+		out:    out,
+		colors: colors,
 		// UTC, because log mode's other surface stamps in UTC and the line
 		// carries no zone to tell them apart. A host outside UTC would
 		// otherwise put two different clocks in one format.
@@ -116,7 +118,7 @@ func (p *storageProgressPrinter) observeSubject(s storageProgressSubject) {
 
 func (p *storageProgressPrinter) emit(now time.Time, s storageProgressSubject, kvs []string) {
 	kvs = append(kvs, s.kvs...)
-	if _, err := fmt.Fprintln(p.out, logfmtLine(now, kvs...)); err != nil {
+	if _, err := fmt.Fprintln(p.out, logfmtLine(now, p.colors, kvs...)); err != nil {
 		p.stopped = true
 	}
 }

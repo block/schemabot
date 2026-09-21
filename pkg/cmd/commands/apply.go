@@ -486,18 +486,31 @@ func (e *logEmitter) emit(kvs ...string) {
 		}
 		kept = append(kept, key, val)
 	}
-	fmt.Println(logfmtLine(now, kept...))
+	// Unconditionally colored, which is this surface's long-standing
+	// behaviour and what its callers already expect from a --output log run.
+	fmt.Println(logfmtLine(now, true, kept...))
 }
 
-// logfmtLine renders a timestamp and key/value pairs as one colored logfmt
-// line. Every log-mode surface renders through here so an operator reads one
-// format wherever the progress comes from — a schema change the server is
-// driving, or a storage convergence running under their own terminal.
-func logfmtLine(now time.Time, kvs ...string) string {
+// logfmtLine renders a timestamp and key/value pairs as one logfmt line. Every
+// log-mode surface renders through here so an operator reads one format
+// wherever the progress comes from — a schema change the server is driving, or
+// a storage convergence running under their own terminal.
+//
+// colors is the caller's, because the surfaces do not share a stream: one
+// writes to stdout and one to stderr, and either can be redirected without the
+// other. Without color the line is the same bytes minus the escapes, which is
+// what makes a redirected log readable and a scraper's job the same either way.
+func logfmtLine(now time.Time, colors bool, kvs ...string) string {
+	paint := func(line []byte, code string) []byte {
+		if !colors || code == "" {
+			return line
+		}
+		return append(line, code...)
+	}
 	var line []byte
-	line = append(line, ansiDim...)
+	line = paint(line, ansiDim)
 	line = append(line, now.Format("15:04:05")...)
-	line = append(line, ansiReset...)
+	line = paint(line, ansiReset)
 
 	for i := 0; i+1 < len(kvs); i += 2 {
 		key, val := kvs[i], kvs[i+1]
@@ -505,17 +518,14 @@ func logfmtLine(now time.Time, kvs ...string) string {
 		if key == "msg" {
 			// Message is rendered as just the value, with color
 			c := msgColor(val)
-			if c != "" {
-				line = append(line, c...)
-			}
+			line = paint(line, c)
 			line = append(line, val...)
 			if c != "" {
-				line = append(line, ansiReset...)
+				line = paint(line, ansiReset)
 			}
 			continue
 		}
-		c := kvColor(key)
-		line = append(line, c...)
+		line = paint(line, kvColor(key))
 		line = append(line, key...)
 		line = append(line, '=')
 		if logfmtNeedsQuoting(val) {
@@ -525,7 +535,7 @@ func logfmtLine(now time.Time, kvs ...string) string {
 		} else {
 			line = append(line, val...)
 		}
-		line = append(line, ansiReset...)
+		line = paint(line, ansiReset)
 	}
 	return string(line)
 }
