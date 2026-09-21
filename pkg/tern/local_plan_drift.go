@@ -203,14 +203,18 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 // deployment's re-plan produced them, so the plan describes the apply as this
 // target will run it rather than as the primary reviewed it.
 //
-// The statement becomes this target's engine-emitted text. The drift
-// comparison has already proven it the same change as the reviewed one under
-// canonicalization; what canonicalization set aside is the spelling that is
-// specific to a target — for an engine that qualifies DDL with the physical
-// schema it planned against, the primary's schema name. Materializing the
-// reviewed text would carry that name here, and the engine refuses a statement
-// naming a schema other than the one the apply addresses. The resume path
-// makes the same substitution when it re-derives a task's statement.
+// The statement becomes this target's engine-emitted text, on every engine.
+// The drift comparison has already proven it the same change as the reviewed
+// one under canonicalization; what canonicalization set aside is the spelling
+// — quoting, whitespace, and for an engine that qualifies DDL with the
+// physical schema it planned against, the primary's schema name. The last is
+// the one that matters for correctness: materializing the reviewed text would
+// carry that name here, and the engine refuses a statement naming a schema
+// other than the one the apply addresses. The others change the stored bytes
+// without changing what runs, so the plan and task rows of one deployment
+// read as that deployment's engine renders them rather than byte-for-byte as
+// the primary's. The resume path makes the same substitution when it
+// re-derives a task's statement.
 //
 // The verdict becomes this target's, so the admission gate judges the plan as
 // this target would run it. The dispatch never carries a verdict today (task
@@ -244,6 +248,74 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 		}
 	}
 	return nil
+}
+
+// dispatchScopeForApply derives the scope a dispatch's task rows are built
+// from, carrying the plan row's copy of each change into it so the task rows
+// and the plan row of one apply hold the same statement and verdict.
+//
+// A whole-deployment dispatch already builds its scope from the plan row, so
+// the stamped changes reach the tasks as they are. A shard-scoped dispatch
+// builds its scope from the dispatched changes instead (the control plane's
+// per-shard fan-out owns that scope), which would carry the primary's text
+// onto the task rows even though the plan row was just materialized with this
+// target's re-planned text. The substitution here closes that gap: each
+// dispatched change is matched to its counterpart in the plan row under the
+// drift key — the same equivalence the drift comparison admitted it on — and
+// takes the counterpart's statement and execution-mode verdict. A change with
+// no counterpart keeps the dispatched statement: the plan row was materialized
+// by a sibling dispatch of the same plan and holds only that dispatch's
+// changes, or was planned locally and holds its sharded changes per shard, and
+// in both the dispatched text is this deployment's own. The substitution never
+// widens what runs — an unmatched change runs exactly the reviewed text — and
+// the operation key a shard-scoped dispatch is stamped with names the
+// namespace, shard and table only, so the control plane's echo check, which
+// derives the key from the dispatched text, is unaffected.
+func (c *LocalClient) dispatchScopeForApply(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatchScope, error) {
+	scope, err := deriveDispatchScope(plan, req)
+	if err != nil {
+		return dispatchScope{}, err
+	}
+	if scope.shard == "" {
+		return scope, nil
+	}
+	parser, err := c.statementParser()
+	if err != nil {
+		return dispatchScope{}, err
+	}
+	stored := map[driftChangeKey][]storage.TableChange{}
+	for _, tc := range plan.FlatDDLChanges() {
+		canon, err := canonicalDDLForDrift(parser, tc.DDL)
+		if err != nil {
+			return dispatchScope{}, fmt.Errorf("plan table %q: %w", tc.Table, err)
+		}
+		key := driftChangeKey{c.planNamespace(tc.Namespace), scope.shard, tc.Table, tc.Operation, canon}
+		stored[key] = append(stored[key], tc)
+	}
+	for i := range scope.ddlChanges {
+		ch := &scope.ddlChanges[i]
+		canon, err := canonicalDDLForDrift(parser, ch.DDL)
+		if err != nil {
+			return dispatchScope{}, fmt.Errorf("dispatch change for table %q: %w", ch.Table, err)
+		}
+		key := driftChangeKey{c.planNamespace(ch.Namespace), scope.shard, ch.Table, ch.Operation, canon}
+		matches := stored[key]
+		if len(matches) == 0 {
+			c.logger.Debug("dispatched change has no counterpart in the plan row; the task keeps the dispatched statement",
+				"plan_id", req.PlanId,
+				"shard", scope.shard,
+				"namespace", ch.Namespace,
+				"table", ch.Table,
+				"operation", ch.Operation)
+			continue
+		}
+		// Consume the match so a duplicated change pairs one to one.
+		stored[key] = matches[1:]
+		ch.DDL = matches[0].DDL
+		ch.ExecutionMode = matches[0].ExecutionMode
+		ch.ModeReason = matches[0].ModeReason
+	}
+	return scope, nil
 }
 
 // driftMultisetFromApplyRequest builds the table DDL multiset the dispatch
