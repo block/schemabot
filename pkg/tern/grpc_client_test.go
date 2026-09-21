@@ -6408,6 +6408,90 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksAttributesEachStatementToItsOw
 	assert.Equal(t, 40, addName.ProgressPercent)
 }
 
+func TestGRPCClient_SyncStoredTasksFromRemoteTasksMatchesDeploymentRenderingAndAdoptsIt(t *testing.T) {
+	// A non-primary deployment stores and reports each statement as its own
+	// engine emitted it, qualified with its own physical schema, while the
+	// control plane's task rows carry the reviewed text. Two statements on one
+	// table must each still find their own progress row, and once the
+	// canonical comparison has proven a row the same change, the stored task
+	// takes the deployment's spelling so the PR comment shows the statement as
+	// that deployment runs it. A row for a different change on the table is
+	// neither matched nor adopted.
+	now := time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)
+	const (
+		reviewedCreate = `CREATE TABLE "app-region-a".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		reviewedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-a".recall USING btree (consumer_uuid)`
+		renderedCreate = `CREATE TABLE "app-region-b".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		renderedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall USING btree (consumer_uuid)`
+	)
+	storedApply := &storage.Apply{ID: 71, ApplyIdentifier: "apply-region-b", DatabaseType: "postgres", State: state.Apply.Running}
+	createTask := &storage.Task{
+		ID: 72, TaskIdentifier: "task-create-recall", ApplyID: storedApply.ID,
+		Namespace: "app", TableName: "recall", DDL: reviewedCreate, State: state.Task.Running,
+	}
+	indexTask := &storage.Task{
+		ID: 73, TaskIdentifier: "task-index-recall", ApplyID: storedApply.ID,
+		Namespace: "app", TableName: "recall", DDL: reviewedIndex, State: state.Task.Pending,
+	}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			tasks: &mockTaskStore{tasks: []*storage.Task{createTask, indexTask}},
+			logs:  &mockApplyLogStore{},
+		},
+	}
+
+	err := client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{createTask, indexTask}, []*ternv1.TableProgress{
+		{TaskId: "remote-1", Namespace: "app", TableName: "recall", Ddl: renderedCreate, Status: state.Task.Completed, PercentComplete: 100},
+		{TaskId: "remote-2", Namespace: "app", TableName: "recall", Ddl: renderedIndex, Status: state.Task.Running, PercentComplete: 40},
+	}, now)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Task.Completed, createTask.State)
+	assert.Equal(t, 100, createTask.ProgressPercent)
+	assert.Equal(t, renderedCreate, createTask.DDL)
+	assert.Equal(t, state.Task.Running, indexTask.State)
+	assert.Equal(t, 40, indexTask.ProgressPercent)
+	assert.Equal(t, renderedIndex, indexTask.DDL)
+
+	// A later tick reports the same rows; the adopted spelling now matches by
+	// text and nothing is rewritten.
+	err = client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{createTask, indexTask}, []*ternv1.TableProgress{
+		{TaskId: "remote-1", Namespace: "app", TableName: "recall", Ddl: renderedCreate, Status: state.Task.Completed, PercentComplete: 100},
+		{TaskId: "remote-2", Namespace: "app", TableName: "recall", Ddl: renderedIndex, Status: state.Task.Completed, PercentComplete: 100},
+	}, now.Add(time.Second))
+	require.NoError(t, err)
+	assert.Equal(t, renderedIndex, indexTask.DDL)
+	assert.Equal(t, state.Task.Completed, indexTask.State)
+}
+
+func TestRemoteStatementRenderingKeepsReviewedTextUnlessProvenSameChange(t *testing.T) {
+	canon, err := StatementCanonicalizerForDatabaseType("postgres")
+	require.NoError(t, err)
+	stored := &storage.Task{Namespace: "app", TableName: "recall", DDL: `CREATE INDEX idx_recall_consumer_uuid ON "app-region-a".recall (consumer_uuid)`}
+
+	t.Run("same text is not rewritten", func(t *testing.T) {
+		_, ok := remoteStatementRendering(stored, &ternv1.TableProgress{Ddl: stored.DDL + "\n"}, canon)
+		assert.False(t, ok)
+	})
+	t.Run("blank remote DDL keeps the reviewed text", func(t *testing.T) {
+		_, ok := remoteStatementRendering(stored, &ternv1.TableProgress{}, canon)
+		assert.False(t, ok)
+	})
+	t.Run("a different change on the table keeps the reviewed text", func(t *testing.T) {
+		_, ok := remoteStatementRendering(stored, &ternv1.TableProgress{Ddl: `CREATE INDEX idx_recall_agency ON "app-region-b".recall (agency_id)`}, canon)
+		assert.False(t, ok)
+	})
+	t.Run("without a canonicalizer nothing is adopted", func(t *testing.T) {
+		_, ok := remoteStatementRendering(stored, &ternv1.TableProgress{Ddl: `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall (consumer_uuid)`}, nil)
+		assert.False(t, ok)
+	})
+	t.Run("the same change in the deployment's spelling is adopted", func(t *testing.T) {
+		rendering, ok := remoteStatementRendering(stored, &ternv1.TableProgress{Ddl: ` CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall (consumer_uuid) `}, canon)
+		require.True(t, ok)
+		assert.Equal(t, `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall (consumer_uuid)`, rendering)
+	})
+}
+
 func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 	// A remote Tern Progress response carries per-shard ShardProgress. The control
 	// plane is a reader/mirror, so it must encode those into per-(table, shard) task

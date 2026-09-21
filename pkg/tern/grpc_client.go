@@ -4031,13 +4031,26 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	now time.Time,
 ) error {
 	logger := c.applyLogger(storedApply)
-	remoteTaskIndex := IndexProtoTableProgress(remoteTasks)
+	canon, err := StatementCanonicalizerForDatabaseType(storedApply.DatabaseType)
+	if err != nil {
+		// Without a dialect the two planes' spellings can only meet on equal
+		// text; a deployment that renders a statement differently from the
+		// reviewed text will then read as omitted below.
+		logger.WarnContext(ctx, "remote gRPC progress is matched to stored tasks by statement text only",
+			append(storedApply.MutableLogAttrs(), "error", err)...)
+	}
+	remoteTaskIndex := IndexProtoTableProgress(remoteTasks, canon)
 	missingProgressTasks := 0
 	for _, storedTask := range storedTasks {
 		remoteTask, ok := remoteTaskIndex.ForTask(storedTask)
 		if !ok {
 			missingProgressTasks++
 			continue
+		}
+		if rendering, ok := remoteStatementRendering(storedTask, remoteTask, canon); ok {
+			logger.InfoContext(ctx, "stored gRPC task takes the deployment's rendering of its statement",
+				append(storedTask.LogAttrs(), "reviewed_ddl", storedTask.DDL, "deployment_ddl", rendering)...)
+			storedTask.DDL = rendering
 		}
 		oldTaskState := storedTask.State
 		c.unrecognizedStatuses.observeTaskStatus(ctx, logger, storedTask, remoteTask.Status)
@@ -4130,6 +4143,24 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			append(storedApply.MutableLogAttrs(), "missing_count", missingProgressTasks)...)
 	}
 	return nil
+}
+
+// remoteStatementRendering returns the deployment's own spelling of a stored
+// task's statement when it differs from the stored text, so the stored row —
+// and every operator surface rendered from it — shows the statement as that
+// deployment runs it rather than as the primary deployment rendered it. The
+// spelling is adopted only once the canonical comparison proves it the same
+// change (RV-1): a remote entry that omits its DDL, or that reports a table's
+// statements as one combined text, leaves the stored statement as reviewed.
+func remoteStatementRendering(storedTask *storage.Task, remoteTask *ternv1.TableProgress, canon StatementCanonicalizer) (string, bool) {
+	rendering := strings.TrimSpace(remoteTask.Ddl)
+	if canon == nil || rendering == "" || rendering == strings.TrimSpace(storedTask.DDL) {
+		return "", false
+	}
+	if canon(rendering) != canon(storedTask.DDL) {
+		return "", false
+	}
+	return rendering, true
 }
 
 func remoteTaskOmittedRowTotals(storedTask *storage.Task, remoteTask *ternv1.TableProgress) bool {

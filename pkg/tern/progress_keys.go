@@ -1,10 +1,13 @@
 package tern
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -34,9 +37,17 @@ func progressStatementKey(namespace, table, ddl string) string {
 // reports the combined text. Once a table has several entries, a statement
 // that matches none of them is unaccounted for, and the lookup reports a miss
 // rather than hand back a sibling statement's progress.
+//
+// Across the plane boundary the two sides spell the same statement
+// differently: a deployment stores and reports the text its own engine
+// emitted, qualified with its own physical schema, while the control plane's
+// task rows carry the reviewed text (RV-1). An index built with a
+// StatementCanonicalizer keys statements by their canonical form so the two
+// spellings meet; an index without one keys by the trimmed text.
 type StatementIndex[T any] struct {
 	byStatement map[string]*T
 	byTable     map[string]tableEntries[T]
+	canon       StatementCanonicalizer
 }
 
 // tableEntries is the last entry recorded for a table and how many entries the
@@ -46,19 +57,66 @@ type tableEntries[T any] struct {
 	count int
 }
 
-// NewStatementIndex returns an empty index sized for about size entries.
+// StatementCanonicalizer reduces a statement to the form two renderings of the
+// same change share. It must return "" for blank input and a non-empty string
+// otherwise, so blank DDL still means "the table as a whole".
+type StatementCanonicalizer func(ddl string) string
+
+// StatementCanonicalizerForDatabaseType returns the canonicalizer for a
+// database type's dialect: the drift comparison's canonical form, which
+// strips the physical schema qualifier and normalizes spelling, so a
+// deployment's rendering of a reviewed statement keys the same as the
+// reviewed text. Text the dialect's parser rejects keys by its trimmed form
+// instead — the drift comparison has already refused such text before any
+// apply, so at this point it can only belong to work that never ran. An
+// unregistered database type is an error.
+func StatementCanonicalizerForDatabaseType(databaseType string) (StatementCanonicalizer, error) {
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if err != nil {
+		return nil, fmt.Errorf("statement canonicalizer for database type %q: %w", databaseType, err)
+	}
+	return func(raw string) string {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return ""
+		}
+		canonical, err := canonicalDDLForDrift(parser, raw)
+		if err != nil {
+			return raw
+		}
+		return canonical
+	}, nil
+}
+
+// NewStatementIndex returns an empty index sized for about size entries that
+// keys statements by their trimmed text.
 func NewStatementIndex[T any](size int) StatementIndex[T] {
+	return NewCanonicalStatementIndex[T](size, nil)
+}
+
+// NewCanonicalStatementIndex returns an empty index sized for about size
+// entries that keys statements by canon; a nil canon keys by trimmed text.
+func NewCanonicalStatementIndex[T any](size int, canon StatementCanonicalizer) StatementIndex[T] {
 	return StatementIndex[T]{
 		byStatement: make(map[string]*T, size),
 		byTable:     make(map[string]tableEntries[T], size),
+		canon:       canon,
 	}
 }
 
+func (ix StatementIndex[T]) statementKey(ddl string) string {
+	if ix.canon != nil {
+		return ix.canon(ddl)
+	}
+	return strings.TrimSpace(ddl)
+}
+
 // Add records an entry for the table and, when ddl is not blank, for that
-// statement on the table. Must be called on an index from NewStatementIndex.
+// statement on the table. Must be called on an index from NewStatementIndex
+// or NewCanonicalStatementIndex.
 func (ix StatementIndex[T]) Add(namespace, table, ddl string, entry *T) {
-	if strings.TrimSpace(ddl) != "" {
-		ix.byStatement[progressStatementKey(namespace, table, ddl)] = entry
+	if key := ix.statementKey(ddl); key != "" {
+		ix.byStatement[progressStatementKey(namespace, table, key)] = entry
 	}
 	tableKey := progressTableKey(namespace, table)
 	ix.byTable[tableKey] = tableEntries[T]{last: entry, count: ix.byTable[tableKey].count + 1}
@@ -70,9 +128,10 @@ func (ix StatementIndex[T]) Add(namespace, table, ddl string, entry *T) {
 // about the table as a whole. A statement that matches none of a table's
 // several entries is a miss.
 func (ix StatementIndex[T]) Lookup(namespace, table, ddl string) (*T, bool) {
-	hasStatement := strings.TrimSpace(ddl) != ""
+	key := ix.statementKey(ddl)
+	hasStatement := key != ""
 	if hasStatement {
-		if entry, ok := ix.byStatement[progressStatementKey(namespace, table, ddl)]; ok {
+		if entry, ok := ix.byStatement[progressStatementKey(namespace, table, key)]; ok {
 			return entry, true
 		}
 	}
@@ -102,9 +161,10 @@ func indexEngineTableProgress(tables []engine.TableProgress) StatementIndex[engi
 }
 
 // IndexProtoTableProgress indexes the per-table entries of a data plane's
-// progress response for lookup by stored task.
-func IndexProtoTableProgress(tables []*ternv1.TableProgress) StatementIndex[ternv1.TableProgress] {
-	index := NewStatementIndex[ternv1.TableProgress](len(tables))
+// progress response for lookup by stored task, keying statements by canon
+// (see NewCanonicalStatementIndex).
+func IndexProtoTableProgress(tables []*ternv1.TableProgress, canon StatementCanonicalizer) StatementIndex[ternv1.TableProgress] {
+	index := NewCanonicalStatementIndex[ternv1.TableProgress](len(tables), canon)
 	for _, tp := range tables {
 		if tp == nil {
 			continue

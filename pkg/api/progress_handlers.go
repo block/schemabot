@@ -468,7 +468,15 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
-		taskIndex := tern.NewStatementIndex[storage.Task](len(tasks))
+		// The routed projection reports each statement as its deployment
+		// spells it, so a stored task is matched by canonical form rather than
+		// by the reviewed text it carries.
+		canon, canonErr := tern.StatementCanonicalizerForDatabaseType(apply.DatabaseType)
+		if canonErr != nil {
+			slog.Warn("progress response matches task timestamps by statement text only",
+				append(apply.LogAttrs(), "error", canonErr)...)
+		}
+		taskIndex := tern.NewCanonicalStatementIndex[storage.Task](len(tasks), canon)
 		for _, t := range tasks {
 			taskIndex.Add(t.Namespace, t.TableName, t.DDL, t)
 		}
