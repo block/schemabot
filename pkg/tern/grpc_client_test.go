@@ -1341,7 +1341,10 @@ func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
 	plan := &storage.Plan{
 		ID:             apply.PlanID,
 		PlanIdentifier: "plan-remote-queued",
-		Namespaces:     map[string]*storage.NamespacePlanData{"default": {}},
+		SchemaFiles: schema.SchemaFiles{
+			"default": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint, `email` varchar(255))"}},
+		},
+		Namespaces: map[string]*storage.NamespacePlanData{"default": {}},
 	}
 	plan.RecordIgnoreTables([]string{"flyway_schema_history", "legacy_audit"})
 	client.storage = &mockStorage{
@@ -1356,6 +1359,9 @@ func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
 
 	req := server.getApplyRequest()
 	require.NotNil(t, req, "expected the queued apply to be dispatched to remote Tern")
+	require.Contains(t, req.SchemaFiles, "default")
+	assert.Contains(t, req.SchemaFiles["default"].GetFiles(), "users.sql",
+		"the schema files the member re-plans are what the exclusions qualify")
 	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit"}, req.IgnoreTables,
 		"the dispatch carries the reviewed entries: without them the member re-plans the withheld tables as drops")
 }
@@ -1414,6 +1420,9 @@ func TestGRPCClient_ResumeApplyOperationVSchemaOnlyDispatchCarriesIgnoreTables(t
 
 	req := server.getApplyRequest()
 	require.NotNil(t, req, "expected the work operation to dispatch a VSchema apply to remote Tern")
+	require.Contains(t, req.SchemaFiles, "commerce")
+	assert.Contains(t, req.SchemaFiles["commerce"].GetFiles(), storage.VSchemaArtifactName,
+		"the plan a member materializes is built from these files")
 	assert.Equal(t, []string{"flyway_schema_history"}, req.IgnoreTables,
 		"a member materializing its plan from this dispatch records the reviewed entries with it")
 }
