@@ -91,6 +91,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 			Deployment: e.Deployment,
 			Primary:    i == 0,
 			Class:      e.Class.String(),
+			Blocked:    e.Blocked,
 		}
 		switch e.Class {
 		case api.DeploymentDiverged:

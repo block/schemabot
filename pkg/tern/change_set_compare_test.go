@@ -147,6 +147,55 @@ func TestCompareChangeSets_ShardDriftCaughtDespiteCollapsedParity(t *testing.T) 
 	assert.Equal(t, "80-", diff.UnexpectedInCandidate[0].Shard)
 }
 
+// The authoritative walk yields each change once: per shard for a namespace the
+// shard rows carry, from the collapsed view for an unsharded namespace, and it
+// agrees with the number of changes the comparison counts in the same set.
+func TestChangeSet_AuthoritativeTableChanges(t *testing.T) {
+	orders := &ternv1.TableChange{
+		TableName:  "orders",
+		Ddl:        "ALTER TABLE `orders` ADD COLUMN `total` int",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		Namespace:  "unsharded",
+	}
+	cs := ChangeSet{
+		Changes: []*ternv1.SchemaChange{
+			{Namespace: "sharded", TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()}},
+			{Namespace: "unsharded", TableChanges: []*ternv1.TableChange{orders}},
+		},
+		Shards: []*ternv1.ShardPlan{
+			{Shard: "-80", Namespace: "sharded", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}},
+			{Shard: "80-", Namespace: "sharded", Changes: []*ternv1.TableChange{protoAlterUsersPhone()}},
+		},
+	}
+
+	got := cs.AuthoritativeTableChanges()
+	require.Len(t, got, 3, "two shard rows for the sharded namespace plus the unsharded change")
+	assert.Equal(t, protoAlterUsersEmail().Ddl, got[0].Ddl)
+	assert.Equal(t, protoAlterUsersPhone().Ddl, got[1].Ddl)
+	assert.Same(t, orders, got[2])
+
+	diff, err := CompareChangeSets(schema.DialectMySQL, cs, ChangeSet{})
+	require.NoError(t, err)
+	assert.Len(t, diff.MissingFromCandidate, len(got), "the walk and the comparison count the same changes")
+
+	// Nil rows are the comparison's failure to report; the walk skips them.
+	withNils := ChangeSet{Changes: append(cs.Changes, nil), Shards: append(cs.Shards, nil)}
+	assert.Equal(t, got, withNils.AuthoritativeTableChanges())
+}
+
+// A namespace with shard rows that carry nothing is read from its collapsed
+// view; the walk does not lose the change because empty shard rows exist.
+func TestChangeSet_AuthoritativeTableChangesEmptyShardRows(t *testing.T) {
+	cs := ChangeSet{
+		Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()}}},
+		Shards:  []*ternv1.ShardPlan{{Shard: "-80", Namespace: "testapp"}},
+	}
+
+	got := cs.AuthoritativeTableChanges()
+	require.Len(t, got, 1)
+	assert.Equal(t, protoAlterUsersEmail().Ddl, got[0].Ddl)
+}
+
 // A database mixing a sharded and an unsharded namespace compares each namespace
 // in its authoritative representation; the unsharded namespace is not dropped.
 func TestCompareChangeSets_MixedShardedAndUnsharded(t *testing.T) {
