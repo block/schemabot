@@ -1966,13 +1966,17 @@ type ApplyRequest struct {
 	// first operation can never terminalize the apply while sibling dispatches
 	// are still on their way. Empty means this dispatch is the whole generation.
 	GenerationOperationKeys []string `protobuf:"bytes,12,rep,name=generation_operation_keys,json=generationOperationKeys,proto3" json:"generation_operation_keys,omitempty"`
-	// The live tables the reviewed plan withheld from the planner, as the plan
-	// recorded them. A deployment that materializes this dispatch re-plans
-	// against its own live schema to prove the reviewed DDL is what it would
-	// independently produce; without the same exclusions that re-plan sees the
-	// withheld tables again and proposes dropping them, so it would refuse an
-	// apply that matches the plan exactly. The plan's own record travels rather
-	// than the current config, so the comparison is against what was reviewed.
+	// The ignore_tables config the reviewed plan was planned under, as the plan
+	// recorded it: every entry the planner was asked to withhold, not the subset
+	// that matched a live table where the plan was made. A deployment that
+	// materializes this dispatch re-plans against its own live schema to prove
+	// the reviewed DDL is what it would independently produce; without the same
+	// entries that re-plan sees a withheld table again and proposes dropping it,
+	// so it would refuse an apply that matches the plan exactly. The whole list
+	// travels because a member holds tables the planning target does not: an
+	// entry that matched nothing there still has to withhold here. The plan's
+	// own record travels rather than the current config, so the comparison is
+	// against what was reviewed.
 	IgnoreTables  []string `protobuf:"bytes,13,rep,name=ignore_tables,json=ignoreTables,proto3" json:"ignore_tables,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
