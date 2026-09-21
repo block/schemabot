@@ -1039,6 +1039,13 @@ message StorageSchemaReport {
   // this, because the same live database yields different answers against
   // different releases.
   string schema_source = 9;
+  // Whether some instance held the storage bootstrap lock when the diff was
+  // taken — a pod booting, or another operator's apply. It is what separates
+  // "this DDL is outstanding" from "this DDL is being run right now", which
+  // the statement sets cannot say on their own: a convergence's work lands on
+  // a shadow table until it cuts over. Only true is a finding; false is the
+  // absence of evidence, not a claim that the database is idle.
+  bool convergence_in_flight = 10;
 }
 
 // StorageSchemaPlanResponse carries the outstanding storage DDL.

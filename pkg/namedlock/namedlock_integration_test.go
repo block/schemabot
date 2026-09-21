@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -253,4 +254,153 @@ func TestLockAutoReleasedWhenSessionEnds(t *testing.T) {
 			assert.True(t, acquired, "ending the holder's session should release the lock")
 		})
 	}
+}
+
+// HeldByAnySession reports a lock held by a different session, which is the
+// only case it exists for: the holder is another instance, converging storage
+// right now, and the probe runs on a connection that has nothing to do with
+// it. The answer follows the lock through acquire and release, and never
+// reports a name nobody took.
+func TestHeldByAnySessionSeesAnotherSessionsLock(t *testing.T) {
+	for _, tc := range lockerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "namedlock_test_held_by_any"
+
+			observer := openLockConn(t, tc.driver, tc.dsn)
+			held, err := tc.locker.HeldByAnySession(t.Context(), observer, name)
+			require.NoError(t, err)
+			require.False(t, held, "a lock nobody has taken is not held")
+
+			holder := openLockConn(t, tc.driver, tc.dsn)
+			acquired, err := tc.locker.Acquire(t.Context(), holder, name, 5*time.Second)
+			require.NoError(t, err)
+			require.True(t, acquired)
+
+			held, err = tc.locker.HeldByAnySession(t.Context(), observer, name)
+			require.NoError(t, err)
+			assert.True(t, held, "another session's lock should be visible to the probe")
+
+			released, err := tc.locker.Release(t.Context(), holder, name)
+			require.NoError(t, err)
+			require.True(t, released)
+
+			held, err = tc.locker.HeldByAnySession(t.Context(), observer, name)
+			require.NoError(t, err)
+			assert.False(t, held, "the probe should follow the lock back down on release")
+		})
+	}
+}
+
+// The probe answers about the lock it was asked for. A different lock held on
+// the same server must not read as this one held — on PostgreSQL the name is
+// hashed to a key and the read goes through a catalog view shared by every
+// advisory lock in the cluster, so the scoping is worth pinning.
+func TestHeldByAnySessionIsPerName(t *testing.T) {
+	for _, tc := range lockerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			holder := openLockConn(t, tc.driver, tc.dsn)
+			acquired, err := tc.locker.Acquire(t.Context(), holder, "namedlock_test_held_name_a", 0)
+			require.NoError(t, err)
+			require.True(t, acquired)
+
+			observer := openLockConn(t, tc.driver, tc.dsn)
+			held, err := tc.locker.HeldByAnySession(t.Context(), observer, "namedlock_test_held_name_b")
+			require.NoError(t, err)
+			assert.False(t, held, "a lock on another name should not read as this one held")
+		})
+	}
+}
+
+// A session's own lock is included. The probe is used where the reader may or
+// may not be the holder and the question is whether a convergence is running
+// at all, so excluding the caller would report "nothing running" to the one
+// caller that knows otherwise.
+func TestHeldByAnySessionIncludesTheCallersOwnLock(t *testing.T) {
+	for _, tc := range lockerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "namedlock_test_held_by_self"
+
+			conn := openLockConn(t, tc.driver, tc.dsn)
+			acquired, err := tc.locker.Acquire(t.Context(), conn, name, 0)
+			require.NoError(t, err)
+			require.True(t, acquired)
+
+			held, err := tc.locker.HeldByAnySession(t.Context(), conn, name)
+			require.NoError(t, err)
+			assert.True(t, held, "the probe should see the lock held on its own session")
+		})
+	}
+}
+
+// A PostgreSQL advisory lock belongs to the database whose session took it, so
+// a convergence of one database on a cluster is not a convergence of its
+// neighbour. The probe has to agree, and this is the one scope it does not
+// share with MySQL: a MySQL named lock is server-wide, and the operator
+// surface says so there and stays quiet here. Were the probe to read across
+// databases, that surface would name this database as the one being converged
+// with nothing left to hint that it might be another.
+func TestHeldByAnySessionPostgresIgnoresAnotherDatabasesLock(t *testing.T) {
+	const name = "namedlock_test_held_per_database"
+
+	neighborDSN := createNeighborDatabase(t)
+	observer := openLockConn(t, "pgx", postgresDSN)
+	holder := openLockConn(t, "pgx", neighborDSN)
+
+	acquired, err := Postgres{}.Acquire(t.Context(), holder, name, 5*time.Second)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// Proves the lock is really held, so the assertion below is the database
+	// filter doing its work rather than an acquire that quietly did nothing.
+	held, err := Postgres{}.HeldByAnySession(t.Context(), holder, name)
+	require.NoError(t, err)
+	require.True(t, held, "the holding session's own database must see the lock it just took")
+
+	held, err = Postgres{}.HeldByAnySession(t.Context(), observer, name)
+	require.NoError(t, err)
+	assert.False(t, held, "a lock held against another database of the same cluster is not this database's convergence")
+}
+
+// createNeighborDatabase creates a second database on the PostgreSQL cluster
+// under test and returns a DSN addressing it, for the tests that need the two
+// to be told apart.
+func createNeighborDatabase(t *testing.T) string {
+	t.Helper()
+
+	// A fixed identifier rather than an interpolated one: CREATE DATABASE
+	// takes no placeholders, so the only safe name is one the test spells out.
+	const database = "namedlock_neighbor"
+
+	admin, err := sql.Open("pgx", postgresDSN)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, admin.Close()) }()
+	require.NoError(t, admin.PingContext(t.Context()))
+
+	_, err = admin.ExecContext(t.Context(), `DROP DATABASE IF EXISTS `+database+` WITH (FORCE)`)
+	require.NoError(t, err)
+	_, err = admin.ExecContext(t.Context(), `CREATE DATABASE `+database)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		// A fresh pool on the original database: this runs after the test's
+		// own connections are closed, and the neighbor cannot be dropped from
+		// a session connected to it.
+		//
+		// The context is stripped of cancellation because t.Context() is
+		// already cancelled by the time a cleanup runs, and a drop issued on
+		// it never reaches the server — leaving the database behind to fail
+		// the next run's CREATE.
+		ctx := context.WithoutCancel(t.Context())
+		db, err := sql.Open("pgx", postgresDSN)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer func() { _ = db.Close() }()
+		_, err = db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+database+` WITH (FORCE)`)
+		assert.NoError(t, err)
+	})
+
+	dsn, err := url.Parse(postgresDSN)
+	require.NoError(t, err)
+	dsn.Path = "/" + database
+	return dsn.String()
 }

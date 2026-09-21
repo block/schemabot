@@ -4112,9 +4112,16 @@ type StorageSchemaReport struct {
 	// binary's embedded files, a directory, or a release. A report always says
 	// this, because the same live database yields different answers against
 	// different releases.
-	SchemaSource  string `protobuf:"bytes,9,opt,name=schema_source,json=schemaSource,proto3" json:"schema_source,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SchemaSource string `protobuf:"bytes,9,opt,name=schema_source,json=schemaSource,proto3" json:"schema_source,omitempty"`
+	// Whether some instance held the storage bootstrap lock when the diff was
+	// taken — a pod booting, or another operator's apply. It is what separates
+	// "this DDL is outstanding" from "this DDL is being run right now", which
+	// the statement sets cannot say on their own: a convergence's work lands on
+	// a shadow table until it cuts over. Only true is a finding; false is the
+	// absence of evidence, not a claim that the database is idle.
+	ConvergenceInFlight bool `protobuf:"varint,10,opt,name=convergence_in_flight,json=convergenceInFlight,proto3" json:"convergence_in_flight,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *StorageSchemaReport) Reset() {
@@ -4208,6 +4215,13 @@ func (x *StorageSchemaReport) GetSchemaSource() string {
 		return x.SchemaSource
 	}
 	return ""
+}
+
+func (x *StorageSchemaReport) GetConvergenceInFlight() bool {
+	if x != nil {
+		return x.ConvergenceInFlight
+	}
+	return false
 }
 
 // StorageSchemaPlanResponse carries the outstanding storage DDL.
@@ -4753,7 +4767,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x1c\n" +
 	"\toperation\x18\x02 \x01(\tR\toperation\x12\x10\n" +
 	"\x03ddl\x18\x03 \x01(\tR\x03ddl\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x8e\x03\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xc2\x03\n" +
 	"\x13StorageSchemaReport\x12\x18\n" +
 	"\adialect\x18\x01 \x01(\tR\adialect\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x18\n" +
@@ -4763,7 +4777,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x13destructive_allowed\x18\x06 \x01(\bR\x12destructiveAllowed\x127\n" +
 	"\x06manual\x18\a \x03(\v2\x1f.tern.v1.StorageSchemaStatementR\x06manual\x12\x12\n" +
 	"\x04host\x18\b \x01(\tR\x04host\x12#\n" +
-	"\rschema_source\x18\t \x01(\tR\fschemaSource\"Q\n" +
+	"\rschema_source\x18\t \x01(\tR\fschemaSource\x122\n" +
+	"\x15convergence_in_flight\x18\n" +
+	" \x01(\bR\x13convergenceInFlight\"Q\n" +
 	"\x19StorageSchemaPlanResponse\x124\n" +
 	"\x06report\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\x06report\"\x89\x01\n" +
 	"\x19StorageSchemaApplyRequest\x12+\n" +

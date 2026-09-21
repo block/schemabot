@@ -10,6 +10,7 @@
 - [Ask what storage DDL is outstanding](#ask-what-storage-ddl-is-outstanding)
 - [Name the release, and the storage database](#name-the-release-and-the-storage-database)
 - [Converge it](#converge-it)
+- [While it runs](#while-it-runs)
 - [Deploying a release that changes the storage schema](#deploying-a-release-that-changes-the-storage-schema)
 - [When a pod will not start](#when-a-pod-will-not-start)
 - [Pre-creating indexes on a long-lived database](#pre-creating-indexes-on-a-long-lived-database)
@@ -343,6 +344,54 @@ not, so a maintenance script keyed on the status gets them right:
 | a destructive statement was not permitted, so nothing ran | non-zero |
 | a change needs manual remediation, so nothing ran | non-zero |
 | the target could not be read, or the DDL failed | non-zero |
+
+Both non-zero refusals mean the same thing: nothing converged, and a person has
+to decide something before anything does. A script keyed on the status can
+therefore treat them alike and re-read the plan for which one it hit.
+
+The one place a refused destructive statement is *not* a failure is a startup
+bootstrap, which skips it and converges the safe remainder (AV-9). That
+asymmetry is deliberate: a pod that refused to boot over state a rollback left
+behind would take the deployment down to protect a table nobody asked it to
+drop, while an operator at a terminal is exactly who should decide.
+
+## While it runs
+
+A convergence over a table with a long history is the one that matters and the
+one that takes time. Here is what to know before you start one.
+
+**A plan says when one is already running.** A convergence is invisible in a
+diff: a statement it is working on is absent from the live catalog until it
+finishes with that statement, so a plan taken mid-run reports the same
+outstanding statement a plan against an idle database reports. The plan says so
+separately:
+
+```console
+$ schemabot storage plan
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Plan                   │
+│                                             │
+│  Database: schemabot on db-1.example        │
+│  Schema: the schema embedded in v1.2.3      │
+╰─────────────────────────────────────────────╯
+
+⚠️ A storage convergence is already running against schemabot on db-1.example. MySQL scopes the bootstrap lock to the server, so the run holding it may be converging another database on the same server. A statement a convergence is working on is absent from the live catalog until it finishes with it, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left.
+
+     ~ applies
+       ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
+
+📋 Plan: 1 table to alter
+```
+
+This is the read for two situations. One is losing the session a convergence
+was running in: the run continues, and this is how you see that it is still
+going. The other is arriving behind somebody else's. An apply started now would
+wait on the bootstrap lock until the run ahead of it finishes or its own budget
+runs out, and being told that beats discovering it by sitting there.
+
+The line only ever appears when a convergence is detected. Its absence is not a
+statement that the database is idle: the same read answers "nothing running"
+and "could not tell", so a plan never claims the second as the first.
 
 ## Deploying a release that changes the storage schema
 
