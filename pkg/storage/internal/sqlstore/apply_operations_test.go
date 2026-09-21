@@ -542,7 +542,10 @@ func newInterpolatedParamsStore(t *testing.T) *Storage {
 	cfg, err := mysql.ParseDSN(testDSNChangedRows)
 	require.NoError(t, err)
 	cfg.InterpolateParams = true
-	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	dsn := cfg.FormatDSN()
+	require.Contains(t, dsn, "interpolateParams=true",
+		"the store under test must interpolate client-side, or it cannot observe the binding")
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(t.Context()))
 	t.Cleanup(func() {

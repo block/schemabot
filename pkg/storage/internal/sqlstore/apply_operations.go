@@ -729,11 +729,7 @@ func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operatio
 	if err != nil {
 		return err
 	}
-	// Bind the JSON as a string, never as []byte: under interpolateParams the
-	// MySQL driver renders []byte as a _binary literal, which a JSON column
-	// rejects (error 3144). Server-side prepared statements coerce either, so
-	// only the production DSN shape exposes the difference.
-	args := append([]any{string(encoded), operationID}, guard.args()...)
+	args := append([]any{nullJSON(encoded), operationID}, guard.args()...)
 	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{{Column: "progress_metadata", Expr: "?"}})
 	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
