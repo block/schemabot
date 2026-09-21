@@ -912,7 +912,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 			continue
 		}
 		if spirittable.IsArchiveTable(live.name) {
-			slog.Info("PostgreSQL archive table has no schema file and is exempt from the undeclared-table verdict",
+			slog.Info("PostgreSQL archive table has no schema file and is left in place rather than dropped",
 				"database", database,
 				"namespace", namespace,
 				"table", live.name)

@@ -18,7 +18,7 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 		want        string
 	}{
 		{templates.PreviewCommentPlanIgnoredNamespaces, "excluded from this plan by `ignore_namespaces`"},
-		{templates.PreviewCommentPlanExemptTables, "exempt from the undeclared-table verdict"},
+		{templates.PreviewCommentPlanExemptTables, "that no schema file declares, left in place"},
 		// The reason is engine prose, so it is escaped like any other: the
 		// underscore renders as itself and cannot start emphasis.
 		{templates.PreviewCommentPlanIgnoreTables, `(ignore\_tables): ` + "`flyway_schema_history`"},

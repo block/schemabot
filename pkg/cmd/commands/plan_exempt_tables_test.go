@@ -9,7 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-const cliExemptLine = "ℹ️  Tables in namespace app exempt from the undeclared-table verdict (archive naming): orders_archive_2024, events_archive_2025_01"
+const cliExemptLine = "ℹ️  Tables in namespace app that no schema file declares, left in place (archive naming): orders_archive_2024, events_archive_2025_01"
 
 func exemptGroup(tables ...string) *apitypes.ExemptTablesResponse {
 	return &apitypes.ExemptTablesResponse{Namespace: "app", Tables: tables, Reason: "archive naming"}
@@ -52,7 +52,7 @@ func TestWritePlanBody_EmptyExemptGroupsRenderNothing(t *testing.T) {
 	want := captureStdout(func() { writePlanBody(plain, false) })
 	got := captureStdout(func() { writePlanBody(withEmpty, false) })
 	assert.Equal(t, want, got)
-	assert.NotContains(t, want, "exempt from the undeclared-table verdict")
+	assert.NotContains(t, want, "that no schema file declares, left in place")
 }
 
 // Two environments with the same DDL but different exempt tables are not the
@@ -70,7 +70,7 @@ func TestOutputMultiEnvPlanResult_ExemptTablesDivergeSections(t *testing.T) {
 
 	assert.NotContains(t, out, "Staging & Production")
 	assert.Contains(t, out, cliExemptLine)
-	assert.Contains(t, out, "ℹ️  Tables in namespace app exempt from the undeclared-table verdict (archive naming): orders_archive_2024\n")
+	assert.Contains(t, out, "ℹ️  Tables in namespace app that no schema file declares, left in place (archive naming): orders_archive_2024\n")
 }
 
 // Identical DDL with identical exempt tables still collapses into one section,
@@ -86,5 +86,5 @@ func TestOutputMultiEnvPlanResult_ExemptTablesIdenticalCollapse(t *testing.T) {
 	}))
 
 	assert.Contains(t, out, "Staging & Production")
-	assert.Equal(t, 1, strings.Count(out, "exempt from the undeclared-table verdict"))
+	assert.Equal(t, 1, strings.Count(out, "that no schema file declares, left in place"))
 }

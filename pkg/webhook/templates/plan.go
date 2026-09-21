@@ -633,10 +633,10 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 // without opening anything.
 const exemptTablesInlineLimit = 5
 
-// writeExemptTables renders one disclosure line per namespace whose live
-// tables the plan exempted from the undeclared-table verdict, so a reviewer
-// can tell an exempted table from a declared one. No-op when nothing was
-// exempted, which is the ordinary case.
+// writeExemptTables renders one disclosure line per namespace holding live
+// tables no schema file declares that the plan leaves in place rather than
+// dropping, so a reviewer can tell an exempted table from a declared one.
+// No-op when nothing was exempted, which is the ordinary case.
 func writeExemptTables(sb *strings.Builder, groups []ExemptTablesData) {
 	for _, group := range groups {
 		writeExemptTablesGroup(sb, group, "")
@@ -659,7 +659,7 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 		if env != "" {
 			prefix, noun = fmt.Sprintf("**%s**: ", capitalizeFirst(env)), "tables"
 		}
-		fmt.Fprintf(sb, glyph.Info+" %s%s in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
+		fmt.Fprintf(sb, glyph.Info+" %s%s in namespace %s that no schema file declares, left in place (%s): %s\n\n",
 			prefix, noun, inlineCode(group.Namespace), exemptReason(group.Reason), names)
 		return
 	}
@@ -670,7 +670,7 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	if env != "" {
 		prefix = fmt.Sprintf("<b>%s</b>: ", html.EscapeString(capitalizeFirst(env)))
 	}
-	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d tables in namespace <code>%s</code> exempt from the undeclared-table verdict (%s)</summary>\n\n%s\n\n</details>\n\n",
+	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d tables in namespace <code>%s</code> that no schema file declares, left in place (%s)</summary>\n\n%s\n\n</details>\n\n",
 		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
 		html.EscapeString(SanitizeInlineError(group.Reason)), names)
 }

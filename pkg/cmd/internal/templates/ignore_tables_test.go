@@ -17,5 +17,5 @@ func TestWriteExemptTablesNamesTheConfigKey(t *testing.T) {
 			Reason:    apitypes.ExemptReasonIgnoreTables,
 		}})
 	})
-	assert.Contains(t, output, "Tables in namespace app exempt from the undeclared-table verdict (ignore_tables): flyway_schema_history, legacy_audit_log")
+	assert.Contains(t, output, "Tables in namespace app that no schema file declares, left in place (ignore_tables): flyway_schema_history, legacy_audit_log")
 }

@@ -126,7 +126,7 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 
 📋 **Plan**: **1** table to create
 
-ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`
+ℹ️ Tables in namespace `app` that no schema file declares, left in place (archive naming): `events_archive_2025_01`, `orders_archive_2024`
 
 
 ---
@@ -150,7 +150,7 @@ schemabot apply -e staging
 
 ✅ **No schema changes detected**
 
-ℹ️ Tables in namespace `testapp` exempt from the undeclared-table verdict (ignore\_tables): `flyway_schema_history`
+ℹ️ Tables in namespace `testapp` that no schema file declares, left in place (ignore\_tables): `flyway_schema_history`
 
 
 </details>

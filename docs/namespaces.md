@@ -345,7 +345,7 @@ Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBo
 ### Exclusions are disclosed
 
 Every plan that withheld tables says so: the PR plan comment renders an
-`ℹ️ Tables in namespace … exempt from the undeclared-table verdict (ignore_tables): …`
+`ℹ️ Tables in namespace … that no schema file declares, left in place (ignore_tables): …`
 line under the plan summary (also on "no changes" results, so a withheld table
 is distinguishable from a declared one), and the CLI prints the same disclosure
 for `plan` and `apply`.
