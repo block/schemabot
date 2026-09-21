@@ -1319,8 +1319,9 @@ privilege and size gates in `pkg/engine/postgres/postgres.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying
-that admitting deployment's verdict at creation, and fresh and resumed drives refusing blocked
-rows before engine hand-off (`pkg/tern`); the
+that admitting deployment's verdict at creation (`pkg/tern/local_client.go`), and fresh and resumed
+drives refusing blocked rows before engine hand-off, a resumed drive first tightening each row to
+its own re-plan's verdict (`pkg/tern/local_apply.go`, `pkg/tern/local_control_resume.go`); the
 direct-execution size bound ([direct-execution.md](direct-execution.md)).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored

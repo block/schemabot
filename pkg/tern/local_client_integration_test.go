@@ -2975,65 +2975,10 @@ func TestLocalClient_ResumeApplyStartRequestFailsWhenTaskRowIsBlocked(t *testing
 	require.NoError(t, err)
 	defer utils.CloseAndLog(client)
 
-	ddl := "ALTER TABLE `users` ADD COLUMN phone varchar(32)"
 	reason := "requires privileges unavailable to the engine"
-	plan := &storage.Plan{
-		PlanIdentifier: fmt.Sprintf("plan-blocked-row-start-fails-%d", time.Now().UnixNano()),
-		Database:       "testdb",
-		DatabaseType:   storage.DatabaseTypeMySQL,
-		Deployment:     "testdb",
-		Environment:    localClientTestEnvironment,
-		CreatedAt:      time.Now(),
-		Namespaces: map[string]*storage.NamespacePlanData{
-			"testdb": {
-				Tables: []storage.TableChange{
-					{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"},
-				},
-			},
-		},
-	}
-	planID, err := stor.Plans().Create(ctx, plan)
-	require.NoError(t, err)
-	plan.ID = planID
-
-	now := time.Now()
-	apply := &storage.Apply{
-		ApplyIdentifier: fmt.Sprintf("apply-blocked-row-start-fails-%d", time.Now().UnixNano()),
-		PlanID:          planID,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Deployment:      "testdb",
-		Engine:          storage.EngineSpirit,
-		State:           state.Apply.Stopped,
-		Environment:     localClientTestEnvironment,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-	}
-	applyID, err := stor.Applies().Create(ctx, apply)
-	require.NoError(t, err)
-	apply.ID = applyID
-
-	task := &storage.Task{
-		TaskIdentifier: fmt.Sprintf("task-blocked-row-start-fails-users-%d", time.Now().UnixNano()),
-		ApplyID:        applyID,
-		PlanID:         planID,
-		Database:       "testdb",
-		DatabaseType:   storage.DatabaseTypeMySQL,
-		Engine:         storage.EngineSpirit,
-		State:          state.Task.Stopped,
-		TableName:      "users",
-		Namespace:      "testdb",
-		DDL:            ddl,
-		DDLAction:      "alter",
-		ExecutionMode:  engine.ExecutionModeBlocked,
-		ModeReason:     reason,
-		Environment:    localClientTestEnvironment,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}
-	taskID, err := stor.Tasks().Create(ctx, task)
-	require.NoError(t, err)
-	task.ID = taskID
+	_, apply, task := seedSingleTaskApply(t, stor, "blocked-row-start-fails", state.Apply.Stopped, state.Task.Stopped, engine.ExecutionModeBlocked, reason)
+	applyID := apply.ID
+	ddl := task.DDL
 
 	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     applyID,
@@ -3091,6 +3036,239 @@ func TestLocalClient_ResumeApplyStartRequestFailsWhenTaskRowIsBlocked(t *testing
 	require.NotNil(t, startReq)
 	assert.Equal(t, storage.ControlRequestFailed, startReq.Status)
 	assert.Contains(t, startReq.ErrorMessage, reason)
+
+	assert.Equal(t, 1, observer.terminalCount(), "the drive that fails the apply posts its terminal summary")
+}
+
+// seedSingleTaskApply persists a plan, an apply in applyState, and one task
+// for `users` in taskState carrying the given execution verdict, and returns
+// the three with their row IDs set.
+func seedSingleTaskApply(t *testing.T, stor storage.Storage, scenario, applyState, taskState, executionMode, modeReason string) (*storage.Plan, *storage.Apply, *storage.Task) {
+	t.Helper()
+	ctx := t.Context()
+	ddl := "ALTER TABLE `users` ADD COLUMN phone varchar(32)"
+	now := time.Now()
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-%s-%d", scenario, now.UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-%s-%d", scenario, now.UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           applyState,
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-%s-users-%d", scenario, now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         planID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          taskState,
+		TableName:      "users",
+		Namespace:      "testdb",
+		DDL:            ddl,
+		DDLAction:      "alter",
+		ExecutionMode:  executionMode,
+		ModeReason:     modeReason,
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+	return plan, apply, task
+}
+
+// This scenario covers a stopped apply whose task row was admitted clean, on a
+// target whose own re-plan now refuses the statement: the table grew past the
+// direct-execution bound, or a grant was revoked, after the row was created.
+// The resumed drive must judge the target's current verdict, not the one
+// frozen on the row: it tightens the row to the re-plan's refusal and fails
+// the apply before any engine hand-off, and the persisted row records why.
+func TestLocalClient_ResumeApplyRefusesTableTheRePlanNowBlocks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	_, apply, task := seedSingleTaskApply(t, stor, "replan-now-blocks", state.Apply.Stopped, state.Task.Stopped, "direct", "fit the direct-execution bound at admission")
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	// The re-plan still lists the table, so the task stays active, and this
+	// time the target refuses its statement.
+	reason := "table exceeds the direct-execution size bound"
+	resumeEngine := &stagedGroupedResumeEngine{
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace: "testdb",
+				TableChanges: []engine.TableChange{{
+					Table:         "users",
+					DDL:           task.DDL,
+					ExecutionMode: engine.ExecutionModeBlocked,
+					ModeReason:    reason,
+				}},
+			}},
+		}},
+	}
+	client.spiritEngine = resumeEngine
+	observer := &recordingTerminalObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	require.NoError(t, client.ResumeApply(ctx, claimed))
+	assert.Equal(t, 0, resumeEngine.applyCount, "a statement the re-plan refuses must never reach the engine")
+
+	storedApply, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, reason)
+	assert.Contains(t, storedApply.ErrorMessage, task.TaskIdentifier)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Failed, storedTask.State)
+	assert.Equal(t, engine.ExecutionModeBlocked, storedTask.ExecutionMode, "the row records the verdict that refused it")
+	assert.Equal(t, reason, storedTask.ModeReason)
+
+	pendingStart, err := stor.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart, "the start that admitted this claim must not stay pending against a terminal apply")
+	startReq, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, storage.ControlRequestFailed, startReq.Status)
+	assert.Contains(t, startReq.ErrorMessage, reason)
+
+	assert.Equal(t, 1, observer.terminalCount(), "the drive that fails the apply posts its terminal summary")
+}
+
+// This scenario covers a fresh drive — the first drive of a newly admitted
+// apply — that loads a task row carrying a blocked verdict, as a drive on a
+// peer deployment does when it claims work admitted elsewhere. It must refuse
+// before any engine hand-off and, because a failed apply is never re-claimed,
+// settle what the terminal apply owes: the operator's pending stop is
+// completed, and the terminal observer fires so the summary lands on the PR.
+func TestLocalClient_RunApplyExecutionRefusesBlockedTaskRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	reason := "requires privileges unavailable to the engine"
+	plan, apply, task := seedSingleTaskApply(t, stor, "fresh-drive-blocked-row", state.Apply.Running, state.Task.Pending, engine.ExecutionModeBlocked, reason)
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	driveEngine := &stagedGroupedResumeEngine{}
+	client.spiritEngine = driveEngine
+	observer := &recordingTerminalObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	client.runApplyExecution(ctx, apply, []*storage.Task{task}, plan, nil, false)
+	assert.Equal(t, 0, driveEngine.applyCount, "a blocked row must never reach the engine")
+
+	storedApply, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, reason)
+	assert.NotNil(t, storedApply.CompletedAt)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Failed, storedTask.State)
+	assert.Contains(t, storedTask.ErrorMessage, reason)
+
+	pendingStop, err := stor.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStop, "a stop issued against the refused apply must not stay pending against a terminal apply")
+	stopReq, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
 
 	assert.Equal(t, 1, observer.terminalCount(), "the drive that fails the apply posts its terminal summary")
 }

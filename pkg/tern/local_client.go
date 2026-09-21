@@ -2423,6 +2423,63 @@ type dispatchScope struct {
 	shard              string
 	finalizer          bool
 	finalizerNamespace string
+	// verdictless names the shard-scoped changes the stored plan holds no
+	// statement for, so their task rows carry only the verdict the dispatch
+	// arrived with. Callers that create rows log these.
+	verdictless []storage.TableChange
+}
+
+// stampDispatchVerdictsFromPlan copies the stored plan's execution verdict
+// onto each shard-scoped change and returns the changes it found no plan
+// statement for. A shard-scoped dispatch carries the statement text but not a
+// verdict — it is built from task rows, which the wire form deliberately
+// strips it from — while the plan this deployment admitted the dispatch
+// against holds the verdict its own engine reached for that statement. Rows
+// built from the stamped changes therefore carry the admitting deployment's
+// verdict, exactly as whole-plan rows do, instead of whatever the wire said.
+//
+// The plan's own change for the dispatch's shard is preferred, since a
+// sharded plan can judge the same statement differently per shard; a plan
+// that keys only by namespace supplies the namespace-level verdict. A verdict
+// is only tightened, never relaxed: a dispatch that arrives already blocked
+// keeps its refusal. Statements are matched by text, which is the same text
+// on both sides — the plan's rows are what the dispatch was built from, or
+// the plan was materialized from the dispatch itself.
+func stampDispatchVerdictsFromPlan(plan *storage.Plan, shard string, changes []storage.TableChange) []storage.TableChange {
+	type statementKey struct{ namespace, table, ddl string }
+	keyOf := func(tc storage.TableChange) statementKey {
+		return statementKey{tc.Namespace, tc.Table, strings.TrimSpace(tc.DDL)}
+	}
+	verdicts := make(map[statementKey]storage.TableChange)
+	for _, tc := range plan.FlatDDLChanges() {
+		verdicts[keyOf(tc)] = tc
+	}
+	for _, sp := range plan.Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.Namespace == "" {
+				tc.Namespace = sp.Namespace
+			}
+			verdicts[keyOf(tc)] = tc
+		}
+	}
+	var verdictless []storage.TableChange
+	for i := range changes {
+		tc := &changes[i]
+		planned, ok := verdicts[keyOf(*tc)]
+		if !ok {
+			verdictless = append(verdictless, *tc)
+			continue
+		}
+		if tc.EngineBlocked() {
+			continue
+		}
+		tc.ExecutionMode = planned.ExecutionMode
+		tc.ModeReason = planned.ModeReason
+	}
+	return verdictless
 }
 
 // deriveDispatchScope determines a dispatch request's scope. A sharded
@@ -2461,6 +2518,7 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 		}
 		scope.shard = shard
 		scope.ddlChanges = scoped
+		scope.verdictless = stampDispatchVerdictsFromPlan(plan, shard, scoped)
 		return scope, nil
 	}
 	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
@@ -2506,6 +2564,24 @@ func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationK
 		return operationKey, storage.ApplyOperationKindGroupFinalizer, nil
 	}
 	return "", "", nil
+}
+
+// logVerdictlessDispatchChanges warns, before task rows are created, about
+// each shard-scoped change whose statement the stored plan does not hold. The
+// plan gate already admitted the plan, so the apply proceeds; the warning is
+// what tells an operator that these rows carry the dispatch's verdict rather
+// than this deployment's.
+func (c *LocalClient) logVerdictlessDispatchChanges(plan *storage.Plan, scope dispatchScope) {
+	for _, tc := range scope.verdictless {
+		c.logger.Warn("Apply: stored plan holds no statement for a shard-scoped change; its task row will carry the dispatched verdict, not this deployment's",
+			"plan_id", plan.PlanIdentifier,
+			"database", c.config.Database,
+			"namespace", tc.Namespace,
+			"shard", scope.shard,
+			"table", tc.Table,
+			"execution_mode", tc.ExecutionMode,
+		)
+	}
 }
 
 // buildDispatchTasks constructs the task rows for a dispatch scope's DDL
@@ -2702,6 +2778,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
 	now := time.Now()
+	c.logVerdictlessDispatchChanges(plan, scope)
 	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
 	operation := &storage.ApplyOperation{
 		Deployment:    c.config.Database,
@@ -2949,6 +3026,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
+	c.logVerdictlessDispatchChanges(plan, scope)
 	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
 
 	operationKey, operationKind, err := operationIdentityForDispatch(scope)

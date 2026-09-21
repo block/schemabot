@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +31,89 @@ func TestBuildDispatchTasksCopiesAsymmetricVerdicts(t *testing.T) {
 	assert.Empty(t, tasks[1].ModeReason)
 }
 
+// A shard-scoped dispatch is built from task rows, so its changes arrive with
+// no execution verdict. The rows it creates must still carry the admitting
+// deployment's verdict, which lives on the stored plan — per shard where the
+// plan judged shards separately — so a drive that later loads those rows
+// judges the same verdict the plan gate did.
+func TestDeriveDispatchScopeStampsShardScopedChangesWithPlanVerdict(t *testing.T) {
+	ordersDDL := "ALTER TABLE `orders` ADD COLUMN note text"
+	usersDDL := "ALTER TABLE `users` ADD COLUMN note text"
+	plan := &storage.Plan{
+		ID: 7, Database: "testdb", DatabaseType: storage.DatabaseTypeVitess,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "orders", DDL: ordersDDL, Operation: "alter", ExecutionMode: "online", ModeReason: "namespace-level verdict"},
+				{Namespace: "commerce", Table: "users", DDL: usersDDL, Operation: "alter", ExecutionMode: "direct", ModeReason: "fits the direct-execution bound"},
+			}},
+		},
+		Shards: []storage.ShardPlan{
+			{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{
+				{Table: "orders", DDL: ordersDDL, Operation: "alter", ExecutionMode: "direct", ModeReason: "small on this shard"},
+			}},
+			{Namespace: "commerce", Shard: "80-", Changes: []storage.TableChange{
+				{Table: "orders", DDL: ordersDDL, Operation: "alter", ExecutionMode: "online", ModeReason: "large on this shard"},
+			}},
+		},
+	}
+	dispatch := func(shard string, changes ...*ternv1.TableChange) *ternv1.ApplyRequest {
+		return &ternv1.ApplyRequest{PlanId: "plan-shards", TargetShards: []string{shard}, DdlChanges: changes}
+	}
+	orders := &ternv1.TableChange{Namespace: "commerce", TableName: "orders", Ddl: ordersDDL, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}
+	users := &ternv1.TableChange{Namespace: "commerce", TableName: "users", Ddl: "  " + usersDDL + "\n", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}
+
+	t.Run("the dispatched shard's own verdict wins over the namespace-level one", func(t *testing.T) {
+		scope, err := deriveDispatchScope(plan, dispatch("80-", orders))
+		require.NoError(t, err)
+		require.Len(t, scope.ddlChanges, 1)
+		assert.Equal(t, "online", scope.ddlChanges[0].ExecutionMode)
+		assert.Equal(t, "large on this shard", scope.ddlChanges[0].ModeReason)
+		assert.Empty(t, scope.verdictless)
+
+		scope, err = deriveDispatchScope(plan, dispatch("-80", orders))
+		require.NoError(t, err)
+		assert.Equal(t, "direct", scope.ddlChanges[0].ExecutionMode)
+		assert.Equal(t, "small on this shard", scope.ddlChanges[0].ModeReason)
+	})
+
+	t.Run("a table the plan judged only at namespace level takes that verdict, whitespace aside", func(t *testing.T) {
+		scope, err := deriveDispatchScope(plan, dispatch("-80", users))
+		require.NoError(t, err)
+		require.Len(t, scope.ddlChanges, 1)
+		assert.Equal(t, "direct", scope.ddlChanges[0].ExecutionMode)
+		assert.Equal(t, "fits the direct-execution bound", scope.ddlChanges[0].ModeReason)
+		assert.Empty(t, scope.verdictless)
+	})
+
+	t.Run("a dispatch that arrives blocked keeps its refusal", func(t *testing.T) {
+		blocked := &ternv1.TableChange{Namespace: "commerce", TableName: "orders", Ddl: ordersDDL, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			ExecutionMode: engine.ExecutionModeBlocked, ModeReason: localBlockedReason}
+		scope, err := deriveDispatchScope(plan, dispatch("-80", blocked))
+		require.NoError(t, err)
+		assert.Equal(t, engine.ExecutionModeBlocked, scope.ddlChanges[0].ExecutionMode)
+		assert.Equal(t, localBlockedReason, scope.ddlChanges[0].ModeReason)
+	})
+
+	t.Run("a statement the plan does not hold is reported, not stamped", func(t *testing.T) {
+		unknown := &ternv1.TableChange{Namespace: "commerce", TableName: "orders", Ddl: "ALTER TABLE `orders` DROP COLUMN note", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}
+		scope, err := deriveDispatchScope(plan, dispatch("-80", unknown))
+		require.NoError(t, err)
+		assert.Empty(t, scope.ddlChanges[0].ExecutionMode)
+		require.Len(t, scope.verdictless, 1)
+		assert.Equal(t, "orders", scope.verdictless[0].Table)
+	})
+
+	t.Run("the stamped verdict reaches the task row", func(t *testing.T) {
+		scope, err := deriveDispatchScope(plan, dispatch("80-", orders))
+		require.NoError(t, err)
+		tasks := buildDispatchTasks(plan, scope, "production", storage.EnginePlanetScale, []byte("{}"), time.Now())
+		require.Len(t, tasks, 1)
+		assert.Equal(t, "80-", tasks[0].Shard)
+		assert.Equal(t, "online", tasks[0].ExecutionMode)
+		assert.Equal(t, "large on this shard", tasks[0].ModeReason)
+	})
+}
+
 func TestBlockedTaskError(t *testing.T) {
 	require.NoError(t, blockedTaskError(nil))
 	require.NoError(t, blockedTaskError([]*storage.Task{{ExecutionMode: "direct"}}))
@@ -43,6 +127,24 @@ func TestBlockedTaskError(t *testing.T) {
 
 	require.EqualError(t, blockedTaskError([]*storage.Task{{TaskIdentifier: "task-fallback", TableName: "orders", ExecutionMode: "blocked"}}),
 		`stored task task-fallback contains a blocked change for table "orders": the engine refuses this statement`)
+
+	// Independent causes render one per line, exactly as the whole-plan
+	// refusal renders them, so an operator sees every cause on the first
+	// attempt rather than the raw encoded separator.
+	multiCause := engine.JoinBlockedCauses([]string{"requires privileges unavailable to the engine", "table size could not be measured"})
+	tasks = []*storage.Task{{TaskIdentifier: "task-multi", TableName: "orders", ExecutionMode: "blocked", ModeReason: multiCause}}
+	taskErr := blockedTaskError(tasks)
+	require.EqualError(t, taskErr,
+		"stored task task-multi contains a blocked change for table \"orders\":\n- requires privileges unavailable to the engine\n- table size could not be measured")
+	assert.NotContains(t, taskErr.Error(), "‖")
+	planErr := (&storage.Plan{PlanIdentifier: "plan-multi", Namespaces: map[string]*storage.NamespacePlanData{
+		"testdb": {Tables: []storage.TableChange{{Table: "orders", ExecutionMode: "blocked", ModeReason: multiCause}}},
+	}}).BlockedApplyError()
+	require.Error(t, planErr)
+	assert.Equal(t,
+		strings.TrimPrefix(planErr.Error(), `stored plan plan-multi contains a blocked change for table "orders"`),
+		strings.TrimPrefix(taskErr.Error(), `stored task task-multi contains a blocked change for table "orders"`),
+		"row and plan refusals render the same causes the same way")
 }
 
 // alterUsersEmailDispatch is the dispatch a non-primary deployment receives for
