@@ -345,10 +345,14 @@ Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBo
 ### Exclusions are disclosed
 
 Every plan that withheld tables says so: the PR plan comment renders an
-`ℹ️ Tables in namespace … that no schema file declares, left in place (ignore_tables): …`
+`ℹ️ Ignored tables in namespace … (ignore_tables): …`
 line under the plan summary (also on "no changes" results, so a withheld table
 is distinguishable from a declared one), and the CLI prints the same disclosure
-for `plan` and `apply`.
+for `plan` and `apply`. Past five tables the line leads with its count and
+folds the names into a collapsed block, so how many were withheld stays visible
+unexpanded. The reason in parentheses says who withheld the table:
+`ignore_tables` is this config, and the PostgreSQL planner uses the same line
+to disclose the archive-named tables its own naming convention leaves in place.
 When reviewing a PR that *introduces* an `ignore_tables` entry, the disclosure
 plus the config diff is the review surface: the plan stops seeing that table
 from this PR onward.

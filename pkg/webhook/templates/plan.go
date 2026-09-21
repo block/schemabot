@@ -655,11 +655,11 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	names := strings.Join(inlineCodeList(group.Tables), ", ")
 
 	if len(group.Tables) <= exemptTablesInlineLimit {
-		prefix, noun := "", "Tables"
+		prefix, noun := "", "Ignored tables"
 		if env != "" {
-			prefix, noun = fmt.Sprintf("**%s**: ", capitalizeFirst(env)), "tables"
+			prefix, noun = fmt.Sprintf("**%s**: ", capitalizeFirst(env)), "ignored tables"
 		}
-		fmt.Fprintf(sb, glyph.Info+" %s%s in namespace %s that no schema file declares, left in place (%s): %s\n\n",
+		fmt.Fprintf(sb, glyph.Info+" %s%s in namespace %s (%s): %s\n\n",
 			prefix, noun, inlineCode(group.Namespace), exemptReason(group.Reason), names)
 		return
 	}
@@ -670,7 +670,7 @@ func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env str
 	if env != "" {
 		prefix = fmt.Sprintf("<b>%s</b>: ", html.EscapeString(capitalizeFirst(env)))
 	}
-	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d tables in namespace <code>%s</code> that no schema file declares, left in place (%s)</summary>\n\n%s\n\n</details>\n\n",
+	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d ignored tables in namespace <code>%s</code> (%s)</summary>\n\n%s\n\n</details>\n\n",
 		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
 		html.EscapeString(SanitizeInlineError(group.Reason)), names)
 }

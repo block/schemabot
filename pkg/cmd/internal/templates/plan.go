@@ -453,7 +453,7 @@ func WriteExemptTables(groups []*apitypes.ExemptTablesResponse) {
 		if group == nil || len(group.Tables) == 0 {
 			continue
 		}
-		fmt.Printf(glyph.Info+"  Tables in namespace %s that no schema file declares, left in place (%s): %s\n",
+		fmt.Printf(glyph.Info+"  Ignored tables in namespace %s (%s): %s\n",
 			group.Namespace, group.Reason, strings.Join(group.Tables, ", "))
 		wrote = true
 	}

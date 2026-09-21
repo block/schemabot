@@ -13,7 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-const cliExemptLine = "ℹ️  Tables in namespace app that no schema file declares, left in place (archive naming): orders_archive_2024, events_archive_2025_01"
+const cliExemptLine = "ℹ️  Ignored tables in namespace app (archive naming): orders_archive_2024, events_archive_2025_01"
 
 func exemptGroup(tables ...string) *apitypes.ExemptTablesResponse {
 	return &apitypes.ExemptTablesResponse{Namespace: "app", Tables: tables, Reason: "archive naming"}
@@ -56,7 +56,7 @@ func TestWritePlanBody_EmptyExemptGroupsRenderNothing(t *testing.T) {
 	want := captureStdout(func() { writePlanBody(plain, false) })
 	got := captureStdout(func() { writePlanBody(withEmpty, false) })
 	assert.Equal(t, want, got)
-	assert.NotContains(t, want, "that no schema file declares, left in place")
+	assert.NotContains(t, want, "Ignored tables in namespace")
 }
 
 // Two environments with the same DDL but different exempt tables are not the
@@ -74,7 +74,7 @@ func TestOutputMultiEnvPlanResult_ExemptTablesDivergeSections(t *testing.T) {
 
 	assert.NotContains(t, out, "Staging & Production")
 	assert.Contains(t, out, cliExemptLine)
-	assert.Contains(t, out, "ℹ️  Tables in namespace app that no schema file declares, left in place (archive naming): orders_archive_2024\n")
+	assert.Contains(t, out, "ℹ️  Ignored tables in namespace app (archive naming): orders_archive_2024\n")
 }
 
 // Identical DDL with identical exempt tables still collapses into one section,
@@ -90,7 +90,7 @@ func TestOutputMultiEnvPlanResult_ExemptTablesIdenticalCollapse(t *testing.T) {
 	}))
 
 	assert.Contains(t, out, "Staging & Production")
-	assert.Equal(t, 1, strings.Count(out, "that no schema file declares, left in place"))
+	assert.Equal(t, 1, strings.Count(out, "Ignored tables in namespace"))
 }
 
 // Apply discloses withheld tables once per run. The command has two places the
@@ -126,7 +126,7 @@ func TestApplyCmd_ExemptTablesDisclosedOnce(t *testing.T) {
 			cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", NoLock: true}
 			out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
 
-			assert.Equal(t, 1, strings.Count(out, "left in place (ignore_tables)"),
+			assert.Equal(t, 1, strings.Count(out, "Ignored tables in namespace"),
 				"exemption stated once:\n%s", out)
 		})
 	}
