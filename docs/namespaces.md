@@ -334,16 +334,13 @@ An ignored table is withheld from the planner's view of the live schema. The pla
 
 ### Rules
 
-- Entries are bare table names, not paths. An entry containing `/` or `\` is rejected when the config is loaded. Patterns are not supported, so a set of time-partitioned tables needs one entry per table.
-- Entries are not namespace-qualified, so an entry applies to every namespace the plan covers. A name that occurs in two namespaces is withheld in both, and there is no way to scope an entry to one of them.
+- Entries are bare table names. Patterns are not supported, so a set of time-partitioned tables needs one entry per table.
+- Entries are not namespace-qualified, so an entry applies to every namespace the plan covers. A name that occurs in two namespaces is withheld in both.
 - `$ENV` substitution does **not** apply. Namespace entries substitute `$ENV` because namespace *directories* are environment-suffixed; table names are not.
-- Matching is exact and case-sensitive. An entry that matches no live table withholds nothing and the plan proceeds, without comment: an entry naming a table that is not always on the target is the ordinary case, not a mistake, and it is indistinguishable from a typo. The server logs unmatched entries, and the rule below refuses the one shape where an unmatched entry is dangerous.
-- A table that is both ignored and declared by a schema file is an error. Either choice is wrong: withholding it leaves the declaring file unreconciled, and honoring the file manages a table the config says to leave alone. Remove the entry or delete the declaring file.
-- That error is the one place case is not significant. Identifiers fold to lower case wherever a database stores them that way, so `Orders` in a file and `orders` in the config are a contradiction there and two distinct tables elsewhere. Withholding stays exact, because an entry must never withhold a table it does not name; a contradiction is refused whatever the case, because letting a real one through costs an apply that fails part way. The error names every entry that folds to the declared name, since a config that spells one table several ways is resolved only by removing all of them.
-- An entry that withheld nothing while the plan proposes dropping the very table it names is refused, not reported. The only way to reach that shape is a deployment whose data plane predates `ignore_tables` and discarded the field, and reviewing it as a drop would undo the exclusion through the change it was written to prevent.
-- `ignore_tables` resolves against the target's catalog before any exclusion the planner applies on its own, so an entry naming a table the engine would have skipped anyway is disclosed as withheld by the config rather than as an entry that matched nothing.
-- On the MySQL-family engines that ordering has a cost, and it is paid for the *shape* of an entry rather than for a match. Naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial, and a table that cannot be read fails the plan instead of being skipped. Prefer naming the table you mean.
-- Unlike `ignore_namespaces`, `ignore_tables` places no requirement on the shape of a MySQL target DSN. A namespace exclusion removes *files* and depends on the live side being scoped the same way; a table exclusion removes the table from the *live* side directly, so it cannot invert into a drop.
+- Matching is exact and case-sensitive. An entry that matches no live table withholds nothing and the plan proceeds, without comment: a table that is not always on the target is the ordinary case, not a mistake. The server logs unmatched entries.
+- On the MySQL-family engines, naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial. Prefer naming the table you mean.
+
+Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. The error names the entries to remove.
 
 ### Exclusions are disclosed
 
