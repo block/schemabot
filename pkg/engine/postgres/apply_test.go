@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -612,7 +613,9 @@ func TestQuotedTableBoundsEscapedNames(t *testing.T) {
 // A cut never lands inside an escape sequence, because the kept prefix is
 // requoted rather than sliced out of the quoted form, and a width too narrow
 // for anything but the mark still gets the mark, so a cause always shows
-// where a name stood.
+// where a name stood. Every rendering is therefore a well-formed quoted
+// string whose text, less the mark, is a prefix of the identifier — which is
+// what a cut that fell between the two bytes of an escape would break.
 func TestBoundedQuoteCutsBetweenEscapes(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -623,6 +626,7 @@ func TestBoundedQuoteCutsBetweenEscapes(t *testing.T) {
 		{name: "fits", ident: `ab"cd`, width: 8, want: `"ab\"cd"`},
 		{name: "cut before the escape it cannot fit", ident: `ab"cd`, width: 7, want: `"ab..."`},
 		{name: "cut keeps a whole escape when it fits", ident: `ab"cdef`, width: 9, want: `"ab\"..."`},
+		{name: "cut that would land between the halves of an escape", ident: `a"""`, width: 7, want: `"a..."`},
 		{name: "width below the mark still gets the mark", ident: "users", width: 3, want: `"..."`},
 		{name: "empty name", ident: "", width: 2, want: `""`},
 	}
@@ -632,6 +636,10 @@ func TestBoundedQuoteCutsBetweenEscapes(t *testing.T) {
 
 			assert.Equal(t, tt.want, got)
 			assert.True(t, utf8.ValidString(got))
+			text, err := strconv.Unquote(got)
+			require.NoError(t, err, "a cut leaves a well-formed quoted string: %s", got)
+			kept := strings.TrimSuffix(text, "...")
+			assert.True(t, strings.HasPrefix(tt.ident, kept), "the kept text %q is a prefix of the identifier %q", kept, tt.ident)
 		})
 	}
 }
@@ -640,6 +648,9 @@ func TestBoundedQuoteCutsBetweenEscapes(t *testing.T) {
 // when they do not all fit the room: the schema is cut first, the table the
 // entry sits on next, and the index name — the one the remedy tells the
 // operator to rename or resolve — last, each keeping at least its cut mark.
+// Those marks are the floor: a room narrower than the cut marks and their
+// punctuation is overdrawn by design, so that the cause still shows where
+// every name stood rather than dropping one.
 func TestInvalidIndexNamesCutsTheIndexLast(t *testing.T) {
 	longest := strings.Repeat("a", maxIdentifierLength)
 	tests := []struct {
@@ -648,6 +659,9 @@ func TestInvalidIndexNamesCutsTheIndexLast(t *testing.T) {
 		withTable bool
 		room      int
 		want      string
+		// belowFloor marks a room the marks alone cannot fit, whose
+		// rendering is wider than the room.
+		belowFloor bool
 	}{
 		{
 			name:      "everything fits",
@@ -679,13 +693,31 @@ func TestInvalidIndexNamesCutsTheIndexLast(t *testing.T) {
 			room: 30,
 			want: `"..."."` + strings.Repeat("a", 19) + `..."`,
 		},
+		{
+			name:       "no room at all still shows where each name stood",
+			err:        &executor.InvalidIndexError{Schema: "public", Index: "orders_ref_idx", Table: "orders"},
+			room:       0,
+			want:       `"..."."..."`,
+			belowFloor: true,
+		},
+		{
+			name:      "a room one byte under the floor is overdrawn rather than dropping a name",
+			err:       &executor.InvalidIndexError{Schema: "public", Index: "orders_ref_idx", Table: "orders"},
+			withTable: true, room: 18,
+			want:       `"..."."..." ("...")`,
+			belowFloor: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := invalidIndexNames(tt.err, tt.withTable, tt.room)
 
 			assert.Equal(t, tt.want, got)
-			assert.LessOrEqual(t, len(got), tt.room)
+			if tt.belowFloor {
+				assert.Greater(t, len(got), tt.room)
+			} else {
+				assert.LessOrEqual(t, len(got), tt.room)
+			}
 		})
 	}
 }
@@ -720,6 +752,72 @@ func TestInvalidIndexDetailKeepsItsRemedyLeadInsideTheClamp(t *testing.T) {
 			at := strings.Index(detail, lead)
 			require.GreaterOrEqual(t, at, 0, detail)
 			assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, detail)
+		})
+	}
+}
+
+// The lead of each invalid-index remedy — the clause the narrowest surface
+// keeps once the detail is cut from the tail — is the instruction itself,
+// the verb and its object, never the reasoning behind it. A remedy that
+// opened with why an operator is needed and left what to do for a later
+// clause would survive the clamp as an explanation with no action.
+func TestInvalidIndexRemedyLeadsWithTheInstruction(t *testing.T) {
+	tests := []struct {
+		name    string
+		verdict *executor.InvalidIndexError
+		want    string
+	}{
+		{
+			name:    "own leftover",
+			verdict: &executor.InvalidIndexError{Cleanup: executor.ErrBuildLeftInvalidIndex},
+			want:    "the retry removes it",
+		},
+		{
+			name: "own leftover the bound cancelled",
+			verdict: &executor.InvalidIndexError{
+				Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour},
+				Cleanup: executor.ErrBuildLeftInvalidIndex,
+			},
+			want: "the retry removes it",
+		},
+		{
+			name:    "abandoned",
+			verdict: &executor.InvalidIndexError{Cleanup: executor.ErrAbandonedInvalidIndex},
+			want:    "the retry removes it",
+		},
+		{
+			name:    "build in flight",
+			verdict: &executor.InvalidIndexError{BuilderPID: 4242, Cleanup: executor.ErrInvalidIndexBuildInFlight},
+			want:    "wait for that build to finish",
+		},
+		{
+			name:    "builder unobservable",
+			verdict: &executor.InvalidIndexError{Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
+			want:    "the retry proves it abandoned under the table's lock",
+		},
+		{
+			name:    "on another table",
+			verdict: &executor.InvalidIndexError{Table: "shipments", Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			want:    "rename the index in the schema file",
+		},
+		{
+			name:    "the server will not drop",
+			verdict: &executor.InvalidIndexError{Cleanup: executor.ErrInvalidIndexNotDroppable},
+			want:    "an operator must resolve it on the target",
+		},
+		{
+			name:    "unproven",
+			verdict: &executor.InvalidIndexError{Cleanup: errors.New("catalog read failed")},
+			want:    "inspect pg_index.indisvalid on the target before any recovery",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.verdict.Schema, tt.verdict.Index = "public", "orders_ref_idx"
+
+			_, remedy := invalidIndexAdvice(tt.verdict, "")
+
+			assert.Equal(t, tt.want, remedyLead(remedy), remedy)
 		})
 	}
 }
