@@ -299,8 +299,12 @@ Legacy verification is optional. To enable it while replacing an existing schema
 change workflow, supply both `--legacy-base-commit <full-base-sha>` and one or more
 `--legacy-path <repository-relative-path>` flags. The generated `legacy_baseline`
 records the base commit and former schema paths reconciled into the generated
-files. GitHub verification requires each path to exist at that anchor and no
-later base commit to touch it.
+files. GitHub verification requires each path to exist at that anchor. While
+the path remains on the current PR base branch (normally `main`), no later base
+commit may touch it. A path absent from that base is treated as retired, without
+skipping checks on other paths. Deletion in the PR does not retire the path;
+after it merges, the baseline may remain without a cleanup PR. A rename on the
+base also retires the old path, so update recorded paths when moving legacy files.
 
 A refresh preserves an existing baseline unless both anchor flags are supplied;
 advance it only after reconciling every later supported DDL effect into the same

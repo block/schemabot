@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	"github.com/block/schemabot/pkg/repoconfig"
 )
 
 func TestSchemabotConfigRejectsEnvironments(t *testing.T) {
@@ -1435,66 +1436,36 @@ legacy_baseline:
 	assert.Equal(t, []string{"service/db/changes"}, config.LegacyBaseline.LegacyPaths)
 }
 
-func TestIntroducedConfigsMatchesDatabaseIdentityAcrossPaths(t *testing.T) {
-	config := func(database, configPath string) DiscoveredConfig {
-		return DiscoveredConfig{
-			Config:    &SchemabotConfig{Database: database, Type: DatabaseTypeMySQL},
-			Path:      configPath,
-			SchemaDir: path.Dir(configPath),
-		}
-	}
-	base := &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{
-		config("orders", "old/schema/schemabot.yaml"),
-		config("billing", "billing/schema/schemabot.yaml"),
-	}}
+func TestLegacyBaselineConfigsSelectsOptedInDatabases(t *testing.T) {
+	baseline := &repoconfig.LegacyBaseline{Version: 1}
+	orders := DiscoveredConfig{Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL, LegacyBaseline: baseline}, Path: "moved/schemabot.yaml"}
+	billing := DiscoveredConfig{Config: &SchemabotConfig{Database: "billing", Type: DatabaseTypeMySQL, LegacyBaseline: baseline}, Path: "billing/schemabot.yaml"}
 	head := &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{
-		config("orders", "new/schema/schemabot.yaml"),
-		config("payments", "payments/schema/schemabot.yaml"),
+		orders,
+		{Config: &SchemabotConfig{Database: "payments", Type: DatabaseTypeMySQL}, Path: "payments/schemabot.yaml"},
+		billing,
 	}}
-
-	introduced, err := IntroducedConfigs(base, head)
-
+	configured, err := LegacyBaselineConfigs(head)
 	require.NoError(t, err)
-	require.Len(t, introduced, 1)
-	assert.Equal(t, "payments", introduced[0].Config.Database)
+	assert.Equal(t, []DiscoveredConfig{billing, orders}, configured)
 }
 
-func TestIntroducedConfigsFailsClosedOnUncertainDiscovery(t *testing.T) {
-	valid := DiscoveredConfig{
-		Config:    &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL},
-		Path:      "schema/schemabot.yaml",
-		SchemaDir: "schema",
-	}
-
-	tests := []struct {
+func TestLegacyBaselineConfigsFailsClosedOnUncertainDiscovery(t *testing.T) {
+	valid := DiscoveredConfig{Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL}, Path: "schema/schemabot.yaml"}
+	for _, tc := range []struct {
 		name string
-		base *FindAllConfigsResult
 		head *FindAllConfigsResult
 		want string
 	}{
-		{
-			name: "invalid base",
-			base: &FindAllConfigsResult{InvalidConfigs: []InvalidConfigInfo{{Path: "bad/schemabot.yaml", Error: "database is required"}}},
-			head: &FindAllConfigsResult{},
-			want: "base contains invalid",
-		},
-		{
-			name: "duplicate head identity",
-			base: &FindAllConfigsResult{},
-			head: &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{valid, {
-				Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL},
-				Path:   "other/schemabot.yaml", SchemaDir: "other",
-			}}},
-			want: "ambiguous database identity",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			introduced, err := IntroducedConfigs(tt.base, tt.head)
-			require.Error(t, err)
-			assert.Nil(t, introduced)
-			assert.Contains(t, err.Error(), tt.want)
+		{name: "missing discovery", want: "head config discovery result is required"},
+		{name: "invalid config", head: &FindAllConfigsResult{InvalidConfigs: []InvalidConfigInfo{{Path: "bad/schemabot.yaml", Error: "database is required"}}}, want: "head contains invalid"},
+		{name: "missing parsed config", head: &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{{Path: "schema/schemabot.yaml"}}}, want: "no parsed configuration"},
+		{name: "duplicate identity", head: &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{valid, {Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL}, Path: "other/schemabot.yaml"}}}, want: "ambiguous database identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configured, err := LegacyBaselineConfigs(tc.head)
+			require.ErrorContains(t, err, tc.want)
+			assert.Nil(t, configured)
 		})
 	}
 }

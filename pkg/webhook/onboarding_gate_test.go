@@ -41,6 +41,7 @@ func registerOnboardingConfigs(t *testing.T, mux *http.ServeMux, baseConfig, hea
 				require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: onboardingLegacyEntries(ref)}))
 				return
 			}
+			assert.Equal(t, onboardingHeadSHA, ref, "config discovery must use the PR head")
 			entries := []map[string]any{}
 			if config != "" {
 				entries = append(entries, map[string]any{"path": "schema/schemabot.yaml", "type": "blob", "sha": "config-blob"})
@@ -56,10 +57,8 @@ func registerOnboardingConfigs(t *testing.T, mux *http.ServeMux, baseConfig, hea
 		})
 	}
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/schemabot.yaml", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, onboardingHeadSHA, r.URL.Query().Get("ref"), "config reads must use the PR head")
 		content := headConfig
-		if r.URL.Query().Get("ref") == onboardingBaseSHA {
-			content = baseConfig
-		}
 		if content == "" {
 			http.NotFound(w, r)
 			return
@@ -86,24 +85,18 @@ func onboardingLegacyEntries(ref string) []*gh.TreeEntry {
 	}
 }
 
-func TestEvaluateOnboardingGateNotApplicableAfterConfigLands(t *testing.T) {
-	for _, metadata := range []string{"", "legacy_baseline: {}\n"} {
-		t.Run(metadata, func(t *testing.T) {
-			client, mux := setupGitHubServer(t)
-			config := "database: orders\ntype: mysql\n" + metadata
-			registerOnboardingDiscovery(t, mux, config, config)
-			h := &Handler{logger: testLogger()}
-
-			result, err := h.evaluateOnboardingGate(t.Context(), ghclient.NewInstallationClient(client, testLogger()), "octocat/hello-world", onboardingHeadSHA, "main")
-
-			require.NoError(t, err)
-			assert.Equal(t, checkConclusionSuccess, result.conclusion)
-			assert.Contains(t, result.summary, "Not applicable")
-		})
-	}
+// A corrected head config is sufficient even when its base version is invalid.
+func TestEvaluateOnboardingGateUsesCorrectedHeadConfig(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	registerOnboardingDiscovery(t, mux, "database: orders\n", "database: orders\ntype: mysql\n")
+	h := &Handler{logger: testLogger()}
+	result, err := h.evaluateOnboardingGate(t.Context(), ghclient.NewInstallationClient(client, testLogger()), "octocat/hello-world", onboardingHeadSHA, "main")
+	require.NoError(t, err)
+	assert.Equal(t, checkConclusionSuccess, result.conclusion)
+	assert.Equal(t, "Not applicable: no database configures legacy verification.", result.summary)
 }
 
-func TestEvaluateOnboardingGateSkipsIntroducedConfigWithoutLegacyMetadata(t *testing.T) {
+func TestEvaluateOnboardingGateSkipsConfigWithoutLegacyMetadata(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	registerOnboardingDiscovery(t, mux, "", "database: orders\ntype: mysql\n")
 	h := &Handler{logger: testLogger()}
@@ -112,7 +105,7 @@ func TestEvaluateOnboardingGateSkipsIntroducedConfigWithoutLegacyMetadata(t *tes
 
 	require.NoError(t, err)
 	assert.Equal(t, checkConclusionSuccess, result.conclusion)
-	assert.Equal(t, "Not applicable: no introduced database configures legacy verification.", result.summary)
+	assert.Equal(t, "Not applicable: no database configures legacy verification.", result.summary)
 }
 
 func TestEvaluateOnboardingGateRejectsMalformedLegacyMetadata(t *testing.T) {
@@ -176,7 +169,7 @@ func TestEvaluateOnboardingGateMixedOptIn(t *testing.T) {
 				return
 			}
 			assert.Equal(t, checkConclusionSuccess, result.conclusion)
-			assert.Contains(t, result.summary, "`legacy`: legacy paths are unchanged")
+			assert.Contains(t, result.summary, "`legacy`: legacy paths still present on base")
 		})
 	}
 }
@@ -191,7 +184,7 @@ legacy_baseline:
   legacy_paths:
     - service/db/changes
 `
-	registerOnboardingDiscovery(t, mux, "", config)
+	registerOnboardingDiscovery(t, mux, config, config)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+onboardingBaseSHA+"..."+onboardingBaseSHA, func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("identical")}))
 	})
@@ -201,7 +194,7 @@ legacy_baseline:
 
 	require.NoError(t, err)
 	assert.Equal(t, checkConclusionSuccess, result.conclusion)
-	assert.Contains(t, result.summary, "legacy paths are unchanged")
+	assert.Contains(t, result.summary, "legacy paths still present on base")
 	assert.Contains(t, result.summary, "Production convergence is enforced independently")
 }
 
@@ -215,7 +208,7 @@ legacy_baseline:
   legacy_paths:
     - service/db/changes
 `
-	registerOnboardingDiscovery(t, mux, "", config)
+	registerOnboardingDiscovery(t, mux, config, config)
 	changedSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+onboardingAnchorSHA+"..."+onboardingBaseSHA, func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
@@ -240,7 +233,7 @@ legacy_baseline:
 	assert.Contains(t, result.summary, "add legacy index")
 }
 
-// Ordinary fold fixtures describe repositories with no newly introduced configs.
+// Ordinary fold fixtures describe repositories with no legacy verification.
 // Specific onboarding tests override these subtree routes with exact routes.
 func registerExistingRepository(t *testing.T, mux *http.ServeMux) {
 	t.Helper()
@@ -312,15 +305,15 @@ func TestOnboardingGatesEveryPassingAggregate(t *testing.T) {
 }
 
 func TestOnboardingBaseFreshnessAndRetry(t *testing.T) {
-	for _, introduced := range []bool{false, true} {
+	for _, legacyMetadata := range []bool{false, true} {
 		for _, readFailure := range []bool{false, true} {
-			t.Run(fmt.Sprintf("introduced=%t/read_failure=%t", introduced, readFailure), func(t *testing.T) {
+			t.Run(fmt.Sprintf("legacy_metadata=%t/read_failure=%t", legacyMetadata, readFailure), func(t *testing.T) {
 				store := &foldCheckStore{}
 				h, mux, client := newFoldHandler(t, nonAggregateConfig(), store)
 				serveHeadSHA(t, mux, onboardingHeadSHA)
 				config := "database: orders\ntype: mysql\n"
 				baseConfig := config
-				if introduced {
+				if legacyMetadata {
 					baseConfig = ""
 					config += "legacy_baseline:\n  version: 1\n  base_commit: " + onboardingBaseSHA + "\n  legacy_paths:\n    - db/changes\n"
 				}
@@ -394,4 +387,117 @@ func TestOnboardingDoesNotPublishAfterHeadMoves(t *testing.T) {
 	err := h.upsertAggregateCheckRunOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA, nil, aggregateCheckName, aggregateSentinel)
 	require.NoError(t, err)
 	assert.Empty(t, store.upserted)
+}
+
+// Retained metadata keeps guarding legacy files until their deletion reaches
+// the base branch. The PR head has already deleted the files in every case.
+// Inconclusive base lookups block and recover through the aggregate retry path.
+func TestOnboardingLegacyPathRetirementAtAggregatePublication(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		retired    bool
+		changed    bool
+		readStatus int
+		truncated  bool
+	}{
+		{name: "active unchanged"},
+		{name: "deletion in PR cannot hide a later legacy change", changed: true},
+		{name: "deletion merged into base retires the path", retired: true, changed: true},
+		{name: "base lookup forbidden", readStatus: http.StatusForbidden},
+		{name: "base tree lookup not found is not path retirement", readStatus: http.StatusNotFound},
+		{name: "base lookup unavailable", readStatus: http.StatusServiceUnavailable},
+		{name: "base lookup truncated", truncated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &foldCheckStore{}
+			h, mux, client := newFoldHandler(t, nonAggregateConfig(), store)
+			serveHeadSHA(t, mux, onboardingHeadSHA)
+			serveCheckRunCreate(t, mux)
+			serveParticipantCheckRunsEmpty(t, mux, onboardingHeadSHA)
+			var recovered atomic.Bool
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/{sha}", func(w http.ResponseWriter, r *http.Request) {
+				ref := r.PathValue("sha")
+				if ref == onboardingHeadSHA {
+					require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+						{Path: new("schema/schemabot.yaml"), Type: new("blob"), SHA: new("config")},
+					}}))
+					return
+				}
+				assert.Empty(t, r.URL.Query().Get("recursive"), "the base and anchor are read only for exact legacy paths")
+				if ref == onboardingBaseSHA {
+					if tc.readStatus != 0 && !recovered.Load() {
+						http.Error(w, "private upstream error", tc.readStatus)
+						return
+					}
+					if tc.truncated && !recovered.Load() {
+						require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Truncated: new(true)}))
+						return
+					}
+					if tc.retired {
+						require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{}}))
+						return
+					}
+				}
+				require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: onboardingLegacyEntries(ref)}))
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/schemabot.yaml", func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, onboardingHeadSHA, r.URL.Query().Get("ref"))
+				config := "database: orders\ntype: mysql\nlegacy_baseline:\n  version: 1\n  base_commit: " + onboardingAnchorSHA + "\n  legacy_paths:\n    - db/changes\n"
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+					"type": "file", "encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(config)),
+				}))
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+onboardingAnchorSHA+"..."+onboardingBaseSHA, func(w http.ResponseWriter, _ *http.Request) {
+				require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+					Status: new("ahead"), TotalCommits: new(1), Commits: []*gh.RepositoryCommit{{SHA: new("change")}},
+				}))
+			})
+			var historyReads atomic.Int32
+			mux.HandleFunc("GET /repos/octocat/hello-world/commits", func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, onboardingBaseSHA, r.URL.Query().Get("sha"))
+				assert.Equal(t, "db/changes", r.URL.Query().Get("path"))
+				historyReads.Add(1)
+				var commits []*gh.RepositoryCommit
+				if tc.changed {
+					commits = []*gh.RepositoryCommit{{SHA: new("change"), Commit: &gh.Commit{Message: new("add legacy index")}}}
+				}
+				require.NoError(t, json.NewEncoder(w).Encode(commits))
+			})
+
+			err := h.postPassingAggregatesOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA)
+			require.Len(t, store.upserted, 1)
+			if tc.readStatus != 0 || tc.truncated {
+				require.ErrorIs(t, err, ghclient.ErrLegacyPathUnavailable)
+				assert.Equal(t, checkConclusionFailure, store.upserted[0].Conclusion)
+				assert.Equal(t, onboardingVerificationBlock.blockingReason, store.upserted[0].BlockingReason)
+				assert.NotContains(t, store.upserted[0].ErrorMessage, "private upstream error")
+				store.get = store.upserted[0]
+				store.byPR = []*storage.Check{store.get}
+				followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA)
+				require.ErrorIs(t, err, ghclient.ErrLegacyPathUnavailable)
+				assert.Equal(t, aggregateFoldScheduleParticipantRefold, followUp)
+				recovered.Store(true)
+				followUp, err = h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, onboardingHeadSHA)
+				require.NoError(t, err)
+				assert.Equal(t, aggregateFoldClearParticipantRefoldBudget, followUp)
+				require.Len(t, store.upserted, 3)
+				assert.Equal(t, checkConclusionSuccess, store.upserted[2].Conclusion)
+				assert.Empty(t, store.upserted[2].BlockingReason)
+				return
+			}
+			require.NoError(t, err)
+			if tc.changed && !tc.retired {
+				assert.Equal(t, checkConclusionFailure, store.upserted[0].Conclusion)
+				assert.Contains(t, store.upserted[0].ErrorMessage, "add legacy index")
+			} else {
+				assert.Equal(t, checkConclusionSuccess, store.upserted[0].Conclusion)
+				assert.Empty(t, store.upserted[0].BlockingReason)
+			}
+			if tc.retired {
+				assert.Zero(t, historyReads.Load())
+			} else {
+				assert.Equal(t, int32(1), historyReads.Load())
+			}
+		})
+	}
 }

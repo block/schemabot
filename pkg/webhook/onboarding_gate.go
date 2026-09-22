@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -27,42 +28,34 @@ func (h *Handler) evaluateOnboardingGate(ctx context.Context, client *ghclient.I
 }
 
 func (h *Handler) evaluateOnboardingGateAtBase(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA, baseSHA string) (onboardingGateResult, error) {
-	baseConfigs, err := client.FindAllConfigs(ctx, repo, baseSHA)
-	if err != nil {
-		return onboardingGateResult{}, fmt.Errorf("discover base configs at %s: %w", baseSHA, err)
-	}
 	headConfigs, err := client.FindAllConfigs(ctx, repo, headSHA)
 	if err != nil {
 		return onboardingGateResult{}, fmt.Errorf("discover head configs at %s: %w", headSHA, err)
 	}
-	introduced, err := ghclient.IntroducedConfigs(baseConfigs, headConfigs)
+	configured, err := ghclient.LegacyBaselineConfigs(headConfigs)
 	if err != nil {
-		return onboardingGateFailure("Onboarding classification failed", err.Error()), nil
+		return onboardingGateFailure("Onboarding configuration invalid", err.Error()), nil
 	}
-	if len(introduced) == 0 {
+	if len(configured) == 0 {
 		return onboardingGateResult{
 			conclusion: checkConclusionSuccess,
 			title:      "Onboarding gate not applicable",
-			summary:    "Not applicable: no database configuration introduced.",
+			summary:    "Not applicable: no database configures legacy verification.",
 		}, nil
 	}
 
 	var failures []string
 	var verified []string
-	for _, discovered := range introduced {
+	for _, discovered := range configured {
 		database := discovered.Config.Database
 		baseline := discovered.Config.LegacyBaseline
-		if baseline == nil {
-			h.logger.Debug("skipping optional legacy verification because no baseline is configured", "repo", repo, "database", database, "head_sha", headSHA)
-			continue
-		}
 		if err := baseline.Validate(); err != nil {
 			failures = append(failures, fmt.Sprintf("- `%s` (`%s`): %s", database, discovered.Path, err))
 			continue
 		}
 		changes, historyErr := client.LegacyPathChangesSinceAnchor(ctx, repo, baseline.BaseCommit, baseSHA, baseline.LegacyPaths)
 		if historyErr != nil {
-			if ghclient.IsUnavailableError(historyErr) {
+			if ghclient.IsUnavailableError(historyErr) || errors.Is(historyErr, ghclient.ErrLegacyPathUnavailable) {
 				return onboardingGateResult{}, fmt.Errorf("verify legacy baseline for %s: %w", database, historyErr)
 			}
 			failures = append(failures, fmt.Sprintf("- `%s`: %s", database, historyErr))
@@ -72,7 +65,7 @@ func (h *Handler) evaluateOnboardingGateAtBase(ctx context.Context, client *ghcl
 			failures = append(failures, renderLegacyPathChanges(database, changes)...)
 			continue
 		}
-		verified = append(verified, fmt.Sprintf("- `%s`: legacy paths are unchanged through base `%s`.", database, shortSHA(baseSHA)))
+		verified = append(verified, fmt.Sprintf("- `%s`: legacy paths still present on base `%s` are unchanged since the anchor.", database, shortSHA(baseSHA)))
 	}
 
 	if len(failures) > 0 {
@@ -81,13 +74,6 @@ func (h *Handler) evaluateOnboardingGateAtBase(ctx context.Context, client *ghcl
 			"Onboarding legacy baseline is stale or invalid",
 			strings.Join(failures, "\n")+"\n\nCorrect invalid `legacy_baseline` metadata. If the legacy source changed, refresh the declarative schema from the current base and advance `legacy_baseline.base_commit` in the same commit.",
 		), nil
-	}
-	if len(verified) == 0 {
-		return onboardingGateResult{
-			conclusion: checkConclusionSuccess,
-			title:      "Onboarding gate not applicable",
-			summary:    "Not applicable: no introduced database configures legacy verification.",
-		}, nil
 	}
 	sort.Strings(verified)
 	return onboardingGateResult{
@@ -163,7 +149,7 @@ func (h *Handler) gateAggregateSuccess(ctx context.Context, client *ghclient.Ins
 	}
 	if result.conclusion == checkConclusionSuccess {
 		// Resolve the branch itself: the PR's base metadata is not the pinned
-		// branch-tip read that the history and config comparison evaluated.
+		// branch-tip read that the legacy path and history checks evaluated.
 		currentBaseSHA, err := client.ResolveBranchTip(ctx, repo, current.BaseRef)
 		if err != nil {
 			return h.failAggregateOnboarding(repo, pr, headSHA, opts, fmt.Errorf("re-read base branch before publishing onboarding result: %w", err))

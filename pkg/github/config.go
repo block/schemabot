@@ -49,9 +49,8 @@ type SchemabotConfig struct {
 	// catalog, in every namespace the plan covers, and every plan discloses
 	// what it withheld.
 	IgnoreTables []string `yaml:"ignore_tables,omitempty" json:"ignore_tables,omitempty"`
-	// LegacyBaseline opts into legacy verification when comparison with the
-	// base branch proves this database is being introduced. Once the config
-	// lands it is historical metadata and must not reactivate onboarding gates.
+	// LegacyBaseline opts into legacy verification for paths that still exist
+	// on the PR's base branch. It may remain after those paths are retired.
 	LegacyBaseline *repoconfig.LegacyBaseline `yaml:"legacy_baseline,omitempty" json:"legacy_baseline,omitempty"`
 }
 
@@ -187,41 +186,32 @@ type FindAllConfigsResult struct {
 	InvalidConfigs []InvalidConfigInfo
 }
 
-// IntroducedConfigs compares complete, commit-pinned config discoveries and
-// returns the head configs whose canonical database identity is absent from
-// the base. Config paths do not participate in identity, so moving a config is
-// not mistaken for onboarding. Any invalid or duplicate identity keeps the
-// comparison fail-closed.
-func IntroducedConfigs(base, head *FindAllConfigsResult) ([]DiscoveredConfig, error) {
-	if base == nil || head == nil {
-		return nil, fmt.Errorf("base and head config discovery results are required")
-	}
-	if len(base.InvalidConfigs) > 0 {
-		return nil, invalidDiscoveryError("base", base.InvalidConfigs)
+// LegacyBaselineConfigs selects configs that opt into legacy verification from
+// a complete, commit-pinned discovery. Invalid configs and duplicate database
+// identities block verification rather than hiding a configured baseline.
+func LegacyBaselineConfigs(head *FindAllConfigsResult) ([]DiscoveredConfig, error) {
+	if head == nil {
+		return nil, fmt.Errorf("head config discovery result is required")
 	}
 	if len(head.InvalidConfigs) > 0 {
 		return nil, invalidDiscoveryError("head", head.InvalidConfigs)
 	}
 
-	baseByDatabase, err := uniqueConfigsByDatabase("base", base.ValidConfigs)
-	if err != nil {
-		return nil, err
-	}
 	headByDatabase, err := uniqueConfigsByDatabase("head", head.ValidConfigs)
 	if err != nil {
 		return nil, err
 	}
 
-	introduced := make([]DiscoveredConfig, 0)
-	for database, cfg := range headByDatabase {
-		if _, existed := baseByDatabase[database]; !existed {
-			introduced = append(introduced, cfg)
+	configured := make([]DiscoveredConfig, 0)
+	for _, cfg := range headByDatabase {
+		if cfg.Config.LegacyBaseline != nil {
+			configured = append(configured, cfg)
 		}
 	}
-	sort.Slice(introduced, func(i, j int) bool {
-		return introduced[i].Config.Database < introduced[j].Config.Database
+	sort.Slice(configured, func(i, j int) bool {
+		return configured[i].Config.Database < configured[j].Config.Database
 	})
-	return introduced, nil
+	return configured, nil
 }
 
 func invalidDiscoveryError(ref string, invalid []InvalidConfigInfo) error {

@@ -213,8 +213,9 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 }
 
 // A no-schema plan command recreates the current-head aggregate. A truncated
-// repository requires exhaustive configured schema directories to verify
-// onboarding; without them, the aggregate blocks instead of reporting success.
+// repository requires exhaustive configured schema directories to discover the
+// first config at the PR head. No config is required on the base, whose exact
+// legacy paths are checked without a recursive scan of the repository.
 func TestE2EPlanCommandOnNoSchemaChangesPRVerifiesOnboarding(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -239,12 +240,24 @@ func TestE2EPlanCommandOnNoSchemaChangesPRVerifiesOnboarding(t *testing.T) {
 			client := gh.NewClient(nil)
 			client.BaseURL, _ = url.Parse(server.URL + "/")
 
-			schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+			schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nlegacy_baseline:\n  version: 1\n  base_commit: %s\n  legacy_paths:\n    - db/changes\n", dbName, onboardingAnchorSHA)
 			result := setupFakeGitHubForPlanOnTruncatedRepo(t, mux, nil, schemabotConfig, dbName)
-			mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+onboardingBaseSHA, func(w http.ResponseWriter, _ *http.Request) {
-				require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
-					Entries: []*gh.TreeEntry{{Path: new("schema/schemabot.yaml"), Type: new("blob"), SHA: new("config-blob")}},
-				}))
+			for _, ref := range []string{onboardingBaseSHA, onboardingAnchorSHA, "legacy-db"} {
+				mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+ref, func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Query().Get("recursive") != "" {
+						require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Truncated: new(true)}))
+						return
+					}
+					require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: onboardingLegacyEntries(ref)}))
+				})
+			}
+			mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+onboardingAnchorSHA+"..."+onboardingBaseSHA, func(w http.ResponseWriter, _ *http.Request) {
+				require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("ahead")}))
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/commits", func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, onboardingBaseSHA, r.URL.Query().Get("sha"))
+				assert.Equal(t, "db/changes", r.URL.Query().Get("path"))
+				require.NoError(t, json.NewEncoder(w).Encode([]*gh.RepositoryCommit{}))
 			})
 			h := newE2EHandlerWithConfigDirHints(t, svc, client)
 

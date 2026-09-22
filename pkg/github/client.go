@@ -1102,11 +1102,17 @@ func (ic *InstallationClient) ResolveBranchTip(ctx context.Context, repo, branch
 
 const maxLegacyHistoryPages = 100
 
+// ErrLegacyPathUnavailable distinguishes an inconclusive path lookup from an
+// invalid baseline. Callers must keep the check blocked and retry the lookup.
+var ErrLegacyPathUnavailable = errors.New("legacy path could not be verified")
+
 // LegacyPathChangesSinceAnchor verifies that anchor is an ancestor of baseSHA,
-// that each recorded path exists at anchor, and returns every later commit that
-// touched a recorded legacy path. The path-filtered commit listing observes
-// intermediate edits even when a later commit restores the path's final tree
-// object to its anchored value.
+// that each recorded path exists at anchor, and returns later commits that
+// touched paths still present at baseSHA. A path absent from that pinned base
+// is treated as retired, independently of the other paths. The PR head never
+// controls retirement, so deleting legacy files in a PR cannot disable its gate.
+// The path-filtered commit listing observes intermediate edits even when a later
+// commit restores the path's final tree object to its anchored value.
 func (ic *InstallationClient) LegacyPathChangesSinceAnchor(ctx context.Context, repo, anchor, baseSHA string, legacyPaths []string) ([]LegacyPathChange, error) {
 	owner, repoName := splitRepo(repo)
 	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "compare onboarding anchor with base", []any{"repo", repo, "anchor", anchor, "base_sha", baseSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
@@ -1127,7 +1133,7 @@ func (ic *InstallationClient) LegacyPathChangesSinceAnchor(ctx context.Context, 
 	for _, legacyPath := range legacyPaths {
 		objectSHA, objectType, found, err := ic.resolveGitObjectSHA(ctx, repo, anchor, legacyPath, levelCache)
 		if err != nil {
-			return nil, fmt.Errorf("verify legacy path %s at anchor %s: %w", legacyPath, anchor, err)
+			return nil, fmt.Errorf("%w: verify legacy path %s at anchor %s: %w", ErrLegacyPathUnavailable, legacyPath, anchor, err)
 		}
 		if !found {
 			return nil, fmt.Errorf("legacy path %s does not exist at anchor %s", legacyPath, anchor)
@@ -1137,6 +1143,25 @@ func (ic *InstallationClient) LegacyPathChangesSinceAnchor(ctx context.Context, 
 		}
 	}
 	if status == "identical" {
+		return nil, nil
+	}
+
+	var activePaths []string
+	for _, legacyPath := range legacyPaths {
+		objectSHA, objectType, found, err := ic.resolveGitObjectSHA(ctx, repo, baseSHA, legacyPath, levelCache)
+		if err != nil {
+			return nil, fmt.Errorf("%w: verify legacy path %s at base %s: %w", ErrLegacyPathUnavailable, legacyPath, baseSHA, err)
+		}
+		if !found {
+			ic.logger.Info("skipping legacy history for a path retired from the base branch", "repo", repo, "base_sha", baseSHA, "legacy_path", legacyPath)
+			continue
+		}
+		if objectSHA == "" || (objectType != "blob" && objectType != "tree") {
+			return nil, fmt.Errorf("legacy path %s at base %s must resolve to a file or directory", legacyPath, baseSHA)
+		}
+		activePaths = append(activePaths, legacyPath)
+	}
+	if len(activePaths) == 0 {
 		return nil, nil
 	}
 
@@ -1171,7 +1196,7 @@ func (ic *InstallationClient) LegacyPathChangesSinceAnchor(ctx context.Context, 
 	}
 
 	var changes []LegacyPathChange
-	for _, legacyPath := range legacyPaths {
+	for _, legacyPath := range activePaths {
 		crossedAnchor := false
 		for page := 1; page <= maxLegacyHistoryPages; page++ {
 			commits, response, listErr := ic.listCommitsForPath(ctx, owner, repoName, repo, baseSHA, legacyPath, page)

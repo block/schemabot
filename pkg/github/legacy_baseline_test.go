@@ -12,11 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func registerLegacyAnchorTree(t *testing.T, mux *http.ServeMux, paths map[string]string) {
+func registerLegacyTrees(t *testing.T, mux *http.ServeMux, anchorPaths, basePaths map[string]string) {
 	t.Helper()
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/{sha}", func(w http.ResponseWriter, r *http.Request) {
 		commit, dir := splitSyntheticTreeSHA(r.PathValue("sha"))
-		assert.Equal(t, "anchor", commit, "path existence must be checked at the anchor")
+		require.Contains(t, []string{"anchor", "base"}, commit, "path existence is checked only at pinned anchor/base commits")
+		paths := anchorPaths
+		if commit == "base" {
+			paths = basePaths
+		}
 		assert.Empty(t, r.URL.Query().Get("recursive"), "resolve exact paths without a whole-repo recursive listing")
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: treeLevel(commit, dir, paths)}))
 	})
@@ -40,7 +44,8 @@ func TestLegacyPathChangesSinceAnchorValidatesEveryPath(t *testing.T) {
 		} {
 			t.Run(status+"/"+tc.name, func(t *testing.T) {
 				client, mux := setupRateLimitedTestGitHubServer(t)
-				registerLegacyAnchorTree(t, mux, map[string]string{"db/changes/001.sql": "schema-blob"})
+				paths := map[string]string{"db/changes/001.sql": "schema-blob"}
+				registerLegacyTrees(t, mux, paths, paths)
 				base := "base"
 				if status == "identical" {
 					base = "anchor"
@@ -99,6 +104,64 @@ func TestLegacyPathChangesSinceAnchorRejectsUnverifiablePath(t *testing.T) {
 			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			_, err := ic.LegacyPathChangesSinceAnchor(t.Context(), "octocat/hello-world", "anchor", "anchor", []string{"db"})
 			require.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
+// Each retired path is skipped independently. Active paths still report every
+// later change, and an absent path must have existed at the anchor to qualify.
+func TestLegacyPathChangesSinceAnchorRetiresOnlyAbsentBasePaths(t *testing.T) {
+	anchorPaths := map[string]string{
+		"retired/001.sql": "old",
+		"active/001.sql":  "old",
+	}
+	for _, tc := range []struct {
+		name        string
+		basePaths   map[string]string
+		legacyPaths []string
+		changed     bool
+		wantLookups []string
+		wantError   string
+	}{
+		{name: "all retired", legacyPaths: []string{"retired", "active"}},
+		{name: "retired file", legacyPaths: []string{"retired/001.sql"}},
+		{name: "active unchanged", basePaths: map[string]string{"active/001.sql": "old"}, legacyPaths: []string{"retired", "active"}, wantLookups: []string{"active"}},
+		{name: "active changed after retired path", basePaths: map[string]string{"active/001.sql": "new"}, legacyPaths: []string{"retired", "active"}, changed: true, wantLookups: []string{"active"}},
+		{name: "active changed before retired path", basePaths: map[string]string{"active/001.sql": "new"}, legacyPaths: []string{"active", "retired"}, changed: true, wantLookups: []string{"active"}},
+		{name: "typo absent at both refs", legacyPaths: []string{"retired", "typo"}, wantError: "does not exist at anchor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupRateLimitedTestGitHubServer(t)
+			registerLegacyTrees(t, mux, anchorPaths, tc.basePaths)
+			mux.HandleFunc("GET /repos/octocat/hello-world/compare/anchor...base", func(w http.ResponseWriter, r *http.Request) {
+				assert.Empty(t, r.URL.Query().Get("page"))
+				require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+					Status: new("ahead"), TotalCommits: new(1), Commits: []*gh.RepositoryCommit{{SHA: new("change")}},
+				}))
+			})
+			var lookedUp []string
+			mux.HandleFunc("GET /repos/octocat/hello-world/commits", func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "base", r.URL.Query().Get("sha"))
+				lookedUp = append(lookedUp, r.URL.Query().Get("path"))
+				var commits []*gh.RepositoryCommit
+				if tc.changed {
+					commits = []*gh.RepositoryCommit{{SHA: new("change"), Commit: &gh.Commit{Message: new("add legacy index")}}}
+				}
+				require.NoError(t, json.NewEncoder(w).Encode(commits))
+			})
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			changes, err := ic.LegacyPathChangesSinceAnchor(t.Context(), "octocat/hello-world", "anchor", "base", tc.legacyPaths)
+			assert.Equal(t, tc.wantLookups, lookedUp)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				return
+			}
+			require.NoError(t, err)
+			if tc.changed {
+				assert.Equal(t, []LegacyPathChange{{Commit: "change", Path: "active", Title: "add legacy index"}}, changes)
+			} else {
+				assert.Empty(t, changes)
+			}
 		})
 	}
 }

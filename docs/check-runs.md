@@ -218,7 +218,7 @@ configured environment, and publishes the normal aggregate check for the
 discovered database.
 
 When replacing a legacy schema change workflow, opt into legacy verification by
-adding this optional metadata to the introduced config:
+adding this optional metadata to the config:
 
 ```yaml
 legacy_baseline:
@@ -233,15 +233,23 @@ need no metadata backfill.
 
 Onboarding verification is part of the existing `SchemaBot` or
 `SchemaBot (<environment>)` aggregate Check Runs. No additional required check
-is needed. Before publishing a passing PR aggregate, SchemaBot compares complete,
-commit-pinned base and head config sets to identify newly introduced databases;
-config moves are therefore not onboarding. For new databases that supply
-`legacy_baseline`, the metadata must be valid, each path must exist at the anchor,
-and no commit after the anchor may touch a recorded legacy path on the current
-base branch. Existence is checked at the anchor even when it equals the current
-base, so the onboarding PR itself can remove the old files. Plans, apply
-completion, and no-schema updates cannot publish success without this opted-in
-verification. Aggregate participants leave this repository-wide verification to
+is needed. Before publishing a passing PR aggregate, SchemaBot discovers configs
+at the pinned PR head and verifies every supplied `legacy_baseline`. It does not
+compare configs against the base branch. The metadata must be valid, the anchor
+must be an ancestor of the current base, and each recorded path must exist at the
+anchor, even when the path has since been retired.
+
+Each path still present on the current base branch must have no commits touching
+it after the anchor. A path absent from that base is treated as retired and
+skipped; verification continues for the other paths. Deleting legacy files in
+the PR does not bypass verification because existence is checked on the base,
+normally `main`. After that deletion merges, `legacy_baseline` can remain without
+a cleanup PR. Renaming a path on the base also retires its old name; update the
+recorded paths when moving legacy files. An inconclusive path lookup blocks the
+aggregate and schedules a bounded retry.
+
+Plans, apply completion, and no-schema updates cannot publish success without
+this opted-in verification. Aggregate participants leave this repository-wide verification to
 their leader.
 
 SchemaBot re-reads the PR head, base branch name, and actual base branch tip

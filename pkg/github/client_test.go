@@ -747,7 +747,8 @@ func TestSchemaPathsChangedSinceMergeBaseUsesRootTreeSHA(t *testing.T) {
 
 func TestLegacyPathChangesSinceAnchorReportsIntermediatePathCommits(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
-	registerLegacyAnchorTree(t, mux, map[string]string{"service/db/changes/001.sql": "schema-blob"})
+	paths := map[string]string{"service/db/changes/001.sql": "schema-blob"}
+	registerLegacyTrees(t, mux, paths, paths)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/anchor...base", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
 			Status:       new("ahead"),
@@ -780,7 +781,8 @@ func TestLegacyPathChangesSinceAnchorReportsIntermediatePathCommits(t *testing.T
 
 func TestLegacyPathChangesSinceAnchorAcceptsUnchangedAnchor(t *testing.T) {
 	client, mux := setupRateLimitedTestGitHubServer(t)
-	registerLegacyAnchorTree(t, mux, map[string]string{"service/db/changes/001.sql": "schema-blob"})
+	paths := map[string]string{"service/db/changes/001.sql": "schema-blob"}
+	registerLegacyTrees(t, mux, paths, paths)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/anchor...anchor", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("identical")}))
 	})

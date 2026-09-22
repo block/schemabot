@@ -186,18 +186,21 @@ type: mysql
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 | `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
-| `legacy_baseline` | No | Opts into legacy verification while introducing a database config. Records the full base commit and exact repository-relative legacy schema paths whose supported DDL effects are represented by the declarative files. `schemabot onboard` writes it when both `--legacy-base-commit` and repeatable `--legacy-path` flags are supplied. |
+| `legacy_baseline` | No | Opts into legacy verification for recorded paths still present on the current base branch. Records the full base commit and exact repository-relative legacy schema paths whose supported DDL effects are represented by the declarative files. `schemabot onboard` writes it when both `--legacy-base-commit` and repeatable `--legacy-path` flags are supplied. |
 
-The existing SchemaBot aggregate Check Runs compare complete config sets at the
-current base and PR head before publishing success. Onboarding verification
-activates only for database identities absent from the base that supply
-`legacy_baseline`, so moving a config does not reactivate it. Omit that optional
-metadata when legacy verification is not needed; existing databases need no
-metadata backfill. For an introduced database with a baseline, the aggregate
-fails if the metadata is malformed, the anchor is no longer an ancestor of the
-base, a recorded path does not exist at the anchor, or a later base commit
-touched a recorded path. The base branch tip is checked again before success;
-a changed or unreadable tip blocks and triggers a bounded retry.
+The existing SchemaBot aggregate Check Runs verify every `legacy_baseline` in
+the configs at the pinned PR head before publishing success. They do not require
+or compare configs on the base branch. Omit that optional metadata when legacy
+verification is not needed; existing databases need no metadata backfill.
+The aggregate fails if the metadata is malformed, the anchor is no longer an
+ancestor of the base, or any recorded path does not exist at the anchor.
+For each path still present on the current base branch, normally `main`, no
+later base commit may have touched it. Paths absent from that base are retired
+individually, so deleting files in the PR cannot disable verification. After the
+deletion merges, the metadata may remain. A rename also retires the old path;
+update recorded paths when moving legacy files. An inconclusive path lookup
+blocks and triggers a bounded retry. The base branch tip is checked again before
+success; a changed or unreadable tip also blocks and triggers a bounded retry.
 The production plan must also be empty before merge.
 
 Keep the existing required aggregate checks; no separate onboarding check is
