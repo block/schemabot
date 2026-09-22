@@ -279,6 +279,16 @@ func watchForShutdownSignal(ctx context.Context) (context.Context, <-chan os.Sig
 			signalled <- sig
 			cancel()
 		case <-runCtx.Done():
+			// The caller's cancellation may be this same signal arriving by
+			// another route: a CLI that traps it for every command cancels the
+			// context this one is derived from, and the runtime has already
+			// delivered to sigCh by then. Take the signal if it is there, so
+			// the cause is not decided by which of the two woke first.
+			select {
+			case sig := <-sigCh:
+				signalled <- sig
+			default:
+			}
 		}
 	}()
 
@@ -292,6 +302,49 @@ func watchForShutdownSignal(ctx context.Context) (context.Context, <-chan os.Sig
 // caller context both end the run context, so the recorded signal is what
 // separates them, and an operator needs the separation: it says whether this
 // process was told to stop or the process embedding it was.
+// grpcDrainTimeout bounds the wait for in-flight RPCs to finish before the gRPC
+// server is stopped from under them.
+const grpcDrainTimeout = 10 * time.Second
+
+// stopGRPCServer ends the gRPC server, letting in-flight RPCs finish within
+// drainTimeout and stopping them once it is spent.
+//
+// The bound is what keeps this stage from swallowing the shutdown. This runs as
+// a deferred call ahead of Server.Close, so an RPC that never returns would
+// otherwise park the whole of the rest of shutdown behind it — every bounded
+// drain below included — and the process would outlive its termination grace
+// period on the one stage that had no bound.
+//
+// What the bound buys is the rest of shutdown, not the handler returning. A
+// goroutine that ignores its context is not something Go can end, so an expired
+// drain walks away from the graceful stop and leaves it parked — the same trade
+// every wait in pkg/drain makes. Both listeners are already closed by then, so
+// nothing new arrives at a server nobody is waiting for any more, and the
+// abandoned handler goes when the process does.
+//
+// Forcing the point with grpc.Server.Stop is not available here. It takes the
+// same lock GracefulStop holds while waiting on the handlers, so calling it on
+// a graceful stop that is already parked deadlocks on the one case worth
+// forcing. Ending the wait is the part that belongs in SchemaBot; a graceful
+// stop that gave up on its own belongs upstream.
+func stopGRPCServer(grpcServer *grpc.Server, logger *slog.Logger, drainTimeout time.Duration) {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		grpcServer.GracefulStop()
+	}()
+
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-stopped:
+	case <-timer.C:
+		logger.Warn("gRPC server still had in-flight RPCs when its drain expired; leaving them and continuing shutdown",
+			"drain_timeout", drainTimeout)
+	}
+}
+
 func logShutdownCause(ctx context.Context, logger *slog.Logger, signalled <-chan os.Signal) {
 	select {
 	case sig := <-signalled:
@@ -354,7 +407,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
 			}
 		}()
-		defer grpcServer.GracefulStop()
+		defer stopGRPCServer(grpcServer, srv.logger, grpcDrainTimeout)
 	}
 
 	// Start background loops (operator, health monitor, pending-drops cleaner,

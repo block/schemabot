@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -38,6 +39,11 @@ const (
 	// config parsing and the first log write on a loaded machine; past that, the
 	// process is not starting up at all and the test has nothing to signal.
 	serveStartupMarkerDeadline = 30 * time.Second
+
+	// buildTimeout bounds compiling the binary under test. A cold build of this
+	// module on a loaded machine fits inside it with room to spare, so a build
+	// that outlasts it is a stuck toolchain rather than a slow one.
+	buildTimeout = 5 * time.Minute
 )
 
 // A SchemaBot server that is signalled while its storage is unreachable exits,
@@ -206,8 +212,13 @@ func buildSchemabotBinary(t *testing.T) string {
 	root, err := moduleRoot()
 	require.NoError(t, err)
 
+	// A budget of its own, so a toolchain that hangs fails this helper rather
+	// than parking the test until the whole package times out.
+	ctx, cancel := context.WithTimeout(t.Context(), buildTimeout)
+	defer cancel()
+
 	binary := filepath.Join(t.TempDir(), "schemabot")
-	build := exec.CommandContext(t.Context(), "go", "build", "-o", binary, "./pkg/cmd")
+	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "./pkg/cmd")
 	build.Dir = root
 	var stderr bytes.Buffer
 	build.Stderr = &stderr
