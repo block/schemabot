@@ -1112,16 +1112,41 @@ func (s *Server) startTargetProbe(ctx context.Context) {
 	}()
 }
 
+// targetProbeDrainTimeout bounds how long stopTargetProbe waits for the
+// cancelled probe goroutine to exit. Enumeration and every per-target step run
+// under the prober's own timeout, so the probe normally exits the moment it is
+// cancelled; the bound is for the target that is reachable but not answering,
+// whose dial holds a pool worker and with it the goroutine feeding that pool.
+//
+// This stage is the first of the close, so leaving it unbounded would leave
+// every bounded stage after it waiting on a probe of a database this process
+// is on its way to stopping using. A probe abandoned here costs nothing: it
+// reads `SELECT 1` and records the result to metrics and the log, writing
+// neither to the target nor to storage, so the only thing lost is a
+// connectivity line for a server that is shutting down.
+const targetProbeDrainTimeout = 5 * time.Second
+
 // stopTargetProbe cancels a running startup probe and waits for its goroutine
-// to exit. In-flight dials observe the cancellation through their context, and
-// the prober discards results cut short by it rather than recording them.
-func (s *Server) stopTargetProbe() {
+// to exit, within the shutdown budget. In-flight dials observe the
+// cancellation through their context, and the prober discards results cut
+// short by it rather than recording them.
+//
+// An abandoned probe still holds the resolver that svc.Close releases below.
+// It opens a connection of its own per target rather than borrowing the
+// service's clients, so what it can reach through a released resolver is an
+// error on its own next step, which it logs as a failed probe and moves past.
+func (s *Server) stopTargetProbe(budget *drain.Budget) {
 	if s.probeCancel == nil {
 		s.logger.Debug("target probe: no startup probe was started; nothing to stop")
 		return
 	}
 	s.probeCancel()
-	<-s.probeDone
+	if !budget.WaitFor(s.probeDone, targetProbeDrainTimeout) {
+		s.logger.Warn("target probe did not exit within the shutdown drain; the close continues without it and its connectivity results for this startup are lost",
+			"drain_timeout", targetProbeDrainTimeout,
+			"budget_spent", budget.Spent())
+		return
+	}
 	s.logger.Info("target probe stopped")
 }
 
@@ -1184,9 +1209,10 @@ func (s *Server) shutdownAllot(own time.Duration) time.Duration {
 // after Start.
 //
 // Close returns whether or not the background work it waits for does. Every
-// stage that waits carries a bound of its own — the reconciliation pass, the
-// durable webhook pool, the in-process webhook drain, the driver pool, the
-// telemetry flush — and every one of them waits inside the shutdown budget, so
+// stage that waits carries a bound of its own — the startup target probe, the
+// reconciliation pass, the durable webhook pool, the in-process webhook drain,
+// the driver pool, the telemetry flush — and every one of them waits inside
+// the shutdown budget, so
 // a stage reaches its own bound only while the budget still has that much left
 // and the worst case is the budget rather than the sum. Each bound is stated
 // where it is declared, alongside what its stage gives up by expiring; none of
@@ -1197,7 +1223,7 @@ func (s *Server) Close() error {
 	// An embedder may stop the server without ever running it, so this is where
 	// shutdown begins for everything Run does not reach first.
 	budget := s.beginShutdown()
-	s.stopTargetProbe()
+	s.stopTargetProbe(budget)
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()

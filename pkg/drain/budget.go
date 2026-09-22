@@ -78,3 +78,9 @@ func (b *Budget) Spent() bool {
 func (b *Budget) Wait(wg *sync.WaitGroup, own time.Duration) bool {
 	return Wait(wg, b.Allot(own))
 }
+
+// WaitFor waits for done within own, or within what is left of the budget when
+// that is less.
+func (b *Budget) WaitFor(done <-chan struct{}, own time.Duration) bool {
+	return WaitFor(done, b.Allot(own))
+}
