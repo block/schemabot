@@ -310,7 +310,10 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -h -o 'func Test[^(]*' pkg/localscale/*_test.go | sed 's/func //' | grep -v '/' | sort)
+          # Searched recursively: the shard runner tests every package under
+          # pkg/localscale that carries test files, so a test in a nested
+          # package that no shard filter names would be run by nobody.
+          tests=$(find pkg/localscale -name '*_test.go' -exec grep -h -o 'func Test[^(]*' {} + | sed 's/func //' | grep -v '/' | sort -u)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no localscale tests discovered"

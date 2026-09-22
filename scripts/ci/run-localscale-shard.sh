@@ -56,9 +56,18 @@ min_slice=30
 # them by what they contain rather than by name means a package that grows its
 # first test joins the run on its own, so nothing is left untested by
 # omission.
-packages=$(go list -tags=integration \
+if ! listed=$(go list -tags=integration \
 	-f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' \
-	./pkg/localscale/...)
+	./pkg/localscale/...); then
+	# A partial listing is the dangerous case: it names some packages and
+	# still reports failure, so testing what it returned would look like a
+	# pass over a subset. Refuse rather than choose for the reader.
+	echo "::error::could not list the LocalScale packages; refusing to test a subset of them" >&2
+	exit 1
+fi
+
+# The template leaves a blank line for each package it rejects.
+packages=$(printf '%s\n' "$listed" | sed '/^$/d')
 if [ -z "$packages" ]; then
 	echo "::error::no LocalScale package contains test files" >&2
 	exit 1
