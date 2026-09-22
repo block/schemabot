@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 )
@@ -669,6 +671,13 @@ type PlanRequest struct {
 	// target as one unit (a database-scoped MySQL DSN), where a withheld
 	// namespace's live tables would otherwise be planned as drops.
 	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
+	// IgnoreTables lists the live tables the config's ignore_tables withholds
+	// from the planner, so a live table no schema file declares is not proposed
+	// for DROP TABLE. Unlike ignored namespaces the exclusion cannot be
+	// expressed by leaving files out of the request — the tables are on the
+	// target, not in the repository — so the data plane applies it and reports
+	// what it actually withheld through ExemptTables on the response.
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
 	// GroupedExecution reports whether an apply of this plan will hand the
 	// engine every ALTER at once or one table at a time. Engines predicting what
 	// an apply will do to unfinished work already on the target need the
@@ -724,20 +733,47 @@ type PlanResponse struct {
 	// applying this plan will adopt or discard, one entry per namespace holding
 	// any. Empty when the target is clean, which is the ordinary case.
 	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
-	// ExemptTables lists live tables the planner intentionally excluded from
-	// the undeclared-table verdict, one entry per namespace holding any. Like
+	// ExemptTables lists live tables that no schema file declares and the
+	// planner left in place instead of dropping, one entry per namespace
+	// holding any. Like
 	// ExistingCopies it describes the target at planning time and is carried
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
 }
 
-// ExemptTablesResponse describes live tables in one namespace that the planner
-// exempted from the undeclared-table verdict, and why.
+// ExemptTablesResponse describes live tables in one namespace that no schema
+// file declares and the planner left in place, and why.
 type ExemptTablesResponse struct {
 	Namespace string   `json:"namespace"`
 	Tables    []string `json:"tables"`
 	Reason    string   `json:"reason"`
+}
+
+// ExemptReasonIgnoreTables is the exemption reason a plan carries for a live
+// table the repository's ignore_tables config withheld from the planner. It
+// mirrors the engine's own vocabulary on the wire; this package holds its own
+// copy because it is dependency-free by design. A test pins the two together.
+const ExemptReasonIgnoreTables = "ignore_tables"
+
+// WithheldTables returns the live tables this plan reports it withheld on the
+// repository's instruction, across every namespace and sorted. The planner
+// exempts tables for reasons of its own as well — an engine's archive naming
+// convention — and only the config's own exclusions answer whether a
+// configured ignore_tables entry matched anything.
+func (r *PlanResponse) WithheldTables() []string {
+	if r == nil {
+		return nil
+	}
+	var tables []string
+	for _, group := range r.ExemptTables {
+		if group == nil || group.Reason != ExemptReasonIgnoreTables {
+			continue
+		}
+		tables = append(tables, group.Tables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
 }
 
 // Dispositions an ExistingCopyResponse can carry. These mirror the engine's
@@ -1040,6 +1076,67 @@ func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 			continue
 		}
 		tables = append(tables, sc.TableChanges...)
+	}
+	return tables
+}
+
+// RenderedTables returns the table changes an operator surface shows and
+// counts. The namespace-level Changes keep one change per table so a keyspace
+// reads as one entry, and that hides what a divergent shard adds: a shard that
+// creates a table its siblings alter, or a second index on one table. So for a
+// namespace with shard rows, those rows are the set, deduplicated by statement
+// in first-seen order so a change uniform across shards appears once, as it
+// renders once. A namespace without shard rows contributes its namespace-level
+// changes as received. A shard-row change that omits its namespace is returned
+// with the namespace filled in, so a shard's change is never attributed to the
+// plan's default database. A shard change with no DDL is not rendered because
+// both UX-6 selections must count only statements their surface can show.
+// Results mix aliases and copies; callers must not mutate them.
+//
+// The PR plan comment walks the same set from its rendered data
+// (keyspaceStatements in pkg/webhook/templates); the two selections must agree
+// for the summaries to.
+func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
+	if r == nil {
+		return nil
+	}
+	shardsByNamespace := make(map[string][]*ShardPlanResponse)
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		shardsByNamespace[sp.Namespace] = append(shardsByNamespace[sp.Namespace], sp)
+	}
+
+	var tables []*TableChangeResponse
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		shards, sharded := shardsByNamespace[sc.Namespace]
+		if !sharded {
+			tables = append(tables, sc.TableChanges...)
+			continue
+		}
+		seen := make(map[string]struct{})
+		for _, sp := range shards {
+			for _, t := range sp.Changes {
+				if t == nil || t.DDL == "" {
+					continue
+				}
+				if _, dup := seen[t.DDL]; dup {
+					continue
+				}
+				seen[t.DDL] = struct{}{}
+				if t.Namespace != "" {
+					tables = append(tables, t)
+					continue
+				}
+				withNamespace := *t
+				withNamespace.Namespace = sc.Namespace
+				tables = append(tables, &withNamespace)
+			}
+		}
 	}
 	return tables
 }

@@ -5,6 +5,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
 )
 
 // TestApplyOptionsFromMapRoundTrip verifies that user-facing apply options can
@@ -83,6 +85,44 @@ func TestPlanBlockedChanges(t *testing.T) {
 	assert.Equal(t, "requires copy-and-swap", changes[0].ModeReason)
 	assert.Equal(t, "accounts", changes[1].Table)
 	assert.Equal(t, "testdb", changes[1].Namespace)
+}
+
+// TestPlanBlockedApplyError verifies the refusal every admission path returns
+// for a plan with a blocked step: it names the first blocked table and its
+// reason, falls back to a fixed reason when the engine recorded none, and is
+// nil for a plan whose every step is executable.
+func TestPlanBlockedApplyError(t *testing.T) {
+	blocked := &Plan{PlanIdentifier: "plan-blocked", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{
+			{Table: "orders", Operation: "alter"},
+			{Table: "users", Operation: "alter", ExecutionMode: "blocked", ModeReason: "requires privileges unavailable to the engine"},
+		}},
+	}}
+	require.EqualError(t, blocked.BlockedApplyError(), `stored plan plan-blocked contains a blocked change for table "users": requires privileges unavailable to the engine`)
+
+	noReason := &Plan{PlanIdentifier: "plan-no-reason", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "blocked"}}},
+	}}
+	require.EqualError(t, noReason.BlockedApplyError(), `stored plan plan-no-reason contains a blocked change for table "users": the engine refuses this statement`)
+
+	twoCauses := &Plan{PlanIdentifier: "plan-two-causes", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "blocked", ModeReason: engine.JoinBlockedCauses([]string{
+			"requires privileges unavailable to the engine",
+			"table exceeds the native-safe size ceiling",
+		})}}},
+	}}
+	require.EqualError(t, twoCauses.BlockedApplyError(), "stored plan plan-two-causes contains a blocked change for table \"users\":\n- requires privileges unavailable to the engine\n- table exceeds the native-safe size ceiling")
+
+	clean := &Plan{PlanIdentifier: "plan-clean", Namespaces: map[string]*NamespacePlanData{
+		"public": {Tables: []TableChange{{Table: "users", Operation: "alter", ExecutionMode: "direct"}}},
+	}}
+	require.NoError(t, clean.BlockedApplyError())
+}
+
+func TestTaskEngineBlocked(t *testing.T) {
+	assert.True(t, (Task{ExecutionMode: "BLOCKED"}).EngineBlocked())
+	assert.False(t, (Task{ExecutionMode: "direct"}).EngineBlocked())
+	assert.False(t, (Task{}).EngineBlocked())
 }
 
 // TestReleasesPausedRollout verifies the one-way release latch semantics: a
@@ -454,4 +494,45 @@ func TestPlanIDForOperation(t *testing.T) {
 		_, err := PlanIDForOperation(apply, nil)
 		require.Error(t, err)
 	})
+}
+
+func TestPlanRecordIgnoreTables(t *testing.T) {
+	(*Plan)(nil).RecordIgnoreTables([]string{"flyway_schema_history"})
+
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"app":       {Tables: []TableChange{{Table: "users"}}},
+		"billing":   {Tables: []TableChange{{Table: "invoices"}}},
+		"nil_entry": nil,
+	}}
+	plan.RecordIgnoreTables([]string{"legacy_audit_log", "flyway_schema_history", "legacy_audit_log"})
+
+	// Every namespace carries the whole list, sorted and deduplicated: the
+	// exclusions are the plan's, and plan_data has no plan-level slot.
+	want := []string{"flyway_schema_history", "legacy_audit_log"}
+	assert.Equal(t, want, plan.Namespaces["app"].IgnoreTables)
+	assert.Equal(t, want, plan.Namespaces["billing"].IgnoreTables)
+	assert.Equal(t, want, plan.IgnoreTables())
+
+	// A plan planned under no ignore_tables config records nothing rather than
+	// an empty list a reader could mistake for an exclusion of nothing.
+	clean := &Plan{Namespaces: map[string]*NamespacePlanData{"app": {}}}
+	clean.RecordIgnoreTables(nil)
+	assert.Nil(t, clean.Namespaces["app"].IgnoreTables)
+}
+
+func TestPlanIgnoreTables(t *testing.T) {
+	assert.Nil(t, (*Plan)(nil).IgnoreTables(), "a nil plan excluded nothing")
+	assert.Nil(t, (&Plan{}).IgnoreTables(), "a plan with no namespaces excluded nothing")
+
+	// ignore_tables applies to the whole plan, so every stored namespace
+	// carries the same list and the union is what a re-plan must withhold
+	// even when it rebuilds only some of the plan's namespaces.
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"billing":   {IgnoreTables: []string{"legacy_audit_log", "flyway_schema_history"}},
+		"app":       {IgnoreTables: []string{"flyway_schema_history"}},
+		"nil_entry": nil,
+		"tables":    {Tables: []TableChange{{Table: "orders"}}},
+	}}
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, plan.IgnoreTables(),
+		"the union, sorted and deduplicated, so a re-plan withholds each table once")
 }

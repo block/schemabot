@@ -7,8 +7,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 func rollupAlterUsers(ddl string) *ternv1.SchemaChange {
@@ -74,6 +78,116 @@ func TestRollupDeploymentDiffs_AllMatchIsClean(t *testing.T) {
 	for _, e := range rollup.Entries {
 		assert.Equal(t, DeploymentMatch, e.Class, "deployment %q", e.Deployment)
 	}
+}
+
+func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
+	const statement = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	change := func(blocked bool) *ternv1.SchemaChange {
+		result := rollupAlterUsers(statement)
+		if blocked {
+			result.TableChanges[0].ExecutionMode = engine.ExecutionModeBlocked
+		}
+		return result
+	}
+
+	t.Run("secondary blocked", func(t *testing.T) {
+		secondary := change(true)
+		secondary.TableChanges = append(secondary.TableChanges, &ternv1.TableChange{
+			TableName:     "users",
+			Ddl:           statement,
+			ChangeType:    ternv1.ChangeType_CHANGE_TYPE_ALTER,
+			Namespace:     "testapp",
+			ExecutionMode: engine.ExecutionModeBlocked,
+		})
+		primary := change(false)
+		primary.TableChanges = append(primary.TableChanges, rollupAlterUsers(statement).TableChanges[0])
+		diffs := []DeploymentPlanDiff{
+			rollupDeployment("eu", primary),
+			rollupDeployment("au", secondary),
+		}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+		require.NoError(t, err)
+		assert.True(t, rollup.Clean)
+		assert.Equal(t, 0, rollup.Entries[0].Blocked)
+		assert.Equal(t, 2, rollup.Entries[1].Blocked)
+	})
+
+	// A sharded namespace is carried twice by the plan: once collapsed on
+	// Changes and once per shard on Shards. The count must agree with the number
+	// of changes the drift comparison sees in the same set, so the expectation
+	// is derived from CompareChangeSets rather than fixed by hand.
+	t.Run("sharded namespace counted once per shard", func(t *testing.T) {
+		table := func(mode string) *ternv1.TableChange {
+			return &ternv1.TableChange{
+				TableName: "users", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				Namespace: "testapp", ExecutionMode: mode,
+			}
+		}
+		sharded := func(mode string) DeploymentPlanDiff {
+			d := rollupDeployment("", &ternv1.SchemaChange{Namespace: "testapp", TableChanges: []*ternv1.TableChange{table(mode)}})
+			d.Shards = []*ternv1.ShardPlan{
+				{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{table(mode)}},
+				{Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{table(mode)}},
+			}
+			return d
+		}
+		diffs := []DeploymentPlanDiff{sharded(""), sharded(engine.ExecutionModeBlocked)}
+		diffs[0].Deployment, diffs[0].Target = "eu", "eu"
+		diffs[1].Deployment, diffs[1].Target = "au", "au"
+
+		drift, err := tern.CompareChangeSets(schema.DialectForDatabaseType("vitess"),
+			tern.ChangeSet{Changes: diffs[1].Changes, Shards: diffs[1].Shards}, tern.ChangeSet{})
+		require.NoError(t, err)
+		require.Len(t, drift.MissingFromCandidate, 2, "drift counts one change per shard")
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+		require.NoError(t, err)
+		assert.True(t, rollup.Clean)
+		assert.Equal(t, 0, rollup.Entries[0].Blocked)
+		assert.Equal(t, len(drift.MissingFromCandidate), rollup.Entries[1].Blocked)
+	})
+
+	// An errored deployment's plan is the one the rollup declared unusable, so
+	// no count is published from it.
+	t.Run("errored deployment publishes no count", func(t *testing.T) {
+		errored := rollupDeployment("au", change(true))
+		errored.Err = fmt.Errorf("deployment unreachable")
+		diffs := []DeploymentPlanDiff{rollupDeployment("eu", change(false)), errored}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+		require.NoError(t, err)
+		assert.False(t, rollup.Clean)
+		assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+		assert.Equal(t, 0, rollup.Entries[1].Blocked)
+	})
+
+	// A diverged deployment's own plan was computed, so its refusal count is
+	// still reported beside the divergence.
+	t.Run("diverged deployment keeps its count", func(t *testing.T) {
+		diverged := rollupDeployment("au", change(true))
+		diverged.Changes[0].TableChanges[0].Ddl = "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)"
+		diffs := []DeploymentPlanDiff{rollupDeployment("eu", change(false)), diverged}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+		require.NoError(t, err)
+		assert.False(t, rollup.Clean)
+		assert.Equal(t, DeploymentDiverged, rollup.Entries[1].Class)
+		assert.Equal(t, 1, rollup.Entries[1].Blocked)
+	})
+
+	t.Run("primary blocked", func(t *testing.T) {
+		diffs := []DeploymentPlanDiff{
+			rollupDeployment("eu", change(true)),
+			rollupDeployment("au", change(false)),
+		}
+
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+		require.NoError(t, err)
+		assert.True(t, rollup.Clean)
+		assert.Equal(t, 1, rollup.Entries[0].Blocked)
+		assert.Equal(t, 0, rollup.Entries[1].Blocked)
+	})
 }
 
 // A deployment that would plan different DDL than was reviewed is diverged, and
@@ -388,4 +502,23 @@ func TestRollupDeploymentDiffs_IndependentEnforcesMemberContract(t *testing.T) {
 	_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"cake", "orders-002"}, [2]string{"cake", "orders-001"}), PlanIndependent)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cake/orders-002")
+}
+
+// Every classification the rollup can produce has to be recorded under its own
+// metric label. RecordReviewDrift relabels one it does not recognize as
+// "unknown", which is reserved for a coding gap — so a classification added
+// here and not there turns a routine outcome into a permanent false gap signal,
+// and nothing fails to say so. The walk stops on String()'s own out-of-range
+// form, which covers whatever the enum holds rather than a list kept in step by
+// hand.
+func TestDeploymentClassificationsAreKnownToTheDriftMetric(t *testing.T) {
+	var walked []string
+	for c := DeploymentMatch; c.String() != fmt.Sprintf("unknown(%d)", int(c)); c++ {
+		assert.True(t, metrics.KnownReviewDriftClassification(c.String()),
+			"classification %q would be recorded as \"unknown\"", c.String())
+		walked = append(walked, c.String())
+	}
+	// Naming them pins the walk itself: a String() that stopped early would
+	// otherwise pass by covering nothing.
+	assert.Equal(t, []string{"match", "diverged", "errored", "planned"}, walked)
 }

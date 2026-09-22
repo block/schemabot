@@ -480,6 +480,13 @@ message PlanRequest {
   // disclosing a discard rather than promising a resume the apply will not
   // perform.
   optional bool grouped_execution = 12;
+  // Live tables the repository's ignore_tables config withholds from the
+  // planner, so a table no schema file declares is not proposed for
+  // DROP TABLE. Matched exactly and case-sensitively against the target's own
+  // catalog, in every namespace the plan covers. The engine discloses what it
+  // actually withheld through exempt_tables on the response, and refuses a
+  // table the config withholds that a schema file also declares.
+  repeated string ignore_tables = 13;
 }
 
 // TableChange represents a DDL change to a table.
@@ -659,6 +666,18 @@ message ApplyRequest {
   // first operation can never terminalize the apply while sibling dispatches
   // are still on their way. Empty means this dispatch is the whole generation.
   repeated string generation_operation_keys = 12;
+  // The ignore_tables config the reviewed plan was planned under, as the plan
+  // recorded it: every entry the planner was asked to withhold, not the subset
+  // that matched a live table where the plan was made. A deployment that
+  // materializes this dispatch re-plans against its own live schema to prove
+  // the reviewed DDL is what it would independently produce; without the same
+  // entries that re-plan sees a withheld table again and proposes dropping it,
+  // so it would refuse an apply that matches the plan exactly. The whole list
+  // travels because a member holds tables the planning target does not: an
+  // entry that matched nothing there still has to withhold here. The plan's
+  // own record travels rather than the current config, so the comparison is
+  // against what was reviewed.
+  repeated string ignore_tables = 13;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a
@@ -971,8 +990,8 @@ message StartResponse {
 // caller deploying a later release asks what this storage needs in order to
 // match that release, which the serving binary cannot answer from files it does
 // not have. Sending the files is the only way to ask the question, and it is
-// safe to ask because a diff executes nothing. The apply RPC carries no such
-// field, so a convergence can only ever run the serving binary's own schema.
+// safe to ask because a diff executes nothing. The apply RPC takes the same
+// field, so the schema an operator previewed here is the schema they converge.
 message StorageSchemaPlanRequest {
   // AllowDestructive reports the destructive statements as allowed rather than
   // refused, matching what an apply carrying the same flag would run. It does
@@ -1024,7 +1043,10 @@ message StorageSchemaReport {
   // Statements classified as destroying data. Refused unless destructive
   // changes are allowed.
   repeated StorageSchemaStatement destructive = 5;
-  // Whether the destructive statements would actually run.
+  // Whether the destructive statements would actually run on this call. It is
+  // the effective policy: the deployment's standing one, widened by an opt-in
+  // this caller sent. Use boot_removal_policy to reason about what some other
+  // process does, which a caller's opt-in never moves.
   bool destructive_allowed = 6;
   // Changes that cannot run automatically, each naming the situation and its
   // remediation. Any entry aborts the whole convergence before a single
@@ -1039,6 +1061,42 @@ message StorageSchemaReport {
   // this, because the same live database yields different answers against
   // different releases.
   string schema_source = 9;
+  // Whether some instance held the storage bootstrap lock when the diff was
+  // taken — a pod booting, or another operator's apply. It is what separates
+  // "this DDL is outstanding" from "this DDL is being run right now", which
+  // the statement sets cannot say on their own: a convergence's work lands on
+  // a shadow table until it cuts over. Only true is a finding; false is the
+  // absence of evidence, not a claim that the database is idle.
+  bool convergence_in_flight = 10;
+  // What the next pod to start does to storage state its own schema does not
+  // declare, which is what says whether state converged ahead of a deploy
+  // survives until that deploy.
+  //
+  // This is a property of the deployment and its dialect, never of the call
+  // that asked. A caller opting in to destructive statements moves
+  // destructive_allowed and leaves this alone, because a boot reads the
+  // deployment's config and has never heard of the request.
+  BootRemovalPolicy boot_removal_policy = 11;
+}
+
+// BootRemovalPolicy is what a boot of the answering deployment does to storage
+// state its own schema does not declare.
+//
+// UNSPECIFIED is a real answer and the reason this is not a bool. A release
+// that predates this field leaves it unset, and so does a caller holding a DSN
+// rather than a deployment's config, so an unset value means the answering side
+// could not say — never that the state is safe. Reading it as "preserved" is
+// how an operator is told to pre-apply storage the next pod will drop.
+enum BootRemovalPolicy {
+  // The answering side did not say. Older releases do not set this field, and
+  // a convergence addressed by DSN alone has no deployment config to read.
+  BOOT_REMOVAL_POLICY_UNSPECIFIED = 0;
+  // A boot leaves surplus storage state in place: it either refuses the
+  // removals, or never computes one.
+  BOOT_REMOVAL_POLICY_PRESERVES = 1;
+  // A boot drops the tables, columns and indexes its own schema does not
+  // declare.
+  BOOT_REMOVAL_POLICY_REMOVES = 2;
 }
 
 // StorageSchemaPlanResponse carries the outstanding storage DDL.
@@ -1047,7 +1105,16 @@ message StorageSchemaPlanResponse {
 }
 
 // StorageSchemaApplyRequest converges the serving instance's own storage
-// schema.
+// schema. Like the diff, it carries no target: the instance converges the
+// storage it uses, and nothing a caller sends can point it at a different
+// database.
+//
+// What a caller may send is the schema to converge *to*. An operator rolling a
+// later release converges the storage to that release before its first pod
+// starts, and the serving binary cannot do that from files it does not have.
+// Sending the files moves which schema runs and nothing else: the destructive
+// refusal and the manual-remediation gate decide exactly as they decide for a
+// boot.
 message StorageSchemaApplyRequest {
   // AllowDestructive permits the destructive statements this call would
   // otherwise refuse. It is an addition to the serving instance's storage
@@ -1059,6 +1126,31 @@ message StorageSchemaApplyRequest {
   // plane that accepted it, so the data plane's logs attribute the
   // convergence to a person rather than to a control plane.
   string caller = 2;
+  // TimeoutSeconds bounds the whole convergence: the advisory-lock wait, the
+  // diff taken under it, and the DDL. Zero means the caller named no budget,
+  // and the serving instance then runs the convergence under the budget it
+  // boots with rather than under an operator's: a caller that could not name
+  // a budget is one whose wait the serving instance cannot know, and the boot
+  // budget is the one every such caller has always waited out. A control
+  // plane names the budget it resolved on every request, so a convergence
+  // runs under the far larger operator default only because a caller asked
+  // for it and is waiting that long. Raise it only to finish work a boot cannot,
+  // such as an index build over a storage table with a long history: the
+  // convergence holds the bootstrap advisory lock for its whole budget, and a
+  // pod booting in that window fails its own lock wait and does not come up.
+  // A value above the serving instance's maximum is refused rather than
+  // clamped, so a caller is never told a budget it did not get.
+  int64 timeout_seconds = 3;
+  // SchemaFiles is the schema to converge to, as file name → file contents
+  // (for example "applies.sql" → "CREATE TABLE ..."). Empty converges the
+  // serving binary's own embedded files, which is what its next boot would
+  // converge.
+  map<string, string> schema_files = 4;
+  // SchemaSource says where schema_files came from, in words, for the reports
+  // to carry back and for the converging instance's logs to name. It is
+  // required with schema_files and never inferred: a convergence attributed to
+  // a release whose files it did not run is worse than one that names nothing.
+  string schema_source = 5;
 }
 
 // StorageSchemaApplyResponse brackets the convergence with the report from

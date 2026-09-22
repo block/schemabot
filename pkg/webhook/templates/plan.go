@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -160,12 +161,21 @@ type PlanCommentData struct {
 	LockAcquired string // formatted timestamp
 
 	// Automatic apply state
-	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
 
-	// StoppedConfirmedApply marks a downgrade that stopped an apply the
-	// operator confirmed themselves rather than pausing an automatic one, so
-	// the comment names what actually stopped.
-	StoppedConfirmedApply bool
+	// PendingManualConfirmation marks a locked comment that is waiting on the
+	// operator rather than announcing an apply already under way. It is the
+	// state itself, not evidence of it, so a downgrade whose cause is disclosed
+	// in a section above can leave the reason below empty without the comment
+	// reading as an apply in flight.
+	PendingManualConfirmation bool
+
+	// PausedApplyCause discloses why the apply is waiting, as a section among
+	// the other disclosures rather than a line in the footer. Every warning on
+	// this comment is then in one region, marked the same way and carrying the
+	// same kind of detail, and the footer is the same sentence on every
+	// comment. Nil when a disclosure above already explains the cause, never a
+	// signal that the apply is proceeding.
+	PausedApplyCause *PausedApplyCauseData
 
 	RecoveredApplyOwnedCheckState bool
 
@@ -183,28 +193,38 @@ type ExemptTablesData struct {
 }
 
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
-// uniform "same plan everywhere" line when every deployment matches, or a
-// per-deployment breakdown when some deployment diverged from — or could not be
-// confirmed against — the reviewed plan.
+// uniform line when every member passed its contract, or a per-member breakdown
+// when some member diverged from — or could not be confirmed against — the
+// reviewed plan.
 type DeploymentDriftData struct {
-	// Deployments is every configured deployment in rollout order, primary first.
+	// Deployments is every configured rollout member in rollout order, primary
+	// first.
 	Deployments []DeploymentDriftEntry
-	// Clean is true only when every deployment matches the reviewed plan.
+	// Clean means every member passed its contract: under mirrored members, that
+	// they all match the reviewed plan; under independent members, that they all
+	// produced a plan of their own.
 	Clean bool
 	// Computed is false when the rollup itself could not be evaluated; the check
 	// still fails closed, and the preview says the deployments are unverified.
 	Computed bool
+	// Independent reports that each member holds its own schema and was planned
+	// against it. Members are then not expected to match each other, so a clean
+	// rollup means every target was planned rather than that they agree — which
+	// is the opposite of what the mirrored wording says.
+	Independent bool
 }
 
-// DeploymentDriftEntry is one deployment's classification against the reviewed
-// primary plan.
+// DeploymentDriftEntry is one rollout member's classification against the
+// reviewed primary plan.
 type DeploymentDriftEntry struct {
 	Deployment string
 	Primary    bool
-	// Class is "match", "diverged", or "errored".
+	// Class is "match", "planned", "diverged", or "errored".
 	Class string
-	// Detail is a short human explanation for a diverged or errored deployment;
-	// empty for a match.
+	// Blocked is the number of changes this member will refuse at apply.
+	Blocked int
+	// Detail is a short human explanation for a diverged or errored member;
+	// empty for a member that passed.
 	Detail string
 }
 
@@ -216,18 +236,17 @@ type DeploymentDriftEntry struct {
 // already out of reach. The footer reads the same predicate, so the two cannot
 // disagree about whether the reader still has a decision to make.
 func (d PlanCommentData) applyingWithoutConfirmation() bool {
-	return d.IsLocked && d.AutoConfirmDowngradeReason == ""
+	return d.IsLocked && !d.PendingManualConfirmation
 }
 
-// downgradeHeading names what the comment stopped. An operator who issued
-// apply-confirm themselves paused nothing automatic, so telling them an
-// automatic apply was paused would describe a schema change that was never in
-// flight.
-func (d PlanCommentData) downgradeHeading() string {
-	if d.StoppedConfirmedApply {
-		return "Apply stopped"
-	}
-	return "Automatic apply paused"
+// PausedApplyCauseData is a cause the rest of the comment does not already
+// disclose, in the shape every other disclosure uses: a heading naming what is
+// wrong, the specifics behind it, and what the operator can do. Entries may be
+// empty where the cause has no per-table detail to give.
+type PausedApplyCauseData struct {
+	Heading string
+	Entries []string
+	Remedy  string
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -345,6 +364,14 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeRunningCopies(&sb, data.RunningCopies, data.applyingWithoutConfirmation())
 	}
 
+	// Why the apply is waiting, when no disclosure above says so. It sits here
+	// rather than in the footer so every warning on the comment is in one
+	// region: the reader meets them in one pass, and the footer stays the same
+	// sentence whatever paused the apply.
+	if data.PausedApplyCause != nil {
+		writePausedApplyCause(&sb, data.PausedApplyCause)
+	}
+
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
@@ -390,8 +417,10 @@ func RenderPlanComment(data PlanCommentData) string {
 
 		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
-			fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
-			sb.WriteString("Review the plan above, then confirm manually:\n")
+			// The same sentence on every paused comment, whatever paused it.
+			// The cause is a disclosure above, so the footer is only ever the
+			// decision the reader is being asked for.
+			sb.WriteString("**Confirmation required** — review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
 			sb.WriteString("```\nschemabot unlock\n```\n")
@@ -428,7 +457,7 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 // unsafe opt-in gate, where no consent was ever solicited and this comment is
 // the operator's notice.
 func attributionStillActionable(data PlanCommentData) bool {
-	if !data.IsLocked || data.AutoConfirmDowngradeReason != "" {
+	if !data.IsLocked || data.PendingManualConfirmation {
 		return true
 	}
 	for _, change := range data.AttributedChanges {
@@ -452,7 +481,7 @@ func attributionStillActionable(data PlanCommentData) bool {
 // that last changed it, never the specific column or index.
 func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "🛑 **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	fmt.Fprintf(sb, glyph.Attention+" **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
 	for _, d := range changes {
 		if d.Unresolved {
 			fmt.Fprintf(sb, "- %s: ownership could not be established; see server logs\n", inlineCode(d.Table))
@@ -533,21 +562,33 @@ func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithV
 }
 
 // keyspaceStatementCount counts a keyspace's DDL statements for the summary and
-// the no-changes short-circuit. It prefers the collapsed namespace-level
-// Statements; when those are absent but the keyspace carries per-shard changes,
-// it counts the distinct statements across shards, so a sharded plan whose only
-// DDL is per-shard is never miscounted as "no changes".
+// the no-changes short-circuit.
 func keyspaceStatementCount(ks KeyspaceChangeData) int {
-	if len(ks.Statements) > 0 {
-		return len(ks.Statements)
+	return len(keyspaceStatements(ks))
+}
+
+// keyspaceStatements returns the DDL statements the plan comment renders for a
+// keyspace, which is the set every summary count walks. A sharded keyspace
+// renders its per-shard changes, so those are authoritative: the collapsed
+// namespace-level Statements can omit a statement confined to one shard, and
+// counting from them would drop it from the summary while the DDL block shows
+// it. The per-shard statements are deduplicated in first-seen order so a
+// uniform change across shards counts once, as it renders once.
+func keyspaceStatements(ks KeyspaceChangeData) []string {
+	if len(ks.Shards) == 0 {
+		return ks.Statements
 	}
 	seen := make(map[string]struct{})
+	var statements []string
 	for _, sh := range ks.Shards {
 		for _, stmt := range sh.Statements {
-			seen[stmt] = struct{}{}
+			if _, dup := seen[stmt]; !dup {
+				seen[stmt] = struct{}{}
+				statements = append(statements, stmt)
+			}
 		}
 	}
-	return len(seen)
+	return statements
 }
 
 func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithVSchema int) {
@@ -560,30 +601,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		return
 	}
 
-	// Count statement types (Terraform-style: X to create, Y to alter, Z to drop)
-	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
-
-	var parts []string
-	if creates > 0 {
-		parts = append(parts, fmt.Sprintf("**%d** %s to create", creates, pluralize("table", creates)))
-	}
-	if alters > 0 {
-		parts = append(parts, fmt.Sprintf("**%d** %s to alter", alters, pluralize("table", alters)))
-	}
-	if drops > 0 {
-		parts = append(parts, fmt.Sprintf("**%d** %s to drop", drops, pluralize("table", drops)))
-	}
-	// Last-resort total: when nothing classified as create/alter/drop — a plan
-	// of only index or rename DDL, or per-shard-only DDL that
-	// countStatementTypes does not walk — report the raw statement total so
-	// the plan never reads as "no changes", and report it before the vschema
-	// clause so a vschema update never hides DDL the plan will run. A mixed
-	// plan with a non-zero typed count renders only the typed counts, so its
-	// untyped statements are not reflected here; SummarizeChanges shares this
-	// behavior, keeping the two surfaces in agreement.
-	if len(parts) == 0 && totalStatements > 0 {
-		parts = append(parts, fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements)))
-	}
+	parts := ui.PlanSummaryParts(countStatementTypes(data.Changes, data.DatabaseType), totalStatements, true)
 	if keyspacesWithVSchema > 0 && !data.IsMySQL {
 		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
 	}
@@ -615,20 +633,54 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 	fmt.Fprintf(sb, glyph.Info+" Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
 }
 
-// writeExemptTables renders one disclosure line per namespace whose live
-// tables the plan exempted from the undeclared-table verdict, so a reviewer
-// can tell an exempted table from a declared one. No-op when nothing was
-// exempted, which is the ordinary case. The namespace and table names come
-// from the target's catalog, so they render as code spans they cannot break
-// out of; the reason is engine prose and is sanitized like any other.
+// exemptTablesInlineLimit caps how many exempt table names render inline in
+// the disclosure. Beyond it the names read as a wall standing above the plan
+// they annotate, so the disclosure leads with its count and folds the names
+// into a collapsed block. The count rides on the visible line either way: a
+// reviewer has to be able to see that the plan withheld tables, and how many,
+// without opening anything.
+const exemptTablesInlineLimit = 5
+
+// writeExemptTables renders one disclosure line per namespace holding live
+// tables no schema file declares that the plan leaves in place rather than
+// dropping, so a reviewer can tell an exempted table from a declared one.
+// No-op when nothing was exempted, which is the ordinary case.
 func writeExemptTables(sb *strings.Builder, groups []ExemptTablesData) {
 	for _, group := range groups {
-		if len(group.Tables) == 0 {
-			continue
-		}
-		fmt.Fprintf(sb, glyph.Info+" Tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
-			inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
+		writeExemptTablesGroup(sb, group, "")
 	}
+}
+
+// writeExemptTablesGroup renders one namespace's exempt-table disclosure,
+// naming the environment when the caller breaks the disclosure down per
+// environment. The namespace and table names come from the target's catalog
+// and the reason is engine prose, so each is escaped for the surface it lands
+// on: markdown inline, HTML inside the <summary> of the collapsed form.
+func writeExemptTablesGroup(sb *strings.Builder, group ExemptTablesData, env string) {
+	if len(group.Tables) == 0 {
+		return
+	}
+	names := strings.Join(inlineCodeList(group.Tables), ", ")
+
+	if len(group.Tables) <= exemptTablesInlineLimit {
+		prefix, noun := "", "Ignored tables"
+		if env != "" {
+			prefix, noun = fmt.Sprintf("**%s**: ", capitalizeFirst(env)), "ignored tables"
+		}
+		fmt.Fprintf(sb, glyph.Info+" %s%s in namespace %s (%s): %s\n\n",
+			prefix, noun, inlineCode(group.Namespace), exemptReason(group.Reason), names)
+		return
+	}
+
+	// GitHub renders <summary> content as HTML, not markdown, so the folded
+	// header names the namespace in a <code> tag and escapes as HTML.
+	prefix := ""
+	if env != "" {
+		prefix = fmt.Sprintf("<b>%s</b>: ", html.EscapeString(capitalizeFirst(env)))
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d ignored tables in namespace <code>%s</code> (%s)</summary>\n\n%s\n\n</details>\n\n",
+		prefix, len(group.Tables), html.EscapeString(flattenIdentifier(group.Namespace)),
+		html.EscapeString(SanitizeInlineError(group.Reason)), names)
 }
 
 // hasExemptTables reports whether writeExemptTables would render anything for
@@ -670,11 +722,7 @@ func writeMultiEnvExemptTables(sb *strings.Builder, data MultiEnvPlanCommentData
 	}
 	for _, env := range data.Environments {
 		for _, group := range planExemptTables(data, env) {
-			if len(group.Tables) == 0 {
-				continue
-			}
-			fmt.Fprintf(sb, glyph.Info+" **%s**: tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
-				capitalizeFirst(env), inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
+			writeExemptTablesGroup(sb, group, env)
 		}
 	}
 }
@@ -776,28 +824,19 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 // create/alter/drop and vschema counting is identical to the plan comment's
 // summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
-	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
+	counts := countStatementTypes(data.Changes, data.DatabaseType)
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
-	var parts []string
-	if creates > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", creates, pluralize("create", creates)))
-	}
-	if alters > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", alters, pluralize("alter", alters)))
-	}
-	if drops > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", drops, pluralize("drop", drops)))
-	}
+	parts := ui.AssemblePlanSummary(counts, totalStatements,
+		func(count int, op string) string { return fmt.Sprintf("%d %s", count, pluralize(op, count)) },
+		func(count int, other bool) string {
+			prefix := ""
+			if other {
+				prefix = "other "
+			}
+			return fmt.Sprintf("%d %sDDL %s", count, prefix, pluralize("statement", count))
+		})
 	ddlSummary := strings.Join(parts, ", ")
-
-	// Fallback matching the plan comment: statements that classify as none of
-	// create/alter/drop — or per-shard-only DDL that countStatementTypes does not
-	// walk — still count. Report the raw statement total so the Change column
-	// never implies "no changes" for a plan that has them.
-	if ddlSummary == "" && totalStatements > 0 {
-		ddlSummary = fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements))
-	}
 
 	if keyspacesWithVSchema > 0 && !data.IsMySQL {
 		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))
@@ -809,44 +848,50 @@ func SummarizeChanges(data PlanCommentData) string {
 	return ddlSummary
 }
 
-// countStatementTypes counts CREATE, ALTER, and DROP statements across all
+// countStatementTypes counts CREATE, ALTER, DROP, and other statements across all
 // keyspaces with each dialect's parser, counting a valid greenfield create set
-// as one create. A database type with no
-// registered parser, or a statement its parser rejects, contributes nothing
-// to the typed counts — the callers' raw statement-total fallbacks keep the
-// summary honest — and each case is logged so a miscounted summary is
-// triageable from server logs.
-func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops int) {
+// as one create. It walks the statements the comment renders
+// (keyspaceStatements), so a sharded keyspace is counted from its per-shard
+// changes. The create/alter/drop counts are per table: when shards diverge,
+// one table can render two different ALTER statements, and it is still one
+// table to alter. A statement the parser rejects or a recognized statement
+// outside the table buckets contributes to other so the summary stays
+// complete. A database type with no registered parser yields no counts at
+// all, and the callers' raw-total fallback carries the statement count.
+func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.PlanCounts {
+	var counts ui.PlanCounts
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
 	if err != nil {
-		slog.Warn("plan summary cannot classify statements; the summary will report raw statement totals instead of create/alter/drop counts",
+		slog.Warn("plan summary cannot classify statements; the summary will report the raw DDL statement total instead of create/alter/drop counts",
 			"database_type", databaseType, "error", err)
-		return 0, 0, 0
+		// The callers' raw-total fallback carries the count when classification
+		// is unavailable.
+		return counts
 	}
 	for _, ks := range changes {
-		for _, stmt := range ks.Statements {
-			stmtType, _, classifyErr := parser.Classify(stmt)
+		for _, stmt := range keyspaceStatements(ks) {
+			stmtType, table, classifyErr := parser.Classify(stmt)
 			if classifyErr != nil {
 				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
 				if createSetErr != nil {
 					slog.Warn("plan summary could not classify a statement or parse it as a supported create set; it is left out of the create/alter/drop counts",
 						"database_type", databaseType, "keyspace", ks.Keyspace,
 						"classify_error", classifyErr, "create_set_error", createSetErr)
+					counts.AddOther()
 					continue
 				}
-				stmtType = createSet.Type
+				stmtType, table = createSet.Type, createSet.Table
 			}
 			switch stmtType {
-			case ddl.StatementCreateTable:
-				creates++
-			case ddl.StatementAlterTable:
-				alters++
-			case ddl.StatementDropTable:
-				drops++
+			case ddl.StatementCreateTable, ddl.StatementAlterTable, ddl.StatementDropTable:
+			default:
+				counts.AddOther()
+				continue
 			}
+			counts.AddTable(ks.Keyspace, ddl.StatementTypeToOp(stmtType), table)
 		}
 	}
-	return
+	return counts
 }
 
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
@@ -1093,9 +1138,15 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
-// line when every deployment matches the reviewed plan, or a per-deployment
-// breakdown naming which deployments diverged or could not be verified. It is a
-// no-op for a nil rollup (single-target database or drift not evaluated).
+// line when every member passed its contract and none will refuse a change, or
+// a per-member breakdown naming which members diverged, could not be planned or
+// verified, or carry changes blocked at apply. It is a no-op for a nil rollup
+// (single-target database or drift not evaluated).
+//
+// The two contracts get different wording throughout, because a clean rollup
+// means a different thing under each. Mirrored members agree with the reviewed
+// plan; independent members were never compared to it, so the uniform line says
+// they were each planned rather than that they match.
 func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	if drift == nil {
 		return
@@ -1106,13 +1157,37 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
-	if drift.Clean {
+	switch {
+	case drift.Clean && drift.Independent:
+		// Independent members were deliberately never compared to each other, so
+		// the mirrored headline would assert agreement the rollup did not check.
+		// It says what was actually established: every target has a plan.
+		//
+		// The members are not named here the way the mirrored line names them.
+		// Mirrored members are distinct deployments, so their names identify
+		// them; independent members usually share one deployment and differ by
+		// target, which this entry does not carry, so the same list would name
+		// one deployment once per target and identify nothing.
+		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** — each target holds its own schema, so their plans are not expected to match.\n\n",
+			len(drift.Deployments))
+	case drift.Clean:
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
 			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
+	case drift.Independent:
+		// A member that could not be planned blocks under either contract, but
+		// only mirrored members can be out of agreement with each other. Calling
+		// an independent environment's failure "drift" would send an operator to
+		// reconcile targets that are supposed to differ.
+		sb.WriteString(glyph.Attention + " **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:\n\n")
+	default:
+		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+	}
+	// A clean rollup has nothing more to say unless some member will refuse a
+	// change at apply, which the per-member list below is the only place to
+	// report.
+	if drift.Clean && !anyDeploymentBlocked(drift.Deployments) {
 		return
 	}
-
-	sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
 	for _, d := range drift.Deployments {
 		name := "`" + d.Deployment + "`"
 		if d.Primary {
@@ -1120,14 +1195,41 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		}
 		switch d.Class {
 		case "match":
-			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan\n", name)
+			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan%s\n", name, blockedSuffix(d.Blocked))
+		case "planned":
+			fmt.Fprintf(sb, "- %s ✅ planned against its own schema%s\n", name, blockedSuffix(d.Blocked))
 		case "diverged":
-			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s\n", name, driftDetailSuffix(d.Detail))
+			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s%s\n", name, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
 		default:
-			fmt.Fprintf(sb, "- %s "+glyph.Failed+" could not verify%s\n", name, driftDetailSuffix(d.Detail))
+			// An errored member means different things under the two contracts:
+			// a mirrored member's diff could not be confirmed against the
+			// reviewed plan, while an independent member has no plan at all.
+			reason := "could not verify"
+			if drift.Independent {
+				reason = "could not plan"
+			}
+			fmt.Fprintf(sb, "- %s "+glyph.Failed+" %s%s%s\n", name, reason, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
 		}
 	}
 	sb.WriteString("\n")
+}
+
+func anyDeploymentBlocked(deployments []DeploymentDriftEntry) bool {
+	for _, d := range deployments {
+		if d.Blocked > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// blockedSuffix renders a deployment's blocked change count as a trailing
+// clause, or an empty string when the deployment refuses nothing.
+func blockedSuffix(blocked int) string {
+	if blocked == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" · blocked: %d", blocked)
 }
 
 // driftDetailSuffix renders a deployment's drift detail as a trailing clause, or
@@ -1161,11 +1263,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
-		} else {
-			fmt.Fprintf(sb, "- %s\n", table)
-		}
+		writeEngineReasonItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
@@ -1203,6 +1301,20 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer st
 // policy routes to native DDL, naming each table and the planner's reason
 // (which carries the row estimate). The fixed footer discloses the semantics
 // the operator consents to by confirming the apply.
+// writePausedApplyCause renders the cause in the same shape as the disclosures
+// around it, so a reader scanning for warnings finds this one where they find
+// the rest rather than below the plan in the footer.
+func writePausedApplyCause(sb *strings.Builder, cause *PausedApplyCauseData) {
+	fmt.Fprintf(sb, glyph.Attention+" **%s**\n", cause.Heading)
+	for _, entry := range cause.Entries {
+		fmt.Fprintf(sb, "- %s\n", entry)
+	}
+	if cause.Remedy != "" {
+		fmt.Fprintf(sb, "\n%s\n", cause.Remedy)
+	}
+	sb.WriteString("\n")
+}
+
 func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool) {
 	headerNoun, footer := directConsentCopy(databaseType, isMySQL)
 	n := len(changes)
@@ -1212,13 +1324,31 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
-		} else {
-			fmt.Fprintf(sb, "- %s\n", table)
-		}
+		writeEngineReasonItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\n" + footer + "\n\n")
+}
+
+// writeEngineReasonItem keeps one cause in the established one-line shape and
+// gives each additional independent cause its own nested Markdown bullet. A
+// cause is judged empty after sanitization, so a reason made only of
+// characters the sanitizer strips falls back to the bare table line instead of
+// a dangling colon.
+func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
+	causes := make([]string, 0)
+	for _, cause := range engine.BlockedCauses(reason) {
+		if cause = SanitizeInlineError(cause); cause != "" {
+			causes = append(causes, cause)
+		}
+	}
+	if len(causes) == 0 {
+		fmt.Fprintf(sb, "- %s\n", table)
+		return
+	}
+	fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(causes[0]))
+	for _, cause := range causes[1:] {
+		fmt.Fprintf(sb, "  - %s\n", escapeInlineMarkdown(cause))
+	}
 }
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {

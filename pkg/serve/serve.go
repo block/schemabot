@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/inventory"
@@ -175,14 +177,60 @@ type webhookRuntime struct {
 	reconcileMissingSummaryComments func(context.Context)
 }
 
-func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, logger *slog.Logger) {
-	if r.reconcileMissingSummaryComments == nil {
-		logger.Debug("missing summary reconciliation disabled")
+// reconcilePass is a running one-shot missing-summary reconciliation. Start
+// detaches the pass from its context on purpose — it repairs terminal PR
+// comments an interrupted process left half-written, and a request context
+// ending must not leave them that way — which makes Close the only place that
+// can put a bound on it. This handle is what gives Close something to bound.
+type reconcilePass struct {
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
+}
+
+// Reconciliation drain policy. The pass reads stored apply state and writes
+// GitHub comments, so Close waits for it before storage closes underneath it.
+//
+// The timeout covers a pass making progress against a responsive GitHub API and
+// abandons one that is not, because an abandoned pass costs nothing that lasts:
+// the comments it did not reach are still missing, which is exactly the
+// condition that makes the next process to start run the pass again. The grace
+// that follows is not a second budget — it is the moment it takes a cancelled
+// pass to unwind, so it ends on its own context rather than on a storage pool
+// that closed under it.
+const (
+	missingSummaryReconcileDrainTimeout = 5 * time.Second
+	missingSummaryReconcileCancelGrace  = 2 * time.Second
+)
+
+// stop waits for the pass, then cancels it if it has not finished. It reports
+// nothing to its caller: every outcome is either routine or already logged, and
+// none of them is a reason to fail a close.
+func (p *reconcilePass) stop(logger *slog.Logger) {
+	if p == nil {
+		return
+	}
+	if drain.Wait(&p.wg, missingSummaryReconcileDrainTimeout) {
 		return
 	}
 
-	reconcileCtx := context.WithoutCancel(ctx)
-	go func() {
+	logger.Warn("missing-summary reconciliation did not finish within the shutdown drain; it is being canceled and the comments it did not reach are reconciled by the next process to start",
+		"drain_timeout", missingSummaryReconcileDrainTimeout)
+	p.cancel()
+	if !drain.Wait(&p.wg, missingSummaryReconcileCancelGrace) {
+		logger.Warn("missing-summary reconciliation has not returned since it was canceled; its remaining storage calls will fail as the pool closes",
+			"cancel_grace", missingSummaryReconcileCancelGrace)
+	}
+}
+
+func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, logger *slog.Logger) *reconcilePass {
+	if r.reconcileMissingSummaryComments == nil {
+		logger.Debug("missing summary reconciliation disabled")
+		return nil
+	}
+
+	reconcileCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	pass := &reconcilePass{cancel: cancel}
+	pass.wg.Go(func() {
 		// The reconcile pass renders GitHub comments from stored apply state; a
 		// panic on one poisoned row must degrade only this startup pass, not
 		// kill the process that serves webhooks and drives applies.
@@ -204,7 +252,106 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 			"panic", fmt.Sprint(reconcilePanic.Value),
 			"stack", string(reconcilePanic.Stack))
 		metrics.RecordRecoveredPanic(reconcileCtx, "summary_reconciliation")
+	})
+	return pass
+}
+
+// watchForShutdownSignal returns a context cancelled when SIGINT or SIGTERM
+// arrives, the signal that did it, and a stop function that uninstalls the
+// handler. The signal is recorded before the cancellation it causes, so a
+// later reader can tell a signal apart from the caller cancelling; the two are
+// indistinguishable at the context alone.
+//
+// It is installed before the server is built rather than once it is serving.
+// Building blocks on storage, and storage boot is patient by design — it
+// retries for minutes while a database is unreachable or a credential is
+// rotating. A process signalled inside that window has to act on the signal
+// there, because nothing later in its lifecycle will run.
+func watchForShutdownSignal(ctx context.Context) (context.Context, <-chan os.Signal, func()) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	signalled := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			signalled <- sig
+			cancel()
+		case <-runCtx.Done():
+			// The caller's cancellation may be this same signal arriving by
+			// another route: a CLI that traps it for every command cancels the
+			// context this one is derived from, and the runtime has already
+			// delivered to sigCh by then. Take the signal if it is there, so
+			// the cause is not decided by which of the two woke first.
+			select {
+			case sig := <-sigCh:
+				signalled <- sig
+			default:
+			}
+		}
 	}()
+
+	return runCtx, signalled, func() {
+		signal.Stop(sigCh)
+		cancel()
+	}
+}
+
+// logShutdownCause states why the run is ending. A signal and a cancelled
+// caller context both end the run context, so the recorded signal is what
+// separates them, and an operator needs the separation: it says whether this
+// process was told to stop or the process embedding it was.
+// grpcDrainTimeout bounds the wait for in-flight RPCs to finish before the gRPC
+// server is stopped from under them.
+const grpcDrainTimeout = 10 * time.Second
+
+// stopGRPCServer ends the gRPC server, letting in-flight RPCs finish within
+// drainTimeout and stopping them once it is spent.
+//
+// The bound is what keeps this stage from swallowing the shutdown. This runs as
+// a deferred call ahead of Server.Close, so an RPC that never returns would
+// otherwise park the whole of the rest of shutdown behind it — every bounded
+// drain below included — and the process would outlive its termination grace
+// period on the one stage that had no bound.
+//
+// What the bound buys is the rest of shutdown, not the handler returning. A
+// goroutine that ignores its context is not something Go can end, so an expired
+// drain walks away from the graceful stop and leaves it parked — the same trade
+// every wait in pkg/drain makes. Both listeners are already closed by then, so
+// nothing new arrives at a server nobody is waiting for any more, and the
+// abandoned handler goes when the process does.
+//
+// Forcing the point with grpc.Server.Stop is not available here. It takes the
+// same lock GracefulStop holds while waiting on the handlers, so calling it on
+// a graceful stop that is already parked deadlocks on the one case worth
+// forcing. Ending the wait is the part that belongs in SchemaBot; a graceful
+// stop that gave up on its own belongs upstream.
+func stopGRPCServer(grpcServer *grpc.Server, logger *slog.Logger, drainTimeout time.Duration) {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		grpcServer.GracefulStop()
+	}()
+
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-stopped:
+	case <-timer.C:
+		logger.Warn("gRPC server still had in-flight RPCs when its drain expired; leaving them and continuing shutdown",
+			"drain_timeout", drainTimeout)
+	}
+}
+
+func logShutdownCause(ctx context.Context, logger *slog.Logger, signalled <-chan os.Signal) {
+	select {
+	case sig := <-signalled:
+		logger.Info("received shutdown signal", "signal", sig)
+	default:
+		logger.Info("context canceled, shutting down", "error", ctx.Err())
+	}
 }
 
 // Run starts the SchemaBot server with the given configuration and blocks until
@@ -213,12 +360,29 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 // STORAGE_DSN env var, then MYSQL_DSN);
 // PORT and GRPC_PORT are read from the environment. Prometheus metrics are
 // served on a dedicated listener at cfg.MetricsListenPort, not on the API port.
+//
+// This is the standalone path, so signals are SchemaBot's to handle: everything
+// below runs under a context that ends when one arrives, startup included. The
+// embedding seam (Build, RegisterGRPC, Start, Close) installs no handler at
+// all — a library that traps signals out from under its host is a worse defect
+// than the one that would fix.
 func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	port := getEnv("PORT", "8080")
 	grpcPort := os.Getenv("GRPC_PORT")
 
-	srv, err := Build(ctx, cfg, opts...)
+	runCtx, signalled, stopWatching := watchForShutdownSignal(ctx)
+	defer stopWatching()
+
+	srv, err := Build(runCtx, cfg, opts...)
 	if err != nil {
+		// A build ended by a signal is a routine stop during startup rather
+		// than a fault, and this is the only place that distinction is still
+		// visible: the error below only ever reports the cancellation.
+		select {
+		case sig := <-signalled:
+			return fmt.Errorf("build server: stopped by signal %s during startup: %w", sig, err)
+		default:
+		}
 		return err
 	}
 	defer utils.CloseAndLog(srv)
@@ -227,11 +391,11 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// docker-compose.grpc.yml). Embedders attach to their own server instead.
 	if grpcPort != "" {
 		grpcServer := newTernGRPCServer(srv.logger)
-		if err := srv.RegisterGRPC(ctx, grpcServer); err != nil {
+		if err := srv.RegisterGRPC(runCtx, grpcServer); err != nil {
 			return fmt.Errorf("register grpc tern service: %w", err)
 		}
 		var lc net.ListenConfig
-		listener, err := lc.Listen(ctx, "tcp", ":"+grpcPort)
+		listener, err := lc.Listen(runCtx, "tcp", ":"+grpcPort)
 		if err != nil {
 			return fmt.Errorf("listen on port %s: %w", grpcPort, err)
 		}
@@ -243,12 +407,12 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
 			}
 		}()
-		defer grpcServer.GracefulStop()
+		defer stopGRPCServer(grpcServer, srv.logger, grpcDrainTimeout)
 	}
 
 	// Start background loops (operator, health monitor, pending-drops cleaner,
 	// missing-summary reconciliation). Server.Close stops them.
-	srv.Start(ctx)
+	srv.Start(runCtx)
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -285,17 +449,11 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		}
 	}()
 
-	// Wait for a shutdown signal, context cancellation (embedded callers), or a
-	// fatal server error.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
+	// Wait for the run context to end — a shutdown signal or the caller
+	// cancelling — or for a fatal server error.
 	select {
-	case sig := <-sigCh:
-		srv.logger.Info("received shutdown signal", "signal", sig)
-	case <-ctx.Done():
-		srv.logger.Info("context canceled, shutting down", "error", ctx.Err())
+	case <-runCtx.Done():
+		logShutdownCause(runCtx, srv.logger, signalled)
 	case err := <-errCh:
 		return err
 	}
@@ -357,6 +515,9 @@ type Server struct {
 	// through attributableVersion on the way, because a report is prose and
 	// the sentinel is a log value.
 	version string
+	// reconcile is the missing-summary pass Start kicked off, nil when Start
+	// has not run or the pass is not configured. Close bounds it.
+	reconcile *reconcilePass
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -639,6 +800,13 @@ func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dial
 // connectStorage runs a single storage boot attempt: resolve the DSN, apply
 // the storage schema, open the pool, and verify it with a ping. It returns the
 // DSN it used so the caller holds the one this pool is dialing.
+//
+// Every step that can block ends when ctx does, so an instance told to stop
+// mid-attempt stops inside the attempt rather than at the end of it. The
+// convergence is the longest of the three and carries a budget of its own,
+// which is what makes that difference a minutes-long one — and it takes the
+// stop as a signal rather than as a context, because it is the one step where
+// only a deliberate stop may reach the work (AV-13).
 func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, string, error) {
 	const pingTimeout = 10 * time.Second
 	dsn, err := cfg.StorageDSN()
@@ -646,7 +814,8 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if err := api.EnsureSchema(dsn, logger,
-		api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges),
+		api.WithStopSignal(ctx.Done()),
+		api.WithDestructiveSchemaChangePolicy(api.ConfiguredDestructivePolicy(cfg.Storage.AllowDestructiveSchemaChanges), false),
 		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
 		api.WithDialect(dialect)); err != nil {
 		return nil, "", fmt.Errorf("ensure storage schema: %w", err)
@@ -834,12 +1003,12 @@ func (s *Server) MetricsHandler() http.Handler {
 // health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
 // metrics), the startup target probe, and the pending-drops cleaner — all of which run until ctx is
 // canceled or Close is called. It also kicks off a one-shot missing-summary
-// reconciliation that, once started, runs to completion independently of ctx (it
-// repairs interrupted terminal comments and must not be cut short by a request
-// context); it runs before the operator so recovered applies attach observers
-// first.
+// reconciliation that, once started, runs independently of ctx (it repairs
+// interrupted terminal comments and must not be cut short by a request context)
+// until Close bounds it; it runs before the operator so recovered applies attach
+// observers first.
 func (s *Server) Start(ctx context.Context) {
-	s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	s.reconcile = s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
 	if s.targetResolver != nil {
 		s.startTargetProbe(ctx)
 	}
@@ -906,12 +1075,25 @@ func (s *Server) stopTargetProbe() {
 // database pool); it repeats StopOperator, which is idempotent, so that is a
 // no-op. It does not stop any gRPC server the embedder owns. Safe to call once
 // after Start.
+//
+// Close returns whether or not the background work it waits for does. Every
+// stage that waits carries a bound of its own — the reconciliation pass, the
+// durable webhook pool, the in-process webhook drain, the driver pool, the
+// telemetry flush — so the worst case is their sum rather than the lifetime of
+// whichever goroutine is stuck. Each of those bounds is stated where it is
+// declared, alongside what its stage gives up by expiring; none of them gives up
+// anything another process cannot redo or reclaim, which is what makes stopping
+// the right move when the wait is the thing holding the process open.
 func (s *Server) Close() error {
 	s.stopTargetProbe()
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()
 	}
+	// The reconciliation pass runs on a context of its own, so nothing above has
+	// asked it to stop and nothing below would wait for it. Bound it here, while
+	// the storage it reads is still open.
+	s.reconcile.stop(s.logger)
 	// Drain the detached in-process webhook goroutines (non-durable event types)
 	// before closing storage below, since that already-acked work can still read
 	// or write the database. Run/embedders stop the HTTP server before Close, so

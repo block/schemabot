@@ -81,7 +81,19 @@ type CLIConfig struct {
 	// IgnoreNamespaces lists namespace subdirectories of the schema root that
 	// SchemaBot must not reconcile against the live database.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
-	SchemaDir        string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	// IgnoreTables lists live tables SchemaBot must not reconcile. Without the
+	// exclusion a live table no schema file declares is planned as DROP TABLE,
+	// which blocks the merge.
+	IgnoreTables []string `yaml:"ignore_tables"`
+	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+}
+
+// PlanExclusions returns the config's declared exclusions in the form the plan
+// API takes them. Both lists are exclusions the repository recorded, and they
+// are passed as one value so a caller cannot hand the plan its tables as its
+// namespaces.
+func (c *CLIConfig) PlanExclusions() client.PlanExclusions {
+	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables}
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -116,6 +128,9 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err := schema.ValidateIgnoreNamespaces(cfg.IgnoreNamespaces); err != nil {
 		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
+	if err := schema.ValidateIgnoreTables(cfg.IgnoreTables); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
+	}
 	// Schema files are in the same directory as schemabot.yaml
 	cfg.SchemaDir = dir
 	if cfg.Type == "" {
@@ -139,7 +154,45 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 
 // confirmAction prompts the user for "yes" confirmation. Returns true if confirmed.
 func confirmAction(prompt, cancelMsg string) (bool, error) {
-	fmt.Print(prompt)
+	return confirmActionOn(os.Stdout, prompt, cancelMsg)
+}
+
+// writeToTerminal runs fn with the human-facing renderers writing to stderr
+// instead of stdout, when the command was asked for machine-readable output.
+// With divert false it just runs fn, so a caller can wrap unconditionally.
+//
+// A command under --json owes stdout to the program reading it, and still owes
+// a person at the terminal everything they are being asked to approve. Those
+// are two audiences, not a choice between them: the plan goes to one and the
+// response to the other. The renderers print through fmt.Print, which resolves
+// os.Stdout per call, so pointing it at stderr for the duration is what moves
+// them; nothing writes the response until after it is restored.
+func writeToTerminal(divert bool, fn func() error) error {
+	if !divert {
+		return fn()
+	}
+	restore := os.Stdout
+	os.Stdout = os.Stderr
+	defer func() { os.Stdout = restore }()
+	return fn()
+}
+
+// confirmActionOn is confirmAction with the prompt written somewhere other than
+// stdout. A command asked for machine-readable output owes stdout to the
+// program reading it, and still has to ask a person before it converges, so the
+// conversation goes to stderr and the answer stays parseable.
+func confirmActionOn(out io.Writer, prompt, cancelMsg string) (bool, error) {
+	// A prompt nobody can be shown is not a prompt, so a write that fails is
+	// an error rather than an unanswered question read from stdin anyway.
+	if _, err := fmt.Fprint(out, prompt); err != nil {
+		return false, fmt.Errorf("write confirmation prompt: %w", err)
+	}
+	cancelled := func() error {
+		if _, err := fmt.Fprintln(out, cancelMsg); err != nil {
+			return fmt.Errorf("write cancellation notice: %w", err)
+		}
+		return nil
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
@@ -158,8 +211,7 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 
 	select {
 	case <-sigCh:
-		fmt.Println(cancelMsg)
-		return false, nil
+		return false, cancelled()
 	case r := <-resultCh:
 		// EOF with data is valid (e.g., echo -n yes | schemabot apply)
 		if r.err != nil && !errors.Is(r.err, io.EOF) {
@@ -167,12 +219,10 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 		}
 		response := strings.TrimSpace(strings.ToLower(r.response))
 		if errors.Is(r.err, io.EOF) && response == "" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		if response != "yes" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		return true, nil
 	}

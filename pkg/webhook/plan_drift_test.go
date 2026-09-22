@@ -133,7 +133,7 @@ func TestDeploymentDriftPreview_CleanMultiDeployment(t *testing.T) {
 	rollup := api.PlanRollup{
 		Entries: []api.DeploymentRollupEntry{
 			{Deployment: "eu", Class: api.DeploymentMatch},
-			{Deployment: "au", Class: api.DeploymentMatch},
+			{Deployment: "au", Class: api.DeploymentMatch, Blocked: 2},
 		},
 		Clean: true,
 	}
@@ -145,6 +145,8 @@ func TestDeploymentDriftPreview_CleanMultiDeployment(t *testing.T) {
 	assert.True(t, preview.Deployments[0].Primary)
 	assert.False(t, preview.Deployments[1].Primary)
 	assert.Equal(t, "match", preview.Deployments[1].Class)
+	assert.Equal(t, 0, preview.Deployments[0].Blocked)
+	assert.Equal(t, 2, preview.Deployments[1].Blocked)
 }
 
 // A diverged deployment carries a compact change-count detail; an errored

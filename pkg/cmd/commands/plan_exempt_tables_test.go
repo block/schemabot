@@ -1,15 +1,19 @@
 package commands
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-const cliExemptLine = "ℹ️  Tables in namespace app exempt from the undeclared-table verdict (archive naming): orders_archive_2024, events_archive_2025_01"
+const cliExemptLine = "ℹ️  Ignored tables in namespace app (archive naming): orders_archive_2024, events_archive_2025_01"
 
 func exemptGroup(tables ...string) *apitypes.ExemptTablesResponse {
 	return &apitypes.ExemptTablesResponse{Namespace: "app", Tables: tables, Reason: "archive naming"}
@@ -52,7 +56,7 @@ func TestWritePlanBody_EmptyExemptGroupsRenderNothing(t *testing.T) {
 	want := captureStdout(func() { writePlanBody(plain, false) })
 	got := captureStdout(func() { writePlanBody(withEmpty, false) })
 	assert.Equal(t, want, got)
-	assert.NotContains(t, want, "exempt from the undeclared-table verdict")
+	assert.NotContains(t, want, "Ignored tables in namespace")
 }
 
 // Two environments with the same DDL but different exempt tables are not the
@@ -70,7 +74,7 @@ func TestOutputMultiEnvPlanResult_ExemptTablesDivergeSections(t *testing.T) {
 
 	assert.NotContains(t, out, "Staging & Production")
 	assert.Contains(t, out, cliExemptLine)
-	assert.Contains(t, out, "ℹ️  Tables in namespace app exempt from the undeclared-table verdict (archive naming): orders_archive_2024\n")
+	assert.Contains(t, out, "ℹ️  Ignored tables in namespace app (archive naming): orders_archive_2024\n")
 }
 
 // Identical DDL with identical exempt tables still collapses into one section,
@@ -86,5 +90,44 @@ func TestOutputMultiEnvPlanResult_ExemptTablesIdenticalCollapse(t *testing.T) {
 	}))
 
 	assert.Contains(t, out, "Staging & Production")
-	assert.Equal(t, 1, strings.Count(out, "exempt from the undeclared-table verdict"))
+	assert.Equal(t, 1, strings.Count(out, "Ignored tables in namespace"))
+}
+
+// Apply discloses withheld tables once per run. The command has two places the
+// disclosure can reach an operator, one for a target with nothing to reconcile
+// and one inside the plan body it renders before prompting, and a run that
+// passes through both must still state the exemption a single time.
+func TestApplyCmd_ExemptTablesDisclosedOnce(t *testing.T) {
+	cases := map[string]*apitypes.PlanResponse{
+		"no changes":   {Engine: "mysql"},
+		"with changes": planWithTablesAndEngine("mysql", createUsers()),
+	}
+	for name, plan := range cases {
+		t.Run(name, func(t *testing.T) {
+			plan.ExemptTables = []*apitypes.ExemptTablesResponse{{
+				Namespace: "app",
+				Tables:    []string{"flyway_schema_history"},
+				Reason:    apitypes.ExemptReasonIgnoreTables,
+			}}
+			body, err := json.Marshal(plan)
+			require.NoError(t, err)
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path != "/api/plan" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_, writeErr := w.Write(body)
+				require.NoError(t, writeErr)
+			}))
+			t.Cleanup(server.Close)
+
+			cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", NoLock: true}
+			out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+			assert.Equal(t, 1, strings.Count(out, "Ignored tables in namespace"),
+				"exemption stated once:\n%s", out)
+		})
+	}
 }

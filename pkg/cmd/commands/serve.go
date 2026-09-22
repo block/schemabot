@@ -17,7 +17,12 @@ type ServeCmd struct{}
 // Run loads the server configuration from the environment and starts the
 // server. The command is a thin wrapper over serve.Run, which holds the server
 // implementation so it can also be embedded by other processes.
-func (cmd *ServeCmd) Run(g *Globals) error {
+//
+// ctx is the CLI's signal-scoped context, and passing it is what makes the
+// process stop when it is told to: the CLI traps SIGINT and SIGTERM for every
+// command and cancels this context on the first one. A server running on a
+// context of its own would leave that signal with nothing to act on.
+func (cmd *ServeCmd) Run(ctx context.Context, g *Globals) error {
 	logger := newServerLogger(os.Stdout, g.Version)
 	slog.SetDefault(logger)
 
@@ -27,7 +32,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	return serve.Run(context.Background(), serverConfig,
+	return serve.Run(ctx, serverConfig,
 		serve.WithLogger(logger),
 		serve.WithBuildInfo(g.Version, g.Commit, g.Date),
 	)

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -20,31 +21,115 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
-// EnsureSchemaTimeout bounds the whole EnsureSchema operation: acquiring the
-// advisory lock, planning, and applying the storage schema change to
-// completion. SchemaBot's storage tables are small, but Spirit applies an
-// *online* DDL, and on Aurora that carries fixed overhead (binlog subscription,
-// checksum, cutover MDL, and throttler poll loops) that can exceed a minute even
-// for a tiny table. Trailing pods also wait up to this long on the advisory lock
-// while the leader applies, then see no changes. Too short a value cancels the
-// apply mid-copy ("failed to read chunk data: context canceled") and leaves
-// storage uninitialized.
+// EnsureSchemaTimeout bounds a convergence nobody asked for: the one a pod runs
+// on the way up. It covers acquiring the advisory lock, planning, and applying
+// the storage schema change to completion. SchemaBot's storage tables are small,
+// but Spirit applies an *online* DDL, and on Aurora that carries fixed overhead
+// (binlog subscription, checksum, cutover MDL, and throttler poll loops) that can
+// exceed a minute even for a tiny table. Trailing pods also wait up to this long
+// on the advisory lock while the leader applies, then see no changes. Too short a
+// value cancels the apply mid-copy ("failed to read chunk data: context
+// canceled") and leaves storage uninitialized.
+//
+// It is short on purpose, and the reason is availability rather than DDL cost: a
+// pod converging is a pod not yet serving, and one holding the advisory lock is
+// every other pod not yet serving either. A boot must therefore give up and
+// report rather than wait out work of unbounded length — which is why a
+// convergence an operator asked for does not use this value. That one has
+// somebody watching it and no deployment waiting on it, so it names its own
+// budget through WithConvergenceTimeout, defaulting to
+// DefaultStorageApplyTimeout.
 //
 // The same constant bounds the PostgreSQL bootstrap flow — its existence
 // checks, advisory-lock wait, and transactional table creation — so tuning it
 // for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits. It is
-// also the base of a fourth derivation: postgresBootstrapDDLStatementTimeout
-// subtracts a margin from it to bound one convergence DDL statement
-// server-side, so lowering this shortens that budget too, down to its own
-// floor.
+// also the base of a fourth derivation on the boot path:
+// postgresBootstrapDDLBudget subtracts a margin from the effective budget to
+// bound one convergence DDL statement server-side, so lowering this shortens
+// that budget too, down to its own floor.
 const EnsureSchemaTimeout = 5 * time.Minute
+
+// MinConvergenceTimeout is the shortest budget a convergence may run under. It
+// is one whole second because that is the granularity the budget is honored
+// at: the wire names a budget in whole seconds, and the coarsest lock wait an
+// engine offers rounds up to whole seconds, so a shorter budget would be
+// reported as one thing and enforced as another. It is also the shortest
+// ceiling every statement budget derived from it stays strictly under; a
+// ceiling that cannot be undercut in whole milliseconds cannot be bounded at
+// all, and a budget that has stopped bounding is the one failure this
+// constant exists to refuse.
+const MinConvergenceTimeout = time.Second
 
 // EnsureSchemaOption customizes EnsureSchema behavior.
 type EnsureSchemaOption func(*ensureSchemaOptions)
 
+// DeploymentDestructivePolicy is a deployment's standing decision about
+// destructive storage schema statements — the one every boot of it converges
+// under, which no per-request opt-in moves.
+type DeploymentDestructivePolicy int
+
+const (
+	// DestructivePolicyUnknown is a caller that cannot read the deployment's
+	// decision, which is a convergence addressed by DSN alone: there is a
+	// deployment behind that database and no config here that names its
+	// policy. It permits nothing, so it never widens what runs, and it is
+	// reported as unknown rather than as a refusal, because the two differ
+	// exactly where an operator is deciding whether to pre-apply.
+	DestructivePolicyUnknown DeploymentDestructivePolicy = iota
+	// DestructivePolicyForbids is a deployment whose boots refuse to remove
+	// storage state they do not declare. It is the default a config carries.
+	DestructivePolicyForbids
+	// DestructivePolicyPermits is a deployment that configured
+	// allow_destructive_schema_changes, whose boots run the removals.
+	DestructivePolicyPermits
+)
+
+// String names the policy for a log line, where the underlying integer would
+// leave an operator counting enum members.
+func (p DeploymentDestructivePolicy) String() string {
+	switch p {
+	case DestructivePolicyPermits:
+		return "permits"
+	case DestructivePolicyForbids:
+		return "forbids"
+	case DestructivePolicyUnknown:
+		return "unknown"
+	}
+	return "unknown"
+}
+
+// ConfiguredDestructivePolicy is the standing policy a deployment's config
+// states, for a caller that has read one. A caller holding only a DSN has not,
+// and passes DestructivePolicyUnknown instead of the false this would give it.
+func ConfiguredDestructivePolicy(allowDestructive bool) DeploymentDestructivePolicy {
+	if allowDestructive {
+		return DestructivePolicyPermits
+	}
+	return DestructivePolicyForbids
+}
+
 type ensureSchemaOptions struct {
+	// allowDestructive is the effective policy for this convergence: the
+	// deployment's standing one widened by a caller's opt-in. It decides what
+	// this run does.
 	allowDestructive bool
-	dialect          schema.Dialect
+	// deploymentDestructive is the standing policy alone, which is what every
+	// boot of this deployment converges under. It decides nothing here and is
+	// reported, not enforced: it is how a report can say what happens to state
+	// this convergence leaves behind, once this command is over and the only
+	// thing still converging is a pod starting.
+	deploymentDestructive DeploymentDestructivePolicy
+	dialect               schema.Dialect
+	// convergenceTimeout bounds one whole convergence: the lock wait, the
+	// diff under it, and the DDL. It defaults to EnsureSchemaTimeout, the
+	// budget a boot needs, so a caller that never considered the question
+	// converges the way a pod does.
+	convergenceTimeout time.Duration
+	// schemaSource is the schema this convergence brings the storage database
+	// to. Nil is the binary's own embedded files, which is what a boot
+	// converges to, so the startup path never sets it and every existing call
+	// site keeps its behavior by not setting it either.
+	schemaSource *StorageSchemaSource
 	// postgresStatementTimeout bounds a single ordinary query on the
 	// PostgreSQL bootstrap's connection. Zero disables the budget explicitly;
 	// negative means "not set", leaving the platform's ambient value in place.
@@ -52,18 +137,74 @@ type ensureSchemaOptions struct {
 	// so a caller that never considered the question still bootstraps under a
 	// budget SchemaBot states instead of one the platform imposed.
 	postgresStatementTimeout time.Duration
+	// progress is called as the convergence runs, for a caller with somebody
+	// watching. Nil on a boot, where the log already carries every statement
+	// and there is nobody to show anything to.
+	progress func(StorageConvergenceProgress)
+	// stop ends this convergence when it closes. Nil is a convergence nothing
+	// but its budget can end, which is every caller that has not been told to
+	// stop by something outside itself.
+	stop <-chan struct{}
 }
 
-// WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
-// destructive DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN)
-// against the storage database. It defaults to false: destructive statements
-// are refused while the remaining non-destructive statements still apply. A
-// mixed ALTER TABLE is split so its safe clauses execute and only the
-// destructive clauses — plus any clause that cannot run without them, such
-// as the ADD PRIMARY KEY behind a refused DROP PRIMARY KEY — are refused.
-// Wire this from StorageConfig.AllowDestructiveSchemaChanges.
-func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
-	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
+// WithDestructiveSchemaChangePolicy controls whether EnsureSchema may execute
+// destructive DDL against the storage database — any statement the plan's own
+// linters report an error against, which for the storage schema means one that
+// loses data (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) and one
+// that removes an index. Both arguments default to false: those statements are
+// refused while the rest of the diff still applies. A mixed ALTER carrying an
+// additive clause beside a drop runs the addition and withholds the drop, so a
+// pod never starts missing a column its own binary needs.
+//
+// This is the only way to have the bootstrap execute one of those statements,
+// so removing a table, column, or index from the embedded schema on purpose
+// means permitting it here or running the DDL by hand. That is the intended
+// trade: a surplus index left in place costs write throughput, while one
+// dropped out from under the fleet's live queries costs availability.
+//
+// The two arguments are different facts and the call site has to supply both,
+// which is the reason this takes two rather than the single flag a convergence
+// needs. deployment is the standing policy — wire it through
+// ConfiguredDestructivePolicy from StorageConfig.AllowDestructiveSchemaChanges,
+// or pass DestructivePolicyUnknown where there is no config to read — and
+// request is one caller's explicit opt-in, which widens that policy for this
+// run and never narrows it. What this convergence runs under is the standing
+// permission or the request. deployment alone is what the next pod to boot
+// runs under, which is a question a report has to be able to answer and cannot
+// once the two have been merged into one flag. A boot supplies its own config
+// and false: nobody is asking it for anything.
+//
+// They are also different types, so the compiler rejects the transposition.
+// Two bools here would swap silently and leave every gate intact — a gate
+// reads whether either permits, which does not depend on which is which —
+// while the report went on to describe the caller's own flag as the fleet's
+// policy, which is the one mistake this pair exists to make impossible.
+func WithDestructiveSchemaChangePolicy(deployment DeploymentDestructivePolicy, request bool) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) {
+		o.deploymentDestructive = deployment
+		o.allowDestructive = deployment == DestructivePolicyPermits || request
+	}
+}
+
+// WithStorageSchema converges the storage database to a schema other than the
+// binary's own embedded files — the schema of a release an operator is about to
+// roll, so the storage is ready before the first pod of it starts.
+//
+// Unset, the convergence runs the embedded files, which is what a boot does and
+// what every startup call site wants. Set, the convergence runs the supplied
+// files instead, under the same differ, the same destructive-change refusal and
+// the same advisory lock: the schema moves, the policy does not (AV-9). Nothing
+// here checks that the files are a *complete* schema, because a file set cannot
+// say what is missing from it — an incomplete one reports the storage's own
+// tables as surplus, and what keeps that from destroying them is the same
+// refusal that guards a boot.
+//
+// The option carries no version and never resolves one. A caller supplying
+// files says in words where they came from (see StorageSchemaSource), because
+// only the caller knows, and a convergence attributed to a release whose files
+// it did not run is the failure this whole surface exists to prevent.
+func WithStorageSchema(source *StorageSchemaSource) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.schemaSource = source }
 }
 
 // WithDialect selects the database family of the storage database so
@@ -84,7 +225,7 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // bootstrap issues — its catalog reads and existence checks. It deliberately
 // does not bound the two statement classes the bootstrap runs that are
 // expected to be slow: convergence DDL raises the budget per transaction to
-// postgresBootstrapDDLStatementTimeout, and the advisory-lock wait runs with
+// postgresBootstrapDDLBudget's value, and the advisory-lock wait runs with
 // no statement budget at all. A zero duration disables the budget explicitly
 // rather than inheriting the platform's, and a negative one leaves the
 // platform's value in place. Unset, the budget is
@@ -92,6 +233,112 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // PostgresConfig.StatementTimeoutOrDefault.
 func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.postgresStatementTimeout = d }
+}
+
+// WithConvergenceTimeout bounds one whole convergence — the advisory-lock wait,
+// the diff taken under it, and the DDL — replacing the boot budget
+// EnsureSchemaTimeout. A duration under MinConvergenceTimeout is refused rather
+// than rounded: a non-positive one would read as "no limit", and a convergence
+// with no ceiling holds the advisory lock forever on a statement that will never
+// finish, so every pod that boots behind it fails its own lock wait; a
+// sub-second one would be enforced at a granularity coarser than it was named
+// at, and report a ceiling it did not run under.
+//
+// Raise it only for a convergence somebody is watching. The budget is what
+// bounds how long this call can keep booting pods out of service, so the
+// deliberate path trades that availability for the ability to finish work a boot
+// could not — an index build over a storage table with a long history, say.
+// Wire it from DefaultStorageApplyTimeout unless an operator named a value.
+func WithConvergenceTimeout(d time.Duration) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.convergenceTimeout = d }
+}
+
+// WithStopSignal ends a convergence when stop closes, for the caller that can
+// be told to stop by something outside itself. On the startup path that is the
+// platform terminating the instance, and it is the only thing besides the
+// budget that reaches a boot's convergence (AV-13).
+//
+// This is a stop, not a context. A convergence is the one write every instance
+// depends on, so the thing that ends it has to be a decision rather than a
+// side effect, and a channel named for the decision cannot be satisfied by
+// threading through whatever context happened to be in scope. Pass a request's,
+// a webhook's, or an RPC's cancellation here and a network blip abandons a
+// table copy partway.
+//
+// Ending a convergence early is not a way to make it cheaper. A stop leaves
+// the statement in flight cancelled and its artifacts reclaimed, and the
+// statements that already finished still applied, so what it saves is the wait
+// — not the work, which the next instance to boot picks up where the next diff
+// finds it.
+func WithStopSignal(stop <-chan struct{}) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.stop = stop }
+}
+
+// WithConvergenceProgress reports a convergence as it runs, for the caller
+// that has somebody watching it.
+//
+// Without it a convergence is silent between the plan and the answer. That is
+// the right shape for a boot — the log carries every statement, and nobody is
+// reading a terminal — but it is the wrong shape for an operator who has just
+// been told an index build may take an hour and cannot tell a slow copy from
+// a stuck one.
+//
+// fn is called from the convergence's own goroutine, once per observation.
+// Observations are frequent and mostly identical, and deciding what is worth
+// showing is the caller's job rather than this package's: a terminal prints on
+// a change, and something else might sample or aggregate. fn must not block —
+// the convergence is what is waiting on it — and must not panic, since it runs
+// inside the run it is describing.
+func WithConvergenceProgress(fn func(StorageConvergenceProgress)) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.progress = fn }
+}
+
+// StorageConvergenceProgress is one observation of a convergence in flight.
+//
+// The fields are the ones every dialect can fill. What a dialect cannot say it
+// leaves empty rather than inventing, and the two percentages are where that
+// matters: PostgreSQL converges each table in a transaction and knows which
+// one it is on but not how far into it, so it fills Percent — how much of the
+// run is behind it — and leaves the table's own Percent at zero. A consumer
+// that reads only the table's gets nothing from this dialect, which is the
+// honest answer to a question it never measured rather than an absence of
+// measurement.
+type StorageConvergenceProgress struct {
+	// DDLCount is how many statements this convergence is running in total.
+	DDLCount int
+	// State is the engine's own name for what it is doing, or the convergence's
+	// own on a dialect with no engine behind it.
+	State string
+	// Percent is how far along the whole convergence is, 0 to 100. A dialect
+	// that cannot measure it reports 0 throughout.
+	Percent int
+	// Message is the engine's own status line. Empty when it has none.
+	Message string
+	// Tables is what is happening per table, where that is known.
+	Tables []StorageConvergenceTableProgress
+}
+
+// StorageConvergenceTableProgress is one table's share of a convergence.
+type StorageConvergenceTableProgress struct {
+	Table string
+	// State is the engine's own name for the table's phase, passed through
+	// rather than translated, so it is the engine's vocabulary an operator
+	// sees and matches on. A dialect without per-table phases leaves it empty.
+	State string
+	// Percent is how far this table's statement has got, 0 to 100.
+	Percent int
+	// RowsCopied is how many rows have been copied into the table's shadow
+	// copy. Zero for a statement that copies nothing, and for an engine that
+	// does not count.
+	RowsCopied int64
+}
+
+// report hands one observation to the caller watching, if anyone is.
+func (o ensureSchemaOptions) report(p StorageConvergenceProgress) {
+	if o.progress == nil {
+		return
+	}
+	o.progress(p)
 }
 
 // EnsureSchema converges SchemaBot's own storage schema at startup, routing to
@@ -106,14 +353,69 @@ func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 // adding a dialect means adding a bootstrapper here, not threading
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
+	// Background, not a caller's context, and the signature is what enforces
+	// it: a boot has nobody to hang up on it, and there is no context a pod's
+	// startup could pass that should be able to abandon a table copy partway.
+	// The convergence budget is the only thing that stops this one.
+	return ensureSchema(context.Background(), dsn, logger, opts...)
+}
+
+// ensureSchema is EnsureSchema with a caller's context, for the one path that
+// has a caller: an operator sitting in front of a convergence they asked for.
+// parent is what lets them stop it — Ctrl-C at the terminal reaches the DDL
+// through here — and the convergence budget still bounds it either way.
+//
+// Nothing else should reach this. A convergence is the one write the storage
+// bootstrap makes to the database every instance depends on, and a context
+// that belongs to a request, a webhook, or an RPC can be cancelled by a
+// network blip. Callers on those paths pass context.WithoutCancel so only
+// their own deliberate stop can reach it.
+func ensureSchema(parent context.Context, dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
 	o := newEnsureSchemaOptions(opts...)
+	if o.convergenceTimeout < MinConvergenceTimeout {
+		return fmt.Errorf("converge storage schema: convergence timeout must be at least %s, got %s", MinConvergenceTimeout, o.convergenceTimeout)
+	}
+	parent, stopped := stoppableContext(parent, o.stop)
+	defer stopped()
 	switch o.dialect {
 	case schema.DialectMySQL:
-		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
+		return ensureMySQLSchema(parent, dsn, logger, o, namedlock.MySQL{})
 	case schema.DialectPostgres:
-		return ensurePostgresSchema(dsn, logger, o, namedlock.Postgres{})
+		return ensurePostgresSchema(parent, dsn, logger, o, namedlock.Postgres{})
 	default:
 		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
+	}
+}
+
+// stoppableContext folds a stop signal into the context a convergence runs on,
+// so every step already written to honor cancellation honors the stop too and
+// nothing on either bootstrapper has to learn about the channel.
+//
+// A nil stop is the common case and returns parent untouched, which is what
+// keeps the convergences that nobody can stop unstoppable: no goroutine, and no
+// second way for a context to end.
+//
+// The returned func must be called before the caller returns. It stops the
+// watcher, which would otherwise outlive a convergence that finished on its own
+// for as long as the stop stayed open — the whole life of a process, on the
+// startup path.
+func stoppableContext(parent context.Context, stop <-chan struct{}) (context.Context, func()) {
+	if stop == nil {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		<-watcherDone
 	}
 }
 
@@ -129,18 +431,19 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 // under the lock to confirm changes are still needed (another pod may have
 // applied them while we waited for the lock).
 //
-// Destructive statements in the diff (DROP TABLE, or an ALTER TABLE containing
-// DROP COLUMN) are refused unless WithAllowDestructiveSchemaChanges(true) is
-// set. A mixed ALTER TABLE is split so its safe clauses (an ADD COLUMN the
-// starting binary needs) still execute and only its destructive clauses are
-// refused. The remaining non-destructive statements apply,
-// and startup proceeds — a deliberate exception to fail-closed, because
-// failing here would crash-loop every pod running an older binary during a
-// rolling deploy or rollback where a storage table or column was legitimately
-// removed. The invariant is that an old binary can never destroy newer schema
-// state: the surplus table or column stays in place until an operator opts in.
-func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
+// Destructive statements in the diff — those the plan's linters report an error
+// against, which for the storage schema means losing data (DROP TABLE, or an
+// ALTER TABLE containing DROP COLUMN) or removing an index — are refused unless
+// WithDestructiveSchemaChangePolicy permits them. A statement carrying an
+// addition beside a drop runs the addition, so a pod never starts missing a
+// column its own binary needs. The statements and clauses that were not refused
+// apply, and startup proceeds — a deliberate exception to fail-closed, because failing
+// here would crash-loop every pod running an older binary during a rolling
+// deploy or rollback where storage state was legitimately removed. The
+// invariant is that an old binary can never destroy newer schema state: the
+// surplus table, column, or index stays in place until an operator opts in.
+func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
+	ctx, cancel := context.WithTimeout(parent, o.convergenceTimeout)
 	defer cancel()
 
 	// Diagnostic preamble: log the actual database target and current state
@@ -160,11 +463,14 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 		)
 	}
 
-	schemaFiles, err := readEmbeddedSchemaFiles()
+	// Nil is the embedded files, so a boot reads its own schema through the
+	// same call an operator converging a named release reads theirs.
+	schemaFiles, err := o.schemaSource.mysqlSchemaFiles()
 	if err != nil {
 		return err
 	}
-	logger.Info("loaded embedded storage schema files",
+	logger.Info("loaded storage schema files",
+		"schema_source", o.schemaSource.Describe(),
 		"namespace_count", len(schemaFiles),
 		"file_count", countSchemaFiles(schemaFiles),
 		"files", schemaFileNames(schemaFiles),
@@ -222,11 +528,15 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	// Changes or stale Spirit tables detected — acquire advisory lock to
 	// serialize cleanup and Spirit execution across pods.
-	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, locker)
+	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, locker, o.convergenceTimeout)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
 	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectMySQL, storageDatabase)
+
+	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectMySQL, storageDatabase, o.convergenceTimeout); err != nil {
+		return err
+	}
 
 	// Clean up stale Spirit internal tables only while holding the advisory
 	// lock. During a rolling deploy, another pod may be actively applying
@@ -255,14 +565,11 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	changes := planResult.Changes
 	if !o.allowDestructive {
-		allowed, refused, err := partitionDestructiveChanges(changes)
-		if err != nil {
-			return fmt.Errorf("classify storage schema changes: %w", err)
-		}
+		allowed, refused := partitionDestructiveChanges(changes)
 		for _, r := range refused {
-			scope, message, attrs := r.refusalTelemetry()
+			message, attrs := r.refusalTelemetry()
 			logger.Warn(message, attrs...)
-			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation), scope)
+			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation))
 		}
 		if len(allowed) == 0 {
 			logger.Warn("all planned storage schema changes are destructive and refused; storage schema left unchanged",
@@ -310,10 +617,14 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 			// ("...context canceled"); name the timeout instead so the cause
 			// is clear from the message line alone.
 			if ctx.Err() != nil {
-				return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+				return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, len(tableChanges), logger)
 			}
 			return fmt.Errorf("check progress: %w", err)
 		}
+
+		// Straight out of the poll the wait already runs — an operator watching
+		// sees what the engine sees, at the rate it is asked.
+		o.report(mysqlConvergenceProgress(progress, len(tableChanges)))
 
 		if progress.State == engine.StateFailed {
 			// Surface the cause in an Error log here — callers typically wrap the
@@ -334,7 +645,17 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 		select {
 		case <-ctx.Done():
-			return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+			// The same stop the failed-progress branch above takes, for the
+			// same reason: the schema change is running on a context of its
+			// own, so returning from here without cancelling the engine would
+			// release the bootstrap lock and leave a copy working against the
+			// storage database under a convergence nobody is watching any
+			// more (AV-13).
+			//
+			// This is the branch a stop actually arrives on. The polls either
+			// side of it are in-process and return in microseconds, so the
+			// loop spends essentially all of its time blocked right here.
+			return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, len(tableChanges), logger)
 		case <-ticker.C:
 		}
 	}
@@ -346,41 +667,222 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	return nil
 }
 
-// ensureSchemaTimeoutError builds and logs the error returned when
-// EnsureSchemaTimeout fires before the storage schema change completes. Spirit
-// cancels the online DDL mid-apply and storage stays uninitialized, so the
-// message names the timeout and the most likely cause (a backend throttling the
-// online DDL) instead of surfacing a bare "context canceled" from the driver.
-func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
-	logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+// mysqlConvergenceProgress narrows one engine poll to what an operator is
+// watching for. The engine's result also carries resume state, retry
+// classification, and its own metadata map, none of which describes how far
+// along the run is; passing them through would make the observation a second
+// name for the engine's response and tie every consumer to it.
+func mysqlConvergenceProgress(result *engine.ProgressResult, ddlCount int) StorageConvergenceProgress {
+	p := StorageConvergenceProgress{
+		DDLCount: ddlCount,
+		State:    string(result.State),
+		Percent:  result.Progress,
+		Message:  result.Message,
+	}
+	for _, table := range result.Tables {
+		p.Tables = append(p.Tables, StorageConvergenceTableProgress{
+			Table:      table.Table,
+			State:      table.State,
+			Percent:    table.Progress,
+			RowsCopied: table.RowsCopied,
+		})
+	}
+	return p
+}
+
+// stopConvergence ends a convergence whose context is gone: it releases what
+// the schema change engine was holding, then reports why the run ended.
+//
+// The engine is cancelled rather than dropped, so the shadow table of the
+// statement that was in flight goes with it. Leaving it behind would not
+// corrupt anything — the next boot's stale-table cleanup reclaims it — but it
+// would sit on the storage database until then, holding disk and shadowing a
+// table name the next convergence wants to use.
+func stopConvergence(ctx context.Context, eng engine.Engine, dsn string, budget time.Duration, ddlCount int, logger *slog.Logger) error {
+	releaseStoppedConvergence(ctx, eng, dsn, storageConvergenceReleaseBudget, logger)
+	return convergenceStopReason(ctx, budget, ddlCount, logger)
+}
+
+// convergenceCanceller is the one thing a stop needs from the schema change
+// engine. Naming it separately keeps the release path honest about its
+// dependency, and lets the bound below be tested against a cancel that does
+// not come back without standing up an engine to not come back from.
+type convergenceCanceller interface {
+	Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error)
+}
+
+// storageConvergenceReleaseBudget bounds the wait for the engine to release
+// what a stopped convergence was holding. It is long enough for an in-process
+// copy to notice the cancel and for the statements that drop its artifacts,
+// and short enough that an operator who pressed Ctrl-C gets an answer rather
+// than a terminal that looks like it ignored them.
+const storageConvergenceReleaseBudget = 10 * time.Second
+
+// releaseStoppedConvergence has the engine release the stopped schema change's
+// artifacts, under a budget of its own.
+//
+// The cancel is synchronous and waits for the goroutine running the copy to
+// return, which is the right thing to wait for: the artifacts cannot be
+// dropped from under a copy still writing to them. What the wait lacks is a
+// bound. It does not honor the context it is given for that wait, so a target
+// that has stopped answering turns the stop an operator asked for into a
+// process that does nothing visible, on the one path where somebody is sitting
+// at a terminal waiting for it. An engine cancel that returned when its
+// context ended would retire this entirely; until then the budget is here,
+// where the operator is.
+//
+// A budget that fires leaves the cancel running rather than abandoning the
+// release: it has already signalled the copy, and what remains is the drop.
+// The artifacts are uncommitted copies rather than live tables, so the next
+// boot's stale-table cleanup reclaims whatever this did not finish.
+//
+// Nothing here is returned. A failure to release is not the finding an
+// operator came for — the convergence stopping is — so it is logged with what
+// it leaves behind, and the caller still reports why the run ended.
+func releaseStoppedConvergence(ctx context.Context, eng convergenceCanceller, dsn string, budget time.Duration, logger *slog.Logger) {
+	// The cancel runs on a context that outlives the one that just ended:
+	// releasing the artifacts is work caused by that context ending, so tying
+	// it to the same context would cancel the cleanup along with the thing
+	// being cleaned up.
+	cancelCtx := context.WithoutCancel(ctx)
+	released := make(chan error, 1)
+	go func() {
+		_, err := eng.Cancel(cancelCtx, &engine.ControlRequest{
+			Database:    storageSchemaNamespace,
+			Credentials: &engine.Credentials{DSN: dsn},
+		})
+		released <- err
+	}()
+
+	select {
+	case err := <-released:
+		switch {
+		case err == nil:
+			logger.Debug("released the stopped storage schema change's artifacts",
+				"database", storageSchemaNamespace)
+		case engine.IsAlreadyCompleted(err):
+			// The statement finished in the window between the last progress
+			// poll and the stop. There is nothing to release, and nothing went
+			// wrong: the statement is applied, which the next plan will show.
+			logger.Info("the storage schema change completed before the stop reached it; nothing to release",
+				"database", storageSchemaNamespace)
+		default:
+			logger.Warn("could not release the stopped storage schema change's artifacts; the next boot's stale-table cleanup will reclaim them",
+				"database", storageSchemaNamespace, "error", err)
+		}
+	case <-time.After(budget):
+		logger.Warn("the stopped storage schema change is still releasing its artifacts; reporting the stop now, and the next boot's stale-table cleanup will reclaim anything it leaves",
+			"database", storageSchemaNamespace, "release_budget", budget)
+	}
+}
+
+// convergenceStopReason says which of the two ways a convergence's context
+// ended. They leave the same storage state and are opposite findings: a budget
+// that fired is a database too slow to converge inside the time it was given,
+// and a cancellation is somebody deciding not to wait.
+//
+// Only a deliberate stop can produce the second: an operator at a terminal, or
+// the platform terminating the instance a boot's convergence is running under.
+// Nothing else ends either context, so a pod that reports this is reporting
+// that it was told to stop, not that something went wrong with the storage.
+func convergenceStopReason(ctx context.Context, budget time.Duration, ddlCount int, logger *slog.Logger) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return ensureSchemaTimeoutError(ctx, budget, ddlCount, logger)
+	}
+	// Not a failure of the storage, and it names no budget: nothing timed out,
+	// and an operator sent looking for a timeout that never fired is an
+	// operator not reading the state they actually left. What they need is the
+	// next command — statements that finished before the stop stay finished,
+	// so "how far did it get" is a question only another plan answers.
+	logger.Warn("storage schema convergence stopped by its caller",
 		"database", storageSchemaNamespace,
-		"timeout", EnsureSchemaTimeout,
+		"ddl_count", ddlCount,
+	)
+	return fmt.Errorf("storage schema convergence stopped (%d change(s) planned); statements that had already finished are still applied, so plan the storage schema again to see what is left: %w",
+		ddlCount, ctx.Err())
+}
+
+// ensureSchemaTimeoutError builds and logs the error returned when the
+// convergence budget fires before the storage schema change completes. Spirit
+// cancels the online DDL mid-apply and storage stays uninitialized, so the
+// message names the budget and the most likely cause (a backend throttling the
+// online DDL) instead of surfacing a bare "context canceled" from the driver.
+//
+// budget is the one this convergence actually ran under, not the boot
+// constant: a convergence an operator asked for runs under a longer one, and a
+// failure reporting a budget it did not have sends them looking for a timeout
+// that never fired.
+func ensureSchemaTimeoutError(ctx context.Context, budget time.Duration, ddlCount int, logger *slog.Logger) error {
+	logger.Error("storage schema change did not complete within the convergence budget; SchemaBot storage will not initialize",
+		"database", storageSchemaNamespace,
+		"timeout", budget,
 		"ddl_count", ddlCount,
 	)
 	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
-		EnsureSchemaTimeout, ddlCount, ctx.Err())
+		budget, ddlCount, ctx.Err())
 }
 
-// refusedStorageChange is a planned storage-schema statement EnsureSchema
-// refused to execute, with the reason it was classified as unsafe.
+// ensureSchemaBudgetAfterLock stops a convergence that reached the front of the
+// advisory-lock queue with nothing left to converge under it. Reaching the
+// front is not the same as being able to use it: the wait and the work are
+// billed to the same budget, so a long enough queue hands an instance the lock
+// at the moment its budget is gone.
+//
+// Converging anyway is worse than stopping. It starts an online DDL that cannot
+// finish, on a context that is already done, so the failure surfaces as
+// whatever the driver says about a cancelled statement rather than as the queue
+// that actually consumed the budget — and the engine it started does not
+// necessarily stop when the outer lock is released, which is how work outlives
+// the lock that was serializing it. Stopping here holds neither: the caller's
+// deferred release hands the lock to the next instance in the queue
+// immediately, and a boot's retry loop opens the next attempt on a fresh
+// budget, which is the attempt that can actually succeed.
+func ensureSchemaBudgetAfterLock(ctx context.Context, logger *slog.Logger, dialect schema.Dialect, database string, budget time.Duration) error {
+	switch {
+	case ctx.Err() == nil:
+		return nil
+	case errors.Is(ctx.Err(), context.Canceled):
+		logger.Info("acquired the EnsureSchema advisory lock after the convergence was stopped; the lock is released without converging",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+		)
+		return fmt.Errorf("acquired advisory lock %q after the convergence was stopped: %w", ensureSchemaLockName, ctx.Err())
+	default:
+		logger.Warn("acquired the EnsureSchema advisory lock with no budget left to converge under it; the wait consumed the whole budget, so the lock is released for the next instance and this attempt converges nothing",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+			"budget", budget,
+		)
+		return fmt.Errorf("acquired advisory lock %q with no time left in the %s convergence budget, which the lock wait consumed: %w",
+			ensureSchemaLockName, budget, ctx.Err())
+	}
+}
+
+// refusedStorageChange is storage-schema DDL EnsureSchema refused to execute,
+// with the reason the plan classified its statement as unsafe.
 type refusedStorageChange struct {
-	change engine.TableChange
-	reason string
-	// splitFrom is the combined ALTER TABLE statement the refused clauses
-	// were split out of; empty when the whole statement was refused.
-	splitFrom string
-	// splitErr is the error that prevented partitioning an unsafe ALTER into
-	// safe and destructive clauses; when set, the statement was refused whole
-	// so no clause of it executed.
+	// change carries the DDL that did not run. That is the whole planned
+	// statement, or only its withheld clauses when the clauses that add were
+	// split out and executed.
+	change  engine.TableChange
+	reason  string
+	partial bool
+	// splitErr records why a gated ALTER could not be reduced to the clauses
+	// that only add, which is why the whole statement was refused rather than
+	// part of it. It is nil for every other refusal.
 	splitErr error
 }
 
 // refusalTelemetry returns the operator-facing telemetry for one refusal: the
-// metrics scope saying whether any of the statement still ran, the warning to
-// log, and its structured attributes. A split refusal carries the combined
-// ALTER its destructive clauses were split out of; a whole refusal of an
-// unsplittable ALTER carries the error that prevented the split.
-func (r refusedStorageChange) refusalTelemetry() (scope, message string, attrs []any) {
+// warning to log, and its structured attributes. The DDL is what did not run,
+// so it narrows to the withheld clauses on a statement that was split.
+func (r refusedStorageChange) refusalTelemetry() (message string, attrs []any) {
+	message = "refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it"
+	if r.partial {
+		message = "withholding the destructive clauses of a storage-schema change; the statement's additions ran and its removals did not — set storage.allow_destructive_schema_changes: true to run them"
+	}
 	attrs = []any{
 		"database", storageSchemaNamespace,
 		"table", r.change.Table,
@@ -388,97 +890,97 @@ func (r refusedStorageChange) refusalTelemetry() (scope, message string, attrs [
 		"reason", r.reason,
 		"ddl", r.change.DDL,
 	}
-	switch {
-	case r.splitErr != nil:
-		return metrics.StorageSchemaRefusalWhole,
-			"refusing an unsafe storage-schema ALTER whole because its clauses could not be partitioned; no clause of it will run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-			append(attrs, "split_error", r.splitErr)
-	case r.splitFrom != "":
-		return metrics.StorageSchemaRefusalSplit,
-			"refusing destructive clauses of a mixed storage-schema ALTER; the destructive clauses will not run, the safe clauses still execute, and startup continues — set storage.allow_destructive_schema_changes: true to allow them",
-			append(attrs, "split_from_ddl", r.splitFrom)
-	default:
-		return metrics.StorageSchemaRefusalWhole,
-			"refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-			attrs
+	if r.splitErr != nil {
+		attrs = append(attrs, "split_error", r.splitErr)
 	}
+	return message, attrs
 }
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
-// statements safe to execute and the unsafe statements to refuse, using
-// Spirit's unsafe vocabulary (ddl.UnsafeStatement). The vocabulary is
-// Spirit's, not a local list: every statement its UnsafeLinter flags as
-// destroying data — dropping a table, column, partition, or primary key,
-// truncating or coalescing partitions, discarding a tablespace — is refused,
-// while structural statements that lose nothing (DROP INDEX, renames) are
-// allowed. A statement Spirit's parser cannot classify fails startup rather
-// than executing unclassified: a classification failure can land on a
-// statement the starting binary needs — an additive ALTER in a syntax a
-// bumped parser trips on — and skipping it would trade a loud startup
-// failure for a missing column at query time. The Spirit diff emits an
-// unsafe statement when the live storage database holds a table or column the
-// starting binary's embedded schema does not declare — during a rolling
-// deploy or rollback that surplus state usually belongs to a newer binary,
-// not to a removal the operator intended. Spirit's diff emits one combined
-// ALTER per table, so an unsafe ALTER that also carries additive clauses is
-// split (ddl.SplitUnsafeAlter): the safe clauses the starting binary needs
-// still execute, and only the destructive clauses are refused. Clauses that
-// cannot run without a refused clause (the ADD PRIMARY KEY half of a
-// primary-key change) are refused with it, so the executed remainder is
-// always independently runnable. A split that cannot be performed falls back
-// to refusing the statement whole rather than failing startup — the opposite
-// disposition from a classification failure, because a split failure only
-// ever happens on a statement already classified unsafe: the starting binary
-// demonstrably does not need it, so refusing it whole is the established
-// answer, and it executes strictly less than any split would, so the failed
-// split cannot widen what the bootstrap executes. Startup survives it, where
-// failing would crash-loop every pod whose pending ALTER the splitter cannot
-// partition.
-func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
+// statements safe to execute and the unsafe statements to refuse, on the
+// verdict the plan already carries.
+//
+// That verdict is the engine's, not this package's. Planning runs Spirit's
+// linter registry over the diff alongside the live schema it was diffed
+// against, and marks a change unsafe when any linter reports an error against
+// it. Re-deriving a verdict here from the statement text would answer a
+// narrower question than the plan already answered, and would answer it without
+// the live schema — so a statement the plan knows is unsafe would execute
+// because this package's vocabulary did not recognize it. Whatever the registry
+// errors on is what the bootstrap refuses, which is how the operator-facing
+// plan surface and the boot that follows it stay in agreement.
+//
+// The bootstrap's exposure is availability, not data loss alone. An index the
+// fleet's live queries plan around is as load-bearing as a column: dropping it
+// destroys no rows and completes in milliseconds because it is metadata-only,
+// and it can still take the storage database down. The registry's error set
+// spans both, so the same gate covers both.
+//
+// The verdict is per statement and Spirit's diff emits one combined ALTER per
+// table, so a gated statement is reduced to the clauses that only add a schema
+// object: those execute and the rest is withheld. The bootstrap exists to give
+// the starting binary the tables, columns, and indexes it needs to run at all,
+// and withholding an addition because it was bundled with a removal leaves a
+// pod serving traffic against storage missing a column its own queries name.
+// Nothing is gained by the bundling: the addition is the same statement's other
+// half, not a consequence of the removal.
+//
+// The reduction is structural, not a second safety verdict. Which clauses add
+// is a closed question about clause shapes (see ddl.SplitAdditiveAlter);
+// whether the statement is gated at all stays the registry's answer. A gated
+// statement that cannot be reduced — a DROP TABLE has no clauses, and an ALTER
+// whose every clause is withheld has nothing left — is refused whole, as is one
+// the parser cannot partition, which is the fail-closed direction.
+//
+// The diff emits an unsafe statement when the live storage database holds a
+// table, column, or index the starting binary's embedded schema does not
+// declare. During a rolling deploy or rollback that surplus state
+// usually belongs to a newer binary, not to a removal the operator intended.
+func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange) {
 	for _, sc := range changes {
 		kept := sc
 		kept.TableChanges = nil
 		for _, tc := range sc.TableChanges {
-			unsafe, reason, err := ddl.UnsafeStatement(tc.DDL)
-			if err != nil {
-				return nil, nil, fmt.Errorf("classify storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
-			}
-			if !unsafe {
+			if !tc.IsUnsafe {
 				kept.TableChanges = append(kept.TableChanges, tc)
 				continue
 			}
-			if tc.Operation == ddl.StatementAlterTable {
-				safeDDL, unsafeDDL, splitErr := ddl.SplitUnsafeAlter(tc.DDL)
-				if splitErr != nil {
-					// Refusing the statement whole executes strictly less
-					// than any split would, so the failed split cannot widen
-					// what the bootstrap executes — and startup proceeds,
-					// which is the reason this path exists. The caller logs
-					// the fallback with the split error.
-					refused = append(refused, refusedStorageChange{change: tc, reason: reason, splitErr: splitErr})
-					continue
-				}
-				if safeDDL != "" {
-					// A mixed ALTER: execute the clauses that lose nothing and
-					// refuse only the destructive remainder. The caller logs the
-					// refusal with the destructive clauses' exact DDL.
-					keptChange := tc
-					keptChange.DDL = safeDDL
-					kept.TableChanges = append(kept.TableChanges, keptChange)
-					refusedChange := tc
-					refusedChange.DDL = unsafeDDL
-					refused = append(refused, refusedStorageChange{change: refusedChange, reason: reason, splitFrom: tc.DDL})
-					continue
-				}
+			// The caller logs every refusal below with its DDL and reason.
+			additive, withheld, err := ddl.SplitAdditiveAlter(tc.DDL)
+			switch {
+			case errors.Is(err, ddl.ErrNotAlterTable):
+				// A statement with no clauses — a DROP TABLE — is all or nothing.
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
+				continue
+			case err != nil:
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason, splitErr: err})
+				continue
+			case additive == "":
+				// Every clause was withheld, so the statement is refused whole
+				// rather than reported as a split that ran nothing.
+				refused = append(refused, refusedStorageChange{change: tc, reason: tc.UnsafeReason})
+				continue
 			}
-			// The caller logs each refusal with the exact DDL and reason.
-			refused = append(refused, refusedStorageChange{change: tc, reason: reason})
+
+			addition := tc
+			addition.DDL = additive
+			addition.IsUnsafe = false
+			addition.UnsafeReason = ""
+			kept.TableChanges = append(kept.TableChanges, addition)
+
+			withheldChange := tc
+			withheldChange.DDL = withheld
+			refused = append(refused, refusedStorageChange{
+				change:  withheldChange,
+				reason:  tc.UnsafeReason,
+				partial: true,
+			})
 		}
 		if len(kept.TableChanges) > 0 {
 			allowed = append(allowed, kept)
 		}
 	}
-	return allowed, refused, nil
+	return allowed, refused
 }
 
 // flatTableChanges returns all table changes across the given schema changes.
@@ -626,7 +1128,7 @@ const ensureSchemaLockName = "schemabot_ensure_schema"
 // dialect's bootstrapper needs its own lock helper alongside its
 // namedlock.Locker. Returns the connection holding the lock — the lock is
 // released when the connection is closed.
-func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
+func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker, wait time.Duration) (*sql.Conn, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -639,17 +1141,28 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 		return nil, fmt.Errorf("get connection: %w", err)
 	}
 
-	// Wait up to the full timeout for the lock — a trailing pod must outwait the
-	// leader's schema change, after which it re-plans and finds no changes.
-	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
+	// Wait up to this convergence's whole budget for the lock — a trailing pod
+	// must outwait the leader's schema change, after which it re-plans and finds
+	// no changes. A pod waits out a boot; it does not wait out an operator's
+	// longer convergence, whose budget is its own and larger. That pod gives up
+	// at its own ceiling and reports the contention by name, which is the
+	// intended trade: converge ahead of a roll, not during one.
+	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, wait)
 	if err != nil {
 		utils.CloseAndLog(conn)
 		// The overall EnsureSchema deadline expires before the server-side
 		// lock wait (which starts later, with the same duration), so a
 		// contended timeout surfaces here as a context error — name the
 		// likely cause instead of reporting only the raw cancellation.
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+		}
+		if ctx.Err() != nil {
+			// Stopped by the operator watching it, before the lock was ever
+			// taken. Nothing ran, and saying so is the whole answer: the run
+			// they stopped changed nothing, and the one they were queued
+			// behind is still going.
+			return nil, fmt.Errorf("stopped while waiting for advisory lock %q; this run changed nothing, and the convergence it was queued behind is still running: %w", ensureSchemaLockName, err)
 		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}
@@ -704,14 +1217,23 @@ func releaseEnsureSchemaLock(ctx context.Context, locker namedlock.Locker, conn 
 // _spirit_sentinel, _spirit_checkpoint) that Spirit normally cleans up after
 // cutover. If a pod is killed mid-apply, they persist until the next startup.
 //
-// This is safe because EnsureSchema only targets SchemaBot's own storage
-// database, and Spirit runs in-process — when the pod restarts, there is no
-// active Spirit runner to resume. Spirit's checkpoint-based resume only works
-// within a single runner lifetime. Cleaning these tables lets Spirit start
-// fresh without logging confusing "successfully dropped old table" messages.
+// Dropping them is a choice rather than a consequence. A checkpoint is durable
+// state on the target, not a handle held by the process that wrote it, and
+// Spirit decides on its own whether to adopt or discard one by comparing the
+// statement it is given against the statement the checkpoint stores. What makes
+// the choice safe is that these tables hold no committed state: the live tables
+// are untouched until cutover, so the whole cost of dropping a copy is the rows
+// it had copied.
 //
-// This must NOT be used on target databases where user schema changes may be
-// in progress or resumable.
+// What makes it the right choice is that this path converges storage against
+// the schema embedded in whichever binary is booting. A release that changed
+// the schema plans a different statement, so its copy is discarded regardless;
+// the only run that could adopt one is the same build restarting with no
+// statement yet finished. A convergence that always starts clean is worth more
+// than that case, because every boot then inherits nothing.
+//
+// This must NOT be used on target databases, where a user's schema change may
+// be in progress or resumable.
 func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger) error {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {

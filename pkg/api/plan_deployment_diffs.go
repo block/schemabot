@@ -179,6 +179,11 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		// the data plane reads the omission as intent to remove and plans DROPs
 		// for namespaces the configuration excluded on purpose.
 		IgnoredNamespaces: req.IgnoredNamespaces,
+		// The exclusions travel with every member's diff. An ignored namespace
+		// is already absent from SchemaFiles, but an ignored table lives on the
+		// target, so a member asked without the list would diff tables the
+		// primary withheld and report them as drift the primary does not have.
+		IgnoreTables: req.IgnoreTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),

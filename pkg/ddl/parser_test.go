@@ -64,6 +64,10 @@ func (f fakeStatementParser) Canonicalize(string) string {
 	return f.canonicalized
 }
 
+func (f fakeStatementParser) CanonicalizeUnqualified(string) string {
+	return f.canonicalized
+}
+
 // The exported package helpers must route through the package's default
 // StatementParser: with a fake parser installed, the helpers must return the
 // fake's canned results — including its errors — not the TiDB parser's view of

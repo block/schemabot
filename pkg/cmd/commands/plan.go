@@ -85,7 +85,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces, false)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(), false)
 			return planErr
 		})
 		if err != nil {
@@ -104,8 +104,9 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return writeJSON(allResults)
 	}
 
-	// Disclose config-driven exclusions once per distinct resolution — the
-	// lists only differ between environments when entries use $ENV.
+	// Disclose ignore_namespaces once per distinct resolution: entries resolve
+	// from config alone and differ between environments only when they use
+	// $ENV, so several environments usually share one notice.
 	disclosed := make(map[string]bool)
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]
@@ -239,7 +240,11 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// The exempt-table disclosure renders on both branches: a clean result is
 	// exactly where a reader needs to tell an exempted live table from one the
 	// plan simply found declared.
-	tables := result.FlatTables()
+	//
+	// The DDL block and the summary below are both built from this one set, so
+	// the summary counts what the block shows — and for a sharded plan that is
+	// every distinct per-shard statement, the same set the PR comment counts.
+	tables := result.RenderedTables()
 	if len(tables) == 0 && len(vschemaChanges) == 0 {
 		templates.WriteNoChanges()
 		templates.WriteExemptTables(result.ExemptTables)
@@ -255,6 +260,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		}
 		namespaceMap[ns] = append(namespaceMap[ns], templates.DDLChange{
 			ChangeType: tbl.ChangeType,
+			Namespace:  ns,
 			TableName:  tbl.TableName,
 			DDL:        tbl.DDL,
 		})
@@ -362,7 +368,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	}
 
 	var ddls []string
-	for _, tbl := range result.FlatTables() {
+	for _, tbl := range result.RenderedTables() {
 		ddls = append(ddls, tbl.DDL)
 	}
 	var vschemas []string

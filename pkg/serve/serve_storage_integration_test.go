@@ -156,8 +156,7 @@ func TestBuildCarriesLocalHostingToTheStorageSchemaAdapter(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, local.Close()) })
 	localAdapter, ok := local.storageSchema.(*storageSchemaAdapter)
 	require.True(t, ok, "the server registers its own adapter")
-	_, err = localAdapter.destructivePolicy(true)
-	require.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest,
+	require.ErrorIs(t, localAdapter.checkDestructiveOptIn(true), tern.ErrInvalidStorageSchemaRequest,
 		"a locally hosted server has no route to a destructive storage bootstrap")
 
 	deployed, err := Build(t.Context(), newConfig(), WithLogger(logger))
@@ -165,7 +164,6 @@ func TestBuildCarriesLocalHostingToTheStorageSchemaAdapter(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, deployed.Close()) })
 	deployedAdapter, ok := deployed.storageSchema.(*storageSchemaAdapter)
 	require.True(t, ok, "the server registers its own adapter")
-	allow, err := deployedAdapter.destructivePolicy(true)
-	require.NoError(t, err)
-	assert.True(t, allow, "the same request is honored on a normally hosted server")
+	assert.NoError(t, deployedAdapter.checkDestructiveOptIn(true),
+		"the same request is honored on a normally hosted server")
 }

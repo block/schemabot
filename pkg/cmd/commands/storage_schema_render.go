@@ -207,6 +207,15 @@ func storageSchemaSummaryTables(changes []templates.DDLChange) []templates.DDLCh
 // outputStorageSchemaPlan prints a storage plan the way `plan` prints one.
 func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
 	writeStorageSchemaHeader(report, isApply)
+	// Before the statements, because it changes how they should be read, and
+	// before the body's converged short-circuit, because a convergence still
+	// finishing up is worth saying over a report that found nothing
+	// outstanding.
+	//
+	// This entry point renders a report before anything has run, which is what
+	// makes the waiting variant true here: on the apply path the run being
+	// described is the one that is about to queue behind the holder.
+	writeStorageConvergenceInFlight(report, isApply)
 	return writeStorageSchemaBody(report, isApply, rerun, hints)
 }
 
@@ -217,6 +226,13 @@ func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool,
 // withPlan prints the plan that ran, for the unattended path where no preview
 // was shown before it. The planned report is that plan, so printing it after
 // the fact costs nothing and leaves every run self-describing.
+//
+// Neither report is rendered with the in-flight notice the plan path writes.
+// The planned report carries the lock as it was read before this run started,
+// and by the time anything here prints, whatever wait that implied is over —
+// announcing it above the count of what ran would tell an operator they are
+// about to queue for a lock they already queued for. The re-read below says
+// the live version of the same fact instead.
 func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
 	if withPlan {
 		writeStorageSchemaHeader(planned, true)
@@ -248,9 +264,64 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 		// is the only new fact and the refusal below it is not.
 		return nil
 	}
+	// The re-read happened after this run released the lock, so a lock held now
+	// is somebody else's and what follows is a catalog read mid-convergence.
+	// That is the plan's reading of the fact, not the apply's: this run is
+	// finished and waits for nothing.
+	writeStorageConvergenceInFlight(remaining, false)
 	return writeStorageSchemaBody(remaining, true, rerun, []string{
 		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual remediation blocks everything else until it is resolved.",
 	})
+}
+
+// writeStorageConvergenceInFlight says that somebody else is converging this
+// storage right now, when the report says so.
+//
+// Only the positive is printed. The report's false covers both "nobody is
+// converging" and "the question could not be answered", and a line announcing
+// an idle database would state the second as the first — on the one surface an
+// operator reads to decide whether it is safe to start their own run.
+//
+// What it costs them to not know differs, so each caller says its own
+// consequence. willWait picks between the two, and it asks about this run
+// rather than about which command is running: a report rendered before a
+// convergence starts belongs to a run that is about to sit on the lock for as
+// long as the run ahead of it takes, while every other report — a plan, and
+// the re-read taken after a convergence has already returned — only says that
+// the catalog was read mid-convergence and will read differently in a minute.
+//
+// An apply renders reports of both kinds, which is why the distinction cannot
+// be drawn from the command.
+func writeStorageConvergenceInFlight(report *apitypes.StorageSchemaReport, willWait bool) {
+	if !report.ConvergenceInFlight {
+		return
+	}
+	consequence := "A statement a convergence is working on is absent from the live catalog until it finishes with it, so these statements are what is outstanding, not what is idle. Re-run this once it finishes to see what it left."
+	if willWait {
+		consequence = "This run waits on the storage bootstrap lock until that one finishes or its budget runs out, and may then find nothing left to do."
+	}
+	fmt.Printf("%s A storage convergence is already running against %s.%s %s\n\n",
+		glyph.Attention, storageSchemaHeaderDatabase(report), storageConvergenceLockScope(report.Dialect), consequence)
+}
+
+// storageConvergenceLockScope qualifies which database the convergence that
+// was detected is actually converging, on the dialect where the lock cannot
+// say.
+//
+// MySQL scopes a named lock to the server rather than to the database the
+// session is connected to, so two instances whose storage lives on one server
+// read each other's convergence here. The consequence above holds either way —
+// this run waits behind that one — but the database named beside it may not be
+// the one being converged, and an operator who goes looking for the run needs
+// that before they start looking in the wrong place.
+//
+// PostgreSQL advisory locks are per-database, so there the holder is
+// converging this database and there is nothing to qualify.
+func storageConvergenceLockScope(dialect string) string {
+	if schema.Dialect(dialect) != schema.DialectMySQL {
+		return ""
+	}
+	return " MySQL scopes the bootstrap lock to the server, so the run holding it may be converging another database on the same server."
 }
 
 func writeStorageSchemaHints(hints []string) {
@@ -375,4 +446,16 @@ func storageSchemaDatabaseLabel(report *apitypes.StorageSchemaReport) string {
 		label += fmt.Sprintf(", deployment %s", report.Deployment)
 	}
 	return label
+}
+
+// storageSchemaPlanHints names the next step for the plan that was just
+// printed.
+//
+// The next step is the same command with `apply` in place of `plan`, which is
+// what an operator will reach for and is the answer: the apply converges the
+// schema this plan named, not the one the answering binary happens to carry.
+// The hint does not reproduce the operator's flags, because the plan they just
+// ran already has them on the line above.
+func storageSchemaPlanHints(report *apitypes.StorageSchemaReport) []string {
+	return []string{fmt.Sprintf("These are what %s needs in order to match %s. To converge them, re-run this as `storage apply` with the same flags.", storageSchemaHeaderDatabase(report), report.SchemaSource)}
 }

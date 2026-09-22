@@ -71,6 +71,14 @@ var schemabotReservedNamespaces = map[string]struct{}{
 // systemSchemasByDialect maps a dialect to the database-managed schemas that
 // must never be treated as user schema for pull discovery.
 var systemSchemasByDialect = map[Dialect]map[string]struct{}{
+	// The MySQL set covers the server's own schemas, the administrative schemas
+	// a managed provider attaches, and the fixed-name schemas that standard
+	// operational tooling creates beside user schemas. slow_query_log is the
+	// latter: it is the query-review sink that Anemometer and the pt-query-digest
+	// workflows built on it create, and despite sharing a name with the server
+	// variable it is not a MySQL built-in. A tooling schema holds monitoring
+	// output rather than user schema, so pull must never offer it as an
+	// onboardable namespace.
 	DialectMySQL: {
 		"information_schema": {},
 		"innodb":             {},
@@ -79,6 +87,7 @@ var systemSchemasByDialect = map[Dialect]map[string]struct{}{
 		"sys":                {},
 		"rdsmon":             {},
 		"dbadmin":            {},
+		"slow_query_log":     {},
 		"polt":               {},
 		"tmp":                {},
 		"topo":               {},

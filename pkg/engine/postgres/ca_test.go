@@ -1,11 +1,13 @@
 package postgres
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -126,7 +128,18 @@ func TestSpritePoolConfig(t *testing.T) {
 	t.Run("unparseable DSN is refused", func(t *testing.T) {
 		_, err := spritePoolConfig("postgres://schemabot@:not-a-port/app", "")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "normalize PostgreSQL DSN for pg-sprite pool")
+		assert.Contains(t, err.Error(), "judge PostgreSQL DSN for pg-sprite pool")
+	})
+
+	t.Run("non-verifying RDS pool posture is announced", func(t *testing.T) {
+		var logs bytes.Buffer
+		originalLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		t.Cleanup(func() { slog.SetDefault(originalLogger) })
+
+		_, err := spritePoolConfig("postgres://schemabot:secret@apply-only.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", "")
+		require.NoError(t, err)
+		assert.Contains(t, logs.String(), "does not authenticate the server")
 	})
 }
 

@@ -26,10 +26,13 @@ import (
 // report that did not name its desired side would leave an operator holding
 // the wrong one with no way to tell.
 //
-// A supplied schema is a diff-only input. ApplyStorageSchema takes no source
-// and has no way to accept one: a convergence runs the schema of the binary
-// running it, or "apply is what a boot does" — the property that makes this
-// usable as a pre-deploy step — stops being true (AV-9).
+// A convergence takes the same input, for the same reason: an operator rolling
+// a later release converges the storage to that release before its first pod
+// starts, which is the whole point of having this as a command. Supplying the
+// files moves which schema runs and nothing else — the destructive refusal and
+// the manual-remediation gate decide exactly as they decide for a boot, so no
+// supplied set can cost the storage a table that nobody permitted losing
+// (AV-9).
 
 // storageSchemaNamespace is the namespace the storage schema files declare.
 // EnsureSchema passes the same value to the engine; naming it once keeps the
@@ -79,12 +82,29 @@ func EmbeddedStorageSchema(version string) *StorageSchemaSource {
 //
 // What it does not do is establish that a readable set is *complete*, because
 // nothing here can: a set is a map, and a map has no way to say what is
-// missing from it. Two things keep that from being a safety hole rather than a
-// caveat. The two selectors that reach this both produce a complete set by
-// construction — a directory listing and a release listing, each an error if it
-// fetches partially — and no convergence can consume a supplied set at all
-// (AV-9), so the worst an incomplete one produces is a report that overstates
-// what is surplus, never a database that has lost a table.
+// missing from it. A convergence can consume a supplied set, so what an
+// incomplete one costs is a real question rather than a hypothetical, and the
+// two dialects answer it differently enough to be worth stating separately.
+//
+// What both rest on is that the selectors reaching here produce a complete set
+// by construction — a directory listing and a release listing, each an error
+// if it fetches partially. Assembling a partial set means going around them,
+// through the API.
+//
+// On MySQL an omitted table is reported as surplus, which is a statement that
+// would drop it. That is destructive, so it is refused unless destroying
+// storage state was explicitly permitted (AV-9), and a convergence to a schema
+// the running binary does not carry is confirmed by an operator who is shown
+// those statements first. An incomplete set therefore costs a report that
+// overstates what is surplus, and it takes a separate, explicit permission
+// before it costs a table.
+//
+// On PostgreSQL the convergence is additive-only and walks only the tables the
+// set supplies, so an omitted table is not reported at all. Nothing is dropped,
+// and the cost is the other way round: a set missing most of a release's files
+// can plan as converged, so a caller assembling its own files is answering for
+// the completeness of what it sent. The selectors are what make that answer
+// true for every operator-facing path.
 func StorageSchemaFromFiles(description string, files map[string]string) (*StorageSchemaSource, error) {
 	description = strings.TrimSpace(description)
 	if description == "" {
@@ -99,7 +119,7 @@ func StorageSchemaFromFiles(description string, files map[string]string) (*Stora
 		return nil, fmt.Errorf("%q is reserved for a binary's own embedded schema; describe a supplied schema by where it came from, so the report can attribute the answer to it", description)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would report every existing storage table as surplus", description)
+		return nil, fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would propose dropping every existing storage table", description)
 	}
 	names := make([]string, 0, len(files))
 	for name := range files {
@@ -111,7 +131,7 @@ func StorageSchemaFromFiles(description string, files map[string]string) (*Stora
 			return nil, fmt.Errorf("schema file %q from %s: %w", name, description, err)
 		}
 		if strings.TrimSpace(files[name]) == "" {
-			return nil, fmt.Errorf("schema file %q from %s is empty: an empty file declares no table, so the table it is named for would be reported as surplus", name, description)
+			return nil, fmt.Errorf("schema file %q from %s is empty: an empty file declares no table, so the diff would propose dropping the table it is named for", name, description)
 		}
 	}
 	return &StorageSchemaSource{Description: description, Files: files}, nil
@@ -174,7 +194,7 @@ func (s *StorageSchemaSource) checkSupplied() error {
 	if len(s.Files) > 0 {
 		return nil
 	}
-	return fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would report every existing storage table as surplus", s.Describe())
+	return fmt.Errorf("no schema files supplied for %s: a diff against an empty schema would propose dropping every existing storage table", s.Describe())
 }
 
 // Describe is the report's attribution for this source.

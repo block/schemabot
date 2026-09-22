@@ -91,6 +91,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 			Deployment: e.Deployment,
 			Primary:    i == 0,
 			Class:      e.Class.String(),
+			Blocked:    e.Blocked,
 		}
 		switch e.Class {
 		case api.DeploymentDiverged:
@@ -108,6 +109,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 		Deployments: entries,
 		Clean:       rollup.Clean,
 		Computed:    true,
+		Independent: rollup.Planning == api.PlanIndependent,
 	}
 }
 
@@ -144,7 +146,13 @@ const maxDriftSummaryLen = 255
 // drift rollup blocked the plan check. It names the deployments that diverged
 // from the reviewed plan and those that could not be diffed or compared, so the
 // check's Change column tells an operator exactly which deployment to reconcile.
+//
+// Independent members are never expected to agree, so their failure is an
+// unplanned target rather than drift between them, and the summary says so. A
+// summary that told an operator to reconcile targets that are supposed to
+// differ would point the incident at the wrong thing.
 func summarizeReviewDrift(rollup api.PlanRollup) string {
+	independent := rollup.Planning == api.PlanIndependent
 	var diverged, errored []string
 	for _, entry := range rollup.Entries {
 		switch entry.Class {
@@ -160,12 +168,25 @@ func summarizeReviewDrift(rollup api.PlanRollup) string {
 		parts = append(parts, fmt.Sprintf("diverged: %s", strings.Join(diverged, ", ")))
 	}
 	if len(errored) > 0 {
-		parts = append(parts, fmt.Sprintf("could not verify: %s", strings.Join(errored, ", ")))
+		// An errored member means different things under the two contracts: a
+		// mirrored member's diff could not be confirmed against the reviewed
+		// plan, while an independent member has no plan of its own at all.
+		reason := "could not verify"
+		if independent {
+			reason = "could not plan"
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", reason, strings.Join(errored, ", ")))
 	}
 	if len(parts) == 0 {
-		// A not-clean rollup always has at least one non-matching entry; guard
+		// A not-clean rollup always has at least one non-passing entry; guard
 		// anyway so the check never records an empty, uninformative reason.
+		if independent {
+			return "blocks apply: not every target could be planned"
+		}
 		return "drift blocks apply: deployments differ from the reviewed plan"
+	}
+	if independent {
+		return clampDriftSummary("blocks apply — " + strings.Join(parts, "; "))
 	}
 	return clampDriftSummary("drift blocks apply — " + strings.Join(parts, "; "))
 }

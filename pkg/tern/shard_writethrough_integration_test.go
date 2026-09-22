@@ -96,6 +96,8 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 		TableName:        "users",
 		DDL:              "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
 		DDLAction:        "alter",
+		ExecutionMode:    "direct",
+		ModeReason:       "fits the direct-execution bound",
 	}
 	tp := &engine.TableProgress{
 		Namespace: "resolute",
@@ -134,6 +136,8 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	assert.Equal(t, int64(500000), byShard["-80"].RowsTotal)
 	assert.Equal(t, 720, byShard["-80"].ETASeconds)
 	assert.Equal(t, 1, byShard["-80"].CutoverAttempts)
+	assert.Equal(t, "direct", byShard["-80"].ExecutionMode, "the admitting verdict travels onto every per-shard row")
+	assert.Equal(t, "fits the direct-execution bound", byShard["-80"].ModeReason)
 	assert.Equal(t, 60, byShard["80-"].ProgressPercent)
 
 	// A later drive pass updates in place — no duplicate rows.

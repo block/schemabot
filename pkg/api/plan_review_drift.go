@@ -11,9 +11,15 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// RollupReviewTimeDrift computes the review-time drift rollup for a
-// database/environment: it diffs every configured deployment against the
-// reviewed primary plan and classifies each as match, diverged, or errored.
+// RollupReviewTimeDrift computes the review-time rollup for a
+// database/environment, classifying every configured rollout member.
+//
+// What a member is classified against depends on the environment's member
+// planning, which is resolved here. Where members mirror each other, each is
+// diffed against the reviewed primary plan and classified match, diverged, or
+// errored. Where members hold their own schemas, none is compared to the
+// reviewed plan or to another member: each is classified planned, or errored
+// when it could not be planned at all.
 //
 // primaryPlan is the just-reviewed primary plan proto, reused as the rollup's
 // baseline so the comparison is against exactly what the user reviewed rather
@@ -27,7 +33,9 @@ import (
 // passed to RollupDeploymentDiffs as the expected set so the rollup can enforce
 // that the producer returned one diff per member in that order — a missing,
 // extra, or reordered result fails closed rather than being mistaken for
-// agreement. The returned rollup is Clean only when every member matches.
+// agreement. The returned rollup is Clean only when every member passed the
+// contract it was classified under, and carries that contract so a caller can
+// describe the result without re-deriving it.
 func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget) (PlanRollup, error) {
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {

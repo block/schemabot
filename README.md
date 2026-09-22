@@ -116,6 +116,7 @@ Guides and reference:
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
 - [Configuration](./docs/configuration.md): Set things up for your environment
+- [Storage schema](./docs/storage-schema.md): Keep SchemaBot’s own bookkeeping database converged across deploys
 - [Authentication](./docs/auth.md): Choose who can read and change your databases
 - [AI agents](./docs/ai-agents.md): Set clear boundaries for your assistants
 - [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change

@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -41,6 +42,40 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 	require.Len(t, data.Changes[0].Shards, 2, "per-shard changes are threaded into the keyspace")
 	assert.Equal(t, "-40", data.Changes[0].Shards[0].Shard)
 	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
+}
+
+// A divergent sharded plan, including a malformed shard row with no DDL,
+// must produce the same UX-6 totals in the CLI and PR comment selections.
+func TestPlanSummarySelectionsAgreeForDivergentShards(t *testing.T) {
+	createUsers := &apitypes.TableChangeResponse{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "CREATE"}
+	alterUsers := &apitypes.TableChangeResponse{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email TEXT", ChangeType: "ALTER"}
+	planResp := &apitypes.PlanResponse{
+		Database: "commerce",
+		Engine:   "planetscale",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "commerce", TableChanges: []*apitypes.TableChangeResponse{createUsers},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*apitypes.TableChangeResponse{createUsers}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*apitypes.TableChangeResponse{alterUsers}},
+			{Namespace: "commerce", Shard: "bad", Changes: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "ALTER"}}},
+		},
+	}
+
+	var cliCounts ui.PlanCounts
+	for _, change := range planResp.RenderedTables() {
+		op := strings.ToLower(strings.TrimPrefix(strings.ToUpper(change.ChangeType), "CHANGE_TYPE_"))
+		cliCounts.AddTable(change.Namespace, op, change.TableName)
+	}
+	cliParts := ui.PlanSummaryParts(cliCounts, len(planResp.RenderedTables()), false)
+	require.Equal(t, []string{"1 table to create", "1 table to alter"}, cliParts)
+
+	schema := &ghclient.SchemaRequestResult{Database: "commerce", Type: "mysql"}
+	commentData := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	comment := templates.RenderPlanComment(commentData)
+	commentSummary := "📋 **Plan**: " + strings.ReplaceAll(strings.Join(cliParts, ", "), "1 table", "**1** table")
+	assert.Contains(t, comment, commentSummary)
+	assert.Len(t, commentData.Errors, 1)
 }
 
 // Every exempt-table group on the plan response reaches the comment data with
@@ -514,12 +549,12 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 
 	t.Run("downgrade hint preserves tenant", func(t *testing.T) {
 		data := templates.PlanCommentData{
-			Database:                   "testdb",
-			Environment:                "staging",
-			Tenant:                     "alpha",
-			IsMySQL:                    true,
-			IsLocked:                   true,
-			AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+			Database:                  "testdb",
+			Environment:               "staging",
+			Tenant:                    "alpha",
+			IsMySQL:                   true,
+			IsLocked:                  true,
+			PendingManualConfirmation: true,
 			Changes: []templates.KeyspaceChangeData{{
 				Keyspace:   "testdb",
 				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
@@ -529,7 +564,7 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		rendered := templates.RenderPlanComment(data)
 
 		assert.Contains(t, rendered, "**Tenant**: `alpha`")
-		assert.Contains(t, rendered, "Automatic apply paused")
+		assert.Contains(t, rendered, "**Confirmation required**")
 		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
 	})
 

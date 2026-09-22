@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/spirit/pkg/checkpoint"
@@ -344,7 +345,9 @@ func TestE2EDiscardingCopyDowngradesToConfirm(t *testing.T) {
 			"the locked comment discloses the copy the apply would destroy")
 		assert.Contains(t, body, "`events`")
 		assert.Contains(t, body, "the schema change differs from the one that started it")
-		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Applying destroys work in progress on the target\n")
+		assert.Contains(t, body, "**Confirmation required** — review the plan above, then confirm manually:\n")
+		assert.Equal(t, 1, strings.Count(body, glyph.Attention),
+			"the disclosure above explains the pause in full, so the footer spends no second marker on it")
 		assert.Contains(t, body, "schemabot apply-confirm -e staging",
 			"the paused comment carries the confirm command copy-pasteably rather than describing it")
 	case <-time.After(webhookIntegrationPollDeadline):
@@ -482,7 +485,8 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
 			"the downgraded comment discloses the copy the reviewed comment never showed")
 		assert.Contains(t, body, "`events`")
-		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Applying destroys work in progress on the target\n")
+		assert.Contains(t, body, "**Confirmation required** — review the plan above, then confirm manually:\n")
+		assert.Equal(t, 1, strings.Count(body, glyph.Attention))
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the downgraded plan comment")
@@ -536,9 +540,9 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
 			"the confirm stops and discloses the copy instead of dispatching over it")
 		assert.Contains(t, body, "`events`")
-		assert.Contains(t, body, "⚠️ **Apply stopped**: Applying destroys work in progress on the target\n",
-			"the operator issued this apply themselves, so nothing automatic was paused")
-		assert.NotContains(t, body, "Automatic apply paused")
+		assert.Contains(t, body, "**Confirmation required** — review the plan above, then confirm manually:\n",
+			"the footer is the same sentence whatever paused the apply")
+		assert.Equal(t, 1, strings.Count(body, glyph.Attention))
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
 		assert.NotContains(t, body, "Schema Change Status", "the apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):
@@ -593,7 +597,7 @@ func TestE2EApplyConfirmProceedsWhenDiscardWasDisclosed(t *testing.T) {
 	require.Eventually(t, func() bool {
 		select {
 		case body := <-f.result.comments:
-			assert.NotContains(t, body, msgCopyDiscardDowngrade,
+			assert.NotContains(t, body, "review the plan above, then confirm manually",
 				"a discard the operator already agreed to must not stop the apply again")
 			return strings.Contains(body, "Schema Change Applied")
 		default:

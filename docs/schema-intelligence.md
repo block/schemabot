@@ -321,8 +321,12 @@ The envelope differs by dialect:
 - **PostgreSQL.** A schema is the namespace, ordinary and partitioned tables
   are exported, and only `basic` catalog detail is available. The full
   envelope is in [postgresql.md](postgresql.md).
-- **Lint.** The linters parse MySQL-family DDL only, so a lint request against
-  another dialect is rejected rather than answered clean.
+- **Lint.** The MySQL family runs Spirit's schema-shape linters. PostgreSQL
+  runs the rules with a PostgreSQL analog — `primary_key`, `has_float`,
+  `name_case`, `redundant_indexes` — as warnings; see
+  [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
+  A lint request against a database of any other type is rejected rather than
+  answered clean.
 
 ### What a pull costs
 
@@ -810,11 +814,17 @@ propose. When the planner exempts live tables from the undeclared-table
 verdict, that disclosure (`exempt_tables`, grouped by namespace with the table
 names and exemption reason) is carried on the response to the plan request
 itself and rendered in the PR comment and in `schemabot plan` and
-`schemabot apply` output; it is not retained on the stored plan, so
-`GET /api/plans/{plan_id}` and `list-plans` omit it. Only PostgreSQL targets
-populate it today: the MySQL-family engines exempt archive tables from their
-live-schema view without reporting which ones. A plan with nothing exempted
-omits the field.
+`schemabot apply` output; it is not part of the stored plan's response, so
+`GET /api/plans/{plan_id}` and `list-plans` omit it. A plan with nothing
+exempted omits the field.
+
+Two things populate it. Tables withheld by the repository's `ignore_tables`
+config (see [Ignoring Tables](namespaces.md#ignoring-tables)) are reported by
+every engine, with `reason` naming the config key; the table names are also
+persisted with the plan so a rollback or resume re-plan withholds the same
+tables the reviewed plan did. Archive-named tables are reported by PostgreSQL
+targets only — the MySQL-family engines exempt them from their live-schema view
+without reporting which ones.
 
 Response excerpt from the plan request (illustrative values):
 

@@ -126,7 +126,7 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 
 📋 **Plan**: **1** table to create
 
-ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`
+ℹ️ Ignored tables in namespace `app` (archive naming): `events_archive_2025_01`, `orders_archive_2024`
 
 
 ---
@@ -135,6 +135,23 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 ```
 schemabot apply -e staging
 ```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-ignore-tables"></a><strong>MySQL Plan (Ignore Tables)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **No schema changes detected**
+
+ℹ️ Ignored tables in namespace `testapp` (ignore\_tables): `flyway_schema_history`
+
 
 </details>
 
@@ -207,7 +224,41 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 
 An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
-📋 **Plan**: **3** tables to alter
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="postgres-plan-engineblocked-change-two-causes"></a><strong>Postgres Plan (Engine-blocked Change, Two Causes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE users ALTER COLUMN email TYPE bigint;
+
+ALTER TABLE orders ADD COLUMN notes text;
+```
+
+⛔ **Cannot apply**: 1 change the engine refuses to execute
+- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
+
+An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+
+📋 **Plan**: **2** tables to alter
 
 
 ---
@@ -249,9 +300,7 @@ These statements run synchronously outside the schema change engine: writes to e
 
 ---
 
-⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -279,7 +328,7 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-🛑 **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
+⚠️ **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
 - `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
 - `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
 
@@ -390,9 +439,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-⚠️ **Automatic apply paused**: Applying destroys work in progress on the target
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -430,9 +477,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-⚠️ **Apply stopped**: Applying destroys work in progress on the target
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -516,16 +561,14 @@ schemabot apply -e staging
 
 ## Schema Change Plan — Staging
 
-**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+**Database**: `testapp` | **Type**: `PostgreSQL`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
-ALTER TABLE `users`
-    DROP PRIMARY KEY,
-    ADD PRIMARY KEY(`id`, `tenant_id`);
+ALTER TABLE users ALTER COLUMN email TYPE bigint;
 
-ALTER TABLE `orders` ADD COLUMN `notes` text;
+ALTER TABLE orders ADD COLUMN notes text;
 ```
 
 📋 **Plan**: **2** tables to alter
@@ -533,7 +576,8 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ---
 
 **⛔ Apply rejected**: 1 planned change the engine refuses to execute
-- `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
+- `users`: statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned
+  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
@@ -1290,6 +1334,59 @@ schemabot apply -e production
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ✅ **Same plan on all 3 deployments** (eu, au, us).
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="deployment-drift-clean-blocked"></a><strong>Deployment Drift (Clean, Blocked)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **Same plan on all 3 deployments** (eu, au, us).
+
+- `eu` (primary) ✅ matches the reviewed plan
+- `au` ✅ matches the reviewed plan · blocked: 1
+- `us` ✅ matches the reviewed plan
 
 ```sql
 CREATE TABLE `users` (
@@ -2577,14 +2674,19 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+⚠️ **Schema changes differ from the plan this apply was started from**
+- `orders` (alter) runs a different statement than in the plan this apply was started from
+- `products` (alter) is in this plan but not in the one this apply was started from
+- `shipments` (create) was in the plan this apply was started from but is not in this one
+
+The statements above are what will run. Review them, then confirm to apply them.
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
 
-⚠️ **Automatic apply paused**: Schema changes differ from auto-plan — review and confirm manually
-
-Review the plan above, then confirm manually:
+**Confirmation required** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -7687,7 +7789,7 @@ _Already applied — no change._
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: 1 DDL statement
+📋 **Plan**: **1** table to alter
 
 
 ---
@@ -7733,7 +7835,7 @@ ALTER TABLE `mutes`
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
 
-📋 **Plan**: 2 DDL statements
+📋 **Plan**: **1** table to alter
 
 
 ---

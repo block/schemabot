@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/drain"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -87,8 +88,20 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 	h.logger.Info("durable webhook dispatch started", "drivers", driverCount, "interval", h.durableWebhookPollInterval)
 }
 
-// StopDurableWebhookDispatch stops the durable webhook driver pool and waits for
-// in-flight claimed deliveries to finish their current drive.
+// durableWebhookDrainTimeout bounds how long StopDurableWebhookDispatch waits
+// for the cancelled deliveries to finish their current drive. A delivery that
+// is between HTTP calls returns as soon as its context ends; the bound is for
+// one that does not return at all.
+//
+// A delivery abandoned here is not lost. Its inbox row stays claimed until the
+// claim goes stale, at which point the next process to run the pool picks it up
+// and delivers it — so the cost of stopping the wait is a delivery that arrives
+// late, against the cost of a process that cannot exit.
+const durableWebhookDrainTimeout = 10 * time.Second
+
+// StopDurableWebhookDispatch stops the durable webhook driver pool and waits up
+// to durableWebhookDrainTimeout for in-flight claimed deliveries to finish
+// their current drive.
 func (h *Handler) StopDurableWebhookDispatch() {
 	h.durableWebhookMu.Lock()
 	if h.durableWebhookStop == nil {
@@ -107,7 +120,16 @@ func (h *Handler) StopDurableWebhookDispatch() {
 	if cancel != nil {
 		cancel()
 	}
-	h.durableWebhookWg.Wait()
+	if !drain.Wait(&h.durableWebhookWg, durableWebhookDrainTimeout) {
+		abandoned := h.durableWebhookClaimsSnapshot()
+		h.logger.Error("durable webhook deliveries did not return within the shutdown drain; their inbox rows stay claimed until the claim goes stale and the next process to run the pool redelivers them",
+			"drain_timeout", durableWebhookDrainTimeout,
+			"abandoned_deliveries", len(abandoned))
+		for _, attrs := range abandoned {
+			h.logger.Error("abandoned a claimed webhook delivery whose driver did not return", attrs...)
+		}
+		return
+	}
 	h.logger.Info("durable webhook dispatch stopped")
 }
 
@@ -200,8 +222,56 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, own
 		"head_sha", event.HeadSHA,
 		"attempts", event.Attempts)
 
+	release := h.registerDurableWebhookClaim(driverID, event)
+	defer release()
+
 	h.driveClaimedDurableWebhook(ctx, driverID, store, event)
 	return true
+}
+
+// registerDurableWebhookClaim records a delivery this process is driving, and
+// returns the function that drops it when the drive returns. What is left in
+// the map when the shutdown drain expires is exactly the set of inbox rows this
+// process walked away from still claimed.
+func (h *Handler) registerDurableWebhookClaim(driverID int, event *storage.WebhookEvent) (release func()) {
+	key := event.Provider + "/" + event.DeliveryID
+	attrs := []any{
+		"driver", driverID,
+		"provider", event.Provider,
+		"delivery_id", event.DeliveryID,
+		"event", event.Event,
+		"action", event.Action,
+		"repo", event.Repository,
+		"pr", event.PullRequest,
+		"head_sha", event.HeadSHA,
+		"attempts", event.Attempts,
+	}
+
+	h.durableWebhookClaimMu.Lock()
+	if h.durableWebhookClaims == nil {
+		h.durableWebhookClaims = make(map[string][]any)
+	}
+	h.durableWebhookClaims[key] = attrs
+	h.durableWebhookClaimMu.Unlock()
+
+	return func() {
+		h.durableWebhookClaimMu.Lock()
+		delete(h.durableWebhookClaims, key)
+		h.durableWebhookClaimMu.Unlock()
+	}
+}
+
+// durableWebhookClaimsSnapshot returns the log attributes of every delivery
+// this process is currently driving.
+func (h *Handler) durableWebhookClaimsSnapshot() [][]any {
+	h.durableWebhookClaimMu.Lock()
+	defer h.durableWebhookClaimMu.Unlock()
+
+	snapshot := make([][]any, 0, len(h.durableWebhookClaims))
+	for _, attrs := range h.durableWebhookClaims {
+		snapshot = append(snapshot, attrs)
+	}
+	return snapshot
 }
 
 // driveClaimedDurableWebhook runs the process → heartbeat → finish lifecycle for

@@ -36,33 +36,53 @@ import (
 //
 // Both name a schema the operator can point at and read for themselves. The
 // schema compiled into whichever binary answered the request is deliberately
-// not offered: which release that is depends on which pod took the call, so an
-// operator mid-roll would be asking about a release they had not chosen and
-// could not predict, and would learn which one only from the report they were
-// about to act on.
+// not offered as a *selector*: which release that is depends on which pod took
+// the call, so an operator mid-roll would be asking about a release they had
+// not chosen and could not predict, and would learn which one only from the
+// report they were about to act on. It is what an apply converges when the
+// operator names nothing, which is a different thing — there the answering
+// binary's own schema is the one they asked for.
 //
-// Neither selector is available on `storage apply`, and that is the safety
-// property rather than an omission: a convergence runs the schema of the binary
-// running it, so "apply is what a boot does" holds by construction (AV-9). To
-// converge a release's schema, run that release's binary.
+// Both selectors work on `storage apply` too, and that is the point of having
+// the command: an operator decides which release's storage schema to converge,
+// and converges it before the release that needs it rolls. What a named schema
+// cannot do is get more permission than a boot has. Every gate that guards a
+// boot guards this — destructive statements refused, manual remediation gating
+// the whole set — plus two that exist only here: the convergence is confirmed
+// at a terminal, and it is never reachable unattended (AV-9).
 
-// storageSchemaSourceFlags names the desired side of the diff. Exactly one
-// selector is required: each names a complete schema, so the parser refuses
-// both of them and validateSource refuses neither.
+// storageSchemaSourceFlags names the schema to compare against, or to converge
+// to. Each selector names a complete schema, so the parser refuses both at
+// once; whether naming none is allowed is the command's own question, which is
+// why requiring one is a separate check from validating the combination.
 type storageSchemaSourceFlags struct {
-	Release   string `help:"Diff against the schema files of this published tag, fetched from the SchemaBot repository (e.g. v1.4.0)" xor:"desired-schema"`
-	SchemaDir string `help:"Diff against the .sql files in this directory instead — a checkout of the release you are about to deploy (e.g. ./pkg/schema/mysql)" name:"schema-dir" type:"path" xor:"desired-schema"`
+	Release   string `help:"Use the schema files of this published tag, fetched from the SchemaBot repository (e.g. v1.4.0)" xor:"desired-schema"`
+	SchemaDir string `help:"Use the .sql files in this directory instead — a checkout of the release you are about to deploy (e.g. ./pkg/schema/mysql)" name:"schema-dir" type:"path" xor:"desired-schema"`
 	// Repo carries no Kong default, so an unset flag stays empty and
-	// validateSource can tell "omitted" from "typed the default value". The
-	// default is applied in resolve instead, where nothing has to distinguish
-	// the two any more.
+	// validateSourceCombination can tell "omitted" from "typed the default
+	// value". The default is applied in resolve instead, where nothing has to
+	// distinguish the two any more.
 	Repo string `help:"Repository to fetch --release schema files from (default block/schemabot)" name:"release-repo"`
 }
 
-// validateSource requires a desired schema and refuses --release-repo without
-// the flag it modifies. Both selectors at once is the parser's own refusal, and
-// restated here for callers that build the command in Go.
-func (f *storageSchemaSourceFlags) validateSource() error {
+// namedSource is the selector the operator used, or empty when they named
+// none. Empty means the answering binary's own embedded schema — the schema its
+// next boot converges.
+func (f *storageSchemaSourceFlags) namedSource() string {
+	if strings.TrimSpace(f.Release) != "" {
+		return "--release"
+	}
+	if strings.TrimSpace(f.SchemaDir) != "" {
+		return "--schema-dir"
+	}
+	return ""
+}
+
+// validateSourceCombination refuses combinations that are wrong on either
+// command: both selectors at once, and --release-repo without the flag it
+// modifies. The parser refuses the first on its own; it is restated here for
+// callers that build the command in Go.
+func (f *storageSchemaSourceFlags) validateSourceCombination() error {
 	named := make([]string, 0, 2)
 	if strings.TrimSpace(f.Release) != "" {
 		named = append(named, "--release")
@@ -70,41 +90,27 @@ func (f *storageSchemaSourceFlags) validateSource() error {
 	if strings.TrimSpace(f.SchemaDir) != "" {
 		named = append(named, "--schema-dir")
 	}
-	switch {
-	case len(named) == 0:
-		return fmt.Errorf("missing flags: --release=STRING or --schema-dir=STRING")
-	case len(named) > 1:
+	if len(named) > 1 {
 		return fmt.Errorf("%s can't be used together", strings.Join(named, " and "))
 	}
-	repo := strings.TrimSpace(f.Repo)
-	if strings.TrimSpace(f.Release) == "" && repo != "" {
+	if strings.TrimSpace(f.Release) == "" && strings.TrimSpace(f.Repo) != "" {
 		return fmt.Errorf("--release-repo only applies with --release: it says which repository to fetch a published tag's schema files from")
 	}
 	return nil
 }
 
-// storageSchemaSourceRefusal refuses the diff's release selectors on a
-// convergence, and names the two ways to converge a release's schema instead.
-//
-// The refusal is the invariant, stated where an operator meets it. A
-// convergence runs the schema embedded in the binary running it, which is what
-// makes an operator apply identical to the next boot's — so it can be used to
-// converge storage ahead of a deploy without the fleet's own boots then
-// disagreeing with it (AV-9). A convergence to files named on the command line
-// would be a second implementation of the one path that must not have two.
-func storageSchemaSourceRefusal(schemaDir, release, repo string) error {
-	selector := ""
-	switch {
-	case strings.TrimSpace(release) != "":
-		selector = "--release"
-	case strings.TrimSpace(schemaDir) != "":
-		selector = "--schema-dir"
-	case strings.TrimSpace(repo) != "":
-		selector = "--release-repo"
-	default:
-		return nil
+// validateSource additionally requires a schema to be named, which the diff
+// does: its whole question is whether the storage is ready for a release, and
+// a diff that defaulted to the answering binary's own would answer about a
+// release the operator did not choose.
+func (f *storageSchemaSourceFlags) validateSource() error {
+	if err := f.validateSourceCombination(); err != nil {
+		return err
 	}
-	return fmt.Errorf("%s cannot be used with a convergence: an apply runs the schema embedded in the binary running it, so that it converges exactly what that binary's next boot would. To converge a release's schema, run that release's binary — its container image is that release — or let the release's own first boot converge it. To see what it would do, use the same flag on `storage plan`", selector)
+	if f.namedSource() == "" {
+		return fmt.Errorf("missing flags: --release=STRING or --schema-dir=STRING")
+	}
+	return nil
 }
 
 // resolve reads the desired schema the flags named.
@@ -120,7 +126,7 @@ func storageSchemaSourceRefusal(schemaDir, release, repo string) error {
 // repository, while a directory on disk is read as given. On the API path
 // resolving the dialect costs a round trip, so the release path pays for it and
 // the directory path does not.
-func (f *storageSchemaSourceFlags) resolve(ctx context.Context, dialect func() (schema.Dialect, error)) (*api.StorageSchemaSource, error) {
+func (f *storageSchemaSourceFlags) resolve(ctx context.Context, dialect func() (schema.Dialect, error), converging bool) (*api.StorageSchemaSource, error) {
 	if dir := strings.TrimSpace(f.SchemaDir); dir != "" {
 		return storageSchemaFromDirectory(dir)
 	}
@@ -136,7 +142,7 @@ func (f *storageSchemaSourceFlags) resolve(ctx context.Context, dialect func() (
 	if repo == "" {
 		repo = defaultStorageSchemaRepo
 	}
-	return storageSchemaFromRelease(ctx, repo, release, d)
+	return storageSchemaFromRelease(ctx, repo, release, d, converging)
 }
 
 // storageSchemaFromDirectory reads a release's schema files from a checkout.
@@ -237,7 +243,7 @@ const (
 // captured, at the same commit. A tag that does not exist, or a repository the
 // caller cannot read, is an error naming the tag — never an empty schema, which
 // would diff as "every storage table is surplus".
-func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect schema.Dialect) (*api.StorageSchemaSource, error) {
+func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect schema.Dialect, converging bool) (*api.StorageSchemaSource, error) {
 	directory, err := storageSchemaReleaseDirectory(dialect)
 	if err != nil {
 		return nil, err
@@ -249,9 +255,11 @@ func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect sch
 	ctx, cancel := context.WithTimeout(ctx, storageSchemaFetchTimeout)
 	defer cancel()
 
-	warnIfReleaseHostIsPlaintext()
+	if err := guardReleaseHostPlaintext(converging); err != nil {
+		return nil, err
+	}
 
-	client := &http.Client{CheckRedirect: refuseInsecureRedirect}
+	client := &http.Client{CheckRedirect: refuseInsecureRedirect(converging)}
 	listing, err := listReleaseSchemaFiles(ctx, client, repo, tag, directory)
 	if err != nil {
 		return nil, err
@@ -284,25 +292,39 @@ func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect sch
 // is what actually travels: net/http copies it onto the redirect request — and
 // drops it when the destination is a different host — before consulting this
 // policy, so its presence here is exactly the question of whether this hop
-// carries the token. A fetch with no token is left alone; an unauthenticated
-// public release has nothing to protect on the wire.
-func refuseInsecureRedirect(request *http.Request, via []*http.Request) error {
-	if len(via) >= maxStorageSchemaRedirects {
-		return fmt.Errorf("stopped after %d redirects fetching release schema files", maxStorageSchemaRedirects)
-	}
-	if request.Header.Get("Authorization") == "" {
-		// Nothing to leak on this hop, so it is followed. The schema still
-		// arrives over whatever channel the redirect chose, though, and the
-		// warning on the configured base URL cannot speak for a host the
-		// operator never named — so the downgrade says so here instead of
-		// passing silently.
-		warnPlaintextSchemaSource(request.URL)
+// carries the token.
+//
+// A hop with no token has nothing to protect on the wire, but it still decides
+// which channel the files arrive over, so it is held to the rule the
+// configured base URL was held to rather than left alone: a convergence
+// refuses a plaintext destination and a diff is warned about one. Guarding the
+// base URL alone would leave the policy in the hands of the remote end, which
+// can redirect an https base wherever it likes.
+func refuseInsecureRedirect(converging bool) func(*http.Request, []*http.Request) error {
+	return func(request *http.Request, via []*http.Request) error {
+		if len(via) >= maxStorageSchemaRedirects {
+			return fmt.Errorf("stopped after %d redirects fetching release schema files", maxStorageSchemaRedirects)
+		}
+		if request.Header.Get("Authorization") == "" {
+			// Nothing to leak on this hop, but the files still arrive over
+			// whatever channel the redirect chose, and the check on the
+			// configured base URL cannot speak for a host the operator never
+			// named. So the channel is held to the same rule here that the
+			// base URL was held to: a convergence refuses it, a diff is warned
+			// that its report is unverified.
+			if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
+				if converging {
+					return fmt.Errorf("refusing to converge a release redirected to %s://%s: %w; anything on the network path can change the schema files before they arrive, and a convergence runs whatever arrives against SchemaBot's own storage", request.URL.Scheme, request.URL.Host, err)
+				}
+				warnPlaintextSchemaSource(request.URL)
+			}
+			return nil
+		}
+		if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
+			return fmt.Errorf("refusing a redirect to %s://%s: %w; the redirect stays on the same host, so the token would follow it in plaintext", request.URL.Scheme, request.URL.Host, err)
+		}
 		return nil
 	}
-	if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
-		return fmt.Errorf("refusing a redirect to %s://%s: %w; the redirect stays on the same host, so the token would follow it in plaintext", request.URL.Scheme, request.URL.Host, err)
-	}
-	return nil
 }
 
 // maxStorageSchemaRedirects matches the ceiling net/http applies when a client
@@ -322,10 +344,10 @@ func storageSchemaReleaseDirectory(dialect schema.Dialect) (string, error) {
 	}
 }
 
-// warnIfReleaseHostIsPlaintext says so when the desired side of the diff is
-// about to be read over a channel anyone on the path can rewrite.
+// guardReleaseHostPlaintext handles a release read over a channel anyone on the
+// path can rewrite, and what it does depends on what the files are for.
 //
-// It warns rather than refuses. With no token there is nothing to leak, and a
+// A diff gets a warning. With no token there is nothing to leak, and a
 // plaintext mirror is a legitimate thing for an operator to point
 // $GITHUB_API_URL at; refusing would take away a working configuration to
 // protect against a tampered report. What the warning buys is that the report
@@ -333,29 +355,42 @@ func storageSchemaReleaseDirectory(dialect schema.Dialect) (string, error) {
 // describe work the release does not need, and nothing downstream can tell,
 // because the files parsed and diffed exactly as a real schema would.
 //
-// A convergence is a different matter and needs no warning here: apply refuses
-// --release and --schema-dir by construction (AV-9), so a binary only ever
-// converges the schema it embeds. Nothing fetched over this path can be
-// applied to a database.
+// A convergence is refused. The same rewrite that costs a plan its authority
+// costs a convergence the database: whatever DDL arrives is what runs against
+// SchemaBot's own storage, having parsed exactly as a real schema would, so no
+// gate downstream has anything to catch. The refusal costs an operator an https
+// mirror or a --schema-dir, and the loopback carve-out below means a mirror on
+// this machine still works.
 //
 // It asks GuardInsecureToken what counts as insecure rather than testing the
 // scheme itself, so "plaintext host" has one definition in the CLI — including
 // its loopback carve-out, which is right here for the same reason: a mirror on
 // the loopback interface has no network path for anything to sit on.
-func warnIfReleaseHostIsPlaintext() {
+func guardReleaseHostPlaintext(converging bool) error {
 	if storageSchemaReleaseToken() != "" {
-		// A token makes this a refusal instead, at the request that would
-		// carry it — see getReleaseContents.
-		return
+		// A token makes this a refusal on either path, at the request that
+		// would carry it, see getReleaseContents.
+		return nil
 	}
 	parsed, err := url.Parse(storageSchemaReleaseAPIBase())
 	if err != nil {
 		// An unparseable base is the fetch's problem to report, with the
 		// reason; a warning about a URL nothing could read would only add
 		// noise to the error that follows.
-		return
+		return nil
+	}
+	if cmdclient.GuardInsecureToken(parsed) == nil {
+		return nil
+	}
+	// A diff read over plaintext is reported as unverified, because a rewritten
+	// report costs an operator a wrong belief. A convergence runs whatever
+	// arrives against SchemaBot's own storage, so the same channel costs the
+	// database, and it is refused instead.
+	if converging {
+		return fmt.Errorf("refusing to converge a release read from %s over plaintext: anything on the network path can change the schema files before they arrive, and a convergence runs whatever arrives against SchemaBot's own storage. Point $GITHUB_API_URL at an https host, or use --schema-dir to converge a checkout, which needs no network at all", parsed.Scheme+"://"+parsed.Host)
 	}
 	warnPlaintextSchemaSource(parsed)
+	return nil
 }
 
 // warnPlaintextSchemaSource says once, for one URL, that the desired side of

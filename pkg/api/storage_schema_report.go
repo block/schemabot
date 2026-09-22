@@ -72,10 +72,52 @@ type StorageSchemaReport struct {
 	// actually run. It reflects the effective policy for the request — the
 	// storage config's allowance, or an explicit per-request opt-in.
 	DestructiveAllowed bool
+	// BootRemovalPolicy is what the next pod to start does to storage state its
+	// own schema does not declare.
+	//
+	// This is the deployment's standing policy and its dialect, never the
+	// request's opt-in: a caller permitting destructive statements moves
+	// DestructiveAllowed and leaves this alone, because a boot reads config
+	// and has never heard of the request. A dialect whose bootstrap is
+	// additive-only preserves the state whatever that deployment configured,
+	// since there a boot computes no removal to permit.
+	//
+	// It answers what becomes of state this convergence leaves behind, which
+	// DestructiveAllowed cannot: an operator converging a later release's
+	// schema ahead of the deploy is asking whether it survives until the
+	// deploy, and the answer belongs to the boots in between rather than to
+	// the command they ran. Unknown is one of the answers — see
+	// apitypes.BootRemovalUnknown — and it never collapses into "preserved".
+	BootRemovalPolicy apitypes.BootRemovalPolicy
 	// Manual lists changes that cannot run automatically, each naming the
 	// situation and the remediation. Any entry aborts convergence before a
 	// single statement executes, so an apply is refused while one is present.
 	Manual []StorageSchemaStatement
+	// ConvergenceInFlight reports that some instance held the storage bootstrap
+	// lock when the diff was taken — a boot converging, or another operator's
+	// apply. The statements above are what is outstanding, not what is idle:
+	// a statement a convergence is working on is not in the catalog the diff
+	// read until that convergence finishes with it, so work in progress looks
+	// exactly like work not started.
+	//
+	// Only true is a finding. False is the absence of evidence rather than a
+	// claim of idleness: the holder may have finished a moment later, or the
+	// probe may not have run at all.
+	ConvergenceInFlight bool
+}
+
+// logAttrs are the identifiers that say which storage database a log line is
+// about. A report is produced for an instance's own storage and for a data
+// plane's alike, so a line without them names no database at all.
+//
+// The DSN is deliberately not among them: it carries credentials, and the
+// database and host it points at are already here under their own keys.
+func (r *StorageSchemaReport) logAttrs() []any {
+	attrs := []any{"dialect", r.Dialect, "database", r.Database}
+	if r.Host != "" {
+		attrs = append(attrs, "host", r.Host)
+	}
+	return attrs
 }
 
 // Converged reports whether the storage schema needs nothing at all. A report
@@ -129,6 +171,9 @@ func (r *StorageSchemaReport) APIType() *apitypes.StorageSchemaReport {
 		Destructive:        storageSchemaStatementsAPIType(r.Destructive),
 		DestructiveAllowed: r.DestructiveAllowed,
 		Manual:             storageSchemaStatementsAPIType(r.Manual),
+
+		ConvergenceInFlight: r.ConvergenceInFlight,
+		BootRemovalPolicy:   r.BootRemovalPolicy,
 	}
 }
 

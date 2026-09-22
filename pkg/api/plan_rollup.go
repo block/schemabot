@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
@@ -81,8 +82,11 @@ type DeploymentRollupEntry struct {
 	Target       string
 
 	Class DeploymentClassification
-	Diff  tern.ChangeSetDiff
-	Err   error
+	// Blocked is informational beside drift classification. It does not affect
+	// Clean: apply admission separately refuses changes blocked by the target.
+	Blocked int
+	Diff    tern.ChangeSetDiff
+	Err     error
 
 	// PlanIdentifier names the stored plan this member will run, set when the
 	// member was planned on its own and its plan was persisted as a row of its
@@ -92,13 +96,22 @@ type DeploymentRollupEntry struct {
 	PlanIdentifier string
 }
 
-// PlanRollup aggregates every deployment's review-time classification for a
-// database. Clean is true only when every deployment matches the reviewed plan;
-// any divergence, error, or the primary baseline itself being unusable makes it
-// false so the review gate fails closed.
+// PlanRollup aggregates every rollout member's review-time classification for a
+// database. Clean means every member passed the contract it was classified
+// under: under PlanMirrored that each matches the reviewed plan, under
+// PlanIndependent that each produced a usable plan of its own. Any divergence,
+// error, or the primary baseline itself being unusable makes it false so the
+// review gate fails closed.
 type PlanRollup struct {
 	Entries []DeploymentRollupEntry
 	Clean   bool
+	// Planning is the contract the members were classified under, and decides
+	// what Clean means. Under PlanMirrored a clean rollup says every member
+	// would run the same plan. Under PlanIndependent it says every member
+	// produced a plan of its own, which are not expected to match — so a reader
+	// of the rollup cannot describe it without knowing which contract produced
+	// it.
+	Planning MemberPlanning
 }
 
 // RollupDeploymentDiffs classifies each rollout member's review-time diff
@@ -224,10 +237,17 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 				entry.Class = DeploymentMatch
 			}
 		}
+		// A blocked count is only as trustworthy as the plan it is read from. An
+		// errored entry's plan is the one the rollup just declared unusable, so
+		// it publishes no count rather than a precise-looking number a reviewer
+		// would read as a real refusal total.
+		if entry.Class != DeploymentErrored {
+			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
+		}
 		entries[i] = entry
 	}
 
-	return PlanRollup{Entries: entries, Clean: clean}, nil
+	return PlanRollup{Entries: entries, Clean: clean, Planning: planning}, nil
 }
 
 // rollupIndependentMembers classifies members that were each planned against
@@ -261,7 +281,30 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 				entry.Class = DeploymentPlanned
 			}
 		}
+		// Same rule as the mirrored path: an errored entry's plan is the one just
+		// declared unusable, so it publishes no count. The count matters more
+		// here than it does there. Mirrored members hold the same change set by
+		// construction, so the primary's count covers them all; independent
+		// members hold different change sets, so this is the only place a
+		// non-primary member's refused DDL can surface at review time.
+		if entry.Class != DeploymentErrored {
+			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
+		}
 		entries[i] = entry
 	}
-	return PlanRollup{Entries: entries, Clean: clean}
+	return PlanRollup{Entries: entries, Clean: clean, Planning: PlanIndependent}
+}
+
+// countBlockedChanges counts the table changes the target's engine will refuse
+// at apply. It walks the change set's authoritative representation so a
+// sharded namespace, which the plan carries both collapsed and per shard, is
+// counted once per shard the same way the drift comparison counts it.
+func countBlockedChanges(cs tern.ChangeSet) int {
+	blocked := 0
+	for _, table := range cs.AuthoritativeTableChanges() {
+		if table.GetExecutionMode() == engine.ExecutionModeBlocked {
+			blocked++
+		}
+	}
+	return blocked
 }

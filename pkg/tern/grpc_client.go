@@ -173,7 +173,30 @@ type Config struct {
 	// Logger is the base logger for drive-path logs. Defaults to
 	// slog.Default() when nil.
 	Logger *slog.Logger
+
+	// MaxRecvMsgBytes bounds a single response message. Zero or negative
+	// selects DefaultMaxRecvMsgBytes.
+	MaxRecvMsgBytes int
 }
+
+// DefaultMaxRecvMsgBytes bounds a single response from a Tern deployment.
+//
+// A pull response carries the canonical CREATE TABLE text for every table in
+// every namespace, so its size tracks the schema rather than the request: a
+// database with thousands of tables answers with megabytes. gRPC's own default
+// is 4 MiB, which is below what the larger schemas in a fleet produce, and the
+// resulting ResourceExhausted arrives only after the deployment has already
+// read the whole schema — the cost is paid on the target and then discarded,
+// and no retry can make the response smaller.
+//
+// It stays a ceiling rather than an invitation: the response is buffered in
+// memory, and a control plane serves every database it routes for, so an
+// unbounded limit would let one oversized schema exhaust it. The value clears
+// the widest schemas seen in practice with room to spare while keeping that
+// bound meaningful. A database that outgrows it is narrowed per namespace
+// rather than answered by raising this further, since the API server's write
+// timeout becomes the real limit well before memory does.
+const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 
 // retryServiceConfig enables client-side retries for idempotent RPCs.
 //
@@ -247,11 +270,17 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		return nil, fmt.Errorf("split host:port from address %s: %w", config.Address, err)
 	}
 
+	maxRecvMsgBytes := config.MaxRecvMsgBytes
+	if maxRecvMsgBytes <= 0 {
+		maxRecvMsgBytes = DefaultMaxRecvMsgBytes
+	}
+
 	conn, err := grpc.NewClient(
 		config.Address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)
@@ -2359,6 +2388,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			// No TargetShards: the VSchema is namespace-level, not per shard.
 			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 			GenerationOperationKeys: scope.generationOperationKeys(),
+			IgnoreTables:            plan.IgnoreTables(),
 		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
@@ -3183,6 +3213,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		TargetShards:            targetShards,
 		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 		GenerationOperationKeys: scope.generationOperationKeys(),
+		IgnoreTables:            plan.IgnoreTables(),
 	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
@@ -4142,6 +4173,8 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 			Shard:            sh.Shard,
 			DDL:              storedTask.DDL,
 			DDLAction:        storedTask.DDLAction,
+			ExecutionMode:    storedTask.ExecutionMode,
+			ModeReason:       storedTask.ModeReason,
 			State:            shardState,
 			RowsCopied:       sh.RowsCopied,
 			RowsTotal:        sh.RowsTotal,

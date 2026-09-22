@@ -147,6 +147,55 @@ func TestCompareChangeSets_ShardDriftCaughtDespiteCollapsedParity(t *testing.T) 
 	assert.Equal(t, "80-", diff.UnexpectedInCandidate[0].Shard)
 }
 
+// The authoritative walk yields each change once: per shard for a namespace the
+// shard rows carry, from the collapsed view for an unsharded namespace, and it
+// agrees with the number of changes the comparison counts in the same set.
+func TestChangeSet_AuthoritativeTableChanges(t *testing.T) {
+	orders := &ternv1.TableChange{
+		TableName:  "orders",
+		Ddl:        "ALTER TABLE `orders` ADD COLUMN `total` int",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		Namespace:  "unsharded",
+	}
+	cs := ChangeSet{
+		Changes: []*ternv1.SchemaChange{
+			{Namespace: "sharded", TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()}},
+			{Namespace: "unsharded", TableChanges: []*ternv1.TableChange{orders}},
+		},
+		Shards: []*ternv1.ShardPlan{
+			{Shard: "-80", Namespace: "sharded", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}},
+			{Shard: "80-", Namespace: "sharded", Changes: []*ternv1.TableChange{protoAlterUsersPhone()}},
+		},
+	}
+
+	got := cs.AuthoritativeTableChanges()
+	require.Len(t, got, 3, "two shard rows for the sharded namespace plus the unsharded change")
+	assert.Equal(t, protoAlterUsersEmail().Ddl, got[0].Ddl)
+	assert.Equal(t, protoAlterUsersPhone().Ddl, got[1].Ddl)
+	assert.Same(t, orders, got[2])
+
+	diff, err := CompareChangeSets(schema.DialectMySQL, cs, ChangeSet{})
+	require.NoError(t, err)
+	assert.Len(t, diff.MissingFromCandidate, len(got), "the walk and the comparison count the same changes")
+
+	// Nil rows are the comparison's failure to report; the walk skips them.
+	withNils := ChangeSet{Changes: append(cs.Changes, nil), Shards: append(cs.Shards, nil)}
+	assert.Equal(t, got, withNils.AuthoritativeTableChanges())
+}
+
+// A namespace with shard rows that carry nothing is read from its collapsed
+// view; the walk does not lose the change because empty shard rows exist.
+func TestChangeSet_AuthoritativeTableChangesEmptyShardRows(t *testing.T) {
+	cs := ChangeSet{
+		Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()}}},
+		Shards:  []*ternv1.ShardPlan{{Shard: "-80", Namespace: "testapp"}},
+	}
+
+	got := cs.AuthoritativeTableChanges()
+	require.Len(t, got, 1)
+	assert.Equal(t, protoAlterUsersEmail().Ddl, got[0].Ddl)
+}
+
 // A database mixing a sharded and an unsharded namespace compares each namespace
 // in its authoritative representation; the unsharded namespace is not dropped.
 func TestCompareChangeSets_MixedShardedAndUnsharded(t *testing.T) {
@@ -320,6 +369,45 @@ func TestCompareChangeSets_PostgresDialect(t *testing.T) {
 
 	_, err = CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.Error(t, err, "PostgreSQL DDL judged under the MySQL grammar must fail closed")
+}
+
+// Two PostgreSQL targets that map the same canonical namespace to differently
+// named physical schemas plan the same change with different schema
+// qualifiers in the DDL. The namespace is already the key, so the qualifier
+// is not drift; a real difference under the qualifiers still is.
+func TestCompareChangeSets_PostgresPhysicalSchemaQualifierIsNotDrift(t *testing.T) {
+	regionSet := func(physicalSchema, alterColumn string) ChangeSet {
+		q := `"` + physicalSchema + `".`
+		return ChangeSet{Changes: []*ternv1.SchemaChange{{
+			Namespace: "orders",
+			TableChanges: []*ternv1.TableChange{
+				{
+					TableName:  "carrier_config",
+					Ddl:        "ALTER TABLE " + q + "carrier_config ADD COLUMN " + alterColumn + " text",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+					Namespace:  "orders",
+				},
+				{
+					TableName: "shipment",
+					Ddl: "CREATE TABLE " + q + "shipment (id bigserial NOT NULL, tracking_code text, CONSTRAINT shipment_pkey PRIMARY KEY (id));\n" +
+						"CREATE INDEX idx_shipment_tracking_code ON " + q + "shipment USING btree (tracking_code)",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE,
+					Namespace:  "orders",
+				},
+			},
+		}}}
+	}
+
+	diff, err := CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "tracking_prefix"), regionSet("orders-region-b", "tracking_prefix"))
+	require.NoError(t, err)
+	assert.True(t, diff.Empty(), "the same change on differently named physical schemas must match: %+v", diff)
+
+	diff, err = CompareChangeSets(schema.DialectPostgres, regionSet("orders-region-a", "tracking_prefix"), regionSet("orders-region-b", "tracking_suffix"))
+	require.NoError(t, err)
+	require.Len(t, diff.MissingFromCandidate, 1, "a different column under a different qualifier must still diverge")
+	require.Len(t, diff.UnexpectedInCandidate, 1)
+	assert.Equal(t, "carrier_config", diff.MissingFromCandidate[0].Table)
+	assert.Equal(t, "carrier_config", diff.UnexpectedInCandidate[0].Table)
 }
 
 // A dialect with no registered parser gives the comparison no grammar to
