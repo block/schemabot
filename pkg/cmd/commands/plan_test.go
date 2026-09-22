@@ -198,6 +198,25 @@ func TestPlanFingerprint_DifferentPlans(t *testing.T) {
 	assert.NotEqual(t, fp1, fp2, "Expected different fingerprints for different plans")
 }
 
+func TestPlanFingerprint_IncludesShardOnlyStatements(t *testing.T) {
+	const baseDDL = "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	base := &apitypes.TableChangeResponse{Namespace: "commerce", TableName: "users", DDL: baseDDL, ChangeType: "ALTER"}
+	shardOnly := &apitypes.TableChangeResponse{Namespace: "commerce", TableName: "users", DDL: baseDDL + ", ADD INDEX idx_email (email)", ChangeType: "ALTER"}
+	plan := func(extra bool) *apitypes.PlanResponse {
+		changes := []*apitypes.TableChangeResponse{base}
+		if extra {
+			changes = append(changes, shardOnly)
+		}
+		return &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{Namespace: "commerce", TableChanges: []*apitypes.TableChangeResponse{base}}},
+			Shards:  []*apitypes.ShardPlanResponse{{Namespace: "commerce", Shard: "-80", Changes: changes}},
+		}
+	}
+
+	assert.Equal(t, planFingerprint(plan(false)), planFingerprint(plan(false)))
+	assert.NotEqual(t, planFingerprint(plan(false)), planFingerprint(plan(true)))
+}
+
 func TestPlanFingerprint_VSchemaOnlyPlans(t *testing.T) {
 	vschemaOnly := func(diff string) *apitypes.PlanResponse {
 		return &apitypes.PlanResponse{
@@ -448,6 +467,8 @@ func TestWriteSQLChanges(t *testing.T) {
 	assert.Contains(t, plainOutput, "DROP TABLE", "Expected DROP TABLE DDL")
 }
 
+// The plan summary counts tables, not statements: the rows here name distinct
+// tables so each one is a table to create, alter, or drop.
 func TestWritePlanSummary(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -457,55 +478,63 @@ func TestWritePlanSummary(t *testing.T) {
 		{
 			name: "single create",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
+				{ChangeType: "CREATE", TableName: "users"},
 			},
 			expected: "1 table to create",
 		},
 		{
 			name: "multiple creates",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
-				{ChangeType: "CREATE"},
+				{ChangeType: "CREATE", TableName: "users"},
+				{ChangeType: "CREATE", TableName: "orders"},
 			},
 			expected: "2 tables to create",
 		},
 		{
 			name: "single alter",
 			changes: []templates.DDLChange{
-				{ChangeType: "ALTER"},
+				{ChangeType: "ALTER", TableName: "users"},
 			},
 			expected: "1 table to alter",
 		},
 		{
 			name: "multiple alters",
 			changes: []templates.DDLChange{
-				{ChangeType: "ALTER"},
-				{ChangeType: "ALTER"},
+				{ChangeType: "ALTER", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "orders"},
 			},
 			expected: "2 tables to alter",
 		},
 		{
+			name: "repeated alters on one table",
+			changes: []templates.DDLChange{
+				{ChangeType: "ALTER", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "users"},
+			},
+			expected: "1 table to alter",
+		},
+		{
 			name: "single drop",
 			changes: []templates.DDLChange{
-				{ChangeType: "DROP"},
+				{ChangeType: "DROP", TableName: "legacy"},
 			},
 			expected: "1 table to drop",
 		},
 		{
 			name: "multiple drops",
 			changes: []templates.DDLChange{
-				{ChangeType: "DROP"},
-				{ChangeType: "DROP"},
-				{ChangeType: "DROP"},
+				{ChangeType: "DROP", TableName: "legacy"},
+				{ChangeType: "DROP", TableName: "archive"},
+				{ChangeType: "DROP", TableName: "staging_copy"},
 			},
 			expected: "3 tables to drop",
 		},
 		{
 			name: "mixed changes",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
-				{ChangeType: "ALTER"},
-				{ChangeType: "DROP"},
+				{ChangeType: "CREATE", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "orders"},
+				{ChangeType: "DROP", TableName: "legacy"},
 			},
 			expected: "1 table to create, 1 table to alter, 1 table to drop",
 		},

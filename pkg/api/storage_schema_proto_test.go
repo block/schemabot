@@ -6,6 +6,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -37,6 +39,8 @@ func TestStorageSchemaReport_ProtoRoundTrip(t *testing.T) {
 			DDL:       `ALTER TABLE "checks" ADD COLUMN "head_sha" varchar(64) NOT NULL`,
 			Reason:    "column is NOT NULL without a DEFAULT",
 		}},
+		ConvergenceInFlight: true,
+		BootRemovalPolicy:   apitypes.BootRemovalRemoves,
 	}
 
 	wire := StorageSchemaReportProto(report)
@@ -64,10 +68,48 @@ func TestStorageSchemaReport_ProtoRoundTrip(t *testing.T) {
 	require.Len(t, wire.GetManual(), 1)
 	assert.Equal(t, "checks", wire.GetManual()[0].GetTable())
 	assert.Equal(t, "column is NOT NULL without a DEFAULT", wire.GetManual()[0].GetReason())
+	assert.True(t, wire.GetConvergenceInFlight(),
+		"a control plane that dropped this would render a mid-convergence database as an idle one")
+	assert.Equal(t, ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_REMOVES, wire.GetBootRemovalPolicy(),
+		"a control plane that dropped this would tell an operator their pre-applied state survives a fleet that drops it")
 
 	round := StorageSchemaReportFromProto(wire)
 	require.NotNil(t, round)
 	assert.Equal(t, report, round)
+}
+
+// A data plane that does not set the boot removal policy is reporting that it
+// could not say, and the control plane must not read that as preservation.
+//
+// An instance older than the field leaves it at the wire's zero value while
+// still answering everything else, including destructive_allowed. Resolving
+// that silence into "your fleet keeps what you pre-apply" is how an operator on
+// a deployment that drops it is told to go ahead.
+func TestStorageSchemaReport_AnUnsetBootPolicyStaysUnknown(t *testing.T) {
+	older := &ternv1.StorageSchemaReport{
+		Dialect:            "mysql",
+		Database:           "schemabot",
+		SchemaSource:       "release v0.1.68",
+		DestructiveAllowed: true,
+	}
+
+	report := StorageSchemaReportFromProto(older)
+	require.NotNil(t, report)
+	assert.Equal(t, apitypes.BootRemovalUnknown, report.BootRemovalPolicy)
+	assert.NotEqual(t, apitypes.BootRemovalPreserves, report.BootRemovalPolicy,
+		"an absent answer is not the reassuring one")
+	assert.True(t, report.DestructiveAllowed, "the fields an older release does set still arrive")
+	assert.Equal(t, apitypes.BootRemovalUnknown, report.APIType().BootRemovalPolicy,
+		"and the unknown survives the hop to the shape the CLI reads")
+}
+
+// A policy this binary has no name for is unknown, not preservation. The
+// answering side is newer and has a case this one cannot act on, which is the
+// same position as being told nothing.
+func TestStorageSchemaReport_AnUnrecognizedBootPolicyStaysUnknown(t *testing.T) {
+	assert.Equal(t, apitypes.BootRemovalUnknown, bootRemovalPolicyFromProto(ternv1.BootRemovalPolicy(99)))
+	assert.Equal(t, ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_UNSPECIFIED,
+		bootRemovalPolicyProto(apitypes.BootRemovalPolicy("a policy from a later release")))
 }
 
 // A nil wire report converts to a nil report rather than to an empty one. An

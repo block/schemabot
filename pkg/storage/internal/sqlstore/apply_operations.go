@@ -729,7 +729,7 @@ func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operatio
 	if err != nil {
 		return err
 	}
-	args := append([]any{encoded, operationID}, guard.args()...)
+	args := append([]any{nullJSON(encoded), operationID}, guard.args()...)
 	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{{Column: "progress_metadata", Expr: "?"}})
 	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {

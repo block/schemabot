@@ -133,6 +133,13 @@ type Handler struct {
 	durableWebhookCancel        context.CancelFunc
 	durableWebhookWake          chan struct{}
 	durableWebhookWg            sync.WaitGroup
+	// durableWebhookClaims holds the log identity of every delivery this
+	// process's drivers currently have claimed, so a shutdown drain that
+	// expires can name the inbox rows it walked away from rather than only
+	// counting them. It has a lock of its own because the drivers write it on
+	// every claim, while durableWebhookMu guards the dispatch lifecycle.
+	durableWebhookClaimMu sync.Mutex
+	durableWebhookClaims  map[string][]any
 	// durableWebhookProcessOverride is a test seam that replaces
 	// processDurableWebhookEvent so driver finish-path behavior (for example
 	// refusing to complete a delivery after lease loss) can be exercised

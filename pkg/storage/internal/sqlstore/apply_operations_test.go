@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -497,6 +498,60 @@ func TestApplyOperationStore_EngineResumeState(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ctx-456", retrieved.MigrationContext)
 	assert.JSONEq(t, updated.Metadata, retrieved.Metadata)
+}
+
+// The production MySQL pool interpolates parameters client-side, so a JSON
+// column write only succeeds when the driver renders the argument as a
+// character-set string literal rather than a _binary one. This test drives the
+// progress-metadata write through that connection shape; the shared test pool
+// uses server-side prepared statements and cannot observe the difference.
+func TestApplyOperationStore_SaveProgressMetadata_InterpolatedParams(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newInterpolatedParamsStore(t)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	apply := createTestApply(t, store, lock, "apply_op_progress_interpolated", 1)
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-a",
+		Target:     "payments",
+	})
+	require.NoError(t, err)
+
+	progressMetadata := map[string]string{
+		"phase":     "copying",
+		"step":      "2",
+		"statement": "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)",
+	}
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(ctx, operationID, progressMetadata))
+
+	operation, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, operation)
+	stored, err := operation.ParseProgressMetadata()
+	require.NoError(t, err)
+	assert.Equal(t, progressMetadata, stored)
+}
+
+// newInterpolatedParamsStore opens a store whose Go MySQL driver interpolates
+// parameters client-side, matching how mysqlconn configures the production
+// pool, so JSON-column writes are exercised under that argument rendering.
+func newInterpolatedParamsStore(t *testing.T) *Storage {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testDSNChangedRows)
+	require.NoError(t, err)
+	cfg.InterpolateParams = true
+	dsn := cfg.FormatDSN()
+	require.Contains(t, dsn, "interpolateParams=true",
+		"the store under test must interpolate client-side, or it cannot observe the binding")
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err)
+	require.NoError(t, db.PingContext(t.Context()))
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	return NewMySQL(db)
 }
 
 func TestApplyOperationStore_EngineResumeStateMissingOperation(t *testing.T) {

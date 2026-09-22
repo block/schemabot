@@ -27,6 +27,12 @@ type Config struct {
 	// Default: "bigint,binary,varbinary"
 	AllowedPKTypes string
 
+	// AllowedPostgresPKTypes are the allowed primary key column types for the
+	// PostgreSQL schema audit. Serial pseudo-types are judged by the integer
+	// type they store, so bigserial passes as bigint.
+	// Default: "bigint,uuid"
+	AllowedPostgresPKTypes string
+
 	// AllowedCharsets are the allowed character sets.
 	// Default: "utf8mb4,binary"
 	AllowedCharsets string
@@ -38,10 +44,11 @@ type Config struct {
 // DefaultConfig returns the default linting configuration.
 func DefaultConfig() Config {
 	return Config{
-		AllowUnsafe:     false,
-		AllowedPKTypes:  "bigint,binary,varbinary",
-		AllowedCharsets: "utf8mb4,binary",
-		IgnoreTables:    []string{"schema_version"},
+		AllowUnsafe:            false,
+		AllowedPKTypes:         "bigint,binary,varbinary",
+		AllowedPostgresPKTypes: "bigint,uuid",
+		AllowedCharsets:        "utf8mb4,binary",
+		IgnoreTables:           []string{"schema_version"},
 	}
 }
 

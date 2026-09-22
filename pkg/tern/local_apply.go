@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -909,6 +910,13 @@ func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
 }
 
 func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+	// Admission normally refuses this work first. The admitting deployment's
+	// verdict also travels on each row so a drive loading work from a peer or
+	// prior build fails closed without relying on the plan it happens to hold.
+	if err := blockedTaskError(tasks); err != nil {
+		c.refuseBlockedTasks(ctx, apply, tasks, err)
+		return
+	}
 	if c.usesGroupedApply(apply, options) {
 		c.runWithRecovery(ctx, apply, tasks, func() {
 			c.executeGroupedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
@@ -919,6 +927,53 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 	c.runWithRecovery(ctx, apply, tasks, func() {
 		c.executeApplySequential(ctx, apply, tasks, plan, options)
 	})
+}
+
+// refuseBlockedTasks fails a fresh drive whose task rows carry a blocked
+// verdict, then settles what the now-terminal apply owes: the pending control
+// requests a failed apply moots, and the observer that posts the terminal
+// summary. Nothing later re-claims a failed apply to do either. A
+// multi-operation drive owns only its operation, so there the operator's
+// projection settles the parent and posts the summary instead; failApplyWithTasks
+// already logged that handoff. A drive cancelled before the failure was
+// recorded leaves the apply non-terminal for another driver to claim, so it
+// owes nothing here.
+func (c *LocalClient) refuseBlockedTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, refusal error) {
+	c.failApplyWithTasks(ctx, apply, tasks, refusal.Error())
+	if suppressParentApplyWrites(ctx) {
+		return
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		return
+	}
+	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		c.logger.Warn("failed to settle pending control requests after refusing blocked task rows",
+			append(apply.LogAttrs(), "error", err)...)
+		return
+	}
+	c.notifyTerminalObserver(apply, tasks)
+}
+
+// blockedTaskError returns the operator-facing refusal for a task row the
+// admitting deployment marked blocked. It is phrased like the whole-plan
+// refusal so every admission path gives the same remedy.
+func blockedTaskError(tasks []*storage.Task) error {
+	for _, task := range tasks {
+		if task == nil || !task.EngineBlocked() {
+			continue
+		}
+		reason := task.ModeReason
+		if reason == "" {
+			reason = "the engine refuses this statement"
+		}
+		// Independent causes are listed one per line so an operator fixing the
+		// first is not surprised by the second on the next attempt.
+		if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+			return fmt.Errorf("stored task %s contains a blocked change for table %q:\n- %s", task.TaskIdentifier, task.TableName, strings.Join(causes, "\n- "))
+		}
+		return fmt.Errorf("stored task %s contains a blocked change for table %q: %s", task.TaskIdentifier, task.TableName, reason)
+	}
+	return nil
 }
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with

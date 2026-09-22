@@ -266,6 +266,45 @@ func TestPlans(t *testing.T, h Harness) {
 		assert.Equal(t, "changing vindex user_idx type re-computes keyspace ids", changes[1].Reason)
 	})
 
+	t.Run("RoundTripsIgnoreTables", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// The tables the plan's ignore_tables config withheld are absent from
+		// the namespace's captured files, so a re-plan that did not know about
+		// them would propose dropping them. The record must survive the
+		// round-trip for a rollback, a resume, or a member's drift check to be
+		// asked to withhold the same entries.
+		plan := &storage.Plan{
+			PlanIdentifier: "plan_ignore_tables",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {
+					Tables: []storage.TableChange{{Namespace: "commerce", Table: "users", Operation: "alter"}},
+				},
+				"billing": {
+					Tables: []storage.TableChange{{Namespace: "billing", Table: "invoices", Operation: "alter"}},
+				},
+			},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		}
+		plan.RecordIgnoreTables([]string{"legacy_audit_log", "flyway_schema_history"})
+		_, err := store.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_ignore_tables")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.Contains(t, got.Namespaces, "commerce")
+		assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, got.Namespaces["commerce"].IgnoreTables)
+		assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, got.IgnoreTables(),
+			"the re-plan reads the union across namespaces")
+	})
+
 	t.Run("EmptyPlanDataRoundTripsAsAbsent", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

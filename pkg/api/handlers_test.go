@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1916,6 +1917,51 @@ func TestExecutePullSchemaLintsPulledTables(t *testing.T) {
 	assert.Contains(t, string(cleanJSON), `"lint":[]`)
 }
 
+// A PostgreSQL pull with lint runs the PostgreSQL schema audit over each
+// rendered table — CREATE TABLE plus its CREATE INDEX statements — and reports
+// the shape rules that have a PostgreSQL analog: primary key presence and
+// type, float columns, and table name case.
+func TestExecutePullSchemaLintsPostgresNamespaces(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "ledger",
+			Type:        storage.DatabaseTypePostgres,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"public": {Tables: map[string]string{
+					"orders": "CREATE TABLE orders (\n    id integer NOT NULL,\n    customer_id bigint NOT NULL,\n    CONSTRAINT orders_pkey PRIMARY KEY (id)\n);\n\nCREATE INDEX orders_customer_id_idx ON orders (customer_id);\n",
+					"events": "CREATE TABLE events (\n    occurred_at timestamp with time zone NOT NULL,\n    weight real\n);\n",
+				}},
+				"billing": {Tables: map[string]string{
+					"invoices": "CREATE TABLE invoices (\n    id bigint NOT NULL,\n    total numeric(12,2) NOT NULL,\n    CONSTRAINT invoices_pkey PRIMARY KEY (id)\n);\n",
+				}},
+			},
+			TableCount: 3,
+		},
+	}
+	svc := newTypeVocabularyService(t, &mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, mockClient, "ledger", storage.DatabaseTypePostgres, "primary")
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "ledger",
+		Environment: "production",
+		Type:        storage.DatabaseTypePostgres,
+		Lint:        true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, []*apitypes.LintViolationResponse{
+		{Table: "events", Linter: "primary_key", Severity: "warning", Message: "No primary key defined"},
+		{Table: "events", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "events" uses "real" data type`},
+		{Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "orders" uses "integer"; allowed types: bigint, uuid`},
+	}, resp.Namespaces["public"].Lint)
+	require.NotNil(t, resp.Namespaces["billing"].Lint)
+	assert.Empty(t, resp.Namespaces["billing"].Lint)
+}
+
 // Every pulled table entry must be a CREATE TABLE statement: the linters
 // silently pass over other statement kinds, so a namespace containing one
 // would produce a partial audit. The whole request fails instead — even when
@@ -2000,10 +2046,26 @@ func TestPullSchemaHandlerRejectsLintFailuresAsBadRequest(t *testing.T) {
 			wantBody: "expected CREATE TABLE",
 		},
 		{
-			name:         "unsupported dialect",
+			name:         "non-CREATE PostgreSQL table entry",
 			databaseType: storage.DatabaseTypePostgres,
+			client: &mockTernClient{
+				pullSchemaResp: &ternv1.PullSchemaResponse{
+					Database:    "orders",
+					Type:        storage.DatabaseTypePostgres,
+					Environment: "production",
+					Namespaces: map[string]*ternv1.PulledNamespace{
+						"public": {Tables: map[string]string{"users": "ALTER TABLE users ADD COLUMN note text;\n"}},
+					},
+					TableCount: 1,
+				},
+			},
+			wantBody: "expected CREATE TABLE",
+		},
+		{
+			name:         "dialect without a schema audit",
+			databaseType: "cockroach",
 			client:       &mockTernClient{},
-			wantBody:     "schema linting on pull is not supported for postgres databases",
+			wantBody:     "schema linting on pull is not supported for cockroach databases",
 		},
 	}
 	for _, tt := range tests {
@@ -2076,15 +2138,16 @@ func TestExecutePullSchemaLintOffByDefault(t *testing.T) {
 	assert.Nil(t, resp.Namespaces["orders"].Lint)
 }
 
-// The schema linters parse MySQL-family DDL only, so a lint request against
-// any other dialect fails closed before the pull is dispatched — silently
-// returning zero violations would read as a clean audit.
+// The schema audits cover the MySQL family and PostgreSQL. A lint request
+// against a database of any other configured type fails closed before the
+// pull is dispatched — silently returning zero violations would read as a
+// clean audit.
 func TestExecutePullSchemaRejectsLintForUnsupportedDialect(t *testing.T) {
 	mockClient := &mockTernClient{}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"ledger": {
-				Type: storage.DatabaseTypePostgres,
+				Type: "cockroach",
 				Environments: map[string]EnvironmentConfig{
 					"production": {Target: "ledger-production", Deployment: "primary"},
 				},
@@ -2110,7 +2173,7 @@ func TestExecutePullSchemaRejectsLintForUnsupportedDialect(t *testing.T) {
 
 	var lintDialectErr *unsupportedLintDialectError
 	require.ErrorAs(t, err, &lintDialectErr)
-	assert.Equal(t, storage.DatabaseTypePostgres, lintDialectErr.DatabaseType)
+	assert.Equal(t, "cockroach", lintDialectErr.DatabaseType)
 	assert.Nil(t, mockClient.pullSchemaReq)
 }
 
@@ -4124,6 +4187,38 @@ func TestExecuteApplyRejectsBlockedStoredPlan(t *testing.T) {
 	assert.Zero(t, applyID)
 	assert.Contains(t, err.Error(), "blocked change")
 	assert.Contains(t, err.Error(), "cannot be executed safely as written")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
+func TestExecuteApplyListsIndependentBlockedCauses(t *testing.T) {
+	plan := executeApplyTestPlan()
+	change := &plan.Namespaces["testdb"].Tables[0]
+	change.ExecutionMode = engine.ExecutionModeBlocked
+	change.ModeReason = engine.JoinBlockedCauses([]string{
+		"planner requires a rewrite; choose a supported statement",
+		"table exceeds the native-safe size ceiling; use an online path",
+	})
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), ":\n- planner requires a rewrite; choose a supported statement\n- table exceeds the native-safe size ceiling; use an online path")
 	assert.Nil(t, applies.apply)
 	assert.Empty(t, tasks.tasks)
 }

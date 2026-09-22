@@ -170,7 +170,12 @@ const blockedSizeUnknownReason = "; direct execution is enabled but the table's 
 // The above-bound reason names only the configured limit, not the measured
 // count, so identical verdicts on different shards collapse into one row in
 // PR-facing summaries.
+//
+// The refusal quotes identifiers the schema author declared, so it is
+// neutralized here, where every mode reason this engine composes starts, and
+// decodes as the one cause the engine issued.
 func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, policy directPolicy, database, tableName, refusalReason string) refusedModeDecision {
+	refusalReason = engine.SanitizeBlockedCause(refusalReason)
 	if !policy.Enabled {
 		return refusedModeDecision{
 			mode:       engine.ExecutionModeBlocked,

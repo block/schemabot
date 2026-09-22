@@ -315,6 +315,15 @@ type PlanRequest struct {
 	// and the re-plan an apply runs predicts the shape it is actually about to
 	// use.
 	GroupedExecution bool
+
+	// IgnoreTables lists the live tables the repository's ignore_tables config
+	// withholds from the planner, so a table no schema file declares is not
+	// proposed for DROP TABLE. Entries are matched exactly and case-sensitively
+	// against the target's own catalog, in every namespace the plan covers.
+	// Every engine honors the list, discloses what it actually withheld through
+	// ExemptTables, and refuses a table the config withholds that a schema file
+	// also declares (see IgnoredTables).
+	IgnoreTables []string
 }
 
 // PlanResult contains the computed schema change plan.
@@ -494,6 +503,63 @@ const (
 	// runs, and it is not revertible.
 	ExecutionModeDirect = "direct"
 )
+
+// blockedCauseSeparator separates independent reasons for a blocked verdict.
+// The double vertical line is readable in raw text, unlike a control character,
+// and is unlikely to occur in natural refusal prose. It is also distinct from
+// the semicolon separator used for clauses within one reason and survives the
+// reason sanitizers used by rendering surfaces.
+const blockedCauseSeparator = " ‖ "
+
+// blockedCauseSeparatorRune is the character that makes the separator
+// distinctive. Its presence anywhere in a cause is what would let the cause
+// masquerade as several, so neutralization targets the rune, not only the
+// space-padded separator.
+const blockedCauseSeparatorRune = "‖"
+
+// SanitizeBlockedCause makes one cause safe to carry in ModeReason by
+// replacing the reserved separator character. Cause text embeds identifiers
+// from the planner and the target database, which a schema author controls,
+// so without this a table named after the separator would decode as extra
+// causes and could forge a refusal the engine never issued. Engines call this
+// on every reason they compose; JoinBlockedCauses also applies it, so a cause
+// reaching BlockedCauses is exactly one cause.
+func SanitizeBlockedCause(cause string) string {
+	return strings.ReplaceAll(cause, blockedCauseSeparatorRune, "//")
+}
+
+// JoinBlockedCauses encodes independent blocked causes in ModeReason. Each
+// cause is sanitized so it decodes as the single cause it was given as.
+func JoinBlockedCauses(causes []string) string {
+	clean := make([]string, 0, len(causes))
+	for _, cause := range causes {
+		if cause = strings.TrimSpace(SanitizeBlockedCause(cause)); cause != "" {
+			clean = append(clean, cause)
+		}
+	}
+	return strings.Join(clean, blockedCauseSeparator)
+}
+
+// BlockedCauses decodes the independent causes carried by ModeReason. The
+// separator is reserved: producers neutralize it with SanitizeBlockedCause
+// before a cause enters ModeReason, so each decoded element is one cause.
+func BlockedCauses(reason string) []string {
+	if strings.TrimSpace(reason) == "" {
+		return nil
+	}
+	return splitNonEmptyTrimmed(reason, blockedCauseSeparator)
+}
+
+func splitNonEmptyTrimmed(value, separator string) []string {
+	parts := strings.Split(value, separator)
+	clean := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			clean = append(clean, part)
+		}
+	}
+	return clean
+}
 
 // CopyDisposition is what applying a plan will do with work an earlier schema
 // change already did on the target and left behind — for engines that copy a

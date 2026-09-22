@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -27,6 +28,9 @@ func StorageSchemaReportProto(r *StorageSchemaReport) *ternv1.StorageSchemaRepor
 		Destructive:        storageSchemaStatementsProto(r.Destructive),
 		DestructiveAllowed: r.DestructiveAllowed,
 		Manual:             storageSchemaStatementsProto(r.Manual),
+
+		ConvergenceInFlight: r.ConvergenceInFlight,
+		BootRemovalPolicy:   bootRemovalPolicyProto(r.BootRemovalPolicy),
 	}
 }
 
@@ -49,7 +53,42 @@ func StorageSchemaReportFromProto(p *ternv1.StorageSchemaReport) *StorageSchemaR
 		Destructive:        storageSchemaStatementsFromProto(p.GetDestructive()),
 		DestructiveAllowed: p.GetDestructiveAllowed(),
 		Manual:             storageSchemaStatementsFromProto(p.GetManual()),
+
+		ConvergenceInFlight: p.GetConvergenceInFlight(),
+		BootRemovalPolicy:   bootRemovalPolicyFromProto(p.GetBootRemovalPolicy()),
 	}
+}
+
+// bootRemovalPolicyProto and bootRemovalPolicyFromProto carry what a boot does
+// to surplus storage state across the wire.
+//
+// Both map an unrecognized value to unknown rather than to preservation. A data
+// plane older than the field leaves it at the zero value, and a newer one may
+// send a policy this binary has no name for; in both cases the honest answer is
+// that this side could not be told, and the reassuring answer is the one that
+// gets an operator to pre-apply storage the next pod will drop.
+func bootRemovalPolicyProto(policy apitypes.BootRemovalPolicy) ternv1.BootRemovalPolicy {
+	switch policy {
+	case apitypes.BootRemovalPreserves:
+		return ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_PRESERVES
+	case apitypes.BootRemovalRemoves:
+		return ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_REMOVES
+	case apitypes.BootRemovalUnknown:
+		return ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_UNSPECIFIED
+	}
+	return ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_UNSPECIFIED
+}
+
+func bootRemovalPolicyFromProto(policy ternv1.BootRemovalPolicy) apitypes.BootRemovalPolicy {
+	switch policy {
+	case ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_PRESERVES:
+		return apitypes.BootRemovalPreserves
+	case ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_REMOVES:
+		return apitypes.BootRemovalRemoves
+	case ternv1.BootRemovalPolicy_BOOT_REMOVAL_POLICY_UNSPECIFIED:
+		return apitypes.BootRemovalUnknown
+	}
+	return apitypes.BootRemovalUnknown
 }
 
 func storageSchemaStatementsProto(statements []StorageSchemaStatement) []*ternv1.StorageSchemaStatement {

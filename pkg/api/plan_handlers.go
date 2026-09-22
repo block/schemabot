@@ -53,6 +53,13 @@ type PlanRequest struct {
 	// environment. Forwarded to the data plane so it can refuse engine shapes
 	// that cannot honor the exclusion.
 	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
+	// IgnoreTables lists the live tables the config's ignore_tables withholds
+	// from the planner, so a table no schema file declares is not proposed for
+	// DROP TABLE. Unlike ignored namespaces the exclusion cannot be expressed
+	// by leaving files out of the request — the tables are on the target, not
+	// in the repository — so the data plane applies it and reports what it
+	// actually withheld through exempt_tables on the response.
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
 
 	// SourceTrusted is set by the GitHub webhook path after SchemaBot has
 	// discovered the PR source itself. It is deliberately not JSON-decodable:
@@ -75,9 +82,8 @@ func (e *unsupportedPullSchemaError) Error() string {
 }
 
 // unsupportedLintDialectError reports a pull request that asked for linting on
-// a database whose dialect the schema linters cannot parse. Failing the
-// request is deliberate: silently returning zero violations would read as a
-// clean audit.
+// a database whose dialect has no schema-shape audit. Failing the request is
+// deliberate: silently returning zero violations would read as a clean audit.
 type unsupportedLintDialectError struct {
 	DatabaseType string
 }
@@ -285,13 +291,14 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
 	}
-	if req.Lint && schema.DialectForDatabaseType(resolvedTarget.DatabaseType) != schema.DialectMySQL {
+	dialect := schema.DialectForDatabaseType(resolvedTarget.DatabaseType)
+	if req.Lint && !pullLintSupported(dialect) {
 		lintErr := &unsupportedLintDialectError{DatabaseType: resolvedTarget.DatabaseType}
 		span.RecordError(lintErr)
 		span.SetStatus(otelcodes.Error, "lint dialect unsupported")
 		return nil, lintErr
 	}
-	namespaces, err := pullNamespaces(schema.DialectForDatabaseType(resolvedTarget.DatabaseType), req.Namespaces)
+	namespaces, err := pullNamespaces(dialect, req.Namespaces)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
@@ -396,13 +403,20 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		httpResp.App = dbConfig.App
 	}
 	if req.Lint {
-		if err := lintPulledNamespaces(httpResp); err != nil {
+		if err := lintPulledNamespaces(httpResp, dialect); err != nil {
 			span.RecordError(err)
 			span.SetStatus(otelcodes.Error, "lint pulled schema")
 			return nil, err
 		}
 	}
 	return httpResp, nil
+}
+
+// pullLintSupported reports whether a dialect has a schema-shape audit for
+// pulled tables: Spirit's linters for the MySQL family, the PostgreSQL audit
+// in pkg/lint for PostgreSQL.
+func pullLintSupported(dialect schema.Dialect) bool {
+	return dialect == schema.DialectMySQL || dialect == schema.DialectPostgres
 }
 
 // lintPulledNamespaces runs the schema-shape linters (primary key types,
@@ -413,35 +427,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 // a clean pull audit says the existing schema is well-shaped, not that any
 // particular change to it is safe. Results are sorted for a stable response
 // body regardless of table iteration order.
-func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
+func lintPulledNamespaces(resp *apitypes.PullSchemaResponse, dialect schema.Dialect) error {
 	linter := lint.New()
 	for name, ns := range resp.Namespaces {
-		// Every pulled table entry must be a CREATE TABLE statement. The
-		// linters silently pass over other statement kinds, so an entry of
-		// another kind would go unlinted and turn the audit into a partial
-		// result — fail the request instead.
-		for tableName, tableDDL := range ns.Tables {
-			stmtType, _, err := ddl.ClassifyStatement(tableDDL)
-			if err != nil {
-				return &unlintablePulledTableError{
-					Database:  resp.Database,
-					Namespace: name,
-					Table:     tableName,
-					Detail:    fmt.Sprintf("cannot be classified: %v", err),
-				}
-			}
-			if stmtType != ddl.StatementCreateTable {
-				return &unlintablePulledTableError{
-					Database:  resp.Database,
-					Namespace: name,
-					Table:     tableName,
-					Detail:    fmt.Sprintf("is a %s statement, expected CREATE TABLE", stmtType),
-				}
-			}
-		}
-		results, err := linter.LintSchema(ns.Tables)
+		results, err := lintPulledTables(linter, dialect, resp.Database, name, ns.Tables)
 		if err != nil {
-			return fmt.Errorf("lint pulled schema for database %q namespace %q: %w", resp.Database, name, err)
+			return err
 		}
 		violations := make([]*apitypes.LintViolationResponse, 0, len(results))
 		for _, r := range results {
@@ -468,6 +459,58 @@ func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
 		ns.Lint = violations
 	}
 	return nil
+}
+
+// lintPulledTables audits one namespace's tables with the dialect's linter.
+// Every pulled table entry must be a table definition the audit covers in
+// full; an entry of another kind would go unlinted and turn the audit into a
+// partial result, so it fails the request as an unlintablePulledTableError.
+func lintPulledTables(linter *lint.Linter, dialect schema.Dialect, database, namespace string, tables map[string]string) ([]lint.Result, error) {
+	switch dialect {
+	case schema.DialectPostgres:
+		results, err := linter.LintPostgresSchema(tables)
+		if unlintable, ok := errors.AsType[*lint.UnlintableTableError](err); ok {
+			return nil, &unlintablePulledTableError{
+				Database:  database,
+				Namespace: namespace,
+				Table:     unlintable.Table,
+				Detail:    unlintable.Detail,
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lint pulled schema for database %q namespace %q: %w", database, namespace, err)
+		}
+		return results, nil
+	case schema.DialectMySQL:
+		// Spirit's linters silently pass over statement kinds other than
+		// CREATE TABLE, so the kind is checked up front.
+		for tableName, tableDDL := range tables {
+			stmtType, _, err := ddl.ClassifyStatement(tableDDL)
+			if err != nil {
+				return nil, &unlintablePulledTableError{
+					Database:  database,
+					Namespace: namespace,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("cannot be classified: %v", err),
+				}
+			}
+			if stmtType != ddl.StatementCreateTable {
+				return nil, &unlintablePulledTableError{
+					Database:  database,
+					Namespace: namespace,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("is a %s statement, expected CREATE TABLE", stmtType),
+				}
+			}
+		}
+		results, err := linter.LintSchema(tables)
+		if err != nil {
+			return nil, fmt.Errorf("lint pulled schema for database %q namespace %q: %w", database, namespace, err)
+		}
+		return results, nil
+	default:
+		return nil, fmt.Errorf("lint pulled schema for database %q namespace %q: no schema audit for dialect %q", database, namespace, dialect)
+	}
 }
 
 func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, error) {
@@ -729,6 +772,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
+		IgnoreTables:      req.IgnoreTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
@@ -759,6 +803,18 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"deployment", deployment,
 			"repository", req.Repository,
 			"ignored_namespaces", req.IgnoredNamespaces,
+		)
+	}
+	if len(req.IgnoreTables) > 0 {
+		// The live-schema view is deliberately partial: the config withholds
+		// these tables from the planner. Recorded so an operator tracing "why
+		// does this plan not touch table X" finds the answer in server logs.
+		s.logger.Info("plan request withholds live tables named by ignore_tables",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"ignore_tables", req.IgnoreTables,
 		)
 	}
 
@@ -805,6 +861,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 				"ddl_len", len(tc.Ddl),
 			)
 		}
+	}
+
+	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
+		return nil, nil, err
 	}
 
 	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
@@ -880,7 +940,9 @@ func (s *Service) normalizeExecutionVerdict(tc *ternv1.TableChange, database, de
 		"table", tc.TableName,
 		"execution_mode", tc.ExecutionMode,
 	)
-	tc.ModeReason = fmt.Sprintf("planner returned execution-mode verdict %q, which this SchemaBot build does not recognize; the change is blocked because SchemaBot cannot determine how the statement would run", tc.ExecutionMode)
+	// The quoted verdict is planner output, so the reason is neutralized like
+	// any other cause an engine composes from text it did not write.
+	tc.ModeReason = engine.SanitizeBlockedCause(fmt.Sprintf("planner returned execution-mode verdict %q, which this SchemaBot build does not recognize; the change is blocked because SchemaBot cannot determine how the statement would run", tc.ExecutionMode))
 	tc.ExecutionMode = engine.ExecutionModeBlocked
 }
 
@@ -905,6 +967,72 @@ type storedPlanRoute struct {
 	// round. Empty for the reviewed plan itself and for every plan of an
 	// environment whose members all run it.
 	PrimaryPlanIdentifier string
+}
+
+// refuseDropsOfWithheldTables refuses a plan that proposes dropping a table the
+// request asked to withhold. Every path that turns a PlanRequest into a stored
+// plan runs it, the rollback re-plan included: a rollback is planned against
+// the same target by the same data plane, so a build that discards the
+// exclusion answers it the same way, and the refusal is only worth anything
+// where the plan would otherwise be stored and surfaced for review.
+//
+// A configured entry that withheld nothing is ordinarily a typo, a case
+// mismatch, or a stale entry for a table that no longer exists — the table it
+// names is fully reconciled, so it is surfaced as a warning rather than letting
+// the config imply an exclusion that is not happening. But an entry the plan
+// did not withhold and whose exact name it proposes dropping is not a typo: the
+// target holds that table, so the exclusion reached a data plane that did not
+// apply it — one that predates the field and discarded it. Every other
+// unmatched shape names a table that is not there to drop, so this one is
+// unambiguous, and letting it through would turn a reviewed exclusion into the
+// drop it was written to prevent.
+func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.PlanResponse, deployment string) error {
+	unmatched := schema.UnmatchedIgnoreTables(req.IgnoreTables, withheldTablesFromProto(resp.ExemptTables))
+	if len(unmatched) == 0 {
+		return nil
+	}
+	var prInt int
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
+	}
+	s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
+		"database", req.Database,
+		"environment", req.Environment,
+		"deployment", deployment,
+		"repository", req.Repository,
+		"pull_request", prInt,
+		"unmatched_entries", unmatched,
+	)
+	dropped := plannedDropsAmong(resp.Changes, unmatched)
+	if len(dropped) == 0 {
+		return nil
+	}
+	s.logger.Error("plan proposes dropping tables that ignore_tables withholds",
+		"database", req.Database,
+		"environment", req.Environment,
+		"deployment", deployment,
+		"repository", req.Repository,
+		"pull_request", prInt,
+		"tables", dropped,
+	)
+	if len(dropped) == 1 {
+		return fmt.Errorf(
+			"the plan from deployment %q proposes dropping %q, which ignore_tables withholds. That deployment's planner never saw the exclusion, so the plan is refused rather than reviewed as a drop. Upgrade that deployment to a build that supports ignore_tables",
+			deployment, dropped[0])
+	}
+	return fmt.Errorf(
+		"the plan from deployment %q proposes dropping %s, which ignore_tables withholds. That deployment's planner never saw the exclusion, so the plan is refused rather than reviewed as drops. Upgrade that deployment to a build that supports ignore_tables",
+		deployment, quotedTableList(dropped))
+}
+
+// quotedTableList renders table names for an operator-facing message, quoted
+// so a name with a space or a trailing character reads as one name.
+func quotedTableList(names []string) string {
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, fmt.Sprintf("%q", name))
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
@@ -965,6 +1093,11 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 		PrimaryPlanIdentifier: route.PrimaryPlanIdentifier,
 		CreatedAt:             time.Now(),
 	}
+	storedPlan.RecordIgnoreTables(req.IgnoreTables)
+	// An identifier the planner supplied can already name a stored row when a
+	// plan is delivered twice, and re-storing it is a no-op rather than a
+	// failure. A member's identifier is minted here per call, so it never
+	// collides and this only ever forgives the supplied kind.
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
 		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
 	}
@@ -1309,7 +1442,7 @@ func (s *Service) createStoredApply(
 	applyOpts := storage.ApplyOptionsFromMap(options)
 	// Blocked changes reject before unsafe changes because no opt-in can make a
 	// statement the engine refuses executable.
-	if err := rejectBlockedStoredPlan(plan); err != nil {
+	if err := plan.BlockedApplyError(); err != nil {
 		return nil, 0, err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
@@ -1426,25 +1559,6 @@ func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.Ap
 		return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
 	}
 	return nil
-}
-
-// rejectBlockedStoredPlan refuses to queue an apply for a plan carrying an
-// engine-blocked change. A blocked verdict means the engine deterministically
-// refuses the statement, and the drive layer rebuilds engine requests from
-// task rows that do not carry the verdict — so the only place the verdict can
-// reliably gate execution is before the apply is queued. There is no opt-in:
-// the schema change itself must be rewritten and re-planned.
-func rejectBlockedStoredPlan(plan *storage.Plan) error {
-	blocked := plan.BlockedChanges()
-	if len(blocked) == 0 {
-		return nil
-	}
-	change := blocked[0]
-	reason := change.ModeReason
-	if reason == "" {
-		reason = "the engine refuses this statement"
-	}
-	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", plan.PlanIdentifier, change.Table, reason)
 }
 
 // applyTaskChanges returns the per-table DDL changes that become apply tasks.
@@ -1818,6 +1932,8 @@ func buildApplyTask(
 		Shard:          shard,
 		DDL:            ddlChange.DDL,
 		DDLAction:      ddlChange.Operation,
+		ExecutionMode:  ddlChange.ExecutionMode,
+		ModeReason:     ddlChange.ModeReason,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -1875,15 +1991,23 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		SchemaFiles: schemaFiles,
 		Repository:  apply.Repository,
 		PullRequest: &prNumber,
+		// The rollback restores the schema the source plan captured, and that
+		// capture never included the tables the plan's ignore_tables withheld.
+		// Withholding them again is what keeps the rollback from proposing to
+		// drop tables the repository asked SchemaBot to leave alone, and
+		// carrying them on the request is what puts them on the rollback's own
+		// stored plan, so a re-plan of *that* plan withholds them too.
+		IgnoreTables: plan.IgnoreTables(),
 	}
 	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Database:    req.Database,
-		Type:        req.Type,
-		SchemaFiles: req.SchemaFiles,
-		Repository:  req.Repository,
-		PullRequest: prNumber,
-		Environment: req.Environment,
-		Target:      plan.Target,
+		Database:     req.Database,
+		Type:         req.Type,
+		SchemaFiles:  req.SchemaFiles,
+		Repository:   req.Repository,
+		PullRequest:  prNumber,
+		Environment:  req.Environment,
+		Target:       plan.Target,
+		IgnoreTables: req.IgnoreTables,
 	})
 	if err != nil {
 		// Mirror ExecutePlanProto's transport classification: only remote
@@ -1898,6 +2022,10 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 				Err:        err,
 			}
 		}
+		return nil, terminalControlf("rollback plan for database %q (%s): %w%s",
+			apply.Database, apply.Environment, err, recordedIgnoreTablesNote(req.IgnoreTables))
+	}
+	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
 		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
@@ -1917,6 +2045,21 @@ func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bo
 	return plan.Database == apply.Database &&
 		plan.DatabaseType == apply.DatabaseType &&
 		plan.Environment == apply.Environment
+}
+
+// recordedIgnoreTablesNote qualifies a failed rollback re-plan with where its
+// exclusions came from. The rollback restores a snapshot the entries were never
+// checked against, so an engine can refuse a contradiction the reviewed plan
+// never had — and its remedy, removing the entry, reads as a config edit. The
+// entries are the source plan's frozen record, so that edit changes nothing and
+// the operator's way out is a pull request that restores the schema. Empty when
+// the plan recorded none, which is every rollback of a plan that withheld
+// nothing.
+func recordedIgnoreTablesNote(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	return ". This rollback uses the plan's recorded ignore_tables, not schemabot.yaml"
 }
 
 func rollbackSchemaFiles(plan *storage.Plan) (map[string]*ternv1.SchemaFiles, error) {

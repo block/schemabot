@@ -12,6 +12,26 @@ type StorageSchemaStatement struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// BootRemovalPolicy is what a boot of the answering deployment does to storage
+// state its own schema does not declare.
+type BootRemovalPolicy string
+
+const (
+	// BootRemovalUnknown is the answering side declining to say, and it is a
+	// real answer rather than a default. A release that predates the field
+	// leaves it empty, and so does a convergence addressed by DSN alone, which
+	// has no deployment config to read. Treating it as BootRemovalPreserves is
+	// how an operator gets told to pre-apply storage the next pod will drop, so
+	// callers state the uncertainty instead of resolving it.
+	BootRemovalUnknown BootRemovalPolicy = ""
+	// BootRemovalPreserves is a boot leaving surplus storage state in place: it
+	// either refuses the removals, or never computes one.
+	BootRemovalPreserves BootRemovalPolicy = "preserves"
+	// BootRemovalRemoves is a boot dropping the tables, columns and indexes its
+	// own schema does not declare.
+	BootRemovalRemoves BootRemovalPolicy = "removes"
+)
+
 // StorageSchemaReport is what one SchemaBot instance's storage database needs
 // in order to match that instance's embedded schema.
 //
@@ -44,11 +64,33 @@ type StorageSchemaReport struct {
 	Version string `json:"version,omitempty"`
 	// Converged reports that the storage schema needs nothing at all. A report
 	// carrying only refused destructive statements is not converged.
-	Converged          bool                     `json:"converged"`
-	Outstanding        []StorageSchemaStatement `json:"outstanding,omitempty"`
-	Destructive        []StorageSchemaStatement `json:"destructive,omitempty"`
+	Converged   bool                     `json:"converged"`
+	Outstanding []StorageSchemaStatement `json:"outstanding,omitempty"`
+	Destructive []StorageSchemaStatement `json:"destructive,omitempty"`
+	// DestructiveAllowed reports whether the destructive statements run on this
+	// call: the deployment's standing policy, widened by an opt-in this caller
+	// sent. BootRemovalPolicy is the one to read for what some other process
+	// does.
 	DestructiveAllowed bool                     `json:"destructive_allowed"`
 	Manual             []StorageSchemaStatement `json:"manual,omitempty"`
+	// BootRemovalPolicy is what the next pod to start does to storage state its
+	// own schema does not declare, which is what says whether state converged
+	// ahead of a deploy survives until that deploy.
+	//
+	// It is the deployment's policy and its dialect, never this request's
+	// opt-in. Empty is BootRemovalUnknown and is a real answer: see the
+	// constants.
+	BootRemovalPolicy BootRemovalPolicy `json:"boot_removal_policy,omitempty"`
+	// ConvergenceInFlight reports that some instance held the storage bootstrap
+	// lock when the diff was taken — a pod booting, or another operator's
+	// apply. It is what separates "this DDL is outstanding" from "this DDL is
+	// being run right now", which the statement lists cannot say on their own:
+	// a statement a convergence is working on stays absent from the live
+	// catalog until that convergence finishes with it.
+	//
+	// Only true is a finding. False is the absence of evidence, not a claim
+	// that the database is idle.
+	ConvergenceInFlight bool `json:"convergence_in_flight,omitempty"`
 }
 
 // AppliedStatements is what a convergence ran from this report of what it

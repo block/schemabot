@@ -86,8 +86,31 @@ drops, invisible-index-before-drop) never fire on a pull. A clean pull audit
 means the existing schema is well-shaped, not that any particular change to it
 is safe: the safety gates above still apply when you plan one.
 
-The linters parse MySQL-family DDL only, so a lint request against any other
-dialect is rejected rather than reporting a misleadingly clean audit.
+The rules are dialect-specific. On the MySQL family the audit runs Spirit's
+schema-shape linters. On PostgreSQL it runs the rules that have a PostgreSQL
+analog, and every finding is a warning, since a pulled table is existing
+schema:
+
+- `primary_key` — no primary key, or a key column whose type is not `bigint`
+  or `uuid`. Serial types are judged by the integer they store; a type is
+  matched by its full spelling, so `bigint[]` and a user type named
+  `custom.bigint` are not `bigint`.
+- `has_float` — `real`, `double precision`, `float(n)`.
+- `name_case` — a quoted table name that is not lowercase.
+- `redundant_indexes` — a btree index whose key columns are a leading prefix
+  of another index or the primary key, or a duplicate of one; a `UNIQUE` key
+  is reported only when a `UNIQUE` key or the primary key covers exactly the
+  same columns, since dropping it otherwise drops a constraint. Partial,
+  expression, `INCLUDE`, and non-btree indexes serve queries a plain index
+  cannot and are left out of the comparison.
+
+The MySQL rules with no PostgreSQL counterpart are not approximated:
+`allow_charset` and `allow_engine` (no per-table charset or storage engine),
+`reserved_words`, `has_timestamp`, `zero_date`, and `datetime_index_position`.
+`has_foreign_key` is not run on PostgreSQL either: a table with a foreign key
+is refused at pull time, so no entry the audit sees can carry one. A lint
+request against a database of any other type is rejected rather than
+reporting a misleadingly clean audit.
 
 ## What "unsafe" means
 
@@ -161,14 +184,27 @@ execute the statement at all, so an apply is guaranteed to fail on it. There is
 no flag that lets a blocked change through — the guidance is to rewrite the
 statement as a supported schema change. Blocked changes render on the plan
 comment and again on the locked apply comment, and any apply command is
-rejected up front while they are present.
+rejected up front while they are present. Local apply admission re-checks the
+whole stored plan before creating or attaching apply work, so a dispatch for
+one table or shard cannot partially apply a plan whose other step is blocked.
+A deployment that did not plan locally re-plans the dispatched changes against
+its own live schema and judges admission on its own engine's verdict, so a
+statement another deployment's target could run is still refused where this
+one cannot run it.
+That admitting deployment's verdict travels on each task row. A fresh drive
+refuses a blocked row before handing work to the engine; a resumed drive first
+re-plans, tightens each row to a blocked verdict the re-plan now reaches, and
+then refuses the same way. The one drive that reattaches without that check is
+recovery of an apply parked at its cutover barrier: the copy is complete and the
+engine already holds the cutover signal, so refusing there would strand the
+shadow table rather than prevent a statement from running.
 
 ## Iconography reference
 
 | Icon | Where it appears | Meaning |
 |---|---|---|
 | ⛔ | Plan comment (**Cannot apply**), unsafe/blocked apply-rejection comments (**Apply rejected**), and the **Apply Blocked** headings where retrying unchanged refuses again (merged/closed PR, failing required checks, missing or untrusted prior-environment check, unlisted environment), plus CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
-| ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**) | Caution: unsafe changes to review before applying |
+| ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**), the **Check before applying** heading for destructive changes SchemaBot cannot attribute to the PR, and the stale-base **Apply rejected — base schema is newer** heading cleared by rebasing. These are the plan and apply-decision sites, not every ⚠️ on the surface — see the note below | Caution: look at this before you apply |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
 | ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
 | 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
@@ -184,12 +220,23 @@ Presentation notes:
   types) render as inline code.
 - The CLI and the plan comment share the same severity reading: ⚠️ marks
   unsafe changes awaiting review at plan time, and ⛔ marks the refused apply.
+- The ⛔ row is exhaustive and the ⚠️ row is not, because refusal is a closed
+  set and caution is not. ⚠️ also heads a comment whose precondition is not
+  met but which clears once the operator acts: **Database Not Found**,
+  **Multiple Databases Detected**, **Apply Already In Progress**, **Cannot
+  Unlock**, the **Rejected —** headings for a stale confirmed plan or new
+  commits since discovery, and the **Deployment drift detected** callout.
 - Not every **Apply Blocked** or **Apply rejected** heading is a refusal: the
   glyph follows the cause. 🔒 marks an apply blocked by a held lock, ⏳ one
   waiting on required checks or another apply (wait, then retry), ❌ one that
   fail-closed on a transient verification error (retry unchanged can succeed),
   and ⚠️ a stale-base rejection cleared by rebasing.
 - The severity vocabulary (🚨 ⛔ ❌ ⚠️ ℹ️) lives in `pkg/glyph`. The other
-  icons in this table — and state/consent icons such as ✅, 💡, ⚙️, and 🛑
-  (**Check before applying**, the unattributed-destructive-change gate) — are
+  icons in this table — and state/consent icons such as ✅, 💡, and ⚙️ — are
   deliberately outside it: they mark states and disclosures, not severities.
+  An icon qualifies for that exemption by reading as neutral next to the
+  severity glyphs. A stop sign does not, which is why **Check before
+  applying** — the unattributed-destructive-change gate — carries ⚠️ rather
+  than an icon of its own: it asks the operator to look before proceeding,
+  which is what ⚠️ already means, and a second glyph for that meaning would
+  sit at a severity the reader has no way to place against the five.

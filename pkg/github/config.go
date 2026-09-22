@@ -40,6 +40,14 @@ type SchemabotConfig struct {
 	// keyspace that only exists in local test infrastructure. Ignored
 	// namespaces are excluded from plans, applies, and checks.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces,omitempty" json:"ignore_namespaces,omitempty"`
+	// IgnoreTables lists live tables SchemaBot must not reconcile — for example
+	// the bookkeeping table of a versioned schema change tool, or a table
+	// another team owns in a shared schema. Without the exclusion a live table
+	// no schema file declares is planned as DROP TABLE, which blocks the merge.
+	// Entries are matched exactly and case-sensitively against the target's own
+	// catalog, in every namespace the plan covers, and every plan discloses
+	// what it withheld.
+	IgnoreTables []string `yaml:"ignore_tables,omitempty" json:"ignore_tables,omitempty"`
 }
 
 // GetType returns the database type. Type is always set — FetchConfig rejects empty values.
@@ -159,6 +167,9 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: unknown type '%s'; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", configPath, declaredType)
 	}
 	if err := schema.ValidateIgnoreNamespaces(config.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
+	}
+	if err := schema.ValidateIgnoreTables(config.IgnoreTables); err != nil {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
 

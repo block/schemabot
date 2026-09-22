@@ -110,13 +110,46 @@ var funcPattern = regexp.MustCompile(`\b(CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_
 var charsetCollatePattern = regexp.MustCompile(
 	`((?:CHARACTER SET|CHARSET|COLLATE)\s*=?\s*)([A-Z][A-Z0-9_]+)`)
 
-// charsetLiteralPattern matches _CHARSET'string' prefixes like _UTF8MB4'pending'.
-// These are stripped entirely since the column charset makes them redundant.
-var charsetLiteralPattern = regexp.MustCompile(`_(UTF8MB4|UTF8|LATIN1|ASCII|BINARY)(')`)
+// charsetIntroducerPattern matches a _CHARSET introducer left at the end of
+// the text before a string literal, as in _UTF8MB4'pending'. The introducer
+// is stripped since the column charset makes it redundant.
+var charsetIntroducerPattern = regexp.MustCompile(`_(UTF8MB4|UTF8|LATIN1|ASCII|BINARY)$`)
 
 // lowercaseTypes post-processes canonicalized DDL to lowercase data types,
-// function names, and charset/collate values while keeping SQL keywords uppercase.
+// function names, and charset/collate values while keeping SQL keywords
+// uppercase. Only text outside quoted regions is rewritten: a type word inside
+// a COMMENT or DEFAULT literal, or a quoted identifier that happens to be a
+// type name, is content and stays as written. An unterminated quote leaves
+// the rest of the statement untouched.
 func lowercaseTypes(ddl string) string {
+	var sb strings.Builder
+	start := 0
+	for i := 0; i < len(ddl); i++ {
+		if !isQuote(ddl[i]) {
+			continue
+		}
+		end, ok := quotedEnd(ddl, i)
+		if !ok {
+			sb.WriteString(lowercaseUnquotedTypes(ddl[start:i]))
+			sb.WriteString(ddl[i:])
+			return sb.String()
+		}
+		unquoted := ddl[start:i]
+		if ddl[i] == '\'' {
+			unquoted = charsetIntroducerPattern.ReplaceAllString(unquoted, "")
+		}
+		sb.WriteString(lowercaseUnquotedTypes(unquoted))
+		sb.WriteString(ddl[i:end])
+		start = end
+		i = end - 1
+	}
+	sb.WriteString(lowercaseUnquotedTypes(ddl[start:]))
+	return sb.String()
+}
+
+// lowercaseUnquotedTypes applies the lowercasing passes to a run of DDL that
+// contains no quoted region.
+func lowercaseUnquotedTypes(ddl string) string {
 	// Lowercase charset/collate values first (before data types, to avoid
 	// matching SET in "CHARACTER SET" as the SET data type)
 	ddl = charsetCollatePattern.ReplaceAllStringFunc(ddl, func(match string) string {
@@ -128,9 +161,6 @@ func lowercaseTypes(ddl string) string {
 		value := match[loc[4]:loc[5]]
 		return prefix + strings.ToLower(value)
 	})
-
-	// Strip _CHARSET'...' introducers (redundant with column charset)
-	ddl = charsetLiteralPattern.ReplaceAllString(ddl, "$2")
 
 	// Lowercase data types
 	ddl = dataTypePattern.ReplaceAllStringFunc(ddl, strings.ToLower)
@@ -144,7 +174,7 @@ func lowercaseTypes(ddl string) string {
 // formatCreateTable formats a CREATE TABLE statement with line breaks.
 func formatCreateTable(ddl string) string {
 	// Find the opening parenthesis
-	openParen := strings.Index(ddl, "(")
+	openParen := findOpeningParen(ddl)
 	if openParen == -1 {
 		return ddl
 	}
@@ -194,17 +224,18 @@ func formatCreateTable(ddl string) string {
 }
 
 // splitPartitionClause separates the trailing PARTITION BY clause, if any,
-// from a CREATE TABLE options footer. Quoted strings are skipped so a COMMENT
-// mentioning PARTITION BY is not mistaken for the clause.
+// from a CREATE TABLE options footer. Quoted regions are skipped so a COMMENT
+// mentioning PARTITION BY is not mistaken for the clause; an unterminated
+// quote leaves the footer whole.
 func splitPartitionClause(options string) (opts, partition string) {
 	const clause = "PARTITION BY"
-	inQuote := false
 	for i := 0; i+len(clause) <= len(options); i++ {
-		if options[i] == '\'' {
-			inQuote = !inQuote
-			continue
-		}
-		if inQuote {
+		if isQuote(options[i]) {
+			end, ok := quotedEnd(options, i)
+			if !ok {
+				return options, ""
+			}
+			i = end - 1
 			continue
 		}
 		if strings.EqualFold(options[i:i+len(clause)], clause) {
@@ -236,8 +267,9 @@ func formatFooter(options, partition string) string {
 
 // tableOptionPattern matches individual table options in the options string.
 // TiDB restores options as: ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI COMMENT = '...'
+// A quoted value runs to its closing quote, with a doubled quote staying inside.
 var tableOptionPattern = regexp.MustCompile(
-	`(?:DEFAULT\s+)?(?:ENGINE|CHARACTER SET|CHARSET|COLLATE|COMMENT|AUTO_INCREMENT|ROW_FORMAT|COMPRESSION|KEY_BLOCK_SIZE|STATS_PERSISTENT|STATS_AUTO_RECALC|PACK_KEYS)\s*=?\s*(?:'[^']*'|\S+)`)
+	`(?:DEFAULT\s+)?(?:ENGINE|CHARACTER SET|CHARSET|COLLATE|COMMENT|AUTO_INCREMENT|ROW_FORMAT|COMPRESSION|KEY_BLOCK_SIZE|STATS_PERSISTENT|STATS_AUTO_RECALC|PACK_KEYS)\s*=?\s*(?:'(?:[^']|'')*'|\S+)`)
 
 // formatTableOptions splits table options onto separate indented lines.
 // Input: "ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI"
@@ -280,11 +312,71 @@ func formatTableOptions(options string) string {
 	return sb.String()
 }
 
+// isQuote reports whether c opens a quoted literal or identifier. The CREATE
+// and ALTER layout scanners and the case pass step over quoted regions via
+// quotedEnd. findTableNameEnd only finds the ALTER header's first backtick-space
+// pair, which is unambiguous in canonical output.
+func isQuote(c byte) bool {
+	return c == '\'' || c == '"' || c == '`'
+}
+
+// quotedEnd returns the index just past the quoted region that opens at
+// s[openPos]. The scanners only ever see a parser's canonical output, and
+// both canonical grammars write an embedded quote as two consecutive quote
+// characters — never as a backslash escape — so the doubled quote is the one
+// escape honoured here. A backslash is ordinary content: MySQL's canonical
+// form writes a literal ending in a backslash as 'a\', which a backslash
+// aware scanner would misread as unterminated. ok is false when the quote is
+// never closed, in which case the caller cannot lay the statement out safely
+// and should leave it as is.
+func quotedEnd(s string, openPos int) (end int, ok bool) {
+	q := s[openPos]
+	for i := openPos + 1; i < len(s); i++ {
+		if s[i] != q {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == q {
+			i++
+			continue
+		}
+		return i + 1, true
+	}
+	return len(s), false
+}
+
+// findOpeningParen returns the index of the first parenthesis outside any
+// quoted region, or -1 when there is none.
+func findOpeningParen(s string) int {
+	for i := 0; i < len(s); i++ {
+		if isQuote(s[i]) {
+			end, ok := quotedEnd(s, i)
+			if !ok {
+				return -1
+			}
+			i = end - 1
+			continue
+		}
+		if s[i] == '(' {
+			return i
+		}
+	}
+	return -1
+}
+
 // findMatchingParen finds the index of the closing parenthesis that matches
-// the opening parenthesis at the given position.
+// the opening parenthesis at the given position, ignoring parentheses inside
+// quoted regions.
 func findMatchingParen(s string, openPos int) int {
 	depth := 0
 	for i := openPos; i < len(s); i++ {
+		if isQuote(s[i]) {
+			end, ok := quotedEnd(s, i)
+			if !ok {
+				return -1
+			}
+			i = end - 1
+			continue
+		}
 		switch s[i] {
 		case '(':
 			depth++
@@ -298,7 +390,11 @@ func findMatchingParen(s string, openPos int) int {
 	return -1
 }
 
-// splitByComma splits a string by commas, respecting parentheses.
+// splitByComma splits a string by top-level commas, treating parentheses and
+// quoted regions as opaque. Callers pass a parenthesized body that
+// findMatchingParen has already scanned, so every quote in it is closed; the
+// unterminated case still keeps the remainder whole rather than splitting
+// inside it.
 func splitByComma(s string) []string {
 	var parts []string
 	var current strings.Builder
@@ -306,6 +402,12 @@ func splitByComma(s string) []string {
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
+		if isQuote(c) {
+			end, _ := quotedEnd(s, i)
+			current.WriteString(s[i:end])
+			i = end - 1
+			continue
+		}
 		switch c {
 		case '(':
 			depth++
@@ -341,14 +443,24 @@ func splitAlterClauses(ddl string) []string {
 	tablePart := ddl[:tableEnd]
 	clausesPart := ddl[tableEnd:]
 
-	// Split on ", ADD ", ", DROP ", ", MODIFY ", ", CHANGE "
-	// Track parentheses to avoid splitting inside column definitions
+	// Split on ", ADD ", ", DROP ", ", MODIFY ", ", CHANGE ". Parentheses and
+	// quoted regions are opaque so a compound key or a literal is never split;
+	// an unterminated quote leaves the statement whole.
 	var clauses []string
 	var current strings.Builder
 	parenDepth := 0
 
 	for i := 0; i < len(clausesPart); i++ {
 		c := clausesPart[i]
+		if isQuote(c) {
+			end, ok := quotedEnd(clausesPart, i)
+			if !ok {
+				return []string{ddl}
+			}
+			current.WriteString(clausesPart[i:end])
+			i = end - 1
+			continue
+		}
 		switch c {
 		case '(':
 			parenDepth++

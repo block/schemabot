@@ -170,9 +170,12 @@ func TestRollupReviewTimeDrift_MemberDiffCarriesTheRequestContract(t *testing.T)
 
 // The execution-mode verdict crosses the wire as free-form text and everything
 // except "blocked" runs on the engine's default path. A member's plan reaches
-// storage from the diff RPC rather than the plan RPC, so the vocabulary is
-// enforced where plan rows are written and an unrecognized verdict is persisted
-// blocked rather than applyable.
+// SchemaBot from the diff RPC rather than the plan RPC, so the vocabulary is
+// enforced where that diff arrives: an unrecognized verdict is persisted blocked
+// rather than applyable, and the review reports the refusal it stored. A member
+// planned against its own schema is the only place its refused DDL surfaces at
+// review, so a count taken before the verdict was settled would tell the
+// operator the plan runs and then store one that cannot.
 func TestRollupReviewTimeDrift_MemberPlanBlocksUnrecognizedVerdict(t *testing.T) {
 	diff := alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")
 	diff.Changes[0].TableChanges[0].ExecutionMode = "future-mode"
@@ -183,6 +186,8 @@ func TestRollupReviewTimeDrift_MemberPlanBlocksUnrecognizedVerdict(t *testing.T)
 	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"), multiTargetMember("testapp-001"))
 	require.NoError(t, err)
 	require.Len(t, rollup.Entries, 2)
+	assert.Equal(t, 1, rollup.Entries[1].Blocked,
+		"the review must publish the refusal it stores, not the verdict the planner sent")
 
 	require.Len(t, plans.created, 1)
 	table := plans.created[0].Namespaces["testapp"].Tables[0]

@@ -152,12 +152,29 @@ func StorageSchemaPlan(ctx context.Context, endpoint string, req apitypes.Storag
 // StorageSchemaApply converges a SchemaBot instance's own storage database by
 // running the startup bootstrap that instance would run on its next boot,
 // under the same advisory lock.
+//
+// The client waits out the budget the request named rather than the shared
+// operator timeout: a convergence is the one operator call whose duration the
+// caller chooses, so a fixed client deadline would abandon exactly the runs
+// that asked for longer.
+//
+// A request naming no budget is given the operator default here and sent with
+// it named, the way an empty Caller is filled in: the wire then always carries
+// the budget this client is about to wait for, and the server never has to
+// guess it. A server that receives no budget runs the boot's instead, which is
+// far shorter than the wait below — so leaving the field empty would have the
+// server stop at a ceiling this client never reported.
 func StorageSchemaApply(ctx context.Context, endpoint string, req apitypes.StorageSchemaApplyRequest) (*apitypes.StorageSchemaApplyResponse, error) {
 	if req.Caller == "" {
 		req.Caller = GenerateCLIOwner()
 	}
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds, apitypes.DefaultStorageApplyTimeout)
+	if err != nil {
+		return nil, err
+	}
+	req.TimeoutSeconds = int64(budget / time.Second)
 	var result apitypes.StorageSchemaApplyResponse
-	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/storage/schema/apply", req, &result); err != nil {
+	if err := doPostIntoWithClient(ctx, clientForBudget(budget), endpoint, "/api/storage/schema/apply", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -192,19 +209,32 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 	return &result, nil
 }
 
+// PlanExclusions carries the exclusions a repository's schemabot.yaml declares:
+// namespace directories the plan must not reconcile (ignore_namespaces) and
+// live tables it must not see (ignore_tables). They travel as one value so a
+// caller cannot hand the plan its tables as its namespaces.
+type PlanExclusions struct {
+	Namespaces []string
+	Tables     []string
+}
+
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
 // Files are grouped by namespace: subdirectories become namespace keys,
 // flat files use the directory name as the namespace. Namespaces listed in
-// ignoreNamespaces are excluded from the plan request. The second return
-// value lists the namespaces actually removed by ignoreNamespaces so callers
-// can disclose the exclusion alongside the plan.
+// exclusions.Namespaces are excluded from the plan request. The second return
+// value lists the namespaces actually removed by them, so callers can disclose
+// the exclusion alongside the plan.
+//
+// exclusions.Tables cannot be resolved here: it names live tables on the
+// target, so the entries travel with the request and the response reports which
+// of them withheld anything (PlanResponse.WithheldTables).
 //
 // groupedExecution says whether the apply this plan is for hands the engine
 // every ALTER at once or one table at a time. It only affects what the plan
 // predicts about work already on the target; a caller that has not chosen yet
 // passes false, the shape an apply runs without asking for anything else.
-func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
-	schemaFiles, ignored, err := ReadSchemaFiles(schemaDir, environment, ignoreNamespaces)
+func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
+	schemaFiles, ignored, err := ReadSchemaFiles(schemaDir, environment, exclusions.Namespaces)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read schema files: %w", err)
 	}
@@ -214,7 +244,7 @@ func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	resp, err := postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, groupedExecution)
+	resp, err := postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution)
 	if err != nil {
 		return nil, ignored, err
 	}
@@ -223,13 +253,15 @@ func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string
 
 // CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped schema files.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
-	return postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, false)
+	return postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, false)
 }
 
 // postPlanRequest posts a plan request. ignoredNamespaces names the
 // namespaces removed from schemaFiles before the call — the server needs
-// them to refuse engine shapes that cannot honor the exclusion.
-func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
+// them to refuse engine shapes that cannot honor the exclusion. ignoreTables
+// names live tables the server withholds from the planner, which no request
+// this side builds can express by omission.
+func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -237,6 +269,7 @@ func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles
 		SchemaFiles:       schemaFiles,
 		Repository:        repo,
 		IgnoredNamespaces: ignoredNamespaces,
+		IgnoreTables:      ignoreTables,
 		GroupedExecution:  groupedExecution,
 	}
 	if pr != 0 {

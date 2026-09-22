@@ -10,6 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
@@ -27,7 +29,7 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 				},
 			},
 		},
-	}, nil)
+	}, client.PlanExclusions{})
 	require.NoError(t, err)
 	require.NoError(t, plan.checkConflicts(false))
 	require.NoError(t, plan.write())
@@ -62,7 +64,7 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 				},
 			},
 		},
-	}, nil)
+	}, client.PlanExclusions{})
 	require.NoError(t, err)
 	require.NoError(t, plan.checkConflicts(false))
 	require.NoError(t, plan.write())
@@ -80,11 +82,11 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 	assert.JSONEq(t, "{\"sharded\":true}", string(vschema))
 }
 
-// Re-onboarding over an existing schema root must not drop the
-// ignore_namespaces an operator configured: the rewritten schemabot.yaml
-// carries the entries forward and the plan verification excludes the same
-// namespaces a real plan would.
-func TestBuildOnboardWritePlanPreservesIgnoreNamespaces(t *testing.T) {
+// Re-onboarding over an existing schema root must not drop the exclusions an
+// operator configured: the rewritten schemabot.yaml carries both lists forward,
+// and the plan verification excludes the same namespaces and withholds the same
+// tables a real plan would.
+func TestBuildOnboardWritePlanPreservesExclusions(t *testing.T) {
 	root := t.TempDir()
 	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
 		Database:    "orders",
@@ -94,31 +96,149 @@ func TestBuildOnboardWritePlanPreservesIgnoreNamespaces(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	}, []string{"local_fixtures", "fixtures_$ENV"})
+	}, client.PlanExclusions{
+		Namespaces: []string{"local_fixtures", "fixtures_$ENV"},
+		Tables:     []string{"flyway_schema_history"},
+	})
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 
 	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
 	require.NoError(t, err)
-	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\n", string(config))
-	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, plan.ignoreNamespaces)
+	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\nignore_tables:\n  - flyway_schema_history\n", string(config))
+	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, plan.exclusions.Namespaces)
+	assert.Equal(t, []string{"flyway_schema_history"}, plan.exclusions.Tables)
 }
 
-func TestPreservedIgnoreNamespaces(t *testing.T) {
+// A pull returns the target's whole catalog, the tables ignore_tables withholds
+// included, so re-onboarding an already-configured repository is where a table
+// can end up both withheld from the planner and declared to it — the
+// contradiction every engine refuses, written into the repo by the rewrite
+// itself, after the files are already on disk.
+func TestBuildOnboardWritePlanDoesNotDeclareAWithheldTable(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  2,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{
+				"users":                 "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history"}})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	assert.FileExists(t, filepath.Join(root, "orders", "users.sql"))
+	assert.NoFileExists(t, filepath.Join(root, "orders", "flyway_schema_history.sql"),
+		"the withheld table is not declared back into the repository it is withheld from")
+	assert.NoFileExists(t, filepath.Join(root, "orders", "schema.sql"),
+		"the namespace still declares a table, so it needs no empty-scope declaration")
+}
+
+// Withholding is exact so an entry never withholds a table it does not name,
+// but the engines refuse a declared-and-ignored table with case folded. An
+// entry that differs from the live table only in case therefore survives the
+// filter, and onboard would write the very file every later plan refuses.
+// Onboard refuses first, before anything is on disk, so the operator is never
+// left holding a repository no plan accepts.
+func TestBuildOnboardWritePlanRefusesACaseDifferingEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry string
+		live  string
+	}{
+		{"entry folds down to the live table", "databasechangelog", "DATABASECHANGELOG"},
+		{"entry folds up to the live table", "Flyway_Schema_History", "flyway_schema_history"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			_, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database:    "orders",
+				Type:        "mysql",
+				Environment: "production",
+				TableCount:  2,
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"orders": {Tables: map[string]string{
+						"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+						tc.live: "CREATE TABLE `" + tc.live + "` (`id` bigint NOT NULL);\n",
+					}},
+				},
+			}, client.PlanExclusions{Tables: []string{tc.entry}})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.entry)
+			assert.Contains(t, err.Error(), "is also declared by a schema file in namespace \"orders\"")
+			assert.NoDirExists(t, filepath.Join(root, "orders"),
+				"the refusal lands before anything reaches disk")
+		})
+	}
+}
+
+// A namespace whose every table is withheld still belongs to the plan, so it
+// keeps its comment-only declaration rather than vanishing from the repository.
+func TestBuildOnboardWritePlanKeepsAFullyWithheldNamespaceExplicit(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"bookkeeping": {Tables: map[string]string{
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history"}})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	assert.NoFileExists(t, filepath.Join(root, "bookkeeping", "flyway_schema_history.sql"))
+	declaration, err := os.ReadFile(filepath.Join(root, "bookkeeping", "schema.sql"))
+	require.NoError(t, err)
+	assert.Equal(t, schema.EmptyNamespaceDeclaration, string(declaration))
+}
+
+// A config with no exclusions emits neither key: an empty list would read as a
+// configured exclusion of nothing.
+func TestBuildOnboardWritePlanOmitsEmptyExclusions(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, "database: orders\ntype: mysql\n", string(config))
+}
+
+func TestPreservedExclusions(t *testing.T) {
 	t.Run("missing config is a fresh onboarding", func(t *testing.T) {
-		ignores, err := preservedIgnoreNamespaces(t.TempDir())
+		exclusions, err := preservedExclusions(t.TempDir())
 		require.NoError(t, err)
-		assert.Nil(t, ignores)
+		assert.Equal(t, client.PlanExclusions{}, exclusions)
 	})
 
 	t.Run("existing config's entries are preserved", func(t *testing.T) {
 		root := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
-			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n"), 0o644))
+			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\nignore_tables:\n  - flyway_schema_history\n"), 0o644))
 
-		ignores, err := preservedIgnoreNamespaces(root)
+		exclusions, err := preservedExclusions(root)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"local_fixtures"}, ignores)
+		assert.Equal(t, []string{"local_fixtures"}, exclusions.Namespaces)
+		assert.Equal(t, []string{"flyway_schema_history"}, exclusions.Tables)
 	})
 
 	t.Run("unreadable config is an error, not a silent drop", func(t *testing.T) {
@@ -126,9 +246,9 @@ func TestPreservedIgnoreNamespaces(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
 			[]byte(": not yaml"), 0o644))
 
-		_, err := preservedIgnoreNamespaces(root)
+		_, err := preservedExclusions(root)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "preserve ignore_namespaces")
+		assert.Contains(t, err.Error(), "preserve ignore_namespaces and ignore_tables")
 	})
 }
 
@@ -183,7 +303,7 @@ func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	}, nil)
+	}, client.PlanExclusions{})
 	require.NoError(t, err)
 
 	err = plan.checkConflicts(false)
@@ -202,7 +322,7 @@ func TestBuildOnboardWritePlanRejectsUnsafeResponsePaths(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"../users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	}, nil)
+	}, client.PlanExclusions{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "table")
 }
@@ -244,7 +364,7 @@ func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			plan, err := buildOnboardWritePlan(tt.schemaRoot, tt.resp, nil)
+			plan, err := buildOnboardWritePlan(tt.schemaRoot, tt.resp, client.PlanExclusions{})
 			require.Error(t, err)
 			assert.Nil(t, plan)
 			assert.Contains(t, err.Error(), tt.want)
@@ -339,29 +459,92 @@ func TestOnboardWritePlanStrayFiles(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	}, nil)
+	}, client.PlanExclusions{})
 	require.NoError(t, err)
 
 	// Namespace directory absent (dry run before any write): nothing to scan.
-	strays, err := plan.strayFiles()
+	strays, withheldStrays, err := plan.strayFiles()
 	require.NoError(t, err)
 	assert.Empty(t, strays)
+	assert.Empty(t, withheldStrays)
 
 	require.NoError(t, plan.write())
-	strays, err = plan.strayFiles()
+	strays, withheldStrays, err = plan.strayFiles()
 	require.NoError(t, err)
 	assert.Empty(t, strays)
+	assert.Empty(t, withheldStrays)
 
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "legacy_bak.sql"), []byte("CREATE TABLE `legacy_bak` (`id` bigint NOT NULL);\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{}"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "README.md"), []byte("docs"), 0o644))
 
 	// MySQL planning never reads vschema.json, so only the table file is stray.
-	strays, err = plan.strayFiles()
+	strays, withheldStrays, err = plan.strayFiles()
 	require.NoError(t, err)
 	assert.Equal(t, []string{
 		filepath.Join(root, "orders", "legacy_bak.sql"),
 	}, strays)
+	assert.Empty(t, withheldStrays, "no entry withholds legacy_bak")
+}
+
+// Adding an ignore_tables entry to an already-onboarded repository leaves the
+// table's old schema file behind: the rewrite stops writing it but never
+// deletes it. That file is not the ordinary stray, whose table is absent from
+// the target and whose remedy is to restore it. This table is present and
+// deliberately unmanaged, so the file states the contradiction the engines
+// refuse and deleting it is the only fix. Reporting it under the ordinary
+// warning would send the operator to restore a table that never left.
+func TestOnboardWritePlanSeparatesAWithheldTablesLeftoverFile(t *testing.T) {
+	root := t.TempDir()
+	pulled := &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{
+				"users":                 "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}
+	before, err := buildOnboardWritePlan(root, pulled, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, before.write())
+	require.FileExists(t, filepath.Join(root, "orders", "flyway_schema_history.sql"))
+
+	after, err := buildOnboardWritePlan(root, pulled, client.PlanExclusions{Tables: []string{"flyway_schema_history"}})
+	require.NoError(t, err)
+	require.NoError(t, after.write())
+
+	strays, withheldStrays, err := after.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays, "the leftover file is not an absent table to restore")
+	assert.Equal(t, []string{filepath.Join(root, "orders", "flyway_schema_history.sql")}, withheldStrays)
+}
+
+// Onboard prints the server's unfiltered table count, so a table missing from
+// the written files has no stated reason unless onboard says what it withheld.
+// It records the exemption the way a plan carries one, so the disclosure reads
+// the same on both surfaces.
+func TestBuildOnboardWritePlanRecordsWhatItWithheld(t *testing.T) {
+	plan, err := buildOnboardWritePlan(t.TempDir(), &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  2,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{
+				"users":                 "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				"flyway_schema_history": "CREATE TABLE `flyway_schema_history` (`installed_rank` int NOT NULL);\n",
+			}},
+		},
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history", "legacy_audit_log"}})
+	require.NoError(t, err)
+
+	require.Len(t, plan.withheld, 1)
+	assert.Equal(t, "orders", plan.withheld[0].Namespace)
+	assert.Equal(t, []string{"flyway_schema_history"}, plan.withheld[0].Tables)
+	assert.Equal(t, apitypes.ExemptReasonIgnoreTables, plan.withheld[0].Reason)
 }
 
 // For Vitess, vschema.json is a schema input: a leftover copy the pull did not
@@ -376,15 +559,16 @@ func TestOnboardWritePlanStrayFilesFlagsVSchemaForVitess(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	}, nil)
+	}, client.PlanExclusions{})
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 
 	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{\"sharded\": true}"), 0o644))
 
-	strays, err := plan.strayFiles()
+	strays, withheldStrays, err := plan.strayFiles()
 	require.NoError(t, err)
 	assert.Equal(t, []string{filepath.Join(root, "orders", "vschema.json")}, strays)
+	assert.Empty(t, withheldStrays)
 }
 
 func validPullSchemaResponse() *apitypes.PullSchemaResponse {
@@ -408,7 +592,7 @@ func TestBuildOnboardWritePlanPostgres(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"public": {Tables: map[string]string{"Order": ddl}},
 		},
-	}, nil)
+	}, client.PlanExclusions{})
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
@@ -423,7 +607,7 @@ func TestBuildOnboardWritePlanPostgres(t *testing.T) {
 func TestBuildOnboardWritePlanEmptyNamespace(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres"} {
 		t.Run(engine, func(t *testing.T) {
-			plan, err := buildOnboardWritePlan(t.TempDir(), &apitypes.PullSchemaResponse{Database: "app", Type: engine, Namespaces: map[string]*apitypes.PulledNamespace{"app": {Tables: map[string]string{}}}}, nil)
+			plan, err := buildOnboardWritePlan(t.TempDir(), &apitypes.PullSchemaResponse{Database: "app", Type: engine, Namespaces: map[string]*apitypes.PulledNamespace{"app": {Tables: map[string]string{}}}}, client.PlanExclusions{})
 			require.NoError(t, err)
 			require.NoError(t, plan.write())
 			require.Equal(t, "-- This namespace is empty. Add CREATE TABLE declarations here.\n", plan.files[filepath.Join("app", "schema.sql")])
@@ -436,10 +620,51 @@ func TestOnboardRetainsEmptyNamespacesAndRejectsCaseCollisions(t *testing.T) {
 		"public": {Tables: map[string]string{}}, "billing": {Tables: map[string]string{"orders": "CREATE TABLE orders (id bigint);"}},
 	}}
 	root := t.TempDir()
-	plan, err := buildOnboardWritePlan(root, response, nil)
+	plan, err := buildOnboardWritePlan(root, response, client.PlanExclusions{})
 	require.NoError(t, err)
 	require.Contains(t, plan.files, filepath.Join("public", "schema.sql"))
 	response.Namespaces["billing"].Tables["Orders"] = "CREATE TABLE \"Orders\" (id bigint);"
-	_, err = buildOnboardWritePlan(root, response, nil)
+	_, err = buildOnboardWritePlan(root, response, client.PlanExclusions{})
 	require.ErrorContains(t, err, "case-insensitive filesystem")
+}
+
+// A table name the target's catalog allows but YAML would reinterpret has to
+// survive the write. Written bare, a name opening with a comment marker is
+// read back as a comment: the config would state an exclusion that no longer
+// loads, and the next plan would propose dropping the table it names.
+func TestOnboardConfigYAML_ExclusionsRoundTripThroughQuoting(t *testing.T) {
+	exclusions := client.PlanExclusions{
+		Namespaces: []string{"#reporting", "app"},
+		Tables:     []string{"#audit", "flyway_schema_history", "yes"},
+	}
+
+	out, err := onboardConfigYAML("testapp", "mysql", exclusions)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(out), 0o600))
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+
+	assert.Equal(t, "testapp", cfg.Database)
+	assert.Equal(t, exclusions.Namespaces, cfg.PlanExclusions().Namespaces)
+	assert.Equal(t, exclusions.Tables, cfg.PlanExclusions().Tables)
+}
+
+// A name needing no quoting is written plain, so an ordinary onboarded config
+// reads the way an operator would have written it by hand.
+func TestOnboardConfigYAML_OrdinaryNamesStayUnquoted(t *testing.T) {
+	out, err := onboardConfigYAML("testapp", "mysql", client.PlanExclusions{
+		Tables: []string{"flyway_schema_history"},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, out, "ignore_tables:\n  - flyway_schema_history\n")
+}
+
+// An empty exclusion list is omitted: a bare key reads as a configured
+// exclusion of nothing rather than as no configuration at all.
+func TestOnboardConfigYAML_EmptyExclusionsOmitTheirKeys(t *testing.T) {
+	out, err := onboardConfigYAML("testapp", "mysql", client.PlanExclusions{})
+	require.NoError(t, err)
+	assert.Equal(t, "database: testapp\ntype: mysql\n", out)
 }

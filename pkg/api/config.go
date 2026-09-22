@@ -1323,7 +1323,7 @@ type PostgresConfig struct {
 	// connections SchemaBot opens to its own PostgreSQL storage database: the
 	// long-lived storage pool and the startup bootstrap's catalog reads. It
 	// does not bound bootstrap DDL, which raises the budget per transaction to
-	// a value derived from EnsureSchemaTimeout, and it does not bound the
+	// a value derived from the convergence's own budget, and it does not bound the
 	// bootstrap advisory-lock wait, which must be free to block. When unset,
 	// DefaultPostgresStatementTimeout applies. "0" disables the budget
 	// explicitly, for a deployment whose storage queries legitimately run

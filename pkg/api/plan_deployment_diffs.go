@@ -121,6 +121,14 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 				results[i].Err = err
 				return nil
 			}
+			// The execution-mode vocabulary is enforced here, where the diff
+			// crosses into SchemaBot, rather than only where the member's plan is
+			// written. The rollup classifies this diff and publishes its blocked
+			// count from it, so a verdict normalized later would be disclosed at
+			// review under the value the planner sent and stored under the one
+			// SchemaBot settled on. The primary's baseline arrives already
+			// normalized by the path that planned it.
+			s.normalizePlanExecutionVerdicts(resp.Changes, resp.Shards, req.Database, target.Deployment)
 			results[i].Engine = resp.Engine
 			results[i].Changes = resp.Changes
 			results[i].Shards = resp.Shards
@@ -179,6 +187,11 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		// the data plane reads the omission as intent to remove and plans DROPs
 		// for namespaces the configuration excluded on purpose.
 		IgnoredNamespaces: req.IgnoredNamespaces,
+		// The exclusions travel with every member's diff. An ignored namespace
+		// is already absent from SchemaFiles, but an ignored table lives on the
+		// target, so a member asked without the list would diff tables the
+		// primary withheld and report them as drift the primary does not have.
+		IgnoreTables: req.IgnoreTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),

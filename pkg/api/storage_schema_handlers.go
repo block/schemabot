@@ -20,6 +20,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -152,7 +153,7 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 	if !s.authorizeStorageSchemaOperation(w, r, storageSchemaPlanOperation) {
 		return
 	}
-	if err := validateStorageSchemaPlanRequest(req); err != nil {
+	if err := validateStorageSchemaSource(req.SchemaFiles, req.SchemaSource); err != nil {
 		s.logger.Warn("rejecting storage schema plan because its desired schema is incomplete",
 			"deployment", req.Deployment, "environment", req.Environment, "error", err)
 		s.writeError(w, http.StatusBadRequest, err.Error())
@@ -189,6 +190,9 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusInternalServerError, "storage schema plan returned no report")
 		return
 	}
+	if s.refuseUnhonoredSchema(w, target, storageSchemaPlanOperation, req.SchemaSource, report) {
+		return
+	}
 	s.writeJSON(w, http.StatusOK, apitypes.StorageSchemaPlanResponse{Report: report})
 }
 
@@ -196,6 +200,12 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 // POST /api/storage/schema/apply. It runs the target instance's startup
 // bootstrap, under the advisory lock that bootstrap already takes, so two
 // operators running it at once serialize the same way two booting pods do.
+//
+// The schema it converges to is the target's own embedded files, or the ones
+// the request carries — a release an operator is rolling, which the target
+// cannot converge from files it does not have. Either way the bootstrap decides
+// what runs, so a supplied schema changes which statements are computed and
+// nothing about which of them are permitted (AV-9).
 func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Request) {
 	req, err := decodeStorageSchemaApplyRequest(r)
 	if err != nil {
@@ -205,9 +215,39 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 	if !s.authorizeStorageSchemaOperation(w, r, storageSchemaApplyOperation) {
 		return
 	}
+	if err := validateStorageSchemaSource(req.SchemaFiles, req.SchemaSource); err != nil {
+		s.logger.Warn("rejecting storage schema apply because the schema to converge to is incomplete",
+			"deployment", req.Deployment, "environment", req.Environment, "error", err)
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A request naming no budget runs under the boot's. SchemaBot's own client
+	// always names one, so this is a caller that could not — and the boot
+	// budget is the one such a caller can wait out, where the operator default
+	// would hold the bootstrap lock for an hour after it had given up.
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds, EnsureSchemaTimeout)
+	if err != nil {
+		s.logger.Warn("rejecting storage schema convergence because its timeout is out of range",
+			"deployment", req.Deployment, "environment", req.Environment,
+			"timeout_seconds", req.TimeoutSeconds, "error", err)
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds: %s", err))
+		return
+	}
 	target, err := s.resolveStorageSchemaTarget(req.Deployment, req.Environment)
 	if err != nil {
 		s.refuseStorageSchemaTarget(w, storageSchemaApplyOperation, req.Deployment, req.Environment, err)
+		return
+	}
+
+	// A named schema costs a diff first, so the deadline has to cover both.
+	writeBudget := storageSchemaApplyWriteBudget(budget)
+	if namesSchema(req.SchemaSource) {
+		writeBudget += StorageSchemaPlanTimeout
+	}
+	ctx, cancel := s.extendOperatorWriteDeadline(w, r, writeBudget)
+	defer cancel()
+
+	if s.refuseUnverifiedNamedSchema(ctx, w, target, req) {
 		return
 	}
 
@@ -216,20 +256,25 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 		"deployment", target.deployment,
 		"environment", target.environment,
 		"allow_destructive", req.AllowDestructive,
+		"convergence_timeout", budget,
+		"schema_source", req.SchemaSource,
+		"schema_file_count", len(req.SchemaFiles),
 		"caller", operator)
-
-	ctx, cancel := s.extendOperatorWriteDeadline(w, r, storageSchemaApplyWriteBudget)
-	defer cancel()
 
 	resp, err := target.service.StorageSchemaApply(ctx, &ternv1.StorageSchemaApplyRequest{
 		AllowDestructive: req.AllowDestructive,
 		Caller:           operator,
+		TimeoutSeconds:   int64(budget / time.Second),
+		SchemaFiles:      req.SchemaFiles,
+		SchemaSource:     req.SchemaSource,
 	})
 	if err != nil {
 		s.logger.Error("storage schema apply failed",
 			"deployment", target.deployment,
 			"environment", target.environment,
 			"allow_destructive", req.AllowDestructive,
+			"schema_source", req.SchemaSource,
+			"schema_file_count", len(req.SchemaFiles),
 			"caller", operator,
 			"error", err)
 		s.writeStorageSchemaFailure(w, err, "storage schema apply failed")
@@ -247,6 +292,9 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 			"has_planned", planned != nil,
 			"has_remaining", remaining != nil)
 		s.writeError(w, http.StatusInternalServerError, "storage schema apply returned an incomplete result; check the target's logs for whether it converged")
+		return
+	}
+	if s.refuseUnhonoredConvergence(w, target, req.SchemaSource, planned, remaining) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, apitypes.StorageSchemaApplyResponse{Planned: planned, Remaining: remaining})
@@ -342,6 +390,161 @@ func (s *Service) writeStorageSchemaFailure(w http.ResponseWriter, err error, su
 	}
 }
 
+// namesSchema reports whether a request asked about a schema of its own rather
+// than about the answering target's embedded one.
+func namesSchema(source string) bool { return strings.TrimSpace(source) != "" }
+
+// refuseUnverifiedNamedSchema proves, before a single statement runs, that the
+// target honors the schema this convergence names.
+//
+// A diff is the only way to ask: there is no capability handshake, and the
+// fields carrying a named schema are ones an instance that predates them drops
+// silently. Since a diff answers the same question a convergence does and runs
+// nothing, the answer to "would this target work from the schema I sent" can be
+// had for a catalog read instead of for executed DDL.
+//
+// Asking after the convergence instead is not equivalent, because a target that
+// ignored the schema did not ignore the rest of the request. It still honors
+// allow_destructive, so it diffs its own older embedded schema against a
+// database holding a newer release's state, finds that state surplus, and drops
+// it — removals no boot of that deployment would have run, since a boot never
+// sees an operator's opt-in. The convergence cannot be taken back once it has
+// run, so the question is asked while the answer can still prevent it (AV-9).
+func (s *Service) refuseUnverifiedNamedSchema(ctx context.Context, w http.ResponseWriter, target *storageSchemaTarget, req apitypes.StorageSchemaApplyRequest) bool {
+	if !namesSchema(req.SchemaSource) {
+		return false
+	}
+	// Bounded on its own so a slow diff cannot spend the convergence's budget:
+	// what this buys is worth a catalog read, not the run it is protecting.
+	ctx, cancel := context.WithTimeout(ctx, StorageSchemaPlanTimeout)
+	defer cancel()
+
+	resp, err := target.service.StorageSchemaPlan(ctx, &ternv1.StorageSchemaPlanRequest{
+		AllowDestructive: req.AllowDestructive,
+		SchemaFiles:      req.SchemaFiles,
+		SchemaSource:     req.SchemaSource,
+	})
+	if err != nil {
+		s.logger.Error("refusing a storage convergence whose target could not be asked which schema it would use",
+			"operation", storageSchemaApplyOperation,
+			"deployment", target.deployment,
+			"environment", target.environment,
+			"asked_schema_source", req.SchemaSource,
+			"schema_file_count", len(req.SchemaFiles),
+			"error", err)
+		s.writeStorageSchemaFailure(w, err, "could not confirm the target converges the named schema, so nothing was converged")
+		return true
+	}
+	report := storageSchemaReportResponse(target, resp.GetReport())
+	if report == nil {
+		s.logger.Error("refusing a storage convergence whose target answered no report when asked which schema it would use",
+			"operation", storageSchemaApplyOperation,
+			"deployment", target.deployment,
+			"environment", target.environment,
+			"asked_schema_source", req.SchemaSource)
+		s.writeError(w, http.StatusBadGateway,
+			"the target returned no report when asked which schema it would converge, so nothing was converged; see the answering deployment's logs")
+		return true
+	}
+	return s.refuseUnhonoredSchema(w, target, storageSchemaApplyOperation, req.SchemaSource, report)
+}
+
+// refuseUnhonoredConvergence is refuseUnhonoredSchema for an answer that
+// arrives once the DDL has run.
+//
+// The convergence is preceded by a diff that proves the target honors the named
+// schema, so reaching here means the pod that converged is not the pod that
+// answered the diff. A deployment is many pods and a roll makes them different
+// releases, so the check is made again on the answer that matters rather than
+// trusted from the one before it.
+//
+// It is a separate refusal because the remedy is: statements have executed
+// against a schema nobody asked for, and saying only "upgrade that target"
+// would leave an operator to discover that from the database. What ran is
+// named here, and the reports are logged whole, since the response carries an
+// error rather than them.
+func (s *Service) refuseUnhonoredConvergence(w http.ResponseWriter, target *storageSchemaTarget, asked string, planned, remaining *apitypes.StorageSchemaReport) bool {
+	asked = strings.TrimSpace(asked)
+	if asked == "" || planned == nil || planned.SchemaSource == asked {
+		return false
+	}
+	s.logger.Error("a storage convergence ran against a schema the caller did not ask for",
+		"operation", storageSchemaApplyOperation,
+		"deployment", target.deployment,
+		"environment", target.environment,
+		"database", planned.Database,
+		"dialect", planned.Dialect,
+		"asked_schema_source", asked,
+		"converged_schema_source", planned.SchemaSource,
+		"converged_version", planned.Version,
+		"statements_run", storageSchemaStatementsRun(planned),
+		"planned", planned,
+		"remaining", remaining)
+	s.writeError(w, http.StatusBadGateway, fmt.Sprintf(
+		"the target converged %q, not the schema that was asked for: it is running a release that does not accept a named schema and worked from its own embedded files instead, and %d statement(s) have already run against %s. Reconcile that database against the release the target is running before retrying, then upgrade the target or address a release that carries this schema",
+		planned.SchemaSource, storageSchemaStatementsRun(planned), storageSchemaDatabaseLabel(planned)))
+	return true
+}
+
+// storageSchemaStatementsRun is how many statements a convergence executed,
+// which is the outstanding set plus the destructive one wherever the target
+// permitted it. A refused destructive statement did not run, so counting it
+// would overstate what an operator has to reconcile.
+func storageSchemaStatementsRun(planned *apitypes.StorageSchemaReport) int {
+	run := len(planned.Outstanding)
+	if planned.DestructiveAllowed {
+		run += len(planned.Destructive)
+	}
+	return run
+}
+
+// storageSchemaDatabaseLabel names the database a report is about, for an error
+// an operator has to act on. The host is included when the target reported one,
+// since a database name alone does not say which instance to go to.
+func storageSchemaDatabaseLabel(report *apitypes.StorageSchemaReport) string {
+	if report.Host == "" {
+		return report.Database
+	}
+	return report.Database + " on " + report.Host
+}
+
+// refuseUnhonoredSchema stops an answer whose report does not name the schema
+// the caller asked about, where nothing has run yet.
+//
+// A named schema travels as fields on the request, and an instance that
+// predates them ignores what it does not recognize and works from its own
+// embedded files instead — the defined behavior of the wire format, and
+// indistinguishable from success in the response. The report's own schema
+// source is the proof, because the answering side sets it from the schema it
+// actually diffed: honored, it echoes what was sent; ignored, it names the
+// answering binary's own files.
+//
+// Refusing is the only safe reading. A report attributed to the release an
+// operator asked about but computed from another is the input to their decision
+// about whether to pre-apply, and it says the named release's storage is ready
+// when nothing has compared the two. The gap surfaces when that release's pods
+// boot and find their storage short — the failure this command exists to
+// prevent, now with an operator who has been told it cannot happen.
+func (s *Service) refuseUnhonoredSchema(w http.ResponseWriter, target *storageSchemaTarget, operation, asked string, report *apitypes.StorageSchemaReport) bool {
+	asked = strings.TrimSpace(asked)
+	if asked == "" || report == nil || report.SchemaSource == asked {
+		return false
+	}
+	s.logger.Error("refusing a storage schema answer computed from a schema the caller did not ask for",
+		"operation", operation,
+		"deployment", target.deployment,
+		"environment", target.environment,
+		"database", report.Database,
+		"dialect", report.Dialect,
+		"asked_schema_source", asked,
+		"answered_schema_source", report.SchemaSource,
+		"answered_version", report.Version)
+	s.writeError(w, http.StatusBadGateway, fmt.Sprintf(
+		"the target answered about %q, not the schema that was asked for; it is running a release that does not accept a named schema and worked from its own embedded files instead. Upgrade that target, or address a release that carries this schema",
+		report.SchemaSource))
+	return true
+}
+
 // storageSchemaReportResponse converts one wire report to its HTTP form,
 // stamping the target it describes. Stamping here rather than at the source is
 // deliberate: only the control plane knows which route it asked, and an
@@ -376,10 +579,20 @@ const (
 // itself, and the diff after it — so its budget is their sum rather than the
 // bootstrap's alone.
 const (
-	storageSchemaResponseMargin   = 30 * time.Second
-	storageSchemaPlanWriteBudget  = StorageSchemaPlanTimeout + storageSchemaResponseMargin
-	storageSchemaApplyWriteBudget = EnsureSchemaTimeout + 2*StorageSchemaPlanTimeout + storageSchemaResponseMargin
+	storageSchemaResponseMargin  = 30 * time.Second
+	storageSchemaPlanWriteBudget = StorageSchemaPlanTimeout + storageSchemaResponseMargin
 )
+
+// storageSchemaApplyWriteBudget is the write deadline a convergence of the
+// given budget needs. It is a function rather than a constant because the
+// convergence's own budget is now the caller's to name: a deadline pinned to
+// any single value would close the connection under every convergence that
+// asked for longer, which is the exact failure the lift exists to prevent — the
+// DDL runs on server-side while the operator sees a truncated response and
+// cannot tell whether their storage was converged.
+func storageSchemaApplyWriteBudget(convergence time.Duration) time.Duration {
+	return convergence + 2*StorageSchemaPlanTimeout + storageSchemaResponseMargin
+}
 
 // authorizeStorageSchemaOperation gates both storage schema routes on admin
 // membership and reports whether the request may proceed.
@@ -440,19 +653,24 @@ func decodeOptionalStorageSchemaBody[T any](r *http.Request) (T, error) {
 	return req, nil
 }
 
-// validateStorageSchemaPlanRequest refuses a desired schema that is only half
-// supplied. The two fields travel together or not at all: files without a
-// source would produce a report that cannot say what it was diffed against,
-// and a source without files would label this server's own embedded schema
-// with somebody else's name — which is the one way a report of this kind can
-// be actively misleading rather than merely wrong.
-func validateStorageSchemaPlanRequest(req apitypes.StorageSchemaPlanRequest) error {
-	source := strings.TrimSpace(req.SchemaSource)
+// validateStorageSchemaSource refuses a schema that is only half supplied. The
+// two fields travel together or not at all: files without a source would
+// produce a report that cannot say which schema it describes, and a source
+// without files would label this server's own embedded schema with somebody
+// else's name — which is the one way an answer of this kind can be actively
+// misleading rather than merely wrong.
+//
+// Both routes validate through this, because on the convergence route the
+// misattribution is worse than a wrong report. A convergence that ran the
+// embedded schema under a release's name would tell an operator their storage
+// is ready for a release it was never compared against.
+func validateStorageSchemaSource(files map[string]string, schemaSource string) error {
+	source := strings.TrimSpace(schemaSource)
 	switch {
-	case len(req.SchemaFiles) > 0 && source == "":
-		return fmt.Errorf("schema_files was sent without schema_source: a report has to say which schema it was diffed against, so name the source (a release, a directory) alongside the files")
-	case len(req.SchemaFiles) == 0 && source != "":
-		return fmt.Errorf("schema_source %q was sent without schema_files: with no files the diff would run against this server's own embedded schema and report it under that name; send the files, or drop schema_source to ask about the embedded schema", source)
+	case len(files) > 0 && source == "":
+		return fmt.Errorf("schema_files was sent without schema_source: an answer has to say which schema it used, so name the source (a release, a directory) alongside the files")
+	case len(files) == 0 && source != "":
+		return fmt.Errorf("schema_source %q was sent without schema_files: with no files this server's own embedded schema would be used and reported under that name; send the files, or drop schema_source to use the embedded schema", source)
 	default:
 		return nil
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/state"
@@ -100,10 +101,10 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// The reaper is maintenance, not claim work, so it runs outside the driver
 	// pool on cadences of its own. It shares the driver lifecycle: one goroutine
 	// per pass per process, stopped by StopOperator.
-	s.recoveryWg.Go(func() {
+	s.maintenanceWg.Go(func() {
 		s.reaperLoop(driverCtx, stop, reaperEvery, "stranded rows", s.runStrandedReaperPass)
 	})
-	s.recoveryWg.Go(func() {
+	s.maintenanceWg.Go(func() {
 		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 
@@ -119,8 +120,53 @@ func (s *Service) StartOperator(ctx context.Context) {
 		"retryable_expiry_interval", expiryEvery)
 }
 
-// StopOperator stops the background operator and waits for all drivers to finish.
-// Safe to call multiple times.
+// driverDrainTimeout bounds how long StopOperator waits for the cancelled
+// drives to return. A drive inside a cooperative wait returns as soon as its
+// context ends, so the drain is normally over in well under this; the bound is
+// for the drive that does not return at all, blocked in a call that takes no
+// context or in an engine that does not stop when asked.
+//
+// Waiting longer than this does not make such an apply safer. Its lease stops
+// being renewed the moment this process stops driving it, and a peer's stranded
+// reaper reclaims it once the lease expires — so the only thing an unbounded
+// wait buys is a process that cannot exit, which is what delays the reclaim it
+// is waiting for. The value is well inside a typical termination grace period,
+// leaving room for the rest of the shutdown path.
+const driverDrainTimeout = 10 * time.Second
+
+// logAbandonedDrives records the claims left registered by drives that did not
+// return within driverDrainTimeout, naming each apply and operation so an
+// operator can tell which work this process walked away from and which peer
+// picked it up.
+func (s *Service) logAbandonedDrives() {
+	applies := s.heldClaimsSnapshot()
+	operations := s.heldOperationClaimsSnapshot()
+
+	s.logger.Error("drivers did not return within the shutdown drain; their claims are left to expire rather than released, and a peer's stranded reaper reclaims the work once the lease does",
+		"drain_timeout", driverDrainTimeout,
+		"abandoned_applies", len(applies),
+		"abandoned_operations", len(operations))
+
+	for _, claim := range applies {
+		s.logger.Error("abandoned an apply whose driver did not return", append(claim.logAttrs, "deployment", claim.deployment)...)
+	}
+	for _, claim := range operations {
+		s.logger.Error("abandoned an apply operation whose driver did not return", append(claim.logAttrs, "operation_deployment", claim.deployment)...)
+	}
+}
+
+// StopOperator stops the background operator and waits for all drivers to
+// finish, up to driverDrainTimeout. Safe to call multiple times.
+//
+// The stages after the drain — halting engines, collecting claims, handing them
+// back — all assume no drive is still running, so a drain that times out stops
+// there rather than running them against a live drive. What it gives up is
+// releasing the claims promptly; the claims then go stale on their own and are
+// reclaimed the way any lease whose holder disappeared is.
+//
+// Only the drives decide that. The reaper passes stop on the same signal but
+// hold nothing those stages touch, so they are waited on separately and a
+// reaper that overruns its own bound does not hold the drives' cleanup hostage.
 func (s *Service) StopOperator() {
 	s.operatorMu.Lock()
 	if s.stopRecovery == nil {
@@ -151,7 +197,21 @@ func (s *Service) StopOperator() {
 	if cancel != nil {
 		cancel()
 	}
-	s.recoveryWg.Wait()
+	drivesReturned := drain.Wait(&s.recoveryWg, driverDrainTimeout)
+	if !drivesReturned {
+		s.logAbandonedDrives()
+	}
+
+	// The reaper passes hold no claim and drive nothing, so the stages below have
+	// nothing to run against one that is still going. Wait for them apart from
+	// the drives, and let a reaper that does not return cost only its own bound:
+	// deciding the drives' fate on a stuck maintenance pass would leave this
+	// process's engines copying and its healthy claims to expire for nothing.
+	s.drainMonitor(&s.maintenanceWg, "operator_reapers")
+
+	if !drivesReturned {
+		return
+	}
 
 	// A drive returning does not stop the engine it started. An engine that runs
 	// its schema change in this process keeps copying and keeps the target's

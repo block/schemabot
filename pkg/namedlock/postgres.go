@@ -25,10 +25,8 @@ const undoAcquireUnlockTimeout = 5 * time.Second
 
 // Postgres implements Locker with PostgreSQL session-level advisory locks
 // (pg_advisory_lock / pg_advisory_unlock). Like MySQL's GET_LOCK, the lock is
-// bound to the connection's session and is server-wide (advisory lock keys are
-// shared across every database of the instance), so callers must pass the same
-// *sql.Conn to Acquire and Release and keep it open for as long as the lock is
-// held.
+// bound to the connection's session, so callers must pass the same *sql.Conn
+// to Acquire and Release and keep it open for as long as the lock is held.
 //
 // That binding is a property of the connection, not of this type: it holds
 // against a PostgreSQL server, and against a pooler that gives a client its
@@ -42,6 +40,12 @@ const undoAcquireUnlockTimeout = 5 * time.Second
 // advisoryLockKey). A hash collision between two distinct names makes them
 // contend on the same lock — extra serialization, never lost mutual
 // exclusion.
+//
+// The key is scoped to the database the session is connected to, unlike
+// MySQL's server-wide lock names: the same name taken against two databases
+// of one server is two locks here and one lock there. Anything that reports a
+// holder to an operator has to say which, since only one of the two can say
+// that the holder is working on the database it named.
 //
 // Connections must use the pgx driver: the bounded-wait path inspects the
 // driver's typed error to distinguish an elapsed wait from a real failure.
@@ -120,6 +124,34 @@ func (Postgres) Release(ctx context.Context, conn *sql.Conn, name string) (bool,
 		return false, fmt.Errorf("release named lock %q: %w", name, err)
 	}
 	return released, nil
+}
+
+// HeldByAnySession reads pg_locks for the advisory key name hashes to. Unlike
+// the session-scoped probe this shares its query shape with, it does not
+// restrict to the current backend: the holder is expected to be some other
+// instance entirely.
+//
+// The read is scoped to the current database, matching the scope the lock
+// itself has. Dropping that filter would report a convergence of an unrelated
+// database on the same cluster as a convergence of this one, and the caller
+// that renders the answer suppresses its "may be another database" caveat on
+// this dialect precisely because the lock cannot mean that here.
+func (Postgres) HeldByAnySession(ctx context.Context, conn *sql.Conn, name string) (bool, error) {
+	classID, objID := advisoryLockCatalogKey(advisoryLockKey(name))
+	const query = `SELECT EXISTS (
+		SELECT 1 FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND granted
+		  AND objsubid = 1
+		  AND classid::bigint = $1
+		  AND objid::bigint = $2
+		  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+	)`
+	var held bool
+	if err := conn.QueryRowContext(ctx, query, classID, objID).Scan(&held); err != nil {
+		return false, fmt.Errorf("check whether named lock %q is held: %w", name, err)
+	}
+	return held, nil
 }
 
 // advisoryLockKey hashes name into the int64 key space of PostgreSQL advisory

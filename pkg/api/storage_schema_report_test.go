@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -54,6 +55,7 @@ func TestStorageSchemaReport_APIType(t *testing.T) {
 			DDL:       "DROP TABLE `newer_release_state`",
 			Reason:    "DROP TABLE destroys data",
 		}},
+		BootRemovalPolicy: apitypes.BootRemovalPreserves,
 	}
 
 	converted := report.APIType()
@@ -69,6 +71,8 @@ func TestStorageSchemaReport_APIType(t *testing.T) {
 	assert.Equal(t, storageSchemaOpDropTable, converted.Destructive[0].Operation)
 	assert.Equal(t, "DROP TABLE `newer_release_state`", converted.Destructive[0].DDL)
 	assert.Equal(t, "DROP TABLE destroys data", converted.Destructive[0].Reason)
+	assert.Equal(t, apitypes.BootRemovalPreserves, converted.BootRemovalPolicy,
+		"what a boot does to surplus state is what the refusal above means for an operator, so it has to survive the conversion")
 }
 
 // A convergence permitted to run destructive statements runs them, so they
@@ -106,4 +110,30 @@ func TestStorageSchemaReportRemainingCount(t *testing.T) {
 	converged := &StorageSchemaReport{}
 	assert.True(t, converged.Converged())
 	assert.Equal(t, 0, converged.remainingCount())
+}
+
+// A probe that could not read the lock logs a warning, and the warning has to
+// say which storage database went unread: one instance reports on its own
+// storage and on every data plane's, so a line without the identifiers names
+// none of them.
+func TestStorageSchemaReportLogAttrs(t *testing.T) {
+	t.Parallel()
+	report := &StorageSchemaReport{
+		Dialect:  schema.DialectPostgres,
+		Database: "schemabot",
+		Host:     "storage.db.example",
+	}
+	assert.Equal(t, []any{
+		"dialect", schema.DialectPostgres,
+		"database", "schemabot",
+		"host", "storage.db.example",
+	}, report.logAttrs())
+}
+
+// A server that does not report a hostname leaves the key off rather than
+// logging an empty one, which would read as a host nobody can look up.
+func TestStorageSchemaReportLogAttrs_OmitsAnUnreportedHost(t *testing.T) {
+	t.Parallel()
+	report := &StorageSchemaReport{Dialect: schema.DialectMySQL, Database: "schemabot"}
+	assert.NotContains(t, report.logAttrs(), "host")
 }

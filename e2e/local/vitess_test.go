@@ -1603,7 +1603,7 @@ func TestVitess_Apply_DeferDeploy(t *testing.T) {
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
-	planResp, _, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0, nil, false)
+	planResp, _, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0, client.PlanExclusions{}, false)
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanID)
 	require.NotEmpty(t, planResp.Changes, "expected plan to have changes")
@@ -1657,7 +1657,7 @@ func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
-	planResp, _, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0, nil, false)
+	planResp, _, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0, client.PlanExclusions{}, false)
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanID)
 

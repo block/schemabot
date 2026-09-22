@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -233,30 +234,30 @@ postgres:
 `)
 	target, err := resolveStorageTarget("", path, "")
 	require.NoError(t, err)
-	assert.True(t, target.allowDestructive, "the config's standing policy travels with the target")
+	assert.Equal(t, api.DestructivePolicyPermits, target.destructive,
+		"the config's standing policy travels with the target")
 	require.NotNil(t, target.postgresStatementTimeout)
 	assert.Equal(t, 45*time.Second, *target.postgresStatementTimeout)
 
-	// A DSN passed on the command line has no config behind it, so it carries
-	// no policy and the request flag is the only way to widen one.
+	// The same config with the policy left out is a policy that was read and
+	// says no, which is a different answer from one nobody could read.
+	silent := writeStorageTestConfig(t, `
+storage:
+  dialect: postgres
+  dsn: postgres://schemabot@storage-host:5432/schemabot
+`)
+	configured, err := resolveStorageTarget("", silent, "")
+	require.NoError(t, err)
+	assert.Equal(t, api.DestructivePolicyForbids, configured.destructive)
+
+	// A DSN passed on the command line has no config behind it, so nobody can
+	// say what the deployment's boots do. The run itself is still refused, and
+	// the request flag is the only way to widen it.
 	direct, err := resolveStorageTarget("postgres://schemabot@db.example:5432/schemabot", "", "")
 	require.NoError(t, err)
-	assert.False(t, direct.allowDestructive)
+	assert.Equal(t, api.DestructivePolicyUnknown, direct.destructive,
+		"a target with no config behind it has no deployment policy to report")
 	assert.Nil(t, direct.postgresStatementTimeout)
-}
-
-// The request flag only ever widens the target's standing policy. A convergence
-// that narrowed it would refuse statements the deployment's own next boot runs.
-func TestStorageTargetAllowsDestructive_RequestOnlyWidens(t *testing.T) {
-	permissive := &storageTarget{dialect: schema.DialectMySQL, allowDestructive: true}
-	assert.True(t, permissive.allowsDestructive(false),
-		"a config that allows destructive changes is not narrowed by a request without the flag")
-	assert.True(t, permissive.allowsDestructive(true))
-
-	strict := &storageTarget{dialect: schema.DialectMySQL}
-	assert.False(t, strict.allowsDestructive(false))
-	assert.True(t, strict.allowsDestructive(true),
-		"the request flag widens a target with no standing policy")
 }
 
 // A target converges or diffs under the policy it resolved: the family whose
@@ -269,16 +270,14 @@ func TestStorageTargetEnsureSchemaOptions_CarryTheResolvedPolicy(t *testing.T) {
 	budget := 45 * time.Second
 	configured := &storageTarget{
 		dialect:                  schema.DialectPostgres,
-		allowDestructive:         true,
+		destructive:              api.DestructivePolicyPermits,
 		postgresStatementTimeout: &budget,
 	}
 	assert.Equal(t, schema.DialectPostgres, configured.dialect)
-	assert.True(t, configured.allowsDestructive(false), "the config's own policy converges without a flag")
 	assert.Len(t, configured.ensureSchemaOptions(false), 3,
 		"dialect, destructive policy, and the config's statement budget")
 
 	direct := &storageTarget{dialect: schema.DialectMySQL}
-	assert.False(t, direct.allowsDestructive(false))
 	assert.Nil(t, direct.postgresStatementTimeout, "a DSN on the command line carries no config budget")
 	assert.Len(t, direct.ensureSchemaOptions(false), 2,
 		"dialect and destructive policy only, so the package default budget stands")

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
@@ -85,6 +86,32 @@ func PreviewCommentPlanExemptTables() string {
 	})
 }
 
+// PreviewCommentPlanIgnoreTables renders the plan a repository gets once its
+// config withholds a live table nothing declares. The plan is clean, which is
+// where the disclosures carry the most: they are the only evidence on the
+// comment that the table was seen and deliberately left alone rather than
+// missed. The disclosure names the config key the decision is recorded in, so
+// a reviewer can tell a table the config withheld from one an engine exempted
+// for reasons of its own.
+func PreviewCommentPlanIgnoreTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "testapp",
+			Tables:    []string{"flyway_schema_history"},
+			Reason:    "ignore_tables",
+		}},
+	})
+}
+
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {
@@ -110,6 +137,38 @@ func PreviewCommentPlanBlocked() string {
 		BlockedChanges: []BlockedChangeData{
 			{Table: "users", Reason: "dropping primary key is not supported"},
 			{Table: "orders", Reason: "adding foreign key constraints is not supported"},
+		},
+	})
+}
+
+// PreviewCommentPlanBlockedPostgres renders a sample PostgreSQL plan whose
+// refused table carries two independent causes — a planner refusal and the
+// native-safe size ceiling — so the plan comment lists both at plan time,
+// before any apply is attempted.
+func PreviewCommentPlanBlockedPostgres() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE orders ADD COLUMN notes text",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
+				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
+			})},
 		},
 	})
 }
@@ -178,7 +237,7 @@ func PreviewCommentPlanDirect() string {
 		DirectChanges: []DirectChangeData{
 			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
 		},
-		AutoConfirmDowngradeReason: "Plan contains direct-execution changes — review the disclosure and confirm manually",
+		PendingManualConfirmation: true,
 	})
 }
 
@@ -249,7 +308,7 @@ func PreviewCommentPlanCopyDiscardedPaused() string {
 				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
-		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+		PendingManualConfirmation: true,
 	})
 }
 
@@ -287,8 +346,7 @@ func PreviewCommentPlanCopyDiscardedStopped() string {
 				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
-		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
-		StoppedConfirmedApply:      true,
+		PendingManualConfirmation: true,
 	})
 }
 
@@ -403,7 +461,10 @@ func PreviewCommentPlanCopyRunning() string {
 }
 
 // PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
-// plan containing statements the engine refuses.
+// plan containing statements the engine refuses. The table carries two
+// independent causes — a planner refusal and the native-safe size ceiling —
+// which is a PostgreSQL shape: that engine's size gate adds its cause to a
+// step the planner already refused, so both reach the operator at once.
 func PreviewCommentApplyBlockedRejected() string {
 	return RenderBlockedChangesApplyRejected(PlanCommentData{
 		Database:     "testapp",
@@ -412,19 +473,22 @@ func PreviewCommentApplyBlockedRejected() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
-		IsMySQL:      true,
-		DatabaseType: "mysql",
+		IsMySQL:      false,
+		DatabaseType: "postgres",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
 				Statements: []string{
-					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
-					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE orders ADD COLUMN notes text",
 				},
 			},
 		},
 		BlockedChanges: []BlockedChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000"},
+			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
+				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
+			})},
 		},
 	})
 }
@@ -479,6 +543,33 @@ func PreviewCommentPlanDriftClean() string {
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "eu", Primary: true, Class: "match"},
 				{Deployment: "au", Class: "match"},
+				{Deployment: "us", Class: "match"},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanDriftCleanBlocked renders a plan comment whose review-time
+// drift rollup confirmed the reviewed plan on every deployment while one
+// deployment carries a change its target will refuse at apply: the uniform
+// clean line followed by a per-deployment breakdown naming that deployment.
+func PreviewCommentPlanDriftCleanBlocked() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match", Blocked: 1},
 				{Deployment: "us", Class: "match"},
 			},
 		},
@@ -1241,19 +1332,28 @@ func PreviewCommentApplyPlanUnsafe() string {
 // manual confirmation after automatic apply was downgraded by a safety recheck.
 func PreviewCommentApplyPlanDowngraded() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:                   "testapp",
-		SchemaName:                 "testapp",
-		Environment:                "staging",
-		HeadSHA:                    previewHeadSHA,
-		Repository:                 previewRepository,
-		RequestedBy:                previewRequestedBy,
-		IsMySQL:                    true,
-		DatabaseType:               "mysql",
-		Changes:                    samplePlanChanges(),
-		IsLocked:                   true,
-		LockOwner:                  "acme/myapp#42",
-		LockAcquired:               "2026-03-14 10:30:00 UTC",
-		AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+		Database:                  "testapp",
+		SchemaName:                "testapp",
+		Environment:               "staging",
+		HeadSHA:                   previewHeadSHA,
+		Repository:                previewRepository,
+		RequestedBy:               previewRequestedBy,
+		IsMySQL:                   true,
+		DatabaseType:              "mysql",
+		Changes:                   samplePlanChanges(),
+		IsLocked:                  true,
+		LockOwner:                 "acme/myapp#42",
+		LockAcquired:              "2026-03-14 10:30:00 UTC",
+		PendingManualConfirmation: true,
+		PausedApplyCause: &PausedApplyCauseData{
+			Heading: "Schema changes differ from the plan this apply was started from",
+			Entries: []string{
+				"`orders` (alter) runs a different statement than in the plan this apply was started from",
+				"`products` (alter) is in this plan but not in the one this apply was started from",
+				"`shipments` (create) was in the plan this apply was started from but is not in this one",
+			},
+			Remedy: "The statements above are what will run. Review them, then confirm to apply them.",
+		},
 	})
 }
 

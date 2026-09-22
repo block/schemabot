@@ -1441,6 +1441,62 @@ func TestStartDeferredDeployRejectsMixedNamespaces(t *testing.T) {
 	assert.ErrorContains(t, err, apply.ApplyIdentifier)
 }
 
+// planWithheldBookkeepingTable is a stored plan reviewed under an ignore_tables
+// config naming a live bookkeeping table. The table has no declaring schema
+// file, so it is absent from the plan's captured files.
+func planWithheldBookkeepingTable() *storage.Plan {
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+		"testapp": {Tables: []storage.TableChange{{Namespace: "testapp", Table: "users", Operation: "alter"}}},
+	}}
+	plan.RecordIgnoreTables([]string{bookkeepingTable})
+	return plan
+}
+
+// A resume re-plans the reviewed schema set against the live target to decide
+// which tasks still owe work. That re-plan has to be asked for the same
+// exclusions the plan was reviewed under, or it diffs a live schema the
+// reviewed plan never saw: the withheld table has no declaring file, so it
+// comes back as a DROP the reviewed plan cannot contain, and the resume is
+// judging its tasks against a delta that no longer describes the same target.
+func TestReplanTargetSchema_WithheldTablesTravelToTheReplan(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	replanned, err := c.replanTargetSchema(t.Context(), &storage.Apply{Database: "testapp"}, planWithheldBookkeepingTable())
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{bookkeepingTable}, shown,
+		"the re-plan is asked for the exclusions the plan was reviewed under")
+	assert.NotContains(t, replanned, shardTableKey{namespace: "testapp", table: bookkeepingTable},
+		"the withheld table is not remaining work the apply owes")
+}
+
+// The task-reconciling half of resume re-plans the same way and needs the same
+// exclusions, for the same reason: it settles or keeps each task by whether its
+// table is still in the delta, so the delta has to be the reviewed one.
+func TestReplanAndFilterTasks_WithheldTablesTravelToTheReplan(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	tasks := []*storage.Task{{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), &storage.Apply{Database: "testapp"}, tasks, planWithheldBookkeepingTable())
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{bookkeepingTable}, shown,
+		"the re-plan is asked for the exclusions the plan was reviewed under")
+	require.Len(t, rp.ActiveTasks, 1)
+	assert.Zero(t, rp.CompletedCount)
+}
+
 // The local drive resolves the plan from the operation it drives, so a rollout
 // member planned against its own live schema runs its own DDL rather than the
 // reviewed primary's.

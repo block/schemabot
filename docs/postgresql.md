@@ -9,6 +9,7 @@
 - [Blocked plans](#blocked-plans)
 - [Apply-time refusals](#apply-time-refusals)
 - [Unsupported workflow features](#unsupported-workflow-features)
+- [Engine capability mapping](#engine-capability-mapping)
 - [Failure and recovery](#failure-and-recovery)
 - [Configuration and credentials](#configuration-and-credentials)
 - [SchemaBot storage](#schemabot-storage)
@@ -50,6 +51,18 @@ relation options, and table inheritance. If any selected table is refused, no
 partial output is produced. Only basic catalog detail is supported on
 PostgreSQL; a request for detailed catalog output is rejected rather than
 answered with the basic shape.
+
+`schemabot pull --lint` audits each pulled table for the schema-shape rules
+that have a PostgreSQL analog: a missing primary key or a key column whose type
+is not `bigint` or `uuid`, `real` / `double precision` / `float(n)` columns, a
+quoted table name that is not lowercase, and a btree index that another index
+or the primary key already covers. Every finding is a warning, and a clean
+audit returns an empty list for the namespace. Each pulled entry is audited as
+the create set the renderer emits — the `CREATE TABLE` followed by that table's
+`CREATE INDEX` statements — and an entry of any other shape fails the request
+rather than producing a partial audit. The rules and the MySQL-only rules they
+leave out are in
+[lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
 
 ## Supported changes
 
@@ -526,6 +539,51 @@ Pending drops is a MySQL/Spirit quarantine and cleaner. PostgreSQL plans do not
 gain that behavior from enabling the server-level `pending_drops` block.
 PostgreSQL DDL also has no deferred table-swap phase, so deferred cutover is
 rejected before an apply is queued.
+
+## Engine capability mapping
+
+The PostgreSQL engine implements the required `engine.Engine` interface and
+only the optional capabilities listed as implemented below. This table maps
+the interface contract to the behavior described in [Control
+operations](#control-operations), [Unsupported workflow
+features](#unsupported-workflow-features), and [Failure and
+recovery](#failure-and-recovery). `TestOptionalCapabilitySet` in
+[`pkg/engine/postgres/postgres_test.go`](../pkg/engine/postgres/postgres_test.go)
+records one verdict per optional interface and fails when package `engine`
+declares one this table does not classify; `TestCapabilityMappingMatchesEngine`
+beside it reads this table and fails when an optional interface's row states a
+verdict the engine does not hold, or when an `engine.Engine` method has no row.
+The text of the *Why* and *Where* columns is not checked by any test.
+
+A declined operation is refused at one of two layers, and the table says
+which. *Typed decline at drive time* means the request is durably recorded
+and acknowledged by the API, then resolved terminally by the driver when the
+engine returns a typed unsupported-operation error; the operator sees the
+decline in the apply's control history. *Refused at intake* means the API
+rejects the request before any engine is consulted, with a `409` naming the
+engine the operation belongs to; nothing durable is recorded and the engine's
+own decline exists only to satisfy the interface, because the driver calls it
+solely from a state this engine never reports.
+
+| Interface / method | PostgreSQL behavior | Why | Where |
+|---|---|---|---|
+| `engine.Engine.Name` | Implemented | Selects the engine with the stable `postgres` identifier. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.Plan` | Implemented | Plans supported PostgreSQL DDL against the live catalog and blocks statements without a safe native route. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.Apply` | Implemented | Starts bounded native DDL or a greenfield create sequence in this process; a concurrent index build runs outside a transaction as PostgreSQL requires. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.Engine.Progress` | Implemented | Reads the apply record held by this engine instance and augments a running concurrent index build from PostgreSQL's progress view. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.Engine.Stop` | Typed decline at drive time | A concurrent index build has no resumable midpoint, while other statements commit or fail on their own; the durable request resolves terminally and never settles the apply as stopped or cancelled. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go), [`pkg/tern/local_control.go`](../pkg/tern/local_control.go) |
+| `engine.Engine.Cancel` | Implemented for concurrent index builds; typed decline for plain DDL | PostgreSQL can cancel the build backend or its apply context, but plain DDL has no separately managed work to cancel safely. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
+| `engine.Engine.Start` | Typed decline at drive time | Stop cannot create a stopped engine phase, so there is nothing to resume. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go), [`pkg/tern/local_control.go`](../pkg/tern/local_control.go) |
+| `engine.Engine.Cutover` | Typed decline at drive time | DDL changes the target directly; there is no deferred table swap to trigger. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go), [`pkg/tern/local_control.go`](../pkg/tern/local_control.go) |
+| `engine.Engine.Revert` | Refused at intake; typed decline never reached | Each successful statement commits directly and creates no revert window, so the API refuses the request before any engine is consulted and the driver never enters the state from which it would call the engine. | [`pkg/api/control_handlers.go`](../pkg/api/control_handlers.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Engine.SkipRevert` | Refused at intake; typed decline never reached | With no revert window, every committed statement is already permanent; refused at the same intake gate as revert. | [`pkg/api/control_handlers.go`](../pkg/api/control_handlers.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Drainer.Drain` | Implemented | Recovery must wait for in-process apply goroutines before re-planning, then discard their instance-local progress. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.ShutdownHalter.HaltForShutdown` | Implemented | Shutdown cancels in-process concurrent index builds so they do not keep target resources after this instance stops renewing its lease; bounded plain DDL is allowed to finish. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.DeferredCutoverSignalChecker.DeferredCutoverSignalExists` | Not applicable; not implemented | Direct DDL has no deferred cutover gate or durable table-swap signal. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Not applicable; not implemented | PostgreSQL does not create copy tables owned by this engine; cancellation attempts to remove any invalid concurrent index before settling, and a removal that fails is named in the terminal summary for operator follow-up rather than deferred to a generic artifact release. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 
 ## Failure and recovery
 

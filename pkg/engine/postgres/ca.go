@@ -33,9 +33,17 @@ const (
 
 // caCertPath resolves the credentials' CA reference to the bundle path
 // pg-sprite's pool trusts. An absent reference and the embedded RDS bundle
-// both resolve to no path: pg-sprite auto-verifies RDS/Aurora endpoints with
-// its embedded bundle when no path is set, and non-RDS targets keep whatever
-// trust their DSN asked for. A reference the engine cannot honor is refused —
+// both resolve to no path: the pool then keeps the trust the normalized DSN
+// asks for. pg-sprite honors an sslmode the DSN spells as `sslmode=` and only
+// supplies its own RDS verify-full default when it sees none, so the sslmode
+// SchemaBot injects for RDS targets is what the pool dials with. That match
+// holds for the common DSN shapes and not for every one: a keyword DSN that
+// spells the mode with spaces around `=` is explicit to SchemaBot but not to
+// pg-sprite, and the two RDS host checks differ on letter case and on
+// partitions outside the commercial `rds.amazonaws.com` suffix. Both layers
+// complete verify-full without an sslrootcert with the embedded RDS bundle;
+// verify-ca carries pgx's own verifier and is left to the roots the DSN
+// names. A reference the engine cannot honor is refused —
 // an unrecognized CA must never silently downgrade to a different trust root.
 // A file reference must be absolute: a relative path would resolve against
 // the server's working directory and could name an unintended file. A file
@@ -90,6 +98,9 @@ func ConnectionOptions(creds *engine.Credentials) ([]postgresconn.Option, error)
 // DSN's own settings apply. Routing every pool through one constructor keeps
 // the dial sites from drifting apart in what they trust.
 func spritePoolConfig(dsn, caPath string) (dbconn.Config, error) {
+	if err := postgresconn.WarnNonVerifyingRDSTLS(dsn); err != nil {
+		return dbconn.Config{}, fmt.Errorf("judge PostgreSQL DSN for pg-sprite pool: %w", err)
+	}
 	normalized, err := postgresconn.ConnectionDSN(dsn)
 	if err != nil {
 		return dbconn.Config{}, fmt.Errorf("normalize PostgreSQL DSN for pg-sprite pool: %w", err)
@@ -100,10 +111,10 @@ func spritePoolConfig(dsn, caPath string) (dbconn.Config, error) {
 // validationRootCAs builds the postgresconn options that pin the validation
 // connection to the bundle a file: reference names — the same path handed to
 // the pg-sprite pool, so the two connection paths cannot verify against
-// different roots. With no bundle path there is nothing to pin: the
-// validation connection keeps the trust its DSN and the connection layer
-// provide, and the pg-sprite pool applies its own RDS auto-trust. A bundle
-// that cannot be read or parsed is refused here, before any dial.
+// different roots. With no bundle path there is nothing to pin: both the
+// validation connection and the pg-sprite pool keep the trust the normalized
+// DSN and the connection layer provide. A bundle that cannot be read or
+// parsed is refused here, before any dial.
 func validationRootCAs(caPath string) ([]postgresconn.Option, error) {
 	if caPath == "" {
 		return nil, nil

@@ -134,8 +134,12 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces())
 	case PreviewCommentPlanExemptTables:
 		fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables())
+	case PreviewCommentPlanIgnoreTables:
+		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables())
 	case PreviewCommentPlanBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentPlanBlocked())
+	case PreviewCommentPlanBlockedPostgres:
+		fmt.Print(webhooktemplates.PreviewCommentPlanBlockedPostgres())
 	case PreviewCommentPlanDirect:
 		fmt.Print(webhooktemplates.PreviewCommentPlanDirect())
 	case PreviewCommentPlanCopyDiscarded:
