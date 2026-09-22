@@ -747,6 +747,13 @@ func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dial
 // connectStorage runs a single storage boot attempt: resolve the DSN, apply
 // the storage schema, open the pool, and verify it with a ping. It returns the
 // DSN it used so the caller holds the one this pool is dialing.
+//
+// Every step that can block ends when ctx does, so an instance told to stop
+// mid-attempt stops inside the attempt rather than at the end of it. The
+// convergence is the longest of the three and carries a budget of its own,
+// which is what makes that difference a minutes-long one — and it takes the
+// stop as a signal rather than as a context, because it is the one step where
+// only a deliberate stop may reach the work (AV-13).
 func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, string, error) {
 	const pingTimeout = 10 * time.Second
 	dsn, err := cfg.StorageDSN()
@@ -754,6 +761,7 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if err := api.EnsureSchema(dsn, logger,
+		api.WithStopSignal(ctx.Done()),
 		api.WithDestructiveSchemaChangePolicy(api.ConfiguredDestructivePolicy(cfg.Storage.AllowDestructiveSchemaChanges), false),
 		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
 		api.WithDialect(dialect)); err != nil {
