@@ -319,6 +319,69 @@ func (PullCatalogDetail) EnumDescriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{3}
 }
 
+// BootRemovalPolicy is what a boot of the answering deployment does to storage
+// state its own schema does not declare.
+//
+// UNSPECIFIED is a real answer and the reason this is not a bool. A release
+// that predates this field leaves it unset, and so does a caller holding a DSN
+// rather than a deployment's config, so an unset value means the answering side
+// could not say — never that the state is safe. Reading it as "preserved" is
+// how an operator is told to pre-apply storage the next pod will drop.
+type BootRemovalPolicy int32
+
+const (
+	// The answering side did not say. Older releases do not set this field, and
+	// a convergence addressed by DSN alone has no deployment config to read.
+	BootRemovalPolicy_BOOT_REMOVAL_POLICY_UNSPECIFIED BootRemovalPolicy = 0
+	// A boot leaves surplus storage state in place: it either refuses the
+	// removals, or never computes one.
+	BootRemovalPolicy_BOOT_REMOVAL_POLICY_PRESERVES BootRemovalPolicy = 1
+	// A boot drops the tables, columns and indexes its own schema does not
+	// declare.
+	BootRemovalPolicy_BOOT_REMOVAL_POLICY_REMOVES BootRemovalPolicy = 2
+)
+
+// Enum value maps for BootRemovalPolicy.
+var (
+	BootRemovalPolicy_name = map[int32]string{
+		0: "BOOT_REMOVAL_POLICY_UNSPECIFIED",
+		1: "BOOT_REMOVAL_POLICY_PRESERVES",
+		2: "BOOT_REMOVAL_POLICY_REMOVES",
+	}
+	BootRemovalPolicy_value = map[string]int32{
+		"BOOT_REMOVAL_POLICY_UNSPECIFIED": 0,
+		"BOOT_REMOVAL_POLICY_PRESERVES":   1,
+		"BOOT_REMOVAL_POLICY_REMOVES":     2,
+	}
+)
+
+func (x BootRemovalPolicy) Enum() *BootRemovalPolicy {
+	p := new(BootRemovalPolicy)
+	*p = x
+	return p
+}
+
+func (x BootRemovalPolicy) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (BootRemovalPolicy) Descriptor() protoreflect.EnumDescriptor {
+	return file_tern_proto_enumTypes[4].Descriptor()
+}
+
+func (BootRemovalPolicy) Type() protoreflect.EnumType {
+	return &file_tern_proto_enumTypes[4]
+}
+
+func (x BootRemovalPolicy) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use BootRemovalPolicy.Descriptor instead.
+func (BootRemovalPolicy) EnumDescriptor() ([]byte, []int) {
+	return file_tern_proto_rawDescGZIP(), []int{4}
+}
+
 // SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).
 type SchemaFiles struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -4156,24 +4219,17 @@ type StorageSchemaReport struct {
 	// a shadow table until it cuts over. Only true is a finding; false is the
 	// absence of evidence, not a claim that the database is idle.
 	ConvergenceInFlight bool `protobuf:"varint,10,opt,name=convergence_in_flight,json=convergenceInFlight,proto3" json:"convergence_in_flight,omitempty"`
-	// Whether a boot of this deployment converges destructively: whether the
-	// next pod to start would drop the storage tables, columns and indexes its
-	// own schema does not declare, rather than refusing them and converging the
-	// rest.
+	// What the next pod to start does to storage state its own schema does not
+	// declare, which is what says whether state converged ahead of a deploy
+	// survives until that deploy.
 	//
 	// This is a property of the deployment and its dialect, never of the call
 	// that asked. A caller opting in to destructive statements moves
 	// destructive_allowed and leaves this alone, because a boot reads the
-	// deployment's config and has never heard of the request. It is false on a
-	// dialect whose bootstrap is additive-only, whatever that deployment has
-	// configured, since there the boot computes no removal to permit.
-	//
-	// It is what says whether state converged ahead of a deploy survives until
-	// that deploy: refused and left in place, or dropped by the next pod to
-	// start.
-	BootConvergesDestructively bool `protobuf:"varint,11,opt,name=boot_converges_destructively,json=bootConvergesDestructively,proto3" json:"boot_converges_destructively,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	// deployment's config and has never heard of the request.
+	BootRemovalPolicy BootRemovalPolicy `protobuf:"varint,11,opt,name=boot_removal_policy,json=bootRemovalPolicy,proto3,enum=tern.v1.BootRemovalPolicy" json:"boot_removal_policy,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *StorageSchemaReport) Reset() {
@@ -4276,11 +4332,11 @@ func (x *StorageSchemaReport) GetConvergenceInFlight() bool {
 	return false
 }
 
-func (x *StorageSchemaReport) GetBootConvergesDestructively() bool {
+func (x *StorageSchemaReport) GetBootRemovalPolicy() BootRemovalPolicy {
 	if x != nil {
-		return x.BootConvergesDestructively
+		return x.BootRemovalPolicy
 	}
-	return false
+	return BootRemovalPolicy_BOOT_REMOVAL_POLICY_UNSPECIFIED
 }
 
 // StorageSchemaPlanResponse carries the outstanding storage DDL.
@@ -4861,7 +4917,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x1c\n" +
 	"\toperation\x18\x02 \x01(\tR\toperation\x12\x10\n" +
 	"\x03ddl\x18\x03 \x01(\tR\x03ddl\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x84\x04\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x8e\x04\n" +
 	"\x13StorageSchemaReport\x12\x18\n" +
 	"\adialect\x18\x01 \x01(\tR\adialect\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x18\n" +
@@ -4873,8 +4929,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x04host\x18\b \x01(\tR\x04host\x12#\n" +
 	"\rschema_source\x18\t \x01(\tR\fschemaSource\x122\n" +
 	"\x15convergence_in_flight\x18\n" +
-	" \x01(\bR\x13convergenceInFlight\x12@\n" +
-	"\x1cboot_converges_destructively\x18\v \x01(\bR\x1abootConvergesDestructively\"Q\n" +
+	" \x01(\bR\x13convergenceInFlight\x12J\n" +
+	"\x13boot_removal_policy\x18\v \x01(\x0e2\x1a.tern.v1.BootRemovalPolicyR\x11bootRemovalPolicy\"Q\n" +
 	"\x19StorageSchemaPlanResponse\x124\n" +
 	"\x06report\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\x06report\"\xc6\x02\n" +
 	"\x19StorageSchemaApplyRequest\x12+\n" +
@@ -4933,7 +4989,11 @@ const file_tern_proto_rawDesc = "" +
 	"\x17CHANGE_TYPE_CREATE_VIEW\x10\t*T\n" +
 	"\x11PullCatalogDetail\x12\x1d\n" +
 	"\x19PULL_CATALOG_DETAIL_BASIC\x10\x00\x12 \n" +
-	"\x1cPULL_CATALOG_DETAIL_DETAILED\x10\x012\xc5\n" +
+	"\x1cPULL_CATALOG_DETAIL_DETAILED\x10\x01*|\n" +
+	"\x11BootRemovalPolicy\x12#\n" +
+	"\x1fBOOT_REMOVAL_POLICY_UNSPECIFIED\x10\x00\x12!\n" +
+	"\x1dBOOT_REMOVAL_POLICY_PRESERVES\x10\x01\x12\x1f\n" +
+	"\x1bBOOT_REMOVAL_POLICY_REMOVES\x10\x022\xc5\n" +
 	"\n" +
 	"\x04Tern\x12a\n" +
 	"\n" +
@@ -4969,164 +5029,166 @@ func file_tern_proto_rawDescGZIP() []byte {
 	return file_tern_proto_rawDescData
 }
 
-var file_tern_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_tern_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
 var file_tern_proto_msgTypes = make([]protoimpl.MessageInfo, 63)
 var file_tern_proto_goTypes = []any{
 	(Engine)(0),                        // 0: tern.v1.Engine
 	(State)(0),                         // 1: tern.v1.State
 	(ChangeType)(0),                    // 2: tern.v1.ChangeType
 	(PullCatalogDetail)(0),             // 3: tern.v1.PullCatalogDetail
-	(*SchemaFiles)(nil),                // 4: tern.v1.SchemaFiles
-	(*PullSchemaRequest)(nil),          // 5: tern.v1.PullSchemaRequest
-	(*PulledNamespace)(nil),            // 6: tern.v1.PulledNamespace
-	(*NamespaceCatalog)(nil),           // 7: tern.v1.NamespaceCatalog
-	(*TableCatalog)(nil),               // 8: tern.v1.TableCatalog
-	(*ColumnCatalog)(nil),              // 9: tern.v1.ColumnCatalog
-	(*IndexCatalog)(nil),               // 10: tern.v1.IndexCatalog
-	(*ForeignKeyCatalog)(nil),          // 11: tern.v1.ForeignKeyCatalog
-	(*PullSchemaResponse)(nil),         // 12: tern.v1.PullSchemaResponse
-	(*PlanRequest)(nil),                // 13: tern.v1.PlanRequest
-	(*TableChange)(nil),                // 14: tern.v1.TableChange
-	(*SchemaChange)(nil),               // 15: tern.v1.SchemaChange
-	(*LintViolation)(nil),              // 16: tern.v1.LintViolation
-	(*ExistingCopy)(nil),               // 17: tern.v1.ExistingCopy
-	(*ExemptTables)(nil),               // 18: tern.v1.ExemptTables
-	(*ShardPlan)(nil),                  // 19: tern.v1.ShardPlan
-	(*PlanResponse)(nil),               // 20: tern.v1.PlanResponse
-	(*PlanDiffResponse)(nil),           // 21: tern.v1.PlanDiffResponse
-	(*ApplyRequest)(nil),               // 22: tern.v1.ApplyRequest
-	(*ApplyConflict)(nil),              // 23: tern.v1.ApplyConflict
-	(*ApplyResponse)(nil),              // 24: tern.v1.ApplyResponse
-	(*ProgressRequest)(nil),            // 25: tern.v1.ProgressRequest
-	(*LogsRequest)(nil),                // 26: tern.v1.LogsRequest
-	(*ApplyLog)(nil),                   // 27: tern.v1.ApplyLog
-	(*LogsResponse)(nil),               // 28: tern.v1.LogsResponse
-	(*ShardProgress)(nil),              // 29: tern.v1.ShardProgress
-	(*TableProgress)(nil),              // 30: tern.v1.TableProgress
-	(*SettledControlRequest)(nil),      // 31: tern.v1.SettledControlRequest
-	(*ProgressResponse)(nil),           // 32: tern.v1.ProgressResponse
-	(*CutoverRequest)(nil),             // 33: tern.v1.CutoverRequest
-	(*CutoverResponse)(nil),            // 34: tern.v1.CutoverResponse
-	(*RevertRequest)(nil),              // 35: tern.v1.RevertRequest
-	(*RevertResponse)(nil),             // 36: tern.v1.RevertResponse
-	(*SkipRevertRequest)(nil),          // 37: tern.v1.SkipRevertRequest
-	(*SkipRevertResponse)(nil),         // 38: tern.v1.SkipRevertResponse
-	(*HealthRequest)(nil),              // 39: tern.v1.HealthRequest
-	(*HealthResponse)(nil),             // 40: tern.v1.HealthResponse
-	(*StopRequest)(nil),                // 41: tern.v1.StopRequest
-	(*StopResponse)(nil),               // 42: tern.v1.StopResponse
-	(*CancelRequest)(nil),              // 43: tern.v1.CancelRequest
-	(*CancelResponse)(nil),             // 44: tern.v1.CancelResponse
-	(*StartRequest)(nil),               // 45: tern.v1.StartRequest
-	(*StartResponse)(nil),              // 46: tern.v1.StartResponse
-	(*StorageSchemaPlanRequest)(nil),   // 47: tern.v1.StorageSchemaPlanRequest
-	(*StorageSchemaStatement)(nil),     // 48: tern.v1.StorageSchemaStatement
-	(*StorageSchemaReport)(nil),        // 49: tern.v1.StorageSchemaReport
-	(*StorageSchemaPlanResponse)(nil),  // 50: tern.v1.StorageSchemaPlanResponse
-	(*StorageSchemaApplyRequest)(nil),  // 51: tern.v1.StorageSchemaApplyRequest
-	(*StorageSchemaApplyResponse)(nil), // 52: tern.v1.StorageSchemaApplyResponse
-	nil,                                // 53: tern.v1.SchemaFiles.FilesEntry
-	nil,                                // 54: tern.v1.PulledNamespace.TablesEntry
-	nil,                                // 55: tern.v1.PulledNamespace.ArtifactsEntry
-	nil,                                // 56: tern.v1.PulledNamespace.TableCatalogEntry
-	nil,                                // 57: tern.v1.PullSchemaResponse.NamespacesEntry
-	nil,                                // 58: tern.v1.PlanRequest.SchemaFilesEntry
-	nil,                                // 59: tern.v1.TableChange.MetadataEntry
-	nil,                                // 60: tern.v1.SchemaChange.MetadataEntry
-	nil,                                // 61: tern.v1.SchemaChange.OriginalFilesEntry
-	nil,                                // 62: tern.v1.ApplyRequest.OptionsEntry
-	nil,                                // 63: tern.v1.ApplyRequest.SchemaFilesEntry
-	nil,                                // 64: tern.v1.ProgressResponse.MetadataEntry
-	nil,                                // 65: tern.v1.StorageSchemaPlanRequest.SchemaFilesEntry
-	nil,                                // 66: tern.v1.StorageSchemaApplyRequest.SchemaFilesEntry
+	(BootRemovalPolicy)(0),             // 4: tern.v1.BootRemovalPolicy
+	(*SchemaFiles)(nil),                // 5: tern.v1.SchemaFiles
+	(*PullSchemaRequest)(nil),          // 6: tern.v1.PullSchemaRequest
+	(*PulledNamespace)(nil),            // 7: tern.v1.PulledNamespace
+	(*NamespaceCatalog)(nil),           // 8: tern.v1.NamespaceCatalog
+	(*TableCatalog)(nil),               // 9: tern.v1.TableCatalog
+	(*ColumnCatalog)(nil),              // 10: tern.v1.ColumnCatalog
+	(*IndexCatalog)(nil),               // 11: tern.v1.IndexCatalog
+	(*ForeignKeyCatalog)(nil),          // 12: tern.v1.ForeignKeyCatalog
+	(*PullSchemaResponse)(nil),         // 13: tern.v1.PullSchemaResponse
+	(*PlanRequest)(nil),                // 14: tern.v1.PlanRequest
+	(*TableChange)(nil),                // 15: tern.v1.TableChange
+	(*SchemaChange)(nil),               // 16: tern.v1.SchemaChange
+	(*LintViolation)(nil),              // 17: tern.v1.LintViolation
+	(*ExistingCopy)(nil),               // 18: tern.v1.ExistingCopy
+	(*ExemptTables)(nil),               // 19: tern.v1.ExemptTables
+	(*ShardPlan)(nil),                  // 20: tern.v1.ShardPlan
+	(*PlanResponse)(nil),               // 21: tern.v1.PlanResponse
+	(*PlanDiffResponse)(nil),           // 22: tern.v1.PlanDiffResponse
+	(*ApplyRequest)(nil),               // 23: tern.v1.ApplyRequest
+	(*ApplyConflict)(nil),              // 24: tern.v1.ApplyConflict
+	(*ApplyResponse)(nil),              // 25: tern.v1.ApplyResponse
+	(*ProgressRequest)(nil),            // 26: tern.v1.ProgressRequest
+	(*LogsRequest)(nil),                // 27: tern.v1.LogsRequest
+	(*ApplyLog)(nil),                   // 28: tern.v1.ApplyLog
+	(*LogsResponse)(nil),               // 29: tern.v1.LogsResponse
+	(*ShardProgress)(nil),              // 30: tern.v1.ShardProgress
+	(*TableProgress)(nil),              // 31: tern.v1.TableProgress
+	(*SettledControlRequest)(nil),      // 32: tern.v1.SettledControlRequest
+	(*ProgressResponse)(nil),           // 33: tern.v1.ProgressResponse
+	(*CutoverRequest)(nil),             // 34: tern.v1.CutoverRequest
+	(*CutoverResponse)(nil),            // 35: tern.v1.CutoverResponse
+	(*RevertRequest)(nil),              // 36: tern.v1.RevertRequest
+	(*RevertResponse)(nil),             // 37: tern.v1.RevertResponse
+	(*SkipRevertRequest)(nil),          // 38: tern.v1.SkipRevertRequest
+	(*SkipRevertResponse)(nil),         // 39: tern.v1.SkipRevertResponse
+	(*HealthRequest)(nil),              // 40: tern.v1.HealthRequest
+	(*HealthResponse)(nil),             // 41: tern.v1.HealthResponse
+	(*StopRequest)(nil),                // 42: tern.v1.StopRequest
+	(*StopResponse)(nil),               // 43: tern.v1.StopResponse
+	(*CancelRequest)(nil),              // 44: tern.v1.CancelRequest
+	(*CancelResponse)(nil),             // 45: tern.v1.CancelResponse
+	(*StartRequest)(nil),               // 46: tern.v1.StartRequest
+	(*StartResponse)(nil),              // 47: tern.v1.StartResponse
+	(*StorageSchemaPlanRequest)(nil),   // 48: tern.v1.StorageSchemaPlanRequest
+	(*StorageSchemaStatement)(nil),     // 49: tern.v1.StorageSchemaStatement
+	(*StorageSchemaReport)(nil),        // 50: tern.v1.StorageSchemaReport
+	(*StorageSchemaPlanResponse)(nil),  // 51: tern.v1.StorageSchemaPlanResponse
+	(*StorageSchemaApplyRequest)(nil),  // 52: tern.v1.StorageSchemaApplyRequest
+	(*StorageSchemaApplyResponse)(nil), // 53: tern.v1.StorageSchemaApplyResponse
+	nil,                                // 54: tern.v1.SchemaFiles.FilesEntry
+	nil,                                // 55: tern.v1.PulledNamespace.TablesEntry
+	nil,                                // 56: tern.v1.PulledNamespace.ArtifactsEntry
+	nil,                                // 57: tern.v1.PulledNamespace.TableCatalogEntry
+	nil,                                // 58: tern.v1.PullSchemaResponse.NamespacesEntry
+	nil,                                // 59: tern.v1.PlanRequest.SchemaFilesEntry
+	nil,                                // 60: tern.v1.TableChange.MetadataEntry
+	nil,                                // 61: tern.v1.SchemaChange.MetadataEntry
+	nil,                                // 62: tern.v1.SchemaChange.OriginalFilesEntry
+	nil,                                // 63: tern.v1.ApplyRequest.OptionsEntry
+	nil,                                // 64: tern.v1.ApplyRequest.SchemaFilesEntry
+	nil,                                // 65: tern.v1.ProgressResponse.MetadataEntry
+	nil,                                // 66: tern.v1.StorageSchemaPlanRequest.SchemaFilesEntry
+	nil,                                // 67: tern.v1.StorageSchemaApplyRequest.SchemaFilesEntry
 }
 var file_tern_proto_depIdxs = []int32{
-	53, // 0: tern.v1.SchemaFiles.files:type_name -> tern.v1.SchemaFiles.FilesEntry
+	54, // 0: tern.v1.SchemaFiles.files:type_name -> tern.v1.SchemaFiles.FilesEntry
 	3,  // 1: tern.v1.PullSchemaRequest.catalog_detail:type_name -> tern.v1.PullCatalogDetail
-	54, // 2: tern.v1.PulledNamespace.tables:type_name -> tern.v1.PulledNamespace.TablesEntry
-	55, // 3: tern.v1.PulledNamespace.artifacts:type_name -> tern.v1.PulledNamespace.ArtifactsEntry
-	7,  // 4: tern.v1.PulledNamespace.namespace_catalog:type_name -> tern.v1.NamespaceCatalog
-	56, // 5: tern.v1.PulledNamespace.table_catalog:type_name -> tern.v1.PulledNamespace.TableCatalogEntry
-	9,  // 6: tern.v1.TableCatalog.columns:type_name -> tern.v1.ColumnCatalog
-	10, // 7: tern.v1.TableCatalog.indexes:type_name -> tern.v1.IndexCatalog
-	11, // 8: tern.v1.TableCatalog.foreign_keys:type_name -> tern.v1.ForeignKeyCatalog
-	57, // 9: tern.v1.PullSchemaResponse.namespaces:type_name -> tern.v1.PullSchemaResponse.NamespacesEntry
-	58, // 10: tern.v1.PlanRequest.schema_files:type_name -> tern.v1.PlanRequest.SchemaFilesEntry
+	55, // 2: tern.v1.PulledNamespace.tables:type_name -> tern.v1.PulledNamespace.TablesEntry
+	56, // 3: tern.v1.PulledNamespace.artifacts:type_name -> tern.v1.PulledNamespace.ArtifactsEntry
+	8,  // 4: tern.v1.PulledNamespace.namespace_catalog:type_name -> tern.v1.NamespaceCatalog
+	57, // 5: tern.v1.PulledNamespace.table_catalog:type_name -> tern.v1.PulledNamespace.TableCatalogEntry
+	10, // 6: tern.v1.TableCatalog.columns:type_name -> tern.v1.ColumnCatalog
+	11, // 7: tern.v1.TableCatalog.indexes:type_name -> tern.v1.IndexCatalog
+	12, // 8: tern.v1.TableCatalog.foreign_keys:type_name -> tern.v1.ForeignKeyCatalog
+	58, // 9: tern.v1.PullSchemaResponse.namespaces:type_name -> tern.v1.PullSchemaResponse.NamespacesEntry
+	59, // 10: tern.v1.PlanRequest.schema_files:type_name -> tern.v1.PlanRequest.SchemaFilesEntry
 	2,  // 11: tern.v1.TableChange.change_type:type_name -> tern.v1.ChangeType
-	59, // 12: tern.v1.TableChange.metadata:type_name -> tern.v1.TableChange.MetadataEntry
-	14, // 13: tern.v1.SchemaChange.table_changes:type_name -> tern.v1.TableChange
-	60, // 14: tern.v1.SchemaChange.metadata:type_name -> tern.v1.SchemaChange.MetadataEntry
-	61, // 15: tern.v1.SchemaChange.original_files:type_name -> tern.v1.SchemaChange.OriginalFilesEntry
-	14, // 16: tern.v1.ShardPlan.changes:type_name -> tern.v1.TableChange
+	60, // 12: tern.v1.TableChange.metadata:type_name -> tern.v1.TableChange.MetadataEntry
+	15, // 13: tern.v1.SchemaChange.table_changes:type_name -> tern.v1.TableChange
+	61, // 14: tern.v1.SchemaChange.metadata:type_name -> tern.v1.SchemaChange.MetadataEntry
+	62, // 15: tern.v1.SchemaChange.original_files:type_name -> tern.v1.SchemaChange.OriginalFilesEntry
+	15, // 16: tern.v1.ShardPlan.changes:type_name -> tern.v1.TableChange
 	0,  // 17: tern.v1.PlanResponse.engine:type_name -> tern.v1.Engine
-	15, // 18: tern.v1.PlanResponse.changes:type_name -> tern.v1.SchemaChange
-	16, // 19: tern.v1.PlanResponse.lint_violations:type_name -> tern.v1.LintViolation
-	19, // 20: tern.v1.PlanResponse.shards:type_name -> tern.v1.ShardPlan
-	17, // 21: tern.v1.PlanResponse.existing_copies:type_name -> tern.v1.ExistingCopy
-	18, // 22: tern.v1.PlanResponse.exempt_tables:type_name -> tern.v1.ExemptTables
+	16, // 18: tern.v1.PlanResponse.changes:type_name -> tern.v1.SchemaChange
+	17, // 19: tern.v1.PlanResponse.lint_violations:type_name -> tern.v1.LintViolation
+	20, // 20: tern.v1.PlanResponse.shards:type_name -> tern.v1.ShardPlan
+	18, // 21: tern.v1.PlanResponse.existing_copies:type_name -> tern.v1.ExistingCopy
+	19, // 22: tern.v1.PlanResponse.exempt_tables:type_name -> tern.v1.ExemptTables
 	0,  // 23: tern.v1.PlanDiffResponse.engine:type_name -> tern.v1.Engine
-	15, // 24: tern.v1.PlanDiffResponse.changes:type_name -> tern.v1.SchemaChange
-	16, // 25: tern.v1.PlanDiffResponse.lint_violations:type_name -> tern.v1.LintViolation
-	19, // 26: tern.v1.PlanDiffResponse.shards:type_name -> tern.v1.ShardPlan
-	62, // 27: tern.v1.ApplyRequest.options:type_name -> tern.v1.ApplyRequest.OptionsEntry
-	63, // 28: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
-	14, // 29: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange
-	23, // 30: tern.v1.ApplyResponse.conflict:type_name -> tern.v1.ApplyConflict
-	27, // 31: tern.v1.LogsResponse.logs:type_name -> tern.v1.ApplyLog
-	29, // 32: tern.v1.TableProgress.shards:type_name -> tern.v1.ShardProgress
+	16, // 24: tern.v1.PlanDiffResponse.changes:type_name -> tern.v1.SchemaChange
+	17, // 25: tern.v1.PlanDiffResponse.lint_violations:type_name -> tern.v1.LintViolation
+	20, // 26: tern.v1.PlanDiffResponse.shards:type_name -> tern.v1.ShardPlan
+	63, // 27: tern.v1.ApplyRequest.options:type_name -> tern.v1.ApplyRequest.OptionsEntry
+	64, // 28: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
+	15, // 29: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange
+	24, // 30: tern.v1.ApplyResponse.conflict:type_name -> tern.v1.ApplyConflict
+	28, // 31: tern.v1.LogsResponse.logs:type_name -> tern.v1.ApplyLog
+	30, // 32: tern.v1.TableProgress.shards:type_name -> tern.v1.ShardProgress
 	2,  // 33: tern.v1.TableProgress.change_type:type_name -> tern.v1.ChangeType
 	1,  // 34: tern.v1.ProgressResponse.state:type_name -> tern.v1.State
 	0,  // 35: tern.v1.ProgressResponse.engine:type_name -> tern.v1.Engine
-	30, // 36: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
-	64, // 37: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
-	31, // 38: tern.v1.ProgressResponse.settled_control_requests:type_name -> tern.v1.SettledControlRequest
-	65, // 39: tern.v1.StorageSchemaPlanRequest.schema_files:type_name -> tern.v1.StorageSchemaPlanRequest.SchemaFilesEntry
-	48, // 40: tern.v1.StorageSchemaReport.outstanding:type_name -> tern.v1.StorageSchemaStatement
-	48, // 41: tern.v1.StorageSchemaReport.destructive:type_name -> tern.v1.StorageSchemaStatement
-	48, // 42: tern.v1.StorageSchemaReport.manual:type_name -> tern.v1.StorageSchemaStatement
-	49, // 43: tern.v1.StorageSchemaPlanResponse.report:type_name -> tern.v1.StorageSchemaReport
-	66, // 44: tern.v1.StorageSchemaApplyRequest.schema_files:type_name -> tern.v1.StorageSchemaApplyRequest.SchemaFilesEntry
-	49, // 45: tern.v1.StorageSchemaApplyResponse.planned:type_name -> tern.v1.StorageSchemaReport
-	49, // 46: tern.v1.StorageSchemaApplyResponse.remaining:type_name -> tern.v1.StorageSchemaReport
-	8,  // 47: tern.v1.PulledNamespace.TableCatalogEntry.value:type_name -> tern.v1.TableCatalog
-	6,  // 48: tern.v1.PullSchemaResponse.NamespacesEntry.value:type_name -> tern.v1.PulledNamespace
-	4,  // 49: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	4,  // 50: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	5,  // 51: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
-	13, // 52: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
-	13, // 53: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
-	22, // 54: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
-	25, // 55: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
-	26, // 56: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
-	33, // 57: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
-	35, // 58: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
-	37, // 59: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
-	39, // 60: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
-	41, // 61: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
-	43, // 62: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
-	45, // 63: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
-	47, // 64: tern.v1.Tern.StorageSchemaPlan:input_type -> tern.v1.StorageSchemaPlanRequest
-	51, // 65: tern.v1.Tern.StorageSchemaApply:input_type -> tern.v1.StorageSchemaApplyRequest
-	12, // 66: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
-	20, // 67: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
-	21, // 68: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
-	24, // 69: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
-	32, // 70: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
-	28, // 71: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
-	34, // 72: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
-	36, // 73: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
-	38, // 74: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
-	40, // 75: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
-	42, // 76: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
-	44, // 77: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
-	46, // 78: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
-	50, // 79: tern.v1.Tern.StorageSchemaPlan:output_type -> tern.v1.StorageSchemaPlanResponse
-	52, // 80: tern.v1.Tern.StorageSchemaApply:output_type -> tern.v1.StorageSchemaApplyResponse
-	66, // [66:81] is the sub-list for method output_type
-	51, // [51:66] is the sub-list for method input_type
-	51, // [51:51] is the sub-list for extension type_name
-	51, // [51:51] is the sub-list for extension extendee
-	0,  // [0:51] is the sub-list for field type_name
+	31, // 36: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
+	65, // 37: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
+	32, // 38: tern.v1.ProgressResponse.settled_control_requests:type_name -> tern.v1.SettledControlRequest
+	66, // 39: tern.v1.StorageSchemaPlanRequest.schema_files:type_name -> tern.v1.StorageSchemaPlanRequest.SchemaFilesEntry
+	49, // 40: tern.v1.StorageSchemaReport.outstanding:type_name -> tern.v1.StorageSchemaStatement
+	49, // 41: tern.v1.StorageSchemaReport.destructive:type_name -> tern.v1.StorageSchemaStatement
+	49, // 42: tern.v1.StorageSchemaReport.manual:type_name -> tern.v1.StorageSchemaStatement
+	4,  // 43: tern.v1.StorageSchemaReport.boot_removal_policy:type_name -> tern.v1.BootRemovalPolicy
+	50, // 44: tern.v1.StorageSchemaPlanResponse.report:type_name -> tern.v1.StorageSchemaReport
+	67, // 45: tern.v1.StorageSchemaApplyRequest.schema_files:type_name -> tern.v1.StorageSchemaApplyRequest.SchemaFilesEntry
+	50, // 46: tern.v1.StorageSchemaApplyResponse.planned:type_name -> tern.v1.StorageSchemaReport
+	50, // 47: tern.v1.StorageSchemaApplyResponse.remaining:type_name -> tern.v1.StorageSchemaReport
+	9,  // 48: tern.v1.PulledNamespace.TableCatalogEntry.value:type_name -> tern.v1.TableCatalog
+	7,  // 49: tern.v1.PullSchemaResponse.NamespacesEntry.value:type_name -> tern.v1.PulledNamespace
+	5,  // 50: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	5,  // 51: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	6,  // 52: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
+	14, // 53: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
+	14, // 54: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
+	23, // 55: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
+	26, // 56: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
+	27, // 57: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
+	34, // 58: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
+	36, // 59: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
+	38, // 60: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
+	40, // 61: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
+	42, // 62: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
+	44, // 63: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
+	46, // 64: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
+	48, // 65: tern.v1.Tern.StorageSchemaPlan:input_type -> tern.v1.StorageSchemaPlanRequest
+	52, // 66: tern.v1.Tern.StorageSchemaApply:input_type -> tern.v1.StorageSchemaApplyRequest
+	13, // 67: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
+	21, // 68: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
+	22, // 69: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
+	25, // 70: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
+	33, // 71: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
+	29, // 72: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
+	35, // 73: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
+	37, // 74: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
+	39, // 75: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
+	41, // 76: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
+	43, // 77: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
+	45, // 78: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
+	47, // 79: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
+	51, // 80: tern.v1.Tern.StorageSchemaPlan:output_type -> tern.v1.StorageSchemaPlanResponse
+	53, // 81: tern.v1.Tern.StorageSchemaApply:output_type -> tern.v1.StorageSchemaApplyResponse
+	67, // [67:82] is the sub-list for method output_type
+	52, // [52:67] is the sub-list for method input_type
+	52, // [52:52] is the sub-list for extension type_name
+	52, // [52:52] is the sub-list for extension extendee
+	0,  // [0:52] is the sub-list for field type_name
 }
 
 func init() { file_tern_proto_init() }
@@ -5141,7 +5203,7 @@ func file_tern_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tern_proto_rawDesc), len(file_tern_proto_rawDesc)),
-			NumEnums:      4,
+			NumEnums:      5,
 			NumMessages:   63,
 			NumExtensions: 0,
 			NumServices:   1,

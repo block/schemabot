@@ -63,18 +63,63 @@ const MinConvergenceTimeout = time.Second
 // EnsureSchemaOption customizes EnsureSchema behavior.
 type EnsureSchemaOption func(*ensureSchemaOptions)
 
+// DeploymentDestructivePolicy is a deployment's standing decision about
+// destructive storage schema statements — the one every boot of it converges
+// under, which no per-request opt-in moves.
+type DeploymentDestructivePolicy int
+
+const (
+	// DestructivePolicyUnknown is a caller that cannot read the deployment's
+	// decision, which is a convergence addressed by DSN alone: there is a
+	// deployment behind that database and no config here that names its
+	// policy. It permits nothing, so it never widens what runs, and it is
+	// reported as unknown rather than as a refusal, because the two differ
+	// exactly where an operator is deciding whether to pre-apply.
+	DestructivePolicyUnknown DeploymentDestructivePolicy = iota
+	// DestructivePolicyForbids is a deployment whose boots refuse to remove
+	// storage state they do not declare. It is the default a config carries.
+	DestructivePolicyForbids
+	// DestructivePolicyPermits is a deployment that configured
+	// allow_destructive_schema_changes, whose boots run the removals.
+	DestructivePolicyPermits
+)
+
+// String names the policy for a log line, where the underlying integer would
+// leave an operator counting enum members.
+func (p DeploymentDestructivePolicy) String() string {
+	switch p {
+	case DestructivePolicyPermits:
+		return "permits"
+	case DestructivePolicyForbids:
+		return "forbids"
+	case DestructivePolicyUnknown:
+		return "unknown"
+	}
+	return "unknown"
+}
+
+// ConfiguredDestructivePolicy is the standing policy a deployment's config
+// states, for a caller that has read one. A caller holding only a DSN has not,
+// and passes DestructivePolicyUnknown instead of the false this would give it.
+func ConfiguredDestructivePolicy(allowDestructive bool) DeploymentDestructivePolicy {
+	if allowDestructive {
+		return DestructivePolicyPermits
+	}
+	return DestructivePolicyForbids
+}
+
 type ensureSchemaOptions struct {
 	// allowDestructive is the effective policy for this convergence: the
 	// deployment's standing one widened by a caller's opt-in. It decides what
 	// this run does.
 	allowDestructive bool
-	// deploymentAllowsDestructive is the standing policy alone, which is what
-	// every boot of this deployment converges under. It decides nothing here
-	// and is reported, not enforced: it is how a report can say what happens
-	// to state this convergence leaves behind, once this command is over and
-	// the only thing still converging is a pod starting.
-	deploymentAllowsDestructive bool
-	dialect                     schema.Dialect
+	// deploymentDestructive is the standing policy alone, which is what every
+	// boot of this deployment converges under. It decides nothing here and is
+	// reported, not enforced: it is how a report can say what happens to state
+	// this convergence leaves behind, once this command is over and the only
+	// thing still converging is a pod starting.
+	deploymentDestructive DeploymentDestructivePolicy
+	dialect               schema.Dialect
 	// convergenceTimeout bounds one whole convergence: the lock wait, the
 	// diff under it, and the DDL. It defaults to EnsureSchemaTimeout, the
 	// budget a boot needs, so a caller that never considered the question
@@ -115,17 +160,25 @@ type ensureSchemaOptions struct {
 //
 // The two arguments are different facts and the call site has to supply both,
 // which is the reason this takes two rather than the single flag a convergence
-// needs. deployment is the standing policy — wire it from
-// StorageConfig.AllowDestructiveSchemaChanges — and request is one caller's
-// explicit opt-in, which widens that policy for this run and never narrows it.
-// Their disjunction is what this convergence runs under. deployment alone is
-// what the next pod to boot runs under, which is a question a report has to be
-// able to answer and cannot once the two have been merged into one flag. A
-// boot supplies its own config and false: nobody is asking it for anything.
-func WithDestructiveSchemaChangePolicy(deployment, request bool) EnsureSchemaOption {
+// needs. deployment is the standing policy — wire it through
+// ConfiguredDestructivePolicy from StorageConfig.AllowDestructiveSchemaChanges,
+// or pass DestructivePolicyUnknown where there is no config to read — and
+// request is one caller's explicit opt-in, which widens that policy for this
+// run and never narrows it. What this convergence runs under is the standing
+// permission or the request. deployment alone is what the next pod to boot
+// runs under, which is a question a report has to be able to answer and cannot
+// once the two have been merged into one flag. A boot supplies its own config
+// and false: nobody is asking it for anything.
+//
+// They are also different types, so the compiler rejects the transposition.
+// Two bools here would swap silently and leave every gate intact — a gate
+// reads whether either permits, which does not depend on which is which —
+// while the report went on to describe the caller's own flag as the fleet's
+// policy, which is the one mistake this pair exists to make impossible.
+func WithDestructiveSchemaChangePolicy(deployment DeploymentDestructivePolicy, request bool) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) {
-		o.deploymentAllowsDestructive = deployment
-		o.allowDestructive = deployment || request
+		o.deploymentDestructive = deployment
+		o.allowDestructive = deployment == DestructivePolicyPermits || request
 	}
 }
 

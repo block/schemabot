@@ -525,6 +525,24 @@ and moves nothing about the pods around you: their boots read the deployment's
 config and have never heard of your request, so state they would have refused to
 drop they still refuse to drop.
 
+Sometimes there is no policy to report, and the notice says so rather than
+picking the reassuring half of it. A `--dsn` target has no deployment config
+behind it, and a target answering from a release older than the field reports
+nothing for it either. The deployment behind either may be of either kind, so
+confirm which before treating pre-applied state as safe until the deploy — check
+that deployment's
+[`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes),
+or converge as part of the deploy instead. PostgreSQL needs no such check: its
+bootstrap is additive-only on every release, so the notice answers from the
+dialect.
+
+A target too old to accept a named schema is refused rather than answered.
+`--release` and `--schema-dir` travel as request fields a release that predates
+them ignores, converging its own embedded schema instead and reporting success —
+so the CLI checks the schema the report says it used against the one you asked
+for, and fails the command when they differ. Upgrade that target, or address a
+release that carries the schema you are converging.
+
 The convergence gets no more permission than a boot: a statement that would drop
 a storage table or column is refused as it is at startup, and a PostgreSQL
 column shape the convergence will not run still stops the whole set. So a

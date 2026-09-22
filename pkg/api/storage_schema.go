@@ -255,7 +255,7 @@ func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSch
 		// A boot runs the standing policy and nothing this caller sent, so the
 		// two fields part company on exactly the deployment where an operator
 		// opted in to something their fleet has not.
-		BootConvergesDestructively: o.deploymentAllowsDestructive,
+		BootRemovalPolicy: mysqlBootRemovalPolicy(o.deploymentDestructive),
 	}
 
 	// The database identity is what makes the report readable as being about
@@ -334,6 +334,26 @@ func storageSchemaOperation(t ddl.StatementType) (string, error) {
 	}
 }
 
+// mysqlBootRemovalPolicy is what a MySQL boot of this deployment does to
+// storage state its own schema does not declare.
+//
+// The MySQL bootstrap computes the removals and then decides, so the answer is
+// the deployment's standing policy — and a caller who could not read that
+// policy gets an unknown rather than the reassuring half of it. Every case is
+// named, so a policy added later falls to the unknown rather than inheriting
+// whichever answer a default happened to be.
+func mysqlBootRemovalPolicy(deployment DeploymentDestructivePolicy) apitypes.BootRemovalPolicy {
+	switch deployment {
+	case DestructivePolicyPermits:
+		return apitypes.BootRemovalRemoves
+	case DestructivePolicyForbids:
+		return apitypes.BootRemovalPreserves
+	case DestructivePolicyUnknown:
+		return apitypes.BootRemovalUnknown
+	}
+	return apitypes.BootRemovalUnknown
+}
+
 // planPostgresStorageSchema diffs the desired PostgreSQL schema files against
 // the live storage database with the additive convergence's own drift scan, so
 // the report is exactly what ensurePostgresSchema would decide. The convergence
@@ -341,13 +361,17 @@ func storageSchemaOperation(t ddl.StatementType) (string, error) {
 // set; what it does have is the manual-remediation set, whose entries abort a
 // whole convergence pass rather than being skipped.
 func planPostgresStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSource, o ensureSchemaOptions) (*StorageSchemaReport, error) {
-	// Both destructive fields stay false here, and the deployment's standing
-	// policy does not reach either of them. An additive convergence computes no
-	// removal, so there is nothing for a policy to permit: a deployment that
-	// configured the allowance still boots pods that leave surplus storage
-	// state alone. Reporting the config would say a boot drops what it declares
-	// nothing about, which is the one thing this pair exists to answer.
-	report := &StorageSchemaReport{Dialect: schema.DialectPostgres, SchemaSource: desired.Describe()}
+	// DestructiveAllowed stays false and the boot policy is preservation, and
+	// neither reads the deployment's standing policy. An additive convergence
+	// computes no removal, so there is nothing for a policy to permit: a
+	// deployment that configured the allowance still boots pods that leave
+	// surplus storage state alone. This is also why the answer here is known
+	// even when the policy is not — the dialect settles it on its own.
+	report := &StorageSchemaReport{
+		Dialect:           schema.DialectPostgres,
+		SchemaSource:      desired.Describe(),
+		BootRemovalPolicy: apitypes.BootRemovalPreserves,
+	}
 
 	tables, files, err := desired.postgresSchemaFiles()
 	if err != nil {

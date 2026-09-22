@@ -648,25 +648,24 @@ func crossReleaseStorageNotice(report *apitypes.StorageSchemaReport) string {
 // convergence leaves behind, for the deployment and dialect the report
 // describes.
 //
-// It reads BootConvergesDestructively and never DestructiveAllowed. The
-// subject is what happens after this command exits, when the only thing still
-// converging is a pod starting, and a pod converges the deployment's standing
-// policy. The effective policy is this command's alone: an operator who passed
+// It reads BootRemovalPolicy and never DestructiveAllowed. The subject is what
+// happens after this command exits, when the only thing still converging is a
+// pod starting, and a pod converges the deployment's standing policy. The
+// effective policy is this command's alone: an operator who passed
 // --allow-unsafe widened what their own convergence runs and moved nothing
 // about what the fleet's boots do, so reading it here would report a
 // deployment's behavior from a flag the deployment never saw.
+//
+// An unknown policy gets its own answer rather than the reassuring one. It
+// arrives from a release too old to report the field and from a database
+// addressed by DSN alone, and in both cases the deployment behind it may be
+// either kind. Survival is the claim an operator acts on by pre-applying, so it
+// is the claim that has to be earned.
+//
+// PostgreSQL is the one case a dialect answers on its own, so it is read before
+// the policy: an additive-only bootstrap preserves surplus state on every
+// release, including the ones too old to say so.
 func crossReleaseConsequence(report *apitypes.StorageSchemaReport, running string) string {
-	// A deployment whose boots converge destructively drops the surplus this
-	// leaves rather than refusing it. The convergence is still worth running as
-	// part of a deploy; what it is not is something to do in advance, which is
-	// the reason an operator reaches for it.
-	if report.BootConvergesDestructively {
-		return fmt.Sprintf(`  This is not the schema %s converges on boot, and this deployment permits
-  destructive storage changes — so it will not leave what is applied here in
-  place. The next pod to boot %s drops the tables, columns and indexes its own
-  schema does not declare, which is every one of them until that release is
-  deployed. Converge as part of the deploy rather than ahead of it.`, running, running)
-	}
 	// PostgreSQL's bootstrap is additive-only: it walks what its own schema
 	// declares and never computes a removal, so surplus state is not refused so
 	// much as never considered. There is no refusal to log, and no release with
@@ -677,6 +676,30 @@ func crossReleaseConsequence(report *apitypes.StorageSchemaReport, running strin
   tables, columns and indexes applied here survive untouched — and the boot
   says nothing about them, because it never considers removing them.`, running, running)
 	}
+
+	switch report.BootRemovalPolicy {
+	// A deployment whose boots remove surplus state drops what this leaves
+	// rather than refusing it. The convergence is still worth running as part
+	// of a deploy; what it is not is something to do in advance, which is the
+	// reason an operator reaches for it.
+	case apitypes.BootRemovalRemoves:
+		return fmt.Sprintf(`  This is not the schema %s converges on boot, and this deployment permits
+  destructive storage changes — so it will not leave what is applied here in
+  place. The next pod to boot %s drops the tables, columns and indexes its own
+  schema does not declare, which is every one of them until that release is
+  deployed. Converge as part of the deploy rather than ahead of it.`, running, running)
+
+	case apitypes.BootRemovalUnknown:
+		return fmt.Sprintf(`  This is not the schema %s converges on boot, and what its pods do with the
+  difference could not be established: this target was reached without a
+  deployment config to read, or answered from a release that does not report
+  it. A deployment permitting destructive storage changes drops the tables,
+  columns and indexes applied here on the next boot; one that does not keeps
+  them. Confirm which before relying on this: converge as part of the deploy
+  instead, or check %s's storage policy and re-run `+"`storage plan`"+` afterwards to
+  see what survived.`, running, running)
+	}
+
 	return fmt.Sprintf(`  This is not the schema %s converges on boot. Until that release is deployed,
   every pod that boots %s refuses to drop what it does not declare, so the
   tables, columns and indexes applied here survive — and every one of those
@@ -800,8 +823,8 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *sto
 			"source", target.source,
 			"dialect", target.dialect,
 			"schema_source", desired.Describe(),
-			"allow_destructive", target.allowDestructive || cmd.AllowUnsafe,
-			"config_allows_destructive", target.allowDestructive)
+			"allow_destructive", target.destructive == api.DestructivePolicyPermits || cmd.AllowUnsafe,
+			"deployment_destructive_policy", target.destructive)
 		budget, err := cmd.convergenceBudget()
 		if err != nil {
 			return nil, nil, err

@@ -872,8 +872,9 @@ func TestStorageApplyCmd_RefusesAReleaseReadOverPlaintext(t *testing.T) {
 func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{
 		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
-		Version:      "v1.4.0",
-		SchemaSource: "the schema files of release v1.5.0 in block/schemabot",
+		Version:           "v1.4.0",
+		SchemaSource:      "the schema files of release v1.5.0 in block/schemabot",
+		BootRemovalPolicy: apitypes.BootRemovalPreserves,
 	}
 
 	named := storageSchemaConfirmation(report, true)
@@ -908,16 +909,16 @@ func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
 // its bootstrap never computes a removal — so it logs no refusal to grep for
 // and has no release with an index gap to warn about.
 func TestStorageSchemaConfirmation_CrossReleaseNoticePerDeployment(t *testing.T) {
-	report := func(dialect string, bootConvergesDestructively bool) *apitypes.StorageSchemaReport {
+	report := func(dialect string, boot apitypes.BootRemovalPolicy) *apitypes.StorageSchemaReport {
 		return &apitypes.StorageSchemaReport{
 			Dialect: dialect, Database: "schemabot", Host: "db-1.example",
-			Version:                    "v1.4.0",
-			SchemaSource:               "the schema files of release v1.5.0 in block/schemabot",
-			BootConvergesDestructively: bootConvergesDestructively,
+			Version:           "v1.4.0",
+			SchemaSource:      "the schema files of release v1.5.0 in block/schemabot",
+			BootRemovalPolicy: boot,
 		}
 	}
 
-	permitted := storageSchemaConfirmation(report("mysql", true), true)
+	permitted := storageSchemaConfirmation(report("mysql", apitypes.BootRemovalRemoves), true)
 	assert.Contains(t, permitted, "this deployment permits")
 	assert.Contains(t, permitted, "drops the tables, columns and indexes its own",
 		"a deployment that converges destructively undoes what was applied here")
@@ -925,12 +926,55 @@ func TestStorageSchemaConfirmation_CrossReleaseNoticePerDeployment(t *testing.T)
 	assert.NotContains(t, permitted, "refuses to drop what it does not declare",
 		"the refusal the notice normally relies on is exactly what this deployment has turned off")
 
-	postgres := storageSchemaConfirmation(report("postgres", false), true)
+	preserved := storageSchemaConfirmation(report("mysql", apitypes.BootRemovalPreserves), true)
+	assert.Contains(t, preserved, "refuses to drop what it does not declare")
+	assert.Contains(t, preserved, "logs a refused destructive change")
+
+	postgres := storageSchemaConfirmation(report("postgres", apitypes.BootRemovalPreserves), true)
 	assert.Contains(t, postgres, "converges only what its own schema adds")
 	assert.NotContains(t, postgres, "logs a refused destructive change",
 		"an additive-only bootstrap computes no removal, so there is no refusal to log or to grep for")
 	assert.NotContains(t, postgres, "indexes were protected",
 		"the index gap is a MySQL release history, and PostgreSQL has no such window")
+}
+
+// A boot policy nobody could report is answered as such, and never as the
+// reassuring half of it.
+//
+// It arrives two ways: a target addressed by DSN, which has no deployment
+// config to read, and a target answering from a release older than the field,
+// which leaves it at the wire's zero value while answering everything else. In
+// both, the deployment behind it may be either kind, and the one an operator
+// acts on — that pre-applied state survives to the deploy — is the one that has
+// to be earned. PostgreSQL is the exception that needs no policy: an
+// additive-only bootstrap preserves surplus state on every release, including
+// the ones too old to say so.
+func TestStorageSchemaConfirmation_CrossReleaseNoticeWithoutABootPolicy(t *testing.T) {
+	unread := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:      "v1.4.0",
+		SchemaSource: "the schema files of release v1.5.0 in block/schemabot",
+	}
+	require.Equal(t, apitypes.BootRemovalUnknown, unread.BootRemovalPolicy)
+
+	notice := storageSchemaConfirmation(unread, true)
+	assert.Contains(t, notice, "could not be established")
+	assert.Contains(t, notice, "Confirm which before relying on this")
+	assert.NotContains(t, notice, "refuses to drop what it does not declare",
+		"an unread policy must not be rendered as the deployment that keeps what is applied here")
+	assert.NotContains(t, notice, "this deployment permits",
+		"nor as the one that drops it")
+
+	// The same silence on PostgreSQL, where the dialect settles it without a
+	// policy to read.
+	postgres := storageSchemaConfirmation(&apitypes.StorageSchemaReport{
+		Dialect: "postgres", Database: "schemabot", Host: "db-1.example",
+		Version:      "v1.4.0",
+		SchemaSource: "the schema files of release v1.5.0 in block/schemabot",
+	}, true)
+	assert.Contains(t, postgres, "converges only what its own schema adds")
+	assert.NotContains(t, postgres, "could not be established",
+		"an additive-only bootstrap preserves surplus state whether or not the release says so")
 }
 
 // The notice describes what the fleet's own boots do, so it reads the
@@ -951,8 +995,8 @@ func TestStorageSchemaConfirmation_CrossReleaseNoticeIgnoresTheRequestOptIn(t *t
 		SchemaSource: "the schema files of release v1.5.0 in block/schemabot",
 		// --allow-unsafe on a deployment that configured nothing: this run may
 		// drop, and every boot of v1.4.0 still refuses to.
-		DestructiveAllowed:         true,
-		BootConvergesDestructively: false,
+		DestructiveAllowed: true,
+		BootRemovalPolicy:  apitypes.BootRemovalPreserves,
 	}
 
 	notice := storageSchemaConfirmation(optedIn, true)

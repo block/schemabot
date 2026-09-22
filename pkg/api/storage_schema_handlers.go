@@ -189,6 +189,9 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusInternalServerError, "storage schema plan returned no report")
 		return
 	}
+	if s.refuseUnhonoredSchema(w, target, storageSchemaPlanOperation, req.SchemaSource, report) {
+		return
+	}
 	s.writeJSON(w, http.StatusOK, apitypes.StorageSchemaPlanResponse{Report: report})
 }
 
@@ -279,6 +282,14 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 			"has_planned", planned != nil,
 			"has_remaining", remaining != nil)
 		s.writeError(w, http.StatusInternalServerError, "storage schema apply returned an incomplete result; check the target's logs for whether it converged")
+		return
+	}
+	// After the fact, because the answer is the first evidence of what the
+	// target worked from. The convergence has run and it ran that target's own
+	// schema, which is what a boot of it would have run anyway — so nothing is
+	// broken that was not already, and what this prevents is the operator
+	// deploying the named release believing its storage is ready.
+	if s.refuseUnhonoredSchema(w, target, storageSchemaApplyOperation, req.SchemaSource, planned) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, apitypes.StorageSchemaApplyResponse{Planned: planned, Remaining: remaining})
@@ -372,6 +383,44 @@ func (s *Service) writeStorageSchemaFailure(w http.ResponseWriter, err error, su
 	default:
 		s.writeError(w, http.StatusInternalServerError, summary+"; see the answering deployment's logs")
 	}
+}
+
+// refuseUnhonoredSchema stops an answer whose report does not name the schema
+// the caller asked about.
+//
+// A named schema travels as fields on the request, and an instance that
+// predates them ignores what it does not recognize and works from its own
+// embedded files instead — the defined behavior of the wire format, and
+// indistinguishable from success in the response. The report's own schema
+// source is the proof, because the answering side sets it from the schema it
+// actually diffed: honored, it echoes what was sent; ignored, it names the
+// answering binary's own files.
+//
+// Refusing is the only safe reading. On a diff, a report attributed to the
+// release an operator asked about but computed from another is the input to
+// their decision about whether to pre-apply. On a convergence it is worse: the
+// storage was converged to the answering instance's schema, the answer says the
+// named release's storage is ready, and the gap surfaces when that release's
+// pods boot and find it missing — which is the failure this command exists to
+// prevent, now with an operator who has been told it cannot happen.
+func (s *Service) refuseUnhonoredSchema(w http.ResponseWriter, target *storageSchemaTarget, operation, asked string, report *apitypes.StorageSchemaReport) bool {
+	asked = strings.TrimSpace(asked)
+	if asked == "" || report == nil || report.SchemaSource == asked {
+		return false
+	}
+	s.logger.Error("refusing a storage schema answer computed from a schema the caller did not ask for",
+		"operation", operation,
+		"deployment", target.deployment,
+		"environment", target.environment,
+		"database", report.Database,
+		"dialect", report.Dialect,
+		"asked_schema_source", asked,
+		"answered_schema_source", report.SchemaSource,
+		"answered_version", report.Version)
+	s.writeError(w, http.StatusBadGateway, fmt.Sprintf(
+		"the target answered about %q, not the schema that was asked for; it is running a release that does not accept a named schema and worked from its own embedded files instead. Upgrade that target, or address a release that carries this schema",
+		report.SchemaSource))
+	return true
 }
 
 // storageSchemaReportResponse converts one wire report to its HTTP form,

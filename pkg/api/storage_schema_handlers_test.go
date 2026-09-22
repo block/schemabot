@@ -675,3 +675,95 @@ func TestStorageSchemaRoutes_RefuseHalfSuppliedSchema(t *testing.T) {
 		assert.Nil(t, local.applyReq, "nothing converges on a refused request")
 	})
 }
+
+// A target that ignored the named schema is refused, on both routes, rather
+// than answered as though it had honored it.
+//
+// The fields carrying a named schema are new, and the wire format's defined
+// behavior is that an instance predating them drops what it does not recognize
+// and answers from its own embedded files. Nothing in that response says so,
+// which leaves the report's own schema source as the only evidence: honored, it
+// echoes what was asked; ignored, it names the answering binary's schema.
+//
+// A diff read this way is attributed to a release it never compared against,
+// and a convergence is worse — the storage was converged to the wrong schema
+// and reported ready, and the gap surfaces when the named release's pods boot
+// into storage missing what they declare.
+func TestStorageSchemaRoutes_RefuseAnAnswerAboutAnotherSchema(t *testing.T) {
+	const asked = "the schema files of release v1.5.0 in block/schemabot"
+
+	// What a release too old to accept a named schema answers: its own
+	// embedded schema, converged and reported as a success.
+	ignored := func(database string) *ternv1.StorageSchemaReport {
+		report := storageSchemaReportMessage(database)
+		report.SchemaSource = "the schema embedded in v1.4.0"
+		return report
+	}
+	honored := func(database string) *ternv1.StorageSchemaReport {
+		report := storageSchemaReportMessage(database)
+		report.SchemaSource = asked
+		return report
+	}
+
+	files, err := json.Marshal(validStorageSchemaFiles())
+	require.NoError(t, err)
+	body := fmt.Sprintf(`{"schema_source":%q,"schema_files":%s}`, asked, files)
+
+	t.Run("plan", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		svc.SetStorageSchemaService(&fakeStorageSchemaService{
+			planResp: &ternv1.StorageSchemaPlanResponse{Report: ignored("schemabot_storage")},
+		})
+
+		rec := storageSchemaPlanRequestFor(t, svc, body)
+		assert.Equal(t, http.StatusBadGateway, rec.Code, "body: %s", rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "the schema embedded in v1.4.0",
+			"the answer names the schema it really used, which is what tells an operator what happened")
+		assert.Contains(t, rec.Body.String(), "Upgrade that target")
+	})
+
+	t.Run("apply", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		svc.SetStorageSchemaService(&fakeStorageSchemaService{
+			applyResp: &ternv1.StorageSchemaApplyResponse{
+				Planned:   ignored("schemabot_storage"),
+				Remaining: storageSchemaReportMessage("schemabot_storage"),
+			},
+		})
+
+		rec := storageSchemaApplyRequest(t, svc, body)
+		assert.Equal(t, http.StatusBadGateway, rec.Code, "body: %s", rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "the schema embedded in v1.4.0")
+	})
+
+	// A target that echoes the schema it was asked about honored it, and is
+	// answered normally. Without this the guard would refuse every named
+	// convergence rather than the ones that went wrong.
+	t.Run("honored", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		svc.SetStorageSchemaService(&fakeStorageSchemaService{
+			planResp:  &ternv1.StorageSchemaPlanResponse{Report: honored("schemabot_storage")},
+			applyResp: &ternv1.StorageSchemaApplyResponse{Planned: honored("schemabot_storage"), Remaining: honored("schemabot_storage")},
+		})
+
+		plan := storageSchemaPlanRequestFor(t, svc, body)
+		require.Equal(t, http.StatusOK, plan.Code, "body: %s", plan.Body.String())
+		assert.Equal(t, asked, decodePlanResponse(t, plan).Report.SchemaSource)
+
+		apply := storageSchemaApplyRequest(t, svc, body)
+		require.Equal(t, http.StatusOK, apply.Code, "body: %s", apply.Body.String())
+	})
+
+	// A request that named no schema asks about the target's own, so whatever
+	// the target says it used is the right answer by construction.
+	t.Run("no schema named", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		svc.SetStorageSchemaService(&fakeStorageSchemaService{
+			planResp: &ternv1.StorageSchemaPlanResponse{Report: ignored("schemabot_storage")},
+		})
+
+		rec := storageSchemaPlanRequestFor(t, svc, "")
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		assert.Equal(t, "the schema embedded in v1.4.0", decodePlanResponse(t, rec).Report.SchemaSource)
+	})
+}

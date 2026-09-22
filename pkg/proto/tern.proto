@@ -1068,22 +1068,35 @@ message StorageSchemaReport {
   // a shadow table until it cuts over. Only true is a finding; false is the
   // absence of evidence, not a claim that the database is idle.
   bool convergence_in_flight = 10;
-  // Whether a boot of this deployment converges destructively: whether the
-  // next pod to start would drop the storage tables, columns and indexes its
-  // own schema does not declare, rather than refusing them and converging the
-  // rest.
+  // What the next pod to start does to storage state its own schema does not
+  // declare, which is what says whether state converged ahead of a deploy
+  // survives until that deploy.
   //
   // This is a property of the deployment and its dialect, never of the call
   // that asked. A caller opting in to destructive statements moves
   // destructive_allowed and leaves this alone, because a boot reads the
-  // deployment's config and has never heard of the request. It is false on a
-  // dialect whose bootstrap is additive-only, whatever that deployment has
-  // configured, since there the boot computes no removal to permit.
-  //
-  // It is what says whether state converged ahead of a deploy survives until
-  // that deploy: refused and left in place, or dropped by the next pod to
-  // start.
-  bool boot_converges_destructively = 11;
+  // deployment's config and has never heard of the request.
+  BootRemovalPolicy boot_removal_policy = 11;
+}
+
+// BootRemovalPolicy is what a boot of the answering deployment does to storage
+// state its own schema does not declare.
+//
+// UNSPECIFIED is a real answer and the reason this is not a bool. A release
+// that predates this field leaves it unset, and so does a caller holding a DSN
+// rather than a deployment's config, so an unset value means the answering side
+// could not say — never that the state is safe. Reading it as "preserved" is
+// how an operator is told to pre-apply storage the next pod will drop.
+enum BootRemovalPolicy {
+  // The answering side did not say. Older releases do not set this field, and
+  // a convergence addressed by DSN alone has no deployment config to read.
+  BOOT_REMOVAL_POLICY_UNSPECIFIED = 0;
+  // A boot leaves surplus storage state in place: it either refuses the
+  // removals, or never computes one.
+  BOOT_REMOVAL_POLICY_PRESERVES = 1;
+  // A boot drops the tables, columns and indexes its own schema does not
+  // declare.
+  BOOT_REMOVAL_POLICY_REMOVES = 2;
 }
 
 // StorageSchemaPlanResponse carries the outstanding storage DDL.

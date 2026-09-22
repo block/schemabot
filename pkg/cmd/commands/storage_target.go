@@ -37,15 +37,21 @@ type storageTarget struct {
 	dsn     string
 	dialect schema.Dialect
 	source  string
-	// allowDestructive is the deployment's standing storage policy
+	// destructive is the deployment's standing storage policy
 	// (storage.allow_destructive_schema_changes), when the DSN came from a
 	// server config. A boot of that config converges under it, so an operator
 	// convergence against the same database must too — an operator may name
 	// which schema runs, but not the policy it runs under (AV-9), and otherwise
-	// the two would disagree on exactly the deployments that opted in. A DSN
-	// passed on the command line carries no config and so no policy, leaving
-	// --allow-unsafe as the only way to widen it.
-	allowDestructive bool
+	// the two would disagree on exactly the deployments that opted in.
+	//
+	// A DSN passed on the command line carries no config, and that is unknown
+	// rather than forbidding. The two behave alike for what this run may
+	// execute — neither permits anything, so --allow-unsafe stays the only way
+	// to widen it — and differently for what the report may claim, because a
+	// database reached by DSN still belongs to a deployment whose policy nobody
+	// here has read. Reporting that absence as a refusal is how an operator is
+	// told to pre-apply storage their fleet will drop.
+	destructive api.DeploymentDestructivePolicy
 	// postgresStatementTimeout is the config's statement budget, for the same
 	// reason: a convergence run here has to read and write under the budget the
 	// deployment's own bootstrap uses. Nil where no config was loaded, which
@@ -62,7 +68,7 @@ type storageTarget struct {
 func (t *storageTarget) ensureSchemaOptions(requestAllowDestructive bool) []api.EnsureSchemaOption {
 	opts := []api.EnsureSchemaOption{
 		api.WithDialect(t.dialect),
-		api.WithDestructiveSchemaChangePolicy(t.allowDestructive, requestAllowDestructive),
+		api.WithDestructiveSchemaChangePolicy(t.destructive, requestAllowDestructive),
 	}
 	if t.postgresStatementTimeout != nil {
 		opts = append(opts, api.WithPostgresStatementTimeout(*t.postgresStatementTimeout))
@@ -179,7 +185,7 @@ func (c *storageConfig) target() (*storageTarget, error) {
 		dsn:                      dsn,
 		dialect:                  c.dialect,
 		source:                   source,
-		allowDestructive:         c.cfg.Storage.AllowDestructiveSchemaChanges,
+		destructive:              api.ConfiguredDestructivePolicy(c.cfg.Storage.AllowDestructiveSchemaChanges),
 		postgresStatementTimeout: &statementTimeout,
 	}, nil
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	seedutil "github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
@@ -188,7 +189,7 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusTable(t *testing.T) {
 
 	// The same report with destructive changes allowed says the statement would
 	// run, which is what the operator opting in is asking to be told.
-	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithDestructiveSchemaChangePolicy(true, false))
+	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false))
 	require.NoError(t, err)
 	assert.True(t, allowed.DestructiveAllowed)
 	require.Len(t, allowed.Destructive, 1)
@@ -238,7 +239,7 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusIndex(t *testing.T) {
 
 	// An operator who removed the index from the embedded schema on purpose
 	// opts in, and the report then says the statement would run.
-	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithDestructiveSchemaChangePolicy(true, false))
+	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false))
 	require.NoError(t, err)
 	assert.True(t, allowed.DestructiveAllowed)
 	require.Len(t, allowed.Destructive, 1)
@@ -265,27 +266,37 @@ func TestDiffStorageSchemaMySQL_BootPolicyIsNotMovedByTheRequestOptIn(t *testing
 	// A deployment that configured nothing, on the run the destructive gate's
 	// own rerun hint asks for.
 	optedIn, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(),
-		WithDestructiveSchemaChangePolicy(false, true))
+		WithDestructiveSchemaChangePolicy(DestructivePolicyForbids, true))
 	require.NoError(t, err)
 	require.Len(t, optedIn.Destructive, 1, "the surplus index is the drift under test")
 	assert.True(t, optedIn.DestructiveAllowed, "this convergence may drop it")
-	assert.False(t, optedIn.BootConvergesDestructively,
+	assert.Equal(t, apitypes.BootRemovalPreserves, optedIn.BootRemovalPolicy,
 		"and every boot of the deployed release still refuses to, which is what keeps pre-applied state alive")
 
 	// The same drift on a deployment that has permitted destructive storage
 	// changes: here the boots really do drop it, and only the config says so.
 	configured, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(),
-		WithDestructiveSchemaChangePolicy(true, false))
+		WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false))
 	require.NoError(t, err)
 	assert.True(t, configured.DestructiveAllowed)
-	assert.True(t, configured.BootConvergesDestructively)
+	assert.Equal(t, apitypes.BootRemovalRemoves, configured.BootRemovalPolicy)
 
 	// And a deployment that permitted nothing, where neither this run nor a
 	// boot removes anything.
-	neither, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
+	neither, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(),
+		WithDestructiveSchemaChangePolicy(DestructivePolicyForbids, false))
 	require.NoError(t, err)
 	assert.False(t, neither.DestructiveAllowed)
-	assert.False(t, neither.BootConvergesDestructively)
+	assert.Equal(t, apitypes.BootRemovalPreserves, neither.BootRemovalPolicy)
+
+	// A database addressed directly, with no deployment config to read. The
+	// run itself is still refused, but the boot's answer is nobody's to give:
+	// reported as preservation, an operator pre-applying against a fleet that
+	// drops surplus state would be told it survives.
+	unread, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.False(t, unread.DestructiveAllowed, "an unread policy grants this run nothing")
+	assert.Equal(t, apitypes.BootRemovalUnknown, unread.BootRemovalPolicy)
 }
 
 // One table can drift in both directions at once: it misses a column the
