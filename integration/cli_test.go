@@ -189,7 +189,7 @@ legacy_baseline:
   version: 1
   base_commit: 0123456789abcdef0123456789abcdef01234567
   legacy_paths:
-    - "legacy/db/changes"
+    - legacy/db/changes
 `, dbName), string(config))
 
 	tableFile := filepath.Join(schemaDir, dbName, "onboard_users.sql")
