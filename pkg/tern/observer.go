@@ -29,6 +29,15 @@ type ProgressObserver interface {
 	OnTerminal(apply *storage.Apply, tasks []*storage.Task)
 }
 
+// supersededObserver is optionally implemented by observers whose publish
+// authority is an apply lease. Superseded reports that a newer owner claimed
+// the apply and this observer permanently skips its side effects — the poller
+// uses it to stop driving an observer that will never publish again, letting
+// the new owner's observer carry the apply instead.
+type supersededObserver interface {
+	Superseded() bool
+}
+
 // SetObserver registers a progress observer for an apply.
 // Called by the operator before resuming an apply. Safe to call concurrently.
 func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
