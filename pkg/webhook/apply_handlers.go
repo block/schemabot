@@ -274,6 +274,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		HeadSHA:           &schemaResult.HeadSHA,
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		IgnoreTables:      schemaResult.IgnoreTables,
 		SourceTrusted:     true,
 		// The copy disclosure in the comment this plan becomes is what the
 		// operator confirms, and the apply re-checks its own re-plan against
@@ -423,7 +424,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if len(planResp.DirectChanges()) > 0 {
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		commentData.AutoConfirmDowngradeReason = "Plan contains direct-execution changes — review the disclosure and confirm manually"
+		// The direct-execution section above names the statements and what
+		// running them costs, so the footer carries the instruction alone.
+		commentData.PendingManualConfirmation = true
 		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
 			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
 			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
@@ -469,7 +472,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		if headSHA != "" {
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		}
-		commentData.AutoConfirmDowngradeReason = msgCopyDiscardDowngrade
+		// The discard section above names the copies and the remedy, so the
+		// footer carries the instruction alone.
+		commentData.PendingManualConfirmation = true
 		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
 			templates.RenderPlanComment(commentData), "copy-discard downgrade disclosure post failure"); postErr != nil {
 			return true, fmt.Errorf("apply command copy-discard downgrade disclosure %s#%d: %w", repo, pr, postErr)
@@ -484,7 +489,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if planErr != nil || storedPlan == nil {
 		h.logger.Info("automatic apply downgraded: could not load plan for DDL comparison",
 			"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
-		commentData.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
+		commentData.PendingManualConfirmation = true
+		commentData.PausedApplyCause = &templates.PausedApplyCauseData{
+			Heading: "The plan this apply would be checked against could not be read",
+			Remedy: "Nothing has run. The statements above were planned fresh from this pull request; " +
+				"review them, then confirm to apply them.",
+		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 		if checkRunErr != nil {

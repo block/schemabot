@@ -3,10 +3,12 @@ package api
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -255,6 +257,53 @@ func exemptTablesFromProto(groups []*ternv1.ExemptTables) []*apitypes.ExemptTabl
 		})
 	}
 	return result
+}
+
+// withheldTablesFromProto returns the live tables a plan reports it withheld
+// on the repository's instruction, across every namespace and sorted. The
+// planner exempts tables for reasons of its own as well — an engine's archive
+// naming convention — and only the config's own exclusions answer whether a
+// configured entry matched anything.
+func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
+	var tables []string
+	for _, group := range groups {
+		if group == nil || group.Reason != engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		tables = append(tables, group.Tables...)
+	}
+	slices.Sort(tables)
+	return slices.Compact(tables)
+}
+
+// plannedDropsAmong returns the tables from names that the plan proposes
+// dropping, sorted. Callers use it to tell an exclusion that matched nothing
+// because the table is not there from one that matched nothing because the
+// planner was never shown the exclusion at all.
+func plannedDropsAmong(changes []*ternv1.SchemaChange, names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	var dropped []string
+	for _, change := range changes {
+		if change == nil {
+			continue
+		}
+		for _, tc := range change.TableChanges {
+			if tc == nil || tc.ChangeType != ternv1.ChangeType_CHANGE_TYPE_DROP {
+				continue
+			}
+			if wanted[tc.TableName] {
+				dropped = append(dropped, tc.TableName)
+			}
+		}
+	}
+	slices.Sort(dropped)
+	return slices.Compact(dropped)
 }
 
 // existingCopiesFromProto carries the target's unfinished copies through to the

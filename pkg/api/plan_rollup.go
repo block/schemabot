@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
@@ -81,8 +82,11 @@ type DeploymentRollupEntry struct {
 	Target       string
 
 	Class DeploymentClassification
-	Diff  tern.ChangeSetDiff
-	Err   error
+	// Blocked is informational beside drift classification. It does not affect
+	// Clean: apply admission separately refuses changes blocked by the target.
+	Blocked int
+	Diff    tern.ChangeSetDiff
+	Err     error
 }
 
 // PlanRollup aggregates every deployment's review-time classification for a
@@ -217,6 +221,13 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 				entry.Class = DeploymentMatch
 			}
 		}
+		// A blocked count is only as trustworthy as the plan it is read from. An
+		// errored entry's plan is the one the rollup just declared unusable, so
+		// it publishes no count rather than a precise-looking number a reviewer
+		// would read as a real refusal total.
+		if entry.Class != DeploymentErrored {
+			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
+		}
 		entries[i] = entry
 	}
 
@@ -257,4 +268,18 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 		entries[i] = entry
 	}
 	return PlanRollup{Entries: entries, Clean: clean}
+}
+
+// countBlockedChanges counts the table changes the target's engine will refuse
+// at apply. It walks the change set's authoritative representation so a
+// sharded namespace, which the plan carries both collapsed and per shard, is
+// counted once per shard the same way the drift comparison counts it.
+func countBlockedChanges(cs tern.ChangeSet) int {
+	blocked := 0
+	for _, table := range cs.AuthoritativeTableChanges() {
+		if table.GetExecutionMode() == engine.ExecutionModeBlocked {
+			blocked++
+		}
+	}
+	return blocked
 }

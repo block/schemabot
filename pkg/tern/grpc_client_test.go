@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -1296,6 +1297,134 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	require.NotNil(t, progressReq)
 	assert.Equal(t, "remote-dispatched-123", progressReq.ApplyId)
 	assert.Equal(t, "staging", progressReq.Environment)
+}
+
+// A member deployment re-plans the schema files it is handed, against its own
+// catalog, before it applies them. The reviewed `ignore_tables` has to travel
+// with the dispatch for that re-plan to reach the same verdict: a table the
+// repository withheld is live on the member and declared by no schema file, so
+// a member that re-plans without the list proposes dropping it and then fails
+// its own drift check against a plan it can never match.
+func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID: "remote-dispatched-ignore",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-control-queued",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:      "alter",
+		Namespace:      "default",
+		State:          state.Task.Pending,
+	}
+	plan := &storage.Plan{
+		ID:             apply.PlanID,
+		PlanIdentifier: "plan-remote-queued",
+		SchemaFiles: schema.SchemaFiles{
+			"default": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint, `email` varchar(255))"}},
+		},
+		Namespaces: map[string]*storage.NamespacePlanData{"default": {}},
+	}
+	plan.RecordIgnoreTables([]string{"flyway_schema_history", "legacy_audit"})
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans:   &mockPlanStore{plan: plan},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApply(ctx, apply))
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the queued apply to be dispatched to remote Tern")
+	require.Contains(t, req.SchemaFiles, "default")
+	assert.Contains(t, req.SchemaFiles["default"].GetFiles(), "users.sql",
+		"the schema files the member re-plans are what the exclusions qualify")
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit"}, req.IgnoreTables,
+		"the dispatch carries the reviewed entries: without them the member re-plans the withheld tables as drops")
+}
+
+// The VSchema-only dispatch is the other hop that hands a plan to a member, and
+// it carries the plan's schema files so a member without the plan locally can
+// materialize one. The withheld tables belong to that materialized plan for the
+// same reason they belong to the DDL dispatch — a plan reconstructed without
+// them judges drift against a different set of tables than the one reviewed.
+func TestGRPCClient_ResumeApplyOperationVSchemaOnlyDispatchCarriesIgnoreTables(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-vschema-ignore"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              9,
+		ApplyIdentifier: "apply-vschema-only",
+		PlanID:          77,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(61)
+	vschema := `{"sharded":true,"vindexes":{"xxhash":{"type":"xxhash"}}}`
+	plan := &storage.Plan{
+		ID:             apply.PlanID,
+		PlanIdentifier: "plan-vschema-only",
+		SchemaFiles: schema.SchemaFiles{
+			"commerce": {Files: map[string]string{storage.VSchemaArtifactName: vschema}},
+		},
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}},
+		},
+	}
+	plan.RecordIgnoreTables([]string{"flyway_schema_history"})
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{},
+		plans:   &mockPlanStore{plan: plan},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKind: storage.ApplyOperationKindWork,
+				State:         state.ApplyOperation.Pending,
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the work operation to dispatch a VSchema apply to remote Tern")
+	require.Contains(t, req.SchemaFiles, "commerce")
+	assert.Contains(t, req.SchemaFiles["commerce"].GetFiles(), storage.VSchemaArtifactName,
+		"the plan a member materializes is built from these files")
+	assert.Equal(t, []string{"flyway_schema_history"}, req.IgnoreTables,
+		"a member materializing its plan from this dispatch records the reviewed entries with it")
 }
 
 // A shard work operation (key "namespace/shard/table") whose tasks carry no
@@ -6292,7 +6421,9 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 		return &storage.Task{
 			ID: 41, TaskIdentifier: "task-shard-sync", ApplyID: apply.ID,
 			ApplyOperationID: &opID, Namespace: "commerce_sharded", TableName: "customers",
-			State: state.Task.Running,
+			State:         state.Task.Running,
+			ExecutionMode: engine.ExecutionModeDirect,
+			ModeReason:    "instant metadata change",
 		}
 	}
 	remoteTables := func() []*ternv1.TableProgress {
@@ -6330,6 +6461,12 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 		assert.Equal(t, opID, *byShard["-80"].ApplyOperationID)
 		assert.Equal(t, "commerce_sharded", byShard["-80"].Namespace)
 		assert.Equal(t, "customers", byShard["-80"].TableName)
+		// The admission verdict is carried too, so a per-shard row is never
+		// stored without the mode the drive admitted the table under.
+		for shard, row := range byShard {
+			assert.Equal(t, engine.ExecutionModeDirect, row.ExecutionMode, "shard %s", shard)
+			assert.Equal(t, "instant metadata change", row.ModeReason, "shard %s", shard)
+		}
 		assert.Equal(t, int64(100), byShard["-80"].RowsCopied)
 		assert.Equal(t, 100, byShard["-80"].ProgressPercent) // 100/100
 		assert.Equal(t, 25, byShard["80-"].ProgressPercent)  // 50/200

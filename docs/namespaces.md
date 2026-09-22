@@ -8,6 +8,7 @@
 - [Where to Put the Schema Directory](#where-to-put-the-schema-directory)
 - [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
 - [Ignoring Namespaces](#ignoring-namespaces)
+- [Ignoring Tables](#ignoring-tables)
 - [Per-Target Schema Overrides](#per-target-schema-overrides)
 - [Summary](#summary)
 - [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
@@ -311,6 +312,50 @@ the whole database as one unit: an ignored namespace's live tables would
 have no declaring files and the diff would plan them as `DROP TABLE`, the
 inverse of "ignore". SchemaBot refuses this combination, and the plan fails with
 an error asking for a namespace-free DSN or removal of `ignore_namespaces`.
+
+## Ignoring Tables
+
+Some live tables exist in a managed namespace but are not SchemaBot's to manage: a schema-versioning tool's bookkeeping table, a table owned by a third-party framework, a one-off table an operator created by hand. No file declares them, so every one is planned as `DROP TABLE`, and that unsafe change blocks the merge until someone reaches for `--allow-unsafe`, which un-blocks every other drop in the plan too.
+
+Temporary tables are the same case with a schedule attached: a backfill's working copy, a staging table a nightly job creates and drops, anything a process leaves on the target between runs. Whether the plan sees one depends on when it runs, so without an entry the same branch plans a drop on one push and nothing on the next. An entry covers both, since it withholds the table when it is there and is silent when it is not.
+
+List such tables under `ignore_tables` in `schemabot.yaml`:
+
+```yaml
+# schemabot.yaml
+database: commerce
+type: mysql
+ignore_tables:
+  - flyway_schema_history
+  - legacy_audit_log
+```
+
+An ignored table is withheld from the planner's view of the live schema. The plan neither proposes creating it nor proposes dropping it, and an apply never touches it.
+
+### Rules
+
+- Entries are bare table names. Patterns are not supported, so a set of time-partitioned tables needs one entry per table.
+- Entries are not namespace-qualified, so an entry applies to every namespace the plan covers. A name that occurs in two namespaces is withheld in both.
+- `$ENV` substitution does **not** apply. Namespace entries substitute `$ENV` because namespace *directories* are environment-suffixed; table names are not.
+- Matching is exact and case-sensitive. An entry that matches no live table withholds nothing and the plan proceeds, without comment: a table that is not always on the target is the ordinary case, not a mistake. The server logs unmatched entries.
+- On the MySQL-family engines, naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial. Prefer naming the table you mean.
+
+Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. The error names the entries to remove.
+
+### Exclusions are disclosed
+
+Every plan that withheld tables says so: the PR plan comment renders an
+`ℹ️ Ignored tables in namespace … (ignore_tables): …`
+line under the plan summary (also on "no changes" results, so a withheld table
+is distinguishable from a declared one), and the CLI prints the same disclosure
+for `plan` and `apply`. Past five tables the line leads with its count and
+folds the names into a collapsed block, so how many were withheld stays visible
+unexpanded. The reason in parentheses says who withheld the table:
+`ignore_tables` is this config, and the PostgreSQL planner uses the same line
+to disclose the archive-named tables its own naming convention leaves in place.
+When reviewing a PR that *introduces* an `ignore_tables` entry, the disclosure
+plus the config diff is the review surface: the plan stops seeing that table
+from this PR onward.
 
 ## Per-Target Schema Overrides
 

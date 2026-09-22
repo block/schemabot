@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -8,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const exemptLine = "ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`"
+const exemptLine = "ℹ️ Ignored tables in namespace `app` (archive naming): `events_archive_2025_01`, `orders_archive_2024`"
 
 func exemptPlanData() PlanCommentData {
 	return PlanCommentData{
@@ -28,7 +29,7 @@ func TestRenderPlanComment_ExemptTablesDisclosedPerNamespace(t *testing.T) {
 	data.ExemptTables = append(data.ExemptTables, ExemptTablesData{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"})
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, exemptLine)
-	assert.Contains(t, out, "ℹ️ Tables in namespace `audit` exempt from the undeclared-table verdict (archive naming): `logs_archive_2023`")
+	assert.Contains(t, out, "ℹ️ Ignored tables in namespace `audit` (archive naming): `logs_archive_2023`")
 }
 
 func TestRenderPlanComment_ExemptTablesDisclosedOnNoChanges(t *testing.T) {
@@ -44,12 +45,12 @@ func TestRenderPlanComment_ExemptTablesReasonStaysInline(t *testing.T) {
 	data := exemptPlanData()
 	data.ExemptTables[0].Reason = "archive\nnaming `*_archive_*`"
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "exempt from the undeclared-table verdict (archive naming \\`\\*\\_archive\\_\\*\\`): `events_archive_2025_01`")
+	assert.Contains(t, out, "(archive naming \\`\\*\\_archive\\_\\*\\`): `events_archive_2025_01`")
 }
 
 func TestRenderPlanComment_NoExemptTablesNoDisclosure(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{Database: "testapp", Environment: "staging"})
-	assert.NotContains(t, out, "exempt from the undeclared-table verdict")
+	assert.NotContains(t, out, "Ignored tables in namespace")
 }
 
 // A namespace entry that carries no tables is not a disclosure: the no-changes
@@ -118,8 +119,8 @@ func TestRenderMultiEnvPlanComment_ExemptTablesDivergentPerEnv(t *testing.T) {
 		Database: "testapp", Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
 	})
-	assert.Contains(t, out, "ℹ️ **Staging**: tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`")
-	assert.Contains(t, out, "ℹ️ **Production**: tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `orders_archive_2024`")
+	assert.Contains(t, out, "ℹ️ **Staging**: ignored tables in namespace `app` (archive naming): `events_archive_2025_01`, `orders_archive_2024`")
+	assert.Contains(t, out, "ℹ️ **Production**: ignored tables in namespace `app` (archive naming): `orders_archive_2024`")
 	assert.NotContains(t, out, exemptLine)
 }
 
@@ -135,8 +136,8 @@ func TestRenderMultiEnvPlanComment_ExemptTablesSameShapeDifferentNames(t *testin
 		Database: "testapp", Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
 	})
-	assert.Contains(t, out, "ℹ️ **Staging**: tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`")
-	assert.Contains(t, out, "ℹ️ **Production**: tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_02`, `orders_archive_2023`")
+	assert.Contains(t, out, "ℹ️ **Staging**: ignored tables in namespace `app` (archive naming): `events_archive_2025_01`, `orders_archive_2024`")
+	assert.Contains(t, out, "ℹ️ **Production**: ignored tables in namespace `app` (archive naming): `events_archive_2025_02`, `orders_archive_2023`")
 	assert.NotContains(t, out, exemptLine)
 }
 
@@ -177,7 +178,7 @@ func TestRenderMultiEnvPlanComment_ExemptTablesUnderEnvironmentSections(t *testi
 	assert.Contains(t, stagingSection, "1 DDL statement")
 	assert.Contains(t, stagingSection, exemptLine)
 	assert.Contains(t, productionSection, "✅ **No schema changes detected**")
-	assert.Contains(t, productionSection, "ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `orders_archive_2024`")
+	assert.Contains(t, productionSection, "ℹ️ Ignored tables in namespace `app` (archive naming): `orders_archive_2024`")
 	assert.NotContains(t, out, "**Staging**: tables in namespace")
 }
 
@@ -190,6 +191,86 @@ func TestRenderMultiEnvPlanComment_ExemptTablesOnlyInOneEnv(t *testing.T) {
 		Database: "testapp", Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
 	})
-	assert.Equal(t, 1, strings.Count(out, "exempt from the undeclared-table verdict"))
-	assert.Contains(t, out, "ℹ️ **Staging**: tables in namespace `app`")
+	assert.Equal(t, 1, strings.Count(strings.ToLower(out), "ignored tables in namespace"))
+	assert.Contains(t, out, "ℹ️ **Staging**: ignored tables in namespace `app`")
+}
+
+func exemptTableNames(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("events_2026_%02d", i+1)
+	}
+	return names
+}
+
+// A namespace exempting more tables than read comfortably inline leads with
+// its count and folds the names, so the disclosure stays one line tall above
+// the plan while every withheld name stays reachable.
+func TestRenderPlanComment_ManyExemptTablesCollapse(t *testing.T) {
+	tables := exemptTableNames(exemptTablesInlineLimit + 1)
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: tables, Reason: "ignore_tables"}}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, fmt.Sprintf(
+		"<summary>ℹ️ %d ignored tables in namespace <code>app</code> (ignore_tables)</summary>", len(tables)))
+	for _, name := range tables {
+		assert.Contains(t, out, "`"+name+"`")
+	}
+	assert.NotContains(t, out, "ℹ️ Ignored tables in namespace `app`")
+}
+
+// The count rides on the <summary>, which GitHub renders without expanding
+// the block: that a plan withheld tables, and how many, survives a reviewer's
+// first read of the comment even when the names are folded away.
+func TestRenderPlanComment_CollapsedExemptCountVisibleUnexpanded(t *testing.T) {
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: exemptTableNames(9), Reason: "ignore_tables"}}
+	summary, _, found := strings.Cut(RenderPlanComment(data), "</summary>")
+	require.True(t, found)
+	assert.Contains(t, summary, "9 ignored tables in namespace <code>app</code>")
+}
+
+// The fold is for lists long enough to wall the comment. A list at the limit
+// still reads inline, where it costs a reviewer nothing to see.
+func TestRenderPlanComment_ExemptTablesAtLimitStayInline(t *testing.T) {
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: exemptTableNames(exemptTablesInlineLimit), Reason: "ignore_tables"}}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "ℹ️ Ignored tables in namespace `app` (ignore\\_tables): `events_2026_01`")
+	assert.NotContains(t, out, "ignored tables in namespace (ignore_tables)</summary>")
+}
+
+// The folded header is HTML rather than markdown, so a namespace or reason
+// carrying markup is escaped as HTML: neither can close the <summary> early
+// or open a tag of its own.
+func TestRenderPlanComment_CollapsedExemptHeaderEscapesAsHTML(t *testing.T) {
+	data := exemptPlanData()
+	data.ExemptTables = []ExemptTablesData{{
+		Namespace: "app<img src=x>",
+		Tables:    exemptTableNames(exemptTablesInlineLimit + 1),
+		Reason:    "archive <b>naming</b>",
+	}}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "<code>app&lt;img src=x&gt;</code>")
+	assert.Contains(t, out, "(archive &lt;b&gt;naming&lt;/b&gt;)</summary>")
+	assert.NotContains(t, out, "<img src=x>")
+}
+
+// A long list folds under its environment heading too, so one environment's
+// wide exemption cannot wall the all-clean multi-environment comment.
+func TestRenderMultiEnvPlanComment_ManyExemptTablesCollapsePerEnv(t *testing.T) {
+	staging := exemptPlanData()
+	staging.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: exemptTableNames(7), Reason: "ignore_tables"}}
+	production := exemptPlanData()
+	production.Environment = "production"
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	assert.Contains(t, out, "<summary>ℹ️ <b>Staging</b>: 7 ignored tables in namespace <code>app</code> (ignore_tables)</summary>")
+	assert.Contains(t, out, "ℹ️ **Production**: ignored tables in namespace `app`")
 }

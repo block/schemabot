@@ -267,3 +267,114 @@ func TestDisclosureDescribesThisApply(t *testing.T) {
 		})
 	}
 }
+
+// The drift disclosure names what moved, per table, so the operator can see it
+// without diffing two comments themselves. It reports both directions — a
+// change this plan added, and one the plan behind the apply had that this one
+// does not — since either is a reason to look again before confirming.
+func TestPlanDriftCause(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+				{TableName: "products", ChangeType: "alter", DDL: "ALTER TABLE `products` ADD INDEX `idx_sku` (`sku`)"},
+			}},
+		},
+	}
+	storedPlan := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+				{Table: "shipments", Operation: "create", DDL: "CREATE TABLE `shipments` (`id` bigint)"},
+			}},
+		},
+	}
+
+	cause := planDriftCause(planResp, storedPlan)
+
+	assert.Equal(t, "Schema changes differ from the plan this apply was started from", cause.Heading)
+	assert.Equal(t, []string{
+		"`products` (alter) is in this plan but not in the one this apply was started from",
+		"`shipments` (create) was in the plan this apply was started from but is not in this one",
+	}, cause.Entries, "the unchanged `users` alter is not drift and is not listed")
+	assert.Contains(t, cause.Remedy, "The statements above are what will run")
+}
+
+// A re-plan that differs in dozens of changes has already made its point, and
+// listing every one buries the statements the operator came to read.
+func TestPlanDriftCauseCapsTheEntryList(t *testing.T) {
+	var tableChanges []*apitypes.TableChangeResponse
+	for i := range planDriftEntryCap + 3 {
+		tableChanges = append(tableChanges, &apitypes.TableChangeResponse{
+			TableName:  fmt.Sprintf("t%02d", i),
+			ChangeType: "create",
+			DDL:        fmt.Sprintf("CREATE TABLE `t%02d` (`id` bigint)", i),
+		})
+	}
+
+	cause := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{Namespace: "mydb", TableChanges: tableChanges}}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+	)
+
+	assert.Len(t, cause.Entries, planDriftEntryCap+1)
+	assert.Equal(t, "and 3 more changes", cause.Entries[planDriftEntryCap])
+}
+
+// The likeliest drift is an amended statement on a table both plans carry: a
+// commit lands between the plan and the apply that changes the same ALTER. The
+// entry names the table and the operation, so reporting that as an addition and
+// a removal would assert the same change is both present and absent, with the
+// statement that tells them apart left out by design.
+func TestPlanDriftCauseReportsAnAmendedStatementOnce(t *testing.T) {
+	cause := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` varchar(500)"},
+			}},
+		}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` varchar(255)"},
+			}},
+		}},
+	)
+
+	assert.Equal(t, []string{
+		"`orders` (alter) runs a different statement than in the plan this apply was started from",
+	}, cause.Entries)
+}
+
+// Two keyspaces can carry the same table under the same operation, so an entry
+// that named the table alone would report one keyspace's change as another's
+// removal. The namespace appears only when the drift spans more than one.
+func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
+	sameTableTwoKeyspaces := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "shard_a", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
+			}},
+		}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"shard_b": {Tables: []storage.TableChange{
+				{Table: "orders", Operation: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
+			}},
+		}},
+	)
+	assert.Equal(t, []string{
+		"`orders` in `shard_a` (create) is in this plan but not in the one this apply was started from",
+		"`orders` in `shard_b` (create) was in the plan this apply was started from but is not in this one",
+	}, sameTableTwoKeyspaces.Entries)
+
+	oneKeyspace := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
+			}},
+		}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+	)
+	assert.Equal(t, []string{
+		"`orders` (create) is in this plan but not in the one this apply was started from",
+	}, oneKeyspace.Entries)
+}

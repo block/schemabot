@@ -27,6 +27,8 @@ CREATE TABLE `tasks` (
   `checksum_rows_total` bigint DEFAULT '0',
   `throttled` tinyint(1) NOT NULL DEFAULT '0',
   `throttle_reason` varchar(255) NOT NULL DEFAULT '',
+  `execution_mode` varchar(50) NOT NULL DEFAULT '',
+  `mode_reason` text,
   `cutover_attempts` int NOT NULL DEFAULT '0',
   `is_instant` tinyint(1) DEFAULT '0',
   `engine_migration_id` varchar(255) DEFAULT NULL,

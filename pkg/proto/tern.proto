@@ -480,6 +480,13 @@ message PlanRequest {
   // disclosing a discard rather than promising a resume the apply will not
   // perform.
   optional bool grouped_execution = 12;
+  // Live tables the repository's ignore_tables config withholds from the
+  // planner, so a table no schema file declares is not proposed for
+  // DROP TABLE. Matched exactly and case-sensitively against the target's own
+  // catalog, in every namespace the plan covers. The engine discloses what it
+  // actually withheld through exempt_tables on the response, and refuses a
+  // table the config withholds that a schema file also declares.
+  repeated string ignore_tables = 13;
 }
 
 // TableChange represents a DDL change to a table.
@@ -659,6 +666,18 @@ message ApplyRequest {
   // first operation can never terminalize the apply while sibling dispatches
   // are still on their way. Empty means this dispatch is the whole generation.
   repeated string generation_operation_keys = 12;
+  // The ignore_tables config the reviewed plan was planned under, as the plan
+  // recorded it: every entry the planner was asked to withhold, not the subset
+  // that matched a live table where the plan was made. A deployment that
+  // materializes this dispatch re-plans against its own live schema to prove
+  // the reviewed DDL is what it would independently produce; without the same
+  // entries that re-plan sees a withheld table again and proposes dropping it,
+  // so it would refuse an apply that matches the plan exactly. The whole list
+  // travels because a member holds tables the planning target does not: an
+  // entry that matched nothing there still has to withhold here. The plan's
+  // own record travels rather than the current config, so the comparison is
+  // against what was reviewed.
+  repeated string ignore_tables = 13;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a
@@ -1039,6 +1058,13 @@ message StorageSchemaReport {
   // this, because the same live database yields different answers against
   // different releases.
   string schema_source = 9;
+  // Whether some instance held the storage bootstrap lock when the diff was
+  // taken — a pod booting, or another operator's apply. It is what separates
+  // "this DDL is outstanding" from "this DDL is being run right now", which
+  // the statement sets cannot say on their own: a convergence's work lands on
+  // a shadow table until it cuts over. Only true is a finding; false is the
+  // absence of evidence, not a claim that the database is idle.
+  bool convergence_in_flight = 10;
 }
 
 // StorageSchemaPlanResponse carries the outstanding storage DDL.
@@ -1059,6 +1085,21 @@ message StorageSchemaApplyRequest {
   // plane that accepted it, so the data plane's logs attribute the
   // convergence to a person rather than to a control plane.
   string caller = 2;
+  // TimeoutSeconds bounds the whole convergence: the advisory-lock wait, the
+  // diff taken under it, and the DDL. Zero means the caller named no budget,
+  // and the serving instance then runs the convergence under the budget it
+  // boots with rather than under an operator's: a caller that could not name
+  // a budget is one whose wait the serving instance cannot know, and the boot
+  // budget is the one every such caller has always waited out. A control
+  // plane names the budget it resolved on every request, so a convergence
+  // runs under the far larger operator default only because a caller asked
+  // for it and is waiting that long. Raise it only to finish work a boot cannot,
+  // such as an index build over a storage table with a long history: the
+  // convergence holds the bootstrap advisory lock for its whole budget, and a
+  // pod booting in that window fails its own lock wait and does not come up.
+  // A value above the serving instance's maximum is refused rather than
+  // clamped, so a caller is never told a budget it did not get.
+  int64 timeout_seconds = 3;
 }
 
 // StorageSchemaApplyResponse brackets the convergence with the report from

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -470,6 +471,29 @@ type NamespacePlanData struct {
 	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate
 	// keys and the rendered VSchema diff apply-time display shows.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// IgnoreTables is the ignore_tables config the plan was reviewed under: the
+	// entries the planner was asked to withhold, not the subset that matched a
+	// live table here. A re-plan of a stored plan — a rollback, a resume, a
+	// member's drift check — must be asked to withhold the same entries, or a
+	// table this plan never captured comes back as a DROP TABLE proposal, the
+	// inverse of the exclusion the repository asked for.
+	//
+	// The whole list is kept rather than the matched subset because the plan
+	// travels to targets this one never read. An entry that matches nothing on
+	// the deployment that planned still names a table a member holds, and a
+	// member re-planning under the narrower subset would propose dropping it
+	// and then fail its own drift check against a plan that can never match.
+	//
+	// It is the plan's record and not the repository's live config, so editing
+	// schemabot.yaml between plan and apply cannot move an apply-time verdict.
+	//
+	// The exclusions are the plan's, not the namespace's: ignore_tables applies
+	// to every namespace a plan covers, and plan_data is namespace-keyed with
+	// no plan-level slot, so every stored namespace carries the same list and
+	// Plan.IgnoreTables reads their union. A re-plan that rebuilds only some
+	// of the plan's namespaces therefore still withholds all of them.
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
@@ -581,6 +605,47 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 	return result
 }
 
+// RecordIgnoreTables stores the ignore_tables config the plan was reviewed
+// under on every namespace it carries, so a re-plan of this plan — a rollback,
+// a resume, a member's drift check — is asked to withhold the same entries
+// instead of proposing to drop the tables the plan never captured. plan_data is
+// namespace-keyed with no plan-level slot, which is why every namespace carries
+// the whole list; IgnoreTables reads it back.
+func (p *Plan) RecordIgnoreTables(tables []string) {
+	if p == nil || len(tables) == 0 {
+		return
+	}
+	normalized := slices.Clone(tables)
+	sort.Strings(normalized)
+	normalized = slices.Compact(normalized)
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		nsData.IgnoreTables = slices.Clone(normalized)
+	}
+}
+
+// IgnoreTables returns, in sorted order, the ignore_tables entries the plan was
+// reviewed under, across all namespaces. A re-plan of a stored plan passes
+// these back so the tables this plan withheld stay withheld: they were never
+// captured in the plan's original files, so a re-plan that saw them would
+// propose dropping them.
+func (p *Plan) IgnoreTables() []string {
+	if p == nil {
+		return nil
+	}
+	var tables []string
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		tables = append(tables, nsData.IgnoreTables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
+}
+
 // VSchemaNamespaces returns, in sorted order, every namespace in the plan that
 // changes its VSchema.
 func (p *Plan) VSchemaNamespaces() []string {
@@ -653,6 +718,27 @@ func (p *Plan) BlockedChanges() []TableChange {
 		}
 	}
 	return result
+}
+
+// BlockedApplyError returns the operator-facing refusal for a plan containing
+// a blocked change. Keeping this with the whole-plan verdict ensures every
+// admission path gives the same remedy.
+func (p *Plan) BlockedApplyError() error {
+	blocked := p.BlockedChanges()
+	if len(blocked) == 0 {
+		return nil
+	}
+	change := blocked[0]
+	reason := change.ModeReason
+	if reason == "" {
+		reason = "the engine refuses this statement"
+	}
+	// Independent causes are listed one per line so an operator fixing the
+	// first is not surprised by the second on the next attempt.
+	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
+	}
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
 }
 
 // HasOriginalFilesCapture reports whether every stored namespace has an
@@ -1436,7 +1522,12 @@ type Task struct {
 	Throttled bool
 	// ThrottleReason names the signal pausing the work, for display (e.g.
 	// "replica-lag 5s >= 2s"). Empty when Throttled is false.
-	ThrottleReason  string
+	ThrottleReason string
+	// ExecutionMode is the admitting deployment's execution verdict, copied
+	// from the plan change that deployment judged when this task was created.
+	ExecutionMode string
+	// ModeReason is the admitting deployment's reason for ExecutionMode.
+	ModeReason      string
 	CutoverAttempts int // Number of cutover attempts for this shard
 
 	// Execution flags
@@ -1448,6 +1539,12 @@ type Task struct {
 	UpdatedAt   time.Time
 	StartedAt   *time.Time
 	CompletedAt *time.Time
+}
+
+// EngineBlocked reports whether the admitting deployment marked this task's
+// statement blocked by the engine.
+func (t Task) EngineBlocked() bool {
+	return strings.EqualFold(t.ExecutionMode, "blocked")
 }
 
 // TaskFilter specifies criteria for listing tasks.

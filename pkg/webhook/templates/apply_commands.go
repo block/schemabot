@@ -232,11 +232,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		if reason := SanitizeInlineError(c.Reason); reason != "" {
-			fmt.Fprintf(&sb, "- %s: %s\n", table, escapeInlineMarkdown(reason))
-		} else {
-			fmt.Fprintf(&sb, "- %s\n", table)
-		}
+		writeEngineReasonItem(&sb, table, c.Reason)
 	}
 	sb.WriteString("\nFix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n")
 

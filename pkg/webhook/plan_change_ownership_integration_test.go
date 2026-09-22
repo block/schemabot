@@ -91,7 +91,7 @@ func TestE2EPlanFlagsDropOfTableAnOpenPullRequestOwns(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "DROP TABLE", "the plan still shows the diff it computed")
-		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "⚠️ **Check before applying**")
 		assert.Contains(t, body, "`reconcile_state`")
 		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
 		assert.Contains(t, body, "▶️ **To apply**",
@@ -140,7 +140,7 @@ func TestE2EPlanFlagsDroppedColumnOnTableAnOpenPullRequestOwns(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "DROP COLUMN", "the plan still shows the diff it computed")
-		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "⚠️ **Check before applying**")
 		assert.Contains(t, body, "`users`", "the notice names the table, the grain task history records")
 		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
 		assert.Contains(t, body, "▶️ **To apply**")
@@ -186,7 +186,7 @@ func TestE2EPlanOffersDropWhenTheOwningPullRequestIsClosed(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "DROP TABLE")
-		assert.NotContains(t, body, "🛑 **Check before applying**")
+		assert.NotContains(t, body, "⚠️ **Check before applying**")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the plan comment")
@@ -226,7 +226,7 @@ func TestE2EPlanFlagsDropAsUnresolvedWhenOwnershipLookupFails(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "⚠️ **Check before applying**")
 		assert.Contains(t, body, "`reconcile_state`")
 		assert.Contains(t, body, "ownership could not be established")
 		assert.NotContains(t, body, ownershipLookupFailureMessage, "a public comment must not carry the raw lookup error")
@@ -276,7 +276,7 @@ func TestE2EPlanOffersDropOfATableThisPullRequestApplied(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "DROP TABLE")
 		assert.Contains(t, body, "`reconcile_state`")
-		assert.NotContains(t, body, "🛑 **Check before applying**",
+		assert.NotContains(t, body, "⚠️ **Check before applying**",
 			"a pull request undoing its own applied change owes no attribution notice")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
@@ -323,7 +323,7 @@ func TestE2EPlanFlagsDropAsUnresolvedWhenTheOwningPullRequestCannotBeRead(t *tes
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "⚠️ **Check before applying**")
 		assert.Contains(t, body, "`reconcile_state`")
 		assert.Contains(t, body, "ownership could not be established")
 		assert.NotContains(t, body, "octocat/hello-world#2",
@@ -373,7 +373,7 @@ func TestE2EUnsafeBlockedApplyDisclosesAttributedChange(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Unsafe")
-		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "⚠️ **Check before applying**")
 		assert.Contains(t, body, "`reconcile_state`")
 		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
 		assert.Contains(t, body, "--allow-unsafe",

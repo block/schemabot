@@ -174,6 +174,11 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		Environment: req.Environment,
 		Target:      target.Target,
 		SchemaPath:  trustedSchemaPath,
+		// The exclusions travel with every member's diff. An ignored namespace
+		// is already absent from SchemaFiles, but an ignored table lives on the
+		// target, so a member asked without the list would diff tables the
+		// primary withheld and report them as drift the primary does not have.
+		IgnoreTables: req.IgnoreTables,
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest

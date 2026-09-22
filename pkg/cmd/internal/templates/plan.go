@@ -93,8 +93,12 @@ func WritePlanHeader(data PlanHeaderData) {
 // DDLChange represents a single DDL change with its type.
 type DDLChange struct {
 	ChangeType string // "CREATE", "ALTER", "DROP"
-	TableName  string
-	DDL        string
+	// Namespace is the schema (MySQL/PostgreSQL) or keyspace (Vitess) the
+	// table lives in. It keeps equal table names in two namespaces apart in
+	// the summary counts; callers that render one namespace may leave it empty.
+	Namespace string
+	TableName string
+	DDL       string
 }
 
 // NamespaceChange groups DDL and VSchema changes for a single namespace (keyspace/schema).
@@ -324,44 +328,7 @@ func extractAlterClause(ddl string) string {
 
 // WritePlanSummary writes the Terraform-style summary line.
 func WritePlanSummary(changes []DDLChange) {
-	creates := 0
-	alters := 0
-	drops := 0
-
-	for _, c := range changes {
-		switch strings.ToUpper(c.ChangeType) {
-		case "CHANGE_TYPE_CREATE", "CREATE":
-			creates++
-		case "CHANGE_TYPE_ALTER", "ALTER":
-			alters++
-		case "CHANGE_TYPE_DROP", "DROP":
-			drops++
-		}
-	}
-
-	var parts []string
-	if creates > 0 {
-		word := "table"
-		if creates > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to create", creates, word))
-	}
-	if alters > 0 {
-		word := "table"
-		if alters > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, word))
-	}
-	if drops > 0 {
-		word := "table"
-		if drops > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, word))
-	}
-
+	parts := ddlSummaryParts(changes)
 	if len(parts) > 0 {
 		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
 	}
@@ -376,42 +343,7 @@ type VSchemaChange struct {
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
 func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
-	creates := 0
-	alters := 0
-	drops := 0
-	for _, c := range ddlChanges {
-		switch strings.ToUpper(c.ChangeType) {
-		case "CHANGE_TYPE_CREATE", "CREATE":
-			creates++
-		case "CHANGE_TYPE_ALTER", "ALTER":
-			alters++
-		case "CHANGE_TYPE_DROP", "DROP":
-			drops++
-		}
-	}
-
-	var parts []string
-	if creates > 0 {
-		word := "table"
-		if creates > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to create", creates, word))
-	}
-	if alters > 0 {
-		word := "table"
-		if alters > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, word))
-	}
-	if drops > 0 {
-		word := "table"
-		if drops > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, word))
-	}
+	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
 		if len(vschemaChanges) > 1 {
@@ -424,6 +356,22 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
 		fmt.Println()
 	}
+}
+
+// ddlSummaryParts builds the create/alter/drop clauses of the plan summary.
+// Statements outside those buckets (indexes, types, extensions, comments)
+// still run, so a mixed plan names them alongside the table counts, and a plan
+// made only of them reports its raw statement total so it never reads as "no
+// changes".
+func ddlSummaryParts(changes []DDLChange) []string {
+	var counts ui.PlanCounts
+	for _, c := range changes {
+		// ChangeType arrives either bare ("ALTER") or with the proto enum
+		// prefix ("CHANGE_TYPE_ALTER"); both name the same operation.
+		op := strings.ToLower(strings.TrimPrefix(strings.ToUpper(c.ChangeType), "CHANGE_TYPE_"))
+		counts.AddTable(c.Namespace, op, c.TableName)
+	}
+	return ui.PlanSummaryParts(counts, len(changes), false)
 }
 
 // WriteOptions writes the options section if any flags are set.
@@ -495,17 +443,17 @@ func WriteIgnoredNamespaces(ignored, unmatched []string) {
 	}
 }
 
-// WriteExemptTables disclosure: one line per namespace whose live tables the
-// plan exempted from the undeclared-table verdict, so a reader can tell an
-// exempted table from a declared one. No-op when nothing was exempted, which
-// is the ordinary case.
+// WriteExemptTables disclosure: one line per namespace holding live tables no
+// schema file declares that the plan leaves in place rather than dropping, so
+// a reader can tell an exempted table from a declared one. No-op when nothing
+// was exempted, which is the ordinary case.
 func WriteExemptTables(groups []*apitypes.ExemptTablesResponse) {
 	wrote := false
 	for _, group := range groups {
 		if group == nil || len(group.Tables) == 0 {
 			continue
 		}
-		fmt.Printf(glyph.Info+"  Tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n",
+		fmt.Printf(glyph.Info+"  Ignored tables in namespace %s (%s): %s\n",
 			group.Namespace, group.Reason, strings.Join(group.Tables, ", "))
 		wrote = true
 	}

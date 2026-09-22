@@ -205,6 +205,18 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 	if !s.authorizeStorageSchemaOperation(w, r, storageSchemaApplyOperation) {
 		return
 	}
+	// A request naming no budget runs under the boot's. SchemaBot's own client
+	// always names one, so this is a caller that could not — and the boot
+	// budget is the one such a caller can wait out, where the operator default
+	// would hold the bootstrap lock for an hour after it had given up.
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds, EnsureSchemaTimeout)
+	if err != nil {
+		s.logger.Warn("rejecting storage schema convergence because its timeout is out of range",
+			"deployment", req.Deployment, "environment", req.Environment,
+			"timeout_seconds", req.TimeoutSeconds, "error", err)
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds: %s", err))
+		return
+	}
 	target, err := s.resolveStorageSchemaTarget(req.Deployment, req.Environment)
 	if err != nil {
 		s.refuseStorageSchemaTarget(w, storageSchemaApplyOperation, req.Deployment, req.Environment, err)
@@ -216,14 +228,16 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 		"deployment", target.deployment,
 		"environment", target.environment,
 		"allow_destructive", req.AllowDestructive,
+		"convergence_timeout", budget,
 		"caller", operator)
 
-	ctx, cancel := s.extendOperatorWriteDeadline(w, r, storageSchemaApplyWriteBudget)
+	ctx, cancel := s.extendOperatorWriteDeadline(w, r, storageSchemaApplyWriteBudget(budget))
 	defer cancel()
 
 	resp, err := target.service.StorageSchemaApply(ctx, &ternv1.StorageSchemaApplyRequest{
 		AllowDestructive: req.AllowDestructive,
 		Caller:           operator,
+		TimeoutSeconds:   int64(budget / time.Second),
 	})
 	if err != nil {
 		s.logger.Error("storage schema apply failed",
@@ -376,10 +390,20 @@ const (
 // itself, and the diff after it — so its budget is their sum rather than the
 // bootstrap's alone.
 const (
-	storageSchemaResponseMargin   = 30 * time.Second
-	storageSchemaPlanWriteBudget  = StorageSchemaPlanTimeout + storageSchemaResponseMargin
-	storageSchemaApplyWriteBudget = EnsureSchemaTimeout + 2*StorageSchemaPlanTimeout + storageSchemaResponseMargin
+	storageSchemaResponseMargin  = 30 * time.Second
+	storageSchemaPlanWriteBudget = StorageSchemaPlanTimeout + storageSchemaResponseMargin
 )
+
+// storageSchemaApplyWriteBudget is the write deadline a convergence of the
+// given budget needs. It is a function rather than a constant because the
+// convergence's own budget is now the caller's to name: a deadline pinned to
+// any single value would close the connection under every convergence that
+// asked for longer, which is the exact failure the lift exists to prevent — the
+// DDL runs on server-side while the operator sees a truncated response and
+// cannot tell whether their storage was converged.
+func storageSchemaApplyWriteBudget(convergence time.Duration) time.Duration {
+	return convergence + 2*StorageSchemaPlanTimeout + storageSchemaResponseMargin
+}
 
 // authorizeStorageSchemaOperation gates both storage schema routes on admin
 // membership and reports whether the request may proceed.

@@ -96,6 +96,35 @@ func TestPlanWithChangesDisclosesExemptTables(t *testing.T) {
 	assertExemptGroup(t, resp.ExemptTables[0], "app", "orders_archive_2024", "events_archive_2025_01")
 }
 
+// A deployment that plans locally stores the plan, and the stored row is where
+// every later re-plan of it — a rollback, a resume, the drift check a dispatch
+// to another deployment runs — reads its exclusions back. The row records the
+// whole config the plan was planned under rather than the subset that matched a
+// live table here: an entry that withheld nothing on this target still names a
+// table a member holds, and a member re-planning without it proposes dropping
+// that table and then refuses an apply of the plan it was handed.
+func TestPlanRecordsTheWholeIgnoreTablesConfigItWasPlannedUnder(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 12}
+	client := exemptTablesClient(store, exemptTablesEngine{
+		exempt: map[string][]*engine.ExemptTables{"app": {{
+			Namespace: "app",
+			Tables:    []string{"legacy_audit"},
+			Reason:    engine.ExemptReasonIgnoreTables,
+		}}},
+		changes: []engine.SchemaChange{{Namespace: "app", TableChanges: alterUsersEmail()}},
+	})
+
+	_, err := client.Plan(t.Context(), &ternv1.PlanRequest{
+		SchemaFiles:  appSchemaFiles(),
+		IgnoreTables: []string{"legacy_audit", "reporting_snapshots"},
+	})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	assert.Equal(t, []string{"legacy_audit", "reporting_snapshots"}, store.created.IgnoreTables(),
+		"the entry that matched no live table here is recorded too: a member that holds it must still withhold it")
+}
+
 // TestPlanMySQLNamespacesKeepsEveryNamespacesExemptTables verifies a
 // multi-namespace plan carries each namespace's exempt tables, in namespace
 // order, rather than only the first namespace's. Each namespace is planned on

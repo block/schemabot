@@ -6,8 +6,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"maps"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,18 +20,23 @@ import (
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/lint"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
-const postgresApplyDeadline = 10 * time.Second
+const (
+	postgresApplyDeadline               = 10 * time.Second
+	introspectionCapObservationDeadline = 250 * time.Millisecond
+)
 
 // TestEnginePullSchema exports every ordinary table in a requested schema as
 // an independently parseable declarative file, including constraints and
@@ -241,10 +251,484 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
-// TestEnginePlanPrivilegeRefusal proves a role that cannot alter the target
-// gets a blocked plan naming the exact provisioning statement, instead of an
-// executable plan that deterministically fails at apply. The plan itself
-// still succeeds: the operator needs the review surface to carry the grant.
+// Planning captures the canonical live schema for rollback, including an
+// explicitly empty baseline when every declared table is new.
+func TestEnginePlanCapturesOriginalFiles(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	const originalAccounts = "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    \"name\" text NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n"
+
+	tests := []struct {
+		name          string
+		database      string
+		setup         string
+		schemaFiles   schema.SchemaFiles
+		expectedFiles map[string]map[string]string
+	}{
+		{
+			name:     "alter existing table",
+			database: "plan_original_alter_test",
+			setup:    "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			schemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}}},
+			expectedFiles: map[string]map[string]string{"public": {"users.sql": originalUsers}},
+		},
+		{
+			name:     "mixed namespaces",
+			database: "plan_original_mixed_test",
+			setup:    "CREATE SCHEMA app; CREATE TABLE app.accounts (id bigint PRIMARY KEY, name text NOT NULL); CREATE SCHEMA fresh",
+			schemaFiles: schema.SchemaFiles{
+				"app": {Files: map[string]string{
+					"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY, name text NOT NULL, active boolean)",
+					"events.sql":   "CREATE TABLE events (id bigint PRIMARY KEY)",
+				}},
+				"fresh": {Files: map[string]string{
+					"jobs.sql": "CREATE TABLE jobs (id bigint PRIMARY KEY)",
+				}},
+			},
+			expectedFiles: map[string]map[string]string{
+				"app":   {"accounts.sql": originalAccounts},
+				"fresh": {},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			_, err := db.ExecContext(t.Context(), tt.setup)
+			require.NoError(t, err)
+
+			result, err := New().Plan(t.Context(), &engine.PlanRequest{
+				Database: tt.database, SchemaFiles: tt.schemaFiles, Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Changes, len(tt.expectedFiles))
+			for _, change := range result.Changes {
+				assert.True(t, change.OriginalFilesCaptured)
+				assert.Equal(t, tt.expectedFiles[change.Namespace], change.OriginalFiles)
+			}
+		})
+	}
+}
+
+// A pull refuses a namespace whose tables carry objects the declarative
+// format cannot represent, because those files become the owner's declared
+// schema. A rollback baseline is declared by nobody, and the differ cannot
+// see those objects in either direction, so plan capture keeps the namespace
+// and the plan stays rollback-capable.
+func TestEnginePlanCapturesNamespaceWithUnmodeledObjects(t *testing.T) {
+	const originalAccounts = "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n"
+
+	dsn, db := testutil.StartPostgres(t, "plan_unmodeled_capture_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_unmodeled_capture_test",
+		SchemaFiles: schema.SchemaFiles{"app": {Files: map[string]string{
+			"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY, email text)",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	assert.True(t, result.Changes[0].OriginalFilesCaptured,
+		"a trigger and a comment are invisible to the renderer and to the differ, so they do not cost the namespace its rollback baseline")
+	assert.Equal(t, map[string]string{"accounts.sql": originalAccounts}, result.Changes[0].OriginalFiles)
+}
+
+// An archive table is left in place rather than dropped, so it sits
+// outside management on the forward plan and on any rollback re-plan. Its
+// shape is therefore not the rollback baseline's concern: an archive table
+// the renderer refuses neither appears in the baseline nor costs the
+// namespace its rollback capability.
+func TestEnginePlanCaptureLeavesExemptArchiveTablesOutOfBaseline(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+
+	dsn, db := testutil.StartPostgres(t, "plan_archive_capture_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY, note text COLLATE "C")`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_archive_capture_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.ExemptTables, 1)
+	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
+	assert.True(t, result.Changes[0].OriginalFilesCaptured,
+		"a table the planner refuses to manage must not decide whether the namespace can be rolled back")
+	assert.Equal(t, map[string]string{"users.sql": originalUsers}, result.Changes[0].OriginalFiles,
+		"the baseline declares exactly the tables a rollback re-plan would manage")
+}
+
+// A cancellation that arrives after listing an all-archive namespace still
+// ends the baseline capture, even though no managed table needs introspection.
+func TestRenderPostgresTablesLeavesExemptArchiveTablesOutOfBaselineAfterCancellation(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_archive_cancel_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(ctx, pool, "public", rollbackBaseline)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, rendered)
+	assert.Nil(t, renderErrors)
+}
+
+// cancelAfterFirstQuery cancels the capture's context as soon as its table
+// listing has returned, so every introspection that follows runs against a
+// cancelled context.
+type cancelAfterFirstQuery struct {
+	cancel  context.CancelFunc
+	queries atomic.Int32
+}
+
+func (c *cancelAfterFirstQuery) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+
+func (c *cancelAfterFirstQuery) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+	if c.queries.Add(1) == 1 {
+		c.cancel()
+	}
+}
+
+// A context cancelled part-way through the capture is the plan's outcome,
+// not one table's: the capture returns the cancellation as an error instead
+// of recording the namespace as rollback-incapable, so a plan interrupted by
+// a shutdown is never stored looking like a namespace that holds an
+// unrenderable table.
+func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_cancel_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public")
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, captured)
+	assert.Nil(t, files)
+}
+
+// introspectionRendezvous holds the first two introspection transactions at
+// their BEGIN until both have arrived, so a render that introspects one table
+// at a time can never get past the first: the hold then outlives the deadline
+// and is reported as such rather than deadlocking the test.
+type introspectionRendezvous struct {
+	deadline context.Context
+	mu       sync.Mutex
+	arrivals int
+	both     chan struct{}
+	timedOut atomic.Bool
+}
+
+func newIntrospectionRendezvous(deadline context.Context) *introspectionRendezvous {
+	return &introspectionRendezvous{deadline: deadline, both: make(chan struct{})}
+}
+
+func (r *introspectionRendezvous) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		return ctx
+	}
+	r.mu.Lock()
+	r.arrivals++
+	if r.arrivals == 2 {
+		close(r.both)
+	}
+	r.mu.Unlock()
+	select {
+	case <-r.both:
+	case <-r.deadline.Done():
+		r.timedOut.Store(true)
+	}
+	return ctx
+}
+
+func (r *introspectionRendezvous) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+type introspectionCeiling struct {
+	mu        sync.Mutex
+	inFlight  int
+	peak      int
+	breached  chan struct{}
+	breachOne sync.Once
+}
+
+func (c *introspectionCeiling) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		return ctx
+	}
+	c.mu.Lock()
+	c.inFlight++
+	c.peak = max(c.peak, c.inFlight)
+	over := c.inFlight > baselineIntrospectionConcurrency
+	c.mu.Unlock()
+	if over {
+		c.breachOne.Do(func() { close(c.breached) })
+	}
+	timer := time.NewTimer(introspectionCapObservationDeadline)
+	defer timer.Stop()
+	select {
+	case <-c.breached:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	c.mu.Lock()
+	c.inFlight--
+	c.mu.Unlock()
+	return ctx
+}
+
+func (c *introspectionCeiling) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (c *introspectionCeiling) observedPeak() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peak
+}
+
+// A baseline render uses the configured concurrency cap even when the pool
+// has enough connections and the namespace has enough tables to exceed it.
+func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_cap_test")
+	var ddl strings.Builder
+	ddl.WriteString("CREATE SCHEMA app;")
+	for i := range baselineIntrospectionConcurrency * 2 {
+		fmt.Fprintf(&ddl, "CREATE TABLE app.t%02d (id bigint PRIMARY KEY);", i)
+	}
+	_, err := db.ExecContext(t.Context(), ddl.String())
+	require.NoError(t, err)
+
+	ceiling := &introspectionCeiling{breached: make(chan struct{})}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = int32(baselineIntrospectionConcurrency * 2)
+	poolCfg.ConnConfig.Tracer = ceiling
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "app", rollbackBaseline)
+	require.NoError(t, err)
+	assert.Empty(t, renderErrors)
+	assert.Len(t, rendered, baselineIntrospectionConcurrency*2)
+	peak := ceiling.observedPeak()
+	assert.LessOrEqual(t, peak, baselineIntrospectionConcurrency,
+		"introspections in flight at once must never exceed the cap")
+	assert.Greater(t, peak, 1,
+		"the render must overlap introspections for the cap to be exercised at all")
+}
+
+// tableDroppedAfterListing removes one table from the namespace the moment
+// the render's table listing has returned, so the listing names a table that
+// introspection can no longer find. Every other table's introspection is
+// then held at the query that resolves its relation until the render cancels
+// it: a render that keeps its remaining introspections running after a
+// sibling's hard failure never cancels them, so the hold outlives the
+// deadline and is reported as such rather than deadlocking the test. The
+// dropped table's own resolve is held until one sibling is at that hold, so
+// the failure always finds an introspection in flight to cancel: a render
+// that took tables one at a time would fail on the dropped table before any
+// sibling began, and the cancellation the test is named for would go
+// unexercised while every assertion still passed.
+type tableDroppedAfterListing struct {
+	table       string
+	drop        func()
+	deadline    context.Context
+	queries     atomic.Int32
+	begins      atomic.Int32
+	timedOut    atomic.Bool
+	siblingHeld chan struct{}
+	holdOne     sync.Once
+}
+
+func newTableDroppedAfterListing(table string, deadline context.Context, drop func()) *tableDroppedAfterListing {
+	return &tableDroppedAfterListing{table: table, deadline: deadline, drop: drop, siblingHeld: make(chan struct{})}
+}
+
+func (d *tableDroppedAfterListing) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		d.begins.Add(1)
+		return ctx
+	}
+	table, resolves := d.resolvesTable(data.Args)
+	if !resolves {
+		return ctx
+	}
+	if table == d.table {
+		select {
+		case <-d.siblingHeld:
+		case <-d.deadline.Done():
+			d.timedOut.Store(true)
+		}
+		return ctx
+	}
+	d.holdOne.Do(func() { close(d.siblingHeld) })
+	select {
+	case <-ctx.Done():
+	case <-d.deadline.Done():
+		d.timedOut.Store(true)
+	}
+	return ctx
+}
+
+// resolvesTable recognizes the introspection query that looks a table up by
+// schema and name, and reports which table it resolves.
+func (d *tableDroppedAfterListing) resolvesTable(args []any) (table string, ok bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	table, ok = args[1].(string)
+	return table, ok
+}
+
+func (d *tableDroppedAfterListing) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+	if d.queries.Add(1) == 1 {
+		d.drop()
+	}
+}
+
+// A table the listing named but introspection cannot find is a schema that
+// changed under the render, not a shape of that table: the render ends with
+// the introspection failure instead of recording it as one table's refusal
+// and assembling a baseline around it, and the failure cancels the
+// introspections still in flight rather than letting the render finish
+// reading a namespace it already knows it cannot report consistently.
+func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_dropped_test")
+	var ddl strings.Builder
+	ddl.WriteString("CREATE SCHEMA app; CREATE TABLE app.a_dropped (id bigint PRIMARY KEY);")
+	for i := range baselineIntrospectionConcurrency * 2 {
+		fmt.Fprintf(&ddl, "CREATE TABLE app.t%02d (id bigint PRIMARY KEY);", i)
+	}
+	_, err := db.ExecContext(t.Context(), ddl.String())
+	require.NoError(t, err)
+
+	deadline, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	dropped := newTableDroppedAfterListing("a_dropped", deadline, func() {
+		_, err := db.ExecContext(deadline, `DROP TABLE app.a_dropped`)
+		assert.NoError(t, err)
+	})
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = int32(baselineIntrospectionConcurrency * 2)
+	poolCfg.ConnConfig.Tracer = dropped
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", rollbackBaseline)
+	assert.False(t, dropped.timedOut.Load(),
+		"the sibling introspections must be cancelled by the failure; a render that lets them run holds them to the deadline")
+	require.ErrorIs(t, err, schemadiff.ErrTableNotFound)
+	assert.ErrorContains(t, err, `introspect schema "app" table "a_dropped"`)
+	assert.Nil(t, rendered)
+	assert.Nil(t, renderErrors)
+	begins := int(dropped.begins.Load())
+	assert.Greater(t, begins, 1,
+		"a sibling introspection must be in flight when the dropped table's read fails, or the cancellation goes unexercised")
+	assert.LessOrEqual(t, begins, baselineIntrospectionConcurrency,
+		"a sibling's hard failure must cancel the introspections still in flight and start no more; only the first wave may have begun")
+}
+
+// A baseline render introspects tables concurrently, and the baseline it
+// assembles does not depend on which introspection finished first: the
+// rendered set and the per-table refusals come back in table-listing order
+// on every run, so the same namespace always reports the same refusals in
+// the same words.
+func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_concurrent_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.a_accounts (id bigint PRIMARY KEY);
+		CREATE TABLE app.b_commented (id bigint PRIMARY KEY);
+		COMMENT ON TABLE app.b_commented IS 'refused: comment';
+		CREATE TABLE app.c_customers (id bigint PRIMARY KEY, name text NOT NULL);
+		CREATE TABLE app.d_triggered (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch BEFORE INSERT ON app.d_triggered FOR EACH ROW EXECUTE FUNCTION app.touch();
+		CREATE TABLE app.e_events (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.f_unlogged (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	deadline, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	rendezvous := newIntrospectionRendezvous(deadline)
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = 4
+	poolCfg.ConnConfig.Tracer = rendezvous
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", pulledBaseline)
+	assert.False(t, rendezvous.timedOut.Load(),
+		"two introspections must be in flight at once; a render that takes tables one at a time never reaches the second BEGIN")
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{"a_accounts", "c_customers", "e_events"}, slices.Collect(maps.Keys(rendered)))
+	assert.Contains(t, rendered["c_customers"], `"name" text NOT NULL`)
+	require.Len(t, renderErrors, 3)
+	assert.Contains(t, renderErrors[0].Error(), `schema "app" table "b_commented"`)
+	assert.Contains(t, renderErrors[0].Error(), "comment")
+	assert.Contains(t, renderErrors[1].Error(), `schema "app" table "d_triggered"`)
+	assert.Contains(t, renderErrors[1].Error(), "trigger")
+	assert.Contains(t, renderErrors[2].Error(), `schema "app" table "f_unlogged": render`)
+
+	// The order is a property of the assembly, not of the run that happened
+	// to finish in listing order: a second pass with no rendezvous holding
+	// anything back reports the same refusals in the same positions.
+	poolCfg.ConnConfig.Tracer = nil
+	freePool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer freePool.Close()
+	for range 3 {
+		again, againErrors, err := renderPostgresTables(t.Context(), freePool, "app", pulledBaseline)
+		require.NoError(t, err)
+		assert.Equal(t, rendered, again)
+		require.Len(t, againErrors, len(renderErrors))
+		for i := range renderErrors {
+			assert.Equal(t, renderErrors[i].Error(), againErrors[i].Error())
+		}
+	}
+}
+
+// TestEnginePlanPrivilegeRefusal proves a role that cannot alter an oversized
+// target gets one blocked verdict with the privilege cause followed by the
+// size cause, so the operator can address both findings from one plan.
 func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_privilege_test")
 	_, err := db.ExecContext(t.Context(), `
@@ -267,7 +751,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
 	}
 
-	result, err := New().Plan(t.Context(), req)
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
 	require.NoError(t, err)
 	require.Len(t, result.Changes, 1)
 	require.Len(t, result.Changes[0].TableChanges, 1)
@@ -279,6 +763,11 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		"the reason must carry the exact provisioning statement")
 	assert.Contains(t, change.ModeReason, "pg_has_role(plan_limited,",
 		"the reason must carry the exact failed catalog check")
+	causes := engine.BlockedCauses(change.ModeReason)
+	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
+	assert.Contains(t, causes[0], "in-place ALTER TABLE", "the privilege cause comes first")
+	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size`),
+		"the size cause follows the privilege cause: %q", causes[1])
 }
 
 // TestEnginePlanPrivilegeRefusalPerTier proves a privilege gap blocks only
@@ -523,6 +1012,9 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
 	require.Len(t, result.Changes, 1)
 	assert.Equal(t, "public", result.Changes[0].Namespace)
+	assert.False(t, result.Changes[0].OriginalFilesCaptured,
+		"a namespace with tables that cannot be rendered as a desired schema plans rollback-incapable rather than not at all")
+	assert.Nil(t, result.Changes[0].OriginalFiles)
 	require.Len(t, result.ExemptTables, 1)
 	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
 	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
@@ -651,8 +1143,8 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 	}, dropsByNamespace, "each namespace reports exactly its own undeclared table")
 }
 
-// TestLiveTablesUnderShadowingSearchPath proves the catalog reads behind the
-// undeclared-table verdict and the schema pull fail closed when the target's
+// TestLiveTablesUnderShadowingSearchPath proves the catalog reads that find
+// undeclared live tables and the schema pull fail closed when the target's
 // search_path lists a user schema ahead of pg_catalog. Decoy relations named
 // after every catalog table the queries touch, decoy "=", "<>", ">" and ">="
 // operators over every operand type the queries compare, and decoy array_agg
@@ -1808,4 +2300,41 @@ func awaitPostgresProgress(t *testing.T, eng *Engine, table string) *engine.Prog
 	}, postgresApplyDeadline, 10*time.Millisecond)
 	require.True(t, finished, "PostgreSQL apply did not finish; last progress: %+v", result)
 	return result
+}
+
+// TestEnginePullSchemaLintsRenderedTables proves the PostgreSQL pull audit
+// runs over the schema exactly as the engine renders it — one CREATE TABLE
+// followed by that table's CREATE INDEX statements — and reports an integer
+// primary key, a float column, and a mixed-case table name as warnings while a
+// well-shaped table audits clean.
+func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_lint_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, balance bigint NOT NULL);
+		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
+		CREATE TABLE app.legacy_orders (id integer PRIMARY KEY, weight real);
+		CREATE INDEX legacy_orders_weight_idx ON app.legacy_orders (weight);
+		CREATE TABLE app.sessions (token char(36) PRIMARY KEY, account_id bigint NOT NULL, seen_at timestamptz);
+		CREATE INDEX sessions_account_idx ON app.sessions (account_id);
+		CREATE INDEX sessions_account_seen_idx ON app.sessions (account_id, seen_at);
+		CREATE TABLE app."Events" (id uuid PRIMARY KEY, payload jsonb)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_lint_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "pull_lint_test", Type: "postgres", Environment: "test", Namespace: "app",
+	})
+	require.NoError(t, err)
+	require.Len(t, response.Namespaces["app"].Tables, 4)
+
+	results, err := lint.New().LintPostgresSchema(response.Namespaces["app"].Tables)
+	require.NoError(t, err)
+	assert.Equal(t, []lint.Result{
+		{Table: "Events", Linter: "name_case", Severity: "warning", Message: `table name "Events" is not lowercase`},
+		{Table: "legacy_orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "legacy_orders" uses "integer"; allowed types: bigint, uuid`},
+		{Table: "legacy_orders", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "legacy_orders" uses "real" data type`},
+		{Table: "sessions", Linter: "redundant_indexes", Severity: "warning", Message: `Index "sessions_account_idx" on column "account_id" is redundant - covered by index "sessions_account_seen_idx" on columns ("account_id", "seen_at")`},
+		{Table: "sessions", Column: "token", Linter: "primary_key", Severity: "warning", Message: `Primary key column "token" in table "sessions" uses "character(36)"; allowed types: bigint, uuid`},
+	}, results)
 }

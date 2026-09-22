@@ -33,6 +33,12 @@ type SchemaRequestResult struct {
 	// and travels with the plan request so the data plane can refuse engine
 	// shapes that cannot honor it.
 	IgnoredNamespaces []string
+	// IgnoreTables is the config's ignore_tables as written. Unlike ignored
+	// namespaces it cannot be resolved here: the exclusion names live tables on
+	// the target, which only the data plane can see, so the entries travel with
+	// the plan request and the response reports which of them withheld
+	// anything.
+	IgnoreTables []string
 }
 
 // EnvironmentValidator verifies that a discovered database can be used with
@@ -152,6 +158,7 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		SchemaLinkPath:    schemaLinkPath,
 		HeadSHA:           prInfo.HeadSHA,
 		IgnoredNamespaces: ignoredNamespaces,
+		IgnoreTables:      config.IgnoreTables,
 	}, nil
 }
 

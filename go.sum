@@ -117,8 +117,8 @@ github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 h1:GvubwsqXHanJkhBotCs
 github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6/go.mod h1:KEo73lbxXs9cFlq+x3Z35UqGg3MTxAPfjDOR/ob/iik=
 github.com/block/pg-sprite v0.3.3 h1:Jrgzh3AACRvTu9tJNPT+A6oHwMsGZEhFU9Xv+wDQw2E=
 github.com/block/pg-sprite v0.3.3/go.mod h1:Tt0Wxy5xgO6lzUvvzNoSNZcusq9NUIZvrxF4ktKVysY=
-github.com/block/spirit v0.17.1-0.20260911050857-16c62ef306a1 h1:8WRlZtL9oF76gZb/1Y7ZAxNNl1jWjWrKUV0pYtXq/tk=
-github.com/block/spirit v0.17.1-0.20260911050857-16c62ef306a1/go.mod h1:Lg97/e4zr2X3AQXRUrDVAQZOVqFDZ09px503h4v/Yss=
+github.com/block/spirit v0.17.1-0.20260919205507-7d229daeef76 h1:8AV3U4XgBVag3Xx0gd7++feNLbt3nkfdBaEuZl5rL0I=
+github.com/block/spirit v0.17.1-0.20260919205507-7d229daeef76/go.mod h1:iALC+OVfFyfxW8QfW3NSYcKqqQjyHZ664Z/fAMqKk3A=
 github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea h1:t9VROoN/aCzwwh7Ap90TLijZz3rZHZ6HUgWymC+yVS8=
 github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea/go.mod h1:193fxGVSfNHDStC08wSg/RzROVHmMh6XoT+QdfSoLjY=
 github.com/bndr/gotabulate v1.1.2 h1:yC9izuZEphojb9r+KYL4W9IJKO/ceIO8HDwxMA24U4c=
@@ -811,8 +811,8 @@ golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e/go.mod h1:RxMgew5VJxzue5/jJ
 golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 golang.org/x/sync v0.0.0-20201207232520-09787c993a3a/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
-golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=
-golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
+golang.org/x/sync v0.23.0 h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=
+golang.org/x/sync v0.23.0/go.mod h1:sUUOizhqBxiL6pEWpqNLUiaJn1ShEbZ6BBqskPbjZm0=
 golang.org/x/sys v0.0.0-20180830151530-49385e6e1522/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
 golang.org/x/sys v0.0.0-20180905080454-ebe1bf3edb33/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
 golang.org/x/sys v0.0.0-20181116152217-5ac8a444bdc5/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=

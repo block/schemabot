@@ -109,9 +109,9 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err := checkInitPublication(stage, renameInitSchema); err != nil {
 		return nil, err
 	}
-	var ignored []string
+	var exclusions client.PlanExclusions
 	if cmd.ReuseSchema {
-		ignored, err = stageExistingInitSchema(root, stage, cmd.Database, cmd.Type, cmd.Environment, namespaces)
+		exclusions, err = stageExistingInitSchema(root, stage, cmd.Database, cmd.Type, cmd.Environment, namespaces)
 		if err != nil {
 			return nil, fmt.Errorf("cannot reuse schema directory %q; choose an existing configured directory for --reuse-schema: %w", root, err)
 		}
@@ -138,14 +138,14 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
-	result, err := cmd.importBaseline(ctx, manager, stage, root, profile, namespaces, ignored)
+	result, err := cmd.importBaseline(ctx, manager, stage, root, profile, namespaces, exclusions)
 	if err != nil {
 		return nil, retainedInitError(err)
 	}
 	return result, nil
 }
 
-func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces, ignored []string) (*initResult, error) {
+func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces []string, exclusions client.PlanExclusions) (*initResult, error) {
 	startupCtx, cancelStartup := context.WithTimeout(ctx, 30*time.Second)
 	connection, err := manager.Ensure(startupCtx)
 	cancelStartup()
@@ -158,7 +158,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		return nil, fmt.Errorf("import live schema: %w", err)
 	}
 	if !cmd.ReuseSchema {
-		plan, err := buildOnboardWritePlan(stage, pulled, nil)
+		plan, err := buildOnboardWritePlan(stage, pulled, client.PlanExclusions{})
 		if err != nil {
 			return nil, err
 		}
@@ -166,7 +166,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 			return nil, err
 		}
 	}
-	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, ignored, false)
+	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}

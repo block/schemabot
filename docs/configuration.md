@@ -19,6 +19,7 @@
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
+- [Target TLS Posture](#target-tls-posture)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -286,7 +287,7 @@ A database that lives on more than one target replaces the scalar `target` with 
 
 > **MySQL only.** `targets` is rejected at startup on any other database type. Addressing N targets has to be represented on every operator-facing surface — the plan comment, progress, the terminal summary — and that presentation is built per engine, so the feature is enabled per engine as the work lands.
 
-> **Config surface only in this release.** `targets` resolves to one rollout member per target, but the plan and apply paths still treat every member of an environment the way they treat deployments.
+> **Review only in this release.** An environment's targets are each planned against their own live schema, and a difference between them no longer blocks the review. Apply is not there yet: it still runs the reviewed plan on every member, so an environment whose targets hold different schemas would run one target's DDL against another. Do not configure `targets` on an environment whose targets can diverge until per-member apply lands.
 
 ```yaml
 databases:
@@ -323,7 +324,11 @@ Rules:
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
 
-`targets` and `deployments` both fan an environment out across several members, but they mean different things. The deployments of one environment are expected to hold the same schema, so a difference between them is drift to surface. The targets of one environment are each planned on their own, so a difference between them is ordinary.
+`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the same schema. What differs is what a difference between members means when one is found.
+
+The deployments of one environment are mirrors, so a difference between them is a fault: the plan under review was not written for the member that disagrees, and the check blocks rather than apply it.
+
+The targets of one environment are each planned against their own live schema, so a difference between them is the work to be done — a target added since the last change, a rollout that landed on some targets and not others. Blocking there would prevent the convergence that resolves it, so the check does not block. It does not block, but it is not silent either: a difference between targets is reported, because it is the first thing worth looking at.
 
 ## Environment Order
 
@@ -719,7 +724,7 @@ a MySQL-format DSN and is only supported with the `mysql` storage dialect;
 combining it with `postgres` fails config validation. (This restriction is
 specific to the storage database — `dsn_from` on a `target_resolver` target
 supports both `mysql` and `postgres`.) See
-[Storage Schema Changes](#storage-schema-changes) for how schema
+[docs/storage-schema.md](storage-schema.md) for how schema
 bootstrapping differs between the two dialects.
 
 ### PostgreSQL storage needs a session-per-connection endpoint
@@ -875,6 +880,24 @@ statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
 `CREATE TABLE` does not consult the ceiling: the gate bounds rewrites of
 existing data, and a table that does not exist yet has none.
 
+Every engine gate still runs when an earlier gate has already blocked all of a
+table's steps. A missing grant is appended to each blocked step whose statement
+needs that access, and an oversized table to each blocked rewrite step, as
+independent causes, so every remedy the gates can name is visible in the same
+plan comment. This holds whether the earlier gate was the planner or the
+privilege gate itself: on a table the plan creates, blocking the steps that
+depend on the table can leave nothing executable, and the CREATE TABLE step is
+then probed at its own tier like any other blocked step. Two blocked steps are
+not probed: a statement whose shape the engine does not execute has no access
+to check, and a step that depends on a table the plan itself creates can only
+be answered "table not found". A probe's answer is appended only when it names
+something the operator can provision — a grant, a table owner role the target
+lacks, or a schema that does not exist yet. A refusal about the table itself
+(it vanished, or is not an ordinary table) names nothing to provision on a plan
+nothing will run, and a lookup that fails outright is not a fact about the
+target; in both cases the existing blocked verdict remains blocked and the
+answer is logged instead.
+
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
 
@@ -916,6 +939,50 @@ session pooler or directly at the database.
 Schema changes are unaffected. They run under limits pg-sprite sets on the
 target database. The bootstrap raises the limit for its own schema DDL, where
 an index build legitimately outruns a query.
+
+## Target TLS Posture
+
+This section is about a target DSN configured directly — `dsn` in a database
+entry, or the resolved value of a raw secret — not about a target assembled by
+`dsn_from`, whose transport settings are fixed by its own allowlist (see
+[PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets)). For a direct
+DSN, MySQL and PostgreSQL differ in what SchemaBot injects for an RDS endpoint
+and in how an explicit weak setting is surfaced. Both apply only to endpoints
+in the commercial AWS partition (`*.rds.amazonaws.com`, any letter case);
+GovCloud and China endpoints are not recognized as RDS, because the embedded
+root bundle does not cover them, so their DSNs must spell out TLS explicitly.
+
+A MySQL RDS DSN without a `tls=` parameter defaults to verified TLS against
+the embedded RDS root bundle. For compatibility with existing configurations,
+a `tls=` value that does not authenticate the server — `false`, `skip-verify`,
+`preferred`, or a config registered with the Go MySQL driver that skips
+certificate verification without installing its own — is honored as written;
+SchemaBot logs a warning naming the host and mode, once per endpoint and mode
+for the life of the process. The judgement is made on the TLS settings the
+driver resolves for the final DSN, so a mode weakened by the embedding
+program's connection options is reported the same way as one carried by the
+DSN, and a registered config is judged by what it verifies rather than by its
+name.
+
+A PostgreSQL RDS DSN without an explicit `sslmode` gets `sslmode=require`
+injected, which encrypts the connection but does not by itself authenticate
+the server. An explicit `sslmode`, including `disable`, is honored as written.
+Either way, a connection to an RDS endpoint that does not authenticate the
+server logs a warning naming the endpoint, what the transport does prove
+(`encrypted, unverified` or `none`), and whether the posture came from the DSN
+or from SchemaBot's injected default, once per endpoint and posture for the
+life of the process. The judgement is made on the TLS settings pgx resolves
+for the DSN it dials, so `sslmode=require` with an `sslrootcert` — which pgx
+verifies through the named roots — does not warn. To authenticate an RDS
+server, set `sslmode=verify-full` explicitly; without an `sslrootcert`, the
+embedded RDS root bundle is used. The same DSN is handed to the engine's
+data-plane pool, which honors the injected `sslmode=require` rather than
+applying its own RDS default, so the warning describes both connections.
+Certificate verification is also required where a trust setting depends on
+it: a pinned CA bundle under a non-verifying `sslmode` is refused at CA
+resolution, as described under
+[PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets), rather than
+silently never consulted.
 
 ## PlanetScale mTLS
 
@@ -959,138 +1026,35 @@ Helm chart, mount the certificate secret with `extraVolumes` /
 ## Storage Schema Changes
 
 SchemaBot's internal storage schema is self-bootstrapping: on every startup,
-`EnsureSchema` converges the live storage database against the embedded schema
-files before the server accepts traffic. How far that convergence goes depends
-on the storage dialect:
+`EnsureSchema` converges the live storage database against the schema files
+embedded in the binary, before the server accepts traffic. Routine convergence
+is never a hand edit, and there is no schema directory to point the server at —
+what operators do run by hand is the exceptions: an index too large to build
+inside the startup budget, and whatever the convergence refuses.
 
-- **MySQL** diffs the embedded schema files against the live database and
-  applies whatever DDL is needed (via Spirit) — new tables, new columns, and
-  index changes all converge automatically. That convergence is bounded by a
-  hard five-minute startup budget, and an index added to an existing table
-  runs as Spirit online DDL — a table copy, not an in-place build — so its
-  cost grows with the table's row count. On a deployment whose storage
-  tables carry a long history, create a newly declared index by hand before
-  rolling out: the startup diff then finds nothing to do, instead of copying
-  the table inside the budget on every pod.
-- **PostgreSQL** automatically creates missing tables, columns, and standalone
-  indexes. It discovers drift before taking the bootstrap advisory lock, then
-  re-checks and applies each table's changes transactionally under that lock.
-  A missing column converges automatically only when the `ADD COLUMN` is
-  metadata-only. A missing `NOT NULL` column without a `DEFAULT`, a generated
-  or identity column, a `UNIQUE` column, a `REFERENCES` column with a
-  `DEFAULT`, or a column with a constraint shape not explicitly classified as
-  safe fails startup with instructions for manual remediation: generated and
-  identity columns rewrite the populated table, `UNIQUE` builds a unique
-  index over it, and a foreign key with a `DEFAULT` validates every existing
-  row against the referenced table — all under an exclusive lock whose hold
-  time the startup lock timeout does not bound. Startup also fails when
-  additive DDL cannot be parsed or executed, or when re-verification finds
-  unresolved drift.
+**[docs/storage-schema.md](storage-schema.md) is the operator guide** — how the
+convergence works on each dialect, what it refuses, the `storage plan` and
+`storage apply` commands, and what to do when a deploy or a pod start does not
+converge. Every SchemaBot operator should read at least its first three
+sections. This section covers only the settings.
 
-  A live index only counts as present when PostgreSQL reports it valid.
-  PostgreSQL marks an index invalid both while a `CREATE INDEX CONCURRENTLY`
-  is still building it and after one fails part-way — a unique build that
-  hits duplicate keys, a cancelled session — and in either case the planner
-  never uses it. Startup fails closed naming that index rather than reading
-  it as converged or colliding with it on a fresh `CREATE INDEX`, and reads
-  `pg_stat_progress_create_index` to say which situation it is. When a build
-  is in progress — the expected state while an operator pre-creates an index
-  ahead of a release — the error says so and asks for nothing; the pod
-  restarts on its backoff and starts cleanly once the build completes. When
-  no build is visible, the error treats the index as a failed build: remove
-  the cause first — a unique build keeps failing while duplicate keys
-  remain — then drop the index so the next startup recreates it, or
-  `REINDEX INDEX CONCURRENTLY` it by hand. That view only shows other roles'
-  sessions to a caller with `pg_read_all_stats`, so if the storage role
-  lacks it and the build runs under a different role, confirm from a
-  privileged session that no build is running before recovering. A
-  non-unique index under a name the embedded schema requires to be unique
-  fails startup the same way. Every such problem across every table is named
-  in the one startup error, and no DDL runs until all of them are resolved.
+### `allow_destructive_schema_changes`
 
-  Convergence is additive-only: extra columns and indexes remain in place for
-  binary rollback, and `allow_destructive_schema_changes` has no effect because
-  this flow never produces destructive DDL. Column verification remains
-  presence-only, so type, length, and nullability drift is outside its scope and
-  is not detected.
+On MySQL, destructive statements in the startup diff are refused and skipped by
+default, because a pod running an older binary does not declare a newer
+binary's tables, columns, and indexes, and would otherwise remove what the
+newer pods depend on. That covers statements that lose data — `DROP TABLE`, or an `ALTER
+TABLE` containing `DROP COLUMN` — and statements that remove an index, which
+destroy no rows and can still take the database down by regressing the plan of a
+query the rest of the fleet is running. Each refusal is logged at warn level with
+the exact DDL and counted in the
+`schemabot.storage_schema.destructive_refusals_total` metric. See
+[What is never automatic](storage-schema.md#what-is-never-automatic) for what a
+statement carrying both a removal and an addition does.
 
-  Indexes added to an embedded schema file after a database was bootstrapped
-  converge on the next startup as plain `CREATE INDEX` statements, each in
-  its own transaction under the bootstrap advisory lock. A plain
-  `CREATE INDEX` holds a `SHARE` lock on the table for the full build and
-  blocks writes to it, and the startup budget is the build's only duration
-  ceiling, so on a deployment whose storage tables carry a long history,
-  pre-create the index by hand before rolling out — the startup diff then
-  finds it present and skips the build. The indexes below are the ones a
-  long-lived database is most likely to be missing.
-
-  A database bootstrapped before `idx_plans_created_at` was added to `plans`
-  needs:
-
-  ```sql
-  CREATE INDEX idx_plans_created_at ON plans (created_at);
-  ```
-
-  Without it, listing recent plans is a sequential scan plus a top-N sort,
-  which gets slower as plan history grows. Likewise, one bootstrapped before
-  the driver claim ordering on `apply_operations` was indexed needs:
-
-  ```sql
-  CREATE INDEX idx_apply_operations_created_id ON apply_operations (created_at, id);
-  ```
-
-  Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows. One bootstrapped
-  before refused applies started naming the schema change holding the
-  database needs:
-
-  ```sql
-  CREATE INDEX idx_apply_operations_external_id ON apply_operations (external_id);
-  ```
-
-  Without it, resolving the holding change behind a refused apply scans the
-  full operation history for one remote identifier. On PostgreSQL the lookup
-  is an optimization, never load-bearing: the refusal still reads correctly,
-  it just gets slower to record as apply history grows. On MySQL the same
-  index is not optional — `EnsureSchema` applies it as a startup `ALTER`
-  under the budget described in the MySQL bullet above, and `apply_operations`
-  grows with total apply history, so large deployments should pre-create it
-  there too. And one bootstrapped before the webhook inbox claim ordering on
-  `webhook_events` was indexed needs:
-
-  ```sql
-  CREATE INDEX idx_webhook_events_created_id ON webhook_events (created_at, id);
-  ```
-
-  Without it, every webhook claim sorts the full claimable inbox before
-  taking one row, which slows claiming as delivery history grows. On MySQL
-  the same index arrives as a startup `ALTER` under the budget described in
-  the MySQL bullet above, and `webhook_events` grows with total delivery
-  history and has no retention sweep, so pre-create it there before rolling
-  out:
-
-  ```sql
-  ALTER TABLE `webhook_events` ADD INDEX `idx_created_id` (`created_at`, `id`);
-  ```
-
-The rest of this section describes the MySQL flow.
-
-By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped. A mixed
-`ALTER TABLE` is split: its additive clauses still execute and only the
-destructive clauses are refused, except that a clause which cannot run
-without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change)
-is refused with it. The remaining non-destructive statements still apply and
-startup proceeds. This protects
-against rolling deploys and rollbacks: a pod running an older binary sees a
-newer binary's tables and columns as surplus, and without the gate would drop
-them (destroying data the newer pods depend on). Each refused statement is
-logged at warn level with the exact DDL, and counted in the
-`schemabot.storage_schema.destructive_refusals_total` metric.
-
-To intentionally remove a storage table or column, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then
-opt in:
+To intentionally remove a storage table, column, or index, first make sure every
+running pod is on a binary whose embedded schema no longer declares it, then opt
+in:
 
 ```yaml
 storage:
@@ -1099,7 +1063,12 @@ storage:
 ```
 
 Leave the flag false during normal operation and revert it after the removal
-converges.
+converges. `--allow-unsafe` on `schemabot storage apply` opts in for one
+invocation instead; it widens this policy and never narrows it.
+
+On PostgreSQL the setting has no effect: that convergence is additive-only and
+never produces destructive DDL. See
+[What is never automatic](storage-schema.md#what-is-never-automatic).
 
 ## Support Channel
 

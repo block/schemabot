@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
@@ -188,6 +189,15 @@ func TestStorageSchemaConvergenceOutcome(t *testing.T) {
 // indistinguishable from one that ran it, if only the output is read.
 func storageSchemaTestServer(t *testing.T, plan *apitypes.StorageSchemaReport, applied, remaining *apitypes.StorageSchemaReport) (endpoint string, routes *[]string) {
 	t.Helper()
+	var discarded apitypes.StorageSchemaApplyRequest
+	return storageSchemaTestServerRecording(t, plan, applied, remaining, &discarded)
+}
+
+// storageSchemaTestServerRecording is storageSchemaTestServer for a test that
+// also asserts on what the convergence request carried, rather than only on
+// which routes were called.
+func storageSchemaTestServerRecording(t *testing.T, plan *apitypes.StorageSchemaReport, applied, remaining *apitypes.StorageSchemaReport, lastApplyRequest *apitypes.StorageSchemaApplyRequest) (endpoint string, routes *[]string) {
+	t.Helper()
 	called := make([]string, 0, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = append(called, r.Method+" "+r.URL.Path)
@@ -196,6 +206,7 @@ func storageSchemaTestServer(t *testing.T, plan *apitypes.StorageSchemaReport, a
 		case "/api/storage/schema/plan":
 			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaPlanResponse{Report: plan}))
 		case "/api/storage/schema/apply":
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(lastApplyRequest))
 			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StorageSchemaApplyResponse{Planned: applied, Remaining: remaining}))
 		default:
 			http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -303,6 +314,103 @@ func TestStorageApplyCmd_ConvergesAConvergedCatalogToo(t *testing.T) {
 	assert.Equal(t, []string{"POST /api/storage/schema/plan", "POST /api/storage/schema/apply"}, *routes,
 		"the convergence runs; a converged catalog is not a reason to skip the bootstrap")
 	assert.Contains(t, out, "Nothing is outstanding.")
+}
+
+// An operator's --timeout reaches the target as the budget it bounds the
+// convergence with, and an unset flag names the operator default on the wire
+// rather than sending nothing. Both ends then agree on the ceiling by
+// construction: a target handed no budget runs the convergence under the one a
+// booting pod gets, which is not the wait the command told the operator it
+// would hold for. This is what lets a convergence outlive the boot budget: the
+// ceiling is the caller's to name, on every path.
+func TestStorageApplyCmd_CarriesTheOperatorBudgetToTheTarget(t *testing.T) {
+	converged := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Converged:    true,
+	}
+
+	var chosen apitypes.StorageSchemaApplyRequest
+	endpoint, _ := storageSchemaTestServerRecording(t, converged, converged, converged, &chosen)
+	captureStdout(func() {
+		cmd := StorageApplyCmd{AutoApprove: true, Timeout: 20 * time.Minute}
+		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: endpoint}))
+	})
+	assert.Equal(t, int64(1200), chosen.TimeoutSeconds)
+
+	var unset apitypes.StorageSchemaApplyRequest
+	defaultEndpoint, _ := storageSchemaTestServerRecording(t, converged, converged, converged, &unset)
+	captureStdout(func() {
+		cmd := StorageApplyCmd{AutoApprove: true}
+		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: defaultEndpoint}))
+	})
+	assert.Equal(t, int64(apitypes.DefaultStorageApplyTimeout/time.Second), unset.TimeoutSeconds,
+		"an unset flag names the operator default on the wire so the target runs under the wait the client holds for")
+}
+
+// A budget beyond what the target will accept is refused at the CLI, before a
+// convergence starts, rather than after one has run under a ceiling the
+// operator did not choose.
+func TestStorageApplyCmd_RefusesABudgetAboveTheMaximum(t *testing.T) {
+	cmd := StorageApplyCmd{AutoApprove: true, Timeout: apitypes.MaxStorageApplyTimeout + time.Minute}
+	err := cmd.Run(t.Context(), &Globals{Endpoint: "http://127.0.0.1:1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds the maximum")
+}
+
+// A budget the wire's whole seconds cannot carry is refused rather than
+// truncated. Truncation would turn the shortest budget an operator can name
+// into the zero that means "no preference", and hand back the hour-long
+// default — the opposite of what they asked for, with nothing saying so.
+func TestStorageApplyCmd_RefusesABudgetTheWireCannotCarry(t *testing.T) {
+	cmd := StorageApplyCmd{AutoApprove: true, Timeout: 500 * time.Millisecond}
+	err := cmd.Run(t.Context(), &Globals{Endpoint: "http://127.0.0.1:1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "shorter than the one second the request carries")
+}
+
+// A budget carrying a fraction of a second is refused rather than rounded.
+// The request carries whole seconds, so the remainder is dropped on the way
+// out — and a budget just over the maximum loses exactly the part that put it
+// over, arriving as one the target accepts. Refusing the fraction is what
+// keeps the maximum a refusal rather than a clamp.
+func TestStorageApplyCmd_RefusesAFractionalBudget(t *testing.T) {
+	for name, tc := range map[string]struct {
+		timeout time.Duration
+		ran     string
+	}{
+		"a fraction the target would accept": {timeout: 1500 * time.Millisecond, ran: "1s"},
+		"a fraction that hides the maximum":  {timeout: time.Hour + 500*time.Millisecond, ran: "1h0m0s"},
+		"a fraction on a many-second budget": {timeout: 90*time.Second + time.Millisecond, ran: "1m30s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd := StorageApplyCmd{AutoApprove: true, Timeout: tc.timeout}
+			err := cmd.Run(t.Context(), &Globals{Endpoint: "http://127.0.0.1:1"})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not the whole number of seconds the request carries")
+			assert.Contains(t, err.Error(), tc.ran, "the refusal names the budget the truncation would have run")
+		})
+	}
+}
+
+// A negative budget is refused whatever its magnitude. One smaller than a
+// whole second truncates to the zero that means "no preference", so a bound
+// applied only after the truncation would answer an invalid flag with the
+// hour-long default instead of an error.
+func TestStorageApplyCmd_RefusesANegativeBudget(t *testing.T) {
+	for name, timeout := range map[string]time.Duration{
+		"smaller than the wire's resolution": -500 * time.Millisecond,
+		"a whole number of seconds":          -30 * time.Second,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd := StorageApplyCmd{AutoApprove: true, Timeout: timeout}
+			err := cmd.Run(t.Context(), &Globals{Endpoint: "http://127.0.0.1:1"})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "must be positive")
+		})
+	}
 }
 
 // A declined confirmation converges nothing at all. The preview is read-only,
@@ -492,6 +600,14 @@ func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
 				Dialect: "postgres",
 			}},
 			rerun: "storage apply --dsn <the same DSN> --dialect postgres --allow-unsafe",
+		},
+		{
+			name: "a chosen budget is carried over",
+			cmd: StorageApplyCmd{
+				storageSchemaTargetFlags: storageSchemaTargetFlags{Deployment: "shard-a", Environment: "production"},
+				Timeout:                  10 * time.Minute,
+			},
+			rerun: "storage apply --deployment shard-a -e production --timeout 10m0s --allow-unsafe",
 		},
 	}
 	for _, tc := range tests {

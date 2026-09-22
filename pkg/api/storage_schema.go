@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -42,9 +43,10 @@ const StorageSchemaPlanTimeout = 30 * time.Second
 
 // PlanStorageSchema reports the storage DDL outstanding between a desired
 // schema and the live storage database at dsn. It is strictly read-only: it
-// opens connections, reads the catalog, and computes a diff. It executes no
-// DDL, takes no advisory lock, and writes nothing, so it is safe to run at any
-// time, including against a database an apply is converging right now.
+// opens connections, reads the catalog, computes a diff, and reads whether the
+// bootstrap lock is held. It executes no DDL, takes no lock, and writes
+// nothing, so it is safe to run at any time, including against a database an
+// apply is converging right now — which is the case it exists to describe.
 //
 // desired is the schema to compare against; nil is the embedded schema of this
 // binary, which is what a boot would converge to. A caller deploying a later
@@ -79,6 +81,13 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 	if err != nil {
 		return nil, err
 	}
+	// Read after the diff, not before. The diff is the slow half, and a lock
+	// taken while it ran is one this report should carry: an operator about to
+	// act on these statements needs to know somebody else is already running
+	// them, and a stale false is the reading that costs them a silent hour
+	// waiting on a lock.
+	report.ConvergenceInFlight = storageConvergenceInFlight(ctx, dsn, report, logger)
+
 	// The differs themselves stay quiet — the MySQL one is handed a discarding
 	// handler so Spirit's planning chatter does not read as a schema change
 	// engine running — so this is the one place a diff leaves a server-side
@@ -92,8 +101,17 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 		"destructive_count", len(report.Destructive),
 		"manual_count", len(report.Manual),
 		"destructive_allowed", report.DestructiveAllowed,
+		"convergence_in_flight", report.ConvergenceInFlight,
 	)
 	return report, nil
+}
+
+// storageApplyOptions puts the operator's convergence budget in front of a
+// caller's options, so every entry point onto the deliberate path gets it
+// without having to remember to ask. Caller options are applied after and so
+// still win, which is what lets a command honor an operator's --timeout.
+func storageApplyOptions(opts []EnsureSchemaOption) []EnsureSchemaOption {
+	return append([]EnsureSchemaOption{WithConvergenceTimeout(apitypes.DefaultStorageApplyTimeout)}, opts...)
 }
 
 // ApplyStorageSchema converges the storage database at dsn and reports what it
@@ -122,12 +140,33 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 // does not declare, which is the expected steady state during a rollback
 // (AV-9) rather than a failure.
 //
-// ctx bounds the two diffs, not the convergence between them: EnsureSchema
-// builds its own context from EnsureSchemaTimeout so that a cancelled request
-// cannot abandon a table copy half-done. A caller whose own deadline is shorter
-// than that budget will therefore return before the convergence does, and must
-// not read its own timeout as the apply having stopped.
+// ctx bounds the whole run, the convergence included, and cancelling it stops
+// the DDL rather than only the wait for it. That is what makes this the
+// deliberate path: an operator watching a convergence they asked for can stop
+// it, and an operator is the only caller who should be able to. Every other
+// caller — an RPC handler, a webhook, anything holding a context a network
+// blip can cancel — passes context.WithoutCancel, because losing a connection
+// is not a decision to abandon a table copy partway.
+//
+// A stopped convergence leaves the storage in a state the next diff describes:
+// the statements that finished stay finished, the one in flight is cancelled
+// and its shadow table dropped, and the ones after it never ran. So the answer
+// to "what did that leave" is another plan, never an inference from where the
+// run got to.
+//
+// The convergence budget bounds ctx rather than the other way round. A caller
+// whose own deadline is shorter returns before the convergence does — with the
+// convergence stopped, not still running behind it.
+//
+// That budget defaults to DefaultStorageApplyTimeout here rather than to the
+// boot budget, and the default belongs on this function rather than on each of
+// its callers. This is the deliberate path by definition — a convergence
+// reached through it was asked for by somebody, whether over the RPC or from a
+// terminal holding the DSN — so every entry point should get the operator's
+// ceiling without having to remember to ask for it. A caller passing
+// WithConvergenceTimeout still wins, since caller options are applied last.
 func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) (planned, remaining *StorageSchemaReport, err error) {
+	opts = storageApplyOptions(opts)
 	planned, err = PlanStorageSchema(ctx, dsn, nil, logger, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("diff storage schema before converging it: %w", err)
@@ -150,14 +189,19 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 	// here would report the storage clean while leaving them on it. The
 	// bootstrap is cheap in that case by construction: it takes no lock and
 	// does no DDL when there is nothing to do.
+	// The budget is logged because it is the one thing about this run an
+	// operator cannot see from the reports either side of it, and it is the
+	// first question asked when a convergence is still going or a booting pod
+	// reports losing the lock wait.
 	logger.Info("converging storage schema on operator request",
 		"dialect", planned.Dialect,
 		"database", planned.Database,
 		"outstanding_count", len(planned.Outstanding),
 		"destructive_count", len(planned.Destructive),
 		"destructive_allowed", planned.DestructiveAllowed,
+		"convergence_timeout", newEnsureSchemaOptions(opts...).convergenceTimeout,
 	)
-	if err := EnsureSchema(dsn, logger, opts...); err != nil {
+	if err := ensureSchema(ctx, dsn, logger, opts...); err != nil {
 		return planned, nil, fmt.Errorf("converge storage schema on database %q (%s): %w", planned.Database, planned.Dialect, err)
 	}
 
@@ -180,10 +224,12 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 // planMySQLStorageSchema diffs the desired MySQL schema files against the live
 // storage database with Spirit's differ — the same Plan call ensureMySQLSchema
 // makes, so the two cannot disagree about what a boot would run. Spirit emits
-// one combined ALTER per table, and partitionDestructiveChanges splits it the
-// way the bootstrap would, so a mixed ALTER is reported as the additive clauses
-// that run plus the destructive clauses that are refused, not as one statement
-// whose disposition an operator has to guess.
+// one combined ALTER per table, and partitionDestructiveChanges sorts those
+// statements the way the bootstrap would, so each one is reported as the boot
+// would treat it rather than as a statement whose disposition an operator has to
+// guess. A statement the boot would reduce to its additions is reported that
+// way too: the additions under Outstanding, the withheld clauses under
+// Destructive, which is what the two halves will actually do.
 func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSource, o ensureSchemaOptions) (*StorageSchemaReport, error) {
 	report := &StorageSchemaReport{
 		Dialect:            schema.DialectMySQL,
@@ -221,10 +267,7 @@ func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSch
 		return report, nil
 	}
 
-	allowed, refused, err := partitionDestructiveChanges(planResult.Changes)
-	if err != nil {
-		return nil, fmt.Errorf("classify storage schema changes on database %q: %w", diag.database, err)
-	}
+	allowed, refused := partitionDestructiveChanges(planResult.Changes)
 	for _, tc := range flatTableChanges(allowed) {
 		operation, err := storageSchemaOperation(tc.Operation)
 		if err != nil {
@@ -245,7 +288,7 @@ func planMySQLStorageSchema(ctx context.Context, dsn string, desired *StorageSch
 			Table:     r.change.Table,
 			Operation: operation,
 			DDL:       r.change.DDL,
-			Reason:    r.reportedReason(),
+			Reason:    r.reason,
 		})
 	}
 	return report, nil
@@ -327,24 +370,13 @@ func planPostgresStorageSchema(ctx context.Context, dsn string, desired *Storage
 	return report, nil
 }
 
-// reportedReason is the refusal reason for an operator-facing report. A split
-// refusal and a whole refusal both carry Spirit's classification; a refusal
-// that happened because the clauses could not be partitioned says so, because
-// that is the difference between "these clauses are refused" and "none of this
-// statement ran".
-func (r refusedStorageChange) reportedReason() string {
-	if r.splitErr != nil {
-		return fmt.Sprintf("%s; refused whole because its clauses could not be partitioned: %v", r.reason, r.splitErr)
-	}
-	return r.reason
-}
-
 // newEnsureSchemaOptions applies opts over the defaults every entry point
 // shares, so PlanStorageSchema and EnsureSchema start from the same policy for
 // an option a caller did not set.
 func newEnsureSchemaOptions(opts ...EnsureSchemaOption) ensureSchemaOptions {
 	o := ensureSchemaOptions{
 		dialect:                  schema.DialectMySQL,
+		convergenceTimeout:       EnsureSchemaTimeout,
 		postgresStatementTimeout: DefaultPostgresStatementTimeout,
 	}
 	for _, opt := range opts {

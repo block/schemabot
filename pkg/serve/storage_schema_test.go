@@ -1,12 +1,14 @@
 package serve
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,6 +53,44 @@ func TestStorageSchemaAdapter_DestructivePolicy(t *testing.T) {
 			assert.Equal(t, tc.want, allow)
 		})
 	}
+}
+
+// A request naming no budget runs under the boot's, and one naming a budget
+// runs under exactly that (AV-11). The control plane always names the budget
+// it resolved, so a zero here is a caller reaching the data plane directly
+// that could not say how long it can wait — and the boot budget is the one
+// such a caller has always waited out, where the operator default would hold
+// the bootstrap lock for an hour after it had given up.
+func TestConvergenceBudget_UnnamedRunsUnderTheBootBudget(t *testing.T) {
+	t.Parallel()
+
+	unnamed, err := convergenceBudget(&ternv1.StorageSchemaApplyRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, api.EnsureSchemaTimeout, unnamed)
+
+	named, err := convergenceBudget(&ternv1.StorageSchemaApplyRequest{TimeoutSeconds: 1200})
+	require.NoError(t, err)
+	assert.Equal(t, 20*time.Minute, named)
+}
+
+// An out-of-range budget on the wire is the caller's mistake, refused before
+// the convergence is dispatched and before the storage database is dialed, so
+// nothing runs under a ceiling nobody chose.
+func TestStorageSchemaAdapter_ApplyRefusesAnOutOfRangeBudget(t *testing.T) {
+	t.Parallel()
+
+	const dsn = "root:pw@tcp(127.0.0.1:1)/schemabot"
+	adapter := &storageSchemaAdapter{
+		resolveDSN: func() (string, error) { return dsn, nil },
+		bootTarget: bootTargetFor(t, schema.DialectMySQL, dsn),
+		dialect:    schema.DialectMySQL,
+		logger:     slog.New(slog.DiscardHandler),
+	}
+
+	_, err := adapter.StorageSchemaApply(t.Context(), &ternv1.StorageSchemaApplyRequest{TimeoutSeconds: -1})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+	assert.Contains(t, err.Error(), "must be positive")
 }
 
 // A locally hosted server has no route to a destructive storage bootstrap, so
@@ -271,6 +311,40 @@ func bootTargetFor(t *testing.T, dialect schema.Dialect, dsn string) storageTarg
 	target, err := storageTargetFor(dialect, dsn)
 	require.NoError(t, err)
 	return target
+}
+
+// A caller that went away does not stop a convergence (AV-13). The adapter
+// answers requests, and a request's context is cancelled by a dropped
+// connection — which is not a decision anyone made about the storage every
+// instance depends on. ApplyStorageSchema observes its context so an operator
+// at a terminal can stop a run they are watching, so the authority to do that
+// has to be withheld here rather than absent everywhere.
+//
+// The seam is visible without a database: a convergence handed an already
+// cancelled context fails on the context before it reaches the storage, while
+// one handed a context stripped of cancellation gets as far as trying to
+// connect. Reaching the connection attempt is what says the cancellation did
+// not travel.
+func TestStorageSchemaAdapter_ADroppedConnectionDoesNotStopTheConvergence(t *testing.T) {
+	const bootDSN = "root:pw@tcp(127.0.0.1:1)/schemabot"
+	adapter := &storageSchemaAdapter{
+		resolveDSN: func() (string, error) { return bootDSN, nil },
+		bootTarget: bootTargetFor(t, schema.DialectMySQL, bootDSN),
+		dialect:    schema.DialectMySQL,
+		version:    "v1.2.3",
+		logger:     slog.New(slog.DiscardHandler),
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := adapter.StorageSchemaApply(ctx, &ternv1.StorageSchemaApplyRequest{})
+
+	// Nothing is listening on the DSN, so this always fails. Which way it
+	// failed is the assertion.
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, context.Canceled,
+		"the request's cancellation must not reach the convergence; a lost connection cannot abandon a table copy")
 }
 
 // A server with no storage DSN configured refuses to answer rather than

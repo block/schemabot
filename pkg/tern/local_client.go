@@ -1600,6 +1600,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		HeadSHA:        req.HeadSha,
 		CreatedAt:      time.Now(),
 	}
+	plan.RecordIgnoreTables(req.GetIgnoreTables())
 	c.logger.Info("Plan: storing plan",
 		"plan_id", result.PlanID,
 		"ddl_change_count", len(ddlChanges),
@@ -1858,6 +1859,7 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 		PullRequest:      int(req.PullRequest),
 		Credentials:      creds,
 		GroupedExecution: groupedExecution,
+		IgnoreTables:     req.GetIgnoreTables(),
 	})
 }
 
@@ -2119,8 +2121,27 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 	// schema and refuse unless it exactly matches the dispatched (reviewed) DDL,
 	// keeping unreviewed DDL from being applied. The comparison is shard-aware: a
 	// shard-scoped dispatch is checked against the re-plan restricted to its shard.
-	if err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles); err != nil {
+	//
+	// The same re-plan supplies the changes as this target will run them: the
+	// statement its own engine emitted (qualified with this target's physical
+	// schema where the engine qualifies at all) and its execution-mode
+	// verdict. The dispatch is built from task rows, which carry the primary's
+	// text and no verdict, and both are properties of this target (its schema
+	// names, its table sizes, its grants) rather than of the reviewed text —
+	// so without stamping them here the materialized plan would name the
+	// primary's schema and pass the blocked-step admission gate no matter what
+	// this engine decided. The stamping is not conditioned on the engine: every
+	// deployment stores the text its own engine emitted, so the stored bytes
+	// differ from the reviewed text wherever the two engines spell the same
+	// change differently (quoting, whitespace, qualification), and every
+	// operator surface that reads a deployment's plan or task rows shows that
+	// deployment's rendering.
+	replanned, err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles)
+	if err != nil {
 		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
+	}
+	if err := c.stampReplannedChanges(namespaces, replanned); err != nil {
+		return nil, fmt.Errorf("materialize plan %s: re-planned changes: %w", req.PlanId, err)
 	}
 
 	target := req.Target
@@ -2138,6 +2159,12 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 		Namespaces:     namespaces,
 		CreatedAt:      time.Now(),
 	}
+	// The dispatch's record of the ignore_tables the plan was reviewed under has
+	// to survive on this deployment's own row. The drift check above was handed
+	// it directly, but a later rollback or resume here reads it back off the
+	// stored plan, and a plan that forgot its exclusions re-plans the withheld
+	// tables as drops.
+	plan.RecordIgnoreTables(req.GetIgnoreTables())
 	c.logger.Info("Apply: materializing plan from dispatch request",
 		"plan_id", req.PlanId,
 		"database", c.config.Database,
@@ -2519,6 +2546,8 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			Shard:          scope.shard,
 			DDL:            ddlChange.DDL,
 			DDLAction:      ddlChange.Operation,
+			ExecutionMode:  ddlChange.ExecutionMode,
+			ModeReason:     ddlChange.ModeReason,
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -2773,9 +2802,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				ErrorMessage: "plan not found",
 			}, nil
 		}
-		scope, err := deriveDispatchScope(plan, req)
+		scope, err := c.dispatchScopeForApply(plan, req)
 		if err != nil {
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+		}
+		if err := plan.BlockedApplyError(); err != nil {
+			return &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: err.Error(),
+			}, nil
 		}
 		return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "hit")
 	}
@@ -2793,9 +2828,21 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	scope, err := deriveDispatchScope(plan, req)
+	scope, err := c.dispatchScopeForApply(plan, req)
 	if err != nil {
 		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+	}
+	// A blocked step is refused before the conflict check and before any apply
+	// or task row exists: no opt-in makes a statement the engine refuses
+	// executable, and admission is the only place the whole plan is judged at
+	// once. Each task row then carries the admitting deployment's verdict for
+	// its own statement, so a drive that later claims the apply refuses a
+	// blocked row without trusting whichever plan it loaded.
+	if err := plan.BlockedApplyError(); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
 	}
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,

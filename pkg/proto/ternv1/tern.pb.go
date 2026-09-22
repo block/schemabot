@@ -1077,8 +1077,15 @@ type PlanRequest struct {
 	// disclosing a discard rather than promising a resume the apply will not
 	// perform.
 	GroupedExecution *bool `protobuf:"varint,12,opt,name=grouped_execution,json=groupedExecution,proto3,oneof" json:"grouped_execution,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Live tables the repository's ignore_tables config withholds from the
+	// planner, so a table no schema file declares is not proposed for
+	// DROP TABLE. Matched exactly and case-sensitively against the target's own
+	// catalog, in every namespace the plan covers. The engine discloses what it
+	// actually withheld through exempt_tables on the response, and refuses a
+	// table the config withholds that a schema file also declares.
+	IgnoreTables  []string `protobuf:"bytes,13,rep,name=ignore_tables,json=ignoreTables,proto3" json:"ignore_tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1186,6 +1193,13 @@ func (x *PlanRequest) GetGroupedExecution() bool {
 		return *x.GroupedExecution
 	}
 	return false
+}
+
+func (x *PlanRequest) GetIgnoreTables() []string {
+	if x != nil {
+		return x.IgnoreTables
+	}
+	return nil
 }
 
 // TableChange represents a DDL change to a table.
@@ -1952,8 +1966,20 @@ type ApplyRequest struct {
 	// first operation can never terminalize the apply while sibling dispatches
 	// are still on their way. Empty means this dispatch is the whole generation.
 	GenerationOperationKeys []string `protobuf:"bytes,12,rep,name=generation_operation_keys,json=generationOperationKeys,proto3" json:"generation_operation_keys,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// The ignore_tables config the reviewed plan was planned under, as the plan
+	// recorded it: every entry the planner was asked to withhold, not the subset
+	// that matched a live table where the plan was made. A deployment that
+	// materializes this dispatch re-plans against its own live schema to prove
+	// the reviewed DDL is what it would independently produce; without the same
+	// entries that re-plan sees a withheld table again and proposes dropping it,
+	// so it would refuse an apply that matches the plan exactly. The whole list
+	// travels because a member holds tables the planning target does not: an
+	// entry that matched nothing there still has to withhold here. The plan's
+	// own record travels rather than the current config, so the comparison is
+	// against what was reviewed.
+	IgnoreTables  []string `protobuf:"bytes,13,rep,name=ignore_tables,json=ignoreTables,proto3" json:"ignore_tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ApplyRequest) Reset() {
@@ -2066,6 +2092,13 @@ func (x *ApplyRequest) GetIdempotencyKey() string {
 func (x *ApplyRequest) GetGenerationOperationKeys() []string {
 	if x != nil {
 		return x.GenerationOperationKeys
+	}
+	return nil
+}
+
+func (x *ApplyRequest) GetIgnoreTables() []string {
+	if x != nil {
+		return x.IgnoreTables
 	}
 	return nil
 }
@@ -4112,9 +4145,16 @@ type StorageSchemaReport struct {
 	// binary's embedded files, a directory, or a release. A report always says
 	// this, because the same live database yields different answers against
 	// different releases.
-	SchemaSource  string `protobuf:"bytes,9,opt,name=schema_source,json=schemaSource,proto3" json:"schema_source,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SchemaSource string `protobuf:"bytes,9,opt,name=schema_source,json=schemaSource,proto3" json:"schema_source,omitempty"`
+	// Whether some instance held the storage bootstrap lock when the diff was
+	// taken — a pod booting, or another operator's apply. It is what separates
+	// "this DDL is outstanding" from "this DDL is being run right now", which
+	// the statement sets cannot say on their own: a convergence's work lands on
+	// a shadow table until it cuts over. Only true is a finding; false is the
+	// absence of evidence, not a claim that the database is idle.
+	ConvergenceInFlight bool `protobuf:"varint,10,opt,name=convergence_in_flight,json=convergenceInFlight,proto3" json:"convergence_in_flight,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *StorageSchemaReport) Reset() {
@@ -4210,6 +4250,13 @@ func (x *StorageSchemaReport) GetSchemaSource() string {
 	return ""
 }
 
+func (x *StorageSchemaReport) GetConvergenceInFlight() bool {
+	if x != nil {
+		return x.ConvergenceInFlight
+	}
+	return false
+}
+
 // StorageSchemaPlanResponse carries the outstanding storage DDL.
 type StorageSchemaPlanResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -4268,9 +4315,24 @@ type StorageSchemaApplyRequest struct {
 	// Caller identifies the operator who issued the command, as resolved by the
 	// plane that accepted it, so the data plane's logs attribute the
 	// convergence to a person rather than to a control plane.
-	Caller        string `protobuf:"bytes,2,opt,name=caller,proto3" json:"caller,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Caller string `protobuf:"bytes,2,opt,name=caller,proto3" json:"caller,omitempty"`
+	// TimeoutSeconds bounds the whole convergence: the advisory-lock wait, the
+	// diff taken under it, and the DDL. Zero means the caller named no budget,
+	// and the serving instance then runs the convergence under the budget it
+	// boots with rather than under an operator's: a caller that could not name
+	// a budget is one whose wait the serving instance cannot know, and the boot
+	// budget is the one every such caller has always waited out. A control
+	// plane names the budget it resolved on every request, so a convergence
+	// runs under the far larger operator default only because a caller asked
+	// for it and is waiting that long. Raise it only to finish work a boot cannot,
+	// such as an index build over a storage table with a long history: the
+	// convergence holds the bootstrap advisory lock for its whole budget, and a
+	// pod booting in that window fails its own lock wait and does not come up.
+	// A value above the serving instance's maximum is refused rather than
+	// clamped, so a caller is never told a budget it did not get.
+	TimeoutSeconds int64 `protobuf:"varint,3,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *StorageSchemaApplyRequest) Reset() {
@@ -4315,6 +4377,13 @@ func (x *StorageSchemaApplyRequest) GetCaller() string {
 		return x.Caller
 	}
 	return ""
+}
+
+func (x *StorageSchemaApplyRequest) GetTimeoutSeconds() int64 {
+	if x != nil {
+		return x.TimeoutSeconds
+	}
+	return 0
 }
 
 // StorageSchemaApplyResponse brackets the convergence with the report from
@@ -4454,7 +4523,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\x93\x04\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xb8\x04\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -4470,7 +4539,8 @@ const file_tern_proto_rawDesc = "" +
 	" \x01(\tR\n" +
 	"schemaPath\x12-\n" +
 	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x120\n" +
-	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x1aT\n" +
+	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x12#\n" +
+	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
@@ -4541,7 +4611,7 @@ const file_tern_proto_rawDesc = "" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
 	"\x0flint_violations\x18\x03 \x03(\v2\x16.tern.v1.LintViolationR\x0elintViolations\x12\x16\n" +
 	"\x06errors\x18\x04 \x03(\tR\x06errors\x12*\n" +
-	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\"\x85\x05\n" +
+	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\"\xaa\x05\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
 	"\aoptions\x18\x02 \x03(\v2\".tern.v1.ApplyRequest.OptionsEntryR\aoptions\x12I\n" +
@@ -4556,7 +4626,8 @@ const file_tern_proto_rawDesc = "" +
 	"\rtarget_shards\x18\n" +
 	" \x03(\tR\ftargetShards\x12'\n" +
 	"\x0fidempotency_key\x18\v \x01(\tR\x0eidempotencyKey\x12:\n" +
-	"\x19generation_operation_keys\x18\f \x03(\tR\x17generationOperationKeys\x1a:\n" +
+	"\x19generation_operation_keys\x18\f \x03(\tR\x17generationOperationKeys\x12#\n" +
+	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x1a:\n" +
 	"\fOptionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aT\n" +
@@ -4731,7 +4802,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x1c\n" +
 	"\toperation\x18\x02 \x01(\tR\toperation\x12\x10\n" +
 	"\x03ddl\x18\x03 \x01(\tR\x03ddl\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x8e\x03\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xc2\x03\n" +
 	"\x13StorageSchemaReport\x12\x18\n" +
 	"\adialect\x18\x01 \x01(\tR\adialect\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x18\n" +
@@ -4741,12 +4812,15 @@ const file_tern_proto_rawDesc = "" +
 	"\x13destructive_allowed\x18\x06 \x01(\bR\x12destructiveAllowed\x127\n" +
 	"\x06manual\x18\a \x03(\v2\x1f.tern.v1.StorageSchemaStatementR\x06manual\x12\x12\n" +
 	"\x04host\x18\b \x01(\tR\x04host\x12#\n" +
-	"\rschema_source\x18\t \x01(\tR\fschemaSource\"Q\n" +
+	"\rschema_source\x18\t \x01(\tR\fschemaSource\x122\n" +
+	"\x15convergence_in_flight\x18\n" +
+	" \x01(\bR\x13convergenceInFlight\"Q\n" +
 	"\x19StorageSchemaPlanResponse\x124\n" +
-	"\x06report\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\x06report\"`\n" +
+	"\x06report\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\x06report\"\x89\x01\n" +
 	"\x19StorageSchemaApplyRequest\x12+\n" +
 	"\x11allow_destructive\x18\x01 \x01(\bR\x10allowDestructive\x12\x16\n" +
-	"\x06caller\x18\x02 \x01(\tR\x06caller\"\x90\x01\n" +
+	"\x06caller\x18\x02 \x01(\tR\x06caller\x12'\n" +
+	"\x0ftimeout_seconds\x18\x03 \x01(\x03R\x0etimeoutSeconds\"\x90\x01\n" +
 	"\x1aStorageSchemaApplyResponse\x126\n" +
 	"\aplanned\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\aplanned\x12:\n" +
 	"\tremaining\x18\x02 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\tremaining*[\n" +

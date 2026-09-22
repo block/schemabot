@@ -256,14 +256,15 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	}
 
 	namespaces := sortedKeys(req.SchemaFiles)
+	ignored := engine.NewIgnoredTables(req.IgnoreTables)
 	result := &engine.PlanResult{}
 	for _, namespace := range namespaces {
 		ns := req.SchemaFiles[namespace]
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
-		files := sortedKeys(ns.Files)
 		schemaChange := engine.SchemaChange{Namespace: namespace}
+		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
 			desired, err := pgstatement.ParseDesired(ns.Files[filename])
@@ -291,17 +292,23 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 					"vocabulary", vocabulary.kind,
 					"value", vocabulary.value)
 			}
-			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers, tableOwner)
+			changes, err = blockMissingPrivileges(ctx, pool, req.Database, report, changes, tiers, tableOwner)
 			if err != nil {
 				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
-			changes, err = blockOversizedTable(ctx, pool, report, changes, tableSizeLimit)
+			changes, err = blockOversizedTable(ctx, pool, req.Database, report, changes, tableSizeLimit)
 			if err != nil {
 				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
-		drops, exempt, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, parser)
+		// A table the config withholds that a schema file also declares is a
+		// contradiction: the declaring file would keep managing the table while
+		// the config says to leave it alone.
+		if err := ignored.RefuseDeclared(namespace, sortedKeys(desiredTables)); err != nil {
+			return nil, err
+		}
+		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, ignored, parser)
 		if err != nil {
 			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
 		}
@@ -314,7 +321,17 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				Reason:    "archive naming",
 			})
 		}
+		if exemption := ignored.Exemption(namespace, withheld); exemption != nil {
+			result.ExemptTables = append(result.ExemptTables, exemption)
+		}
 		if len(schemaChange.TableChanges) > 0 {
+			// Only a namespace with changes needs a rollback baseline, so
+			// the render is paid once per changed namespace rather than for
+			// every namespace the schema files declare.
+			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace)
+			if err != nil {
+				return nil, err
+			}
 			result.Changes = append(result.Changes, schemaChange)
 		}
 	}
@@ -323,13 +340,64 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	return result, nil
 }
 
+// captureOriginalFiles renders the live namespace as the plan's rollback
+// baseline, keyed by schema file name. The baseline is every managed table
+// in the namespace except the archive tables the plan exempts, so it is
+// complete or it is nothing, and the two ways it can fall short end
+// differently. A table the engine read but pg-sprite's renderer refuses —
+// each shape it refuses is named by one of its ErrUnrenderable errors,
+// foreign keys on either side and inheritance among them — leaves captured
+// false, and RV-7 then refuses rollback for this plan rather than
+// reconstructing the originals; the plan itself still proceeds, because
+// rollback capability is not a precondition for reviewing or applying the
+// change. A table the engine could not read — the listing named it and
+// introspection cannot find or resolve it, a catalog query fails, the
+// context is cancelled — is an error that ends the plan, whether it is one
+// table's read or the namespace's: a catalog that could not be read
+// consistently is not one to plan against, and a plan interrupted
+// mid-capture is never recorded as rollback-incapable.
+//
+// The render introspects every managed table in the namespace, changed or
+// not, so its cost grows with the namespace rather than with the change; the
+// introspections run concurrently within the pool's ceiling, so the wall
+// time grows more slowly than the table count does.
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string) (files map[string]string, captured bool, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline)
+	if err != nil {
+		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+	}
+	if len(renderErrors) > 0 {
+		// One representative cause is enough to start triage; the count says
+		// how far the namespace is from a complete baseline without the log
+		// line growing with the number of unrenderable tables.
+		slog.Warn("PostgreSQL plan could not capture the whole namespace as rollback originals; the plan proceeds rollback-incapable",
+			"database", database,
+			"namespace", namespace,
+			"unrenderable_tables", len(renderErrors),
+			"first_error", renderErrors[0])
+		return nil, false, nil
+	}
+	files = make(map[string]string, len(originalTables))
+	for table, content := range originalTables {
+		files[table+".sql"] = content
+	}
+	return files, true, nil
+}
+
+// tierUnderived marks a step whose privilege tier could not be derived: its
+// statement is a shape the engine does not execute, so the step is blocked
+// and there is no access to probe on its behalf. It sits below preflight's
+// lowest rung so it can never match a checked tier.
+const tierUnderived preflight.Tier = -1
+
 // tableChanges renders the report's statements as planned table changes and
-// derives each executable step's privilege tier alongside them. The returned
-// slices are parallel: tiers[i] is the access changes[i] needs from the
-// engine role, and is meaningful only while changes[i] carries no verdict —
-// a blocked step never reaches a privilege check. unrecognized carries one
-// entry per statement whose verdict is a placeholder for planner vocabulary
-// this build does not map, for the caller to log with the plan's identifiers.
+// derives each step's privilege tier alongside them. The returned slices are
+// parallel: tiers[i] is the access changes[i] needs from the engine role,
+// including when an earlier verdict already blocked that step, so a later
+// gate can name the grant a blocked step will also need; a blocked step whose
+// shape has no tier carries tierUnderived. unrecognized carries one entry per
+// statement whose verdict is a placeholder for planner vocabulary this build
+// does not map, for the caller to log with the plan's identifiers.
 func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
 	// Each statement's verdict is derived once and reused for both the
 	// greenfield decision and the rendering, so a placeholder verdict is
@@ -367,22 +435,26 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				table = report.Table
 			}
 			stepMode, stepReason := mode, reason
-			var stepTier preflight.Tier
-			if stepMode == "" {
-				// The apply path derives a privilege tier for every statement
-				// it executes, and that derivation refuses shapes outside the
-				// native-safe set. Run the same authority here so the verdict
-				// the operator reviews matches what the engine will do,
-				// instead of emitting an executable plan that deterministically
-				// fails at apply.
-				tier, tierErr := preflight.RequiredTier([]string{sql})
-				if tierErr != nil {
-					stepMode = engine.ExecutionModeBlocked
-					stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
-				} else {
-					stepTier = tier
-				}
+			// The apply path derives a privilege tier for every statement it
+			// executes, and that derivation refuses shapes outside the
+			// native-safe set. Run the same authority here, for blocked steps
+			// too: an executable step whose shape it refuses becomes a blocked
+			// verdict that matches what the engine will do, instead of an
+			// executable plan that deterministically fails at apply, and a
+			// step the planner already blocked keeps the tier the privilege
+			// gate needs to name the grant the operator will also need.
+			stepTier := tierUnderived
+			tier, tierErr := preflight.RequiredTier([]string{sql})
+			switch {
+			case tierErr == nil:
+				stepTier = tier
+			case stepMode == "":
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
 			}
+			// Verdict reasons quote the table name, a planner-sourced
+			// identifier, so the reserved cause separator is neutralized
+			// before the reason becomes one cause of the verdict.
 			changes = append(changes, engine.TableChange{
 				Table:         table,
 				Operation:     operation,
@@ -390,7 +462,7 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				IsUnsafe:      statement.Destructive,
 				UnsafeReason:  destructiveReason(statement.Destructive, table),
 				ExecutionMode: stepMode,
-				ModeReason:    stepReason,
+				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 			})
 			tiers = append(tiers, stepTier)
 		}
@@ -490,7 +562,7 @@ func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
 }
 
 // blockMissingPrivileges verifies the connected role holds the access each
-// executable step needs, at that step's own tier, so a missing grant surfaces
+// step needs, at that step's own tier, so a missing grant surfaces
 // on the plan the operator reviews — with the exact provisioning statement —
 // instead of failing only after apply is requested. Tiers are checked
 // per-step rather than aggregated so a refusal's remediation names only the
@@ -500,18 +572,47 @@ func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
 // grant revoked between plan and apply still fails closed there. A privilege
 // refusal blocks the steps at its tier; a table-scoped refusal blocks every
 // executable step; any other failure fails the plan — an executable plan
-// must never be produced while the check's answer is unknown. Reasons come
+// must never be produced while the check's answer is unknown. When every step
+// is already blocked, a refusal the operator answers by provisioning — a
+// grant, a role, a schema — is appended as an independent cause; any other
+// answer leaves the safe verdicts intact and is logged. Reasons come
 // from classifyRefusal, so the same failure carries the same detail at plan
 // and apply time; here it is prefixed with the statement it blocks. The
 // returned slice is the input with verdicts marked.
-func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier, tableOwner string) ([]engine.TableChange, error) {
+func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier, tableOwner string) ([]engine.TableChange, error) {
+	checkTier := func(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, tier preflight.Tier, tableOwner string) error {
+		if tier == preflight.TierCreateTable {
+			// The off-ladder create tier is checked against the schema, not
+			// the table: CheckPrivileges' ladder walks facts about an
+			// existing table, and a greenfield target has none.
+			_, err := preflight.CheckCreatePrivilegesAs(ctx, pool, report.Schema, tableOwner)
+			return err
+		}
+		_, err := preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+		return err
+	}
+	return blockMissingPrivilegesWithCheck(ctx, pool, database, report, changes, tiers, tableOwner, checkTier)
+}
+
+// privilegeTierCheck answers whether the connected role holds one tier's
+// access for the report's target; the error is the preflight's own so
+// classifyRefusal can render it.
+type privilegeTierCheck func(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, tier preflight.Tier, tableOwner string) error
+
+// blockMissingPrivilegesWithCheck is blockMissingPrivileges with the per-tier
+// check injected, so the verdict rewriting can be exercised without a target.
+func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier, tableOwner string, checkTier privilegeTierCheck) ([]engine.TableChange, error) {
 	if len(changes) != len(tiers) {
 		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
 	}
+	fullyBlocked := !hasExecutableChanges(changes)
 	// Checked before any verdict rewriting below: blocking dependent steps
 	// must never launder a report that carries executable work but names no
 	// target into a plan that skips the privilege check entirely.
-	if hasExecutableChanges(changes) && report.Table == "" {
+	if report.Table == "" {
+		if fullyBlocked {
+			return changes, nil
+		}
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
 	if isGreenfieldTable(report) {
@@ -521,10 +622,27 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 		// target can satisfy; every other executable step depends on the
 		// table's creation, so that dependency is its accurate reason.
 		blockAbsentTableDependents(changes, tiers, report.Table)
+		// Blocking the dependents can leave no executable step: a plan whose
+		// CREATE TABLE the planner refused and whose index build was the
+		// only executable work is now blocked throughout, and its create
+		// step is probed below like any other fully blocked plan's, so the
+		// schema grant is named beside the shape refusal here too.
+		fullyBlocked = !hasExecutableChanges(changes)
 	}
+	// Executable steps are always checked. On a plan every gate has already
+	// refused, the blocked steps' tiers are checked too, so a grant the
+	// operator will also need is named in the same verdict rather than after
+	// the planner refusal is fixed.
+	greenfield := isGreenfieldTable(report)
 	required := make(map[preflight.Tier]bool)
 	for i, change := range changes {
-		if change.ExecutionMode == "" {
+		switch {
+		case change.ExecutionMode == "":
+			if tiers[i] == tierUnderived {
+				return nil, fmt.Errorf("verify privileges for table %q: executable statement %q carries no privilege tier", report.Table, change.DDL)
+			}
+			required[tiers[i]] = true
+		case fullyBlocked && change.ExecutionMode == engine.ExecutionModeBlocked && blockedTierIsProbeable(tiers[i], greenfield):
 			required[tiers[i]] = true
 		}
 	}
@@ -532,19 +650,39 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 		return changes, nil
 	}
 	for _, tier := range slices.Sorted(maps.Keys(required)) {
-		var err error
-		if tier == preflight.TierCreateTable {
-			// The off-ladder create tier is checked against the schema, not
-			// the table: CheckPrivileges' ladder walks facts about an
-			// existing table, and a greenfield target has none.
-			_, err = preflight.CheckCreatePrivilegesAs(ctx, pool, report.Schema, tableOwner)
-		} else {
-			_, err = preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
-		}
+		err := checkTier(ctx, pool, report, tier, tableOwner)
 		if err == nil {
 			continue
 		}
 		r := classifyRefusal(err, report.Table)
+		if fullyBlocked {
+			// The plan is already safe as it stands, so the probe's answer
+			// can only add to the verdicts, never replace them. A refusal
+			// that names something to provision — a grant, a role, a
+			// schema — is work the operator will have to do anyway, so it
+			// is appended beside the earlier cause. Every other answer goes
+			// to the log: a refusal about the table itself names nothing to
+			// provision on a plan nothing will run, and an operational
+			// failure is not a fact about the target at all.
+			switch {
+			case r != nil && r.provisionable:
+				appendBlockedCauseAtTier(changes, tiers, tier, r.detail)
+			case r != nil:
+				slog.Warn("PostgreSQL privilege check refused the table; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"refusal", r.reason,
+					"detail", r.detail)
+			default:
+				slog.Warn("PostgreSQL privilege check failed; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"error", err)
+			}
+			continue
+		}
 		if r == nil {
 			return nil, fmt.Errorf("check privileges for table %q: %w", report.Table, err)
 		}
@@ -564,6 +702,19 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	return changes, nil
 }
 
+// blockedTierIsProbeable reports whether a blocked step's tier can be checked
+// against the target on a plan every gate has already refused. A step whose
+// shape has no tier has no access to probe. On a table the planner proved
+// absent, only the CREATE TABLE tier states facts the target can answer:
+// probing an absent table for any other tier can only say "table not found",
+// which names nothing the operator can provision.
+func blockedTierIsProbeable(tier preflight.Tier, greenfield bool) bool {
+	if tier == tierUnderived {
+		return false
+	}
+	return !greenfield || tier == preflight.TierCreateTable
+}
+
 // blockOversizedTable applies the native-safe table size ceiling to executable
 // steps whose native cost scales with the existing table. The preflight
 // measures the table and proves it exists and is an ordinary or partitioned
@@ -571,60 +722,123 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 // where concurrent index builds keep their verdict because their bound is a
 // duration envelope, not the table size. A typed refusal is rendered as a
 // blocked verdict; an operational failure fails planning rather than producing
-// an executable plan while the table size is unknown.
-func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
-	if !hasExecutableChanges(changes) {
+// an executable plan while the table size is unknown. When an earlier gate has
+// already blocked every step, an operational failure or a refusal unrelated to
+// size leaves those safe verdicts intact and is logged for operator triage.
+func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
+	return blockOversizedTableWithCheck(ctx, pool, database, report, changes, tableSizeLimit, preflight.CheckTable)
+}
+
+func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64, checkTable func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error)) ([]engine.TableChange, error) {
+	// A table the plan leaves untouched has no step for a size verdict to
+	// land on, so it is not charged a catalog round trip.
+	if len(changes) == 0 {
 		return changes, nil
 	}
+	// When an earlier gate has already blocked every step the plan is safe as
+	// it stands; the size check then runs only so the operator sees both
+	// causes at once, and nothing it finds may turn that safe plan into a
+	// planning failure.
+	fullyBlocked := !hasExecutableChanges(changes)
 	if report.Table == "" {
+		if fullyBlocked {
+			return changes, nil
+		}
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
 	if isGreenfieldTable(report) {
 		return changes, nil
 	}
-	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	_, err := checkTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
 	if err == nil {
 		return changes, nil
 	}
 	r := classifyRefusal(err, report.Table)
 	if r == nil {
+		if fullyBlocked {
+			slog.Warn("PostgreSQL table size check failed; existing blocked plan verdicts remain unchanged",
+				"database", database,
+				"namespace", report.Schema,
+				"table", report.Table,
+				"error", err)
+			return changes, nil
+		}
 		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
 	}
 	// The table name is a database-sourced identifier. Quoting escapes control
 	// characters but not whitespace runs, so the composed reason is collapsed
 	// to one line as a whole; the Markdown surfaces that render it escape
 	// their own delimiters at the rendering boundary, so the name reaches the
-	// operator as the relation it is.
-	reason := singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
+	// operator as the relation it is. The blocked-cause separator is the one
+	// delimiter decoded before rendering, so it is neutralized here.
+	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
 		if err := blockRewriteSteps(changes, reason); err != nil {
+			if fullyBlocked {
+				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"error", err)
+				return changes, nil
+			}
 			return nil, err
 		}
+		return changes, nil
+	}
+	if fullyBlocked {
+		// A refusal about the table itself, not its size, has no executable
+		// step left to land on; the verdicts already carry a cause the
+		// operator can act on, so the answer goes to the log instead of
+		// being lost.
+		slog.Warn("PostgreSQL table size check refused the table; existing blocked plan verdicts remain unchanged",
+			"database", database,
+			"namespace", report.Schema,
+			"table", report.Table,
+			"refusal", r.reason,
+			"detail", r.detail)
 		return changes, nil
 	}
 	blockExecutableChanges(changes, reason)
 	return changes, nil
 }
 
-// blockRewriteSteps marks every still-executable step whose native cost
-// scales with the existing table blocked with the reason. A concurrent index
-// build keeps its verdict: it is bounded by its duration envelope rather than
-// the table size ceiling. Steps already carrying a verdict keep it, so a
-// refusal an earlier gate recorded is never overwritten by the size verdict.
-// Every executable step here was parsed when its privilege tier was derived,
-// so a statement that fails to classify is an invariant violation and fails
-// planning rather than being exempted or blocked on a guess.
+// blockRewriteSteps marks every step whose native cost scales with the existing
+// table blocked with the reason. A concurrent index build keeps its verdict: it
+// is bounded by its duration envelope rather than the table size ceiling. An
+// earlier blocked verdict retains its reason and gains the independent size
+// cause so the operator can resolve both without another planning round trip.
+// parser.Classify in tableChanges parsed every rendered statement, including
+// blocked steps, with the same single-statement requirements used here. A
+// statement that now fails to classify is therefore an invariant violation.
+// Every step is classified before any verdict is written, so a caller that
+// keeps the plan on that error keeps it exactly as it was rather than with
+// the size cause on some steps and not others.
 func blockRewriteSteps(changes []engine.TableChange, reason string) error {
+	concurrentIndexes := make([]bool, len(changes))
 	for i := range changes {
-		if changes[i].ExecutionMode != "" {
+		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
 		}
 		concurrentIndex, err := concurrentIndexStatement(changes[i].DDL)
 		if err != nil {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
-		if concurrentIndex {
+		concurrentIndexes[i] = concurrentIndex
+	}
+	for i := range changes {
+		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
+			continue
+		}
+		if concurrentIndexes[i] {
+			continue
+		}
+		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
+			causes := engine.BlockedCauses(changes[i].ModeReason)
+			if !slices.Contains(causes, reason) {
+				changes[i].ModeReason = engine.JoinBlockedCauses(append(causes, reason))
+			}
 			continue
 		}
 		changes[i].ExecutionMode = engine.ExecutionModeBlocked
@@ -674,19 +888,31 @@ func concurrentIndexStatement(sql string) (bool, error) {
 // relationship needs instead of pointing at a file the pull cannot write. The
 // catalog is read directly because the namespace's schema may not exist yet,
 // in which case the answer is an empty set, not an error.
-func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, parser ddl.StatementParser) ([]engine.TableChange, []string, error) {
+func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
 	tables, err := liveTables(ctx, pool, namespace)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var drops []engine.TableChange
 	var exempt []string
+	var withheld []string
 	for _, live := range tables {
 		if declared[live.name] {
 			continue
 		}
+		// The config's own entry is reported ahead of the naming conventions:
+		// an operator who wrote the table down deserves to read their own
+		// reason back, not an incidental one the table also happens to match.
+		if ignored.Withholds(live.name) {
+			slog.Info("live table withheld from the plan by ignore_tables",
+				"database", database,
+				"namespace", namespace,
+				"table", live.name)
+			withheld = append(withheld, live.name)
+			continue
+		}
 		if spirittable.IsArchiveTable(live.name) {
-			slog.Info("PostgreSQL archive table has no schema file and is exempt from the undeclared-table verdict",
+			slog.Info("PostgreSQL archive table has no schema file and is left in place rather than dropped",
 				"database", database,
 				"namespace", namespace,
 				"table", live.name)
@@ -696,7 +922,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, live.name}.Sanitize())
 		operation, _, err := parser.Classify(sql)
 		if err != nil {
-			return nil, nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
+			return nil, nil, nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
 		}
 		// The plan comment classifies this drop from the statement; when a
 		// stored plan carries no statement it falls back to the words "DROP
@@ -712,7 +938,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 			ModeReason:    sanitizeReasonText(undeclaredTableReason(namespace, live)),
 		})
 	}
-	return drops, exempt, nil
+	return drops, exempt, withheld, nil
 }
 
 // undeclaredTableReason explains why the drop is blocked and what the
@@ -932,14 +1158,28 @@ func blockChangesAtTier(changes []engine.TableChange, tiers []preflight.Tier, ti
 	}
 }
 
+// appendBlockedCauseAtTier adds an independent cause to every blocked step
+// whose statement requires the given tier, leaving steps at other tiers and
+// steps that already carry this cause untouched. The step's existing verdict
+// stays first: it is the refusal the operator saw before this gate ran.
+func appendBlockedCauseAtTier(changes []engine.TableChange, tiers []preflight.Tier, tier preflight.Tier, reason string) {
+	for i := range changes {
+		if changes[i].ExecutionMode == engine.ExecutionModeBlocked && tiers[i] == tier && !strings.Contains(changes[i].ModeReason, reason) {
+			changes[i].ModeReason += clauseSeparator + reason
+		}
+	}
+}
+
 // sanitizeReasonText makes text that embeds database-sourced identifiers safe
 // for the single-line Markdown surfaces that render a blocked reason: control
 // and format characters (including bidi overrides usable for visual spoofing)
 // are stripped, whitespace runs — including newlines — collapse to one space,
 // and the table cell separator is neutralized so a crafted identifier cannot
-// break comment layout.
+// break comment layout. The blocked-cause separator is neutralized for the
+// same reason: an identifier carrying it would otherwise decode as causes the
+// engine never issued.
 func sanitizeReasonText(s string) string {
-	return strings.ReplaceAll(singleLine(s), "|", "/")
+	return engine.SanitizeBlockedCause(strings.ReplaceAll(singleLine(s), "|", "/"))
 }
 
 // maxStatementMetadataLen bounds the statement text carried in progress
