@@ -193,30 +193,38 @@ type ExemptTablesData struct {
 }
 
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
-// uniform "same plan everywhere" line when every deployment matches, or a
-// per-deployment breakdown when some deployment diverged from — or could not be
-// confirmed against — the reviewed plan.
+// uniform line when every member passed its contract, or a per-member breakdown
+// when some member diverged from — or could not be confirmed against — the
+// reviewed plan.
 type DeploymentDriftData struct {
-	// Deployments is every configured deployment in rollout order, primary first.
+	// Deployments is every configured rollout member in rollout order, primary
+	// first.
 	Deployments []DeploymentDriftEntry
-	// Clean is true only when every deployment matches the reviewed plan.
+	// Clean means every member passed its contract: under mirrored members, that
+	// they all match the reviewed plan; under independent members, that they all
+	// produced a plan of their own.
 	Clean bool
 	// Computed is false when the rollup itself could not be evaluated; the check
 	// still fails closed, and the preview says the deployments are unverified.
 	Computed bool
+	// Independent reports that each member holds its own schema and was planned
+	// against it. Members are then not expected to match each other, so a clean
+	// rollup means every target was planned rather than that they agree — which
+	// is the opposite of what the mirrored wording says.
+	Independent bool
 }
 
-// DeploymentDriftEntry is one deployment's classification against the reviewed
-// primary plan.
+// DeploymentDriftEntry is one rollout member's classification against the
+// reviewed primary plan.
 type DeploymentDriftEntry struct {
 	Deployment string
 	Primary    bool
-	// Class is "match", "diverged", or "errored".
+	// Class is "match", "planned", "diverged", or "errored".
 	Class string
-	// Blocked is the number of changes this deployment will refuse at apply.
+	// Blocked is the number of changes this member will refuse at apply.
 	Blocked int
-	// Detail is a short human explanation for a diverged or errored deployment;
-	// empty for a match.
+	// Detail is a short human explanation for a diverged or errored member;
+	// empty for a member that passed.
 	Detail string
 }
 
@@ -1130,10 +1138,15 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
-// line when every deployment matches the reviewed plan and none will refuse a
-// change, or a per-deployment breakdown naming which deployments diverged,
-// could not be verified, or carry changes blocked at apply. It is a no-op for a
-// nil rollup (single-target database or drift not evaluated).
+// line when every member passed its contract and none will refuse a change, or
+// a per-member breakdown naming which members diverged, could not be planned or
+// verified, or carry changes blocked at apply. It is a no-op for a nil rollup
+// (single-target database or drift not evaluated).
+//
+// The two contracts get different wording throughout, because a clean rollup
+// means a different thing under each. Mirrored members agree with the reviewed
+// plan; independent members were never compared to it, so the uniform line says
+// they were each planned rather than that they match.
 func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	if drift == nil {
 		return
@@ -1144,14 +1157,36 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
-	if drift.Clean {
+	switch {
+	case drift.Clean && drift.Independent:
+		// Independent members were deliberately never compared to each other, so
+		// the mirrored headline would assert agreement the rollup did not check.
+		// It says what was actually established: every target has a plan.
+		//
+		// The members are not named here the way the mirrored line names them.
+		// Mirrored members are distinct deployments, so their names identify
+		// them; independent members usually share one deployment and differ by
+		// target, which this entry does not carry, so the same list would name
+		// one deployment once per target and identify nothing.
+		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** — each target holds its own schema, so their plans are not expected to match.\n\n",
+			len(drift.Deployments))
+	case drift.Clean:
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
 			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
-		if !anyDeploymentBlocked(drift.Deployments) {
-			return
-		}
-	} else {
+	case drift.Independent:
+		// A member that could not be planned blocks under either contract, but
+		// only mirrored members can be out of agreement with each other. Calling
+		// an independent environment's failure "drift" would send an operator to
+		// reconcile targets that are supposed to differ.
+		sb.WriteString(glyph.Attention + " **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:\n\n")
+	default:
 		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+	}
+	// A clean rollup has nothing more to say unless some member will refuse a
+	// change at apply, which the per-member list below is the only place to
+	// report.
+	if drift.Clean && !anyDeploymentBlocked(drift.Deployments) {
+		return
 	}
 	for _, d := range drift.Deployments {
 		name := "`" + d.Deployment + "`"
@@ -1161,10 +1196,19 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		switch d.Class {
 		case "match":
 			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan%s\n", name, blockedSuffix(d.Blocked))
+		case "planned":
+			fmt.Fprintf(sb, "- %s ✅ planned against its own schema%s\n", name, blockedSuffix(d.Blocked))
 		case "diverged":
 			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s%s\n", name, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
 		default:
-			fmt.Fprintf(sb, "- %s "+glyph.Failed+" could not verify%s%s\n", name, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
+			// An errored member means different things under the two contracts:
+			// a mirrored member's diff could not be confirmed against the
+			// reviewed plan, while an independent member has no plan at all.
+			reason := "could not verify"
+			if drift.Independent {
+				reason = "could not plan"
+			}
+			fmt.Fprintf(sb, "- %s "+glyph.Failed+" %s%s%s\n", name, reason, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
 		}
 	}
 	sb.WriteString("\n")

@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
@@ -70,7 +71,7 @@ func TestRollupDeploymentDiffs_AllMatchIsClean(t *testing.T) {
 		rollupDeployment("au", rollupAlterUsers(change)),
 		rollupDeployment("us", rollupAlterUsers(change)),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 3)
@@ -105,7 +106,7 @@ func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
 			rollupDeployment("au", secondary),
 		}
 
-		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 		require.NoError(t, err)
 		assert.True(t, rollup.Clean)
 		assert.Equal(t, 0, rollup.Entries[0].Blocked)
@@ -140,7 +141,7 @@ func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, drift.MissingFromCandidate, 2, "drift counts one change per shard")
 
-		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 		require.NoError(t, err)
 		assert.True(t, rollup.Clean)
 		assert.Equal(t, 0, rollup.Entries[0].Blocked)
@@ -154,7 +155,7 @@ func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
 		errored.Err = fmt.Errorf("deployment unreachable")
 		diffs := []DeploymentPlanDiff{rollupDeployment("eu", change(false)), errored}
 
-		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 		require.NoError(t, err)
 		assert.False(t, rollup.Clean)
 		assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
@@ -168,7 +169,7 @@ func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
 		diverged.Changes[0].TableChanges[0].Ddl = "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)"
 		diffs := []DeploymentPlanDiff{rollupDeployment("eu", change(false)), diverged}
 
-		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 		require.NoError(t, err)
 		assert.False(t, rollup.Clean)
 		assert.Equal(t, DeploymentDiverged, rollup.Entries[1].Class)
@@ -181,7 +182,7 @@ func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
 			rollupDeployment("au", change(false)),
 		}
 
-		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 		require.NoError(t, err)
 		assert.True(t, rollup.Clean)
 		assert.Equal(t, 1, rollup.Entries[0].Blocked)
@@ -196,7 +197,7 @@ func TestRollupDeploymentDiffs_DivergenceBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 		rollupDeployment("au", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
@@ -214,7 +215,7 @@ func TestRollupDeploymentDiffs_ProducerErrorBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers(change)),
 		errored,
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
@@ -229,7 +230,7 @@ func TestRollupDeploymentDiffs_ComparisonErrorBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 		rollupDeployment("au", rollupAlterUsers("not valid sql")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
@@ -245,7 +246,7 @@ func TestRollupDeploymentDiffs_UnusablePrimaryBlocksAll(t *testing.T) {
 		primary,
 		rollupDeployment("au", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentErrored, rollup.Entries[0].Class)
@@ -256,7 +257,7 @@ func TestRollupDeploymentDiffs_UnusablePrimaryBlocksAll(t *testing.T) {
 // An empty result set is a fail-closed error: there is nothing to prove the
 // deployments agree.
 func TestRollupDeploymentDiffs_EmptyErrors(t *testing.T) {
-	_, err := RollupDeploymentDiffs(nil, nil)
+	_, err := RollupDeploymentDiffs(nil, nil, PlanMirrored)
 	require.Error(t, err)
 }
 
@@ -265,7 +266,7 @@ func TestRollupDeploymentDiffs_SingleDeploymentClean(t *testing.T) {
 	diffs := []DeploymentPlanDiff{
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 1)
@@ -279,7 +280,7 @@ func TestRollupDeploymentDiffs_MalformedSingleDeploymentBaselineBlocks(t *testin
 	diffs := []DeploymentPlanDiff{
 		rollupDeployment("eu", rollupAlterUsers("not valid sql")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 1)
@@ -313,7 +314,7 @@ func TestRollupDeploymentDiffs_PostgresDialectClean(t *testing.T) {
 		rollupPostgresDeployment("eu", change()),
 		rollupPostgresDeployment("us", change()),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 2)
@@ -329,7 +330,7 @@ func TestRollupDeploymentDiffs_UnregisteredPrimaryDialectBlocks(t *testing.T) {
 	primary := rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"))
 	primary.DatabaseType = "oracle"
 	diffs := []DeploymentPlanDiff{primary}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 1)
@@ -349,7 +350,7 @@ func TestRollupDeploymentDiffs_MySQLFamilyTypesShareDialect(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers(change)),
 		mysqlDeployment,
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 2)
@@ -366,7 +367,7 @@ func TestRollupDeploymentDiffs_MixedDialectBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 		rollupPostgresDeployment("us", rollupAlterUsers("ALTER TABLE users ADD COLUMN email varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
@@ -386,15 +387,15 @@ func TestRollupDeploymentDiffs_ContractMismatchErrors(t *testing.T) {
 	}
 
 	t.Run("wrong primary", func(t *testing.T) {
-		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"au", "au"}, [2]string{"eu", "eu"}))
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"au", "au"}, [2]string{"eu", "eu"}), PlanMirrored)
 		require.Error(t, err)
 	})
 	t.Run("missing member", func(t *testing.T) {
-		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"eu", "eu"}, [2]string{"au", "au"}, [2]string{"us", "us"}))
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"eu", "eu"}, [2]string{"au", "au"}, [2]string{"us", "us"}), PlanMirrored)
 		require.Error(t, err)
 	})
 	t.Run("extra diff", func(t *testing.T) {
-		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"eu", "eu"}))
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"eu", "eu"}), PlanMirrored)
 		require.Error(t, err)
 	})
 }
@@ -411,7 +412,7 @@ func TestRollupDeploymentDiffs_SameDeploymentDifferentTargets(t *testing.T) {
 	}
 
 	t.Run("matching members roll up clean", func(t *testing.T) {
-		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
 		require.NoError(t, err)
 		assert.True(t, rollup.Clean)
 		require.Len(t, rollup.Entries, 2)
@@ -420,8 +421,104 @@ func TestRollupDeploymentDiffs_SameDeploymentDifferentTargets(t *testing.T) {
 	})
 
 	t.Run("swapped targets are a contract mismatch", func(t *testing.T) {
-		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"cake", "orders-002"}, [2]string{"cake", "orders-001"}))
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"cake", "orders-002"}, [2]string{"cake", "orders-001"}), PlanMirrored)
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "cake/orders-001")
 	})
+}
+
+// An environment whose members are distinct targets plans each one against its
+// own live schema, so members that would run different changes are ordinary
+// rather than drift. The rollup stays clean and every member classifies as
+// planned — the same change sets under mirrored planning would block.
+func TestRollupDeploymentDiffs_IndependentMembersDoNotBlockOnDifference(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupMember("cake", "orders-001", rollupAlterUsers("ALTER TABLE users ADD COLUMN email VARCHAR(255)")),
+		rollupMember("cake", "orders-002", rollupAlterUsers("ALTER TABLE users ADD COLUMN phone VARCHAR(32)")),
+		rollupMember("cake", "orders-003"),
+	}
+	members := rollupMembers(diffs)
+
+	independent, err := RollupDeploymentDiffs(diffs, members, PlanIndependent)
+	require.NoError(t, err)
+	assert.True(t, independent.Clean, "targets planned on their own do not drift against each other")
+	require.Len(t, independent.Entries, 3)
+	for i, entry := range independent.Entries {
+		assert.Equal(t, DeploymentPlanned, entry.Class, "entry %d", i)
+		assert.NoError(t, entry.Err, "entry %d", i)
+	}
+
+	mirrored, err := RollupDeploymentDiffs(diffs, members, PlanMirrored)
+	require.NoError(t, err)
+	assert.False(t, mirrored.Clean, "the same change sets are drift when members are expected to match")
+	assert.Equal(t, DeploymentDiverged, mirrored.Entries[1].Class)
+}
+
+// Independent planning removes the comparison between members, not the
+// requirement that each member be plannable: a member the producer could not
+// diff still blocks the review closed.
+func TestRollupDeploymentDiffs_IndependentMemberErrorBlocks(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupMember("cake", "orders-001", rollupAlterUsers("ALTER TABLE users ADD COLUMN email VARCHAR(255)")),
+		rollupMember("cake", "orders-002"),
+	}
+	diffs[1].Err = fmt.Errorf("target unreachable")
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanIndependent)
+	require.NoError(t, err)
+	assert.False(t, rollup.Clean)
+	assert.Equal(t, DeploymentPlanned, rollup.Entries[0].Class)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+	require.Error(t, rollup.Entries[1].Err)
+	assert.Contains(t, rollup.Entries[1].Err.Error(), "target unreachable")
+}
+
+// A member whose change content will not parse under its own grammar has no
+// usable plan, so it blocks even though nothing is compared against it.
+func TestRollupDeploymentDiffs_IndependentUnparseableMemberBlocks(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupMember("cake", "orders-001", rollupAlterUsers("ALTER TABLE users ADD COLUMN email VARCHAR(255)")),
+		rollupMember("cake", "orders-002", rollupAlterUsers("this is not valid DDL at all")),
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanIndependent)
+	require.NoError(t, err)
+	assert.False(t, rollup.Clean)
+	assert.Equal(t, DeploymentPlanned, rollup.Entries[0].Class)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+	require.Error(t, rollup.Entries[1].Err)
+	assert.Contains(t, rollup.Entries[1].Err.Error(), "not usable")
+}
+
+// The member contract is enforced whatever the planning: independent planning
+// stops members being compared to each other, it does not stop a missing or
+// misidentified member from failing the rollup closed.
+func TestRollupDeploymentDiffs_IndependentEnforcesMemberContract(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupMember("cake", "orders-001"),
+		rollupMember("cake", "orders-002"),
+	}
+
+	_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"cake", "orders-002"}, [2]string{"cake", "orders-001"}), PlanIndependent)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cake/orders-002")
+}
+
+// Every classification the rollup can produce has to be recorded under its own
+// metric label. RecordReviewDrift relabels one it does not recognize as
+// "unknown", which is reserved for a coding gap — so a classification added
+// here and not there turns a routine outcome into a permanent false gap signal,
+// and nothing fails to say so. The walk stops on String()'s own out-of-range
+// form, which covers whatever the enum holds rather than a list kept in step by
+// hand.
+func TestDeploymentClassificationsAreKnownToTheDriftMetric(t *testing.T) {
+	var walked []string
+	for c := DeploymentMatch; c.String() != fmt.Sprintf("unknown(%d)", int(c)); c++ {
+		assert.True(t, metrics.KnownReviewDriftClassification(c.String()),
+			"classification %q would be recorded as \"unknown\"", c.String())
+		walked = append(walked, c.String())
+	}
+	// Naming them pins the walk itself: a String() that stopped early would
+	// otherwise pass by covering nothing.
+	assert.Equal(t, []string{"match", "diverged", "errored", "planned"}, walked)
 }

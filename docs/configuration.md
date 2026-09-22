@@ -287,7 +287,7 @@ A database that lives on more than one target replaces the scalar `target` with 
 
 > **MySQL only.** `targets` is rejected at startup on any other database type. Addressing N targets has to be represented on every operator-facing surface — the plan comment, progress, the terminal summary — and that presentation is built per engine, so the feature is enabled per engine as the work lands.
 
-> **Config surface only in this release.** `targets` resolves to one rollout member per target, but the plan and apply paths still treat every member of an environment the way they treat deployments.
+> **Review only in this release.** An environment's targets are each planned against their own live schema, and a difference between them no longer blocks the review. Apply is not there yet: it still runs the reviewed plan on every member, so an environment whose targets hold different schemas would run one target's DDL against another. Do not configure `targets` on an environment whose targets can diverge until per-member apply lands.
 
 ```yaml
 databases:
@@ -324,7 +324,7 @@ Rules:
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
 
-`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the same schema. What differs is what a difference between members means when one is found. The planning behavior described here arrives with the plan and apply work noted above; this release ships the config surface.
+`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the same schema. What differs is what a difference between members means when one is found.
 
 The deployments of one environment are mirrors, so a difference between them is a fault: the plan under review was not written for the member that disagrees, and the check blocks rather than apply it.
 

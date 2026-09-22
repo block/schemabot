@@ -373,17 +373,33 @@ func RecordTransientPlanRetry(ctx context.Context, database, environment, outcom
 
 var knownReviewDriftClassifications = map[string]bool{
 	"match":    true,
+	"planned":  true,
 	"diverged": true,
 	"errored":  true,
 }
 
-// RecordReviewDrift increments the counter for a deployment's review-time drift
-// classification against the reviewed primary plan. A spike with
-// classification="diverged" means a deployment's live schema no longer matches
-// what was reviewed — an operator must reconcile that deployment before the PR
-// can apply. classification="errored" means the deployment could not be diffed
-// or compared and is failing the check closed; investigate connectivity to that
-// deployment or the plan input.
+// KnownReviewDriftClassification reports whether the review-drift counter
+// records a classification under its own label rather than collapsing it into
+// "unknown". It exists so the package that owns the classifications can prove
+// every one of them is recognized here; nothing on a request path needs to ask.
+func KnownReviewDriftClassification(classification string) bool {
+	return knownReviewDriftClassifications[classification]
+}
+
+// RecordReviewDrift increments the counter for a rollout member's review-time
+// classification. A spike with classification="diverged" means a deployment's
+// live schema no longer matches what was reviewed — an operator must reconcile
+// that deployment before the PR can apply. classification="errored" means the
+// member could not be diffed, compared, or planned and is failing the check
+// closed; investigate connectivity to that member or the plan input.
+//
+// classification="planned" is the healthy outcome for a member that holds its
+// own schema: it was planned against that schema and never compared to the
+// reviewed plan, so it is the independent counterpart of "match" and not a
+// signal to alert on. It has to be listed here rather than left to the unknown
+// bucket, which is reserved for a classification the code emits and this
+// contract does not know about — a coding gap, which normal independent
+// planning is not.
 func RecordReviewDrift(ctx context.Context, database, environment, deployment, classification string) {
 	if !knownReviewDriftClassifications[classification] {
 		// An unrecognized classification is a coding gap, not a drift signal.
@@ -392,7 +408,7 @@ func RecordReviewDrift(ctx context.Context, database, environment, deployment, c
 		classification = "unknown"
 	}
 	addCounter(ctx, "schemabot.review_drift.total",
-		"review-time per-deployment drift classifications against the reviewed primary plan", "{deployment}",
+		"review-time per-member classifications: against the reviewed primary plan where members mirror it, against the member's own schema where they do not", "{deployment}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("deployment", deployment),
