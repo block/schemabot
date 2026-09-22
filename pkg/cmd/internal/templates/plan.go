@@ -443,17 +443,17 @@ func WriteIgnoredNamespaces(ignored, unmatched []string) {
 	}
 }
 
-// WriteExemptTables disclosure: one line per namespace whose live tables the
-// plan exempted from the undeclared-table verdict, so a reader can tell an
-// exempted table from a declared one. No-op when nothing was exempted, which
-// is the ordinary case.
+// WriteExemptTables disclosure: one line per namespace holding live tables no
+// schema file declares that the plan leaves in place rather than dropping, so
+// a reader can tell an exempted table from a declared one. No-op when nothing
+// was exempted, which is the ordinary case.
 func WriteExemptTables(groups []*apitypes.ExemptTablesResponse) {
 	wrote := false
 	for _, group := range groups {
 		if group == nil || len(group.Tables) == 0 {
 			continue
 		}
-		fmt.Printf(glyph.Info+"  Tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n",
+		fmt.Printf(glyph.Info+"  Ignored tables in namespace %s (%s): %s\n",
 			group.Namespace, group.Reason, strings.Join(group.Tables, ", "))
 		wrote = true
 	}

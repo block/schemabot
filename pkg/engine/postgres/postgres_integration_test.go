@@ -343,7 +343,7 @@ func TestEnginePlanCapturesNamespaceWithUnmodeledObjects(t *testing.T) {
 	assert.Equal(t, map[string]string{"accounts.sql": originalAccounts}, result.Changes[0].OriginalFiles)
 }
 
-// An archive table is exempt from the undeclared-table verdict, so it sits
+// An archive table is left in place rather than dropped, so it sits
 // outside management on the forward plan and on any rollback re-plan. Its
 // shape is therefore not the rollback baseline's concern: an archive table
 // the renderer refuses neither appears in the baseline nor costs the
@@ -1143,8 +1143,8 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 	}, dropsByNamespace, "each namespace reports exactly its own undeclared table")
 }
 
-// TestLiveTablesUnderShadowingSearchPath proves the catalog reads behind the
-// undeclared-table verdict and the schema pull fail closed when the target's
+// TestLiveTablesUnderShadowingSearchPath proves the catalog reads that find
+// undeclared live tables and the schema pull fail closed when the target's
 // search_path lists a user schema ahead of pg_catalog. Decoy relations named
 // after every catalog table the queries touch, decoy "=", "<>", ">" and ">="
 // operators over every operand type the queries compare, and decoy array_agg

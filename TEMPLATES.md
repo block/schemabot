@@ -126,7 +126,7 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 
 📋 **Plan**: **1** table to create
 
-ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`
+ℹ️ Ignored tables in namespace `app` (archive naming): `events_archive_2025_01`, `orders_archive_2024`
 
 
 ---
@@ -135,6 +135,23 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 ```
 schemabot apply -e staging
 ```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-ignore-tables"></a><strong>MySQL Plan (Ignore Tables)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **No schema changes detected**
+
+ℹ️ Ignored tables in namespace `testapp` (ignore\_tables): `flyway_schema_history`
+
 
 </details>
 

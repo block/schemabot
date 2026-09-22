@@ -85,7 +85,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces, false)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(), false)
 			return planErr
 		})
 		if err != nil {
@@ -104,8 +104,9 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return writeJSON(allResults)
 	}
 
-	// Disclose config-driven exclusions once per distinct resolution — the
-	// lists only differ between environments when entries use $ENV.
+	// Disclose ignore_namespaces once per distinct resolution: entries resolve
+	// from config alone and differ between environments only when they use
+	// $ENV, so several environments usually share one notice.
 	disclosed := make(map[string]bool)
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]

@@ -123,6 +123,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		HeadSHA:           &schemaResult.HeadSHA,
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		IgnoreTables:      schemaResult.IgnoreTables,
 		SourceTrusted:     true,
 	}
 
@@ -427,6 +428,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			HeadSHA:           &schemaResult.HeadSHA,
 			SchemaPath:        schemaResult.SchemaPath,
 			IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+			IgnoreTables:      schemaResult.IgnoreTables,
 			SourceTrusted:     true,
 		}
 

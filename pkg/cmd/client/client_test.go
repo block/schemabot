@@ -317,7 +317,7 @@ func TestCallPlanAPI_IgnoreSoleFlatNamespace(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
 
-	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, []string{"orders"}, false)
+	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, PlanExclusions{Namespaces: []string{"orders"}}, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "after excluding ignored namespaces")
 	assert.Contains(t, err.Error(), "orders")
@@ -346,13 +346,39 @@ func TestCallPlanAPI_SendsIgnoredNamespaces(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, []string{"local_fixtures"}, false)
+	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{Namespaces: []string{"local_fixtures"}}, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"local_fixtures"}, ignored)
 	assert.Equal(t, []string{"local_fixtures"}, gotReq.IgnoredNamespaces)
 	require.Contains(t, gotReq.SchemaFiles, "payments")
 	assert.NotContains(t, gotReq.SchemaFiles, "local_fixtures")
+}
+
+// ignore_tables cannot be expressed by omission the way ignore_namespaces can
+// — the tables live on the target, not in the repository — so the entries have
+// to reach the server on the request itself or the plan proposes dropping the
+// very tables the config withholds.
+func TestCallPlanAPI_SendsIgnoreTables(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	var gotReq apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0,
+		PlanExclusions{Tables: []string{"flyway_schema_history", "legacy_audit_log"}}, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, gotReq.IgnoreTables)
+	assert.Contains(t, gotReq.SchemaFiles, "payments",
+		"withholding a live table removes nothing from the declared schema")
 }
 
 // A plan made for an apply that will hand the engine every ALTER at once has
@@ -372,12 +398,12 @@ func TestCallPlanAPI_SendsGroupedExecution(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, true)
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, true)
 	require.NoError(t, err)
 	assert.True(t, gotReq.GroupedExecution, "the grouping the apply will use reaches the server")
 
 	gotReq = apitypes.PlanRequest{}
-	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, false)
+	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false)
 	require.NoError(t, err)
 	assert.False(t, gotReq.GroupedExecution, "a caller that has not chosen leaves the plan on the ungrouped default")
 }

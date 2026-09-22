@@ -13,8 +13,8 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
-// A live table named by ignore_tables is withheld from the planner, so the
-// undeclared-table verdict never sees it and the plan discloses what it
+// A live table named by ignore_tables is withheld from the planner, so
+// nothing proposes dropping it and the plan discloses what it
 // withheld with a reason naming the config key. An entry that matches nothing
 // withholds nothing: the plan proceeds and the table it does not name is still
 // reported as a blocked drop, which is what makes the disclosure worth reading.

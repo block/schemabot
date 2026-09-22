@@ -107,7 +107,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	var ignoredNamespaces []string
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
-		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces,
+		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
 			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover))
 		return planErr
 	})
@@ -145,6 +145,13 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// Check if there are any changes (DDL or VSchema)
 	if !planResult.HasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")
+		// Apply returns here without rendering a plan body, so this is the one
+		// place an operator whose target has nothing to reconcile learns which
+		// live tables the plan was not shown. Every other path reaches the
+		// body, which discloses them on both of its own branches.
+		if cmd.Output != OutputFormatJSON {
+			templates.WriteExemptTables(planResult.ExemptTables)
+		}
 		return nil
 	}
 

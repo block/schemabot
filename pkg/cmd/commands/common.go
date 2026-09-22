@@ -81,7 +81,19 @@ type CLIConfig struct {
 	// IgnoreNamespaces lists namespace subdirectories of the schema root that
 	// SchemaBot must not reconcile against the live database.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
-	SchemaDir        string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	// IgnoreTables lists live tables SchemaBot must not reconcile. Without the
+	// exclusion a live table no schema file declares is planned as DROP TABLE,
+	// which blocks the merge.
+	IgnoreTables []string `yaml:"ignore_tables"`
+	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+}
+
+// PlanExclusions returns the config's declared exclusions in the form the plan
+// API takes them. Both lists are exclusions the repository recorded, and they
+// are passed as one value so a caller cannot hand the plan its tables as its
+// namespaces.
+func (c *CLIConfig) PlanExclusions() client.PlanExclusions {
+	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables}
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -114,6 +126,9 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 		return nil, fmt.Errorf("schemabot.yaml: database is required")
 	}
 	if err := schema.ValidateIgnoreNamespaces(cfg.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
+	}
+	if err := schema.ValidateIgnoreTables(cfg.IgnoreTables); err != nil {
 		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml

@@ -86,6 +86,32 @@ func PreviewCommentPlanExemptTables() string {
 	})
 }
 
+// PreviewCommentPlanIgnoreTables renders the plan a repository gets once its
+// config withholds a live table nothing declares. The plan is clean, which is
+// where the disclosures carry the most: they are the only evidence on the
+// comment that the table was seen and deliberately left alone rather than
+// missed. The disclosure names the config key the decision is recorded in, so
+// a reviewer can tell a table the config withheld from one an engine exempted
+// for reasons of its own.
+func PreviewCommentPlanIgnoreTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "testapp",
+			Tables:    []string{"flyway_schema_history"},
+			Reason:    "ignore_tables",
+		}},
+	})
+}
+
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {

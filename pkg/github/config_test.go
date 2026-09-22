@@ -668,6 +668,37 @@ func TestCreateSchemaRequestFromPRSurfacesEmptiedNamespace(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE users (id bigint primary key);\n", result.SchemaFiles["surviving"].Files["users.sql"])
 }
 
+// A repository withholds live tables from the planner by naming them in its
+// schemabot.yaml, and the plan request is what carries that statement to the
+// server. The entries travel with the schema files read from the same commit,
+// so a reviewer reading the config on the pull request knows what the planner
+// was asked to leave alone.
+func TestCreateSchemaRequestFromPRCarriesIgnoreTables(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "head-sha")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("schema/surviving/users.sql"),
+		Status:   new("modified"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml",
+		"database: orders\ntype: mysql\nignore_tables:\n  - flyway_schema_history\n  - legacy_audit\n")
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
+		{Type: new("dir"), Name: new("surviving"), Path: new("schema/surviving")},
+	})
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema/surviving", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("users.sql"), Path: new("schema/surviving/users.sql")},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/surviving/users.sql", "CREATE TABLE users (id bigint primary key);\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "", "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit"}, result.IgnoreTables,
+		"the plan request carries the configured entries: without them the planner reads the withheld tables from the target and, finding no declaration, proposes dropping them")
+}
+
 // TestCreateSchemaRequestFromPRIgnoresInheritedDeletion covers a pull request
 // whose base lags the default branch: GitHub lists a deletion the default
 // branch already carries, and that deletion must not plan drops for a
@@ -1330,4 +1361,54 @@ func TestFetchSchemaFilesFromTreeFailsClosedWhenSubtreeAlsoTruncated(t *testing.
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrGitTreeTruncated)
+}
+
+func TestSchemabotConfigParsesIgnoreTables(t *testing.T) {
+	yamlData := `
+database: testdb
+type: mysql
+ignore_tables:
+  - flyway_schema_history
+  - legacy_audit_log
+`
+	var config SchemabotConfig
+	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
+	decoder.KnownFields(true)
+	require.NoError(t, decoder.Decode(&config))
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, config.IgnoreTables)
+}
+
+// The exclusion keys are validated where the config is read, not where it is
+// used: an entry that cannot match — one carrying whitespace the target's
+// catalog can never spell — withholds nothing, and matching is exact, so the
+// table it names would still be planned as a drop with only a warning to say
+// so. Both keys are covered here because the validation is
+// the fetch's, and a call that goes missing from it is invisible to the
+// validators' own tests.
+func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
+	for name, tc := range map[string]struct {
+		yaml string
+		want string
+	}{
+		"padded ignore_tables entry": {
+			yaml: "database: payments\ntype: mysql\nignore_tables:\n  - \" flyway_schema_history\"\n",
+			want: "ignore_tables",
+		},
+		"padded ignore_namespaces entry": {
+			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - \" local_fixtures\"\n",
+			want: "ignore_namespaces",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, mux := setupConfigTestGitHubServer(t)
+			registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", tc.yaml)
+
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			_, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "abc123")
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid schemabot.yaml")
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
 }

@@ -144,7 +144,7 @@ type baselinePolicy struct {
 	// indexes without them.
 	refuseUnmodeledObjects bool
 	// skipArchiveTables leaves archive-named tables out of the baseline, the
-	// same tables the plan exempts from the undeclared-table verdict.
+	// same tables the plan leaves in place instead of dropping.
 	skipArchiveTables bool
 }
 
