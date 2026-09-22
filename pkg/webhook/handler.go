@@ -707,9 +707,11 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 			ops = nil
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
-		summaryBase += controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
-		summaryBody := summaryBase + failureLogsSections(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, summaryBase)
+		renderBody := func(apply *storage.Apply) string {
+			body := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
+			return body + controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, body)
+		}
+		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
 	}
 }

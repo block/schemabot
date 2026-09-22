@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
@@ -202,3 +204,73 @@ func TestEngineApplyLogsFailsWhenTheOperationRowsCannotBeLoaded(t *testing.T) {
 	assert.Contains(t, err.Error(), "apply-control")
 	assert.Empty(t, sources)
 }
+
+// One deployment can drive several targets, and each target is a separate
+// change against a separate database. Every source carries the target it came
+// from, so a reader can say which target raised a warning instead of seeing
+// two indistinguishable groups from the same deployment.
+func TestEngineApplyLogsKeepsTheTargetOfEachSource(t *testing.T) {
+	apply := engineLogsApply()
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/orders", Target: "cluster-a", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/users", Target: "cluster-b", ExternalID: "remote-b"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{
+			{Id: 1, Level: "warn", Source: storage.LogSourceSpirit, Message: "[orders] warning on " + req.Target, CreatedAt: "2026-07-18T18:33:11Z"},
+		}}, nil
+	}
+	service := engineLogsService(apply, operations, map[string]tern.Client{"region-a/staging": client})
+
+	sources, err := service.EngineApplyLogs(t.Context(), apply, 50)
+	require.NoError(t, err)
+	require.Len(t, sources, 2)
+	assert.Equal(t, "cluster-a", sources[0].Target)
+	assert.Equal(t, "cluster-b", sources[1].Target)
+	assert.Equal(t, "region-a", sources[0].Deployment)
+	assert.Equal(t, "region-a", sources[1].Deployment)
+}
+
+// The caller bounds the whole read with one deadline, because a terminal
+// comment cannot wait on an unhealthy fleet. A data plane that never answers
+// must therefore not spend that deadline on behalf of the others: the ones
+// that would have answered in time still reach the comment.
+func TestEngineApplyLogsOneStalledDataPlaneDoesNotStarveTheRest(t *testing.T) {
+	apply := engineLogsApply()
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/orders", Target: "cluster-a", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-b", OperationKey: "commerce/users", Target: "cluster-b", ExternalID: "remote-b"},
+	}
+	// region-a is read first, so serially it would consume the deadline and
+	// region-b would be dropped for a timeout it did not cause.
+	stalled := &mockTernClient{isRemote: true}
+	stalled.logsHook = func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		time.Sleep(engineLogsStallTestTimeout * 2)
+		return nil, fmt.Errorf("deadline exceeded")
+	}
+	answering := &mockTernClient{isRemote: true}
+	answering.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{
+			{Id: 1, Level: "warn", Source: storage.LogSourceSpirit, Message: "[users] unsafe warning 1265", CreatedAt: "2026-07-18T18:33:11Z"},
+		}}, nil
+	}
+	service := engineLogsService(apply, operations, map[string]tern.Client{
+		"region-a/staging": stalled,
+		"region-b/staging": answering,
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), engineLogsStallTestTimeout)
+	defer cancel()
+	sources, err := service.EngineApplyLogs(ctx, apply, 50)
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, "region-b", sources[0].Deployment)
+	require.Len(t, sources[0].Entries, 1)
+	assert.Equal(t, "[users] unsafe warning 1265", sources[0].Entries[0].Message)
+}
+
+// engineLogsStallTestTimeout is the deadline the stalled-data-plane test gives
+// the whole read: long enough that the answering data plane is never the one
+// that timed out, short enough that the test does not wait on the stall.
+const engineLogsStallTestTimeout = 300 * time.Millisecond

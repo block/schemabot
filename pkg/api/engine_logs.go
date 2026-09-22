@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -59,18 +60,72 @@ func (s *Service) EngineApplyLogs(ctx context.Context, apply *storage.Apply, lim
 	if err != nil {
 		return nil, fmt.Errorf("list apply operations for engine logs on apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	var sources []EngineLogSource
+	var reads []engineLogRead
 	for _, deployment := range operationDeployments(ops) {
-		sources = append(sources, s.engineLogsForDeployment(ctx, apply, ops, deployment, limit)...)
+		reads = append(reads, s.engineLogReadsForDeployment(apply, ops, deployment)...)
 	}
-	return sources, nil
+	return s.runEngineLogReads(ctx, apply, reads, limit), nil
 }
 
-// engineLogsForDeployment reads one deployment's engine lines, returning
-// nothing when the deployment has no data plane to read from or cannot be
-// read. Every way of returning nothing is logged by this function, so a caller
-// that receives no source knows to look for the reason in the server log.
-func (s *Service) engineLogsForDeployment(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation, deployment string, limit int) []EngineLogSource {
+// engineLogRead is one data plane read: a resolved client and the single
+// (target, data-plane apply) pair to ask it about.
+type engineLogRead struct {
+	deployment string
+	client     tern.Client
+	fetch      *deploymentLogFetch
+}
+
+// maxConcurrentEngineLogReads bounds how many data planes are read at once. A
+// fan-out across a large fleet must not open a connection per shard at the
+// moment an apply fails, which is exactly when the deployments involved are
+// least likely to be healthy.
+const maxConcurrentEngineLogReads = 8
+
+// runEngineLogReads performs the reads concurrently and returns their sources
+// in the order the reads were planned, so a fan-out renders the same way every
+// time. Concurrency is what keeps the caller's single deadline fair: read
+// serially, one slow data plane spends the whole budget and every deployment
+// behind it is dropped for a timeout it did not cause, which would turn one
+// unreachable deployment into a fold missing every other deployment's lines.
+func (s *Service) runEngineLogReads(ctx context.Context, apply *storage.Apply, reads []engineLogRead, limit int) []EngineLogSource {
+	results := make([]*EngineLogSource, len(reads))
+	slots := make(chan struct{}, maxConcurrentEngineLogReads)
+	var wg sync.WaitGroup
+	for i, read := range reads {
+		slots <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-slots }()
+			source, err := s.engineLogSource(ctx, apply, read.client, read.deployment, read.fetch, limit)
+			switch {
+			case err != nil:
+				s.recordDeploymentLogFailure(apply, read.deployment, read.fetch, err)
+			case source == nil:
+				s.logger.Debug("data plane reported no engine lines for this apply",
+					append(apply.LogAttrs(), "operation", "read_engine_logs", "operation_deployment", read.deployment,
+						"target", read.fetch.target, "external_id", read.fetch.externalID)...)
+			default:
+				results[i] = source
+			}
+		})
+	}
+	wg.Wait()
+	var sources []EngineLogSource
+	for _, source := range results {
+		if source != nil {
+			sources = append(sources, *source)
+		}
+	}
+	return sources
+}
+
+// engineLogReadsForDeployment plans one deployment's reads, returning none
+// when the deployment has no data plane to read from or nothing dispatched to
+// read about. Every way of returning nothing is logged by this function, so a
+// caller that receives no read knows to look for the reason in the server log.
+// Planning is separated from reading so the reads can run together: resolving
+// a client is local and cheap, while the read behind it crosses a network to
+// another deployment.
+func (s *Service) engineLogReadsForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) []engineLogRead {
 	attrs := func(extra ...any) []any {
 		return append(append(apply.LogAttrs(), "operation", "read_engine_logs", "operation_deployment", deployment), extra...)
 	}
@@ -94,22 +149,11 @@ func (s *Service) engineLogsForDeployment(ctx context.Context, apply *storage.Ap
 		s.logger.Debug("deployment has no dispatched operation to read engine logs from", attrs()...)
 		return nil
 	}
-	var sources []EngineLogSource
+	reads := make([]engineLogRead, 0, len(fetches))
 	for _, key := range sortedFetchKeys(fetches) {
-		fetch := fetches[key]
-		source, err := s.engineLogSource(ctx, apply, client, deployment, fetch, limit)
-		if err != nil {
-			s.recordDeploymentLogFailure(apply, deployment, fetch, err)
-			continue
-		}
-		if source == nil {
-			s.logger.Debug("data plane reported no engine lines for this apply",
-				attrs("target", fetch.target, "external_id", fetch.externalID)...)
-			continue
-		}
-		sources = append(sources, *source)
+		reads = append(reads, engineLogRead{deployment: deployment, client: client, fetch: fetches[key]})
 	}
-	return sources
+	return reads
 }
 
 // engineLogSource reads one (target, data-plane apply) pair and keeps the

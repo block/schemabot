@@ -740,16 +740,20 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 // section, appended after whichever layout rendered, so triage data lands on
 // the PR without an extra operator step.
 func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
-	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
-	} else {
-		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
 	}
-	body += controlRejectionSection(ctx, o.stor, o.logger, apply, body)
-	return body + failureLogsSections(ctx, o.stor, o.engineLogs, o.logger, apply, body)
+	renderBody := func(apply *storage.Apply) string {
+		var body string
+		if opsErr != nil {
+			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
+		} else {
+			body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
+		}
+		return body + controlRejectionSection(ctx, o.stor, o.logger, apply, body)
+	}
+	return summaryWithFailureLogs(ctx, o.stor, o.engineLogs, o.logger, apply, renderBody)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

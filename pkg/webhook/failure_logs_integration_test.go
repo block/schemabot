@@ -146,15 +146,16 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	// A summary body that already fills GitHub's comment budget leaves no room
 	// for the section — it must be dropped so the summary itself still posts.
 	hugeBase := strings.Repeat("x", templates.GitHubIssueCommentMaxChars)
-	noRoom := failureLogsSections(ctx, st, nil,
+	noRoom := summaryWithFailureLogs(ctx, st, nil,
 		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
-		&terminalApply, hugeBase)
-	assert.Empty(t, noRoom)
+		&terminalApply, func(*storage.Apply) string { return hugeBase })
+	assert.Equal(t, hugeBase, noRoom)
 
-	// An apply that ran on a data plane carries a second fold: the engine's own
-	// lines for it, which live in that data plane's storage and would otherwise
-	// reach an operator only through the CLI. The control-plane fold is
-	// unchanged beside it, and the engine's text is sanitized on the way in.
+	// An apply that ran on a data plane carries a second group inside the same
+	// fold: the engine's own lines for it, which live in that data plane's
+	// storage and would otherwise reach an operator only through the CLI. The
+	// control-plane group reads first, and the engine's text is sanitized on
+	// the way in.
 	engineApply := seedApply("engine")
 	engineTask := task(engineApply, state.Task.Failed)
 	require.NoError(t, st.ApplyLogs().Append(ctx, &storage.ApplyLog{
@@ -199,12 +200,14 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	observer3.OnTerminal(&terminalEngine, []*storage.Task{engineTask})
 
 	engineSummary := waitForSummaryCreate(t, capture3)
-	assert.Contains(t, engineSummary, "<summary>Show apply logs (1 entry)</summary>")
-	assert.Contains(t, engineSummary, "<summary>Show engine logs (2 entries)</summary>")
+	assert.Contains(t, engineSummary, "<summary>Show logs (3 entries)</summary>")
+	assert.Contains(t, engineSummary, "== apply logs ==")
+	assert.Contains(t, engineSummary, "== engine logs: region-a, target: cluster-a ==")
+
 	assert.Contains(t, engineSummary, "[INF] [users] copy starting")
 	assert.Contains(t, engineSummary, "unsafe warning 1265: Data truncated for column 'nickname' at row 1")
 	assert.NotContains(t, engineSummary, "10.1.2.3:3306", "connection endpoints never reach the PR")
-	assert.Less(t, strings.Index(engineSummary, "Show apply logs ("), strings.Index(engineSummary, "Show engine logs ("))
+	assert.Less(t, strings.Index(engineSummary, "== apply logs =="), strings.Index(engineSummary, "== engine logs:"))
 
 	// Completed apply: the summary stays clean even though log entries exist.
 	completedApply := seedApply("done")

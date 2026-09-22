@@ -814,24 +814,27 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr                error
-	planResp                 *ternv1.PlanResponse
-	planErr                  error
-	planReq                  *ternv1.PlanRequest
-	planDiffResp             *ternv1.PlanDiffResponse
-	planDiffErr              error
-	planDiffReq              *ternv1.PlanRequest
-	pullSchemaResp           *ternv1.PullSchemaResponse
-	pullSchemaErr            error
-	pullSchemaReq            *ternv1.PullSchemaRequest
-	pullSchemaReqs           []*ternv1.PullSchemaRequest
-	pullSchemaHook           func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
-	applyResp                *ternv1.ApplyResponse
-	applyErr                 error
-	applyReq                 *ternv1.ApplyRequest
-	progressResp             *ternv1.ProgressResponse
-	progressErr              error
-	progressReq              *ternv1.ProgressRequest
+	healthErr      error
+	planResp       *ternv1.PlanResponse
+	planErr        error
+	planReq        *ternv1.PlanRequest
+	planDiffResp   *ternv1.PlanDiffResponse
+	planDiffErr    error
+	planDiffReq    *ternv1.PlanRequest
+	pullSchemaResp *ternv1.PullSchemaResponse
+	pullSchemaErr  error
+	pullSchemaReq  *ternv1.PullSchemaRequest
+	pullSchemaReqs []*ternv1.PullSchemaRequest
+	pullSchemaHook func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+	applyResp      *ternv1.ApplyResponse
+	applyErr       error
+	applyReq       *ternv1.ApplyRequest
+	progressResp   *ternv1.ProgressResponse
+	progressErr    error
+	progressReq    *ternv1.ProgressRequest
+	// logsMu guards logsReqs: an apply that fanned out reads its data planes
+	// concurrently, so one client can serve several reads at once.
+	logsMu                   sync.Mutex
 	logsReqs                 []*ternv1.LogsRequest
 	logsHook                 func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
 	stopResp                 *ternv1.StopResponse
@@ -904,8 +907,15 @@ func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressReque
 	}
 	return nil, m.progressErr
 }
-func (m *mockTernClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+func (m *mockTernClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	// A real client fails a call made on an expired context rather than
+	// answering it, which is what makes a caller's deadline mean anything.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.logsMu.Lock()
 	m.logsReqs = append(m.logsReqs, req)
+	m.logsMu.Unlock()
 	if m.logsHook != nil {
 		return m.logsHook(req)
 	}

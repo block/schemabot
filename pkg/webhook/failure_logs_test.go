@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -46,6 +47,16 @@ func failureLogsTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// renderFailureLogsSection renders the fold summaryWithFailureLogs appends
+// under a summary body, without the body itself, so a test can assert on the
+// fold alone while still driving the production entry point.
+func renderFailureLogsSection(t *testing.T, stor storage.Storage, engineLogs EngineLogReader, apply *storage.Apply, base string) string {
+	t.Helper()
+	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply,
+		func(*storage.Apply) string { return base })
+	return strings.TrimPrefix(rendered, base)
+}
+
 func engineLogSource(deployment string, messages ...string) []api.EngineLogSource {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	entries := make([]*apitypes.LogEntry, len(messages))
@@ -58,66 +69,70 @@ func engineLogSource(deployment string, messages ...string) []api.EngineLogSourc
 // A failed apply that ran on a data plane carries both accounts of it: the
 // control plane's timeline, and the engine's own lines — which for a remote
 // drive live in the data plane's storage and would otherwise reach an
-// operator only through the CLI. The control-plane fold comes first, because
-// it is what sets the scene for the engine's lines.
-func TestFailureLogsSectionsRendersBothFolds(t *testing.T) {
+// operator only through the CLI. One fold holds both, each under its own
+// heading, and the control plane's comes first because it sets the scene for
+// the engine's lines.
+func TestFailureLogsSectionRendersEveryAccountInOneFold(t *testing.T) {
 	apply := failureLogsTestApply()
 	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
 	engineLogs := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
 		return engineLogSource("region-a", "[orders] unsafe warning 1265: Data truncated"), nil
 	}
 
-	rendered := failureLogsSections(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply, "summary body")
+	rendered := renderFailureLogsSection(t, stor, engineLogs, apply, "summary body")
 
-	assert.Contains(t, rendered, "<summary>Show apply logs (1 entry)</summary>")
+	assert.Contains(t, rendered, "<summary>Show logs (2 entries)</summary>")
+	assert.Equal(t, 1, strings.Count(rendered, "<details>"), "one fold carries every account of the apply")
+	assert.Contains(t, rendered, "== apply logs ==")
 	assert.Contains(t, rendered, "Apply failed [running -> failed]")
-	assert.Contains(t, rendered, "<summary>Show engine logs (1 entry)</summary>")
+	assert.Contains(t, rendered, "== engine logs: region-a ==")
 	assert.Contains(t, rendered, "[orders] unsafe warning 1265: Data truncated")
-	assert.Less(t, strings.Index(rendered, "Show apply logs ("), strings.Index(rendered, "Show engine logs ("),
+	assert.Less(t, strings.Index(rendered, "== apply logs =="), strings.Index(rendered, "== engine logs: region-a =="),
 		"the apply's own timeline reads before the engine's account of the failure")
 }
 
 // An apply with no data plane renders exactly what it rendered before the
-// engine fold existed: one fold, spending the whole budget. An empty second
-// fold would be worse than none — it reads as an engine that said nothing,
-// when the engine's lines are in the fold above it.
-func TestFailureLogsSectionsOmitsTheEngineFoldWithoutADataPlane(t *testing.T) {
+// engine's account reached the PR: one unnamed group spending the whole
+// budget. An empty engine group would be worse than none — it reads as an
+// engine that said nothing, when its lines are in the group above it.
+func TestFailureLogsSectionOmitsTheEngineGroupWithoutADataPlane(t *testing.T) {
 	apply := failureLogsTestApply()
 	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
 	noSources := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
 		return nil, nil
 	}
 
-	withReader := failureLogsSections(t.Context(), stor, noSources, failureLogsTestLogger(), apply, "summary body")
-	withoutReader := failureLogsSections(t.Context(), stor, nil, failureLogsTestLogger(), apply, "summary body")
+	withReader := renderFailureLogsSection(t, stor, noSources, apply, "summary body")
+	withoutReader := renderFailureLogsSection(t, stor, nil, apply, "summary body")
 
 	assert.NotContains(t, withReader, "engine logs")
-	assert.NotContains(t, withReader, "<details>\n<summary>Show engine")
+	assert.NotContains(t, withReader, "==", "one account needs no heading")
 	assert.Equal(t, withoutReader, withReader,
 		"a data plane that reported no engine lines renders the same summary as an apply that never had one")
 }
 
-// A data plane that cannot be read costs the summary its engine fold and
+// A data plane that cannot be read costs the summary the engine's group and
 // nothing else. The terminal comment is how the PR learns the apply ended, so
 // an unreachable deployment must never be the reason it does not post.
-func TestFailureLogsSectionsKeepsTheSummaryWhenTheDataPlaneCannotBeRead(t *testing.T) {
+func TestFailureLogsSectionKeepsTheSummaryWhenTheDataPlaneCannotBeRead(t *testing.T) {
 	apply := failureLogsTestApply()
 	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
 	unreadable := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
 		return nil, fmt.Errorf("storage unavailable")
 	}
 
-	rendered := failureLogsSections(t.Context(), stor, unreadable, failureLogsTestLogger(), apply, "summary body")
+	rendered := renderFailureLogsSection(t, stor, unreadable, apply, "summary body")
 
 	assert.Contains(t, rendered, "<summary>Show logs (1 entry)</summary>")
 	assert.NotContains(t, rendered, "engine logs")
+	assert.NotContains(t, rendered, "==", "the apply's own account is unnamed when it is the only one")
 }
 
-// A long control-plane timeline must not be able to spend the room the engine
-// fold needs: the engine's account of the failure is the reason an operator
-// opens the comment. Both folds render, and together they stay inside the
-// comment's budget.
-func TestFailureLogsSectionsReservesRoomForTheEngineFold(t *testing.T) {
+// A long control-plane timeline must not be able to spend the room the
+// engine's lines need: the engine's account of the failure is the reason an
+// operator opens the comment. Each account gets its own share, both render,
+// and the fold stays inside the comment's budget.
+func TestFailureLogsSectionSharesTheRoomWithTheEngineGroup(t *testing.T) {
 	apply := failureLogsTestApply()
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	var logs []*storage.ApplyLog
@@ -130,16 +145,16 @@ func TestFailureLogsSectionsReservesRoomForTheEngineFold(t *testing.T) {
 	}
 
 	base := "summary body"
-	rendered := failureLogsSections(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply, base)
+	rendered := renderFailureLogsSection(t, stor, engineLogs, apply, base)
 
-	assert.Contains(t, rendered, "Show recent apply logs (")
+	assert.Contains(t, rendered, "Show recent logs (")
 	assert.Contains(t, rendered, "[orders] unsafe warning 1265: Data truncated")
 	assert.LessOrEqual(t, len(base)+len(rendered), templates.GitHubIssueCommentMaxChars-commentChromeHeadroom)
 }
 
 // Only a failed apply carries logs. A completed, stopped, or cancelled
 // apply's summary stays clean, and the data plane is not read for one.
-func TestFailureLogsSectionsSkipsAnApplyThatDidNotFail(t *testing.T) {
+func TestFailureLogsSectionSkipsAnApplyThatDidNotFail(t *testing.T) {
 	apply := failureLogsTestApply()
 	apply.State = state.Apply.Completed
 	read := false
@@ -148,16 +163,16 @@ func TestFailureLogsSectionsSkipsAnApplyThatDidNotFail(t *testing.T) {
 		return engineLogSource("region-a", "[orders] copy complete"), nil
 	}
 
-	rendered := failureLogsSections(t.Context(), failureLogsTestStorage(), engineLogs, failureLogsTestLogger(), apply, "summary body")
+	rendered := renderFailureLogsSection(t, failureLogsTestStorage(), engineLogs, apply, "summary body")
 
 	assert.Empty(t, rendered)
 	assert.False(t, read)
 }
 
-// A summary body that already fills GitHub's comment budget leaves room for
-// neither fold. Both are dropped so the summary itself still posts, and
+// A summary body that already fills GitHub's comment budget leaves no room
+// for the fold at all. It is dropped so the summary itself still posts, and
 // neither load is attempted.
-func TestFailureLogsSectionsDropsBothFoldsWhenTheCommentIsFull(t *testing.T) {
+func TestFailureLogsSectionDropsTheFoldWhenTheCommentIsFull(t *testing.T) {
 	apply := failureLogsTestApply()
 	read := false
 	engineLogs := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
@@ -166,9 +181,65 @@ func TestFailureLogsSectionsDropsBothFoldsWhenTheCommentIsFull(t *testing.T) {
 	}
 	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed"})
 
-	rendered := failureLogsSections(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply,
+	rendered := renderFailureLogsSection(t, stor, engineLogs, apply,
 		strings.Repeat("x", templates.GitHubIssueCommentMaxChars))
 
 	require.Empty(t, rendered)
 	assert.False(t, read)
+}
+
+// A failure SchemaBot has no account of reports the generic sentence, which
+// tells an operator to read a server log. When the fold below it carries the
+// engine's own lines, that sentence sends them to a server they may not be
+// able to reach while the line explaining the failure is one click away — so
+// the summary points at the fold instead. The stored error is untouched: it is
+// the record of what the target reported, and this is one surface's rendering.
+func TestSummaryWithFailureLogsPointsTheGenericErrorAtTheFold(t *testing.T) {
+	apply := failureLogsTestApply()
+	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
+	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
+	engineLogs := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+		return engineLogSource("region-a", "[orders] unsafe warning 1265: Data truncated"), nil
+	}
+
+	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply,
+		func(apply *storage.Apply) string { return "Error: " + apply.ErrorMessage + "\n" })
+
+	assert.Contains(t, rendered, "Error: "+mysqlerr.GenericRenderedLogs+" (error 1265)")
+	assert.NotContains(t, rendered, "see the server logs for the reason")
+	assert.Equal(t, mysqlerr.Generic+" (error 1265)", apply.ErrorMessage, "the stored error is the record of what the target reported")
+}
+
+// Without the engine's account the fold holds only what the server already
+// logged, so "the logs below" would be a promise the comment cannot keep. The
+// summary keeps pointing at the server logs, where the reason actually is.
+func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWithoutAnEngineGroup(t *testing.T) {
+	apply := failureLogsTestApply()
+	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
+	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
+
+	rendered := summaryWithFailureLogs(t.Context(), stor, nil, failureLogsTestLogger(), apply,
+		func(apply *storage.Apply) string { return "Error: " + apply.ErrorMessage + "\n" })
+
+	assert.Contains(t, rendered, "Error: "+mysqlerr.Generic+" (error 1265)")
+	assert.NotContains(t, rendered, "in the logs below")
+}
+
+// A reason SchemaBot chose from the target's error code already says what an
+// operator should do about it. The fold below adds detail; it does not replace
+// the instruction, so the sentence stands whatever the fold turns out to hold.
+func TestSummaryWithFailureLogsLeavesAnAuthoredReasonAlone(t *testing.T) {
+	apply := failureLogsTestApply()
+	authored := "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key. (error 1062)"
+	apply.ErrorMessage = authored
+	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
+	engineLogs := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+		return engineLogSource("region-a", "[orders] duplicate entry"), nil
+	}
+
+	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply,
+		func(apply *storage.Apply) string { return "Error: " + apply.ErrorMessage + "\n" })
+
+	assert.Contains(t, rendered, "Error: "+authored)
+	assert.Contains(t, rendered, "== engine logs: region-a ==")
 }

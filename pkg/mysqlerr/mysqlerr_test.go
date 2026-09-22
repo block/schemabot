@@ -279,3 +279,30 @@ func TestEveryKnownReasonRendersWithItsCode(t *testing.T) {
 		assert.Equal(t, want, Reason(&mysql.MySQLError{Number: uint16(code), Message: "something went wrong"}))
 	}
 }
+
+// A surface that renders the engine's own lines beside the reason sends the
+// reader there rather than to a server log they may not be able to reach. The
+// code the generic sentence carries is part of the reason and survives the
+// rewrite, because it is what an operator searches for.
+func TestPointToRenderedLogsRedirectsTheGenericReason(t *testing.T) {
+	assert.Equal(t, GenericRenderedLogs+" (error 1265)", PointToRenderedLogs(ReasonFromText("Error 1265 (01000): something went wrong")))
+	assert.Equal(t, GenericRenderedLogs, PointToRenderedLogs(Generic))
+}
+
+// Only the generic sentence is rewritten. A reason chosen by code already says
+// what to do, and the connection-family sentences describe a failure the
+// engine never got far enough to write a line about — pointing at logs that
+// cannot explain it would send an operator the wrong way.
+func TestPointToRenderedLogsLeavesEveryOtherReasonAlone(t *testing.T) {
+	for sentence := range Authored() {
+		if sentence == Generic {
+			continue
+		}
+		assert.Equal(t, sentence, PointToRenderedLogs(sentence))
+	}
+	for code := range reasons {
+		rendered := render(code)
+		assert.Equal(t, rendered, PointToRenderedLogs(rendered))
+	}
+	assert.Equal(t, "", PointToRenderedLogs(""))
+}

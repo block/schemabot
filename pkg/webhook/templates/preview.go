@@ -2627,15 +2627,18 @@ func PreviewCommentSummaryFailed() string {
 	// could not be copied — stay in the server logs.
 	data.ErrorMessage = mysqlerr.ReasonFromText("(errno 1364)")
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false, LogFoldAlone)
+		RenderFailureLogs([]LogGroupData{
+			{Entries: sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value")},
+		}, GitHubIssueCommentMaxChars)
 }
 
 // PreviewCommentSummaryFailedEngineLogs renders a failed summary for an apply
-// a data plane drove, carrying both folds: SchemaBot's own account of the
-// apply, and the engine's account of why the copy stopped. The error block
-// above them names the code and no more, because the target's own words quote
-// the row it could not convert; the engine's line is what turns that code into
-// something an operator can act on without leaving the PR.
+// a data plane drove. The one logs fold carries both accounts of it:
+// SchemaBot's own, and the engine's account of why the copy stopped. The error
+// block above them names the code and no more, because the target's own words
+// quote the row it could not convert; the engine's line is what turns that
+// code into something an operator can act on without leaving the PR, which is
+// where the error block sends them.
 func PreviewCommentSummaryFailedEngineLogs() string {
 	tables := sampleApplyTables()[:2]
 	tables[0].Status = state.Task.Completed
@@ -2644,18 +2647,21 @@ func PreviewCommentSummaryFailedEngineLogs() string {
 	tables[1].RowsCopied = 439870
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 30
+	// The stored reason is what SchemaBot recorded and what its own log line
+	// repeats; the summary renders the version that points at the fold below.
+	stored := mysqlerr.ReasonFromText("(errno 1265)")
 	data := sampleSummaryData(state.Apply.Failed, tables)
-	data.ErrorMessage = mysqlerr.ReasonFromText("(errno 1265)")
+	data.ErrorMessage = mysqlerr.PointToRenderedLogs(stored)
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleRemoteFailureLogEntries("users", data.ErrorMessage), GitHubIssueCommentMaxChars/2, false, LogFoldBesideEngineLogs) +
-		RenderEngineFailureLogs([]EngineLogSourceData{
-			{Deployment: "shard-a", Entries: sampleEngineFailureLogEntries("users", "nickname")},
-		}, GitHubIssueCommentMaxChars/2)
+		RenderFailureLogs([]LogGroupData{
+			{Label: "apply logs", Entries: sampleRemoteFailureLogEntries("users", stored)},
+			{Label: "engine logs: shard-a", Entries: sampleEngineFailureLogEntries("users", "nickname")},
+		}, GitHubIssueCommentMaxChars)
 }
 
-// PreviewCommentSummaryFailedEngineLogsMultiDeployment renders the engine-logs
-// fold for an apply that fanned out across two data planes. Each data plane
-// keeps its own group: their clocks and log ids are independent, so merging
+// PreviewCommentSummaryFailedEngineLogsMultiDeployment renders the logs fold
+// for an apply that fanned out across two data planes. Every account keeps its
+// own group: the clocks and log ids behind them are independent, so merging
 // them into one stream would assert an ordering across machines.
 func PreviewCommentSummaryFailedEngineLogsMultiDeployment() string {
 	shardA := sampleEngineFailureLogEntries("users", "nickname")
@@ -2664,10 +2670,11 @@ func PreviewCommentSummaryFailedEngineLogsMultiDeployment() string {
 		{CreatedAt: sampleTime().Add(-3 * time.Minute), Level: "info", Message: "[users] copy complete: 1192044 rows"},
 		{CreatedAt: sampleTime().Add(-2 * time.Minute), Level: "info", Message: "[users] cutover complete"},
 	}
-	return RenderEngineFailureLogs([]EngineLogSourceData{
-		{Deployment: "shard-a", Entries: shardA},
-		{Deployment: "shard-b", Entries: shardB},
-	}, GitHubIssueCommentMaxChars/2)
+	return RenderFailureLogs([]LogGroupData{
+		{Label: "apply logs", Entries: sampleRemoteFailureLogEntries("users", mysqlerr.ReasonFromText("(errno 1265)"))},
+		{Label: "engine logs: shard-a, target: cluster-a", Entries: shardA},
+		{Label: "engine logs: shard-b, target: cluster-b", Entries: shardB},
+	}, GitHubIssueCommentMaxChars)
 }
 
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.
@@ -2723,7 +2730,7 @@ func PreviewCommentSummaryFailedLarge() string {
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), GitHubIssueCommentMaxChars, false, LogFoldAlone)
+		RenderFailureLogs([]LogGroupData{{Entries: sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'")}}, GitHubIssueCommentMaxChars)
 }
 
 // PreviewCommentSummaryMultiNamespaceFailed renders a failed summary with tables from multiple namespaces.
@@ -2738,7 +2745,7 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), GitHubIssueCommentMaxChars, false, LogFoldAlone)
+		RenderFailureLogs([]LogGroupData{{Entries: sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded")}}, GitHubIssueCommentMaxChars)
 }
 
 // PreviewCommentSummaryMultiNamespaceCompleted renders a completed summary with tables from multiple namespaces.
