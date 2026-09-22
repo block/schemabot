@@ -87,6 +87,13 @@ type DeploymentRollupEntry struct {
 	Blocked int
 	Diff    tern.ChangeSetDiff
 	Err     error
+
+	// PlanIdentifier names the stored plan this member will run, set when the
+	// member was planned on its own and its plan was persisted as a row of its
+	// own. Empty means the member runs the plan the apply itself was created
+	// from — which is every member under mirrored planning, and the primary
+	// under either.
+	PlanIdentifier string
 }
 
 // PlanRollup aggregates every rollout member's review-time classification for a
