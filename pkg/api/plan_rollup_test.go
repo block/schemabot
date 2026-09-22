@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
@@ -501,4 +502,23 @@ func TestRollupDeploymentDiffs_IndependentEnforcesMemberContract(t *testing.T) {
 	_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"cake", "orders-002"}, [2]string{"cake", "orders-001"}), PlanIndependent)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cake/orders-002")
+}
+
+// Every classification the rollup can produce has to be recorded under its own
+// metric label. RecordReviewDrift relabels one it does not recognize as
+// "unknown", which is reserved for a coding gap — so a classification added
+// here and not there turns a routine outcome into a permanent false gap signal,
+// and nothing fails to say so. The walk stops on String()'s own out-of-range
+// form, which covers whatever the enum holds rather than a list kept in step by
+// hand.
+func TestDeploymentClassificationsAreKnownToTheDriftMetric(t *testing.T) {
+	var walked []string
+	for c := DeploymentMatch; c.String() != fmt.Sprintf("unknown(%d)", int(c)); c++ {
+		assert.True(t, metrics.KnownReviewDriftClassification(c.String()),
+			"classification %q would be recorded as \"unknown\"", c.String())
+		walked = append(walked, c.String())
+	}
+	// Naming them pins the walk itself: a String() that stopped early would
+	// otherwise pass by covering nothing.
+	assert.Equal(t, []string{"match", "diverged", "errored", "planned"}, walked)
 }

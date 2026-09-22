@@ -89,13 +89,22 @@ type DeploymentRollupEntry struct {
 	Err     error
 }
 
-// PlanRollup aggregates every deployment's review-time classification for a
-// database. Clean is true only when every deployment matches the reviewed plan;
-// any divergence, error, or the primary baseline itself being unusable makes it
-// false so the review gate fails closed.
+// PlanRollup aggregates every rollout member's review-time classification for a
+// database. Clean means every member passed the contract it was classified
+// under: under PlanMirrored that each matches the reviewed plan, under
+// PlanIndependent that each produced a usable plan of its own. Any divergence,
+// error, or the primary baseline itself being unusable makes it false so the
+// review gate fails closed.
 type PlanRollup struct {
 	Entries []DeploymentRollupEntry
 	Clean   bool
+	// Planning is the contract the members were classified under, and decides
+	// what Clean means. Under PlanMirrored a clean rollup says every member
+	// would run the same plan. Under PlanIndependent it says every member
+	// produced a plan of its own, which are not expected to match — so a reader
+	// of the rollup cannot describe it without knowing which contract produced
+	// it.
+	Planning MemberPlanning
 }
 
 // RollupDeploymentDiffs classifies each rollout member's review-time diff
@@ -231,7 +240,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 		entries[i] = entry
 	}
 
-	return PlanRollup{Entries: entries, Clean: clean}, nil
+	return PlanRollup{Entries: entries, Clean: clean, Planning: planning}, nil
 }
 
 // rollupIndependentMembers classifies members that were each planned against
@@ -265,9 +274,18 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 				entry.Class = DeploymentPlanned
 			}
 		}
+		// Same rule as the mirrored path: an errored entry's plan is the one just
+		// declared unusable, so it publishes no count. The count matters more
+		// here than it does there. Mirrored members hold the same change set by
+		// construction, so the primary's count covers them all; independent
+		// members hold different change sets, so this is the only place a
+		// non-primary member's refused DDL can surface at review time.
+		if entry.Class != DeploymentErrored {
+			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
+		}
 		entries[i] = entry
 	}
-	return PlanRollup{Entries: entries, Clean: clean}
+	return PlanRollup{Entries: entries, Clean: clean, Planning: PlanIndependent}
 }
 
 // countBlockedChanges counts the table changes the target's engine will refuse
