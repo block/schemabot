@@ -121,8 +121,13 @@ func (h *Handler) StopDurableWebhookDispatch() {
 		cancel()
 	}
 	if !drain.Wait(&h.durableWebhookWg, durableWebhookDrainTimeout) {
+		abandoned := h.durableWebhookClaimsSnapshot()
 		h.logger.Error("durable webhook deliveries did not return within the shutdown drain; their inbox rows stay claimed until the claim goes stale and the next process to run the pool redelivers them",
-			"drain_timeout", durableWebhookDrainTimeout)
+			"drain_timeout", durableWebhookDrainTimeout,
+			"abandoned_deliveries", len(abandoned))
+		for _, attrs := range abandoned {
+			h.logger.Error("abandoned a claimed webhook delivery whose driver did not return", attrs...)
+		}
 		return
 	}
 	h.logger.Info("durable webhook dispatch stopped")
@@ -217,8 +222,56 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, own
 		"head_sha", event.HeadSHA,
 		"attempts", event.Attempts)
 
+	release := h.registerDurableWebhookClaim(driverID, event)
+	defer release()
+
 	h.driveClaimedDurableWebhook(ctx, driverID, store, event)
 	return true
+}
+
+// registerDurableWebhookClaim records a delivery this process is driving, and
+// returns the function that drops it when the drive returns. What is left in
+// the map when the shutdown drain expires is exactly the set of inbox rows this
+// process walked away from still claimed.
+func (h *Handler) registerDurableWebhookClaim(driverID int, event *storage.WebhookEvent) (release func()) {
+	key := event.Provider + "/" + event.DeliveryID
+	attrs := []any{
+		"driver", driverID,
+		"provider", event.Provider,
+		"delivery_id", event.DeliveryID,
+		"event", event.Event,
+		"action", event.Action,
+		"repo", event.Repository,
+		"pr", event.PullRequest,
+		"head_sha", event.HeadSHA,
+		"attempts", event.Attempts,
+	}
+
+	h.durableWebhookClaimMu.Lock()
+	if h.durableWebhookClaims == nil {
+		h.durableWebhookClaims = make(map[string][]any)
+	}
+	h.durableWebhookClaims[key] = attrs
+	h.durableWebhookClaimMu.Unlock()
+
+	return func() {
+		h.durableWebhookClaimMu.Lock()
+		delete(h.durableWebhookClaims, key)
+		h.durableWebhookClaimMu.Unlock()
+	}
+}
+
+// durableWebhookClaimsSnapshot returns the log attributes of every delivery
+// this process is currently driving.
+func (h *Handler) durableWebhookClaimsSnapshot() [][]any {
+	h.durableWebhookClaimMu.Lock()
+	defer h.durableWebhookClaimMu.Unlock()
+
+	snapshot := make([][]any, 0, len(h.durableWebhookClaims))
+	for _, attrs := range h.durableWebhookClaims {
+		snapshot = append(snapshot, attrs)
+	}
+	return snapshot
 }
 
 // driveClaimedDurableWebhook runs the process → heartbeat → finish lifecycle for

@@ -22,12 +22,18 @@ import (
 const monitorDrainTimeout = 5 * time.Second
 
 // drainMonitor waits for a cancelled monitor loop to return, naming the monitor
-// in the log if it does not.
-func (s *Service) drainMonitor(wg *sync.WaitGroup, monitor string) {
+// in the log if it does not, and reports whether it returned.
+//
+// Callers must not announce that the monitor stopped without checking: past the
+// bound the loop is still running, and an operator reading that it stopped is
+// reading the opposite of what is true at the one moment the distinction
+// matters.
+func (s *Service) drainMonitor(wg *sync.WaitGroup, monitor string) bool {
 	if drain.Wait(wg, monitorDrainTimeout) {
-		return
+		return true
 	}
 	s.logger.Warn("background monitor did not return within the shutdown drain; the close continues without it and its next pass runs in whichever process starts next",
 		"monitor", monitor,
 		"drain_timeout", monitorDrainTimeout)
+	return false
 }

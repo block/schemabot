@@ -101,10 +101,10 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// The reaper is maintenance, not claim work, so it runs outside the driver
 	// pool on cadences of its own. It shares the driver lifecycle: one goroutine
 	// per pass per process, stopped by StopOperator.
-	s.recoveryWg.Go(func() {
+	s.maintenanceWg.Go(func() {
 		s.reaperLoop(driverCtx, stop, reaperEvery, "stranded rows", s.runStrandedReaperPass)
 	})
-	s.recoveryWg.Go(func() {
+	s.maintenanceWg.Go(func() {
 		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 
@@ -163,6 +163,10 @@ func (s *Service) logAbandonedDrives() {
 // there rather than running them against a live drive. What it gives up is
 // releasing the claims promptly; the claims then go stale on their own and are
 // reclaimed the way any lease whose holder disappeared is.
+//
+// Only the drives decide that. The reaper passes stop on the same signal but
+// hold nothing those stages touch, so they are waited on separately and a
+// reaper that overruns its own bound does not hold the drives' cleanup hostage.
 func (s *Service) StopOperator() {
 	s.operatorMu.Lock()
 	if s.stopRecovery == nil {
@@ -193,8 +197,19 @@ func (s *Service) StopOperator() {
 	if cancel != nil {
 		cancel()
 	}
-	if !drain.Wait(&s.recoveryWg, driverDrainTimeout) {
+	drivesReturned := drain.Wait(&s.recoveryWg, driverDrainTimeout)
+	if !drivesReturned {
 		s.logAbandonedDrives()
+	}
+
+	// The reaper passes hold no claim and drive nothing, so the stages below have
+	// nothing to run against one that is still going. Wait for them apart from
+	// the drives, and let a reaper that does not return cost only its own bound:
+	// deciding the drives' fate on a stuck maintenance pass would leave this
+	// process's engines copying and its healthy claims to expire for nothing.
+	s.drainMonitor(&s.maintenanceWg, "operator_reapers")
+
+	if !drivesReturned {
 		return
 	}
 

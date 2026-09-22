@@ -98,8 +98,9 @@ func (s *Service) StopPendingDropsCleaner() {
 	s.pendingDropsMu.Unlock()
 
 	cancel()
-	s.drainMonitor(&s.pendingDropsWg, "pending_drops_cleaner")
-	s.logger.Info("pending drops cleaner stopped")
+	if s.drainMonitor(&s.pendingDropsWg, "pending_drops_cleaner") {
+		s.logger.Info("pending drops cleaner stopped")
+	}
 }
 
 func (s *Service) pendingDropsCleanerLoop(ctx context.Context, retention time.Duration, dryRun bool) {
