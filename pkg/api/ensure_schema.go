@@ -63,14 +63,73 @@ const MinConvergenceTimeout = time.Second
 // EnsureSchemaOption customizes EnsureSchema behavior.
 type EnsureSchemaOption func(*ensureSchemaOptions)
 
+// DeploymentDestructivePolicy is a deployment's standing decision about
+// destructive storage schema statements — the one every boot of it converges
+// under, which no per-request opt-in moves.
+type DeploymentDestructivePolicy int
+
+const (
+	// DestructivePolicyUnknown is a caller that cannot read the deployment's
+	// decision, which is a convergence addressed by DSN alone: there is a
+	// deployment behind that database and no config here that names its
+	// policy. It permits nothing, so it never widens what runs, and it is
+	// reported as unknown rather than as a refusal, because the two differ
+	// exactly where an operator is deciding whether to pre-apply.
+	DestructivePolicyUnknown DeploymentDestructivePolicy = iota
+	// DestructivePolicyForbids is a deployment whose boots refuse to remove
+	// storage state they do not declare. It is the default a config carries.
+	DestructivePolicyForbids
+	// DestructivePolicyPermits is a deployment that configured
+	// allow_destructive_schema_changes, whose boots run the removals.
+	DestructivePolicyPermits
+)
+
+// String names the policy for a log line, where the underlying integer would
+// leave an operator counting enum members.
+func (p DeploymentDestructivePolicy) String() string {
+	switch p {
+	case DestructivePolicyPermits:
+		return "permits"
+	case DestructivePolicyForbids:
+		return "forbids"
+	case DestructivePolicyUnknown:
+		return "unknown"
+	}
+	return "unknown"
+}
+
+// ConfiguredDestructivePolicy is the standing policy a deployment's config
+// states, for a caller that has read one. A caller holding only a DSN has not,
+// and passes DestructivePolicyUnknown instead of the false this would give it.
+func ConfiguredDestructivePolicy(allowDestructive bool) DeploymentDestructivePolicy {
+	if allowDestructive {
+		return DestructivePolicyPermits
+	}
+	return DestructivePolicyForbids
+}
+
 type ensureSchemaOptions struct {
+	// allowDestructive is the effective policy for this convergence: the
+	// deployment's standing one widened by a caller's opt-in. It decides what
+	// this run does.
 	allowDestructive bool
-	dialect          schema.Dialect
+	// deploymentDestructive is the standing policy alone, which is what every
+	// boot of this deployment converges under. It decides nothing here and is
+	// reported, not enforced: it is how a report can say what happens to state
+	// this convergence leaves behind, once this command is over and the only
+	// thing still converging is a pod starting.
+	deploymentDestructive DeploymentDestructivePolicy
+	dialect               schema.Dialect
 	// convergenceTimeout bounds one whole convergence: the lock wait, the
 	// diff under it, and the DDL. It defaults to EnsureSchemaTimeout, the
 	// budget a boot needs, so a caller that never considered the question
 	// converges the way a pod does.
 	convergenceTimeout time.Duration
+	// schemaSource is the schema this convergence brings the storage database
+	// to. Nil is the binary's own embedded files, which is what a boot
+	// converges to, so the startup path never sets it and every existing call
+	// site keeps its behavior by not setting it either.
+	schemaSource *StorageSchemaSource
 	// postgresStatementTimeout bounds a single ordinary query on the
 	// PostgreSQL bootstrap's connection. Zero disables the budget explicitly;
 	// negative means "not set", leaving the platform's ambient value in place.
@@ -84,23 +143,64 @@ type ensureSchemaOptions struct {
 	progress func(StorageConvergenceProgress)
 }
 
-// WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
+// WithDestructiveSchemaChangePolicy controls whether EnsureSchema may execute
 // destructive DDL against the storage database — any statement the plan's own
 // linters report an error against, which for the storage schema means one that
 // loses data (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) and one
-// that removes an index. It defaults to false: those statements are refused
-// while the rest of the diff still applies. A mixed ALTER carrying an additive
-// clause beside a drop runs the addition and withholds the drop, so a pod never
-// starts missing a column its own binary needs.
+// that removes an index. Both arguments default to false: those statements are
+// refused while the rest of the diff still applies. A mixed ALTER carrying an
+// additive clause beside a drop runs the addition and withholds the drop, so a
+// pod never starts missing a column its own binary needs.
 //
 // This is the only way to have the bootstrap execute one of those statements,
 // so removing a table, column, or index from the embedded schema on purpose
-// means setting this flag or running the DDL by hand. That is the
-// intended trade: a surplus index left in place costs write throughput, while
-// one dropped out from under the fleet's live queries costs availability.
-// Wire this from StorageConfig.AllowDestructiveSchemaChanges.
-func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
-	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
+// means permitting it here or running the DDL by hand. That is the intended
+// trade: a surplus index left in place costs write throughput, while one
+// dropped out from under the fleet's live queries costs availability.
+//
+// The two arguments are different facts and the call site has to supply both,
+// which is the reason this takes two rather than the single flag a convergence
+// needs. deployment is the standing policy — wire it through
+// ConfiguredDestructivePolicy from StorageConfig.AllowDestructiveSchemaChanges,
+// or pass DestructivePolicyUnknown where there is no config to read — and
+// request is one caller's explicit opt-in, which widens that policy for this
+// run and never narrows it. What this convergence runs under is the standing
+// permission or the request. deployment alone is what the next pod to boot
+// runs under, which is a question a report has to be able to answer and cannot
+// once the two have been merged into one flag. A boot supplies its own config
+// and false: nobody is asking it for anything.
+//
+// They are also different types, so the compiler rejects the transposition.
+// Two bools here would swap silently and leave every gate intact — a gate
+// reads whether either permits, which does not depend on which is which —
+// while the report went on to describe the caller's own flag as the fleet's
+// policy, which is the one mistake this pair exists to make impossible.
+func WithDestructiveSchemaChangePolicy(deployment DeploymentDestructivePolicy, request bool) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) {
+		o.deploymentDestructive = deployment
+		o.allowDestructive = deployment == DestructivePolicyPermits || request
+	}
+}
+
+// WithStorageSchema converges the storage database to a schema other than the
+// binary's own embedded files — the schema of a release an operator is about to
+// roll, so the storage is ready before the first pod of it starts.
+//
+// Unset, the convergence runs the embedded files, which is what a boot does and
+// what every startup call site wants. Set, the convergence runs the supplied
+// files instead, under the same differ, the same destructive-change refusal and
+// the same advisory lock: the schema moves, the policy does not (AV-9). Nothing
+// here checks that the files are a *complete* schema, because a file set cannot
+// say what is missing from it — an incomplete one reports the storage's own
+// tables as surplus, and what keeps that from destroying them is the same
+// refusal that guards a boot.
+//
+// The option carries no version and never resolves one. A caller supplying
+// files says in words where they came from (see StorageSchemaSource), because
+// only the caller knows, and a convergence attributed to a release whose files
+// it did not run is the failure this whole surface exists to prevent.
+func WithStorageSchema(source *StorageSchemaSource) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.schemaSource = source }
 }
 
 // WithDialect selects the database family of the storage database so
@@ -275,7 +375,7 @@ func ensureSchema(parent context.Context, dsn string, logger *slog.Logger, opts 
 // Destructive statements in the diff — those the plan's linters report an error
 // against, which for the storage schema means losing data (DROP TABLE, or an
 // ALTER TABLE containing DROP COLUMN) or removing an index — are refused unless
-// WithAllowDestructiveSchemaChanges(true) is set. A statement carrying an
+// WithDestructiveSchemaChangePolicy permits them. A statement carrying an
 // addition beside a drop runs the addition, so a pod never starts missing a
 // column its own binary needs. The statements and clauses that were not refused
 // apply, and startup proceeds — a deliberate exception to fail-closed, because failing
@@ -304,11 +404,14 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 		)
 	}
 
-	schemaFiles, err := readEmbeddedSchemaFiles()
+	// Nil is the embedded files, so a boot reads its own schema through the
+	// same call an operator converging a named release reads theirs.
+	schemaFiles, err := o.schemaSource.mysqlSchemaFiles()
 	if err != nil {
 		return err
 	}
-	logger.Info("loaded embedded storage schema files",
+	logger.Info("loaded storage schema files",
+		"schema_source", o.schemaSource.Describe(),
 		"namespace_count", len(schemaFiles),
 		"file_count", countSchemaFiles(schemaFiles),
 		"files", schemaFileNames(schemaFiles),

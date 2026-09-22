@@ -447,3 +447,15 @@ func storageSchemaDatabaseLabel(report *apitypes.StorageSchemaReport) string {
 	}
 	return label
 }
+
+// storageSchemaPlanHints names the next step for the plan that was just
+// printed.
+//
+// The next step is the same command with `apply` in place of `plan`, which is
+// what an operator will reach for and is the answer: the apply converges the
+// schema this plan named, not the one the answering binary happens to carry.
+// The hint does not reproduce the operator's flags, because the plan they just
+// ran already has them on the line above.
+func storageSchemaPlanHints(report *apitypes.StorageSchemaReport) []string {
+	return []string{fmt.Sprintf("These are what %s needs in order to match %s. To converge them, re-run this as `storage apply` with the same flags.", storageSchemaHeaderDatabase(report), report.SchemaSource)}
+}

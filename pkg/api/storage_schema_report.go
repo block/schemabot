@@ -72,6 +72,23 @@ type StorageSchemaReport struct {
 	// actually run. It reflects the effective policy for the request — the
 	// storage config's allowance, or an explicit per-request opt-in.
 	DestructiveAllowed bool
+	// BootRemovalPolicy is what the next pod to start does to storage state its
+	// own schema does not declare.
+	//
+	// This is the deployment's standing policy and its dialect, never the
+	// request's opt-in: a caller permitting destructive statements moves
+	// DestructiveAllowed and leaves this alone, because a boot reads config
+	// and has never heard of the request. A dialect whose bootstrap is
+	// additive-only preserves the state whatever that deployment configured,
+	// since there a boot computes no removal to permit.
+	//
+	// It answers what becomes of state this convergence leaves behind, which
+	// DestructiveAllowed cannot: an operator converging a later release's
+	// schema ahead of the deploy is asking whether it survives until the
+	// deploy, and the answer belongs to the boots in between rather than to
+	// the command they ran. Unknown is one of the answers — see
+	// apitypes.BootRemovalUnknown — and it never collapses into "preserved".
+	BootRemovalPolicy apitypes.BootRemovalPolicy
 	// Manual lists changes that cannot run automatically, each naming the
 	// situation and the remediation. Any entry aborts convergence before a
 	// single statement executes, so an apply is refused while one is present.
@@ -156,6 +173,7 @@ func (r *StorageSchemaReport) APIType() *apitypes.StorageSchemaReport {
 		Manual:             storageSchemaStatementsAPIType(r.Manual),
 
 		ConvergenceInFlight: r.ConvergenceInFlight,
+		BootRemovalPolicy:   r.BootRemovalPolicy,
 	}
 }
 

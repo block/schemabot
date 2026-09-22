@@ -37,14 +37,21 @@ type storageTarget struct {
 	dsn     string
 	dialect schema.Dialect
 	source  string
-	// allowDestructive is the deployment's standing storage policy
+	// destructive is the deployment's standing storage policy
 	// (storage.allow_destructive_schema_changes), when the DSN came from a
 	// server config. A boot of that config converges under it, so an operator
-	// convergence against the same database must too — otherwise "apply is what
-	// a boot does" (AV-9) stops being true on exactly the deployments that
-	// opted in. A DSN passed on the command line carries no config and so no
-	// policy, leaving --allow-unsafe as the only way to widen it.
-	allowDestructive bool
+	// convergence against the same database must too — an operator may name
+	// which schema runs, but not the policy it runs under (AV-9), and otherwise
+	// the two would disagree on exactly the deployments that opted in.
+	//
+	// A DSN passed on the command line carries no config, and that is unknown
+	// rather than forbidding. The two behave alike for what this run may
+	// execute — neither permits anything, so --allow-unsafe stays the only way
+	// to widen it — and differently for what the report may claim, because a
+	// database reached by DSN still belongs to a deployment whose policy nobody
+	// here has read. Reporting that absence as a refusal is how an operator is
+	// told to pre-apply storage their fleet will drop.
+	destructive api.DeploymentDestructivePolicy
 	// postgresStatementTimeout is the config's statement budget, for the same
 	// reason: a convergence run here has to read and write under the budget the
 	// deployment's own bootstrap uses. Nil where no config was loaded, which
@@ -52,20 +59,16 @@ type storageTarget struct {
 	postgresStatementTimeout *time.Duration
 }
 
-// allowsDestructive is whether destructive storage statements run against this
-// target. The operator's per-command flag only ever widens the target's
-// standing policy: a request may permit destructive statements on a deployment
-// that does not, and must never refuse ones the deployment's own boot would
-// run.
-func (t *storageTarget) allowsDestructive(requestAllowDestructive bool) bool {
-	return t.allowDestructive || requestAllowDestructive
-}
-
 // ensureSchemaOptions is the policy this target converges or diffs under.
+//
+// The target's standing policy and the operator's per-command flag are handed
+// over as the two separate facts they are. Widening the one by the other is
+// api's to do, so that every caller widens it the same way and a report can
+// still name what a boot of this deployment does on its own.
 func (t *storageTarget) ensureSchemaOptions(requestAllowDestructive bool) []api.EnsureSchemaOption {
 	opts := []api.EnsureSchemaOption{
 		api.WithDialect(t.dialect),
-		api.WithAllowDestructiveSchemaChanges(t.allowsDestructive(requestAllowDestructive)),
+		api.WithDestructiveSchemaChangePolicy(t.destructive, requestAllowDestructive),
 	}
 	if t.postgresStatementTimeout != nil {
 		opts = append(opts, api.WithPostgresStatementTimeout(*t.postgresStatementTimeout))
@@ -182,7 +185,7 @@ func (c *storageConfig) target() (*storageTarget, error) {
 		dsn:                      dsn,
 		dialect:                  c.dialect,
 		source:                   source,
-		allowDestructive:         c.cfg.Storage.AllowDestructiveSchemaChanges,
+		destructive:              api.ConfiguredDestructivePolicy(c.cfg.Storage.AllowDestructiveSchemaChanges),
 		postgresStatementTimeout: &statementTimeout,
 	}, nil
 }

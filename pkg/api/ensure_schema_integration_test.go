@@ -274,12 +274,12 @@ func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 	require.True(t, testutil.TableExists(t, db, sdb.Name, "vitess_tasks"))
 
 	// EnsureSchema reconciles the obsolete table away without error...
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"EnsureSchema with an obsolete vitess_tasks table failed")
 	assert.False(t, testutil.TableExists(t, db, sdb.Name, "vitess_tasks"), "obsolete vitess_tasks should be removed")
 
 	// ...and the next run is a clean no-op.
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"second EnsureSchema not idempotent")
 }
 
@@ -653,13 +653,13 @@ func TestEnsureSchema_AllowDestructiveExecutesIndexDrop(t *testing.T) {
 	seedSurplusIndex(t, db)
 	require.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"EnsureSchema with destructive changes allowed failed")
 
 	assert.Empty(t, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
 		"surplus index should be dropped when destructive changes are allowed")
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"second EnsureSchema not idempotent")
 }
 
@@ -675,7 +675,7 @@ func TestEnsureSchema_AllowDestructiveExecutesDrops(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger))
 	surplusColumn, surplusTable := seedSurplusStorageState(t, db)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"EnsureSchema with destructive changes allowed failed")
 
 	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn),
@@ -683,7 +683,7 @@ func TestEnsureSchema_AllowDestructiveExecutesDrops(t *testing.T) {
 	assert.False(t, testutil.TableExists(t, db, sdb.Name, surplusTable),
 		"surplus table should be dropped when destructive changes are allowed")
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"second EnsureSchema not idempotent")
 }
 

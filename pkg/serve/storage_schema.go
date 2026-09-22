@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -26,13 +27,15 @@ import (
 // the request, so no caller — not even the control plane — can point this at a
 // different database.
 //
-// Two things a caller may influence, and neither reaches the database a
-// convergence writes to. Whether destructive statements run only ever widens
-// what the local config already allows, and on a locally hosted server not even
-// that (see destructivePolicy). A
-// desired schema sent with a diff replaces the files the comparison reads, and
-// is accepted only there: the convergence RPC carries no schema, so an apply
-// always runs this binary's own (see desiredSchema).
+// Two things a caller may influence, and neither moves the database. Whether
+// destructive statements run only ever widens what the local config already
+// allows, and on a locally hosted server not even that (see
+// checkDestructiveOptIn). A desired schema replaces the files both RPCs read,
+// on a diff and on a convergence alike (see desiredSchema), because an operator
+// rolling a later release has to be able to converge this storage to it before
+// its first pod starts. What a supplied schema cannot do is widen what the
+// bootstrap permits: the destructive refusal and the manual-remediation gate
+// decide on supplied files the same way they decide on embedded ones (AV-9).
 type storageSchemaAdapter struct {
 	// resolveDSN re-resolves the storage DSN per call rather than capturing a
 	// string, so a credential rotated since startup is picked up the same way
@@ -50,8 +53,9 @@ type storageSchemaAdapter struct {
 	version string
 	// configAllowsDestructive is the deployment's standing storage policy
 	// (storage.allow_destructive_schema_changes). A boot converges under it, so
-	// an operator convergence must too — otherwise "apply is what a boot does"
-	// would stop being true on exactly the deployments that opted in.
+	// an operator convergence must too — an operator may name which schema
+	// runs, never the policy it runs under, and otherwise the two would
+	// disagree on exactly the deployments that opted in.
 	configAllowsDestructive bool
 	// localHosted marks a server the local runtime hosts, where no route to a
 	// destructive storage bootstrap exists at all (AZ-6).
@@ -136,7 +140,7 @@ func (a *storageSchemaAdapter) StorageSchemaPlan(ctx context.Context, req *ternv
 	if err != nil {
 		return nil, err
 	}
-	desired, err := a.desiredSchema(req)
+	desired, err := a.desiredSchema(req.GetSchemaFiles(), req.GetSchemaSource(), "diff")
 	if err != nil {
 		return nil, err
 	}
@@ -151,20 +155,35 @@ func (a *storageSchemaAdapter) StorageSchemaPlan(ctx context.Context, req *ternv
 	return &ternv1.StorageSchemaPlanResponse{Report: api.StorageSchemaReportProto(report)}, nil
 }
 
-// desiredSchema resolves the schema the diff compares the live database
-// against: the files the caller sent, or this binary's own when it sent none.
+// desiredSchema resolves the schema a request works from: the files the caller
+// sent, or this binary's own when it sent none.
 //
-// A caller-supplied schema is accepted here and nowhere else. A diff executes
-// nothing, so answering "what would this database need in order to match that
-// release" is a read however the release's files arrived; the convergence RPC
-// has no such field to send, so the schema a convergence runs is always this
-// binary's (AV-9).
-func (a *storageSchemaAdapter) desiredSchema(req *ternv1.StorageSchemaPlanRequest) (*api.StorageSchemaSource, error) {
-	files := req.GetSchemaFiles()
+// Both RPCs resolve it here, so the schema a caller previews is the schema they
+// converge. Sending files is how an operator asks about — and readies — a
+// release this binary does not carry, which is the question a deploy actually
+// has. What the supplied files never do is decide what may run: the convergence
+// applies the bootstrap's own destructive refusal and manual-remediation gate
+// to them, unchanged (AV-9).
+//
+// operation names what the files are for, so the log line says whether a
+// supplied schema was read for a diff or run against the database.
+//
+// A name with no files to go with it is refused here rather than at a
+// transport, because the tern gRPC server reaches this adapter without passing
+// the HTTP API's validation, and this is the one half of that pair the
+// defaulting below would swallow: it would resolve to the embedded schema and
+// converge it, running one release's schema for a caller that named another's.
+// Files with no name are refused by StorageSchemaFromFiles, which cannot
+// attribute a report without one.
+func (a *storageSchemaAdapter) desiredSchema(files map[string]string, schemaSource, operation string) (*api.StorageSchemaSource, error) {
 	if len(files) == 0 {
+		if strings.TrimSpace(schemaSource) != "" {
+			return nil, fmt.Errorf("%w: schema_source %q was sent without schema_files: with no files this server's own embedded schema would run and be reported under that name; send the files, or drop schema_source to use the embedded schema",
+				tern.ErrInvalidStorageSchemaRequest, schemaSource)
+		}
 		return api.EmbeddedStorageSchema(a.version), nil
 	}
-	desired, err := api.StorageSchemaFromFiles(req.GetSchemaSource(), files)
+	desired, err := api.StorageSchemaFromFiles(schemaSource, files)
 	if err != nil {
 		// The caller wrote these files, so the reason goes back to the caller
 		// rather than into a log it cannot read (see ErrInvalidStorageSchemaRequest).
@@ -173,7 +192,8 @@ func (a *storageSchemaAdapter) desiredSchema(req *ternv1.StorageSchemaPlanReques
 	if err := a.parseSupplied(desired); err != nil {
 		return nil, err
 	}
-	a.logger.Info("diffing storage schema against a supplied schema",
+	a.logger.Info("storage schema request carries a supplied schema",
+		"operation", operation,
 		"dialect", a.dialect,
 		"schema_source", desired.Description,
 		"schema_file_count", len(files),
@@ -191,21 +211,26 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 		return nil, err
 	}
 	opts = append(opts, api.WithConvergenceTimeout(budget))
+	desired, err := a.desiredSchema(req.GetSchemaFiles(), req.GetSchemaSource(), "converge")
+	if err != nil {
+		return nil, err
+	}
 	// ApplyStorageSchema cancels its convergence when its context is cancelled
 	// — that is what lets an operator at a terminal stop a run they are
 	// watching. This context is a request's, and cancelling it means the
 	// connection dropped, not that anyone decided anything. Stripping the
 	// cancellation is what keeps a lost TCP connection from taking a table
 	// copy with it; the budget above is still what bounds the run.
-	planned, remaining, err := api.ApplyStorageSchema(context.WithoutCancel(ctx), dsn, a.logger, opts...)
+	planned, remaining, err := api.ApplyStorageSchema(context.WithoutCancel(ctx), dsn, desired, a.logger, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("converge storage schema (dialect %s): %w", a.dialect, err)
+		return nil, fmt.Errorf("converge storage schema (dialect %s) to %s: %w", a.dialect, desired.Describe(), err)
 	}
 	planned.AttributeTo(a.version)
 	remaining.AttributeTo(a.version)
 	a.logger.InfoContext(ctx, "storage schema convergence answered",
 		"dialect", a.dialect,
 		"database", remaining.Database,
+		"schema_source", remaining.SchemaSource,
 		"caller", req.GetCaller(),
 		"planned_count", len(planned.Outstanding),
 		"remaining_count", len(remaining.Outstanding),
@@ -264,13 +289,12 @@ func (a *storageSchemaAdapter) target(requestAllowsDestructive bool) (string, []
 	if err := a.checkBootTarget(dsn); err != nil {
 		return "", nil, err
 	}
-	allowDestructive, err := a.destructivePolicy(requestAllowsDestructive)
-	if err != nil {
+	if err := a.checkDestructiveOptIn(requestAllowsDestructive); err != nil {
 		return "", nil, err
 	}
 	return dsn, []api.EnsureSchemaOption{
 		api.WithDialect(a.dialect),
-		api.WithAllowDestructiveSchemaChanges(allowDestructive),
+		api.WithDestructiveSchemaChangePolicy(api.ConfiguredDestructivePolicy(a.configAllowsDestructive), requestAllowsDestructive),
 		api.WithPostgresStatementTimeout(a.postgresStatementTimeout),
 	}, nil
 }
@@ -282,9 +306,9 @@ func (a *storageSchemaAdapter) target(requestAllowsDestructive bool) (string, []
 // a restart, and a rotation is the only movement that may be honored. A DSN
 // that now names a different server or a different database describes some
 // other SchemaBot's storage: reading it would attribute another instance's
-// drift to this one, and converging it would run this binary's embedded schema
-// against a database it never booted on. Both are refused, which is the
-// binding the adapter documents and the one AV-9 rests on.
+// drift to this one, and converging it would run DDL against a database this
+// instance never booted on. Both are refused, which is the binding the adapter
+// documents and the one AV-9 rests on.
 func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 	resolved, err := storageTargetFor(a.dialect, dsn)
 	if err != nil {
@@ -302,17 +326,21 @@ func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 		"the storage schema surface only answers for the database this instance is running on, so restart it to adopt the new storage", resolved, a.bootTarget)
 }
 
-// destructivePolicy resolves whether this call may run destructive statements:
-// the deployment's policy widened by an explicit per-request opt-in, never
-// narrowed by its absence — and never widened at all on a locally hosted
-// server, which refuses the request instead.
+// checkDestructiveOptIn admits or refuses a per-request opt-in to destructive
+// statements. It resolves nothing: the two policies travel separately into the
+// bootstrap options, which is what lets a report say what this call runs and
+// what a boot runs without the second being inferred from the first.
+//
+// What this decides is whether the opt-in may be honored at all — it is never
+// honored on a locally hosted server, which refuses the request rather than
+// widening anything.
 //
 // The two directions are not symmetric and the asymmetry is the point. A
 // deployment that configured allow_destructive_schema_changes has already made
 // the decision for every boot; a convergence that ignored it would run less
-// than the next boot runs, so "apply is what a boot does" — the property that
-// makes this usable as a pre-deploy convergence step — would quietly stop
-// holding there. In the other direction, a request opting in is exactly the
+// than the next boot runs — an apply refusing on a deployment where a boot
+// proceeds, which is the deployment an operator converging ahead of a roll most
+// needs it not to. In the other direction, a request opting in is exactly the
 // explicit operator consent AV-9 asks for before surplus storage state is
 // destroyed, arriving through a command an admin had to issue rather than
 // through a config file nobody re-read.
@@ -324,14 +352,14 @@ func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 // rather than running the safe remainder under a flag it ignored, so an
 // operator learns their opt-in did not apply instead of reading a report that
 // looks like it did (AZ-6).
-func (a *storageSchemaAdapter) destructivePolicy(requestAllowsDestructive bool) (bool, error) {
+func (a *storageSchemaAdapter) checkDestructiveOptIn(requestAllowsDestructive bool) error {
 	if requestAllowsDestructive && a.localHosted {
 		a.logger.Warn("refusing a storage schema request that opts in to destructive statements: this server is locally hosted",
 			"dialect", a.dialect,
 			"boot_target", a.bootTarget.String(),
 		)
-		return false, fmt.Errorf("%w: this server is locally hosted, which never runs destructive storage schema statements; "+
+		return fmt.Errorf("%w: this server is locally hosted, which never runs destructive storage schema statements; "+
 			"re-run without the destructive opt-in to converge everything else, or address a deployed server to run them", tern.ErrInvalidStorageSchemaRequest)
 	}
-	return a.configAllowsDestructive || requestAllowsDestructive, nil
+	return nil
 }

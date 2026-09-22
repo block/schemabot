@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -51,6 +52,30 @@ type storageSchemaTargetFlags struct {
 	DSN         string `help:"Connect to the storage database directly with this DSN instead of going through the API; for when the server is down"`
 	Config      string `help:"Server config file to resolve the storage DSN from, connecting directly instead of going through the API"`
 	Dialect     string `help:"Storage database family of --dsn (mysql or postgres) when its form does not say"`
+	// resolvedTarget is the storage database these flags name, once it has been
+	// resolved. It sits on the flags rather than on a command because a command
+	// that hands the target off hands these flags off with it, so the copy
+	// carries the resolution and cannot resolve a second one.
+	resolvedTarget *storageTarget `kong:"-"`
+}
+
+// target is the storage database these flags address, resolved at most once.
+//
+// One resolution per run is the point. A config using storage.dsn_from resolves
+// its DSN from secret references, so every resolution is a call to someone
+// else's system, with its own audit trail and its own chance to answer
+// differently than it did a moment ago. A convergence that resolved again could
+// run against a database its own preview never looked at.
+func (f *storageSchemaTargetFlags) target() (*storageTarget, error) {
+	if f.resolvedTarget != nil {
+		return f.resolvedTarget, nil
+	}
+	target, err := resolveStorageTarget(f.DSN, f.Config, f.Dialect)
+	if err != nil {
+		return nil, err
+	}
+	f.resolvedTarget = target
+	return target, nil
 }
 
 // direct reports whether the operator asked for a direct connection. Passing
@@ -128,6 +153,11 @@ type StoragePlanCmd struct {
 	// standing storage policy can allow destructive changes with no flag on the
 	// line at all.
 	AllowUnsafe bool `kong:"-"`
+	// resolved is a schema the caller has already read from the selectors,
+	// used instead of reading them again. The apply's preview sets it so the
+	// plan an operator approves is computed from the same bytes the
+	// convergence then runs.
+	resolved *api.StorageSchemaSource `kong:"-"`
 }
 
 func (cmd *StoragePlanCmd) Run(ctx context.Context, g *Globals) error {
@@ -147,7 +177,7 @@ func (cmd *StoragePlanCmd) Run(ctx context.Context, g *Globals) error {
 		if err := encoder.Encode(apitypes.StorageSchemaPlanResponse{Report: report}); err != nil {
 			return fmt.Errorf("encode storage schema report: %w", err)
 		}
-	} else if err := outputStorageSchemaPlan(report, false, "", nil); err != nil {
+	} else if err := outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)); err != nil {
 		return err
 	}
 	if report.Converged {
@@ -168,13 +198,13 @@ func (cmd *StoragePlanCmd) read(ctx context.Context, g *Globals) (*apitypes.Stor
 // here, for when the server is down — including when it is down because its own
 // schema bootstrap is failing.
 func (cmd *StoragePlanCmd) readDirect(ctx context.Context, g *Globals) (*apitypes.StorageSchemaReport, error) {
-	target, err := resolveStorageTarget(cmd.DSN, cmd.Config, cmd.Dialect)
+	target, err := cmd.target()
 	if err != nil {
 		return nil, err
 	}
 	// The dialect is already resolved on this path, so a release fetch costs no
 	// extra round trip.
-	desired, err := cmd.resolve(ctx, func() (schema.Dialect, error) { return target.dialect, nil })
+	desired, err := cmd.desiredSchema(ctx, func() (schema.Dialect, error) { return target.dialect, nil })
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +235,7 @@ func (cmd *StoragePlanCmd) readThroughAPI(ctx context.Context, g *Globals) (*api
 		Environment:      cmd.Environment,
 		AllowDestructive: cmd.AllowUnsafe,
 	}
-	desired, err := cmd.resolve(ctx, func() (schema.Dialect, error) {
+	desired, err := cmd.desiredSchema(ctx, func() (schema.Dialect, error) {
 		return cmd.dialectThroughAPI(ctx, endpoint)
 	})
 	if err != nil {
@@ -224,6 +254,15 @@ func (cmd *StoragePlanCmd) readThroughAPI(ctx context.Context, g *Globals) (*api
 		return nil, fmt.Errorf("storage schema diff%s returned no report", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment))
 	}
 	return response.Report, nil
+}
+
+// desiredSchema is the schema this plan compares against: one the caller
+// already read, or the selectors read now.
+func (cmd *StoragePlanCmd) desiredSchema(ctx context.Context, dialect func() (schema.Dialect, error)) (*api.StorageSchemaSource, error) {
+	if cmd.resolved != nil {
+		return cmd.resolved, nil
+	}
+	return cmd.resolve(ctx, dialect, false)
 }
 
 // dialectThroughAPI asks the target which storage family it runs, so a release
@@ -255,12 +294,20 @@ func (cmd *StoragePlanCmd) dialectThroughAPI(ctx context.Context, endpoint strin
 // same refusal of destructive statements, and the same advisory lock — so two
 // operators running this at once serialize exactly the way two booting pods
 // do, and a pre-deploy convergence step is this command with nothing added.
-// It converges to the schema of the binary that runs it, and there is no flag
-// to point it at another release's — see storageSchemaSourceRefusal.
+//
+// Which schema it converges to is the operator's to name. Named nothing, it
+// converges the answering binary's own embedded files, which is what that
+// binary's next boot converges. Named a release, it converges that release's
+// files — the reason the command exists, because the storage a release needs
+// has to be there before the first pod of that release starts, and the pod
+// that would converge it is the one that cannot start until it is. Naming a
+// release is confirmed at a terminal and never runs unattended; see
+// blockUnattendedNamedSchema and storageSchemaConfirmation.
 type StorageApplyCmd struct {
 	storageSchemaTargetFlags `embed:""`
+	storageSchemaSourceFlags `embed:""`
 	AllowUnsafe              bool `help:"Permit the destructive statements the convergence would otherwise refuse; it widens the target's standing storage policy and never narrows it" name:"allow-unsafe"`
-	AutoApprove              bool `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
+	AutoApprove              bool `short:"y" help:"Skip confirmation prompt; refused with --release or --schema-dir, which are always confirmed at a terminal" name:"auto-approve"`
 	JSON                     bool `help:"Output as JSON"`
 	// Timeout is how a convergence outlives the budget a boot runs under. A
 	// booting pod gives up after minutes because a pod converging is a pod not
@@ -268,23 +315,19 @@ type StorageApplyCmd struct {
 	// to. Left unset, the operator default is named on its behalf, so the
 	// target always runs the budget this command is waiting for.
 	Timeout time.Duration `help:"Bound the whole convergence — the lock wait, the diff under it, and the DDL. Defaults to the operator budget, which is already far above a booting pod's. Raising it holds the storage bootstrap lock for that long, and pods booting in the window will not come up" name:"timeout"`
-	// The diff's file selectors are accepted here only to be refused with the
-	// reason and the alternative. An operator who has just run the diff against
-	// a release reaches for the same flags on the apply, and Kong's bare
-	// "unknown flag" would leave them guessing at whether the convergence
-	// silently used a different schema. --release-repo is accepted for the same
-	// reason: it is the flag most likely to be left on the line after the one
-	// it modifies has been dropped.
-	SchemaDir string `hidden:"" name:"schema-dir"`
-	Release   string `hidden:""`
-	Repo      string `hidden:"" name:"release-repo"`
 }
 
 func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	if err := cmd.validate(); err != nil {
 		return err
 	}
-	if err := storageSchemaSourceRefusal(cmd.SchemaDir, cmd.Release, cmd.Repo); err != nil {
+	if err := cmd.validateSourceCombination(); err != nil {
+		return err
+	}
+	// At the door, before anything is read: this refuses a command form, not
+	// something a plan could have found, so there is nothing to learn from the
+	// database first.
+	if err := blockUnattendedNamedSchema(cmd.namedSource(), cmd.AutoApprove); err != nil {
 		return err
 	}
 	// Checked before the preview rather than on the way to the convergence: a
@@ -301,21 +344,42 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// statements, and the read is free of side effects. Unattended, it is what
 	// the destructive gate below decides from.
 	//
-	// No selector on the preview asks the target about its own embedded schema,
-	// which is the schema this convergence is about to run.
+	// It is built before anything is read so that its target flags are the only
+	// ones anything here uses: the schema a named release resolves for, the
+	// plan, and the convergence all take their storage database from this one
+	// value, which resolves it once and remembers it (see
+	// storageSchemaTargetFlags.target).
 	preview := &StoragePlanCmd{
 		storageSchemaTargetFlags: cmd.storageSchemaTargetFlags,
+		storageSchemaSourceFlags: cmd.storageSchemaSourceFlags,
 		AllowUnsafe:              cmd.AllowUnsafe,
 	}
+	flags := &preview.storageSchemaTargetFlags
+
+	// The schema is resolved once and used for the preview, the confirmation
+	// and the convergence. Resolving it again for the convergence would open a
+	// window where a moved tag or an edited directory made the operator
+	// approve one file set and converge another.
+	desired, err := cmd.resolveDesired(ctx, g, flags)
+	if err != nil {
+		return err
+	}
+	preview.resolved = desired
+
 	report, err := preview.read(ctx, g)
 	if err != nil {
 		return err
 	}
 	// With --auto-approve the convergence's own planned report says what ran,
 	// so the plan is printed after the fact instead — unless the gate stops the
-	// run, which prints it itself.
+	// run, which prints it itself. Under --json it goes to the terminal rather
+	// than into the stream being parsed: the statements are what the person at
+	// the prompt is being asked to approve, so the one thing this must never do
+	// is skip them.
 	if !cmd.AutoApprove {
-		if err := outputStorageSchemaPlan(report, true, cmd.rerunWithAllowUnsafe(), nil); err != nil {
+		if err := writeToTerminal(cmd.JSON, func() error {
+			return outputStorageSchemaPlan(report, true, cmd.rerunWithAllowUnsafe(), nil)
+		}); err != nil {
 			return err
 		}
 	}
@@ -324,40 +388,107 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// operator and a pre-deploy job are told the same thing. Manual first: it
 	// gates the whole drift set, which makes a destructive statement behind it
 	// unreachable rather than merely refused.
-	if err := blockManualStorageApply(report, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
-		return err
+	//
+	// A --json run is read by a program, so the gates print no plan on it and
+	// the refusal is reported as the response shape instead.
+	gatePrintsPlan := cmd.AutoApprove && !cmd.JSON
+	if err := blockManualStorageApply(report, gatePrintsPlan, cmd.rerunWithAllowUnsafe()); err != nil {
+		return cmd.reportRefusal(report, err)
 	}
-	if err := blockDestructiveStorageApply(report, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
-		return err
+	if err := blockDestructiveStorageApply(report, gatePrintsPlan, cmd.rerunWithAllowUnsafe()); err != nil {
+		return cmd.reportRefusal(report, err)
 	}
 
 	if !cmd.AutoApprove {
-		confirmed, err := confirmAction(
-			storageSchemaConfirmation(report),
+		prompts := io.Writer(os.Stdout)
+		if cmd.JSON {
+			prompts = os.Stderr
+		}
+		confirmed, err := confirmActionOn(
+			prompts,
+			storageSchemaConfirmation(report, cmd.namedSource() != ""),
 			"\nApply cancelled.",
 		)
 		if err != nil {
 			return err
 		}
 		if !confirmed {
+			// A decline is an outcome a program has to be able to read, and it
+			// leaves the database exactly as the plan found it — the same shape
+			// a refusal answers with, for the same reason.
+			if cmd.JSON {
+				return encodeStorageSchemaConvergence(report, report)
+			}
 			return nil
 		}
 	}
 
-	planned, remaining, err := cmd.converge(ctx, g)
+	planned, remaining, err := cmd.converge(ctx, g, flags, desired)
 	if err != nil {
 		return err
 	}
 	if cmd.JSON {
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(apitypes.StorageSchemaApplyResponse{Planned: planned, Remaining: remaining}); err != nil {
-			return fmt.Errorf("encode storage schema convergence: %w", err)
+		if err := encodeStorageSchemaConvergence(planned, remaining); err != nil {
+			return err
 		}
 	} else if err := outputStorageSchemaConvergence(planned, remaining, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
 		return err
 	}
 	return storageSchemaConvergenceOutcome(remaining)
+}
+
+// reportRefusal hands a refused convergence back in the shape the caller asked
+// for, and returns the refusal either way.
+//
+// A refusal under --json is the case a program most needs to read: nothing ran,
+// so every statement the plan found is still outstanding, which is why the
+// planned and remaining halves are the same report. Without this the run
+// printed a human plan on a surface a program parses, or on the destructive
+// gate nothing at all, and a caller could not tell a refusal from a crash.
+func (cmd *StorageApplyCmd) reportRefusal(report *apitypes.StorageSchemaReport, refusal error) error {
+	if !cmd.JSON {
+		return refusal
+	}
+	// An encode failure is the answer to why there is no report on stdout, so it
+	// is the error to return: the refusal it would have carried is in the
+	// statements the plan already holds, and the command fails on either.
+	if err := encodeStorageSchemaConvergence(report, report); err != nil {
+		return err
+	}
+	return refusal
+}
+
+func encodeStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(apitypes.StorageSchemaApplyResponse{Planned: planned, Remaining: remaining}); err != nil {
+		return fmt.Errorf("encode storage schema convergence: %w", err)
+	}
+	return nil
+}
+
+// blockUnattendedNamedSchema refuses to converge a named release's schema
+// without a person watching.
+//
+// Naming a schema is the one thing about this command that a boot cannot check
+// for itself. Every other decision here is the bootstrap's, made the same way
+// on the same files whoever asked; this one substitutes files the answering
+// binary never carried, so the fleet's own boots will not agree with what was
+// just converged until the release that carries them is deployed. That
+// disagreement is safe and expected, and it is also the kind of thing an
+// operator must be looking at when it starts — so the confirmation is the
+// consent, and --auto-approve is not a way to give it (AV-9).
+//
+// Refusing the combination is stricter than refusing at the prompt: a
+// pre-deploy job cannot converge a release's schema at all. That is the right
+// default for a surface whose whole value is that the fleet and the storage
+// agree, and an unattended convergence of the answering binary's own schema —
+// the pre-deploy step this command was built for — is untouched by it.
+func blockUnattendedNamedSchema(selector string, autoApprove bool) error {
+	if selector == "" || !autoApprove {
+		return nil
+	}
+	return fmt.Errorf("%s cannot be combined with --auto-approve: converging storage to a schema this binary does not carry is confirmed at a terminal, because until that release is deployed the running one will not converge the same schema. Run it without --auto-approve and answer the prompt, or drop %s to converge what this binary's own next boot would", selector, selector)
 }
 
 // rerunWithAllowUnsafe is the command that permits what this one refused, for
@@ -367,6 +498,13 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 // same storage database the refusal is about. Dropping them would suggest a
 // convergence of the storage of the server the CLI happens to point at, which
 // during a rollback is a different database than the one being looked at.
+//
+// It carries the schema selector forward for a stronger version of the same
+// reason. The refused statements were computed against the schema the operator
+// named, so a command that dropped the selector would permit destructive
+// changes while converging a different schema than the one the refusal was
+// about — and on a cross-release convergence that is the schema of a different
+// release.
 //
 // A DSN is named rather than repeated: it carries the storage database's
 // credentials, and this is printed to a terminal and scrolled back through.
@@ -389,29 +527,18 @@ func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() string {
 	if cmd.Timeout > 0 {
 		parts = append(parts, "--timeout", cmd.Timeout.String())
 	}
+	switch {
+	case strings.TrimSpace(cmd.Release) != "":
+		parts = append(parts, "--release", cmd.Release)
+		if strings.TrimSpace(cmd.Repo) != "" {
+			parts = append(parts, "--release-repo", cmd.Repo)
+		}
+	case strings.TrimSpace(cmd.SchemaDir) != "":
+		parts = append(parts, "--schema-dir", cmd.SchemaDir)
+	}
 	return strings.Join(append(parts, "--allow-unsafe"), " ")
 }
 
-// blockDestructiveStorageApply stops a convergence that would have to destroy
-// storage state nothing has permitted, before it runs anything.
-//
-// This is the gate `apply` puts in front of a destructive schema change, in the
-// same place and behind the same flag: the plan is on screen, the statements
-// are named, and --allow-unsafe is the way through. It is in front of the
-// confirmation rather than after it because --auto-approve skips a prompt, and
-// consenting to a convergence is not consenting to destroy state.
-//
-// A deployment that already allows destructive storage changes has permitted
-// them, so there is nothing here to ask: the report says so and the statements
-// run. The gate narrows no standing policy (AV-9), and where it does stop a run
-// it runs strictly less than the convergence would have — the bootstrap refuses
-// the same statements on its own and converges the safe remainder. What changes
-// is when the operator finds out: before a DROP against SchemaBot's own storage
-// is decided, rather than in a report of what was already done.
-//
-// withPlan prints the plan for an unattended run, which has not printed one
-// yet. Naming refused statements without showing them would send the operator
-// back to `storage plan` to find out what was refused.
 // blockManualStorageApply stops a convergence that cannot run at all.
 //
 // A manual entry gates the whole drift set: the bootstrap refuses every
@@ -436,6 +563,26 @@ func blockManualStorageApply(report *apitypes.StorageSchemaReport, withPlan bool
 		storageSchemaDatabaseLabel(report), len(report.Manual))
 }
 
+// blockDestructiveStorageApply stops a convergence that would have to destroy
+// storage state nothing has permitted, before it runs anything.
+//
+// This is the gate `apply` puts in front of a destructive schema change, in the
+// same place and behind the same flag: the plan is on screen, the statements
+// are named, and --allow-unsafe is the way through. It is in front of the
+// confirmation rather than after it because --auto-approve skips a prompt, and
+// consenting to a convergence is not consenting to destroy state.
+//
+// A deployment that already allows destructive storage changes has permitted
+// them, so there is nothing here to ask: the report says so and the statements
+// run. The gate narrows no standing policy (AV-9), and where it does stop a run
+// it runs strictly less than the convergence would have — the bootstrap refuses
+// the same statements on its own and converges the safe remainder. What changes
+// is when the operator finds out: before a DROP against SchemaBot's own storage
+// is decided, rather than in a report of what was already done.
+//
+// withPlan prints the plan for an unattended run, which has not printed one
+// yet. Naming refused statements without showing them would send the operator
+// back to `storage plan` to find out what was refused.
 func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
 	if report.DestructiveAllowed || len(report.Destructive) == 0 {
 		return nil
@@ -461,12 +608,112 @@ func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan
 // here would leave them on the database and make an interactive apply do less
 // than the same command with --auto-approve — and the one an operator reaches
 // for mid-incident is the interactive one.
-func storageSchemaConfirmation(report *apitypes.StorageSchemaReport) string {
+//
+// namedSchema says the operator named a schema rather than taking the
+// answering binary's own, which changes what they are consenting to and gets
+// the notice that says how.
+func storageSchemaConfirmation(report *apitypes.StorageSchemaReport, namedSchema bool) string {
 	label := storageSchemaDatabaseLabel(report)
-	if report.Converged {
-		return fmt.Sprintf("\nThe catalog of %s already matches. Run the bootstrap anyway, to clear any engine state a catalog diff cannot see? Only 'yes' will be accepted: ", label)
+	notice := ""
+	if namedSchema {
+		notice = crossReleaseStorageNotice(report)
 	}
-	return fmt.Sprintf("\nDo you want to apply these changes to %s? Only 'yes' will be accepted: ", label)
+	if report.Converged {
+		return fmt.Sprintf("\n%sThe catalog of %s already matches. Run the bootstrap anyway, to clear any engine state a catalog diff cannot see? Only 'yes' will be accepted: ", notice, label)
+	}
+	return fmt.Sprintf("\n%sDo you want to apply these changes to %s? Only 'yes' will be accepted: ", notice, label)
+}
+
+// crossReleaseStorageNotice states the consequences of converging a schema the
+// deployed release does not carry, which an operator has no other way to find
+// out.
+//
+// A boot of the deployed release diffs this schema against its own, so
+// everything converged here that the deployed release does not declare is a
+// removal its bootstrap has to decide about. What it decides is the whole
+// content of this notice, and it is not one answer: it depends on whether the
+// deployment permits destructive storage changes, and on the dialect. The plan
+// carries both, and shows what the storage needs rather than what will undo
+// it, so neither is visible to an operator reading it.
+func crossReleaseStorageNotice(report *apitypes.StorageSchemaReport) string {
+	running := "the release answering this command"
+	if version := strings.TrimSpace(report.Version); version != "" {
+		running = version
+	}
+	return fmt.Sprintf("Converging %s to %s.\n\n%s\n\n", storageSchemaDatabaseLabel(report), report.SchemaSource,
+		crossReleaseConsequence(report, running))
+}
+
+// crossReleaseConsequence is what the deployed release does to the state this
+// convergence leaves behind, for the deployment and dialect the report
+// describes.
+//
+// It reads BootRemovalPolicy and never DestructiveAllowed. The subject is what
+// happens after this command exits, when the only thing still converging is a
+// pod starting, and a pod converges the deployment's standing policy. The
+// effective policy is this command's alone: an operator who passed
+// --allow-unsafe widened what their own convergence runs and moved nothing
+// about what the fleet's boots do, so reading it here would report a
+// deployment's behavior from a flag the deployment never saw.
+//
+// An unknown policy gets its own answer rather than the reassuring one. It
+// arrives from a release too old to report the field and from a database
+// addressed by DSN alone, and in both cases the deployment behind it may be
+// either kind. Survival is the claim an operator acts on by pre-applying, so it
+// is the claim that has to be earned.
+//
+// PostgreSQL is the one case a dialect answers on its own, so it is read before
+// the policy: an additive-only bootstrap preserves surplus state on every
+// release, including the ones too old to say so.
+func crossReleaseConsequence(report *apitypes.StorageSchemaReport, running string) string {
+	// PostgreSQL's bootstrap is additive-only: it walks what its own schema
+	// declares and never computes a removal, so surplus state is not refused so
+	// much as never considered. There is no refusal to log, and no release with
+	// a gap to warn about.
+	if schema.Dialect(report.Dialect) == schema.DialectPostgres {
+		return fmt.Sprintf(`  This is not the schema %s converges on boot. Until that release is deployed,
+  every pod that boots %s converges only what its own schema adds, so the
+  tables, columns and indexes applied here survive untouched — and the boot
+  says nothing about them, because it never considers removing them.`, running, running)
+	}
+
+	switch report.BootRemovalPolicy {
+	// A deployment whose boots remove surplus state drops what this leaves
+	// rather than refusing it. The convergence is still worth running as part
+	// of a deploy; what it is not is something to do in advance, which is the
+	// reason an operator reaches for it.
+	case apitypes.BootRemovalRemoves:
+		return fmt.Sprintf(`  This is not the schema %s converges on boot, and this deployment permits
+  destructive storage changes — so it will not leave what is applied here in
+  place. The next pod to boot %s drops the tables, columns and indexes its own
+  schema does not declare, which is every one of them until that release is
+  deployed. Converge as part of the deploy rather than ahead of it.`, running, running)
+
+	case apitypes.BootRemovalPreserves:
+		return fmt.Sprintf(`  This is not the schema %s converges on boot. Until that release is deployed,
+  every pod that boots %s refuses to drop what it does not declare, so the
+  tables, columns and indexes applied here survive — and every one of those
+  boots logs a refused destructive change for them. A release from before
+  indexes were protected is the exception: its boots converge a surplus index
+  away. Re-run `+"`storage plan`"+` just before the deploy to confirm what you
+  applied is still there.`, running, running)
+
+	// Unknown, and every policy a later release adds that this binary has no
+	// text for. The CLI is versioned apart from the server it dials, so the
+	// values arriving here grow without it, and the default has to be the
+	// answer that claims nothing — survival is what an operator acts on by
+	// pre-applying, so it is never what a value this binary cannot read
+	// resolves to.
+	default:
+		return fmt.Sprintf(`  This is not the schema %s converges on boot, and what its pods do with the
+  difference could not be established: this target was reached without a
+  deployment config to read, or answered from a release that does not report
+  it. A deployment permitting destructive storage changes drops the tables,
+  columns and indexes applied here on the next boot; one that does not keeps
+  them. Confirm which before relying on this: converge as part of the deploy
+  instead, or check %s's storage policy and re-run `+"`storage plan`"+` afterwards to
+  see what survived.`, running, running)
+	}
 }
 
 // storageSchemaConvergenceOutcome is whether a convergence counts as having
@@ -529,10 +776,52 @@ func (cmd *StorageApplyCmd) timeoutSeconds() int64 {
 	return int64(cmd.Timeout / time.Second)
 }
 
-// converge runs the convergence over whichever path the flags selected.
-func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, remaining *apitypes.StorageSchemaReport, err error) {
-	if cmd.direct() {
-		target, err := resolveStorageTarget(cmd.DSN, cmd.Config, cmd.Dialect)
+// resolveDesired reads the schema this convergence will run, once, before
+// anything is planned.
+//
+// Naming nothing resolves to nil, which is the answering binary's own embedded
+// schema — and resolves without asking anything, because there are no files to
+// fetch and no dialect to discover.
+//
+// A named release needs the target's storage dialect, since a release keeps one
+// schema directory per family. Where that costs a round trip it is the same
+// round trip the plan would have made; hoisting it here buys the guarantee that
+// the file set is read once (see StoragePlanCmd.resolved).
+func (cmd *StorageApplyCmd) resolveDesired(ctx context.Context, g *Globals, flags *storageSchemaTargetFlags) (*api.StorageSchemaSource, error) {
+	if cmd.namedSource() == "" {
+		return nil, nil
+	}
+	// One call, so that "these files are about to run" is stated once and
+	// cannot be true on one path and false on the other.
+	return cmd.resolve(ctx, dialectOfTarget(ctx, g, flags), true)
+}
+
+// dialectOfTarget asks whichever side owns the storage which family it runs.
+// It is a function rather than a value because only --release needs the answer,
+// and on the API path the answer costs a round trip.
+func dialectOfTarget(ctx context.Context, g *Globals, flags *storageSchemaTargetFlags) func() (schema.Dialect, error) {
+	return func() (schema.Dialect, error) {
+		if flags.direct() {
+			target, err := flags.target()
+			if err != nil {
+				return "", err
+			}
+			return target.dialect, nil
+		}
+		endpoint, err := g.Resolve()
+		if err != nil {
+			return "", err
+		}
+		probe := &StoragePlanCmd{storageSchemaTargetFlags: *flags}
+		return probe.dialectThroughAPI(ctx, endpoint)
+	}
+}
+
+// converge runs the convergence over whichever path the flags selected, against
+// the schema already resolved for the plan the operator approved.
+func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *storageSchemaTargetFlags, desired *api.StorageSchemaSource) (planned, remaining *apitypes.StorageSchemaReport, err error) {
+	if flags.direct() {
+		target, err := flags.target()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -540,8 +829,9 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 		logger.Info("converging storage schema directly",
 			"source", target.source,
 			"dialect", target.dialect,
-			"allow_destructive", target.allowDestructive || cmd.AllowUnsafe,
-			"config_allows_destructive", target.allowDestructive)
+			"schema_source", desired.Describe(),
+			"allow_destructive", target.destructive == api.DestructivePolicyPermits || cmd.AllowUnsafe,
+			"deployment_destructive_policy", target.destructive)
 		budget, err := cmd.convergenceBudget()
 		if err != nil {
 			return nil, nil, err
@@ -552,7 +842,7 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 		// document a caller parses, and a progress line in the middle of it is
 		// not a progress line, it is a parse error.
 		progress := newStorageProgressPrinter(os.Stderr, ui.SupportsColors(os.Stderr))
-		plannedReport, remainingReport, err := api.ApplyStorageSchema(ctx, target.dsn, logger,
+		plannedReport, remainingReport, err := api.ApplyStorageSchema(ctx, target.dsn, desired, logger,
 			append(target.ensureSchemaOptions(cmd.AllowUnsafe),
 				api.WithConvergenceTimeout(budget),
 				api.WithConvergenceProgress(progress.observe))...)
@@ -567,20 +857,28 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 	if err != nil {
 		return nil, nil, err
 	}
-	response, err := cmdclient.StorageSchemaApply(ctx, endpoint, apitypes.StorageSchemaApplyRequest{
-		Deployment:       cmd.Deployment,
-		Environment:      cmd.Environment,
+	request := apitypes.StorageSchemaApplyRequest{
+		Deployment:       flags.Deployment,
+		Environment:      flags.Environment,
 		AllowDestructive: cmd.AllowUnsafe,
 		TimeoutSeconds:   cmd.timeoutSeconds(),
-	})
+	}
+	// A named schema travels with the request, because the answering binary
+	// does not carry another release's files. Sent as the same pair the plan
+	// sends, so the convergence is attributed to the release whose files ran.
+	if desired != nil {
+		request.SchemaFiles = desired.Files
+		request.SchemaSource = desired.Description
+	}
+	response, err := cmdclient.StorageSchemaApply(ctx, endpoint, request)
 	if err != nil {
-		return nil, nil, fmt.Errorf("converge storage schema%s: %w", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment), err)
+		return nil, nil, fmt.Errorf("converge storage schema%s: %w", storageSchemaTargetSuffix(flags.Deployment, flags.Environment), err)
 	}
 	if response.Planned == nil || response.Remaining == nil {
 		// Both halves are required to say what happened; without the pair there
 		// is no way to tell a convergence that finished from one that left
 		// statements behind.
-		return nil, nil, fmt.Errorf("storage schema convergence%s returned an incomplete result; check the target's logs for whether it converged", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment))
+		return nil, nil, fmt.Errorf("storage schema convergence%s returned an incomplete result; check the target's logs for whether it converged", storageSchemaTargetSuffix(flags.Deployment, flags.Environment))
 	}
 	return response.Planned, response.Remaining, nil
 }
@@ -588,11 +886,13 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 // attributeStorageSchemaConvergence says which release a convergence ran, on
 // both halves of it.
 //
-// A convergence names no schema source of its own — that is the invariant, not
-// an omission (AV-9) — so the attribution is what turns "the embedded schema"
-// into this binary's release. Both halves take it, and by the same call the
-// preview took: a run whose plan header named a release and whose result header
-// named a placeholder would read as two runs against two schemas.
+// A convergence of the answering binary's own schema names no release of its
+// own, so the attribution is what turns "the embedded schema" into this
+// binary's version; a convergence of files the operator named keeps their
+// attribution, which is what AttributeTo already does. Both halves take it, and
+// by the same call the preview took: a run whose plan header named a release
+// and whose result header named a placeholder would read as two runs against
+// two schemas.
 func attributeStorageSchemaConvergence(version string, planned, remaining *api.StorageSchemaReport) {
 	planned.AttributeTo(version)
 	remaining.AttributeTo(version)
