@@ -30,8 +30,8 @@ import (
 // Two things a caller may influence, and neither moves the database. Whether
 // destructive statements run only ever widens what the local config already
 // allows, and on a locally hosted server not even that (see
-// checkDestructiveOptIn). A desired schema replaces the files both RPCs read, on a
-// diff and on a convergence alike (see desiredSchema), because an operator
+// checkDestructiveOptIn). A desired schema replaces the files both RPCs read,
+// on a diff and on a convergence alike (see desiredSchema), because an operator
 // rolling a later release has to be able to converge this storage to it before
 // its first pod starts. What a supplied schema cannot do is widen what the
 // bootstrap permits: the destructive refusal and the manual-remediation gate
