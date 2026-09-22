@@ -121,6 +121,14 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 				results[i].Err = err
 				return nil
 			}
+			// The execution-mode vocabulary is enforced here, where the diff
+			// crosses into SchemaBot, rather than only where the member's plan is
+			// written. The rollup classifies this diff and publishes its blocked
+			// count from it, so a verdict normalized later would be disclosed at
+			// review under the value the planner sent and stored under the one
+			// SchemaBot settled on. The primary's baseline arrives already
+			// normalized by the path that planned it.
+			s.normalizePlanExecutionVerdicts(resp.Changes, resp.Shards, req.Database, target.Deployment)
 			results[i].Engine = resp.Engine
 			results[i].Changes = resp.Changes
 			results[i].Shards = resp.Shards
