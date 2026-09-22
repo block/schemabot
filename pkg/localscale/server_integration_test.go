@@ -464,8 +464,27 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 	return result
 }
 
+// blocksNewDeploy reports whether a deploy request in this state occupies the
+// one active deploy a database is allowed, so that a later test's deploy is
+// refused until it clears.
+func blocksNewDeploy(deployState string) bool {
+	switch deployState {
+	case drState.Submitting, drState.Queued, drState.InProgress,
+		drState.PendingCutover, drState.InProgressCutover:
+		return true
+	default:
+		return false
+	}
+}
+
 // cleanupActiveDeployRequests skips-revert or cancels any active deploy requests
 // so the next test isn't blocked by the gated deployment check.
+//
+// Both calls are asynchronous: the deploy request is still active when they
+// return and settles a moment later. Cleanup therefore has to wait for it to
+// clear and say so when it does not. Reporting a request as cleaned without
+// checking is what lets one wedged deploy fail every test that follows it,
+// each for a reason that names neither the wedged request nor this helper.
 func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 	t.Helper()
 	start := time.Now()
@@ -478,21 +497,62 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 		if err != nil {
 			break // no more deploy requests
 		}
-		switch dr.DeploymentState {
-		case "complete_pending_revert":
-			_, _ = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+		var clearErr error
+		switch {
+		case dr.DeploymentState == drState.CompletePendingRevert:
+			_, clearErr = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
-			cleaned++
-		case "queued", "in_progress", "pending_cutover", "in_progress_cutover", "submitting":
-			_, _ = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
+		case blocksNewDeploy(dr.DeploymentState):
+			_, clearErr = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
-			cleaned++
+		default:
+			continue
 		}
+		// Reported rather than asserted: a wedged request fails the next test
+		// that actually needs the deploy slot, with its own message, and that
+		// is the test worth reddening. Failing here as well would also redden
+		// the tests that never deploy, burying the one real failure.
+		if clearErr != nil {
+			t.Logf("cleanupActiveDeployRequests: clearing deploy request %d from %q failed: %v",
+				i, dr.DeploymentState, clearErr)
+			continue
+		}
+		if last, ok := waitForDeployCleared(ctx, i); !ok {
+			t.Logf("cleanupActiveDeployRequests: deploy request %d did not clear, last state %q; "+
+				"it will block every deploy that follows", i, last)
+			continue
+		}
+		cleaned++
 	}
 	if cleaned > 0 {
 		t.Logf("cleanupActiveDeployRequests: cleaned %d DRs in %s", cleaned, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+// waitForDeployCleared waits for a deploy request to stop occupying the active
+// slot, returning the last state it saw and whether it cleared. It reports
+// rather than failing so the caller can name the request in one message.
+func waitForDeployCleared(ctx context.Context, number uint64) (string, bool) {
+	deadline := time.Now().Add(shortPollTimeout)
+	last := ""
+	for {
+		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: testOrg, Database: testDB, Number: number,
+		})
+		if err != nil {
+			// The request cannot be read, so it cannot be confirmed clear.
+			return fmt.Sprintf("unreadable: %v", err), false
+		}
+		last = dr.DeploymentState
+		if !blocksNewDeploy(last) && last != drState.CompletePendingRevert {
+			return last, true
+		}
+		if time.Now().After(deadline) {
+			return last, false
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
