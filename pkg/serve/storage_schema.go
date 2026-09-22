@@ -289,13 +289,12 @@ func (a *storageSchemaAdapter) target(requestAllowsDestructive bool) (string, []
 	if err := a.checkBootTarget(dsn); err != nil {
 		return "", nil, err
 	}
-	allowDestructive, err := a.destructivePolicy(requestAllowsDestructive)
-	if err != nil {
+	if err := a.checkDestructiveOptIn(requestAllowsDestructive); err != nil {
 		return "", nil, err
 	}
 	return dsn, []api.EnsureSchemaOption{
 		api.WithDialect(a.dialect),
-		api.WithAllowDestructiveSchemaChanges(allowDestructive),
+		api.WithDestructiveSchemaChangePolicy(a.configAllowsDestructive, requestAllowsDestructive),
 		api.WithPostgresStatementTimeout(a.postgresStatementTimeout),
 	}, nil
 }
@@ -327,10 +326,14 @@ func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 		"the storage schema surface only answers for the database this instance is running on, so restart it to adopt the new storage", resolved, a.bootTarget)
 }
 
-// destructivePolicy resolves whether this call may run destructive statements:
-// the deployment's policy widened by an explicit per-request opt-in, never
-// narrowed by its absence — and never widened at all on a locally hosted
-// server, which refuses the request instead.
+// checkDestructiveOptIn admits or refuses a per-request opt-in to destructive
+// statements. It resolves nothing: the two policies travel separately into the
+// bootstrap options, which is what lets a report say what this call runs and
+// what a boot runs without the second being inferred from the first.
+//
+// What this decides is whether the opt-in may be honored at all — it is never
+// honored on a locally hosted server, which refuses the request rather than
+// widening anything.
 //
 // The two directions are not symmetric and the asymmetry is the point. A
 // deployment that configured allow_destructive_schema_changes has already made
@@ -349,14 +352,14 @@ func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 // rather than running the safe remainder under a flag it ignored, so an
 // operator learns their opt-in did not apply instead of reading a report that
 // looks like it did (AZ-6).
-func (a *storageSchemaAdapter) destructivePolicy(requestAllowsDestructive bool) (bool, error) {
+func (a *storageSchemaAdapter) checkDestructiveOptIn(requestAllowsDestructive bool) error {
 	if requestAllowsDestructive && a.localHosted {
 		a.logger.Warn("refusing a storage schema request that opts in to destructive statements: this server is locally hosted",
 			"dialect", a.dialect,
 			"boot_target", a.bootTarget.String(),
 		)
-		return false, fmt.Errorf("%w: this server is locally hosted, which never runs destructive storage schema statements; "+
+		return fmt.Errorf("%w: this server is locally hosted, which never runs destructive storage schema statements; "+
 			"re-run without the destructive opt-in to converge everything else, or address a deployed server to run them", tern.ErrInvalidStorageSchemaRequest)
 	}
-	return a.configAllowsDestructive || requestAllowsDestructive, nil
+	return nil
 }

@@ -44,12 +44,40 @@ func TestNewEnsureSchemaOptions_Defaults(t *testing.T) {
 	assert.Equal(t, DefaultPostgresStatementTimeout, defaults.postgresStatementTimeout)
 	assert.False(t, defaults.allowDestructive, "destructive storage changes are refused unless asked for")
 
+	assert.False(t, defaults.deploymentAllowsDestructive, "and a deployment is not assumed to have permitted them")
+
 	configured := newEnsureSchemaOptions(
 		WithDialect(schema.DialectPostgres),
-		WithAllowDestructiveSchemaChanges(true),
+		WithDestructiveSchemaChangePolicy(true, false),
 		WithPostgresStatementTimeout(0),
 	)
 	assert.Equal(t, schema.DialectPostgres, configured.dialect)
 	assert.True(t, configured.allowDestructive)
 	assert.Zero(t, configured.postgresStatementTimeout, "zero disables the statement budget explicitly")
+}
+
+// A caller's opt-in widens the deployment's standing policy for the run it
+// asked for, and says nothing about the deployment. The two are tracked apart
+// because a report has to be able to state what the next pod to boot does,
+// which no per-request flag moves: a convergence run with the flag against a
+// deployment that has not configured it leaves surplus state that the
+// deployment's own boots still refuse to drop.
+func TestWithDestructiveSchemaChangePolicy_RequestWidensOnlyThisRun(t *testing.T) {
+	neither := newEnsureSchemaOptions(WithDestructiveSchemaChangePolicy(false, false))
+	assert.False(t, neither.allowDestructive)
+	assert.False(t, neither.deploymentAllowsDestructive)
+
+	requestOnly := newEnsureSchemaOptions(WithDestructiveSchemaChangePolicy(false, true))
+	assert.True(t, requestOnly.allowDestructive, "the opt-in widens what this run may execute")
+	assert.False(t, requestOnly.deploymentAllowsDestructive,
+		"and leaves the deployment's own policy exactly where it was")
+
+	deploymentOnly := newEnsureSchemaOptions(WithDestructiveSchemaChangePolicy(true, false))
+	assert.True(t, deploymentOnly.allowDestructive,
+		"a standing policy is never narrowed by a request that did not mention it")
+	assert.True(t, deploymentOnly.deploymentAllowsDestructive)
+
+	both := newEnsureSchemaOptions(WithDestructiveSchemaChangePolicy(true, true))
+	assert.True(t, both.allowDestructive)
+	assert.True(t, both.deploymentAllowsDestructive)
 }

@@ -647,13 +647,20 @@ func crossReleaseStorageNotice(report *apitypes.StorageSchemaReport) string {
 // crossReleaseConsequence is what the deployed release does to the state this
 // convergence leaves behind, for the deployment and dialect the report
 // describes.
+//
+// It reads BootConvergesDestructively and never DestructiveAllowed. The
+// subject is what happens after this command exits, when the only thing still
+// converging is a pod starting, and a pod converges the deployment's standing
+// policy. The effective policy is this command's alone: an operator who passed
+// --allow-unsafe widened what their own convergence runs and moved nothing
+// about what the fleet's boots do, so reading it here would report a
+// deployment's behavior from a flag the deployment never saw.
 func crossReleaseConsequence(report *apitypes.StorageSchemaReport, running string) string {
-	// A deployment that has permitted destructive storage changes converges
-	// them, so the surplus this leaves is dropped rather than refused. The
-	// convergence is still worth running as part of a deploy; what it is not is
-	// something to do in advance, which is the reason an operator reaches for
-	// it.
-	if report.DestructiveAllowed {
+	// A deployment whose boots converge destructively drops the surplus this
+	// leaves rather than refusing it. The convergence is still worth running as
+	// part of a deploy; what it is not is something to do in advance, which is
+	// the reason an operator reaches for it.
+	if report.BootConvergesDestructively {
 		return fmt.Sprintf(`  This is not the schema %s converges on boot, and this deployment permits
   destructive storage changes — so it will not leave what is applied here in
   place. The next pod to boot %s drops the tables, columns and indexes its own

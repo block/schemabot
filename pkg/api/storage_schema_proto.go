@@ -28,7 +28,8 @@ func StorageSchemaReportProto(r *StorageSchemaReport) *ternv1.StorageSchemaRepor
 		DestructiveAllowed: r.DestructiveAllowed,
 		Manual:             storageSchemaStatementsProto(r.Manual),
 
-		ConvergenceInFlight: r.ConvergenceInFlight,
+		ConvergenceInFlight:        r.ConvergenceInFlight,
+		BootConvergesDestructively: r.BootConvergesDestructively,
 	}
 }
 
@@ -52,7 +53,8 @@ func StorageSchemaReportFromProto(p *ternv1.StorageSchemaReport) *StorageSchemaR
 		DestructiveAllowed: p.GetDestructiveAllowed(),
 		Manual:             storageSchemaStatementsFromProto(p.GetManual()),
 
-		ConvergenceInFlight: p.GetConvergenceInFlight(),
+		ConvergenceInFlight:        p.GetConvergenceInFlight(),
+		BootConvergesDestructively: p.GetBootConvergesDestructively(),
 	}
 }
 

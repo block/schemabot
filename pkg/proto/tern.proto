@@ -1043,7 +1043,10 @@ message StorageSchemaReport {
   // Statements classified as destroying data. Refused unless destructive
   // changes are allowed.
   repeated StorageSchemaStatement destructive = 5;
-  // Whether the destructive statements would actually run.
+  // Whether the destructive statements would actually run on this call. It is
+  // the effective policy: the deployment's standing one, widened by an opt-in
+  // this caller sent. Use boot_converges_destructively to reason about what
+  // some other process does, which a caller's opt-in never moves.
   bool destructive_allowed = 6;
   // Changes that cannot run automatically, each naming the situation and its
   // remediation. Any entry aborts the whole convergence before a single
@@ -1065,6 +1068,22 @@ message StorageSchemaReport {
   // a shadow table until it cuts over. Only true is a finding; false is the
   // absence of evidence, not a claim that the database is idle.
   bool convergence_in_flight = 10;
+  // Whether a boot of this deployment converges destructively: whether the
+  // next pod to start would drop the storage tables, columns and indexes its
+  // own schema does not declare, rather than refusing them and converging the
+  // rest.
+  //
+  // This is a property of the deployment and its dialect, never of the call
+  // that asked. A caller opting in to destructive statements moves
+  // destructive_allowed and leaves this alone, because a boot reads the
+  // deployment's config and has never heard of the request. It is false on a
+  // dialect whose bootstrap is additive-only, whatever that deployment has
+  // configured, since there the boot computes no removal to permit.
+  //
+  // It is what says whether state converged ahead of a deploy survives until
+  // that deploy: refused and left in place, or dropped by the next pod to
+  // start.
+  bool boot_converges_destructively = 11;
 }
 
 // StorageSchemaPlanResponse carries the outstanding storage DDL.

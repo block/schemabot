@@ -44,11 +44,24 @@ type StorageSchemaReport struct {
 	Version string `json:"version,omitempty"`
 	// Converged reports that the storage schema needs nothing at all. A report
 	// carrying only refused destructive statements is not converged.
-	Converged          bool                     `json:"converged"`
-	Outstanding        []StorageSchemaStatement `json:"outstanding,omitempty"`
-	Destructive        []StorageSchemaStatement `json:"destructive,omitempty"`
+	Converged   bool                     `json:"converged"`
+	Outstanding []StorageSchemaStatement `json:"outstanding,omitempty"`
+	Destructive []StorageSchemaStatement `json:"destructive,omitempty"`
+	// DestructiveAllowed reports whether the destructive statements run on this
+	// call: the deployment's standing policy, widened by an opt-in this caller
+	// sent. BootConvergesDestructively is the one to read for what some other
+	// process does.
 	DestructiveAllowed bool                     `json:"destructive_allowed"`
 	Manual             []StorageSchemaStatement `json:"manual,omitempty"`
+	// BootConvergesDestructively reports whether the next pod to start drops
+	// the storage tables, columns and indexes its own schema does not declare,
+	// rather than refusing them and converging the rest.
+	//
+	// It is the deployment's policy and its dialect, never this request's
+	// opt-in, and it is false wherever the bootstrap is additive-only. It is
+	// what says whether state converged ahead of a deploy survives until that
+	// deploy, which the effective policy above cannot answer.
+	BootConvergesDestructively bool `json:"boot_converges_destructively,omitempty"`
 	// ConvergenceInFlight reports that some instance held the storage bootstrap
 	// lock when the diff was taken — a pod booting, or another operator's
 	// apply. It is what separates "this DDL is outstanding" from "this DDL is

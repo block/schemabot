@@ -908,12 +908,12 @@ func TestStorageSchemaConfirmation_CrossReleaseNotice(t *testing.T) {
 // its bootstrap never computes a removal — so it logs no refusal to grep for
 // and has no release with an index gap to warn about.
 func TestStorageSchemaConfirmation_CrossReleaseNoticePerDeployment(t *testing.T) {
-	report := func(dialect string, destructiveAllowed bool) *apitypes.StorageSchemaReport {
+	report := func(dialect string, bootConvergesDestructively bool) *apitypes.StorageSchemaReport {
 		return &apitypes.StorageSchemaReport{
 			Dialect: dialect, Database: "schemabot", Host: "db-1.example",
-			Version:            "v1.4.0",
-			SchemaSource:       "the schema files of release v1.5.0 in block/schemabot",
-			DestructiveAllowed: destructiveAllowed,
+			Version:                    "v1.4.0",
+			SchemaSource:               "the schema files of release v1.5.0 in block/schemabot",
+			BootConvergesDestructively: bootConvergesDestructively,
 		}
 	}
 
@@ -925,16 +925,43 @@ func TestStorageSchemaConfirmation_CrossReleaseNoticePerDeployment(t *testing.T)
 	assert.NotContains(t, permitted, "refuses to drop what it does not declare",
 		"the refusal the notice normally relies on is exactly what this deployment has turned off")
 
-	// PostgreSQL permitting destructive changes reads the same way: the
-	// dialect decides how the surplus survives, not whether it does.
-	assert.Contains(t, storageSchemaConfirmation(report("postgres", true), true), "this deployment permits")
-
 	postgres := storageSchemaConfirmation(report("postgres", false), true)
 	assert.Contains(t, postgres, "converges only what its own schema adds")
 	assert.NotContains(t, postgres, "logs a refused destructive change",
 		"an additive-only bootstrap computes no removal, so there is no refusal to log or to grep for")
 	assert.NotContains(t, postgres, "indexes were protected",
 		"the index gap is a MySQL release history, and PostgreSQL has no such window")
+}
+
+// The notice describes what the fleet's own boots do, so it reads the
+// deployment's standing policy and never this command's flag.
+//
+// An operator whose deployment has not permitted destructive storage changes
+// meets the destructive gate, is handed `--allow-unsafe` by the rerun hint, and
+// runs it. That widens their convergence and moves nothing about the pods
+// around them: those boots still refuse to drop what they do not declare, and
+// the state applied here still survives until the deploy. A notice reading the
+// effective policy would tell them the opposite on exactly the run the hint
+// told them to make, and they would abandon a safe pre-deploy convergence over
+// it.
+func TestStorageSchemaConfirmation_CrossReleaseNoticeIgnoresTheRequestOptIn(t *testing.T) {
+	optedIn := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:      "v1.4.0",
+		SchemaSource: "the schema files of release v1.5.0 in block/schemabot",
+		// --allow-unsafe on a deployment that configured nothing: this run may
+		// drop, and every boot of v1.4.0 still refuses to.
+		DestructiveAllowed:         true,
+		BootConvergesDestructively: false,
+	}
+
+	notice := storageSchemaConfirmation(optedIn, true)
+	assert.Contains(t, notice, "refuses to drop what it does not declare",
+		"the deployed release's own behavior is what the notice is about")
+	assert.NotContains(t, notice, "this deployment permits",
+		"one command's opt-in is not the deployment's standing policy")
+	assert.NotContains(t, notice, "Converge as part of the deploy rather than ahead of it.",
+		"the advice to wait for the deploy belongs to a deployment whose boots would drop this")
 }
 
 // Destructive statements the target has permitted are not gated: the report

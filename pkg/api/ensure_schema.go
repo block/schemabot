@@ -64,8 +64,17 @@ const MinConvergenceTimeout = time.Second
 type EnsureSchemaOption func(*ensureSchemaOptions)
 
 type ensureSchemaOptions struct {
+	// allowDestructive is the effective policy for this convergence: the
+	// deployment's standing one widened by a caller's opt-in. It decides what
+	// this run does.
 	allowDestructive bool
-	dialect          schema.Dialect
+	// deploymentAllowsDestructive is the standing policy alone, which is what
+	// every boot of this deployment converges under. It decides nothing here
+	// and is reported, not enforced: it is how a report can say what happens
+	// to state this convergence leaves behind, once this command is over and
+	// the only thing still converging is a pod starting.
+	deploymentAllowsDestructive bool
+	dialect                     schema.Dialect
 	// convergenceTimeout bounds one whole convergence: the lock wait, the
 	// diff under it, and the DDL. It defaults to EnsureSchemaTimeout, the
 	// budget a boot needs, so a caller that never considered the question
@@ -89,23 +98,35 @@ type ensureSchemaOptions struct {
 	progress func(StorageConvergenceProgress)
 }
 
-// WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
+// WithDestructiveSchemaChangePolicy controls whether EnsureSchema may execute
 // destructive DDL against the storage database — any statement the plan's own
 // linters report an error against, which for the storage schema means one that
 // loses data (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) and one
-// that removes an index. It defaults to false: those statements are refused
-// while the rest of the diff still applies. A mixed ALTER carrying an additive
-// clause beside a drop runs the addition and withholds the drop, so a pod never
-// starts missing a column its own binary needs.
+// that removes an index. Both arguments default to false: those statements are
+// refused while the rest of the diff still applies. A mixed ALTER carrying an
+// additive clause beside a drop runs the addition and withholds the drop, so a
+// pod never starts missing a column its own binary needs.
 //
 // This is the only way to have the bootstrap execute one of those statements,
 // so removing a table, column, or index from the embedded schema on purpose
-// means setting this flag or running the DDL by hand. That is the
-// intended trade: a surplus index left in place costs write throughput, while
-// one dropped out from under the fleet's live queries costs availability.
-// Wire this from StorageConfig.AllowDestructiveSchemaChanges.
-func WithAllowDestructiveSchemaChanges(allow bool) EnsureSchemaOption {
-	return func(o *ensureSchemaOptions) { o.allowDestructive = allow }
+// means permitting it here or running the DDL by hand. That is the intended
+// trade: a surplus index left in place costs write throughput, while one
+// dropped out from under the fleet's live queries costs availability.
+//
+// The two arguments are different facts and the call site has to supply both,
+// which is the reason this takes two rather than the single flag a convergence
+// needs. deployment is the standing policy — wire it from
+// StorageConfig.AllowDestructiveSchemaChanges — and request is one caller's
+// explicit opt-in, which widens that policy for this run and never narrows it.
+// Their disjunction is what this convergence runs under. deployment alone is
+// what the next pod to boot runs under, which is a question a report has to be
+// able to answer and cannot once the two have been merged into one flag. A
+// boot supplies its own config and false: nobody is asking it for anything.
+func WithDestructiveSchemaChangePolicy(deployment, request bool) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) {
+		o.deploymentAllowsDestructive = deployment
+		o.allowDestructive = deployment || request
+	}
 }
 
 // WithStorageSchema converges the storage database to a schema other than the
@@ -301,7 +322,7 @@ func ensureSchema(parent context.Context, dsn string, logger *slog.Logger, opts 
 // Destructive statements in the diff — those the plan's linters report an error
 // against, which for the storage schema means losing data (DROP TABLE, or an
 // ALTER TABLE containing DROP COLUMN) or removing an index — are refused unless
-// WithAllowDestructiveSchemaChanges(true) is set. A statement carrying an
+// WithDestructiveSchemaChangePolicy permits them. A statement carrying an
 // addition beside a drop runs the addition, so a pod never starts missing a
 // column its own binary needs. The statements and clauses that were not refused
 // apply, and startup proceeds — a deliberate exception to fail-closed, because failing

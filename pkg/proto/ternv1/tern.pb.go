@@ -4131,7 +4131,10 @@ type StorageSchemaReport struct {
 	// Statements classified as destroying data. Refused unless destructive
 	// changes are allowed.
 	Destructive []*StorageSchemaStatement `protobuf:"bytes,5,rep,name=destructive,proto3" json:"destructive,omitempty"`
-	// Whether the destructive statements would actually run.
+	// Whether the destructive statements would actually run on this call. It is
+	// the effective policy: the deployment's standing one, widened by an opt-in
+	// this caller sent. Use boot_converges_destructively to reason about what
+	// some other process does, which a caller's opt-in never moves.
 	DestructiveAllowed bool `protobuf:"varint,6,opt,name=destructive_allowed,json=destructiveAllowed,proto3" json:"destructive_allowed,omitempty"`
 	// Changes that cannot run automatically, each naming the situation and its
 	// remediation. Any entry aborts the whole convergence before a single
@@ -4153,8 +4156,24 @@ type StorageSchemaReport struct {
 	// a shadow table until it cuts over. Only true is a finding; false is the
 	// absence of evidence, not a claim that the database is idle.
 	ConvergenceInFlight bool `protobuf:"varint,10,opt,name=convergence_in_flight,json=convergenceInFlight,proto3" json:"convergence_in_flight,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Whether a boot of this deployment converges destructively: whether the
+	// next pod to start would drop the storage tables, columns and indexes its
+	// own schema does not declare, rather than refusing them and converging the
+	// rest.
+	//
+	// This is a property of the deployment and its dialect, never of the call
+	// that asked. A caller opting in to destructive statements moves
+	// destructive_allowed and leaves this alone, because a boot reads the
+	// deployment's config and has never heard of the request. It is false on a
+	// dialect whose bootstrap is additive-only, whatever that deployment has
+	// configured, since there the boot computes no removal to permit.
+	//
+	// It is what says whether state converged ahead of a deploy survives until
+	// that deploy: refused and left in place, or dropped by the next pod to
+	// start.
+	BootConvergesDestructively bool `protobuf:"varint,11,opt,name=boot_converges_destructively,json=bootConvergesDestructively,proto3" json:"boot_converges_destructively,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *StorageSchemaReport) Reset() {
@@ -4253,6 +4272,13 @@ func (x *StorageSchemaReport) GetSchemaSource() string {
 func (x *StorageSchemaReport) GetConvergenceInFlight() bool {
 	if x != nil {
 		return x.ConvergenceInFlight
+	}
+	return false
+}
+
+func (x *StorageSchemaReport) GetBootConvergesDestructively() bool {
+	if x != nil {
+		return x.BootConvergesDestructively
 	}
 	return false
 }
@@ -4835,7 +4861,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x1c\n" +
 	"\toperation\x18\x02 \x01(\tR\toperation\x12\x10\n" +
 	"\x03ddl\x18\x03 \x01(\tR\x03ddl\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xc2\x03\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x84\x04\n" +
 	"\x13StorageSchemaReport\x12\x18\n" +
 	"\adialect\x18\x01 \x01(\tR\adialect\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x18\n" +
@@ -4847,7 +4873,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x04host\x18\b \x01(\tR\x04host\x12#\n" +
 	"\rschema_source\x18\t \x01(\tR\fschemaSource\x122\n" +
 	"\x15convergence_in_flight\x18\n" +
-	" \x01(\bR\x13convergenceInFlight\"Q\n" +
+	" \x01(\bR\x13convergenceInFlight\x12@\n" +
+	"\x1cboot_converges_destructively\x18\v \x01(\bR\x1abootConvergesDestructively\"Q\n" +
 	"\x19StorageSchemaPlanResponse\x124\n" +
 	"\x06report\x18\x01 \x01(\v2\x1c.tern.v1.StorageSchemaReportR\x06report\"\xc6\x02\n" +
 	"\x19StorageSchemaApplyRequest\x12+\n" +

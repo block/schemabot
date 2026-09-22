@@ -53,20 +53,16 @@ type storageTarget struct {
 	postgresStatementTimeout *time.Duration
 }
 
-// allowsDestructive is whether destructive storage statements run against this
-// target. The operator's per-command flag only ever widens the target's
-// standing policy: a request may permit destructive statements on a deployment
-// that does not, and must never refuse ones the deployment's own boot would
-// run.
-func (t *storageTarget) allowsDestructive(requestAllowDestructive bool) bool {
-	return t.allowDestructive || requestAllowDestructive
-}
-
 // ensureSchemaOptions is the policy this target converges or diffs under.
+//
+// The target's standing policy and the operator's per-command flag are handed
+// over as the two separate facts they are. Widening the one by the other is
+// api's to do, so that every caller widens it the same way and a report can
+// still name what a boot of this deployment does on its own.
 func (t *storageTarget) ensureSchemaOptions(requestAllowDestructive bool) []api.EnsureSchemaOption {
 	opts := []api.EnsureSchemaOption{
 		api.WithDialect(t.dialect),
-		api.WithAllowDestructiveSchemaChanges(t.allowsDestructive(requestAllowDestructive)),
+		api.WithDestructiveSchemaChangePolicy(t.allowDestructive, requestAllowDestructive),
 	}
 	if t.postgresStatementTimeout != nil {
 		opts = append(opts, api.WithPostgresStatementTimeout(*t.postgresStatementTimeout))

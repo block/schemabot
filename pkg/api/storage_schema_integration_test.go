@@ -188,7 +188,7 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusTable(t *testing.T) {
 
 	// The same report with destructive changes allowed says the statement would
 	// run, which is what the operator opting in is asking to be told.
-	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithAllowDestructiveSchemaChanges(true))
+	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithDestructiveSchemaChangePolicy(true, false))
 	require.NoError(t, err)
 	assert.True(t, allowed.DestructiveAllowed)
 	require.Len(t, allowed.Destructive, 1)
@@ -238,11 +238,54 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusIndex(t *testing.T) {
 
 	// An operator who removed the index from the embedded schema on purpose
 	// opts in, and the report then says the statement would run.
-	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithAllowDestructiveSchemaChanges(true))
+	allowed, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithDestructiveSchemaChangePolicy(true, false))
 	require.NoError(t, err)
 	assert.True(t, allowed.DestructiveAllowed)
 	require.Len(t, allowed.Destructive, 1)
 	assert.Equal(t, "applies", allowed.Destructive[0].Table)
+}
+
+// A report separates what this call may run from what the next pod to boot
+// will run, because only one of them is moved by the caller asking.
+//
+// An operator converging a later release's schema ahead of the deploy is
+// asking whether the state they apply survives until the deploy, and the
+// answer belongs to the boots in between. Those read the deployment's config
+// and have never heard of this request, so a per-request opt-in has to leave
+// the boot's answer exactly where it was. Reported as one field, an operator
+// passing --allow-unsafe would be told their own flag had changed what the
+// fleet does.
+func TestDiffStorageSchemaMySQL_BootPolicyIsNotMovedByTheRequestOptIn(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
+
+	_, err := db.ExecContext(t.Context(), "CREATE INDEX `idx_applies_caller` ON `applies` (`caller`)")
+	require.NoError(t, err, "pre-create an index the embedded schema does not declare")
+
+	// A deployment that configured nothing, on the run the destructive gate's
+	// own rerun hint asks for.
+	optedIn, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(),
+		WithDestructiveSchemaChangePolicy(false, true))
+	require.NoError(t, err)
+	require.Len(t, optedIn.Destructive, 1, "the surplus index is the drift under test")
+	assert.True(t, optedIn.DestructiveAllowed, "this convergence may drop it")
+	assert.False(t, optedIn.BootConvergesDestructively,
+		"and every boot of the deployed release still refuses to, which is what keeps pre-applied state alive")
+
+	// The same drift on a deployment that has permitted destructive storage
+	// changes: here the boots really do drop it, and only the config says so.
+	configured, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(),
+		WithDestructiveSchemaChangePolicy(true, false))
+	require.NoError(t, err)
+	assert.True(t, configured.DestructiveAllowed)
+	assert.True(t, configured.BootConvergesDestructively)
+
+	// And a deployment that permitted nothing, where neither this run nor a
+	// boot removes anything.
+	neither, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.False(t, neither.DestructiveAllowed)
+	assert.False(t, neither.BootConvergesDestructively)
 }
 
 // One table can drift in both directions at once: it misses a column the

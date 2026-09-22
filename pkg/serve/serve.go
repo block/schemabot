@@ -646,7 +646,7 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if err := api.EnsureSchema(dsn, logger,
-		api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges),
+		api.WithDestructiveSchemaChangePolicy(cfg.Storage.AllowDestructiveSchemaChanges, false),
 		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
 		api.WithDialect(dialect)); err != nil {
 		return nil, "", fmt.Errorf("ensure storage schema: %w", err)

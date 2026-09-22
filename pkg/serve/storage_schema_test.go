@@ -20,41 +20,6 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// A request may widen the deployment's destructive-statement policy and can
-// never narrow it.
-//
-// The asymmetry is the point. A deployment that configured
-// allow_destructive_schema_changes has already decided for every boot, so a
-// convergence that ignored it would run less than the next boot runs — an apply
-// refusing on a deployment where a boot proceeds, which is the deployment an
-// operator converging ahead of a roll most needs it not to. In the other direction, a
-// request opting in is the explicit operator consent required before surplus
-// storage state is destroyed.
-func TestStorageSchemaAdapter_DestructivePolicy(t *testing.T) {
-	tests := []struct {
-		name          string
-		configAllows  bool
-		requestAllows bool
-		want          bool
-	}{
-		{"neither", false, false, false},
-		{"request opts in", false, true, true},
-		{"config already opted in", true, false, true},
-		{"both", true, true, true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			adapter := &storageSchemaAdapter{
-				configAllowsDestructive: tc.configAllows,
-				logger:                  slog.New(slog.DiscardHandler),
-			}
-			allow, err := adapter.destructivePolicy(tc.requestAllows)
-			require.NoError(t, err)
-			assert.Equal(t, tc.want, allow)
-		})
-	}
-}
-
 // A request naming no budget runs under the boot's, and one naming a budget
 // runs under exactly that (AV-11). The control plane always names the budget
 // it resolved, so a zero here is a caller reaching the data plane directly
@@ -103,15 +68,14 @@ func TestStorageSchemaAdapter_ApplyRefusesAnOutOfRangeBudget(t *testing.T) {
 // runtime cannot say who issued the command, and a local host can be pointed at
 // a real deployment's storage, so consent arriving this way is not the consent
 // the widening is granted for.
-func TestStorageSchemaAdapter_DestructivePolicyRefusesTheOptInWhenLocallyHosted(t *testing.T) {
+func TestStorageSchemaAdapter_RefusesTheDestructiveOptInWhenLocallyHosted(t *testing.T) {
 	adapter := &storageSchemaAdapter{
 		localHosted: true,
 		logger:      slog.New(slog.DiscardHandler),
 	}
 
-	allow, err := adapter.destructivePolicy(true)
+	err := adapter.checkDestructiveOptIn(true)
 	require.Error(t, err)
-	assert.False(t, allow)
 	assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest, "the request is what is wrong, not this server")
 	assert.Contains(t, err.Error(), "locally hosted")
 	assert.Contains(t, err.Error(), "re-run without the destructive opt-in",
@@ -120,15 +84,13 @@ func TestStorageSchemaAdapter_DestructivePolicyRefusesTheOptInWhenLocallyHosted(
 
 // Local hosting refuses the destructive opt-in without refusing the request
 // that never asked for it: an ordinary local convergence still runs.
-func TestStorageSchemaAdapter_DestructivePolicyAllowsAnOrdinaryLocalConvergence(t *testing.T) {
+func TestStorageSchemaAdapter_AllowsAnOrdinaryLocalConvergence(t *testing.T) {
 	adapter := &storageSchemaAdapter{
 		localHosted: true,
 		logger:      slog.New(slog.DiscardHandler),
 	}
 
-	allow, err := adapter.destructivePolicy(false)
-	require.NoError(t, err)
-	assert.False(t, allow)
+	require.NoError(t, adapter.checkDestructiveOptIn(false))
 }
 
 // The server carries its local hosting into the adapter it builds, so the
@@ -146,8 +108,7 @@ func TestNewStorageSchemaServiceCarriesLocalHosting(t *testing.T) {
 	adapter, err := srv.newStorageSchemaService()
 	require.NoError(t, err)
 
-	_, err = adapter.destructivePolicy(true)
-	require.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+	require.ErrorIs(t, adapter.checkDestructiveOptIn(true), tern.ErrInvalidStorageSchemaRequest)
 }
 
 // The refusal is reached through the path every RPC takes, not only by calling

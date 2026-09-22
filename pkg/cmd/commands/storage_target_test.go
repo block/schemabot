@@ -245,20 +245,6 @@ postgres:
 	assert.Nil(t, direct.postgresStatementTimeout)
 }
 
-// The request flag only ever widens the target's standing policy. A convergence
-// that narrowed it would refuse statements the deployment's own next boot runs.
-func TestStorageTargetAllowsDestructive_RequestOnlyWidens(t *testing.T) {
-	permissive := &storageTarget{dialect: schema.DialectMySQL, allowDestructive: true}
-	assert.True(t, permissive.allowsDestructive(false),
-		"a config that allows destructive changes is not narrowed by a request without the flag")
-	assert.True(t, permissive.allowsDestructive(true))
-
-	strict := &storageTarget{dialect: schema.DialectMySQL}
-	assert.False(t, strict.allowsDestructive(false))
-	assert.True(t, strict.allowsDestructive(true),
-		"the request flag widens a target with no standing policy")
-}
-
 // A target converges or diffs under the policy it resolved: the family whose
 // differ runs, whether destructive statements are permitted, and the statement
 // budget its config asked for. A target with no config behind it passes no
@@ -273,12 +259,10 @@ func TestStorageTargetEnsureSchemaOptions_CarryTheResolvedPolicy(t *testing.T) {
 		postgresStatementTimeout: &budget,
 	}
 	assert.Equal(t, schema.DialectPostgres, configured.dialect)
-	assert.True(t, configured.allowsDestructive(false), "the config's own policy converges without a flag")
 	assert.Len(t, configured.ensureSchemaOptions(false), 3,
 		"dialect, destructive policy, and the config's statement budget")
 
 	direct := &storageTarget{dialect: schema.DialectMySQL}
-	assert.False(t, direct.allowsDestructive(false))
 	assert.Nil(t, direct.postgresStatementTimeout, "a DSN on the command line carries no config budget")
 	assert.Len(t, direct.ensureSchemaOptions(false), 2,
 		"dialect and destructive policy only, so the package default budget stands")

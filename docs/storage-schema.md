@@ -509,15 +509,21 @@ declares, and the confirmation's notice says what that costs for this
 deployment. On MySQL every one of those boots refuses the removals and logs
 them, so the pre-applied state survives and the fleet warns about it until the
 deploy; a release from before indexes were protected is the exception ([What is
-never automatic](#what-is-never-automatic)). On PostgreSQL the boots never
-compute a removal at all, so the state survives unremarked. A deployment that
-has set
-[`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes)
-is the case to watch: its boots converge destructively, so what you pre-apply is
-dropped by the next pod to start, and this belongs in the deploy rather than
-ahead of it. Converge close to the deploy, re-run `storage plan` just before it,
-and leave unattended runs to a job with no selector, which converges the
-answering binary's own schema.
+never automatic](#what-is-never-automatic)). The case to watch is a MySQL
+deployment that has set
+[`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes):
+its boots converge destructively, so what you pre-apply is dropped by the next
+pod to start, and this belongs in the deploy rather than ahead of it. On
+PostgreSQL the boots never compute a removal at all, whatever that deployment
+has configured, so the state survives unremarked. Converge close to the deploy,
+re-run `storage plan` just before it, and leave unattended runs to a job with no
+selector, which converges the answering binary's own schema.
+
+What the notice reports is the deployment's own standing policy, never the flags
+on your command. Passing `--allow-unsafe` widens what your convergence may run
+and moves nothing about the pods around you: their boots read the deployment's
+config and have never heard of your request, so state they would have refused to
+drop they still refuse to drop.
 
 The convergence gets no more permission than a boot: a statement that would drop
 a storage table or column is refused as it is at startup, and a PostgreSQL
