@@ -3,6 +3,7 @@
 package webhook
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
@@ -143,10 +146,65 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	// A summary body that already fills GitHub's comment budget leaves no room
 	// for the section — it must be dropped so the summary itself still posts.
 	hugeBase := strings.Repeat("x", templates.GitHubIssueCommentMaxChars)
-	noRoom := failureLogsSection(ctx, st,
+	noRoom := failureLogsSections(ctx, st, nil,
 		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
 		&terminalApply, hugeBase)
 	assert.Empty(t, noRoom)
+
+	// An apply that ran on a data plane carries a second fold: the engine's own
+	// lines for it, which live in that data plane's storage and would otherwise
+	// reach an operator only through the CLI. The control-plane fold is
+	// unchanged beside it, and the engine's text is sanitized on the way in.
+	engineApply := seedApply("engine")
+	engineTask := task(engineApply, state.Task.Failed)
+	require.NoError(t, st.ApplyLogs().Append(ctx, &storage.ApplyLog{
+		ApplyID: engineApply.ID, Level: "error", EventType: "state_transition",
+		Message: "Apply failed: the schema change failed on the target", OldState: "running", NewState: "failed",
+	}))
+
+	engineLogs := func(_ context.Context, apply *storage.Apply, _ int) ([]api.EngineLogSource, error) {
+		require.Equal(t, engineApply.ID, apply.ID)
+		at := time.Now().UTC()
+		return []api.EngineLogSource{{
+			Deployment: "region-a",
+			Target:     "cluster-a",
+			Entries: []*apitypes.LogEntry{
+				{CreatedAt: at, Level: "info", Message: "[users] copy starting"},
+				{CreatedAt: at.Add(time.Second), Level: "warn", Message: "[users] unsafe warning 1265: Data truncated for column 'nickname' at row 1\ndial tcp 10.1.2.3:3306"},
+			},
+		}}, nil
+	}
+
+	installClient3, capture3 := setupFakeGitHubForComments(t)
+	observer3 := NewCommentObserver(CommentObserverConfig{
+		GHClient:       &fakeClientFactory{client: installClient3},
+		Storage:        st,
+		Repo:           repo,
+		PR:             46,
+		InstallationID: 12345,
+		ApplyID:        engineApply.ID,
+		ApplyLease: storage.ApplyLease{
+			ApplyID: engineApply.ID,
+			Owner:   "failure-logs-driver",
+			Token:   "failure-logs-token-engine",
+		},
+		EngineLogs: engineLogs,
+		Logger:     slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
+	})
+
+	terminalEngine := *engineApply
+	terminalEngine.State = state.Apply.Failed
+	terminalEngine.ErrorMessage = "the schema change failed on the target"
+	terminalEngine.CompletedAt = &now
+	observer3.OnTerminal(&terminalEngine, []*storage.Task{engineTask})
+
+	engineSummary := waitForSummaryCreate(t, capture3)
+	assert.Contains(t, engineSummary, "<summary>Show logs (1 entry)</summary>")
+	assert.Contains(t, engineSummary, "<summary>Show engine logs (2 entries)</summary>")
+	assert.Contains(t, engineSummary, "[INF] [users] copy starting")
+	assert.Contains(t, engineSummary, "unsafe warning 1265: Data truncated for column 'nickname' at row 1")
+	assert.NotContains(t, engineSummary, "10.1.2.3:3306", "connection endpoints never reach the PR")
+	assert.Less(t, strings.Index(engineSummary, "Show logs ("), strings.Index(engineSummary, "Show engine logs ("))
 
 	// Completed apply: the summary stays clean even though log entries exist.
 	completedApply := seedApply("done")

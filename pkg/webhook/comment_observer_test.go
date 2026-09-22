@@ -41,14 +41,17 @@ func (s *stubApplyOperationStore) GetEngineResumeState(_ context.Context, opID i
 // other store would panic, keeping the test honest about the path it covers.
 type stubStorage struct {
 	storage.Storage
-	ops     storage.ApplyOperationStore
-	applies storage.ApplyStore
-	settled []*storage.ApplyControlRequest
+	ops       storage.ApplyOperationStore
+	applies   storage.ApplyStore
+	applyLogs storage.ApplyLogStore
+	settled   []*storage.ApplyControlRequest
 }
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
 func (s *stubStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *stubStorage) ApplyLogs() storage.ApplyLogStore { return s.applyLogs }
 
 // stubApplyStore serves the authority gate's fresh re-read of the apply row
 // from a fixed result.

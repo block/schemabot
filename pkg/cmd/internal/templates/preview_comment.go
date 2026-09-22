@@ -124,6 +124,7 @@ func previewCommentAllOutput() {
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
+		{"SUMMARY: FAILED ON A DATA PLANE (ENGINE LOGS)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedEngineLogs()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
 		{"SUMMARY: COMPLETED (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedLarge()) }},
 		{"SUMMARY: VITESS DDL + VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedVitessDDLWithVSchema()) }},
@@ -330,6 +331,7 @@ func previewCommentApplyFlowAllOutput() {
 		// Summaries
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
+		{"SUMMARY: FAILED ON A DATA PLANE (ENGINE LOGS)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedEngineLogs()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
 		{"SUMMARY: CANCELLED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCancelled()) }},
 		{"SUMMARY: POSTGRESQL MULTI-STATEMENT TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryPostgresMultiStatementFailed()) }},
@@ -355,6 +357,7 @@ func previewCommentMultiDeployAllOutput() {
 		{"ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyCompleted()) }},
 		{"SUMMARY: ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryCompleted()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryFailed()) }},
+		{"ENGINE LOGS FOLD: TWO DATA PLANES", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedEngineLogsMultiDeployment()) }},
 	}
 	printSections(sections)
 }

@@ -2630,6 +2630,46 @@ func PreviewCommentSummaryFailed() string {
 		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false)
 }
 
+// PreviewCommentSummaryFailedEngineLogs renders a failed summary for an apply
+// a data plane drove, carrying both folds: SchemaBot's own account of the
+// apply, and the engine's account of why the copy stopped. The error block
+// above them names the code and no more, because the target's own words quote
+// the row it could not convert; the engine's line is what turns that code into
+// something an operator can act on without leaving the PR.
+func PreviewCommentSummaryFailedEngineLogs() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Failed
+	tables[1].DDL = "ALTER TABLE `users` MODIFY COLUMN `nickname` varchar(32) NOT NULL"
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	data := sampleSummaryData(state.Apply.Failed, tables)
+	data.ErrorMessage = mysqlerr.ReasonFromText("(errno 1265)")
+	return RenderApplySummaryComment(data) +
+		RenderRecentFailureLogs(sampleRemoteFailureLogEntries("users", data.ErrorMessage), GitHubIssueCommentMaxChars/2, false) +
+		RenderEngineFailureLogs([]EngineLogSourceData{
+			{Deployment: "shard-a", Entries: sampleEngineFailureLogEntries("users", "nickname")},
+		}, GitHubIssueCommentMaxChars/2)
+}
+
+// PreviewCommentSummaryFailedEngineLogsMultiDeployment renders the engine-logs
+// fold for an apply that fanned out across two data planes. Each data plane
+// keeps its own group: their clocks and log ids are independent, so merging
+// them into one stream would assert an ordering across machines.
+func PreviewCommentSummaryFailedEngineLogsMultiDeployment() string {
+	shardA := sampleEngineFailureLogEntries("users", "nickname")
+	shardB := []LogEntryData{
+		{CreatedAt: sampleTime().Add(-8*time.Minute + 30*time.Second), Level: "info", Message: "[users] copy starting: 1192044 rows estimated, 4 threads"},
+		{CreatedAt: sampleTime().Add(-3 * time.Minute), Level: "info", Message: "[users] copy complete: 1192044 rows"},
+		{CreatedAt: sampleTime().Add(-2 * time.Minute), Level: "info", Message: "[users] cutover complete"},
+	}
+	return RenderEngineFailureLogs([]EngineLogSourceData{
+		{Deployment: "shard-a", Entries: shardA},
+		{Deployment: "shard-b", Entries: shardB},
+	}, GitHubIssueCommentMaxChars/2)
+}
+
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.
 func PreviewCommentSummaryStopped() string {
 	tables := sampleApplyTables()[:2]

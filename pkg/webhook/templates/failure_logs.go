@@ -200,3 +200,33 @@ func sampleFailureLogEntries(failedTable, failureMessage string) []LogEntryData 
 		{CreatedAt: start.Add(7 * time.Minute), Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"},
 	}
 }
+
+// sampleRemoteFailureLogEntries returns the control-plane tail of an apply a
+// data plane drove: the same lifecycle as sampleFailureLogEntries, minus the
+// engine lines, which for a remote drive land in the data plane's storage and
+// reach the PR through the engine-logs fold instead. The failure it reports is
+// the sentence SchemaBot wrote for the target's error code, because the
+// target's own words never leave the server log.
+func sampleRemoteFailureLogEntries(failedTable, failureReason string) []LogEntryData {
+	start := sampleTime().Add(-8 * time.Minute)
+	return []LogEntryData{
+		{CreatedAt: start, Level: "info", Message: "Apply dispatched to data plane", OldState: "queued", NewState: "running"},
+		{CreatedAt: start.Add(20 * time.Second), Level: "info", Message: "Task started: schema change on `" + failedTable + "`"},
+		{CreatedAt: start.Add(6 * time.Minute), Level: "error", Message: "Apply failed: " + failureReason, OldState: "running", NewState: "failed"},
+	}
+}
+
+// sampleEngineFailureLogEntries returns the engine's own account of the same
+// failure: the copy it started, the warning the target raised on a row it
+// could not convert, and the abort that followed.
+func sampleEngineFailureLogEntries(failedTable, failedColumn string) []LogEntryData {
+	start := sampleTime().Add(-8 * time.Minute)
+	prefix := "[" + failedTable + "] "
+	return []LogEntryData{
+		{CreatedAt: start.Add(25 * time.Second), Level: "info", Message: prefix + "copy starting: 1466232 rows estimated, 4 threads"},
+		{CreatedAt: start.Add(2 * time.Minute), Level: "info", Message: prefix + "copy progress: 12.4% 181812/1466232 rows, eta 21m"},
+		{CreatedAt: start.Add(5 * time.Minute), Level: "info", Message: prefix + "copy progress: 30.0% 439870/1466232 rows, eta 14m"},
+		{CreatedAt: start.Add(5*time.Minute + 40*time.Second), Level: "warn", Message: prefix + "unsafe warning 1265: Data truncated for column '" + failedColumn + "' at row 1"},
+		{CreatedAt: start.Add(5*time.Minute + 41*time.Second), Level: "error", Message: prefix + "aborting: the copy would change values that are already in the table"},
+	}
+}

@@ -32,7 +32,11 @@ type CommentObserver struct {
 	deferCutover   bool
 	supportChannel api.SupportChannelConfig
 	tenant         string
-	logger         interface {
+	// engineLogs reads the engine's own lines back from the data planes that
+	// ran an apply, for the engine-logs fold on a failed apply's summary.
+	// Nil where no reader was wired; see EngineLogReader.
+	engineLogs EngineLogReader
+	logger     interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
@@ -154,6 +158,12 @@ type CommentObserverConfig struct {
 	// deployments.
 	Tenant string
 
+	// EngineLogs reads the engine's own lines back from the data planes that
+	// ran an apply, so a failed apply's summary comment carries the engine's
+	// account of the failure alongside SchemaBot's. Optional — nil leaves the
+	// engine-logs fold off the summary.
+	EngineLogs EngineLogReader
+
 	Logger interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
@@ -225,6 +235,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		deferCutover:   cfg.DeferCutover,
 		supportChannel: cfg.SupportChannel,
 		tenant:         cfg.Tenant,
+		engineLogs:     cfg.EngineLogs,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -738,7 +749,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
 	}
 	body += controlRejectionSection(ctx, o.stor, o.logger, apply, body)
-	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)
+	return body + failureLogsSections(ctx, o.stor, o.engineLogs, o.logger, apply, body)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

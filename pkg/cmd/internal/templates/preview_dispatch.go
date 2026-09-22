@@ -276,6 +276,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedVitessVSchemaOnly())
 	case PreviewCommentSummaryFailedLarge:
 		fmt.Print(webhooktemplates.PreviewCommentSummaryFailedLarge())
+	case PreviewCommentSummaryFailedEngineLogs:
+		fmt.Print(webhooktemplates.PreviewCommentSummaryFailedEngineLogs())
 	case PreviewCommentSummaryMultiNSFailed:
 		fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceFailed())
 	case PreviewCommentSummaryMultiNSCompleted:

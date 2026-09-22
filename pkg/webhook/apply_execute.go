@@ -272,6 +272,7 @@ func (h *Handler) executeApply(
 		DeferCutover:   options["defer_cutover"] == "true",
 		SupportChannel: h.supportChannel(),
 		Tenant:         h.deploymentTenant(),
+		EngineLogs:     h.engineLogReader(),
 		Logger:         h.logger,
 		OnTerminalHook: func(apply *storage.Apply) {
 			// refreshChecksForTerminalApply routes a completed rollback straight

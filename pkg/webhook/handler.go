@@ -334,6 +334,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					ApplyLease:     apply.Lease(),
 					SupportChannel: h.supportChannel(),
 					Tenant:         h.deploymentTenant(),
+					EngineLogs:     h.engineLogReader(),
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
 						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
@@ -374,6 +375,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				ApplyID:        apply.ID,
 				SupportChannel: h.supportChannel(),
 				Tenant:         h.deploymentTenant(),
+				EngineLogs:     h.engineLogReader(),
 				Logger:         logger,
 				OnTerminalHook: func(a *storage.Apply) {
 					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
@@ -707,7 +709,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
 		summaryBase += controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
-		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
+		summaryBody := summaryBase + failureLogsSections(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, summaryBase)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
 	}
 }

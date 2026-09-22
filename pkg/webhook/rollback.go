@@ -638,6 +638,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		DeferCutover:   options["defer_cutover"] == "true",
 		SupportChannel: h.supportChannel(),
 		Tenant:         h.deploymentTenant(),
+		EngineLogs:     h.engineLogReader(),
 		Logger:         h.logger,
 		OnTerminalHook: func(a *storage.Apply) {
 			// refreshChecksForTerminalApply routes a completed rollback straight

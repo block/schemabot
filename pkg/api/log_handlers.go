@@ -179,6 +179,54 @@ type deploymentLogFetch struct {
 	operations []*apitypes.LogOperationProvenance
 }
 
+// deploymentLogFetches groups one deployment's operations of an apply into the
+// distinct data-plane reads they need: one per (target, data-plane apply id)
+// pair, since a deployment can drive several targets and each read is scoped
+// to one remote apply on one target. It also returns the operations that carry
+// no data-plane apply id — those have not been dispatched yet, so their logs
+// live in control-plane storage rather than behind this fan-out, and the
+// caller logs them rather than the shared grouping guessing at the wording.
+//
+// Callers must have proven the deployment remote before calling: on a locally
+// driven operation the recorded id is engine resume state, not an apply id
+// (see storage.ApplyOperation.RemoteApplyID).
+func deploymentLogFetches(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) (map[string]*deploymentLogFetch, []*storage.ApplyOperation) {
+	fetches := make(map[string]*deploymentLogFetch)
+	var undispatched []*storage.ApplyOperation
+	for _, op := range ops {
+		if op.Deployment != deployment {
+			continue
+		}
+		externalID := op.RemoteApplyID()
+		if externalID == "" && len(ops) == 1 {
+			externalID = apply.ExternalID
+		}
+		if externalID == "" {
+			undispatched = append(undispatched, op)
+			continue
+		}
+		key := op.Target + "\x00" + externalID
+		fetch := fetches[key]
+		if fetch == nil {
+			fetch = &deploymentLogFetch{target: op.Target, externalID: externalID}
+			fetches[key] = fetch
+		}
+		fetch.operations = append(fetch.operations, &apitypes.LogOperationProvenance{OperationKey: op.OperationKey, Target: op.Target, OperationKind: op.OperationKind})
+	}
+	return fetches, undispatched
+}
+
+// sortedFetchKeys orders the grouped reads deterministically, so a fan-out
+// across several targets renders in the same order on every read.
+func sortedFetchKeys(fetches map[string]*deploymentLogFetch) []string {
+	keys := make([]string, 0, len(fetches))
+	for key := range fetches {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment string, limit int) {
 	ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if err != nil {
@@ -211,46 +259,21 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q is local-only; omit --deployment to read control-plane logs", deployment))
 		return
 	}
-	fetches := make(map[string]*deploymentLogFetch)
-	for _, op := range ops {
-		if op.Deployment != deployment {
-			continue
-		}
-		// The deployment is proven remote above, so the operation's recorded
-		// remote apply id — including one living only in the legacy engine
-		// resume context carrier — is a data-plane apply id, not engine resume
-		// state.
-		externalID := op.RemoteApplyID()
-		if externalID == "" && len(ops) == 1 {
-			externalID = apply.ExternalID
-		}
-		if externalID == "" {
-			// An operation without a remote apply id has not been dispatched to
-			// the data plane; its logs live in control-plane storage, not behind
-			// this fan-out.
-			s.logger.Debug("skipping operation without a remote apply id for data-plane logs",
-				append(apply.LogAttrs(),
-					"operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
-			continue
-		}
-		key := op.Target + "\x00" + externalID
-		fetch := fetches[key]
-		if fetch == nil {
-			fetch = &deploymentLogFetch{target: op.Target, externalID: externalID}
-			fetches[key] = fetch
-		}
-		fetch.operations = append(fetch.operations, &apitypes.LogOperationProvenance{OperationKey: op.OperationKey, Target: op.Target, OperationKind: op.OperationKind})
+	fetches, undispatched := deploymentLogFetches(apply, ops, deployment)
+	for _, op := range undispatched {
+		// An operation without a remote apply id has not been dispatched to
+		// the data plane; its logs live in control-plane storage, not behind
+		// this fan-out.
+		s.logger.Debug("skipping operation without a remote apply id for data-plane logs",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
 	}
 	if len(fetches) == 0 {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no remote operation logs; omit --deployment to read control-plane logs", deployment))
 		return
 	}
 	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
-	keys := make([]string, 0, len(fetches))
-	for key := range fetches {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := sortedFetchKeys(fetches)
 	// The data plane serves at most tern.MaxLogsLimit entries per read and
 	// silently serves the cap to larger requests, which would swallow the
 	// over-fetch probe: the probe entry is exactly the one clamped away, and a
