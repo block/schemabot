@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -87,15 +88,36 @@ const maxConcurrentEngineLogReads = 8
 // serially, one slow data plane spends the whole budget and every deployment
 // behind it is dropped for a timeout it did not cause, which would turn one
 // unreachable deployment into a fold missing every other deployment's lines.
+//
+// The concurrency limit means a wide fan-out still runs in waves, so the
+// budget is divided between them and each read is given its own deadline out
+// of its wave's share. Without that, the first wave hanging would spend the
+// whole budget and every read behind it would start already cancelled — the
+// same unfairness the concurrency exists to prevent, moved one level up.
 func (s *Service) runEngineLogReads(ctx context.Context, apply *storage.Apply, reads []engineLogRead, limit int) []EngineLogSource {
+	perRead := engineLogReadTimeout(ctx, len(reads))
 	results := make([]*EngineLogSource, len(reads))
 	slots := make(chan struct{}, maxConcurrentEngineLogReads)
 	var wg sync.WaitGroup
 	for i, read := range reads {
-		slots <- struct{}{}
+		// Taking a slot waits for an earlier read to finish, so it has to
+		// watch the caller's cancellation too: once the budget is spent there
+		// is nothing left to read with, and the reads never started are
+		// reported once rather than as a failure each.
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			s.logger.Warn("ran out of time to read the remaining data planes for engine logs; the fold will omit their lines",
+				append(apply.LogAttrs(), "operation", engineLogsOperation,
+					"reads_not_started", len(reads)-i, "reads_planned", len(reads), "error", ctx.Err())...)
+			wg.Wait()
+			return collectEngineLogSources(results)
+		}
 		wg.Go(func() {
 			defer func() { <-slots }()
-			source, err := s.engineLogSource(ctx, apply, read.client, read.deployment, read.fetch, limit)
+			readCtx, cancel := context.WithTimeout(ctx, perRead)
+			defer cancel()
+			source, err := s.engineLogSource(readCtx, apply, read.client, read.deployment, read.fetch, limit)
 			switch {
 			case err != nil:
 				s.recordDeploymentLogFailure(apply, engineLogsOperation, read.deployment, read.fetch, err)
@@ -109,6 +131,36 @@ func (s *Service) runEngineLogReads(ctx context.Context, apply *storage.Apply, r
 		})
 	}
 	wg.Wait()
+	return collectEngineLogSources(results)
+}
+
+// engineLogReadTimeout is what one data-plane read may spend: the caller's
+// remaining budget divided between the waves the concurrency limit imposes, so
+// a read in the last wave gets as long as one in the first. A caller with no
+// deadline of its own gets the default, which bounds a hung data plane from
+// holding its slot for the whole fan-out.
+func engineLogReadTimeout(ctx context.Context, reads int) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return defaultEngineLogReadTimeout
+	}
+	waves := max((reads+maxConcurrentEngineLogReads-1)/maxConcurrentEngineLogReads, 1)
+	remaining := time.Until(deadline) / time.Duration(waves)
+	if remaining > defaultEngineLogReadTimeout {
+		return defaultEngineLogReadTimeout
+	}
+	return remaining
+}
+
+// defaultEngineLogReadTimeout bounds a single data-plane read when the caller
+// set no deadline, and caps the share a read takes when the caller's budget is
+// generous. A read that has not answered in this long is not going to make the
+// fold; holding a slot for it costs the deployments behind it.
+const defaultEngineLogReadTimeout = 3 * time.Second
+
+// collectEngineLogSources flattens the reads that answered, in the order they
+// were planned.
+func collectEngineLogSources(results []*EngineLogSource) []EngineLogSource {
 	var sources []EngineLogSource
 	for _, source := range results {
 		if source != nil {

@@ -39,6 +39,12 @@ const GitHubIssueCommentMaxChars = 65536
 // line.
 const MinRenderedLogLineChars = len("2006-01-02 15:04:05 UTC [] ") + 1
 
+// groupSeparator sets one group's lines apart from the next inside the fenced
+// block. It is charged to the budget per group, not to the fixed chrome
+// reserve, because how much of it the section renders depends on how many
+// groups survive.
+const groupSeparator = "\n\n"
+
 // sectionChromeChars reserves room within the budget for the section's own
 // markup: the details/summary fold, the omitted-entries note, and the code
 // fences.
@@ -176,7 +182,7 @@ func RenderFailureLogs(groups []LogGroupData, available int) string {
 	if note := omissionNote(omitted, droppedGroups, hasOlder); note != "" {
 		section += note
 	}
-	section += "```text\n" + strings.Join(blocks, "\n\n") + "\n```\n\n</details>\n"
+	section += "```text\n" + strings.Join(blocks, groupSeparator) + "\n```\n\n</details>\n"
 	return section
 }
 
@@ -192,25 +198,44 @@ func RenderFailureLogs(groups []LogGroupData, available int) string {
 // itself. The earliest groups are kept, so what survives is the apply's own
 // account before any data plane's.
 func groupsWithinBudget(groups []LogGroupData, available int) (kept []LogGroupData, headings []string, budget int, dropped int) {
+	// A group's heading does not depend on how many groups survive, so they
+	// are built once and the loop below slices them. Building them per
+	// iteration would rebuild and re-sanitize every heading each time the fold
+	// narrows by one, which is quadratic in the width of the fan-out.
+	all, costUpTo := groupHeadings(groups)
 	for n := len(groups); n > 0; n-- {
-		kept = groups[:n]
 		budget = available - sectionChromeChars
 		headings = nil
 		if n > 1 {
-			headings = make([]string, n)
-			for i, group := range kept {
-				headings[i] = groupHeading(group.Label)
-				// The heading and the newline joining it to the lines below
-				// come out of the budget before it is shared, so a headed fold
-				// cannot overrun the room a bare one would have fitted in.
-				budget -= len(headings[i]) + 1
-			}
+			// The headings, the newline joining each to the lines below, and
+			// the blank line between each pair of groups come out of the
+			// budget before it is shared, so a headed fold cannot overrun the
+			// room a bare one would have fitted in. Everything the section
+			// adds per group has to be charged per group: the fixed chrome
+			// reserve does not grow with the fan-out, so a wide one would
+			// otherwise spend room the reserve never held.
+			headings = all[:n]
+			budget -= costUpTo[n] + len(groupSeparator)*(n-1)
 		}
 		if budget/n >= MinRenderedLogLineChars {
-			return kept, headings, budget, len(groups) - n
+			return groups[:n], headings, budget, len(groups) - n
 		}
 	}
 	return nil, nil, 0, len(groups)
+}
+
+// groupHeadings renders every group's heading and, alongside them, what the
+// first n of them cost the budget: the heading itself plus the newline joining
+// it to the lines below. costUpTo is indexed by the number of headings, so
+// costUpTo[n] is what a fold of n groups spends on them.
+func groupHeadings(groups []LogGroupData) (headings []string, costUpTo []int) {
+	headings = make([]string, len(groups))
+	costUpTo = make([]int, len(groups)+1)
+	for i, group := range groups {
+		headings[i] = groupHeading(group.Label)
+		costUpTo[i+1] = costUpTo[i] + len(headings[i]) + 1
+	}
+	return headings, costUpTo
 }
 
 // groupHeading introduces one account's lines inside the fenced block. The

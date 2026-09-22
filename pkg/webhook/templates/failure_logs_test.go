@@ -352,3 +352,40 @@ func TestElideMiddleKeepsTheEndThatDistinguishes(t *testing.T) {
 		}
 	}
 }
+
+// The section must never exceed the room it was given, whatever shape the
+// groups take: the comment it is appended to is already sized against
+// GitHub's cap, and a section that overruns costs the operator the terminal
+// summary itself. The budget has to cover more than the lines — the headings,
+// the blank line between each pair of groups, and the omission note, all of
+// which grow with the number of groups — so this sweeps the shapes rather
+// than checking one.
+func TestRenderFailureLogsNeverExceedsItsBudget(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	for _, groupCount := range []int{1, 2, 3, 8, 40, 300} {
+		for _, labelLen := range []int{0, 13, 200} {
+			for _, entries := range []int{1, 7} {
+				for _, messageLen := range []int{0, 40, 300} {
+					for _, available := range []int{MinFailureLogsSectionChars, 600, 4096, GitHubIssueCommentMaxChars} {
+						groups := make([]LogGroupData, groupCount)
+						for i := range groups {
+							lines := make([]LogEntryData, entries)
+							for j := range lines {
+								lines[j] = LogEntryData{CreatedAt: at, Level: "info", Message: strings.Repeat("x", messageLen)}
+							}
+							groups[i] = LogGroupData{
+								Label:    strings.Repeat("r", labelLen) + string(rune('a'+i%26)),
+								Entries:  lines,
+								HasOlder: i%2 == 0,
+							}
+						}
+						rendered := RenderFailureLogs(groups, available)
+						require.LessOrEqual(t, len(rendered), available,
+							"groups=%d label=%d entries=%d message=%d available=%d",
+							groupCount, labelLen, entries, messageLen, available)
+					}
+				}
+			}
+		}
+	}
+}

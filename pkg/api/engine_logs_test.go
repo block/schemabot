@@ -274,3 +274,64 @@ func TestEngineApplyLogsOneStalledDataPlaneDoesNotStarveTheRest(t *testing.T) {
 // the whole read: long enough that the answering data plane is never the one
 // that timed out, short enough that the test does not wait on the stall.
 const engineLogsStallTestTimeout = 300 * time.Millisecond
+
+// A fan-out wider than the concurrency limit runs in waves, so the reads in a
+// later wave must still get a real chance at the budget. If the first wave
+// hangs, the reads behind it would otherwise start on an already-cancelled
+// context and be dropped for a timeout raised by deployments they have nothing
+// to do with — the same unfairness the concurrency exists to prevent.
+func TestEngineApplyLogsALaterWaveStillGetsItsShareOfTheBudget(t *testing.T) {
+	apply := engineLogsApply()
+	stalled := &mockTernClient{isRemote: true, logsStall: make(chan struct{})}
+	answering := &mockTernClient{isRemote: true}
+	answering.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{
+			{Id: 1, Level: "warn", Source: storage.LogSourceSpirit, Message: "[users] unsafe warning 1265", CreatedAt: "2026-07-18T18:33:11Z"},
+		}}, nil
+	}
+	// The first full wave stalls; one deployment in the wave behind it answers.
+	var operations []*storage.ApplyOperation
+	clients := map[string]tern.Client{}
+	for i := range maxConcurrentEngineLogReads {
+		// Deployments are read in sorted order, so these fill the first wave
+		// and the answering one below lands in the wave behind it.
+		name := fmt.Sprintf("region-a-stalled-%d", i)
+		operations = append(operations, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: name, OperationKey: "commerce/orders", Target: "cluster-" + name, ExternalID: "remote-" + name,
+		})
+		clients[name+"/staging"] = stalled
+	}
+	operations = append(operations, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-z-last", OperationKey: "commerce/users", Target: "cluster-last", ExternalID: "remote-last",
+	})
+	clients["region-z-last/staging"] = answering
+	service := engineLogsService(apply, operations, clients)
+
+	ctx, cancel := context.WithTimeout(t.Context(), engineLogsStallTestTimeout)
+	defer cancel()
+	sources, err := service.EngineApplyLogs(ctx, apply, 50)
+
+	require.NoError(t, err)
+	require.Len(t, sources, 1, "the read behind the stalled wave still reaches its data plane")
+	assert.Equal(t, "region-z-last", sources[0].Deployment)
+}
+
+// A read is bounded even when the caller set no deadline of its own, so a data
+// plane that never answers cannot hold its slot against the deployments queued
+// behind it. With a deadline, each wave gets an equal share of what is left.
+func TestEngineLogReadTimeoutSplitsTheBudgetBetweenWaves(t *testing.T) {
+	assert.Equal(t, defaultEngineLogReadTimeout, engineLogReadTimeout(t.Context(), 40),
+		"a caller with no deadline still bounds each read")
+
+	budget := 4 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), budget)
+	defer cancel()
+
+	// One wave: the read is capped at the default rather than the whole budget.
+	assert.Equal(t, defaultEngineLogReadTimeout, engineLogReadTimeout(ctx, maxConcurrentEngineLogReads))
+	// Four waves: each read gets a quarter, so the last wave is not left with
+	// a context the first wave already spent.
+	assert.InDelta(t, (budget / 4).Seconds(),
+		engineLogReadTimeout(ctx, 4*maxConcurrentEngineLogReads).Seconds(), 0.1)
+	assert.Positive(t, engineLogReadTimeout(ctx, 0), "an empty fan-out never divides by zero")
+}
