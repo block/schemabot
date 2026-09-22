@@ -1094,6 +1094,10 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 		CreatedAt:             time.Now(),
 	}
 	storedPlan.RecordIgnoreTables(req.IgnoreTables)
+	// An identifier the planner supplied can already name a stored row when a
+	// plan is delivered twice, and re-storing it is a no-op rather than a
+	// failure. A member's identifier is minted here per call, so it never
+	// collides and this only ever forgives the supplied kind.
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
 		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
 	}
