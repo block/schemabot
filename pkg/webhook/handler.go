@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -26,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
@@ -140,6 +142,10 @@ type Handler struct {
 	// every claim, while durableWebhookMu guards the dispatch lifecycle.
 	durableWebhookClaimMu sync.Mutex
 	durableWebhookClaims  map[string][]any
+	// shutdownBudget is the deadline the rest of the process's shutdown shares
+	// with this pool's drain, so the drain costs whatever is left rather than
+	// its own bound on top of every stage before it. Nil means unbudgeted.
+	shutdownBudget atomic.Pointer[drain.Budget]
 	// durableWebhookProcessOverride is a test seam that replaces
 	// processDurableWebhookEvent so driver finish-path behavior (for example
 	// refusing to complete a delivery after lease loss) can be exercised

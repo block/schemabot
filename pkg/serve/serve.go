@@ -62,6 +62,13 @@ type options struct {
 	// this server, and the local one carries boundaries the normal one does
 	// not (AZ-6).
 	localHosted bool
+	// shutdownBudget is how long the whole of shutdown may take, defaulting to
+	// shutdownBudgetTotal. Zero means unbudgeted: every stage waits its own
+	// bound in full, and the worst case is their sum.
+	shutdownBudget time.Duration
+	// shutdownBudgetSet distinguishes an embedder asking for no budget from one
+	// that never asked, since both leave shutdownBudget at zero.
+	shutdownBudgetSet bool
 }
 
 // withLocalHosting marks the server as hosted by the local runtime. It is
@@ -96,6 +103,34 @@ func WithEngine(databaseType string, factory tern.EngineFactory) Option {
 			o.engines = make(map[string]tern.EngineFactory)
 		}
 		o.engines[databaseType] = factory
+	}
+}
+
+// shutdownBudgetTotal is how long the whole of a shutdown may take, from the
+// moment the run ends to the last stage of Close.
+//
+// Every stage of shutdown has a bound of its own, and each is sized for the
+// work it waits on. Nothing relates them, so left alone they sum: a shutdown
+// where each stage in turn is the one that hangs takes longer than any bound
+// states, and longer than the termination grace period a deployment gives a
+// pod before it is killed outright. A process killed mid-close skips the
+// stages it had not reached, which are the ones that hand this process's work
+// back rather than leaving it to expire.
+//
+// One deadline shared by every stage is what makes the bounds cost their
+// maximum instead of their sum. This value sits inside a routine grace period
+// with room to spare, so the close finishes on its own terms rather than being
+// cut off part-way.
+const shutdownBudgetTotal = 25 * time.Second
+
+// WithShutdownBudget sets how long the whole of this server's shutdown may
+// take, in place of shutdownBudgetTotal. Pass zero to run unbudgeted, where
+// every stage waits its own bound in full — appropriate only for an embedder
+// whose process has no termination grace period to fit inside.
+func WithShutdownBudget(total time.Duration) Option {
+	return func(o *options) {
+		o.shutdownBudget = total
+		o.shutdownBudgetSet = true
 	}
 }
 
@@ -173,6 +208,7 @@ type webhookRuntime struct {
 	handler                         http.Handler
 	startDurableWebhookDispatch     func(context.Context)
 	stopDurableWebhookDispatch      func()
+	setShutdownBudget               func(*drain.Budget)
 	drainInProcessWebhookWork       func(context.Context)
 	reconcileMissingSummaryComments func(context.Context)
 }
@@ -205,18 +241,19 @@ const (
 // stop waits for the pass, then cancels it if it has not finished. It reports
 // nothing to its caller: every outcome is either routine or already logged, and
 // none of them is a reason to fail a close.
-func (p *reconcilePass) stop(logger *slog.Logger) {
+func (p *reconcilePass) stop(logger *slog.Logger, budget *drain.Budget) {
 	if p == nil {
 		return
 	}
-	if drain.Wait(&p.wg, missingSummaryReconcileDrainTimeout) {
+	if budget.Wait(&p.wg, missingSummaryReconcileDrainTimeout) {
 		return
 	}
 
 	logger.Warn("missing-summary reconciliation did not finish within the shutdown drain; it is being canceled and the comments it did not reach are reconciled by the next process to start",
-		"drain_timeout", missingSummaryReconcileDrainTimeout)
+		"drain_timeout", missingSummaryReconcileDrainTimeout,
+		"budget_spent", budget.Spent())
 	p.cancel()
-	if !drain.Wait(&p.wg, missingSummaryReconcileCancelGrace) {
+	if !budget.Wait(&p.wg, missingSummaryReconcileCancelGrace) {
 		logger.Warn("missing-summary reconciliation has not returned since it was canceled; its remaining storage calls will fail as the pool closes",
 			"cancel_grace", missingSummaryReconcileCancelGrace)
 	}
@@ -305,6 +342,16 @@ func watchForShutdownSignal(ctx context.Context) (context.Context, <-chan os.Sig
 // grpcDrainTimeout bounds the wait for in-flight RPCs to finish before the gRPC
 // server is stopped from under them.
 const grpcDrainTimeout = 10 * time.Second
+
+// httpShutdownTimeout bounds the graceful shutdown of the API and metrics
+// listeners. Both stop accepting immediately; the wait is for the requests
+// already in a handler, which is why it is sized for the slowest API call
+// rather than for the listener.
+const httpShutdownTimeout = 30 * time.Second
+
+// telemetryShutdownTimeout bounds the final metrics and traces flush. A flush
+// that does not finish costs the last export, not the close.
+const telemetryShutdownTimeout = 5 * time.Second
 
 // stopGRPCServer ends the gRPC server, letting in-flight RPCs finish within
 // drainTimeout and stopping them once it is spent.
@@ -407,7 +454,9 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
 			}
 		}()
-		defer stopGRPCServer(grpcServer, srv.logger, grpcDrainTimeout)
+		// The allotment is read when the defer runs, not when it is registered,
+		// so this stage measures itself against what shutdown has already spent.
+		defer func() { stopGRPCServer(grpcServer, srv.logger, srv.shutdownAllot(grpcDrainTimeout)) }()
 	}
 
 	// Start background loops (operator, health monitor, pending-drops cleaner,
@@ -460,7 +509,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 
 	// Graceful shutdown of both HTTP servers; Server.Close (deferred) releases
 	// the rest.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), srv.shutdownAllot(httpShutdownTimeout))
 	defer cancel()
 
 	srv.logger.Info("shutting down server")
@@ -518,6 +567,14 @@ type Server struct {
 	// reconcile is the missing-summary pass Start kicked off, nil when Start
 	// has not run or the pass is not configured. Close bounds it.
 	reconcile *reconcilePass
+	// shutdownBudgetTotal is how long the whole of this server's shutdown may
+	// take. Zero runs it unbudgeted.
+	shutdownBudgetTotal time.Duration
+	// shutdownBudgetOnce arms shutdownBudget on the first stage of shutdown to
+	// ask for it, whichever that is: Run reaches it at the top of its own
+	// shutdown, an embedder that never calls Run reaches it through Close.
+	shutdownBudgetOnce sync.Once
+	shutdownBudget     *drain.Budget
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -741,6 +798,9 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		storageDSN:      storageDSN,
 		version:         version,
 		localHosted:     o.localHosted,
+		// An embedder that asked for no budget gets none; one that never asked
+		// gets the default rather than the unbounded sum of every stage.
+		shutdownBudgetTotal: shutdownBudgetFor(o),
 	}
 
 	if err := srv.registerStorageSchema(svc); err != nil {
@@ -1065,6 +1125,53 @@ func (s *Server) stopTargetProbe() {
 	s.logger.Info("target probe stopped")
 }
 
+// shutdownBudgetFor reads the shutdown budget an embedder asked for, falling
+// back to the default when it did not ask. A negative value is read as no
+// budget rather than as one that is already spent, so a configuration mistake
+// cannot silently turn every stage of shutdown into its minimum wait.
+func shutdownBudgetFor(o options) time.Duration {
+	if !o.shutdownBudgetSet {
+		return shutdownBudgetTotal
+	}
+	if o.shutdownBudget < 0 {
+		return 0
+	}
+	return o.shutdownBudget
+}
+
+// beginShutdown starts this server's shutdown budget and returns it, or nil
+// when the server is unbudgeted. It is idempotent and safe to call from any
+// stage: the first caller sets the deadline every later stage measures itself
+// against, so where shutdown begins is wherever it is first noticed — the top
+// of Run's own shutdown for a server Run owns, Close for one an embedder
+// stops directly.
+//
+// Every stage that shares the budget is told about it here rather than at
+// build time, because a budget is a deadline and a deadline that was set at
+// build time would already be spent.
+func (s *Server) beginShutdown() *drain.Budget {
+	s.shutdownBudgetOnce.Do(func() {
+		if s.shutdownBudgetTotal <= 0 {
+			s.logger.Info("shutdown is unbudgeted; each stage waits its own bound in full")
+			return
+		}
+		s.shutdownBudget = drain.NewBudget(s.shutdownBudgetTotal)
+		s.svc.SetShutdownBudget(s.shutdownBudget)
+		if s.webhook.setShutdownBudget != nil {
+			s.webhook.setShutdownBudget(s.shutdownBudget)
+		}
+		s.logger.Info("shutdown started", "budget", s.shutdownBudgetTotal)
+	})
+	return s.shutdownBudget
+}
+
+// shutdownAllot returns how long a shutdown stage whose own bound is own may
+// take, given what is left of the budget. It starts the budget if no stage has
+// yet, so a stage cannot measure itself against a budget nobody armed.
+func (s *Server) shutdownAllot(own time.Duration) time.Duration {
+	return s.beginShutdown().Allot(own)
+}
+
 // Close releases the resources the Server owns and returns all cleanup errors
 // encountered, joined together. It stops the startup target probe and the
 // pending-drops cleaner, stops the
@@ -1079,12 +1186,17 @@ func (s *Server) stopTargetProbe() {
 // Close returns whether or not the background work it waits for does. Every
 // stage that waits carries a bound of its own — the reconciliation pass, the
 // durable webhook pool, the in-process webhook drain, the driver pool, the
-// telemetry flush — so the worst case is their sum rather than the lifetime of
-// whichever goroutine is stuck. Each of those bounds is stated where it is
-// declared, alongside what its stage gives up by expiring; none of them gives up
-// anything another process cannot redo or reclaim, which is what makes stopping
-// the right move when the wait is the thing holding the process open.
+// telemetry flush — and every one of them waits inside the shutdown budget, so
+// a stage reaches its own bound only while the budget still has that much left
+// and the worst case is the budget rather than the sum. Each bound is stated
+// where it is declared, alongside what its stage gives up by expiring; none of
+// them gives up anything another process cannot redo or reclaim, which is what
+// makes stopping the right move when the wait is the thing holding the process
+// open.
 func (s *Server) Close() error {
+	// An embedder may stop the server without ever running it, so this is where
+	// shutdown begins for everything Run does not reach first.
+	budget := s.beginShutdown()
 	s.stopTargetProbe()
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
@@ -1093,13 +1205,13 @@ func (s *Server) Close() error {
 	// The reconciliation pass runs on a context of its own, so nothing above has
 	// asked it to stop and nothing below would wait for it. Bound it here, while
 	// the storage it reads is still open.
-	s.reconcile.stop(s.logger)
+	s.reconcile.stop(s.logger, budget)
 	// Drain the detached in-process webhook goroutines (non-durable event types)
 	// before closing storage below, since that already-acked work can still read
 	// or write the database. Run/embedders stop the HTTP server before Close, so
 	// no new deliveries arrive during the drain.
 	if s.webhook.drainInProcessWebhookWork != nil {
-		drainCtx, cancelDrain := context.WithTimeout(context.Background(), inProcessWebhookDrainTimeout)
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), budget.Allot(inProcessWebhookDrainTimeout))
 		s.webhook.drainInProcessWebhookWork(drainCtx)
 		cancelDrain()
 	}
@@ -1111,7 +1223,7 @@ func (s *Server) Close() error {
 	s.svc.StopOperator()
 
 	var errs []error
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), budget.Allot(telemetryShutdownTimeout))
 	defer cancel()
 	// Telemetry shutdown is best-effort: a failure here means the final
 	// metrics/traces flush was dropped (e.g. the collector is unreachable or
@@ -1315,6 +1427,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	return webhookRuntime{
 		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
 		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
+		setShutdownBudget:               handler.SetShutdownBudget,
 		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
@@ -1397,6 +1510,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	return webhookRuntime{
 		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
 		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
+		setShutdownBudget:               handler.SetShutdownBudget,
 		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,

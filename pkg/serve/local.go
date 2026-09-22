@@ -126,7 +126,10 @@ func RunLocal(ctx context.Context, config api.ServerConfig, local LocalOptions, 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
 	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		// This is the first stage of the local runtime's shutdown, so the
+		// allotment it asks for is what starts the budget the Close below
+		// shares with it.
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), srv.shutdownAllot(httpShutdownTimeout))
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			runErr = errors.Join(runErr, fmt.Errorf("drain local HTTP server: %w", err), server.Close())
