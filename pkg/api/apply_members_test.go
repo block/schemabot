@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -369,4 +370,91 @@ func TestBuildShardedApplyOperationGroups_TargetsOfOneDeploymentDoNotShareOperat
 	}
 	assert.Zero(t, byTarget["testapp-001"].Operation.PlanID)
 	assert.Equal(t, int64(11), byTarget["testapp-002"].Operation.PlanID)
+}
+
+// multiTargetApplyService wires the stores apply creation reaches before it
+// builds operations, so a test can drive createStoredApply for an environment
+// whose members are planned independently.
+func multiTargetApplyService(t *testing.T, plans storage.PlanStore) *Service {
+	t.Helper()
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"testapp": {
+				Type:         storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{"production": multiTargetEnv()},
+			},
+		},
+	}
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorageWithApplyStores{
+		plans:     plans,
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+}
+
+// memberPlanWithChange is a member's own stored plan carrying one table change,
+// which is the DDL an apply would build that member's tasks from.
+func memberPlanWithChange(change storage.TableChange) *storage.Plan {
+	plan := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"testapp": {Tables: []storage.TableChange{change}},
+	}
+	return plan
+}
+
+// Apply admission clears the plan the apply was created from, which is the
+// primary's. A member planned against its own live schema runs its own plan
+// instead, so a statement the engine refuses reaches its target through that
+// member rather than through the plan the operator reviewed — admission has to
+// clear every member's plan, and name the one that carries the change.
+func TestCreateStoredApply_BlockedMemberPlanIsRefused(t *testing.T) {
+	member := memberPlanWithChange(storage.TableChange{
+		Namespace:     "testapp",
+		Table:         "orders",
+		Operation:     "alter",
+		DDL:           "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)",
+		ExecutionMode: "blocked",
+		ModeReason:    "the engine refuses this statement",
+	})
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{member}})
+
+	_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production"}, nil, "apply-blocked-member")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+	assert.Contains(t, err.Error(), "blocked change")
+	assert.Contains(t, err.Error(), "orders")
+}
+
+// The unsafe opt-in is the operator's, and it is asked for per apply rather than
+// per member. A member whose own plan drops a table therefore needs the same
+// opt-in the primary's would, or the drop runs on the strength of an approval
+// that was never given for it.
+func TestCreateStoredApply_UnsafeMemberPlanNeedsTheOptIn(t *testing.T) {
+	member := memberPlanWithChange(storage.TableChange{
+		Namespace: "testapp",
+		Table:     "legacy_orders",
+		Operation: "drop",
+		DDL:       "DROP TABLE `legacy_orders`",
+	})
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{member}})
+	primary := primaryPlanRow("testapp-001")
+
+	_, _, err := svc.createStoredApply(t.Context(), primary, ApplyRequest{Environment: "production"}, nil, "apply-unsafe-member")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+	assert.Contains(t, err.Error(), "legacy_orders")
+	assert.Contains(t, err.Error(), "allow_unsafe")
+
+	_, _, err = svc.createStoredApply(t.Context(), primary, ApplyRequest{Environment: "production"},
+		map[string]string{"allow_unsafe": "true"}, "apply-unsafe-member-opted-in")
+	assert.NotContains(t, fmt.Sprint(err), "allow_unsafe",
+		"the opt-in the operator gave covers every member's plan")
 }

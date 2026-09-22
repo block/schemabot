@@ -1509,6 +1509,17 @@ func (s *Service) createStoredApply(
 	if err != nil {
 		return nil, 0, err
 	}
+	// Admission is per member, because the plan a member runs is the plan it was
+	// paired with. A member planned against its own live schema carries DDL the
+	// apply's plan does not, so the checks above clear the apply's plan and say
+	// nothing about that member's — and the tasks built below come from the
+	// member's. Members that run the apply's plan re-clear the same checks here,
+	// which is a no-op rather than a second verdict.
+	for _, member := range members {
+		if err := rejectUnapplyableMemberPlan(member, applyOpts); err != nil {
+			return nil, 0, err
+		}
+	}
 	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, members, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
 	if err != nil {
 		return nil, 0, err
@@ -1544,6 +1555,23 @@ func (s *Service) createStoredApply(
 	}
 
 	return apply, storedApplyID, nil
+}
+
+// rejectUnapplyableMemberPlan runs a rollout member's own plan through the same
+// admission checks the apply's plan cleared, naming the member so an operator
+// reading the refusal knows which target's plan carries the change rather than
+// looking for it in the plan they reviewed.
+//
+// Blocked changes reject before unsafe ones for the same reason they do there:
+// no opt-in can make a statement the engine refuses executable.
+func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOptions) error {
+	if err := member.Plan.BlockedApplyError(); err != nil {
+		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
+		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	return nil
 }
 
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
