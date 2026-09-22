@@ -160,7 +160,8 @@ type LocalConfig struct {
 	// optional direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
-	// (enable_experimental_autoscaling, checkpoint_max_age,
+	// (enable_experimental_autoscaling,
+	// enable_experimental_lockless_checksum, checkpoint_max_age,
 	// checksum_yield_timeout).
 	Metadata map[string]string
 

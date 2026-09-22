@@ -33,15 +33,31 @@ func TestSettingsFromMetadata(t *testing.T) {
 		{
 			name: "all overrides parse",
 			metadata: map[string]string{
-				MetadataEnableExperimentalAutoscaling: "false",
-				MetadataCheckpointMaxAge:              "24h",
-				MetadataChecksumYieldTimeout:          "6h",
+				MetadataEnableExperimentalAutoscaling:      "false",
+				MetadataEnableExperimentalLocklessChecksum: "true",
+				MetadataCheckpointMaxAge:                   "24h",
+				MetadataChecksumYieldTimeout:               "6h",
 			},
 			want: Settings{
-				EnableExperimentalAutoscaling: boolPtr(false),
-				CheckpointMaxAge:              24 * time.Hour,
-				ChecksumYieldTimeout:          6 * time.Hour,
+				EnableExperimentalAutoscaling:      boolPtr(false),
+				EnableExperimentalLocklessChecksum: true,
+				CheckpointMaxAge:                   24 * time.Hour,
+				ChecksumYieldTimeout:               6 * time.Hour,
 			},
+		},
+		{
+			name: "lockless checksum false parses to the default",
+			metadata: map[string]string{
+				MetadataEnableExperimentalLocklessChecksum: "false",
+			},
+			want: Settings{},
+		},
+		{
+			name: "invalid lockless checksum value errors",
+			metadata: map[string]string{
+				MetadataEnableExperimentalLocklessChecksum: "sure",
+			},
+			wantErr: MetadataEnableExperimentalLocklessChecksum,
 		},
 		{
 			name: "autoscaling true is preserved as an explicit value",
@@ -95,17 +111,20 @@ func TestNewResolvesSettings(t *testing.T) {
 		assert.Equal(t, DefaultCheckpointMaxAge, eng.checkpointMaxAge)
 		assert.Equal(t, DefaultChecksumYieldTimeout, eng.checksumYieldTimeout)
 		assert.True(t, eng.autoscaling)
+		assert.False(t, eng.locklessChecksum)
 	})
 
 	t.Run("overrides", func(t *testing.T) {
 		disabled := false
 		eng := New(Config{Settings: Settings{
-			EnableExperimentalAutoscaling: &disabled,
-			CheckpointMaxAge:              24 * time.Hour,
-			ChecksumYieldTimeout:          6 * time.Hour,
+			EnableExperimentalAutoscaling:      &disabled,
+			EnableExperimentalLocklessChecksum: true,
+			CheckpointMaxAge:                   24 * time.Hour,
+			ChecksumYieldTimeout:               6 * time.Hour,
 		}})
 		assert.Equal(t, 24*time.Hour, eng.checkpointMaxAge)
 		assert.Equal(t, 6*time.Hour, eng.checksumYieldTimeout)
 		assert.False(t, eng.autoscaling)
+		assert.True(t, eng.locklessChecksum)
 	})
 }

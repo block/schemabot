@@ -69,6 +69,7 @@ type Engine struct {
 	checkpointMaxAge     time.Duration
 	checksumYieldTimeout time.Duration
 	autoscaling          bool
+	locklessChecksum     bool
 
 	// onLog routes Spirit logs to the ApplyLogStore, with table context. It is
 	// swapped as drives hand the engine over and read from the log filter on
@@ -199,6 +200,7 @@ func New(cfg Config) *Engine {
 		checkpointMaxAge:     checkpointMaxAge,
 		checksumYieldTimeout: checksumYieldTimeout,
 		autoscaling:          autoscaling,
+		locklessChecksum:     cfg.Settings.EnableExperimentalLocklessChecksum,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 

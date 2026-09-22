@@ -33,6 +33,16 @@ type Settings struct {
 	// the operator kill switch when autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool
 
+	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
+	// reads, retries, and hot-range splitting instead of a checksum setup lock
+	// held over long-lived REPEATABLE READ snapshots. Cutover locking is
+	// unchanged either way. False — the zero value — is the default: a row
+	// updated continuously throughout the checksum is not yet supported, so
+	// the lockless checker can fail to converge where the snapshot one
+	// completes. Unlike the autoscaling kill switch this needs no tri-state,
+	// because absent and false both mean the same thing.
+	EnableExperimentalLocklessChecksum bool
+
 	// CheckpointMaxAge bounds how old a checkpoint may be and still be
 	// resumed. Zero defaults to DefaultCheckpointMaxAge.
 	CheckpointMaxAge time.Duration
@@ -47,9 +57,10 @@ type Settings struct {
 // translated into these keys, and a database's own metadata entry wins over
 // the server-level value.
 const (
-	MetadataEnableExperimentalAutoscaling = "enable_experimental_autoscaling"
-	MetadataCheckpointMaxAge              = "checkpoint_max_age"
-	MetadataChecksumYieldTimeout          = "checksum_yield_timeout"
+	MetadataEnableExperimentalAutoscaling      = "enable_experimental_autoscaling"
+	MetadataEnableExperimentalLocklessChecksum = "enable_experimental_lockless_checksum"
+	MetadataCheckpointMaxAge                   = "checkpoint_max_age"
+	MetadataChecksumYieldTimeout               = "checksum_yield_timeout"
 )
 
 // SettingsFromMetadata builds Settings from engine metadata key-value pairs.
@@ -65,6 +76,13 @@ func SettingsFromMetadata(metadata map[string]string) (Settings, error) {
 			return Settings{}, fmt.Errorf("parse %s %q: %w", MetadataEnableExperimentalAutoscaling, raw, err)
 		}
 		settings.EnableExperimentalAutoscaling = &enabled
+	}
+	if raw, ok := metadata[MetadataEnableExperimentalLocklessChecksum]; ok {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Settings{}, fmt.Errorf("parse %s %q: %w", MetadataEnableExperimentalLocklessChecksum, raw, err)
+		}
+		settings.EnableExperimentalLocklessChecksum = enabled
 	}
 	var err error
 	if settings.CheckpointMaxAge, err = parsePositiveDuration(metadata, MetadataCheckpointMaxAge); err != nil {

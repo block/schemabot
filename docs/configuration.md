@@ -813,9 +813,10 @@ defaults below.
 
 ```yaml
 spirit:
-  enable_experimental_autoscaling: true  # default: true
-  checkpoint_max_age: 72h                # default: 72h (3 days)
-  checksum_yield_timeout: 12h            # default: 12h
+  enable_experimental_autoscaling: true        # default: true
+  enable_experimental_lockless_checksum: true  # default: false
+  checkpoint_max_age: 72h                      # default: 72h (3 days)
+  checksum_yield_timeout: 12h                  # default: 12h
 ```
 
 The defaults, and why they were chosen:
@@ -829,6 +830,16 @@ The defaults, and why they were chosen:
   no operator knob for copy aggressiveness. Set
   `enable_experimental_autoscaling: false` only as an incident kill switch when
   autoscaling misbehaves on a target fleet.
+- **The copy is verified under the snapshot checksum** unless
+  `enable_experimental_lockless_checksum: true` is set. The lockless checker
+  verifies with optimistic reads, retries, and hot-range splitting instead of a
+  checksum setup lock held over long-lived `REPEATABLE READ` snapshots, which
+  keeps a long checksum from pinning InnoDB purge on the target. It defaults off
+  because a row updated continuously throughout the checksum is not yet
+  supported, so on such a table the lockless checker can fail to converge where
+  the snapshot one completes. Cutover locking is the same either way. Setting it
+  to `false` at the server level restates the default and overrides nothing, so
+  a database that opts itself in stays opted in.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
   the copy restarts cleanly instead of replaying days of old binlogs, which on
   a busy target is slower and riskier than starting over.
@@ -842,8 +853,9 @@ The defaults, and why they were chosen:
   the universally supported file+position source.
 
 A database can override the server-level value by setting the same key
-(`enable_experimental_autoscaling`, `checkpoint_max_age`,
-`checksum_yield_timeout`) in its own metadata; the database's entry wins.
+(`enable_experimental_autoscaling`, `enable_experimental_lockless_checksum`,
+`checkpoint_max_age`, `checksum_yield_timeout`) in its own metadata; the
+database's entry wins.
 
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
