@@ -63,7 +63,7 @@ func (s *Service) StopRemoteDeploymentHealthMonitor() {
 	s.remoteHealthMu.Unlock()
 
 	cancel()
-	s.remoteHealthWg.Wait()
+	s.drainMonitor(&s.remoteHealthWg, "remote_deployment_health")
 }
 
 // SetRemoteDeploymentHealthCheckInterval sets the background health check

@@ -421,15 +421,19 @@ anyone extending the test.
 A convergence of SchemaBot's own storage runs until it finishes, its budget expires (AV-11), or the
 person who asked for it stops it. Nothing else reaches it. A dropped connection, an abandoned
 request, a caller that went away: none of those is a decision about the storage every instance
-depends on, and none of them ends the DDL. A convergence an instance runs to start cannot be
-stopped by anything but its budget at all, because a start has nobody to decide otherwise. However
+depends on, and none of them ends the DDL. A convergence an instance runs to start has one thing
+besides its budget that can decide otherwise: the platform terminating that instance. That is a
+deliberate stop like an operator's, and it reaches the DDL as one, because the alternative is not
+the convergence finishing — it is the instance being killed at the end of its grace period with the
+copy abandoned mid-statement. However
 it ends, it releases rather than abandons: the statement in flight is cancelled and what it was
 building is reclaimed, statements that already finished stay finished, and what is left is what the
 next diff reports rather than something inferred from how far the run got. *Breaks if violated:* a
 network blip abandons a table copy partway through SchemaBot's own storage, leaving the schema
 between two releases with nobody watching and artifacts nobody owns. *Enforced:* by the signatures,
 in that the startup entry point accepts no caller context at all while the operator entry point
-takes one (`pkg/api/ensure_schema.go`, `pkg/api/storage_schema.go`), and in that the adapter
+takes one, so the only way to stop a boot's convergence is the option that names itself a stop
+signal (`pkg/api/ensure_schema.go`, `pkg/api/storage_schema.go`), and in that the adapter
 answering a remote convergence strips cancellation from the request's context before calling it
 (`pkg/serve/storage_schema.go`); behaviorally by
 `TestApplyStorageSchemaMySQL_StopsWhenItsCallerStops` and
@@ -438,6 +442,33 @@ require it to return having changed nothing rather than wait out its budget, and
 direction by `TestStorageSchemaAdapter_ADroppedConnectionDoesNotStopTheConvergence`, which hands the
 adapter an already-cancelled request context and requires the failure that comes back to be
 something other than that cancellation.
+
+### AV-14: An instance that is told to stop, stops
+
+Stopping is bounded from the moment the instance is told to, and startup is inside that: the
+signal that ends a running instance also ends one that is still bringing storage up, rather than
+waiting out a boot budget measured in minutes for a database the instance will never use. On the
+way down, every wait on background work carries a bound of its own, so shutdown ends when those
+bounds are spent rather than when the slowest goroutine decides to return. An instance that cannot
+finish starting exits non-zero rather than lingering, so the platform restarts it instead of
+routing to it.
+
+Stopping at a bound is safe because the instance is on its way out and nothing abandoned at one is
+lost: the work left behind stops when the process does, so the target it still holds is released by
+the exit itself. An apply whose driver did not return keeps its claim, which goes stale and is
+reclaimed by a peer on the same window that covers any driver that disappears (OW-3) — releasing it
+instead would be the unsafe move, since a peer would then be invited onto a target the exiting
+instance has not let go of. A claimed delivery is redelivered, a repair pass that did not finish is
+rerun by the next instance to start, and storage that was not converged is converged by whichever
+instance boots next. Waiting past the bound buys none of that back; it only delays the exit the
+recovery is waiting on.
+
+*Breaks if violated:* a single goroutine that never returns holds the instance open indefinitely, so
+a routine restart becomes an interrupted schema change with no bound on how long the target stays
+locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`,
+`pkg/api/shutdown.go`, `pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the
+signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
+in-flight storage convergence as the deliberate stop AV-13 permits.
 
 ## Merge gate (MG)
 

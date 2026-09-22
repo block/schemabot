@@ -141,6 +141,10 @@ type ensureSchemaOptions struct {
 	// watching. Nil on a boot, where the log already carries every statement
 	// and there is nobody to show anything to.
 	progress func(StorageConvergenceProgress)
+	// stop ends this convergence when it closes. Nil is a convergence nothing
+	// but its budget can end, which is every caller that has not been told to
+	// stop by something outside itself.
+	stop <-chan struct{}
 }
 
 // WithDestructiveSchemaChangePolicy controls whether EnsureSchema may execute
@@ -249,6 +253,27 @@ func WithConvergenceTimeout(d time.Duration) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.convergenceTimeout = d }
 }
 
+// WithStopSignal ends a convergence when stop closes, for the caller that can
+// be told to stop by something outside itself. On the startup path that is the
+// platform terminating the instance, and it is the only thing besides the
+// budget that reaches a boot's convergence (AV-13).
+//
+// This is a stop, not a context. A convergence is the one write every instance
+// depends on, so the thing that ends it has to be a decision rather than a
+// side effect, and a channel named for the decision cannot be satisfied by
+// threading through whatever context happened to be in scope. Pass a request's,
+// a webhook's, or an RPC's cancellation here and a network blip abandons a
+// table copy partway.
+//
+// Ending a convergence early is not a way to make it cheaper. A stop leaves
+// the statement in flight cancelled and its artifacts reclaimed, and the
+// statements that already finished still applied, so what it saves is the wait
+// — not the work, which the next instance to boot picks up where the next diff
+// finds it.
+func WithStopSignal(stop <-chan struct{}) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.stop = stop }
+}
+
 // WithConvergenceProgress reports a convergence as it runs, for the caller
 // that has somebody watching it.
 //
@@ -350,6 +375,8 @@ func ensureSchema(parent context.Context, dsn string, logger *slog.Logger, opts 
 	if o.convergenceTimeout < MinConvergenceTimeout {
 		return fmt.Errorf("converge storage schema: convergence timeout must be at least %s, got %s", MinConvergenceTimeout, o.convergenceTimeout)
 	}
+	parent, stopped := stoppableContext(parent, o.stop)
+	defer stopped()
 	switch o.dialect {
 	case schema.DialectMySQL:
 		return ensureMySQLSchema(parent, dsn, logger, o, namedlock.MySQL{})
@@ -357,6 +384,38 @@ func ensureSchema(parent context.Context, dsn string, logger *slog.Logger, opts 
 		return ensurePostgresSchema(parent, dsn, logger, o, namedlock.Postgres{})
 	default:
 		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
+	}
+}
+
+// stoppableContext folds a stop signal into the context a convergence runs on,
+// so every step already written to honor cancellation honors the stop too and
+// nothing on either bootstrapper has to learn about the channel.
+//
+// A nil stop is the common case and returns parent untouched, which is what
+// keeps the convergences that nobody can stop unstoppable: no goroutine, and no
+// second way for a context to end.
+//
+// The returned func must be called before the caller returns. It stops the
+// watcher, which would otherwise outlive a convergence that finished on its own
+// for as long as the stop stayed open — the whole life of a process, on the
+// startup path.
+func stoppableContext(parent context.Context, stop <-chan struct{}) (context.Context, func()) {
+	if stop == nil {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		<-watcherDone
 	}
 }
 
@@ -474,6 +533,10 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
 	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectMySQL, storageDatabase)
+
+	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectMySQL, storageDatabase, o.convergenceTimeout); err != nil {
+		return err
+	}
 
 	// Clean up stale Spirit internal tables only while holding the advisory
 	// lock. During a rolling deploy, another pod may be actively applying
@@ -718,9 +781,10 @@ func releaseStoppedConvergence(ctx context.Context, eng convergenceCanceller, ds
 // that fired is a database too slow to converge inside the time it was given,
 // and a cancellation is somebody deciding not to wait.
 //
-// Only the deliberate path can produce the second. A boot's convergence runs
-// on a context nothing but its own budget can end, so a pod that reports this
-// is reporting something that should not have been possible.
+// Only a deliberate stop can produce the second: an operator at a terminal, or
+// the platform terminating the instance a boot's convergence is running under.
+// Nothing else ends either context, so a pod that reports this is reporting
+// that it was told to stop, not that something went wrong with the storage.
 func convergenceStopReason(ctx context.Context, budget time.Duration, ddlCount int, logger *slog.Logger) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ensureSchemaTimeoutError(ctx, budget, ddlCount, logger)
@@ -756,6 +820,44 @@ func ensureSchemaTimeoutError(ctx context.Context, budget time.Duration, ddlCoun
 	)
 	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
 		budget, ddlCount, ctx.Err())
+}
+
+// ensureSchemaBudgetAfterLock stops a convergence that reached the front of the
+// advisory-lock queue with nothing left to converge under it. Reaching the
+// front is not the same as being able to use it: the wait and the work are
+// billed to the same budget, so a long enough queue hands an instance the lock
+// at the moment its budget is gone.
+//
+// Converging anyway is worse than stopping. It starts an online DDL that cannot
+// finish, on a context that is already done, so the failure surfaces as
+// whatever the driver says about a cancelled statement rather than as the queue
+// that actually consumed the budget — and the engine it started does not
+// necessarily stop when the outer lock is released, which is how work outlives
+// the lock that was serializing it. Stopping here holds neither: the caller's
+// deferred release hands the lock to the next instance in the queue
+// immediately, and a boot's retry loop opens the next attempt on a fresh
+// budget, which is the attempt that can actually succeed.
+func ensureSchemaBudgetAfterLock(ctx context.Context, logger *slog.Logger, dialect schema.Dialect, database string, budget time.Duration) error {
+	switch {
+	case ctx.Err() == nil:
+		return nil
+	case errors.Is(ctx.Err(), context.Canceled):
+		logger.Info("acquired the EnsureSchema advisory lock after the convergence was stopped; the lock is released without converging",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+		)
+		return fmt.Errorf("acquired advisory lock %q after the convergence was stopped: %w", ensureSchemaLockName, ctx.Err())
+	default:
+		logger.Warn("acquired the EnsureSchema advisory lock with no budget left to converge under it; the wait consumed the whole budget, so the lock is released for the next instance and this attempt converges nothing",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+			"budget", budget,
+		)
+		return fmt.Errorf("acquired advisory lock %q with no time left in the %s convergence budget, which the lock wait consumed: %w",
+			ensureSchemaLockName, budget, ctx.Err())
+	}
 }
 
 // refusedStorageChange is storage-schema DDL EnsureSchema refused to execute,

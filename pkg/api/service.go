@@ -151,11 +151,16 @@ type Service struct {
 	engineFactories map[string]tern.EngineFactory
 
 	// Operator loop management.
-	operatorMu           sync.Mutex
-	stopRecovery         chan struct{}
-	cancelRecovery       context.CancelFunc
-	operatorWake         chan struct{}
-	recoveryWg           sync.WaitGroup
+	operatorMu     sync.Mutex
+	stopRecovery   chan struct{}
+	cancelRecovery context.CancelFunc
+	operatorWake   chan struct{}
+	recoveryWg     sync.WaitGroup
+	// maintenanceWg holds the reaper passes, which share the driver lifecycle
+	// but claim nothing and drive nothing. They are waited on apart from the
+	// drivers so that a reaper which does not return cannot decide whether the
+	// stages that bring this process's own drives down get to run.
+	maintenanceWg        sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
 	retryableExpiryEvery time.Duration
