@@ -59,7 +59,7 @@ func normalizedMySQLDefault(col statement.Column) columnDefault {
 	}
 
 	value := *col.Default
-	if !col.DefaultIsString || isNumericColumn(col) {
+	if col.DefaultKind != statement.DefaultKindString || isNumericColumn(col) {
 		value = strings.TrimSpace(value)
 		if strings.EqualFold(value, "NULL") {
 			return columnDefault{}
@@ -146,22 +146,22 @@ func TestNormalizedMySQLDefault(t *testing.T) {
 		},
 		{
 			name: "string literal 'NULL' stays a present value",
-			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr("NULL"), DefaultIsString: true},
+			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr("NULL"), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: "NULL", present: true},
 		},
 		{
 			name: "char literal 'NULL' stays a present value",
-			col:  statement.Column{Type: "char", Length: intPtr(2), Default: strPtr("NULL"), DefaultIsString: true},
+			col:  statement.Column{Type: "char", Length: intPtr(2), Default: strPtr("NULL"), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: "NULL", present: true},
 		},
 		{
 			name: "string literal whitespace is preserved",
-			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr(" "), DefaultIsString: true},
+			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr(" "), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: " ", present: true},
 		},
 		{
 			name: "char literal whitespace is preserved",
-			col:  statement.Column{Type: "char", Length: intPtr(2), Default: strPtr(" "), DefaultIsString: true},
+			col:  statement.Column{Type: "char", Length: intPtr(2), Default: strPtr(" "), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: " ", present: true},
 		},
 		{
@@ -176,12 +176,12 @@ func TestNormalizedMySQLDefault(t *testing.T) {
 		},
 		{
 			name: "tinyint(1) quoted '0' folds to false",
-			col:  statement.Column{Type: "tinyint", Length: intPtr(1), Default: strPtr("0"), DefaultIsString: true},
+			col:  statement.Column{Type: "tinyint", Length: intPtr(1), Default: strPtr("0"), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: "false", present: true},
 		},
 		{
 			name: "bigint quoted '0' is a typed value not a string",
-			col:  statement.Column{Type: "bigint", Default: strPtr("0"), DefaultIsString: true},
+			col:  statement.Column{Type: "bigint", Default: strPtr("0"), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: "0", present: true},
 		},
 		{
@@ -206,12 +206,12 @@ func TestNormalizedMySQLDefault(t *testing.T) {
 		},
 		{
 			name: "varchar 'now()' literal does not fold",
-			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr("now()"), DefaultIsString: true},
+			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr("now()"), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: "now()", present: true},
 		},
 		{
 			name: "varchar 'TRUE' literal does not fold",
-			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr("TRUE"), DefaultIsString: true},
+			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr("TRUE"), DefaultKind: statement.DefaultKindString},
 			want: columnDefault{value: "TRUE", present: true},
 		},
 	}

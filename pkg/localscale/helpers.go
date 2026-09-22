@@ -162,7 +162,14 @@ func showCreateAllFromConn(ctx context.Context, conn *sql.Conn, opts ...table.Fi
 			return nil, fmt.Errorf("show create table %s: %w", name, err)
 		}
 		if optSet[table.WithStrippedAutoIncrement] {
-			createStmt = table.StripAutoIncrement(createStmt)
+			// An unstrippable counter is an error rather than a passthrough:
+			// returning the statement as-is would write one shard's counter
+			// into the schema this read produces.
+			stripped, err := table.StripAutoIncrement(createStmt)
+			if err != nil {
+				return nil, fmt.Errorf("strip auto-increment from %s: %w", name, err)
+			}
+			createStmt = stripped
 		}
 		result = append(result, table.TableSchema{Name: tbl, Schema: createStmt})
 	}

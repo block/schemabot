@@ -9,6 +9,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -562,8 +563,18 @@ func TestLocalClient_Health(t *testing.T) {
 	assert.NoError(t, client.Health(ctx), "Health() returned error")
 }
 
+// autoIncrementCounter matches the table-level AUTO_INCREMENT=N option together
+// with the blank separating it from the option before it, which is what
+// stripping removes.
+var autoIncrementCounter = regexp.MustCompile(`[ \t]*AUTO_INCREMENT=\d+`)
+
 // Pulling a live MySQL schema returns deterministic declarative files from the
 // data-plane database without preserving volatile AUTO_INCREMENT counters.
+//
+// The fixture is written to on purpose. MySQL only reports AUTO_INCREMENT=N on
+// a table whose sequence has moved, so a table that is created and never
+// inserted into emits no counter at all — and an assertion that the pulled file
+// carries none would then hold whether or not stripping ran.
 func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -588,8 +599,19 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	})
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL COMMENT 'login email', `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='users table'")
 	require.NoError(t, err, "create pull schema table")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `pull_schema_users` (`email`) VALUES ('pull@example.com')")
+	require.NoError(t, err, "advance the auto-increment sequence")
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users_archive_2026_06_12` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err, "create archive table")
+
+	// What the pulled file is measured against. Read after the insert, so the
+	// counter is in it; the test fails on this line rather than going quiet if
+	// a future server stops reporting one.
+	var liveTable, liveDDL string
+	require.NoError(t,
+		db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `pull_schema_users`").Scan(&liveTable, &liveDDL),
+		"show create table")
+	require.Contains(t, liveDDL, "AUTO_INCREMENT=", "the fixture must carry a counter for stripping to be exercised")
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	client, err := NewLocalClient(LocalConfig{
@@ -618,6 +640,14 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.Contains(t, ddl, "`email` varchar(255) NOT NULL")
 	assert.NotContains(t, ddl, "AUTO_INCREMENT=")
 	assert.True(t, strings.HasSuffix(ddl, "\n"), "pulled schema file should end with a newline")
+	// The counter is all that may differ. A pulled file is a repo artifact, so
+	// re-rendering the statement — reflowing it onto one line, recasing the
+	// keywords — rewrites every schema file on the next pull even where the
+	// table did not change. The column-level AUTO_INCREMENT attribute carries no
+	// `=`, so only the table option is removed here.
+	wantDDL := autoIncrementCounter.ReplaceAllString(liveDDL, "")
+	assert.Equal(t, wantDDL, strings.TrimRight(ddl, "\n"), "pulled file should be the live DDL minus its counter, byte for byte")
+	assert.Contains(t, wantDDL, "AUTO_INCREMENT,", "the column attribute survives: without it the ids stop generating")
 	assert.NotContains(t, pulledNamespace.Tables, "pull_schema_users_archive_2026_06_12")
 	require.NotNil(t, pulledNamespace.NamespaceCatalog)
 	assert.Equal(t, "testdb", pulledNamespace.NamespaceCatalog.Name)
@@ -659,8 +689,8 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.True(t, tableCatalog.Columns[0].AutoIncrement, "id column is AUTO_INCREMENT")
 	assert.False(t, tableCatalog.Columns[1].AutoIncrement, "email column is not AUTO_INCREMENT")
 	assert.False(t, tableCatalog.Columns[0].Generated, "id column is not generated")
-	// Size is an engine estimate; a freshly created InnoDB table always reports
-	// a non-zero data_length, so the field is wired even with no rows.
+	// Size is an engine estimate, not a row count, so this only shows the field
+	// is wired through.
 	assert.Positive(t, tableCatalog.DataSizeBytes, "table should report a non-zero size estimate at detailed")
 	assert.Empty(t, tableCatalog.ForeignKeys, "users table has no foreign keys")
 
