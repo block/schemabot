@@ -453,20 +453,22 @@ bounds are spent rather than when the slowest goroutine decides to return. An in
 finish starting exits non-zero rather than lingering, so the platform restarts it instead of
 routing to it.
 
-Stopping at a bound is safe because nothing abandoned at one is lost. An apply whose driver did not
-return keeps its claim, which goes stale and is reclaimed by a peer on the same window that covers
-any driver that disappears (OW-3) — releasing it instead would be the unsafe move, since a peer
-would then be invited onto a target the exiting instance has not let go of. A claimed delivery is
-redelivered, a repair pass that did not finish is rerun by the next instance to start, and storage
-that was not converged is converged by whichever instance boots next. Waiting past the bound buys
-none of that back; it only delays the exit the recovery is waiting on.
+Stopping at a bound is safe because the instance is on its way out and nothing abandoned at one is
+lost: the work left behind stops when the process does, so the target it still holds is released by
+the exit itself. An apply whose driver did not return keeps its claim, which goes stale and is
+reclaimed by a peer on the same window that covers any driver that disappears (OW-3) — releasing it
+instead would be the unsafe move, since a peer would then be invited onto a target the exiting
+instance has not let go of. A claimed delivery is redelivered, a repair pass that did not finish is
+rerun by the next instance to start, and storage that was not converged is converged by whichever
+instance boots next. Waiting past the bound buys none of that back; it only delays the exit the
+recovery is waiting on.
 
-*Breaks if violated:* an instance told to stop outlives its termination grace period and is killed
-mid-work, turning a routine restart into an interrupted schema change. *Enforced:* the bounded
-waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`, `pkg/api/shutdown.go`,
-`pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the signal-scoped startup context
-(`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an in-flight storage
-convergence as the deliberate stop AV-13 permits.
+*Breaks if violated:* a single goroutine that never returns holds the instance open indefinitely, so
+a routine restart becomes an interrupted schema change with no bound on how long the target stays
+locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`,
+`pkg/api/shutdown.go`, `pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the
+signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
+in-flight storage convergence as the deliberate stop AV-13 permits.
 
 ## Merge gate (MG)
 
