@@ -5046,7 +5046,7 @@ schemabot apply -e staging
 ```
 
 <details>
-<summary>Show logs (3 entries)</summary>
+<summary>Show apply logs (3 entries)</summary>
 
 ```text
 2026-03-15 14:22:00 UTC [INF] Apply dispatched to data plane [queued -> running]

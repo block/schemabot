@@ -50,17 +50,34 @@ const sectionChromeChars = 256
 // against it to skip loading entries that could never render.
 const MinFailureLogsSectionChars = 512
 
+// LogFoldCompanion says whether this fold is the only account of the apply in
+// the summary or renders beside the engine's. It decides the fold's name: on
+// its own the fold is the apply's logs and needs no qualifier, while beside
+// the engine-logs fold the pair has to say which account each one carries.
+type LogFoldCompanion bool
+
+const (
+	// LogFoldAlone is a summary whose only log fold is this one.
+	LogFoldAlone LogFoldCompanion = false
+	// LogFoldBesideEngineLogs is a summary that also carries the engine's own
+	// lines, read back from the data planes that ran the apply.
+	LogFoldBesideEngineLogs LogFoldCompanion = true
+)
+
 // RenderRecentFailureLogs renders the collapsed logs section appended to a
 // failed apply's summary comment, formatted like the CLI logs output
 // (timestamp, level tag, message, state transition). The fold is labeled
 // "Show logs" when it carries the apply's complete log history and "Show
 // recent logs" when it is a tail — hasOlder reports that entries older than
-// entries[0] exist but were not loaded. The section spends at most available characters —
+// entries[0] exist but were not loaded. When the engine-logs fold renders
+// beside it, both labels take the "apply logs" qualifier, so the pair reads as
+// the two accounts of one apply rather than as logs and something else. The
+// section spends at most available characters —
 // the room the rest of the comment leaves under GitHub's size limit, so a
 // large summary body shrinks the fold instead of pushing the comment over the
 // limit. Returns "" when there are no entries or no meaningful room, so the
 // summary renders unchanged.
-func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder bool) string {
+func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder bool, companion LogFoldCompanion) string {
 	if len(entries) == 0 {
 		return ""
 	}
@@ -75,9 +92,13 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder boo
 	}
 	lines, omitted := trimLogLinesToBudget(lines, budget-sectionChromeChars)
 
-	label := "Show logs"
+	kind := "logs"
+	if companion == LogFoldBesideEngineLogs {
+		kind = "apply logs"
+	}
+	label := "Show " + kind
 	if hasOlder || omitted > 0 {
-		label = "Show recent logs"
+		label = "Show recent " + kind
 	}
 	noun := "entries"
 	if len(lines) == 1 {

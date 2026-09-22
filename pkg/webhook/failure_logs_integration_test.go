@@ -199,12 +199,12 @@ func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	observer3.OnTerminal(&terminalEngine, []*storage.Task{engineTask})
 
 	engineSummary := waitForSummaryCreate(t, capture3)
-	assert.Contains(t, engineSummary, "<summary>Show logs (1 entry)</summary>")
+	assert.Contains(t, engineSummary, "<summary>Show apply logs (1 entry)</summary>")
 	assert.Contains(t, engineSummary, "<summary>Show engine logs (2 entries)</summary>")
 	assert.Contains(t, engineSummary, "[INF] [users] copy starting")
 	assert.Contains(t, engineSummary, "unsafe warning 1265: Data truncated for column 'nickname' at row 1")
 	assert.NotContains(t, engineSummary, "10.1.2.3:3306", "connection endpoints never reach the PR")
-	assert.Less(t, strings.Index(engineSummary, "Show logs ("), strings.Index(engineSummary, "Show engine logs ("))
+	assert.Less(t, strings.Index(engineSummary, "Show apply logs ("), strings.Index(engineSummary, "Show engine logs ("))
 
 	// Completed apply: the summary stays clean even though log entries exist.
 	completedApply := seedApply("done")

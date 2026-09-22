@@ -99,14 +99,19 @@ func failureLogsSections(ctx context.Context, stor storage.Storage, engineLogs E
 	// timeline must not be able to push them out. It is appended second,
 	// because the apply's own timeline is what sets the scene for them.
 	engineSection := engineFailureLogsSection(ctx, engineLogs, logger, apply, available/2)
-	applySection := applyFailureLogsSection(ctx, stor, logger, apply, available-len(engineSection))
+	companion := templates.LogFoldAlone
+	if engineSection != "" {
+		companion = templates.LogFoldBesideEngineLogs
+	}
+	applySection := applyFailureLogsSection(ctx, stor, logger, apply, available-len(engineSection), companion)
 	return applySection + engineSection
 }
 
 // applyFailureLogsSection renders the fold carrying SchemaBot's own log
 // stream for the apply: the state transitions it recorded and, for an apply
 // driven in this process, the engine lines that landed in the same storage.
-func applyFailureLogsSection(ctx context.Context, stor storage.Storage, logger failureLogsLogger, apply *storage.Apply, available int) string {
+// companion names the fold for what the summary carries beside it.
+func applyFailureLogsSection(ctx context.Context, stor storage.Storage, logger failureLogsLogger, apply *storage.Apply, available int, companion templates.LogFoldCompanion) string {
 	if available < templates.MinFailureLogsSectionChars {
 		logger.Debug("no room left for the apply-logs fold after the engine-logs fold; posting summary with engine logs only",
 			append(apply.LogAttrs(), "available_chars", available)...)
@@ -137,7 +142,7 @@ func applyFailureLogsSection(ctx context.Context, stor storage.Storage, logger f
 			NewState:  entry.NewState,
 		}
 	}
-	return templates.RenderRecentFailureLogs(entries, available, hasOlder)
+	return templates.RenderRecentFailureLogs(entries, available, hasOlder, companion)
 }
 
 // engineFailureLogsSection renders the fold carrying the engine's own lines,

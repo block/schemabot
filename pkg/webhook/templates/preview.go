@@ -2627,7 +2627,7 @@ func PreviewCommentSummaryFailed() string {
 	// could not be copied — stay in the server logs.
 	data.ErrorMessage = mysqlerr.ReasonFromText("(errno 1364)")
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false)
+		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false, LogFoldAlone)
 }
 
 // PreviewCommentSummaryFailedEngineLogs renders a failed summary for an apply
@@ -2647,7 +2647,7 @@ func PreviewCommentSummaryFailedEngineLogs() string {
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = mysqlerr.ReasonFromText("(errno 1265)")
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleRemoteFailureLogEntries("users", data.ErrorMessage), GitHubIssueCommentMaxChars/2, false) +
+		RenderRecentFailureLogs(sampleRemoteFailureLogEntries("users", data.ErrorMessage), GitHubIssueCommentMaxChars/2, false, LogFoldBesideEngineLogs) +
 		RenderEngineFailureLogs([]EngineLogSourceData{
 			{Deployment: "shard-a", Entries: sampleEngineFailureLogEntries("users", "nickname")},
 		}, GitHubIssueCommentMaxChars/2)
@@ -2723,7 +2723,7 @@ func PreviewCommentSummaryFailedLarge() string {
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), GitHubIssueCommentMaxChars, false)
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), GitHubIssueCommentMaxChars, false, LogFoldAlone)
 }
 
 // PreviewCommentSummaryMultiNamespaceFailed renders a failed summary with tables from multiple namespaces.
@@ -2738,7 +2738,7 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), GitHubIssueCommentMaxChars, false)
+		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), GitHubIssueCommentMaxChars, false, LogFoldAlone)
 }
 
 // PreviewCommentSummaryMultiNamespaceCompleted renders a completed summary with tables from multiple namespaces.

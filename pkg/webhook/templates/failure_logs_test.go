@@ -20,7 +20,7 @@ func TestRenderRecentFailureLogs(t *testing.T) {
 		{CreatedAt: at, Level: "info", Message: "Apply claimed by driver", OldState: "queued", NewState: "running"},
 		{CreatedAt: at.Add(3 * time.Second), Level: "warn", Message: "Copy throttled by replication lag"},
 		{CreatedAt: at.Add(9 * time.Second), Level: "error", Message: "Lost MySQL connection; retrying"},
-	}, GitHubIssueCommentMaxChars, false)
+	}, GitHubIssueCommentMaxChars, false, LogFoldAlone)
 
 	assert.Contains(t, rendered, "<details>")
 	assert.Contains(t, rendered, "<summary>Show logs (3 entries)</summary>")
@@ -39,15 +39,33 @@ func TestRenderRecentFailureLogsTailLabel(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	rendered := RenderRecentFailureLogs([]LogEntryData{
 		{CreatedAt: at, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"},
-	}, GitHubIssueCommentMaxChars, true)
+	}, GitHubIssueCommentMaxChars, true, LogFoldAlone)
 
 	assert.Contains(t, rendered, "<summary>Show recent logs (1 entry)</summary>")
+}
+
+// A summary that also carries the engine's own lines names both folds for the
+// account each one holds, so an operator choosing between them can tell which
+// is which. A summary with only this fold keeps the unqualified label: there
+// is nothing to distinguish it from.
+func TestRenderRecentFailureLogsNamesTheFoldBesideTheEngineFold(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	entries := []LogEntryData{
+		{CreatedAt: at, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"},
+	}
+
+	assert.Contains(t, RenderRecentFailureLogs(entries, GitHubIssueCommentMaxChars, false, LogFoldBesideEngineLogs),
+		"<summary>Show apply logs (1 entry)</summary>")
+	assert.Contains(t, RenderRecentFailureLogs(entries, GitHubIssueCommentMaxChars, true, LogFoldBesideEngineLogs),
+		"<summary>Show recent apply logs (1 entry)</summary>")
+	assert.Contains(t, RenderRecentFailureLogs(entries, GitHubIssueCommentMaxChars, false, LogFoldAlone),
+		"<summary>Show logs (1 entry)</summary>")
 }
 
 // TestRenderRecentFailureLogsEmpty verifies an apply with no log entries adds
 // nothing to the summary — no empty details block.
 func TestRenderRecentFailureLogsEmpty(t *testing.T) {
-	assert.Empty(t, RenderRecentFailureLogs(nil, GitHubIssueCommentMaxChars, false))
+	assert.Empty(t, RenderRecentFailureLogs(nil, GitHubIssueCommentMaxChars, false, LogFoldAlone))
 }
 
 // TestRenderRecentFailureLogsSanitizesUntrustedText verifies engine-supplied
@@ -60,7 +78,7 @@ func TestRenderRecentFailureLogsSanitizesUntrustedText(t *testing.T) {
 		{CreatedAt: at, Level: "error", Message: "line one\r\nline two\nline three"},
 		{CreatedAt: at.Add(time.Second), Level: "error", Message: "fence breakout ```\n# not a heading"},
 		{CreatedAt: at.Add(2 * time.Second), Level: "error", Message: "long run `````x"},
-	}, GitHubIssueCommentMaxChars, false)
+	}, GitHubIssueCommentMaxChars, false, LogFoldAlone)
 
 	assert.Contains(t, rendered, "[ERR] line one line two line three")
 	assert.Contains(t, rendered, "[ERR] fence breakout `` ` # not a heading")
@@ -82,7 +100,7 @@ func TestRenderRecentFailureLogsTrimsToSizeBudget(t *testing.T) {
 			Message:   strings.Repeat("x", 1000) + " #" + time.Duration(i).String(),
 		}
 	}
-	rendered := RenderRecentFailureLogs(entries, GitHubIssueCommentMaxChars, false)
+	rendered := RenderRecentFailureLogs(entries, GitHubIssueCommentMaxChars, false, LogFoldAlone)
 
 	require.Less(t, len(rendered), 65536, "rendered section must leave room inside GitHub's size limit")
 	assert.Contains(t, rendered, "<summary>Show recent logs (")
@@ -106,7 +124,7 @@ func TestRenderRecentFailureLogsShrinksToAvailableRoom(t *testing.T) {
 		}
 	}
 	available := 2000
-	rendered := RenderRecentFailureLogs(entries, available, false)
+	rendered := RenderRecentFailureLogs(entries, available, false, LogFoldAlone)
 
 	require.NotEmpty(t, rendered)
 	assert.LessOrEqual(t, len(rendered), available, "the section must fit in the room the summary body leaves")
@@ -123,9 +141,9 @@ func TestRenderRecentFailureLogsSkipsWhenNoRoom(t *testing.T) {
 	entries := []LogEntryData{
 		{CreatedAt: time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC), Level: "error", Message: "Apply failed"},
 	}
-	assert.Empty(t, RenderRecentFailureLogs(entries, 0, false))
-	assert.Empty(t, RenderRecentFailureLogs(entries, -500, false))
-	assert.Empty(t, RenderRecentFailureLogs(entries, MinFailureLogsSectionChars-1, false))
+	assert.Empty(t, RenderRecentFailureLogs(entries, 0, false, LogFoldAlone))
+	assert.Empty(t, RenderRecentFailureLogs(entries, -500, false, LogFoldAlone))
+	assert.Empty(t, RenderRecentFailureLogs(entries, MinFailureLogsSectionChars-1, false, LogFoldAlone))
 }
 
 // TestRenderRecentFailureLogsTruncatesSingleOversizedLine verifies one
@@ -140,7 +158,7 @@ func TestRenderRecentFailureLogsTruncatesSingleOversizedLine(t *testing.T) {
 		},
 	}
 	available := 4000
-	rendered := RenderRecentFailureLogs(entries, available, false)
+	rendered := RenderRecentFailureLogs(entries, available, false, LogFoldAlone)
 
 	require.NotEmpty(t, rendered)
 	assert.LessOrEqual(t, len(rendered), available, "a single oversized line must be truncated to the budget")
@@ -156,7 +174,7 @@ func TestRenderRecentFailureLogsRedactsEndpoints(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	rendered := RenderRecentFailureLogs([]LogEntryData{
 		{CreatedAt: at, Level: "error", Message: "dial tcp db-primary.internal:3306: connection refused"},
-	}, GitHubIssueCommentMaxChars, false)
+	}, GitHubIssueCommentMaxChars, false, LogFoldAlone)
 
 	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
 	assert.Contains(t, rendered, "[ERR] dial tcp [endpoint redacted]: connection refused")
@@ -166,7 +184,7 @@ func TestRenderRecentFailureLogsRedactsTabSeparatedPostgresIdentity(t *testing.T
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	rendered := RenderRecentFailureLogs([]LogEntryData{
 		{CreatedAt: at, Level: "error", Message: "\tALTER TABLE database\t\"orders\" DROP COLUMN legacy (SQLSTATE 42704)"},
-	}, GitHubIssueCommentMaxChars, false)
+	}, GitHubIssueCommentMaxChars, false, LogFoldAlone)
 
 	assert.Contains(t, rendered, "[ERR] \tALTER TABLE database \"[endpoint redacted]\" DROP COLUMN legacy (SQLSTATE 42704)")
 	assert.NotContains(t, rendered, "orders")
@@ -180,7 +198,7 @@ func TestRenderRecentFailureLogsStripsControlCharacters(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
 	rendered := RenderRecentFailureLogs([]LogEntryData{
 		{CreatedAt: at, Level: "error", Message: "red\x1b[31malert re\u202enamed.txt\u202c"},
-	}, GitHubIssueCommentMaxChars, false)
+	}, GitHubIssueCommentMaxChars, false, LogFoldAlone)
 
 	assert.Contains(t, rendered, "[ERR] redalert renamed.txt")
 	assert.NotContains(t, rendered, "\x1b", "ANSI escapes are stripped")

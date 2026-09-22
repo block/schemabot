@@ -69,11 +69,11 @@ func TestFailureLogsSectionsRendersBothFolds(t *testing.T) {
 
 	rendered := failureLogsSections(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply, "summary body")
 
-	assert.Contains(t, rendered, "<summary>Show logs (1 entry)</summary>")
+	assert.Contains(t, rendered, "<summary>Show apply logs (1 entry)</summary>")
 	assert.Contains(t, rendered, "Apply failed [running -> failed]")
 	assert.Contains(t, rendered, "<summary>Show engine logs (1 entry)</summary>")
 	assert.Contains(t, rendered, "[orders] unsafe warning 1265: Data truncated")
-	assert.Less(t, strings.Index(rendered, "Show logs ("), strings.Index(rendered, "Show engine logs ("),
+	assert.Less(t, strings.Index(rendered, "Show apply logs ("), strings.Index(rendered, "Show engine logs ("),
 		"the apply's own timeline reads before the engine's account of the failure")
 }
 
@@ -132,7 +132,7 @@ func TestFailureLogsSectionsReservesRoomForTheEngineFold(t *testing.T) {
 	base := "summary body"
 	rendered := failureLogsSections(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply, base)
 
-	assert.Contains(t, rendered, "Show recent logs (")
+	assert.Contains(t, rendered, "Show recent apply logs (")
 	assert.Contains(t, rendered, "[orders] unsafe warning 1265: Data truncated")
 	assert.LessOrEqual(t, len(base)+len(rendered), templates.GitHubIssueCommentMaxChars-commentChromeHeadroom)
 }
