@@ -323,7 +323,11 @@ Rules:
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
 
-`targets` and `deployments` both fan an environment out across several members, but they mean different things. The deployments of one environment are expected to hold the same schema, so a difference between them is drift to surface. The targets of one environment are each planned on their own, so a difference between them is ordinary.
+`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the same schema. What differs is what a difference between members means when one is found. The planning behavior described here arrives with the plan and apply work noted above; this release ships the config surface.
+
+The deployments of one environment are mirrors, so a difference between them is a fault: the plan under review was not written for the member that disagrees, and the check blocks rather than apply it.
+
+The targets of one environment are each planned against their own live schema, so a difference between them is the work to be done — a target added since the last change, a rollout that landed on some targets and not others. Blocking there would prevent the convergence that resolves it, so the check does not block. It does not block, but it is not silent either: a difference between targets is reported, because it is the first thing worth looking at.
 
 ## Environment Order
 
