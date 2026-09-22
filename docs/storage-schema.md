@@ -536,18 +536,40 @@ or converge as part of the deploy instead. PostgreSQL needs no such check: its
 bootstrap is additive-only on every release, so the notice answers from the
 dialect.
 
-A target too old to accept a named schema is refused rather than answered.
-`--release` and `--schema-dir` travel as request fields a release that predates
-them ignores, converging its own embedded schema instead and reporting success —
-so the CLI checks the schema the report says it used against the one you asked
-for, and fails the command when they differ. Upgrade that target, or address a
-release that carries the schema you are converging.
+A target too old to accept a named schema is refused rather than answered, and
+the two hops the request crosses refuse it differently.
+
+The server is what compares. `--release` and `--schema-dir` reach a data plane
+over gRPC, where a release that predates the fields drops them and works from
+its own embedded schema — silently, since that is what proto does with a field
+it does not know. The report says which schema it used, so the server checks
+that against the one you asked for. A convergence is checked *before* it runs,
+with a diff, because DDL cannot be taken back; it is checked again on the answer,
+because a deployment is many pods and a roll makes them different releases.
+Either refusal is a 502 naming the schema the target actually used.
+
+The CLI-to-server hop refuses earlier and says something else. That body is
+strictly decoded, so a SchemaBot server predating these fields rejects the
+request outright with a 400 about an unknown field, rather than ignoring them.
+The hop fails closed either way; the error just does not mention schemas.
+
+Upgrade that target, or address a release that carries the schema you are
+converging.
 
 The convergence gets no more permission than a boot: a statement that would drop
 a storage table or column is refused as it is at startup, and a PostgreSQL
-column shape the convergence will not run still stops the whole set. So a
-hand-assembled `--schema-dir` missing half its tables is refused rather than
-applied.
+column shape the convergence will not run still stops the whole set.
+
+What that does **not** cover is a `--schema-dir` missing files, and the two
+dialects fail it in opposite directions. On MySQL an omitted table reads as
+surplus, so the plan is full of drops and the convergence refuses them: the cost
+is a report that overstates what is surplus, and a table is only lost if someone
+then permits it. On PostgreSQL the convergence is additive-only and walks only
+the files it was given, so an omitted table is not reported at all — a set
+missing most of a release's tables converges cleanly and reports converged, for
+storage that is not ready. Point `--schema-dir` at a release's whole
+`pkg/schema/<dialect>` directory rather than at a hand-assembled subset;
+`--release` cannot get this wrong, because it fetches the directory whole.
 
 ## Deploying a release that changes the storage schema
 

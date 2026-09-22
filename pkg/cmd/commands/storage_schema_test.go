@@ -2,10 +2,12 @@ package commands
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -977,6 +979,39 @@ func TestStorageSchemaConfirmation_CrossReleaseNoticeWithoutABootPolicy(t *testi
 		"an additive-only bootstrap preserves surplus state whether or not the release says so")
 }
 
+// A policy this binary has no text for reads as unknown, not as survival.
+//
+// The CLI is versioned apart from the control plane it dials, and the policy
+// crosses the HTTP hop as an open string that the decoder passes through
+// verbatim — so a value only ever arrives here from a *newer* server, and the
+// set of them grows for as long as the field does. The producer is exhaustive
+// for the same reason; the consumer is the half an operator reads, so it is the
+// half where falling through to "your pre-applied state survives" would be
+// acted on.
+func TestStorageSchemaConfirmation_CrossReleaseNoticeWithAPolicyFromALaterRelease(t *testing.T) {
+	later := storageSchemaConfirmation(&apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:           "v1.4.0",
+		SchemaSource:      "the schema files of release v1.5.0 in block/schemabot",
+		BootRemovalPolicy: apitypes.BootRemovalPolicy("removes_after_grace"),
+	}, true)
+
+	assert.Contains(t, later, "could not be established")
+	assert.NotContains(t, later, "refuses to drop what it does not declare",
+		"a policy this binary cannot read must not resolve to the one that keeps what is applied here")
+	assert.NotContains(t, later, "this deployment permits",
+		"nor to the one that drops it")
+
+	preserves := storageSchemaConfirmation(&apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		Version:           "v1.4.0",
+		SchemaSource:      "the schema files of release v1.5.0 in block/schemabot",
+		BootRemovalPolicy: apitypes.BootRemovalPreserves,
+	}, true)
+	assert.Contains(t, preserves, "refuses to drop what it does not declare",
+		"and the policy that does mean survival still says so, so the default is not swallowing it")
+}
+
 // The notice describes what the fleet's own boots do, so it reads the
 // deployment's standing policy and never this command's flag.
 //
@@ -1165,4 +1200,71 @@ func TestStorageApplyCmd_RefusalIsReportedAsJSON(t *testing.T) {
 			assert.Equal(t, response.Planned, response.Remaining, "nothing ran, so what was planned is what is still outstanding")
 		})
 	}
+}
+
+// The schema an operator approves is the schema that converges, read once.
+//
+// A convergence resolves its selectors once and threads the result through the
+// preview, the confirmation and the apply. Reading them a second time opens a
+// window the operator cannot see: a tag that moves, or a checkout someone
+// edits or rebuilds while the prompt is waiting, and the file set that runs is
+// not the one the plan showed. The window is small and the consequence is not —
+// it is DDL nobody approved, against the storage database.
+//
+// A release is the case where the two reads are separated by a network, so the
+// count is what proves it. Asserting on the DDL instead would not: the two
+// reads sit next to each other in one call, so there is no seam for a test to
+// change the files through, and a second read of unchanged files is invisible
+// in what runs while still being a second read.
+func TestStorageApplyCmd_ResolvesTheNamedReleaseOnce(t *testing.T) {
+	var fetches int
+	releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches++
+		const directory = "pkg/schema/mysql"
+		path := strings.TrimPrefix(r.URL.Path, "/repos/example/schemabot/contents/")
+		if path == directory {
+			_, err := fmt.Fprintf(w, `[{"name":"applies.sql","path":%q,"type":"file"}]`, directory+"/applies.sql")
+			assert.NoError(t, err)
+			return
+		}
+		_, err := w.Write([]byte("CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(releases.Close)
+	t.Setenv("GITHUB_API_URL", releases.URL)
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+
+	const source = "the schema files of release v1.4.0 in example/schemabot"
+	report := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		SchemaSource: source,
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "create_table", DDL: "CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"},
+		},
+	}
+	converged := &apitypes.StorageSchemaReport{
+		Dialect: "mysql", Database: "schemabot", Host: "db-1.example",
+		SchemaSource: source, Converged: true,
+	}
+
+	var applied apitypes.StorageSchemaApplyRequest
+	endpoint, _ := storageSchemaTestServerRecording(t, report, report, converged, &applied)
+
+	answerPrompt(t, "yes")
+	var err error
+	captureStdout(func() {
+		cmd := StorageApplyCmd{}
+		cmd.Release = "v1.4.0"
+		cmd.Repo = "example/schemabot"
+		err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+	})
+	require.NoError(t, err)
+
+	// One listing and one file read. A second resolution would double both.
+	assert.Equal(t, 2, fetches,
+		"the release is fetched once and reused; fetching it again for the convergence is the moved-tag window")
+	assert.Equal(t, source, applied.SchemaSource)
+	assert.Contains(t, applied.SchemaFiles, "applies.sql",
+		"and the schema that was read is the schema that converges")
 }

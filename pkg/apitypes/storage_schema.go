@@ -69,8 +69,8 @@ type StorageSchemaReport struct {
 	Destructive []StorageSchemaStatement `json:"destructive,omitempty"`
 	// DestructiveAllowed reports whether the destructive statements run on this
 	// call: the deployment's standing policy, widened by an opt-in this caller
-	// sent. BootConvergesDestructively is the one to read for what some other
-	// process does.
+	// sent. BootRemovalPolicy is the one to read for what some other process
+	// does.
 	DestructiveAllowed bool                     `json:"destructive_allowed"`
 	Manual             []StorageSchemaStatement `json:"manual,omitempty"`
 	// BootRemovalPolicy is what the next pod to start does to storage state its

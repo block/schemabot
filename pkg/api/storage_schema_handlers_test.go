@@ -685,22 +685,25 @@ func TestStorageSchemaRoutes_RefuseHalfSuppliedSchema(t *testing.T) {
 // which leaves the report's own schema source as the only evidence: honored, it
 // echoes what was asked; ignored, it names the answering binary's schema.
 //
-// A diff read this way is attributed to a release it never compared against,
-// and a convergence is worse — the storage was converged to the wrong schema
-// and reported ready, and the gap surfaces when the named release's pods boot
-// into storage missing what they declare.
+// A diff read this way is attributed to a release it never compared against. A
+// convergence is worse, so a convergence is refused before it runs: the diff
+// that proves the target honors the schema costs a catalog read, and executed
+// DDL cannot be taken back. A target that ignored the schema did not ignore
+// allow_destructive along with it, so left to run it drops state its own older
+// schema does not declare.
 func TestStorageSchemaRoutes_RefuseAnAnswerAboutAnotherSchema(t *testing.T) {
 	const asked = "the schema files of release v1.5.0 in block/schemabot"
 
 	// What a release too old to accept a named schema answers: its own
-	// embedded schema, converged and reported as a success.
-	ignored := func(database string) *ternv1.StorageSchemaReport {
-		report := storageSchemaReportMessage(database)
+	// embedded schema, reported as a success.
+	ignored := func(outstanding ...string) *ternv1.StorageSchemaReport {
+		report := storageSchemaReportMessage("schemabot_storage", outstanding...)
 		report.SchemaSource = "the schema embedded in v1.4.0"
+		report.Host = "db-1.example"
 		return report
 	}
-	honored := func(database string) *ternv1.StorageSchemaReport {
-		report := storageSchemaReportMessage(database)
+	honored := func(outstanding ...string) *ternv1.StorageSchemaReport {
+		report := storageSchemaReportMessage("schemabot_storage", outstanding...)
 		report.SchemaSource = asked
 		return report
 	}
@@ -712,7 +715,7 @@ func TestStorageSchemaRoutes_RefuseAnAnswerAboutAnotherSchema(t *testing.T) {
 	t.Run("plan", func(t *testing.T) {
 		svc := newStorageSchemaService(t, &ServerConfig{})
 		svc.SetStorageSchemaService(&fakeStorageSchemaService{
-			planResp: &ternv1.StorageSchemaPlanResponse{Report: ignored("schemabot_storage")},
+			planResp: &ternv1.StorageSchemaPlanResponse{Report: ignored()},
 		})
 
 		rec := storageSchemaPlanRequestFor(t, svc, body)
@@ -722,29 +725,71 @@ func TestStorageSchemaRoutes_RefuseAnAnswerAboutAnotherSchema(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), "Upgrade that target")
 	})
 
-	t.Run("apply", func(t *testing.T) {
+	// The convergence is stopped by the diff in front of it, so the refusal
+	// costs the operator a catalog read rather than a reconciliation.
+	t.Run("apply refuses before converging", func(t *testing.T) {
 		svc := newStorageSchemaService(t, &ServerConfig{})
-		svc.SetStorageSchemaService(&fakeStorageSchemaService{
+		local := &fakeStorageSchemaService{
+			planResp: &ternv1.StorageSchemaPlanResponse{Report: ignored()},
 			applyResp: &ternv1.StorageSchemaApplyResponse{
-				Planned:   ignored("schemabot_storage"),
-				Remaining: storageSchemaReportMessage("schemabot_storage"),
+				Planned:   ignored("applies"),
+				Remaining: ignored(),
 			},
-		})
+		}
+		svc.SetStorageSchemaService(local)
 
 		rec := storageSchemaApplyRequest(t, svc, body)
 		assert.Equal(t, http.StatusBadGateway, rec.Code, "body: %s", rec.Body.String())
 		assert.Contains(t, rec.Body.String(), "the schema embedded in v1.4.0")
+		assert.Nil(t, local.applyReq, "the convergence must not have been attempted")
+		assert.NotContains(t, rec.Body.String(), "have already run",
+			"nothing ran, so the refusal must not send an operator reconciling")
+	})
+
+	// A deployment is many pods, and a roll makes them different releases, so
+	// the pod that answered the diff need not be the pod that converges. Here
+	// the DDL has run against the wrong schema, and the refusal has to say so
+	// and name what to reconcile rather than only naming the upgrade.
+	t.Run("apply refuses after a later pod ran it", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		ran := ignored("applies", "checks")
+		ran.DestructiveAllowed = true
+		ran.Destructive = []*ternv1.StorageSchemaStatement{{
+			Table:     "newer_release_state",
+			Operation: storageSchemaOpDropTable,
+			Ddl:       "DROP TABLE `newer_release_state`",
+			Reason:    "DROP TABLE destroys data",
+		}}
+		local := &fakeStorageSchemaService{
+			planResp: &ternv1.StorageSchemaPlanResponse{Report: honored()},
+			applyResp: &ternv1.StorageSchemaApplyResponse{
+				Planned:   ran,
+				Remaining: ignored(),
+			},
+		}
+		svc.SetStorageSchemaService(local)
+
+		rec := storageSchemaApplyRequest(t, svc, body)
+		assert.Equal(t, http.StatusBadGateway, rec.Code, "body: %s", rec.Body.String())
+		require.NotNil(t, local.applyReq, "the diff passed, so the convergence was attempted")
+		assert.Contains(t, rec.Body.String(), "the schema embedded in v1.4.0")
+		assert.Contains(t, rec.Body.String(), "3 statement(s) have already run",
+			"two outstanding and one permitted destructive statement executed")
+		assert.Contains(t, rec.Body.String(), "schemabot_storage on db-1.example",
+			"the database to reconcile has to be named, not left to the operator to work out")
+		assert.Contains(t, rec.Body.String(), "Reconcile that database")
 	})
 
 	// A target that echoes the schema it was asked about honored it, and is
-	// answered normally. Without this the guard would refuse every named
+	// answered normally. Without this the guards would refuse every named
 	// convergence rather than the ones that went wrong.
 	t.Run("honored", func(t *testing.T) {
 		svc := newStorageSchemaService(t, &ServerConfig{})
-		svc.SetStorageSchemaService(&fakeStorageSchemaService{
-			planResp:  &ternv1.StorageSchemaPlanResponse{Report: honored("schemabot_storage")},
-			applyResp: &ternv1.StorageSchemaApplyResponse{Planned: honored("schemabot_storage"), Remaining: honored("schemabot_storage")},
-		})
+		local := &fakeStorageSchemaService{
+			planResp:  &ternv1.StorageSchemaPlanResponse{Report: honored()},
+			applyResp: &ternv1.StorageSchemaApplyResponse{Planned: honored(), Remaining: honored()},
+		}
+		svc.SetStorageSchemaService(local)
 
 		plan := storageSchemaPlanRequestFor(t, svc, body)
 		require.Equal(t, http.StatusOK, plan.Code, "body: %s", plan.Body.String())
@@ -752,18 +797,41 @@ func TestStorageSchemaRoutes_RefuseAnAnswerAboutAnotherSchema(t *testing.T) {
 
 		apply := storageSchemaApplyRequest(t, svc, body)
 		require.Equal(t, http.StatusOK, apply.Code, "body: %s", apply.Body.String())
+		assert.Equal(t, asked, local.applyReq.GetSchemaSource(), "the schema still reaches the target")
+	})
+
+	// A target that cannot answer the diff has not said it honors the schema,
+	// which is not the same as saying it does. Converging anyway would run the
+	// DDL the diff exists to gate.
+	t.Run("apply refuses when the target cannot be asked", func(t *testing.T) {
+		svc := newStorageSchemaService(t, &ServerConfig{})
+		local := &fakeStorageSchemaService{
+			planErr: status.Error(codes.Unavailable, "connection refused"),
+			applyResp: &ternv1.StorageSchemaApplyResponse{
+				Planned:   honored(),
+				Remaining: honored(),
+			},
+		}
+		svc.SetStorageSchemaService(local)
+
+		rec := storageSchemaApplyRequest(t, svc, body)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "body: %s", rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "nothing was converged")
+		assert.Nil(t, local.applyReq, "an unanswered diff converges nothing")
 	})
 
 	// A request that named no schema asks about the target's own, so whatever
-	// the target says it used is the right answer by construction.
+	// the target says it used is the right answer by construction — and the
+	// convergence needs no diff in front of it.
 	t.Run("no schema named", func(t *testing.T) {
 		svc := newStorageSchemaService(t, &ServerConfig{})
-		svc.SetStorageSchemaService(&fakeStorageSchemaService{
-			planResp: &ternv1.StorageSchemaPlanResponse{Report: ignored("schemabot_storage")},
-		})
+		local := &fakeStorageSchemaService{
+			applyResp: &ternv1.StorageSchemaApplyResponse{Planned: ignored(), Remaining: ignored()},
+		}
+		svc.SetStorageSchemaService(local)
 
-		rec := storageSchemaPlanRequestFor(t, svc, "")
+		rec := storageSchemaApplyRequest(t, svc, "")
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-		assert.Equal(t, "the schema embedded in v1.4.0", decodePlanResponse(t, rec).Report.SchemaSource)
+		assert.Nil(t, local.planReq, "an unnamed convergence costs no extra diff")
 	})
 }

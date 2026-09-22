@@ -4196,8 +4196,8 @@ type StorageSchemaReport struct {
 	Destructive []*StorageSchemaStatement `protobuf:"bytes,5,rep,name=destructive,proto3" json:"destructive,omitempty"`
 	// Whether the destructive statements would actually run on this call. It is
 	// the effective policy: the deployment's standing one, widened by an opt-in
-	// this caller sent. Use boot_converges_destructively to reason about what
-	// some other process does, which a caller's opt-in never moves.
+	// this caller sent. Use boot_removal_policy to reason about what some other
+	// process does, which a caller's opt-in never moves.
 	DestructiveAllowed bool `protobuf:"varint,6,opt,name=destructive_allowed,json=destructiveAllowed,proto3" json:"destructive_allowed,omitempty"`
 	// Changes that cannot run automatically, each naming the situation and its
 	// remediation. Any entry aborts the whole convergence before a single

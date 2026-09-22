@@ -689,7 +689,22 @@ func crossReleaseConsequence(report *apitypes.StorageSchemaReport, running strin
   schema does not declare, which is every one of them until that release is
   deployed. Converge as part of the deploy rather than ahead of it.`, running, running)
 
-	case apitypes.BootRemovalUnknown:
+	case apitypes.BootRemovalPreserves:
+		return fmt.Sprintf(`  This is not the schema %s converges on boot. Until that release is deployed,
+  every pod that boots %s refuses to drop what it does not declare, so the
+  tables, columns and indexes applied here survive — and every one of those
+  boots logs a refused destructive change for them. A release from before
+  indexes were protected is the exception: its boots converge a surplus index
+  away. Re-run `+"`storage plan`"+` just before the deploy to confirm what you
+  applied is still there.`, running, running)
+
+	// Unknown, and every policy a later release adds that this binary has no
+	// text for. The CLI is versioned apart from the server it dials, so the
+	// values arriving here grow without it, and the default has to be the
+	// answer that claims nothing — survival is what an operator acts on by
+	// pre-applying, so it is never what a value this binary cannot read
+	// resolves to.
+	default:
 		return fmt.Sprintf(`  This is not the schema %s converges on boot, and what its pods do with the
   difference could not be established: this target was reached without a
   deployment config to read, or answered from a release that does not report
@@ -699,14 +714,6 @@ func crossReleaseConsequence(report *apitypes.StorageSchemaReport, running strin
   instead, or check %s's storage policy and re-run `+"`storage plan`"+` afterwards to
   see what survived.`, running, running)
 	}
-
-	return fmt.Sprintf(`  This is not the schema %s converges on boot. Until that release is deployed,
-  every pod that boots %s refuses to drop what it does not declare, so the
-  tables, columns and indexes applied here survive — and every one of those
-  boots logs a refused destructive change for them. A release from before
-  indexes were protected is the exception: its boots converge a surplus index
-  away. Re-run `+"`storage plan`"+` just before the deploy to confirm what you
-  applied is still there.`, running, running)
 }
 
 // storageSchemaConvergenceOutcome is whether a convergence counts as having

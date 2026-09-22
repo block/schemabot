@@ -339,8 +339,10 @@ operator-facing storage schema surface reads rather than reimplements (`pkg/api/
 the instance's own storage is the only target a remote caller can address, and the deployment's
 permission is only ever widened, in the adapter that answers for it (`pkg/serve/storage_schema.go`);
 and a named schema is refused apart from the files it names on every transport that carries one
-(`pkg/serve/storage_schema.go`), with the CLI additionally converging one only behind a confirmation
-it refuses to skip (`pkg/cmd/commands/storage_schema.go`).
+(`pkg/api/storage_schema_handlers.go`, `pkg/serve/storage_schema.go`), is not converged at all
+until the target has confirmed it would use it (`pkg/api/storage_schema_handlers.go`), and is
+converged by the CLI only behind a confirmation it refuses to skip
+(`pkg/cmd/commands/storage_schema.go`).
 
 ### AV-10: Anything the PR can do, the CLI can do
 
