@@ -333,6 +333,40 @@ legacy_baseline:
 `, string(config))
 }
 
+func TestOnboardRefreshPreservesLegacyBaselineAndExclusions(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte(`database: orders
+type: mysql
+ignore_namespaces:
+  - local_fixtures
+ignore_tables:
+  - flyway_schema_history
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - "#legacy.yaml"
+`), 0o600))
+	original, err := LoadCLIConfig(root)
+	require.NoError(t, err)
+	exclusions, err := preservedExclusions(root)
+	require.NoError(t, err)
+	baseline, err := resolveOnboardLegacyBaseline(root, "", nil)
+	require.NoError(t, err)
+	resp := validPullSchemaResponse()
+	resp.Namespaces["orders"].Tables["flyway_schema_history"] = "CREATE TABLE flyway_schema_history (id bigint);\n"
+	plan, err := buildOnboardWritePlanWithBaseline(root, resp, exclusions, baseline)
+	require.NoError(t, err)
+	assert.NotContains(t, plan.files, "orders/flyway_schema_history.sql")
+	assert.Contains(t, plan.files, "orders/users.sql")
+	assert.Equal(t, original.PlanExclusions(), plan.exclusions)
+	require.NoError(t, plan.write())
+	refreshed, err := LoadCLIConfig(root)
+	require.NoError(t, err)
+	assert.Equal(t, original.LegacyBaseline, refreshed.LegacyBaseline)
+	assert.Equal(t, original.PlanExclusions(), refreshed.PlanExclusions())
+}
+
 func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
 	pullNamespaces, err := onboardPullNamespaces([]string{"orders_production", "orders_audit_production"})
 	require.NoError(t, err)
