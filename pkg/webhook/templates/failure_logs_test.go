@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -324,5 +325,30 @@ func TestRenderFailureLogsSanitizesGroupHeadings(t *testing.T) {
 	}, GitHubIssueCommentMaxChars)
 
 	assert.Equal(t, 2, strings.Count(rendered, "```"))
-	assert.NotContains(t, rendered, strings.Repeat("z", maxGroupLabelChars+1))
+	assert.NotContains(t, rendered, strings.Repeat("z", MaxGroupLabelChars+1))
+}
+
+// A heading exists to tell two accounts apart, so the clamp that keeps it
+// inside the budget must not be the thing that makes them identical. Names
+// that identify a deployment or a target share long prefixes and differ at
+// the tail, so the middle goes rather than the end.
+func TestElideMiddleKeepsTheEndThatDistinguishes(t *testing.T) {
+	const max = MaxGroupLabelPartChars
+	third := ElideMiddle("payments-production-shard-003", max)
+	fourth := ElideMiddle("payments-production-shard-004", max)
+
+	assert.LessOrEqual(t, len(third), max)
+	assert.LessOrEqual(t, len(fourth), max)
+	assert.NotEqual(t, third, fourth, "two targets that differ only at the tail must not clamp to one name")
+	assert.True(t, strings.HasSuffix(third, "003"))
+	assert.True(t, strings.HasSuffix(fourth, "004"))
+	assert.Equal(t, "shard-a", ElideMiddle("shard-a", max), "a name that fits is left alone")
+
+	for _, name := range []string{"ααααααααααααα", "shard-ααααα-003", strings.Repeat("é", 40)} {
+		for budget := 1; budget <= max; budget++ {
+			elided := ElideMiddle(name, budget)
+			assert.LessOrEqual(t, len(elided), budget, "%q at %d", name, budget)
+			assert.True(t, utf8.ValidString(elided), "a clamp never splits a rune: %q at %d", name, budget)
+		}
+	}
 }

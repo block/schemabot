@@ -45,6 +45,9 @@ type stubStorage struct {
 	applies   storage.ApplyStore
 	applyLogs storage.ApplyLogStore
 	settled   []*storage.ApplyControlRequest
+	// settledReads counts the settled-control-request reads, so a test can
+	// pin that rendering a comment body twice still reads storage once.
+	settledReads *int
 }
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
@@ -68,7 +71,7 @@ func (s *stubApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
 
 func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
-	return stubControlRequestStore{settled: s.settled}
+	return stubControlRequestStore{settled: s.settled, reads: s.settledReads}
 }
 
 // stubControlRequestStore supplies the settled-control-request read the comment
@@ -76,9 +79,13 @@ func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
 type stubControlRequestStore struct {
 	storage.ControlRequestStore
 	settled []*storage.ApplyControlRequest
+	reads   *int
 }
 
 func (s stubControlRequestStore) ListSettled(context.Context, int64) ([]*storage.ApplyControlRequest, error) {
+	if s.reads != nil {
+		*s.reads++
+	}
 	return s.settled, nil
 }
 

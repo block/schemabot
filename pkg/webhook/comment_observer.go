@@ -744,14 +744,27 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
 	}
+	// Everything read from storage is resolved once, before the body is
+	// rendered: summaryWithFailureLogs can render it twice, and a best-effort
+	// read that failed on the second pass would silently drop a section from
+	// the body actually posted.
+	var released bool
+	var display map[int64]operationDisplay
+	var vschemaDiffs map[string]string
+	if opsErr == nil {
+		released = o.resolveReleased(apply, ops)
+		display = o.resolveDisplay(apply, ops)
+		vschemaDiffs = o.resolveVSchemaDiffs(apply, ops)
+	}
+	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
 	renderBody := func(apply *storage.Apply) string {
 		var body string
 		if opsErr != nil {
 			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 		} else {
-			body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, vschemaDiffs, o.tenant)
 		}
-		return body + controlRejectionSection(ctx, o.stor, o.logger, apply, body)
+		return body + renderControlRejections(rejections, o.logger, apply, body)
 	}
 	return summaryWithFailureLogs(ctx, o.stor, o.engineLogs, o.logger, apply, renderBody)
 }

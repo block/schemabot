@@ -98,10 +98,10 @@ func (s *Service) runEngineLogReads(ctx context.Context, apply *storage.Apply, r
 			source, err := s.engineLogSource(ctx, apply, read.client, read.deployment, read.fetch, limit)
 			switch {
 			case err != nil:
-				s.recordDeploymentLogFailure(apply, read.deployment, read.fetch, err)
+				s.recordDeploymentLogFailure(apply, engineLogsOperation, read.deployment, read.fetch, err)
 			case source == nil:
 				s.logger.Debug("data plane reported no engine lines for this apply",
-					append(apply.LogAttrs(), "operation", "read_engine_logs", "operation_deployment", read.deployment,
+					append(apply.LogAttrs(), "operation", engineLogsOperation, "operation_deployment", read.deployment,
 						"target", read.fetch.target, "external_id", read.fetch.externalID)...)
 			default:
 				results[i] = source
@@ -127,7 +127,7 @@ func (s *Service) runEngineLogReads(ctx context.Context, apply *storage.Apply, r
 // another deployment.
 func (s *Service) engineLogReadsForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) []engineLogRead {
 	attrs := func(extra ...any) []any {
-		return append(append(apply.LogAttrs(), "operation", "read_engine_logs", "operation_deployment", deployment), extra...)
+		return append(append(apply.LogAttrs(), "operation", engineLogsOperation, "operation_deployment", deployment), extra...)
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {

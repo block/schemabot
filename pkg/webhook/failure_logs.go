@@ -117,8 +117,19 @@ func summaryWithFailureLogs(ctx context.Context, stor storage.Storage, engineLog
 	}
 	groups := failureLogGroups(ctx, stor, engineLogs, logger, apply)
 	if pointed := applyPointingAtRenderedLogs(apply, groups); pointed != apply {
-		body = renderBody(pointed)
-		available = templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - len(body)
+		pointedBody := renderBody(pointed)
+		pointedRoom := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - len(pointedBody)
+		// The pointed sentence is longer than the one it replaces, so a body
+		// that only just cleared the check above can fail it now. Keeping the
+		// pointed body then would promise an account in the logs below and
+		// post no fold at all, so the original sentence stands instead — it
+		// names the server logs, which do have the reason.
+		if pointedRoom < templates.MinFailureLogsSectionChars {
+			logger.Error("pointing the failure summary at the rendered logs leaves no room for them under the GitHub comment size limit; keeping the reason that names the server logs",
+				append(apply.LogAttrs(), "summary_chars", len(pointedBody))...)
+		} else {
+			body, available = pointedBody, pointedRoom
+		}
 	}
 	return body + templates.RenderFailureLogs(groups, available)
 }
@@ -256,10 +267,14 @@ const engineLogGroupLabelPrefix = "engine logs: "
 // is part of the name whenever the source carries one: a deployment that
 // drives several targets produces a group per target, and without the target
 // an operator cannot tell which one raised the warning they are reading.
+//
+// Each name is clamped on its own rather than the joined label being cut to
+// length, so a deployment long enough to fill the heading cannot cost the
+// target beside it the characters that tell two targets apart.
 func engineLogGroupLabel(deployment, target string) string {
-	label := engineLogGroupLabelPrefix + deployment
+	label := engineLogGroupLabelPrefix + templates.ElideMiddle(deployment, templates.MaxGroupLabelPartChars)
 	if target != "" {
-		label += ", target: " + target
+		label += ", target: " + templates.ElideMiddle(target, templates.MaxGroupLabelPartChars)
 	}
 	return label
 }

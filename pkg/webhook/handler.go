@@ -706,10 +706,17 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			ops = nil
 		}
+		// Everything read from storage is resolved once, before the body is
+		// rendered: summaryWithFailureLogs can render it twice, and a
+		// best-effort read that failed on the second pass would silently drop
+		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
+		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops)
+		vschemaDiffs := resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops)
+		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
-			return body + controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, body)
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, vschemaDiffs, h.deploymentTenant())
+			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)

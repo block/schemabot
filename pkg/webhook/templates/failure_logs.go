@@ -70,10 +70,48 @@ type LogGroupData struct {
 	HasOlder bool
 }
 
-// maxGroupLabelChars bounds what one group heading costs the budget. A label
+// MaxGroupLabelChars bounds what one group heading costs the budget. A label
 // longer than this is clamped rather than allowed to eat the lines it exists
-// to introduce.
-const maxGroupLabelChars = 64
+// to introduce. A caller composing a label keeps it inside this by clamping
+// each of its parts with ElideMiddle, so the clamp here is a backstop.
+const MaxGroupLabelChars = 64
+
+// MaxGroupLabelPartChars bounds one name inside a composed group label — a
+// deployment or a target. A caller composing a label from several names clamps
+// each of them with ElideMiddle before joining, so the label arrives within
+// MaxGroupLabelChars and the heading's own clamp never has to cut it.
+const MaxGroupLabelPartChars = 20
+
+// ElideMiddle shortens text to at most maxBytes by replacing its middle with
+// an ellipsis, keeping both ends. Names that identify a deployment or a target
+// share long prefixes and differ at the tail, so cutting the tail off makes
+// two distinct names render identically — which is the one thing a heading
+// that exists to tell them apart must not do.
+func ElideMiddle(text string, maxBytes int) string {
+	const ellipsis = "…"
+	if len(text) <= maxBytes {
+		return text
+	}
+	if maxBytes <= len(ellipsis) {
+		return truncateToBytes(text, maxBytes)
+	}
+	keep := maxBytes - len(ellipsis)
+	head := keep / 2
+	tail := keep - head
+	return truncateToBytes(text, head) + ellipsis + tailBytes(text, tail)
+}
+
+// tailBytes returns the last maxBytes of text without splitting a UTF-8 rune.
+func tailBytes(text string, maxBytes int) string {
+	if len(text) <= maxBytes {
+		return text
+	}
+	cut := len(text) - maxBytes
+	for cut < len(text) && !utf8.RuneStart(text[cut]) {
+		cut++
+	}
+	return text[cut:]
+}
 
 // RenderFailureLogs renders the collapsed logs section appended to a failed
 // apply's summary comment, formatted like the CLI logs output (timestamp,
@@ -180,7 +218,7 @@ func groupsWithinBudget(groups []LogGroupData, available int) (kept []LogGroupDa
 // server configuration rather than from a log line, but it shares the fence
 // with text the engine wrote and nothing in it should be able to close it.
 func groupHeading(label string) string {
-	return "== " + truncateToBytes(sanitizeLogText(label), maxGroupLabelChars) + " =="
+	return "== " + truncateToBytes(sanitizeLogText(label), MaxGroupLabelChars) + " =="
 }
 
 // groupsWithEntries drops the groups that carried no line, so an account that

@@ -243,3 +243,84 @@ func TestSummaryWithFailureLogsLeavesAnAuthoredReasonAlone(t *testing.T) {
 	assert.Contains(t, rendered, "Error: "+authored)
 	assert.Contains(t, rendered, "== engine logs: region-a ==")
 }
+
+// One deployment can drive several targets whose names differ only at the
+// tail. The heading names both, and each name is clamped on its own, so a
+// long deployment cannot cost the target beside it the characters that tell
+// two groups apart — and the whole heading still fits its budget.
+func TestEngineLogGroupLabelKeepsLongTargetsDistinct(t *testing.T) {
+	const deployment = "payments-production-us-west-2"
+	third := engineLogGroupLabel(deployment, "payments-production-shard-003")
+	fourth := engineLogGroupLabel(deployment, "payments-production-shard-004")
+
+	assert.NotEqual(t, third, fourth)
+	assert.LessOrEqual(t, len(third), templates.MaxGroupLabelChars)
+	assert.LessOrEqual(t, len(fourth), templates.MaxGroupLabelChars)
+	assert.True(t, strings.HasPrefix(third, engineLogGroupLabelPrefix))
+	assert.Equal(t, "engine logs: region-a, target: cluster-a", engineLogGroupLabel("region-a", "cluster-a"),
+		"names that fit are left alone")
+	assert.Equal(t, "engine logs: region-a", engineLogGroupLabel("region-a", ""))
+}
+
+// The sentence pointing at the fold is longer than the one naming the server
+// logs, so a summary that only just had room for the fold can lose it to the
+// rewrite. Promising an account in the logs below and then posting no fold is
+// worse than the generic sentence, so the original stands in that case.
+func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWhenTheFoldWouldNotFit(t *testing.T) {
+	apply := failureLogsTestApply()
+	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
+	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
+	engineLogs := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+		return engineLogSource("region-a", "[orders] unsafe warning 1265: Data truncated"), nil
+	}
+	// A body that clears the room check by a margin narrower than the rewrite
+	// grows it: the unpointed body leaves exactly the minimum, the pointed one
+	// leaves less.
+	room := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - templates.MinFailureLogsSectionChars
+	pad := strings.Repeat("x", room-len(apply.ErrorMessage))
+	renderBody := func(apply *storage.Apply) string {
+		return pad + apply.ErrorMessage
+	}
+
+	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply, renderBody)
+
+	assert.Contains(t, rendered, mysqlerr.Generic+" (error 1265)")
+	assert.NotContains(t, rendered, "in the logs below", "the summary never promises a fold it does not carry")
+	assert.Contains(t, rendered, "<details>", "the fold the original body had room for still renders")
+}
+
+// Rendering the summary body twice must not read storage twice. A failed
+// apply's summary can be rendered again once the fold's contents are known, so
+// every section under the body is loaded before the first render and rendered
+// from the loaded value. A best-effort read that succeeded the first time and
+// failed the second would otherwise drop a section from the body posted.
+func TestSummaryCommentFromOpsReadsEachSectionOnce(t *testing.T) {
+	apply := failureLogsTestApply()
+	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
+	reads := 0
+	observer := &CommentObserver{
+		stor: &stubStorage{
+			ops:          &stubApplyOperationStore{},
+			applyLogs:    &stubApplyLogStore{logs: []*storage.ApplyLog{{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"}}},
+			settledReads: &reads,
+			settled: []*storage.ApplyControlRequest{{
+				Operation: storage.ControlOperationStop, Status: storage.ControlRequestFailed,
+				ErrorMessage: "the apply had already finished", RequestedBy: "example-operator",
+			}},
+		},
+		logger: failureLogsTestLogger(),
+		engineLogs: func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+			return engineLogSource("region-a", "[orders] unsafe warning 1265: Data truncated"), nil
+		},
+	}
+
+	body := observer.summaryCommentFromOps(t.Context(), apply, nil, nil, nil, nil)
+
+	assert.Equal(t, 1, reads, "the settled control requests are read once however often the body renders")
+	assert.Contains(t, body, "the apply had already finished", "the notice survives the second render")
+	// The summary escapes the reason for markdown, so the rendered sentence is
+	// matched by the part of it that carries no apostrophe.
+	assert.Contains(t, body, "account of it is in the logs below.", "the second render is what points at the fold")
+	assert.NotContains(t, body, "see the server logs for the reason")
+	assert.Contains(t, body, "== engine logs: region-a ==")
+}
