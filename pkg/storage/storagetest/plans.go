@@ -306,6 +306,77 @@ func TestPlans(t *testing.T, h Harness) {
 			"the re-plan reads the union across namespaces")
 	})
 
+	t.Run("RoundTripsDirectExecutionPolicy", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// The apply created from a plan runs under the policy the plan's
+		// execution verdicts were judged against, so the policy has to come
+		// back off the row rather than be resolved again from a configuration
+		// that has moved on since the review.
+		plan := &storage.Plan{
+			PlanIdentifier: "plan_direct_execution",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			DirectExecution: &storage.DirectExecutionPolicy{
+				Enabled:                       true,
+				MaxTableRows:                  10000,
+				LockAcquisitionTimeoutSeconds: 5,
+			},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		}
+		_, err := store.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_direct_execution")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, plan.DirectExecution, got.DirectExecution)
+	})
+
+	t.Run("DirectExecutionOptOutRoundTripsDistinctFromAbsent", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A plan judged under no grant recorded that answer. Only a plan
+		// stored before the column existed comes back with nothing, and that
+		// is the one case admission may resolve from configuration — so the
+		// two must not collapse into each other across the round-trip.
+		optedOut := &storage.Plan{
+			PlanIdentifier:  "plan_direct_execution_off",
+			Database:        "commerce",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+			DirectExecution: &storage.DirectExecutionPolicy{Enabled: false},
+			CreatedAt:       time.Now().UTC().Truncate(time.Second),
+		}
+		_, err := store.Plans().Create(ctx, optedOut)
+		require.NoError(t, err)
+
+		unstated := &storage.Plan{
+			PlanIdentifier: "plan_direct_execution_unstated",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Environment:    "staging",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		}
+		_, err = store.Plans().Create(ctx, unstated)
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_direct_execution_off")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, got.DirectExecution)
+
+		got, err = store.Plans().Get(ctx, "plan_direct_execution_unstated")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Nil(t, got.DirectExecution)
+	})
+
 	t.Run("EmptyPlanDataRoundTripsAsAbsent", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

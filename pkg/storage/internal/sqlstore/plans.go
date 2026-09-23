@@ -17,7 +17,7 @@ import (
 
 // planColumns lists all columns for SELECT queries.
 const planColumns = `id, plan_identifier, database_name, database_type,
-	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, created_at`
+	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at`
 
 // planListColumns matches planColumns except schema_files, which is replaced
 // by a NULL placeholder so the scan shape stays identical. schema_files holds
@@ -25,7 +25,7 @@ const planColumns = `id, plan_identifier, database_name, database_type,
 // listings never need it, so List leaves SchemaFiles unhydrated rather than
 // transferring megabytes per page.
 const planListColumns = `id, plan_identifier, database_name, database_type,
-	deployment, target, repository, pull_request, schema_path, environment, NULL AS schema_files, plan_data, head_sha, primary_plan_identifier, created_at`
+	deployment, target, repository, pull_request, schema_path, environment, NULL AS schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at`
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
@@ -48,10 +48,15 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 		return 0, fmt.Errorf("marshal schema files: %w", err)
 	}
 
+	directExecutionJSON, err := marshalPlanDirectExecution(plan.DirectExecution)
+	if err != nil {
+		return 0, fmt.Errorf("marshal plan direct execution policy: %w", err)
+	}
+
 	id, err := s.identity.InsertID(ctx, s.db, `
-		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.PrimaryPlanIdentifier, plan.CreatedAt)
+		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.PrimaryPlanIdentifier, directExecutionJSON, plan.CreatedAt)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
 			return 0, storage.ErrPlanIDExists
@@ -234,6 +239,7 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 	var plan storage.Plan
 	var schemaFilesJSON []byte
 	var planDataJSON []byte
+	var directExecutionJSON []byte
 
 	err := s.Scan(
 		&plan.ID,
@@ -250,6 +256,7 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 		&planDataJSON,
 		&plan.HeadSHA,
 		&plan.PrimaryPlanIdentifier,
+		&directExecutionJSON,
 		&plan.CreatedAt,
 	)
 	if err != nil {
@@ -271,7 +278,31 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 		plan.Shards = shardPlansFromNamespaces(plan.Namespaces)
 	}
 
+	// A NULL column is a plan stored before it existed. It reads back as no
+	// recorded policy, which is what sends admission to the configuration the
+	// way it resolved one before this column was written.
+	if len(directExecutionJSON) > 0 {
+		if err := json.Unmarshal(directExecutionJSON, &plan.DirectExecution); err != nil {
+			return nil, fmt.Errorf("unmarshal plan direct execution policy: %w", err)
+		}
+	}
+
 	return &plan, nil
+}
+
+// marshalPlanDirectExecution renders a plan's recorded policy for storage. No
+// recorded policy stores NULL rather than a JSON null, so the column reads
+// back as absent on every driver rather than as a four-byte literal one
+// driver decodes and another does not.
+func marshalPlanDirectExecution(policy *storage.DirectExecutionPolicy) (any, error) {
+	if policy == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(policy)
+	if err != nil {
+		return nil, err
+	}
+	return string(encoded), nil
 }
 
 func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespacePlanData {

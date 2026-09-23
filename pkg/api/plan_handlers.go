@@ -828,9 +828,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
 
 	route := storedPlanRoute{
-		DatabaseType: resolvedTarget.DatabaseType,
-		Deployment:   deployment,
-		Target:       resolvedTarget.Target,
+		DatabaseType:    resolvedTarget.DatabaseType,
+		Deployment:      deployment,
+		Target:          resolvedTarget.Target,
+		DirectExecution: resolvedDirectExecution(directExecution),
 	}
 	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
 		return nil, nil, err
@@ -925,6 +926,14 @@ type storedPlanRoute struct {
 	// round. Empty for the reviewed plan itself and for every plan of an
 	// environment whose members all run it.
 	PrimaryPlanIdentifier string
+
+	// DirectExecution is the policy this route's execution verdicts were
+	// judged under, stamped on the row so the apply that runs them runs under
+	// the same one. Nil records nothing, which reads back at admission as a
+	// plan whose policy the configuration still decides — so a producer that
+	// resolved an answer states it, disabled included, and only a producer
+	// with no answer to give leaves this unset.
+	DirectExecution *storage.DirectExecutionPolicy
 }
 
 // refuseDropsOfWithheldTables refuses a plan that proposes dropping a table the
@@ -993,6 +1002,23 @@ func quotedTableList(names []string) string {
 	return strings.Join(quoted, ", ")
 }
 
+// resolvedDirectExecution renders a policy the configuration resolved into the
+// form the plan row records. A resolver that returned nothing means no grant
+// was in force, and the plan records that as a disabled policy rather than as
+// nothing: a row holding nothing is read as one written before the column
+// existed and sends admission back to the configuration, which is exactly the
+// drift this record exists to remove.
+//
+// This is for producers that ran the resolver. A producer carrying a policy
+// forward from somewhere else passes it through unchanged, so a source that
+// itself recorded nothing stays recorded as nothing.
+func resolvedDirectExecution(policy *storage.DirectExecutionPolicy) *storage.DirectExecutionPolicy {
+	if policy == nil {
+		return &storage.DirectExecutionPolicy{Enabled: false}
+	}
+	return policy
+}
+
 func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
 	return s.storePlan(ctx, req, resp.PlanId, resp.Changes, resp.Shards, route)
 }
@@ -1049,6 +1075,7 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 		Shards:                storedShards,
 		HeadSHA:               headSHA,
 		PrimaryPlanIdentifier: route.PrimaryPlanIdentifier,
+		DirectExecution:       route.DirectExecution,
 		CreatedAt:             time.Now(),
 	}
 	storedPlan.RecordIgnoreTables(req.IgnoreTables)
@@ -1389,6 +1416,24 @@ func (s *Service) enqueueApply(
 	return apply.ApplyIdentifier, storedApplyID, nil
 }
 
+// applyDirectExecution resolves the policy an apply created from this plan
+// runs under. The plan's own record is authoritative: it is what the plan's
+// execution verdicts were computed against, and a configuration change
+// between review and apply must not move the statement to a different bound
+// than the one the operator saw. A plan stored before the column existed
+// recorded nothing, and falls back to configuration the way admission
+// resolved it then.
+func (s *Service) applyDirectExecution(plan *storage.Plan, environment string) (*storage.DirectExecutionPolicy, error) {
+	if plan.DirectExecution != nil {
+		return plan.DirectExecution, nil
+	}
+	policy, err := s.config.DirectExecutionPolicyFor(plan.Database, environment, plan.DatabaseType)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", plan.Database, environment, err)
+	}
+	return policy, nil
+}
+
 func (s *Service) createStoredApply(
 	ctx context.Context,
 	plan *storage.Plan,
@@ -1398,14 +1443,15 @@ func (s *Service) createStoredApply(
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
-	// The apply records the policy it was admitted under, from configuration
-	// and never from the caller's options. Recording it here is what lets the
-	// drive that eventually runs the statement — a later one, possibly on
-	// another pod or after this server has been reconfigured — route it under
-	// the policy this admission was judged against.
-	directExecution, err := s.config.DirectExecutionPolicyFor(plan.Database, req.Environment, plan.DatabaseType)
+	// The apply runs under the policy its plan's execution verdicts were
+	// judged under, never under one the caller named in its options.
+	// Recording it here is what lets the drive that eventually runs the
+	// statement — a later one, possibly on another pod or after this server
+	// has been reconfigured — route it under the policy the operator
+	// reviewed.
+	directExecution, err := s.applyDirectExecution(plan, req.Environment)
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", plan.Database, req.Environment, err)
+		return nil, 0, err
 	}
 	applyOpts.DirectExecution = directExecution
 	// Blocked changes reject before unsafe changes because no opt-in can make a
@@ -2055,6 +2101,13 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		DatabaseType: apply.DatabaseType,
 		Deployment:   deployment,
 		Target:       plan.Target,
+		// The rollback's plan records the same policy its request stated, so
+		// the apply admitted from it runs the reversal under the policy the
+		// forward change was admitted with rather than under one resolved
+		// again from a configuration that has moved on since. A source apply
+		// that recorded nothing carries nothing forward: its own dispatch
+		// deferred to the configuration, and the reversal does the same.
+		DirectExecution: apply.GetOptions().DirectExecution,
 	}
 	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
 		return nil, err
