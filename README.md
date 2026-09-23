@@ -85,14 +85,6 @@ To run the PR workflow for your team, deploy the server from [Releases](#release
 
 Follow progress, choose cutover timing, and pause, resume, cancel, or roll back where the engine supports it. Execution methods, throttling, and recovery differ by engine; the [capability matrix](./docs/engines.md) explains the choices.
 
-## Use your own databases
-
-Install a [release](#releases), then choose your setup:
-
-- [Start locally](./docs/cli.md#initialize-your-database): Import an existing schema and verify that the files match your database
-- [Set up the PR workflow](./docs/github-app-setup.md): Connect a GitHub App and configure the server for your databases
-- [Configure access and review policies](./docs/auth.md): Decide who can inspect schemas, approve changes, and run commands
-
 ## Docs
 
 Guides and reference:
@@ -100,6 +92,7 @@ Guides and reference:
 - [Vision](./docs/vision.md): See what we’re building toward
 - [Quick start](#quick-start): Try it on your machine
 - [Initialize a database](./docs/init.md): Connect a database you already have and start from its live schema
+- [Local examples](./examples/README.md): Run the demo and [connect to its MySQL databases](./examples/README.md#connect-to-mysql)
 - [Pre-merge workflow](./docs/pre-merge-workflow.md): Take a schema change from your first edit to a merged PR
 - [CLI guide](./docs/cli.md): Set up the CLI, inspect your databases, and run changes
 - [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
