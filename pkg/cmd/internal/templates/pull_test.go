@@ -302,6 +302,39 @@ func TestWritePullSchema_RendersBothOneSidedDifferences(t *testing.T) {
 	assert.Contains(t, out, "--   orders.receipts: extra")
 }
 
+// A server newer than the CLI reading it can report a difference this client
+// has no phrasing for. The row is still rendered, carrying the kind the server
+// sent, because dropping it would tell the operator that targets which disagree
+// about a table agree about it.
+func TestWritePullSchema_UnphrasedDifferenceIsStillReported(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  1,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			Targets: []*apitypes.TargetDivergence{
+				{Deployment: "eu", Target: "orders-001", TableCount: 1, Primary: true},
+				{Deployment: "eu", Target: "orders-002", TableCount: 2, DivergedTables: []apitypes.DivergedTable{
+					{Namespace: "orders", Table: "audits", Difference: "collation_only"},
+					{Namespace: "orders", Table: "users", Difference: apitypes.DivergenceDiffers},
+				}},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "--   orders.audits: collation_only",
+		"a difference this client cannot phrase carries the kind the server sent")
+	assert.Contains(t, out, "--   orders.users: differs",
+		"a difference alongside it is still phrased")
+	assert.Contains(t, out, "-- Target `orders-002` — 2 tables differ from the primary target",
+		"the unphrased table counts toward the target's divergence")
+}
+
 // A target name is opaque and only unique within its deployment, so two
 // deployments addressing the same name would render the same header twice. Such
 // a target is named by its full member identity so the operator can tell which
