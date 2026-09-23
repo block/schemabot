@@ -53,9 +53,10 @@ its polished experience for day-to-day operations.
 
 ## Skeema: schema diffing and linting
 
-[Skeema](https://github.com/skeema/skeema)'s schema differ and lint rules helped
-shape our thinking about declarative schema changes: work out the SQL needed to
-reach the desired schema, and catch problems before that SQL runs.
+[Skeema](https://github.com/skeema/skeema)'s schema differ, lint rules, and idea
+of showing the diff in a PR comment helped shape our thinking about declarative
+schema changes: work out the SQL needed to reach the desired schema, make it
+visible during review, and catch problems before that SQL runs.
 
 ## PlanetScale deploy requests: keep operators in control
 
