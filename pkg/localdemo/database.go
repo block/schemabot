@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/url"
@@ -195,7 +197,7 @@ func ready(ctx context.Context, engine, dsn string) error {
 	var db *sql.DB
 	var err error
 	if engine == "mysql" {
-		db, err = mysqlconn.Open(dsn)
+		db, err = mysqlconn.Open(dsn, func(cfg *mysql.Config) { cfg.Logger = log.New(io.Discard, "", 0) })
 	} else {
 		db, err = postgresconn.Open(dsn)
 	}
