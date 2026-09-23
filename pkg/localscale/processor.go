@@ -140,7 +140,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			// Without this, Vitess may leave schema changes in ready_to_complete indefinitely
 			// (e.g. after previous cancelled schema changes affect executor state in vtcombo).
 			if r.autoCutover && r.migrationContext != "" {
-				if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, "COMPLETE"); err != nil {
+				if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, migrationActionComplete); err != nil {
 					s.logger.Error("processor: auto-cutover COMPLETE failed", "number", r.number, "error", err)
 					continue
 				}
@@ -176,7 +176,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			// alterVitessMigrations issues per-UUID commands, so already-completed
 			// schema changes are safely ignored by Vitess.
 			if cutoverRequested && anyWaitingCutover(migrations) {
-				if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, "COMPLETE"); err != nil {
+				if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, migrationActionComplete); err != nil {
 					s.logger.Error("processor: COMPLETE schema changes failed", "number", r.number, "error", err)
 				}
 			}
@@ -239,7 +239,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 			// Re-issue CANCEL on every tick to handle the race where schema changes
 			// become visible after the initial cancel request.
-			if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, "CANCEL"); err != nil {
+			if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, migrationActionCancel); err != nil {
 				s.logger.Warn("processor: re-cancel schema changes", "number", r.number, "error", err)
 			}
 			migrations := s.getMigrationInfos(ctx, backend, r.migrationContext)
