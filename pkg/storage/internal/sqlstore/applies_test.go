@@ -535,6 +535,79 @@ func TestApplyStore_CreateWithGroupedOperationsAllowsTaskLessFinalizer(t *testin
 	assert.Equal(t, "commerce/group_finalizer", finalizer.OperationKey)
 }
 
+// A rollout member whose own plan found nothing to change has no task to carry,
+// and is recorded already completed so the apply covers every member it
+// addressed. CreateWithGroupedOperations must accept that converged member
+// alongside its working siblings: no driver will ever claim a terminal
+// operation, so it cannot be stranded by arriving empty.
+func TestApplyStore_CreateWithGroupedOperationsAllowsConvergedMember(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	now := time.Now()
+
+	apply := newGroupedCreateApply(now, "apply_grouped_converged_member")
+	groups := []*storage.ApplyOperationWithTasks{
+		newGroupedCreateGroup(now, "payments-a", "payments-001", "users"),
+		{Operation: &storage.ApplyOperation{
+			Deployment:    "payments-a",
+			OperationKey:  "payments-002",
+			OperationKind: storage.ApplyOperationKindWork,
+			Target:        "payments-002",
+			State:         state.ApplyOperation.Completed,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureHalt,
+			StartedAt:     &now,
+			CompletedAt:   &now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}},
+	}
+
+	applyID, err := store.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	require.NoError(t, err)
+
+	ops, err := store.ApplyOperations().ListByApply(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, ops, 2)
+	var converged *storage.ApplyOperation
+	for _, op := range ops {
+		if op.Target == "payments-002" {
+			converged = op
+		}
+	}
+	require.NotNil(t, converged, "the converged member must be recorded so the apply covers it")
+	assert.Equal(t, state.ApplyOperation.Completed, converged.State)
+	assert.Equal(t, storage.ApplyOperationKindWork, converged.OperationKind)
+}
+
+// A work operation that is still to be driven must carry its tasks. Without
+// them an operation-scoped drive would claim the operation and find nothing to
+// run, so it is refused at creation rather than stranding a driver.
+func TestApplyStore_CreateWithGroupedOperationsRejectsPendingWorkWithoutTasks(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	now := time.Now()
+
+	apply := newGroupedCreateApply(now, "apply_grouped_pending_no_tasks")
+	groups := []*storage.ApplyOperationWithTasks{
+		{Operation: &storage.ApplyOperation{
+			Deployment:    "payments-a",
+			OperationKey:  "payments-002",
+			OperationKind: storage.ApplyOperationKindWork,
+			Target:        "payments-002",
+			State:         state.ApplyOperation.Pending,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}},
+	}
+
+	_, err := store.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "grouped work operation has no tasks")
+}
+
 // TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeployment
 // proves the active-apply invariant covers every deployment a fan-out apply
 // owns, not just the parent's primary deployment. A non-terminal apply spanning

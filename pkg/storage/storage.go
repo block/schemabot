@@ -508,7 +508,10 @@ type ListPlansOptions struct {
 	// Since, when set, restricts results to plans created at or after this
 	// instant.
 	Since time.Time
-	// Limit bounds the number of plans returned and must be positive.
+	// Limit bounds the number of plans returned. It must be positive unless
+	// PrimaryPlanIdentifier names one review round, which bounds the listing to
+	// that round's member plans on its own; every other listing is open-ended
+	// and must say how many rows it wants.
 	Limit int
 }
 
@@ -539,8 +542,8 @@ type PlanStore interface {
 	// rationale). Returned plans omit SchemaFiles — the full desired-schema
 	// DDL is the bulk of a plan row and listings never need it; fetch a single
 	// plan via Get for the complete record. Returns an error when opts.Limit
-	// is not positive, or when opts.PullRequest is set without
-	// opts.Repository.
+	// is not positive and opts.PrimaryPlanIdentifier is unset, or when
+	// opts.PullRequest is set without opts.Repository.
 	List(ctx context.Context, opts ListPlansOptions) ([]*Plan, error)
 
 	// Delete removes a plan by ID.

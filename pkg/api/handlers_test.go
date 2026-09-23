@@ -200,7 +200,26 @@ type staticPlanStore struct {
 	storage.PlanStore
 	plan      *storage.Plan
 	plansByID map[int64]*storage.Plan
-	err       error
+	// memberPlans are the plans stored for the members of a review round,
+	// listed by the round the apply was created from.
+	memberPlans []*storage.Plan
+	err         error
+}
+
+func (s *staticPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if opts.PrimaryPlanIdentifier == "" {
+		return s.memberPlans, nil
+	}
+	var matched []*storage.Plan
+	for _, plan := range s.memberPlans {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
 }
 
 func (s *staticPlanStore) Get(context.Context, string) (*storage.Plan, error) {

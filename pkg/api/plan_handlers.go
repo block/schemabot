@@ -1505,7 +1505,22 @@ func (s *Service) createStoredApply(
 	taskChanges := applyTaskChanges(plan)
 	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, targets, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
+	members, err := s.resolveApplyMembers(ctx, plan, req.Environment, targets)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Admission is per member, because the plan a member runs is the plan it was
+	// paired with. A member planned against its own live schema carries DDL the
+	// apply's plan does not, so the checks above clear the apply's plan and say
+	// nothing about that member's — and the tasks built below come from the
+	// member's. Members that run the apply's plan re-clear the same checks here,
+	// which is a no-op rather than a second verdict.
+	for _, member := range members {
+		if err := rejectUnapplyableMemberPlan(member, applyOpts); err != nil {
+			return nil, 0, err
+		}
+	}
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, members, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1542,6 +1557,23 @@ func (s *Service) createStoredApply(
 	return apply, storedApplyID, nil
 }
 
+// rejectUnapplyableMemberPlan runs a rollout member's own plan through the same
+// admission checks the apply's plan cleared, naming the member so an operator
+// reading the refusal knows which target's plan carries the change rather than
+// looking for it in the plan they reviewed.
+//
+// Blocked changes reject before unsafe ones for the same reason they do there:
+// no opt-in can make a statement the engine refuses executable.
+func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOptions) error {
+	if err := member.Plan.BlockedApplyError(); err != nil {
+		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
+		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	return nil
+}
+
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
 	if applyOpts.AllowUnsafe {
 		return nil
@@ -1568,7 +1600,7 @@ func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
 func buildApplyOperationGroups(
 	plan *storage.Plan,
 	taskChanges []storage.TableChange,
-	targets []routing.ExecutionTarget,
+	members []applyMember,
 	environment string,
 	applyOpts storage.ApplyOptions,
 	cutoverPolicy string,
@@ -1579,8 +1611,9 @@ func buildApplyOperationGroups(
 	// instance-local sharded engine (Strata) produces those, so an
 	// externally-authoritative engine (e.g. PlanetScale) — whose plans never
 	// carry per-shard changes — is never fanned out, regardless of transport.
+	keys := newMemberOperationKeys(members)
 	if canBuildShardedOperationGroups(plan, taskChanges) {
-		groups, err := buildShardedApplyOperationGroups(plan, targets, environment, applyOpts, cutoverPolicy, onFailure, now)
+		groups, err := buildShardedApplyOperationGroups(plan, members, keys, environment, applyOpts, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1597,24 +1630,75 @@ func buildApplyOperationGroups(
 	// every keyspace in it, so splitting the namespaces across operations would
 	// have each drive validating keyspaces whose VSchema it never applied.
 	if len(taskChanges) == 0 && len(plan.VSchemaNamespaces()) > 0 {
-		groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
-		for _, target := range targets {
-			operation := newPendingApplyOperation(target, finalizerOperationKeySegment, cutoverPolicy, onFailure, now)
+		groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
+		for _, member := range members {
+			operationKey, err := keys.qualify(member, finalizerOperationKeySegment)
+			if err != nil {
+				return nil, false, err
+			}
+			operation := newPendingApplyOperation(member, plan, operationKey, cutoverPolicy, onFailure, now)
 			operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
 			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
 		}
 		return groups, false, nil
 	}
 
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
-	for _, target := range targets {
-		tasks := buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now)
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
+	for _, member := range members {
+		// A member planned on its own runs its own changes, not the apply plan's:
+		// its target holds a schema the apply plan never described.
+		memberChanges := applyTaskChanges(member.Plan)
+		tasks := buildApplyTasks(member.Plan, memberChanges, environment, applyOpts, "", now)
+		operationKey, err := keys.qualify(member, "")
+		if err != nil {
+			return nil, false, err
+		}
 		groups = append(groups, &storage.ApplyOperationWithTasks{
-			Operation: newPendingApplyOperation(target, "", cutoverPolicy, onFailure, now),
+			Operation: newPendingApplyOperation(member, plan, operationKey, cutoverPolicy, onFailure, now),
 			Tasks:     tasks,
 		})
 	}
+	settleConvergedMemberOperations(groups, now)
 	return groups, false, nil
+}
+
+// settleConvergedMemberOperations records the members that had nothing left to
+// run as completed at creation, once the rollout is known to have work
+// somewhere. A member planned on its own can already hold the reviewed change,
+// so its plan has nothing left to run, and it still belongs to the rollout:
+// dropping it would make the apply silently address fewer targets than the
+// operator asked for, while a pending work operation with no tasks can never be
+// driven and would halt the rollout. So it is recorded as the already-settled
+// work it is.
+//
+// "Already settled" only means anything against an apply that is going
+// somewhere. When no member has work, the apply has nothing to drive at all,
+// and settling its operations would turn that into an apply admitted with every
+// operation terminal before a driver ever saw it — holding the database lock
+// with nothing left to resolve it. An apply must keep at least one drivable
+// operation, so an empty one is left pending for storage to refuse.
+func settleConvergedMemberOperations(groups []*storage.ApplyOperationWithTasks, now time.Time) {
+	drivable := false
+	for _, group := range groups {
+		if len(group.Tasks) > 0 {
+			drivable = true
+			break
+		}
+	}
+	if !drivable {
+		return
+	}
+	for _, group := range groups {
+		if len(group.Tasks) > 0 {
+			continue
+		}
+		// Completed, but never started: no driver claimed it and nothing ran on
+		// its target. Leaving StartedAt unset is what distinguishes it from an
+		// apply that ran and finished instantly, and keeps it out of the
+		// earliest-start calculation the apply's progress summary makes.
+		group.Operation.State = state.ApplyOperation.Completed
+		group.Operation.CompletedAt = &now
+	}
 }
 
 // buildNamespaceFinalizerOperations builds one task-less group_finalizer per
@@ -1624,23 +1708,27 @@ func buildApplyOperationGroups(
 // synthetic task. A namespace with no shard work still gets a finalizer so its
 // VSchema change is never dropped.
 func buildNamespaceFinalizerOperations(
-	plan *storage.Plan,
-	target routing.ExecutionTarget,
+	applyPlan *storage.Plan,
+	member applyMember,
+	keys memberOperationKeys,
 	cutoverPolicy string,
 	onFailure string,
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
-	namespaces := plan.VSchemaNamespaces()
+	namespaces := member.Plan.VSchemaNamespaces()
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(namespaces))
 	for _, namespace := range namespaces {
 		if err := validateOperationKeyPart("namespace", namespace); err != nil {
 			return nil, err
 		}
-		operationKey := finalizerOperationKey(namespace)
+		operationKey, err := keys.qualify(member, finalizerOperationKey(namespace))
+		if err != nil {
+			return nil, err
+		}
 		if len(operationKey) > applyOperationKeyMaxLen {
 			return nil, fmt.Errorf("operation key for namespace %q finalizer exceeds %d characters", namespace, applyOperationKeyMaxLen)
 		}
-		operation := newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now)
+		operation := newPendingApplyOperation(member, applyPlan, operationKey, cutoverPolicy, onFailure, now)
 		operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
 		groups = append(groups, &storage.ApplyOperationWithTasks{
 			Operation: operation,
@@ -1671,24 +1759,31 @@ func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.Ta
 }
 
 func buildShardedApplyOperationGroups(
-	plan *storage.Plan,
-	targets []routing.ExecutionTarget,
+	applyPlan *storage.Plan,
+	members []applyMember,
+	keys memberOperationKeys,
 	environment string,
 	applyOpts storage.ApplyOptions,
 	cutoverPolicy string,
 	onFailure string,
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
-	shardsByNamespace := changingShardsByNamespace(plan.Shards)
-	namespaces := make([]string, 0, len(shardsByNamespace))
-	for namespace := range shardsByNamespace {
-		namespaces = append(namespaces, namespace)
-	}
-	sort.Strings(namespaces)
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(members)*(len(applyPlan.Shards)+1))
+	// One group per (member, operation key). A member is identified by its
+	// deployment and target together, so two targets of one deployment get their
+	// own groups instead of one member's shard work being folded into the other's.
+	groupsByMemberAndKey := make(map[string]*storage.ApplyOperationWithTasks)
+	for _, member := range members {
+		// A member planned on its own carries its own shards and changes; a member
+		// of a mirrored environment carries the apply's plan, so this is the same
+		// shard set for every member there.
+		shardsByNamespace := changingShardsByNamespace(member.Plan.Shards)
+		namespaces := make([]string, 0, len(shardsByNamespace))
+		for namespace := range shardsByNamespace {
+			namespaces = append(namespaces, namespace)
+		}
+		sort.Strings(namespaces)
 
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(plan.Shards)+1))
-	groupsByTargetAndKey := make(map[string]*storage.ApplyOperationWithTasks)
-	for _, target := range targets {
 		for _, namespace := range namespaces {
 			for _, shard := range shardsByNamespace[namespace] {
 				// Each shard is driven from its own changes; it is in
@@ -1705,30 +1800,75 @@ func buildShardedApplyOperationGroups(
 					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
 						return nil, err
 					}
-					operationKey := storage.ShardOperationKey(namespace, shard.Shard, ddlChange.Table)
+					operationKey, err := keys.qualify(member, storage.ShardOperationKey(namespace, shard.Shard, ddlChange.Table))
+					if err != nil {
+						return nil, err
+					}
 					if len(operationKey) > applyOperationKeyMaxLen {
 						return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
 					}
-					groupKey := target.Deployment + "\x00" + operationKey
-					group := groupsByTargetAndKey[groupKey]
+					groupKey := member.MemberID() + "\x00" + operationKey
+					group := groupsByMemberAndKey[groupKey]
 					if group == nil {
 						group = &storage.ApplyOperationWithTasks{
-							Operation: newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now),
+							Operation: newPendingApplyOperation(member, applyPlan, operationKey, cutoverPolicy, onFailure, now),
 						}
-						groupsByTargetAndKey[groupKey] = group
+						groupsByMemberAndKey[groupKey] = group
 						groups = append(groups, group)
 					}
-					group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
+					group.Tasks = append(group.Tasks, buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now))
 				}
 			}
 		}
-		finalizers, err := buildNamespaceFinalizerOperations(plan, target, cutoverPolicy, onFailure, now)
+		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, err
 		}
 		groups = append(groups, finalizers...)
 	}
 	return groups, nil
+}
+
+// memberOperationKeys decides how one apply's operation keys are qualified.
+//
+// An operation is unique on (apply, deployment, operation key), so a deployment
+// addressing several targets needs the target in the key or its members collide
+// on one row. A deployment addressing one target does not: its key is already
+// unique, and naming the target would change the shape of every key every
+// existing reader parses, for no gain. So the target leads the key exactly where
+// the deployment stops identifying the member — the same rule that decides
+// whether an operator sees a member named "eu" or "eu/shop-002".
+//
+// Keeping both shapes live is what makes widening the rule later a change to
+// this one predicate: readers already recover the scoped key by matching the
+// operation's own target rather than by counting components.
+type memberOperationKeys struct {
+	multiTargetDeployments map[string]bool
+}
+
+func newMemberOperationKeys(members []applyMember) memberOperationKeys {
+	targets := make([]routing.ExecutionTarget, len(members))
+	for i, member := range members {
+		targets[i] = member.Target
+	}
+	return memberOperationKeys{multiTargetDeployments: routing.MultiTargetDeployments(targets)}
+}
+
+// qualify returns the operation key for one member's scoped work. scopedKey is
+// the key within the member — a shard key, a finalizer key, or empty for work
+// covering the whole target.
+func (k memberOperationKeys) qualify(member applyMember, scopedKey string) (string, error) {
+	if !k.multiTargetDeployments[member.Target.Deployment] {
+		return scopedKey, nil
+	}
+	// The config that admits a target refuses the delimiter in its name, but a
+	// stored plan can carry a target from a config that no longer applies. A key
+	// that cannot be split back into the target it came from is not recoverable
+	// once written, so it is refused here too.
+	if err := validateOperationKeyPart("target", member.Target.Target); err != nil {
+		return "", err
+	}
+	return storage.TargetOperationKey(member.Target.Target, scopedKey), nil
 }
 
 func validateShardOperationKeyParts(namespace, shard, table string) error {
@@ -1748,8 +1888,8 @@ func validateShardOperationKeyParts(namespace, shard, table string) error {
 }
 
 func validateOperationKeyPart(label, value string) error {
-	if strings.Contains(value, "/") {
-		return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", label, value, "/")
+	if strings.Contains(value, storage.OperationKeyDelimiter) {
+		return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", label, value, storage.OperationKeyDelimiter)
 	}
 	return nil
 }
@@ -1775,18 +1915,28 @@ func finalizerOperationKey(namespace string) string {
 	return namespace + "/" + finalizerOperationKeySegment
 }
 
-func newPendingApplyOperation(target routing.ExecutionTarget, operationKey, cutoverPolicy, onFailure string, now time.Time) *storage.ApplyOperation {
-	return &storage.ApplyOperation{
-		Deployment:    target.Deployment,
+// newPendingApplyOperation builds one member's pending operation.
+//
+// applyPlan is the plan the apply itself was created from. PlanID is stamped
+// only when the member runs a different plan, so an operation names a plan of
+// its own exactly when it was planned on its own — every other operation runs
+// its apply's plan, which is what an unset PlanID already means.
+func newPendingApplyOperation(member applyMember, applyPlan *storage.Plan, operationKey, cutoverPolicy, onFailure string, now time.Time) *storage.ApplyOperation {
+	op := &storage.ApplyOperation{
+		Deployment:    member.Target.Deployment,
 		OperationKey:  operationKey,
 		OperationKind: storage.ApplyOperationKindWork,
-		Target:        target.Target,
+		Target:        member.Target.Target,
 		State:         state.ApplyOperation.Pending,
 		CutoverPolicy: cutoverPolicy,
 		OnFailure:     onFailure,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
+	if member.Plan != nil && applyPlan != nil && member.Plan.ID != applyPlan.ID {
+		op.PlanID = member.Plan.ID
+	}
+	return op
 }
 
 func buildApplyTasks(
