@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -88,7 +87,7 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	}
 	if !cmd.JSON {
 		heading := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1A7F37", Dark: "#3FB950"}).Render("✓ Sample database connected")
-		fmt.Printf("\n  %s\n  %s · Docker container %s\n  Your schema files will be saved in %s.\n\n", heading, cmd.Type, sample.Name, filepath.Join(project, cmd.SchemaDir))
+		fmt.Printf("\n  %s\n  Docker container: %s\n\n", heading, sample.Name)
 	}
 	return nil
 }
