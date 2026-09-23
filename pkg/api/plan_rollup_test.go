@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -573,6 +574,44 @@ func TestRollupDeploymentDiffs_ErroredMemberCarriesNoPlan(t *testing.T) {
 	assert.Empty(t, rollup.Entries[1].PlanFingerprint)
 	assert.Empty(t, rollup.Entries[1].ChangeSet.Changes)
 	assert.ErrorContains(t, rollup.Entries[1].Err, "deployment unreachable")
+}
+
+// A member's plan is stored after the rollup has already classified and keyed
+// it, so a storage failure reclassifies an entry that is by then carrying a
+// change set and a grouping key. That plan describes work which will now never
+// run — the member has no stored plan for an apply to dispatch — so the entry
+// sheds it along with the classification. An entry that kept its key would be
+// collected by a reader grouping on the raw value and rendered as a member
+// agreeing on a plan it cannot run.
+func TestPersistMemberPlans_StoreFailureLeavesTheMemberCarryingNoPlan(t *testing.T) {
+	alter := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers(alter)),
+		rollupDeployment("au", rollupAlterUsers(alter)),
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanIndependent)
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 2)
+	require.Equal(t, DeploymentPlanned, rollup.Entries[1].Class)
+	require.NotEmpty(t, rollup.Entries[1].PlanFingerprint, "the member must be carrying a plan for the clearing to be worth asserting")
+	require.True(t, rollup.Clean)
+
+	// A null change is refused while the plan is being converted for storage,
+	// which fails the store on its own without a storage that has to be made to
+	// fail.
+	diffs[1].Changes = []*ternv1.SchemaChange{nil}
+
+	s := &Service{logger: slog.New(slog.DiscardHandler)}
+	require.NoError(t, s.persistMemberPlans(t.Context(),
+		PlanRequest{Database: "testdb", Environment: "production"}, PlanIndependent, "plan-primary", diffs, &rollup))
+
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+	assert.Empty(t, rollup.Entries[1].PlanFingerprint)
+	assert.Empty(t, rollup.Entries[1].ChangeSet.Changes)
+	assert.Empty(t, rollup.Entries[1].PlanIdentifier)
+	assert.False(t, rollup.Clean, "a member with no stored plan must block the review")
+	assert.ErrorContains(t, rollup.Entries[1].Err, "store plan for rollout member")
 }
 
 // The member contract is enforced whatever the planning: independent planning

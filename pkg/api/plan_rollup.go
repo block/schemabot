@@ -120,6 +120,24 @@ type DeploymentRollupEntry struct {
 	PlanIdentifier string
 }
 
+// markErrored classifies a member as errored and drops the plan it was
+// carrying, so the errored contract the fields above describe holds however the
+// member got there.
+//
+// A member can be reclassified after the rollup has already keyed it: storing
+// its plan is a separate step that can fail, and by then the entry holds a
+// change set and a grouping key describing work that will now never run.
+// Clearing at the point of reclassification is what keeps the two fields from
+// outliving the classification that justified them — a reader grouping on the
+// raw key would otherwise collect this member under a plan it no longer has,
+// which is the outcome an empty key exists to prevent.
+func (e *DeploymentRollupEntry) markErrored(err error) {
+	e.Class = DeploymentErrored
+	e.Err = err
+	e.ChangeSet = tern.ChangeSet{}
+	e.PlanFingerprint = ""
+}
+
 // PlanRollup aggregates every rollout member's review-time classification for a
 // database. Clean means every member passed the contract it was classified
 // under: under PlanMirrored that each matches the reviewed plan, under
@@ -212,8 +230,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 		}
 		switch {
 		case d.Err != nil:
-			entry.Class = DeploymentErrored
-			entry.Err = d.Err
+			entry.markErrored(d.Err)
 			clean = false
 		case i == 0:
 			// The reviewed primary plan is the baseline. It matches itself only when
@@ -221,8 +238,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			// A producer error on the primary was already handled above, so a cause
 			// here is a content error.
 			if baselineCause != nil {
-				entry.Class = DeploymentErrored
-				entry.Err = fmt.Errorf("reviewed primary plan is not a usable baseline: %w", baselineCause)
+				entry.markErrored(fmt.Errorf("reviewed primary plan is not a usable baseline: %w", baselineCause))
 				clean = false
 			} else {
 				entry.Class = DeploymentMatch
@@ -231,8 +247,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			// Without a usable baseline no deployment can be confirmed to match, so
 			// every deployment blocks. Wrap the primary's root cause so each entry is
 			// self-contained for triage without cross-referencing the primary's.
-			entry.Class = DeploymentErrored
-			entry.Err = fmt.Errorf("primary reviewed plan is not a usable baseline, cannot confirm deployment matches the reviewed changes: %w", baselineCause)
+			entry.markErrored(fmt.Errorf("primary reviewed plan is not a usable baseline, cannot confirm deployment matches the reviewed changes: %w", baselineCause))
 			clean = false
 		case schema.DialectForDatabaseType(d.DatabaseType) != baselineDialect:
 			// Change sets canonicalized under different grammars cannot be compared:
@@ -242,16 +257,14 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			// producer stamps one database's single configured type onto every
 			// deployment, so a mixed-dialect rollup only reaches here through a
 			// producer bug or a hand-built result.
-			entry.Class = DeploymentErrored
-			entry.Err = fmt.Errorf("deployment database type %q (dialect %q) differs from the primary's %q (dialect %q); cannot compare change sets across dialects",
-				d.DatabaseType, schema.DialectForDatabaseType(d.DatabaseType), diffs[0].DatabaseType, baselineDialect)
+			entry.markErrored(fmt.Errorf("deployment database type %q (dialect %q) differs from the primary's %q (dialect %q); cannot compare change sets across dialects",
+				d.DatabaseType, schema.DialectForDatabaseType(d.DatabaseType), diffs[0].DatabaseType, baselineDialect))
 			clean = false
 		default:
 			diff, err := tern.CompareChangeSets(baselineDialect, baseline, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
 			switch {
 			case err != nil:
-				entry.Class = DeploymentErrored
-				entry.Err = err
+				entry.markErrored(err)
 				clean = false
 			case !diff.Empty():
 				entry.Class = DeploymentDiverged
@@ -299,8 +312,7 @@ func recordMemberPlan(entry *DeploymentRollupEntry, dialect schema.Dialect, cs t
 	}
 	fingerprint, err := tern.ChangeSetFingerprint(dialect, cs)
 	if err != nil {
-		entry.Class = DeploymentErrored
-		entry.Err = fmt.Errorf("member plan could not be keyed for grouping: %w", err)
+		entry.markErrored(fmt.Errorf("member plan could not be keyed for grouping: %w", err))
 		return false
 	}
 	entry.ChangeSet = cs
@@ -326,14 +338,12 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 		}
 		switch {
 		case d.Err != nil:
-			entry.Class = DeploymentErrored
-			entry.Err = d.Err
+			entry.markErrored(d.Err)
 			clean = false
 		default:
 			own := tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}
 			if _, err := tern.CompareChangeSets(schema.DialectForDatabaseType(d.DatabaseType), own, own); err != nil {
-				entry.Class = DeploymentErrored
-				entry.Err = fmt.Errorf("member plan is not usable: %w", err)
+				entry.markErrored(fmt.Errorf("member plan is not usable: %w", err))
 				clean = false
 			} else {
 				entry.Class = DeploymentPlanned

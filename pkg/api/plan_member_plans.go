@@ -78,8 +78,7 @@ func (s *Service) persistMemberPlans(ctx context.Context, req PlanRequest, plann
 				"target", entry.Target,
 				"plan_id", planIdentifier,
 				"error", err)
-			entry.Class = DeploymentErrored
-			entry.Err = fmt.Errorf("store plan for rollout member %s: %w", member.MemberID(), err)
+			entry.markErrored(fmt.Errorf("store plan for rollout member %s: %w", member.MemberID(), err))
 			rollup.Clean = false
 			continue
 		}
