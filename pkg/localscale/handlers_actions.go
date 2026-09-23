@@ -531,12 +531,18 @@ func (s *Server) showMigrations(ctx context.Context, backend *databaseBackend, m
 	return result, nil
 }
 
-// showMigrationsOnShard reads one shard's rows for a context.
+// showMigrationsOnShard reads one shard's rows for a context. Getting the
+// shard-targeted connection and reading it share one budget, so the whole read
+// is bounded rather than each of its round trips: the caller resolving a cancel
+// passes what is left of its own deadline, and that shorter one wins.
 func (s *Server) showMigrationsOnShard(
 	ctx context.Context,
 	backend *databaseBackend,
 	keyspace, shard, migrationContext string,
 ) ([]map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+
 	conn, cleanup, err := s.vtgateTargetConn(ctx, backend, keyspace, shard)
 	if err != nil {
 		return nil, fmt.Errorf("shard-targeted conn: %w", err)
@@ -545,16 +551,16 @@ func (s *Server) showMigrationsOnShard(
 	return showMigrationsOn(ctx, conn, migrationContext)
 }
 
-// showMigrationsOn reads one keyspace's rows within vitessQueryTimeout. The
-// scan shares the deadline with the query: rows are streamed, so a shard that
-// stops answering part way through blocks the scan exactly as it would block
-// the query.
 // rowQuerier is satisfied by both *sql.DB and the *sql.Conn a shard-targeted
 // read runs on, which has to stay one connection to keep its USE keyspace:shard.
 type rowQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// showMigrationsOn reads one target's rows within vitessQueryTimeout. The scan
+// shares the deadline with the query: rows are streamed, so a target that stops
+// answering part way through blocks the scan exactly as it would block the
+// query.
 func showMigrationsOn(ctx context.Context, db rowQuerier, migrationContext string) ([]map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
 	defer cancel()

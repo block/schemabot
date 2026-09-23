@@ -266,7 +266,15 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		return nil, nil, fmt.Errorf("invalid shard %s: %w", shard, err)
 	}
 
-	conn, err := backend.unscopedVtgateDB.Conn(ctx)
+	// Acquiring the connection and targeting the shard are both round trips to
+	// vtgate, so they carry their own deadline rather than the caller's lifetime:
+	// a vtgate that accepts a connection and then stops answering must not hold
+	// the caller indefinitely before it has a statement to time out. A shorter
+	// deadline already on ctx still wins.
+	setupCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+
+	conn, err := backend.unscopedVtgateDB.Conn(setupCtx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get vtgate connection: %w", err)
 	}
@@ -278,7 +286,7 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("invalid shard target %s: %w", target, err)
 	}
-	if _, err := conn.ExecContext(ctx, "USE "+quoteIdentifier(target)); err != nil {
+	if _, err := conn.ExecContext(setupCtx, "USE "+quoteIdentifier(target)); err != nil {
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("target shard %s: %w", target, err)
 	}
