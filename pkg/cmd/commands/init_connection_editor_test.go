@@ -133,3 +133,35 @@ func TestInitConnectionScreenStates(t *testing.T) {
 	require.NotContains(t, connected, "retry")
 	require.NotContains(t, connected, "secret")
 }
+
+func TestInitPasteBackToConnectionChoices(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop"}, "default", io.Discard)
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, "paste", m.connectionEditor.mode)
+	m.input.SetValue("mysql://demo:private-password@localhost/shop")
+	require.Contains(t, stripANSI(m.View()), "shift+tab back")
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, "menu", m.connectionEditor.mode)
+	require.Equal(t, 3, m.step)
+	require.False(t, m.cancelled)
+	require.NotContains(t, m.View(), "private-password")
+	wizardKey(m, tea.KeyDown)
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, "details", m.connectionEditor.mode)
+	require.Contains(t, m.View(), "Host")
+}
+
+func TestInitReferenceEntryCursorStartsAtEnd(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop"}, "default", io.Discard)
+	wizardKey(m, tea.KeyDown)
+	wizardKey(m, tea.KeyDown)
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, "reference", m.connectionEditor.mode)
+	require.Equal(t, "env:DATABASE_URL", m.input.Value())
+	require.Equal(t, len([]rune(m.input.Value())), m.input.Position())
+	require.NotContains(t, m.View(), "Choose a connection source")
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("_TEST")})
+	require.Equal(t, "env:DATABASE_URL_TEST", m.input.Value())
+}

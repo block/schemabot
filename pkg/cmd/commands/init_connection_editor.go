@@ -131,6 +131,7 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 				if strings.HasPrefix(m.input.Value(), "draft:") {
 					m.input.SetValue("env:DATABASE_URL")
 				}
+				m.input.CursorEnd()
 			}
 			return true, textinput.Blink
 		}
@@ -225,26 +226,26 @@ func (m *initWizard) connectionEditorView() string {
 		labels := []string{"Host", "Port", "Database", "Username", "Password (hidden; Enter for none)"}
 		b.WriteString(labels[e.detail] + "\n\n" + m.input.View())
 	case "reference":
-		b.WriteString("Use env:VARIABLE or file:/absolute/path.\nThe file should contain only the connection string.\n\n" + m.input.View() + "\n\n" + m.connectionSummary)
+		b.WriteString("Use env:VARIABLE or file:/absolute/path.\nThe file should contain only the connection string.\n\n" + m.input.View())
 	case "ready":
 		b.WriteString(m.connectionSummary)
 	}
 	if e.mode == "menu" {
 		return b.String()
 	}
-	help := "enter continue · shift+tab edit · esc cancel"
+	help := "enter continue · shift+tab back · esc cancel"
 	if e.mode == "ready" || e.mode == "reference" {
 		switch {
 		case m.checkingConnection:
 			b.WriteString("\n\n" + m.spinner.View() + " Checking connection…")
-			help = "shift+tab edit · esc cancel"
+			help = "shift+tab back · esc cancel"
 		case m.err != "":
 			b.WriteString("\n\n" + failure.Render(initConnectionFailure(m.err)))
-			help = "enter retry · shift+tab edit · esc cancel"
+			help = "enter retry · shift+tab back · esc cancel"
 		case m.connectionChecked:
 			b.WriteString("\n\n" + success.Render("✓ Connected"))
 		default:
-			help = "enter check connection · shift+tab edit · esc cancel"
+			help = "enter check connection · shift+tab back · esc cancel"
 		}
 	} else if m.err != "" {
 		b.WriteString("\n\n" + failure.Render(m.err))

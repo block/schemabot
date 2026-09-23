@@ -291,7 +291,7 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 func (m *initWizard) contentView() string {
 	if m.cancelled {
-		return "\n  Setup cancelled. Come back whenever you’re ready.\n"
+		return "\n  Setup cancelled.\n"
 	}
 	blue := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	bold := m.renderer.NewStyle().Bold(true)
@@ -315,8 +315,8 @@ func (m *initWizard) contentView() string {
 			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String() + m.storageChoiceView())
 		}
 		if m.step == 0 {
-			b.WriteString(bold.Render("Let’s bring your database into SchemaBot.") + "\n\n")
-			b.WriteString(wrap.Render("We’ll turn your live schema into files and verify they match. Your application’s tables and existing files stay untouched.") + "\n\n")
+			b.WriteString(bold.Render("Let’s connect your database.") + "\n\n")
+			b.WriteString(wrap.Render("Connect your database, bring its schema into your project, and get ready for your first change. Your existing tables and files stay as they are.") + "\n\n")
 		} else if m.step != 3 && m.step != 4 {
 			b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
 		}
@@ -363,7 +363,7 @@ func (m *initWizard) contentView() string {
 			help = "↑/↓ choose · enter continue · esc cancel"
 		}
 		if m.step == 5 && !m.explicitNamespaces {
-			help = "shift+tab edit connection · esc cancel"
+			help = "shift+tab back · esc cancel"
 		}
 		b.WriteString(muted.Render(help))
 	} else {
@@ -390,7 +390,7 @@ func (m *initWizard) contentView() string {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}
 		b.WriteString("\n" + wrap.Render("We’ll prepare SchemaBot’s state and verify your schema files. We won’t change your application’s schema.") + "\n\n")
-		b.WriteString(blue.Render("enter connect and verify") + muted.Render(" · shift+tab edit · esc cancel"))
+		b.WriteString(blue.Render("enter connect and verify") + muted.Render(" · shift+tab back · esc cancel"))
 	}
 	return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
 }
@@ -402,7 +402,7 @@ func (m *initWizard) View() string {
 	if len(lines) > m.height-2 {
 		available := m.height - 4
 		offset := min(m.scroll, len(lines)-available)
-		content = strings.Join(lines[offset:offset+available], "\n") + "\n" + wrap.Render("  pgup/pgdown scroll · esc cancel")
+		content = strings.Join(lines[offset:offset+available], "\n") + "\n" + wrap.Render("  pgup/pgdown scroll · shift+tab back · esc cancel")
 	}
 	return "\n" + content + "\n"
 }
