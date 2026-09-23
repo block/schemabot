@@ -46,22 +46,26 @@ func classifyRunnerError(err error) error {
 // the instance vCPU count) and, when autoscaling is enabled, scale
 // dynamically from there on throttler feedback, so apply throughput tracks
 // the target instance rather than a fixed constant.
+//
+// The copy is verified under the snapshot checksum unless the lockless one is
+// enabled; cutover locking is the same either way.
 func (e *Engine) newSpiritMigration(host, username, password, database, stmt string) *spiritmigration.Migration {
 	threads, lockTimeout := e.threads, e.lockWaitTimeout
 	return &spiritmigration.Migration{
-		Host:                          host,
-		Username:                      username,
-		Password:                      &password,
-		Database:                      database,
-		Statement:                     stmt,
-		Threads:                       threads,
-		WriteThreads:                  0, // auto-size for the target
-		LockWaitTimeout:               lockTimeout,
-		InterpolateParams:             true,
-		CheckpointMaxAge:              e.checkpointMaxAge,
-		ChecksumYieldTimeout:          e.checksumYieldTimeout,
-		MaxCommitLatency:              maxCommitLatency,
-		EnableExperimentalAutoscaling: e.autoscaling,
+		Host:                               host,
+		Username:                           username,
+		Password:                           &password,
+		Database:                           database,
+		Statement:                          stmt,
+		Threads:                            threads,
+		WriteThreads:                       0, // auto-size for the target
+		LockWaitTimeout:                    lockTimeout,
+		InterpolateParams:                  true,
+		CheckpointMaxAge:                   e.checkpointMaxAge,
+		ChecksumYieldTimeout:               e.checksumYieldTimeout,
+		MaxCommitLatency:                   maxCommitLatency,
+		EnableExperimentalAutoscaling:      e.autoscaling,
+		EnableExperimentalLocklessChecksum: e.locklessChecksum,
 	}
 }
 

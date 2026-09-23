@@ -4587,16 +4587,33 @@ func TestServerConfig_SpiritMetadata(t *testing.T) {
 		require.NoError(t, yaml.Unmarshal([]byte(`
 spirit:
   enable_experimental_autoscaling: false
+  enable_experimental_lockless_checksum: true
   checkpoint_max_age: 24h
   checksum_yield_timeout: 6h
 `), &cfg))
 		metadata, err := cfg.SpiritMetadata()
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
-			spirit.MetadataEnableExperimentalAutoscaling: "false",
-			spirit.MetadataCheckpointMaxAge:              "24h",
-			spirit.MetadataChecksumYieldTimeout:          "6h",
+			spirit.MetadataEnableExperimentalAutoscaling:      "false",
+			spirit.MetadataEnableExperimentalLocklessChecksum: "true",
+			spirit.MetadataCheckpointMaxAge:                   "24h",
+			spirit.MetadataChecksumYieldTimeout:               "6h",
 		}, metadata)
+	})
+
+	// The lockless checksum is off by default, so a block that spells that out
+	// carries no override: the key would restate the default, and a database
+	// that enabled the checker in its own metadata outranks the server value
+	// regardless.
+	t.Run("lockless checksum false carries no override", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte(`
+spirit:
+  enable_experimental_lockless_checksum: false
+`), &cfg))
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Empty(t, metadata)
 	})
 
 	t.Run("invalid duration errors", func(t *testing.T) {

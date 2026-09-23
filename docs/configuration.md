@@ -813,9 +813,10 @@ defaults below.
 
 ```yaml
 spirit:
-  enable_experimental_autoscaling: true  # default: true
-  checkpoint_max_age: 72h                # default: 72h (3 days)
-  checksum_yield_timeout: 12h            # default: 12h
+  enable_experimental_autoscaling: true        # default: true
+  enable_experimental_lockless_checksum: true  # default: false
+  checkpoint_max_age: 72h                      # default: 72h (3 days)
+  checksum_yield_timeout: 12h                  # default: 12h
 ```
 
 The defaults, and why they were chosen:
@@ -829,12 +830,41 @@ The defaults, and why they were chosen:
   no operator knob for copy aggressiveness. Set
   `enable_experimental_autoscaling: false` only as an incident kill switch when
   autoscaling misbehaves on a target fleet.
+- **The copy is verified under the snapshot checksum** unless
+  `enable_experimental_lockless_checksum: true` is set. The lockless checker
+  verifies with optimistic reads, retries, and hot-range splitting instead of a
+  checksum setup lock held over long-lived `REPEATABLE READ` snapshots, which
+  keeps a long checksum from pinning InnoDB purge on the target. Cutover locking
+  is the same either way. It is experimental and off by default, and these are
+  the terms an operator accepts by turning it on:
+  - **A confirmed divergence fails the apply instead of being repaired.** The
+    snapshot checker rewrites a mismatched chunk from the source and carries on.
+    The lockless checker treats a chunk that mismatches twice with the source
+    unchanged as real divergence and aborts the apply — where the snapshot
+    checker would have self-healed, this one stops.
+  - **A continuously updated row can keep the verify phase running.** Such a
+    row is not yet supported: its chunk is deferred at the end of every pass, no
+    pass ever comes back clean, and passes repeat until an operator stops the
+    apply. The apply holds the database's active-apply slot until they do.
+  - **The verify phase reports 0% for its whole duration.** The lockless checker
+    has verified nothing conclusively until its first clean pass, so progress
+    goes from 0% straight to complete rather than climbing. Expect
+    `Checksumming to verify data (0%)` on the PR comment throughout, and a
+    stalled-task warning in the server logs every five minutes, for an apply
+    that is healthy.
+  - **`checksum_yield_timeout` does not apply.** It bounds the snapshot
+    checker's read transactions; the lockless checker holds no snapshot to
+    yield.
+
+  Setting it to `false` at the server level restates the default and overrides
+  nothing, so a database that opts itself in stays opted in.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
   the copy restarts cleanly instead of replaying days of old binlogs, which on
   a busy target is slower and riskier than starting over.
 - **`checksum_yield_timeout: 12h`** — each checksum read transaction yields its
   `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
-  InnoDB purge and degrade the whole target instance.
+  InnoDB purge and degrade the whole target instance. It bounds the snapshot
+  checker only, and has no effect where the lockless one is enabled.
 - **GTID change source is auto-detected** (no knob). Targets running with
   `gtid_mode=ON` and `enforce_gtid_consistency=ON` get Spirit's GTID-based
   change source, which tracks replication position across binlog rotation and
@@ -842,8 +872,9 @@ The defaults, and why they were chosen:
   the universally supported file+position source.
 
 A database can override the server-level value by setting the same key
-(`enable_experimental_autoscaling`, `checkpoint_max_age`,
-`checksum_yield_timeout`) in its own metadata; the database's entry wins.
+(`enable_experimental_autoscaling`, `enable_experimental_lockless_checksum`,
+`checkpoint_max_age`, `checksum_yield_timeout`) in its own metadata; the
+database's entry wins.
 
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment

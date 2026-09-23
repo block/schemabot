@@ -450,6 +450,15 @@ type SpiritConfig struct {
 	// autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
 
+	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
+	// reads and retries instead of a checksum setup lock held over long-lived
+	// snapshots, leaving cutover locking unchanged. Defaults to false: a row
+	// updated continuously throughout the checksum is not yet supported, so
+	// the lockless checker can fail to converge where the snapshot one
+	// completes. Absent and false are the same thing here, so this needs no
+	// tri-state.
+	EnableExperimentalLocklessChecksum bool `yaml:"enable_experimental_lockless_checksum,omitempty"`
+
 	// CheckpointMaxAge bounds how old a Spirit checkpoint may be and still be
 	// resumed, as a Go duration string (e.g. "72h"). Defaults to 3 days:
 	// a copy stalled that long restarts cleanly instead of replaying days of
@@ -471,6 +480,12 @@ func (c *ServerConfig) SpiritMetadata() (map[string]string, error) {
 	metadata := map[string]string{}
 	if c.Spirit.EnableExperimentalAutoscaling != nil {
 		metadata[spirit.MetadataEnableExperimentalAutoscaling] = strconv.FormatBool(*c.Spirit.EnableExperimentalAutoscaling)
+	}
+	// Only the enabling value is recorded. A server-level false would be
+	// indistinguishable from the default it restates, and it could not
+	// override a database that set the key itself — the database's entry wins.
+	if c.Spirit.EnableExperimentalLocklessChecksum {
+		metadata[spirit.MetadataEnableExperimentalLocklessChecksum] = strconv.FormatBool(true)
 	}
 	if err := setSpiritDuration(metadata, spirit.MetadataCheckpointMaxAge, c.Spirit.CheckpointMaxAge); err != nil {
 		return nil, err

@@ -69,6 +69,7 @@ type Engine struct {
 	checkpointMaxAge     time.Duration
 	checksumYieldTimeout time.Duration
 	autoscaling          bool
+	locklessChecksum     bool
 
 	// onLog routes Spirit logs to the ApplyLogStore, with table context. It is
 	// swapped as drives hand the engine over and read from the log filter on
@@ -199,6 +200,7 @@ func New(cfg Config) *Engine {
 		checkpointMaxAge:     checkpointMaxAge,
 		checksumYieldTimeout: checksumYieldTimeout,
 		autoscaling:          autoscaling,
+		locklessChecksum:     cfg.Settings.EnableExperimentalLocklessChecksum,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -1018,7 +1020,11 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		// Spirit reports a single runner-wide checksum estimate (rows verified so
 		// far / total to verify), populated only during the verify phase and zero
 		// otherwise. Every table copy is complete by the time the verify phase
-		// runs, so the estimate is stamped on all tables unconditionally.
+		// runs, so the estimate is stamped on all tables unconditionally. The two
+		// checkers fill it differently: the snapshot one climbs through the
+		// table, while the lockless one has verified nothing conclusively until
+		// its first clean pass, so it reports zero for the phase and then the
+		// total.
 		tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
 		tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
 		// Spirit's throttle status is likewise runner-wide and already scoped to
