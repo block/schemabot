@@ -711,6 +711,15 @@ func PreviewCommentSupportChannel() string {
 		RenderSupportChannelFooter(PreviewCommentApplyFailed(), previewSupportChannel())
 }
 
+// PreviewCommentOversized renders the notice posted in place of a comment
+// larger than GitHub accepts, with the support-channel footer it offers.
+func PreviewCommentOversized() string {
+	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
+		Title:         "## Schema Change Apply — Staging",
+		RenderedBytes: 84801,
+	}), previewSupportChannel())
+}
+
 // PreviewCommentErrorNoConfig renders the "no config found" error comment.
 func PreviewCommentErrorNoConfig() string {
 	return RenderNoConfig(SchemaErrorData{

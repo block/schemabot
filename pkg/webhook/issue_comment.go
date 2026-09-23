@@ -622,7 +622,7 @@ func (h *Handler) postCommentReportingError(repo string, pr int, installationID 
 		return fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
 	}
 
-	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body)); err != nil {
+	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, body)); err != nil {
 		return fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
 	}
 	return nil
@@ -651,7 +651,7 @@ func (h *Handler) postAndTrackComment(
 		return
 	}
 
-	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, body))
 	if err != nil {
 		h.logger.Error("failed to post tracked comment",
 			"repo", repo, "pr", pr, "commentState", commentState, "error", err)
@@ -739,7 +739,7 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 		return
 	}
 	finalBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
-	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(finalBody)); err != nil {
+	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(repo, pr, finalBody)); err != nil {
 		h.logger.Error("failed to finalize progress comment for already-terminal apply",
 			append(apply.LogAttrs(), "github_comment_id", comment.GitHubCommentID, "error", err)...)
 		return
@@ -844,8 +844,23 @@ func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, 
 	})
 }
 
-func (h *Handler) renderPRComment(body string) string {
-	return appendSupportChannelFooter(body, h.supportChannel())
+// renderPRComment finishes a comment body for posting on repo's PR: an
+// oversized body is replaced with the notice that fits, then the support
+// footer is appended.
+func (h *Handler) renderPRComment(repo string, pr int, body string) string {
+	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, body), h.supportChannel())
+}
+
+// fitPRComment returns body when GitHub will accept it and otherwise the
+// oversized-comment notice, logging the rendered size with the identifiers an
+// operator needs to find the comment that was replaced.
+func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, body string) string {
+	fitted, replaced := templates.FitGitHubComment(body)
+	if replaced {
+		logger.Error("comment exceeds GitHub's size cap; posting the oversized-comment notice in its place",
+			"repo", repo, "pr", pr, "rendered_bytes", len(body), "limit_bytes", templates.GitHubIssueCommentMaxChars)
+	}
+	return fitted
 }
 
 func (h *Handler) supportChannel() api.SupportChannelConfig {
