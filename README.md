@@ -118,6 +118,8 @@ See [docs/release.md](./docs/release.md) for how releases are cut and what is ch
 
 ## Contributing
 
+Read [Ideas behind SchemaBot](./docs/inspiration.md) for the projects that helped shape it.
+
 Contributors are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 For feature requests and bugs, [open an issue](https://github.com/block/schemabot/issues).
