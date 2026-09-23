@@ -96,7 +96,7 @@ Nothing else is required. There is no manual artifact step.
 
 After the release artifacts are available, update the formula in
 [block/homebrew-tap](https://github.com/block/homebrew-tap). Its bump workflow downloads each
-platform archive, verifies its checksum, and opens a formula update for review:
+platform archive, records its checksum, and opens a formula update for review:
 
 ```bash
 gh workflow run bump-formula.yaml --repo block/homebrew-tap \
