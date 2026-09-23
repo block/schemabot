@@ -1,7 +1,7 @@
 # Ideas behind SchemaBot
 
 SchemaBot grew out of years of work on database schema changes and ideas from
-projects we admire. These are some of the people and projects whose work shaped
+projects we admire. These are some of the projects whose work shaped
 how we think about the workflow, safety, and operator experience.
 
 ## Atlantis: bring the workflow into the pull request
