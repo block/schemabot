@@ -32,6 +32,15 @@ var terminalDeployStates = map[string]bool{
 	dr.NoChanges:           true,
 }
 
+// IsTerminalDeployState reports whether a deploy request in this state will
+// make no further progress. It is what the deploy gate consults to decide
+// whether an earlier request still occupies the database's one active deploy,
+// so anything that needs to ask the same question asks it here rather than
+// keeping a second copy of the set.
+func IsTerminalDeployState(deployState string) bool {
+	return terminalDeployStates[deployState]
+}
+
 // runStateProcessor is a background goroutine that drives deploy request state
 // transitions by polling Vitess schema change statuses every 500ms. This replaces
 // the previous approach of deriving state lazily on each GET request.

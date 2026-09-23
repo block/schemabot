@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -467,13 +468,49 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 // blocksNewDeploy reports whether a deploy request in this state occupies the
 // one active deploy a database is allowed, so that a later test's deploy is
 // refused until it clears.
+//
+// It asks the same question the deploy gate asks — whether the state is
+// terminal — rather than listing the blocking states over again. A list here
+// would be a second copy to find and update, and a state missing from it
+// reads as cleared while the gate still refuses on it.
+//
+// Pending and Ready are the exception: they precede the deploy, so the gate
+// never sees them and the processor never advances them.
 func blocksNewDeploy(deployState string) bool {
 	switch deployState {
-	case drState.Submitting, drState.Queued, drState.InProgress,
-		drState.PendingCutover, drState.InProgressCutover:
-		return true
-	default:
+	case drState.Pending, drState.Ready:
 		return false
+	default:
+		return !localscale.IsTerminalDeployState(deployState)
+	}
+}
+
+// Cleanup's idea of a cleared deploy request has to be the deploy gate's, or
+// it counts a request the gate still refuses on and every test after it fails
+// for a reason nothing connects back to the cleanup that let it through. This
+// pins the two together across every state the API defines, by reflection
+// rather than a list, so a state added later is covered without anyone
+// remembering this test exists.
+func TestBlocksNewDeployAgreesWithTheDeployGate(t *testing.T) {
+	states := reflect.ValueOf(drState)
+	require.Positive(t, states.NumField())
+
+	for i := range states.NumField() {
+		name := states.Type().Field(i).Name
+		value := states.Field(i).String()
+		t.Run(name, func(t *testing.T) {
+			switch {
+			case localscale.IsTerminalDeployState(value):
+				assert.False(t, blocksNewDeploy(value),
+					"%q is terminal, so cleanup must count it as cleared", value)
+			case value == drState.Pending || value == drState.Ready:
+				assert.False(t, blocksNewDeploy(value),
+					"%q precedes the deploy, so the gate never sees it", value)
+			default:
+				assert.True(t, blocksNewDeploy(value),
+					"the deploy gate refuses while a request is %q, so cleanup must keep waiting through it", value)
+			}
+		})
 	}
 }
 
@@ -552,7 +589,7 @@ func waitForDeployCleared(ctx context.Context, number uint64, deadline time.Time
 			return fmt.Sprintf("unreadable: %v", err), false
 		}
 		last = dr.DeploymentState
-		if !blocksNewDeploy(last) && last != drState.CompletePendingRevert {
+		if !blocksNewDeploy(last) {
 			return last, true
 		}
 		if time.Now().After(deadline) {
