@@ -566,6 +566,9 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		assert.Contains(t, rendered, "**Tenant**: `alpha`")
 		assert.Contains(t, rendered, "**Confirmation required**")
 		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
+		// The unlock hint is the other half of the same decision, and a tenant
+		// deployment ignores a command that does not name its tenant.
+		assert.Contains(t, rendered, "schemabot unlock --tenant alpha")
 	})
 
 	t.Run("preview shows tenant metadata without putting tenant in title", func(t *testing.T) {

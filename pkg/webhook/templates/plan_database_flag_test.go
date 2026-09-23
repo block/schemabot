@@ -86,13 +86,20 @@ func TestPlanCommentCommandsCarryScopedDatabase(t *testing.T) {
 }
 
 // The scoped database sits between the environment and the deployment's tenant
-// so every pasteable command reads the same way whatever produced it.
+// so every pasteable command reads the same way whatever produced it, and a
+// command that carries one flag carries the other.
 func TestPlanCommentScopedDatabasePrecedesTenant(t *testing.T) {
 	data := planWithChanges()
 	data.ScopedDatabase = "orders"
 	data.Tenant = "acme"
 
 	assert.Contains(t, RenderPlanComment(data), "\nschemabot apply -e staging -d orders --tenant acme\n")
+
+	data.IsLocked = true
+	data.PendingManualConfirmation = true
+	locked := RenderPlanComment(data)
+	assert.Contains(t, locked, "\nschemabot apply-confirm -e staging -d orders --tenant acme\n")
+	assert.Contains(t, locked, "\nschemabot unlock -d orders --tenant acme\n")
 }
 
 // A plan run without -e answers with one comment covering every environment,

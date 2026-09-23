@@ -95,12 +95,15 @@ type AttributedChangeData struct {
 type PlanCommentData struct {
 	Database string
 
-	// ScopedDatabase is the database the operator named with -d on the command
-	// that produced this comment. The copy-paste commands in the footer carry
-	// it, so the follow-up an operator is being asked for stays scoped to the
-	// database they already chose instead of failing as ambiguous in a
-	// repository that configures several. Empty on an unscoped command and on
-	// every comment SchemaBot posts on its own, which render as before.
+	// ScopedDatabase is the database this comment's copy-paste commands name,
+	// so the follow-up an operator is being asked for is one they can paste in
+	// a repository that configures several databases rather than one rejected
+	// as ambiguous. It comes from the -d on the command that produced the
+	// comment, or, on a comment SchemaBot posts on its own, from the database
+	// that comment plans — an auto-plan posts one comment per database, so
+	// naming it is the comment's own identity rather than a guess at what an
+	// operator meant. Empty only on an unscoped command, which renders the
+	// commands bare.
 	ScopedDatabase string
 
 	SchemaName   string // Schema directory name (e.g. filepath.Base of schema dir)
@@ -432,7 +435,8 @@ func RenderPlanComment(data PlanCommentData) string {
 			sb.WriteString("**Confirmation required** — review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
-			fmt.Fprintf(&sb, "```\n%s\n```\n", appendDatabaseFlag("schemabot unlock", data.ScopedDatabase))
+			unlockCmd := appendTenantFlag(appendDatabaseFlag("schemabot unlock", data.ScopedDatabase), data.Tenant)
+			fmt.Fprintf(&sb, "```\n%s\n```\n", unlockCmd)
 		} else {
 			// Automatic apply is proceeding. No unlock hint — it's noise on the
 			// happy path; the operator can still unlock from the CLI if needed.
