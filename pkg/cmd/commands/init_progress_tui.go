@@ -143,10 +143,9 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 // initCompletion prints the next command with only the flags it needs: the
 // profile is named when the CLI would not resolve to it on its own.
 func initCompletion(result *initResult, environment, defaultProfile, invocation string) string {
-	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
-	next := fmt.Sprintf("%s plan -s %s -e %s", invocation, quote(result.SchemaDir), quote(environment))
+	next := fmt.Sprintf("%s plan -s %s -e %s", invocation, initShellArg(result.SchemaDir), initShellArg(environment))
 	if result.Profile != defaultProfile {
-		next += " --profile " + quote(result.Profile)
+		next += " --profile " + initShellArg(result.Profile)
 	}
 	noun := "tables"
 	if result.Tables == 1 {
@@ -234,7 +233,16 @@ func initCommandName(name, executable string) string {
 				return name
 			}
 		}
-		return "'" + strings.ReplaceAll(executable, "'", "'\"'\"'") + "'"
+		return initShellArg(executable)
 	}
 	return name
+}
+
+func initShellArg(value string) string {
+	if value != "" && strings.IndexFunc(value, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("_./:-", r)
+	}) == -1 {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

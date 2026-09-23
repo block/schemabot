@@ -66,7 +66,7 @@ func TestInitWizardReviewExistingFilesAndCancel(t *testing.T) {
 	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 	m.step = len(m.fields)
 	m.loadField()
-	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "verify them and keep your edits")
+	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "check them against your database without changing them")
 	wizardKey(m, tea.KeyEsc)
 	require.False(t, m.confirmed)
 	require.True(t, m.cancelled)
@@ -111,7 +111,7 @@ func TestInitCompletionQuotesNextCommand(t *testing.T) {
 
 func TestInitCompletionOmitsDefaultProfile(t *testing.T) {
 	output := initCompletion(&initResult{SchemaDir: "schema", Profile: "default"}, "development", "default", "schemabot")
-	require.Contains(t, output, "schemabot plan -s 'schema' -e 'development'\n")
+	require.Contains(t, output, "schemabot plan -s schema -e development\n")
 	require.NotContains(t, output, "--profile")
 }
 
@@ -437,7 +437,7 @@ func TestInitWizardChecksFolderBeforeReviewAndKeepsStateStepReachable(t *testing
 	m.loadField()
 	require.Equal(t, 6, m.step)
 	require.Contains(t, m.err, "placeholder")
-	require.NotContains(t, m.View(), "verify them and keep your edits")
+	require.NotContains(t, m.View(), "check them against your database without changing them")
 	require.FileExists(t, filepath.Join(root, ".gitkeep"))
 	m.step = 5
 	m.explicitNamespaces = false
@@ -529,7 +529,7 @@ func TestInitCompletionShowsSchemaFiles(t *testing.T) {
 }
 
 func TestInitCommandNamePreservesLocalBinary(t *testing.T) {
-	require.Equal(t, "'./schemabot'", initCommandName("schemabot", "./schemabot"))
+	require.Equal(t, "./schemabot", initCommandName("schemabot", "./schemabot"))
 	require.Equal(t, "schemabot", initCommandName("schemabot", "schemabot"))
 	require.Equal(t, "sq schemabot", initCommandName("sq schemabot", "/tmp/sq-schemabot"))
 	require.Equal(t, "'/tmp/my cli/schemabot'", initCommandName("schemabot", "/tmp/my cli/schemabot"))
@@ -547,5 +547,14 @@ func TestInitCommandNameUsesMatchingPATHBinary(t *testing.T) {
 	require.Equal(t, "schemabot", initCommandName("schemabot", executable))
 	require.NoError(t, os.Remove(installed))
 	require.NoError(t, os.WriteFile(installed, []byte("#!/bin/sh\n"), 0700))
-	require.Equal(t, "'"+executable+"'", initCommandName("schemabot", executable))
+	require.Equal(t, executable, initCommandName("schemabot", executable))
+}
+
+func TestInitShellArg(t *testing.T) {
+	for _, value := range []string{"", "my schema", "dev's profile", "$(whoami)", "schema;echo", "*.sql", "~/schema", "line\nbreak"} {
+		require.True(t, strings.HasPrefix(initShellArg(value), "'"), value)
+	}
+	for _, value := range []string{"./schemabot", "schema", "development", "wizard-playground"} {
+		require.Equal(t, value, initShellArg(value))
+	}
 }

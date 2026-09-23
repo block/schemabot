@@ -391,7 +391,6 @@ func (m *initWizard) contentView() string {
 		row("Namespaces", m.fields[5].value)
 		row("Schema folder", m.fields[6].value)
 		row("Profile", m.fields[7].value)
-		row("Connection", initConnectionLabel(m.fields[3].value))
 		if m.integrated {
 			row("Storage", "schemabot (new database, same server)")
 		} else {
@@ -401,7 +400,7 @@ func (m *initWizard) contentView() string {
 			b.WriteString("\nCredentials will be saved outside your project in private, unencrypted\nfiles under ~/.schemabot/credentials.\n")
 		}
 		if m.hasExistingSchema {
-			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
+			b.WriteString("\n" + wrap.Render("This folder already has schema files. We’ll check them against your database without changing them.") + "\n")
 		}
 		b.WriteString("\n" + wrap.Render("We’ll set up SchemaBot and verify your schema files.") + "\n\n")
 		b.WriteString(blue.Render("enter finish setup") + muted.Render(" · shift+tab back · esc cancel"))
