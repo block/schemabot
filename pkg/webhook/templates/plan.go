@@ -93,7 +93,16 @@ type AttributedChangeData struct {
 
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
-	Database     string
+	Database string
+
+	// ScopedDatabase is the database the operator named with -d on the command
+	// that produced this comment. The copy-paste commands in the footer carry
+	// it, so the follow-up an operator is being asked for stays scoped to the
+	// database they already chose instead of failing as ambiguous in a
+	// repository that configures several. Empty on an unscoped command and on
+	// every comment SchemaBot posts on its own, which render as before.
+	ScopedDatabase string
+
 	SchemaName   string // Schema directory name (e.g. filepath.Base of schema dir)
 	Environment  string
 	Tenant       string
@@ -401,7 +410,7 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	switch {
 	case data.IsLocked:
-		applyConfirmCmd := fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment)
+		applyConfirmCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
 			applyConfirmCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
@@ -423,14 +432,14 @@ func RenderPlanComment(data PlanCommentData) string {
 			sb.WriteString("**Confirmation required** — review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
-			sb.WriteString("```\nschemabot unlock\n```\n")
+			fmt.Fprintf(&sb, "```\n%s\n```\n", appendDatabaseFlag("schemabot unlock", data.ScopedDatabase))
 		} else {
 			// Automatic apply is proceeding. No unlock hint — it's noise on the
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
 	default:
-		applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
+		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
@@ -1638,6 +1647,10 @@ type MultiEnvPlanCommentData struct {
 	RequestedBy  string
 	Tenant       string
 
+	// ScopedDatabase carries the operator's -d through to this comment's
+	// copy-paste commands, on the same terms as PlanCommentData.ScopedDatabase.
+	ScopedDatabase string
+
 	// AgentHint is the deployment's configured guidance for AI agents reading
 	// the plan. Empty on deployments that configure none, which render an
 	// unchanged comment.
@@ -1914,18 +1927,22 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	}
 
+	command := func(baseCommand, environment string) string {
+		return scopedCommand(baseCommand, environment, data.ScopedDatabase, data.Tenant)
+	}
+
 	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
 		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
-		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
+		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 		for i := 1; i < len(envsWithChanges); i++ {
 			fmt.Fprintf(sb, "\nAfter verifying %s, apply to %s:\n", envsWithChanges[i-1], envsWithChanges[i])
-			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[i], data.Tenant))
+			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[i]))
 		}
 	case len(envsWithChanges) == 1:
 		sb.WriteString("▶️ **To apply** these changes, comment:\n")
-		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
+		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 	case len(envsWithErrors) == 0:
 		sb.WriteString("No changes to apply.\n")
 	}
@@ -1935,13 +1952,23 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
 			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
-			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot plan", env, data.Tenant))
+			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}
 	}
 }
 
 func tenantCommand(baseCommand, environment, tenant string) string {
-	return appendTenantFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), tenant)
+	return scopedCommand(baseCommand, environment, "", tenant)
+}
+
+// scopedCommand renders a pasteable command for one environment, carrying the
+// database the operator named with -d and the deployment's tenant. Flags are
+// ordered as an operator would type them — the target first, then the
+// deployment qualifier — so a command lifted from one comment reads the same as
+// one lifted from another.
+func scopedCommand(baseCommand, environment, database, tenant string) string {
+	command := appendDatabaseFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), database)
+	return appendTenantFlag(command, tenant)
 }
 
 // appendTenantFlag appends the --tenant flag to a pasteable command hint when
@@ -1953,6 +1980,20 @@ func appendTenantFlag(command, tenant string) string {
 		return command
 	}
 	return fmt.Sprintf("%s --tenant %s", command, tenant)
+}
+
+// appendDatabaseFlag scopes a copy-paste command to the database the operator
+// named with -d, so the next command in a repository with several databases
+// does not have to name it again. Empty leaves the command unchanged: an
+// unscoped command is answered with an unscoped one, because the database this
+// comment resolved to is SchemaBot's answer to the ambiguity rather than a
+// choice the operator made, and a copy-paste line is not where to put words in
+// their mouth.
+func appendDatabaseFlag(command, database string) string {
+	if database == "" {
+		return command
+	}
+	return fmt.Sprintf("%s -d %s", command, database)
 }
 
 // allPlansIdentical returns true if all environments have identical changes.
