@@ -41,6 +41,32 @@ func IsTerminalDeployState(deployState string) bool {
 	return terminalDeployStates[deployState]
 }
 
+// alreadyCancelling reports whether a deploy request in this state is already
+// on its way to a terminal one, so a cancel has nothing left to ask for.
+var alreadyCancelling = map[string]bool{
+	dr.InProgressCancel:        true,
+	dr.InProgressRevert:        true,
+	dr.InProgressRevertVSchema: true,
+}
+
+// CanCancelDeployRequest reports whether a cancel can still reach a deploy
+// request in this state.
+//
+// A cancel is accepted for as long as the request holds the database's one
+// active deploy and nothing else is already retiring it. Cutover is included
+// deliberately: it is the phase a deploy is most likely to be stuck in, and a
+// phase that refuses the only command that frees the slot leaves the database
+// with no way back short of a restart.
+//
+// Pending and Ready precede the deploy, so they hold nothing to cancel.
+func CanCancelDeployRequest(deployState string) bool {
+	switch deployState {
+	case dr.Pending, dr.Ready:
+		return false
+	}
+	return !IsTerminalDeployState(deployState) && !alreadyCancelling[deployState]
+}
+
 // runStateProcessor is a background goroutine that drives deploy request state
 // transitions by polling Vitess schema change statuses every 500ms. This replaces
 // the previous approach of deriving state lazily on each GET request.
