@@ -657,11 +657,29 @@ local-mode MySQL and `cleanup_enabled: true`.
 For MySQL databases executed by the Spirit engine, some ALTER statements are
 deterministically refused by the engine — for example dropping a primary key or
 adding a foreign key, which its online copy cannot preserve. By default those
-statements block the apply. The per-database-environment `direct_execution`
-policy lets a refused statement instead run verbatim as native MySQL DDL when
-the target table is small enough. See
-[Direct Execution](direct-execution.md) for how routing works and what other
-engines need to adopt it:
+statements block the apply. The `direct_execution` policy lets a refused
+statement instead run verbatim as native MySQL DDL when the target table is
+small enough. See [Direct Execution](direct-execution.md) for how routing
+works and what other engines need to adopt it.
+
+Set it at the top level of the server config to state one policy for every
+MySQL database the server drives:
+
+```yaml
+direct_execution:
+  enabled: true           # default: false
+  max_table_rows: 100000  # required (positive) when enabled
+  lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
+```
+
+This is the only way to state a policy for a database a data-plane server
+resolves through its `target_resolver`: those targets are addressed by an
+opaque identifier and have no `databases` entry to carry a policy of their
+own. It is also the form to reach for on a fleet — a per-database block for
+every database is the same policy written many times, and each copy is one
+more place for the row bound to drift.
+
+A database environment may override the server-wide policy:
 
 ```yaml
 databases:
@@ -671,10 +689,24 @@ databases:
       staging:
         dsn: "file:/run/secrets/payments-staging-dsn"
         direct_execution:
-          enabled: true           # default: false
-          max_table_rows: 100000  # required (positive) when enabled
-          lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
+          enabled: true
+          max_table_rows: 1000
 ```
+
+An override replaces the server-wide policy whole rather than merging into
+it, so an environment that enables direct execution always states the bound
+it runs under, and `enabled: false` is a complete opt out. A resolved target
+whose own connection metadata carries any direct execution key is treated the
+same way: it states the whole policy, and the server-wide one does not apply.
+
+State the policy on the server that runs the engine. Where a database
+executes in-process, that is this config and there is nothing more to do. On
+a deployment whose applies execute on a remote data plane, the routing server
+hands that data plane a target to connect to, not a policy, so a block
+written only on the routing server is read by nothing: an enabled one never
+routes a statement, and an opt-out never reaches the server it was meant to
+constrain. Write both the server-wide policy and any override on the data
+plane until the routing server forwards them.
 
 A direct statement is synchronous, blocks writes to the table while it runs,
 and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
@@ -697,11 +729,52 @@ apply fails fast with a retryable "table is busy" error instead. Lower it for
 environments where even a short stall is unacceptable; the value must be a
 whole number of seconds (at least `1s`).
 
-Config validation fails at startup when a `direct_execution` block — even a
-disabled one — is set on a non-MySQL database, when the policy is enabled
-without a positive `max_table_rows`, or when `lock_acquisition_timeout` is malformed
-(not a duration, under a second, or not whole seconds). A policy that can
-never take effect is never silently carried in config.
+Config validation fails at startup when a per-database `direct_execution`
+block — even a disabled one — is set on a non-MySQL database, when a policy is
+enabled without a positive `max_table_rows`, or when
+`lock_acquisition_timeout` is malformed (not a duration, under a second, or
+not whole seconds). A per-database policy that can never take effect is never
+silently carried in config.
+
+The server-wide policy is held to the same shape rules but is not rejected
+alongside other engines: it names no database type, so a server that drives
+MySQL and PostgreSQL can state one policy, and it reaches only the engines
+that consume it. It is rejected when it reaches *nothing* — an enabled policy
+on a server with no `target_resolver` and no registered database whose engine
+can honor it fails startup, the same way a per-database block on the wrong
+engine does. A server holding a `target_resolver` is exempt, because the
+engines behind its targets are not knowable from config.
+
+`direct_execution` is a policy rather than an engine setting, which is why it
+sits beside `pending_drops` at the top level rather than inside an engine
+block like `spirit`, `planetscale`, or `postgres`. Its two fields mean the
+same thing on any engine — a blast-radius bound in rows, and a bound on lock
+acquisition — and each engine supplies only the three pieces that are
+genuinely its own: which statements it refuses, how it estimates a table's
+size, and which native session timeout the lock bound maps to. Today the
+MySQL engine is the only one that implements those, so the policy reaches
+only MySQL databases; an engine that adopts direct execution later reads the
+same policy rather than needing a second copy of it. See
+[Direct Execution → Engine compatibility](direct-execution.md#engine-compatibility).
+
+Should an engine ever need a field the others have no meaning for, it nests
+*inside* `direct_execution` under the engine's own name rather than moving the
+block into that engine's settings:
+
+```yaml
+direct_execution:
+  enabled: true
+  max_table_rows: 10000       # every engine
+  postgres:
+    some_engine_specific: v   # that engine only
+```
+
+This keeps the shared bounds stated once, in one place, for every engine —
+which is the property worth protecting, since `max_table_rows` is the only
+thing between a refused statement and an unbounded write outage. There is no
+such field today, and one should only be added where the value genuinely has
+no cross-engine meaning; a bound that any engine could honor belongs at the
+top of the block.
 
 ## Storage Dialect
 
