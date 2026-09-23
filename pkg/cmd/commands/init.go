@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/localsetup"
 )
@@ -77,7 +78,7 @@ func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 	if defaultProfile == "" {
 		defaultProfile = "default"
 	}
-	fmt.Print(initCompletion(&display, cmd.Environment, defaultProfile))
+	fmt.Print(initCompletion(&display, cmd.Environment, defaultProfile, initCommandName(cliname.Name(), os.Args[0])))
 	return nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -31,6 +32,7 @@ type initWizard struct {
 	hasExistingSchema                        bool
 	originalNamespaces                       []string
 	checkingConnection, connectionChecked    bool
+	applicationConnected                     bool
 	check                                    func(context.Context, string, string) error
 	fields                                   []initField
 	step, width                              int
@@ -162,8 +164,21 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err.Error()
 		} else {
 			m.connectionChecked = true
+			if m.step == 3 {
+				m.applicationConnected = true
+			}
+			generation, step := m.generation, m.step
+			return m, tea.Tick(700*time.Millisecond, func(time.Time) tea.Msg {
+				return initConnectionAdvanceMsg{generation: generation, step: step}
+			})
 		}
 		return m, nil
+	case initConnectionAdvanceMsg:
+		if m.cancelled || msg.generation != m.generation || msg.step != m.step || !m.connectionChecked {
+			return m, nil
+		}
+		m.fields[m.step].value = strings.TrimSpace(m.input.Value())
+		return m, tea.Batch(m.advance(), textinput.Blink)
 	case initNamespacesMsg:
 		return m, m.acceptNamespaces(msg)
 	case tea.WindowSizeMsg:
@@ -316,7 +331,7 @@ func (m *initWizard) contentView() string {
 		}
 		if m.step == 0 {
 			b.WriteString(bold.Render("Let’s connect your database.") + "\n\n")
-			b.WriteString(wrap.Render("Connect your database, bring its schema into your project, and get ready for your first change. Your existing tables and files stay as they are.") + "\n\n")
+			b.WriteString(wrap.Render("Connect your database, bring its schema into your project, and get ready for your first change.") + "\n\n")
 		} else if m.step != 3 && m.step != 4 {
 			b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
 		}
@@ -367,30 +382,29 @@ func (m *initWizard) contentView() string {
 		}
 		b.WriteString(muted.Render(help))
 	} else {
-		b.WriteString(bold.Render("Ready when you are") + "\n\n")
-		if m.notice != "" {
-			b.WriteString(wrap.Render(m.notice) + "\n\n")
+		b.WriteString(bold.Render("Review your setup") + "\n\n")
+		row := func(label, value string) {
+			b.WriteString(wrap.Render(muted.Render(fmt.Sprintf("%-14s", label))+initTerminalText(value)) + "\n")
 		}
-		b.WriteString(bold.Render("Your database") + "\n")
-		b.WriteString(wrap.Render(initTerminalText(m.fields[1].value+" · "+m.fields[0].value+" · "+m.fields[2].value)) + "\n")
-		b.WriteString(wrap.Render("Namespaces: "+initTerminalText(m.fields[5].value)) + "\n\n")
-		b.WriteString(bold.Render("Your schema files") + "\n")
-		b.WriteString(wrap.Render(initTerminalText(m.fields[6].value+" · profile "+m.fields[7].value)) + "\n\n")
-		b.WriteString(bold.Render("Connections") + "\n")
-		b.WriteString(wrap.Render("Application: "+initConnectionLabel(m.fields[3].value)) + "\n")
+		row("Database", m.fields[1].value+" ("+m.fields[0].value+")")
+		row("Environment", m.fields[2].value)
+		row("Namespaces", m.fields[5].value)
+		row("Schema folder", m.fields[6].value)
+		row("Profile", m.fields[7].value)
+		row("Connection", initConnectionLabel(m.fields[3].value))
 		if m.integrated {
-			b.WriteString(wrap.Render("SchemaBot’s own data: new schemabot database on your application’s server") + "\n")
+			row("Storage", "schemabot (new database, same server)")
 		} else {
-			b.WriteString(wrap.Render("SchemaBot state: "+initConnectionLabel(m.fields[4].value)) + "\n")
+			row("Storage", initConnectionLabel(m.fields[4].value))
 		}
 		if strings.HasPrefix(m.fields[3].value, "draft:") || !m.integrated && strings.HasPrefix(m.fields[4].value, "draft:") {
-			b.WriteString("\nEntered credentials will be saved in private, unencrypted files\nunder ~/.schemabot/credentials, outside your project.\n")
+			b.WriteString("\nCredentials will be saved outside your project in private, unencrypted\nfiles under ~/.schemabot/credentials.\n")
 		}
 		if m.hasExistingSchema {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}
-		b.WriteString("\n" + wrap.Render("We’ll prepare SchemaBot’s state and verify your schema files. We won’t change your application’s schema.") + "\n\n")
-		b.WriteString(blue.Render("enter connect and verify") + muted.Render(" · shift+tab back · esc cancel"))
+		b.WriteString("\n" + wrap.Render("We’ll set up SchemaBot and verify your schema files.") + "\n\n")
+		b.WriteString(blue.Render("enter finish setup") + muted.Render(" · shift+tab back · esc cancel"))
 	}
 	return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
 }

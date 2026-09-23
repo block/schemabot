@@ -129,7 +129,7 @@ func TestInitConnectionScreenStates(t *testing.T) {
 	m.Update(initConnectionMsg{generation: m.generation})
 	connected := stripANSI(m.View())
 	require.Contains(t, connected, "✓ Connected")
-	require.Contains(t, connected, "enter continue")
+	require.NotContains(t, connected, "enter continue")
 	require.NotContains(t, connected, "retry")
 	require.NotContains(t, connected, "secret")
 }
@@ -164,4 +164,37 @@ func TestInitReferenceEntryCursorStartsAtEnd(t *testing.T) {
 	require.NotContains(t, m.View(), "Choose a connection source")
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("_TEST")})
 	require.Equal(t, "env:DATABASE_URL_TEST", m.input.Value())
+}
+
+func TestInitConnectionAutoAdvance(t *testing.T) {
+	for _, action := range []string{"advance", "back", "cancel", "edit"} {
+		t.Run(action, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "root@tcp(localhost:3306)/shop")
+			m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop"}, "default", io.Discard)
+			wizardKey(m, tea.KeyEnter)
+			generation := m.generation
+			_, cmd := m.Update(initConnectionMsg{generation: generation})
+			require.NotNil(t, cmd)
+			require.Contains(t, stripANSI(m.View()), "✓ Connected")
+			switch action {
+			case "back":
+				wizardKey(m, tea.KeyShiftTab)
+			case "cancel":
+				wizardKey(m, tea.KeyEsc)
+			case "edit":
+				m.connectionChecked = false
+			}
+			m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
+			if action == "advance" {
+				require.Equal(t, 4, m.step)
+				require.Contains(t, stripANSI(m.View()), "✓ Application database connected")
+				require.Equal(t, "env:DATABASE_URL", m.fields[3].value)
+				require.False(t, m.confirmed)
+				m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
+				require.Equal(t, 4, m.step)
+			} else {
+				require.Equal(t, 3, m.step)
+			}
+		})
+	}
 }

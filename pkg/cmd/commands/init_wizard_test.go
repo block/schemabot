@@ -54,7 +54,7 @@ func TestInitWizardNavigationAndValidation(t *testing.T) {
 		wizardKey(m, tea.KeyEnter)
 	}
 	require.False(t, m.confirmed)
-	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "We won’t change your application’s schema")
+	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "We’ll set up SchemaBot and verify your schema files.")
 	wizardKey(m, tea.KeyEnter)
 	require.True(t, m.confirmed)
 }
@@ -104,13 +104,13 @@ func TestInitProgressCancellationWaitsForCleanup(t *testing.T) {
 	require.NotNil(t, cmd)
 }
 func TestInitCompletionQuotesNextCommand(t *testing.T) {
-	output := initCompletion(&initResult{SchemaDir: "my schema", Profile: "dev's profile"}, "development", "default")
+	output := initCompletion(&initResult{SchemaDir: "my schema", Profile: "dev's profile"}, "development", "default", "schemabot")
 	require.Contains(t, output, "-s 'my schema'")
 	require.Contains(t, output, "--profile 'dev'\"'\"'s profile'")
 }
 
 func TestInitCompletionOmitsDefaultProfile(t *testing.T) {
-	output := initCompletion(&initResult{SchemaDir: "schema", Profile: "default"}, "development", "default")
+	output := initCompletion(&initResult{SchemaDir: "schema", Profile: "default"}, "development", "default", "schemabot")
 	require.Contains(t, output, "schemabot plan -s 'schema' -e 'development'\n")
 	require.NotContains(t, output, "--profile")
 }
@@ -146,7 +146,7 @@ func (w initSignalWriter) Write(p []byte) (int, error) {
 func TestInitWizardNarrowReviewCanScroll(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
 	m.step = len(m.fields)
-	m.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 14})
 	before := m.View()
 	require.Contains(t, before, "scroll")
 	for line := range strings.SplitSeq(before, "\n") {
@@ -165,7 +165,8 @@ func TestInitWizardDiscoverySelectsOneAndReviewsDefaults(t *testing.T) {
 	m.Update(initNamespacesMsg{generation: 1, names: []string{"public"}})
 	require.Equal(t, len(m.fields), m.step)
 	require.Equal(t, "public", m.fields[5].value)
-	require.Contains(t, m.View(), "Found public")
+	require.Contains(t, m.View(), "Namespaces")
+	require.Contains(t, m.View(), "public")
 	require.False(t, m.confirmed)
 	wizardKey(m, tea.KeyShiftTab)
 	require.Equal(t, 7, m.step)
@@ -508,4 +509,28 @@ func TestInitReviewEscapesFlagValues(t *testing.T) {
 	view := m.View()
 	require.NotContains(t, view, "\x1b[2J")
 	require.Contains(t, view, `\x1b[2J`)
+}
+
+func TestInitCompletionShowsSchemaFiles(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "schema")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "shop"), 0700))
+	for _, name := range []string{"customers.sql", "orders.sql", "schemabot.yaml"} {
+		require.NoError(t, os.WriteFile(filepath.Join(root, "shop", name), nil, 0600))
+	}
+	output := initCompletion(&initResult{SchemaDir: root, Tables: 2}, "development", "", "schemabot")
+	require.Contains(t, output, root+"/")
+	require.Contains(t, output, "└── shop/\n      ├── customers.sql\n      └── orders.sql")
+	require.NotContains(t, output, "schemabot.yaml")
+	for i := range 10 {
+		require.NoError(t, os.WriteFile(filepath.Join(root, fmt.Sprintf("table%02d.sql", i)), nil, 0600))
+	}
+	require.Contains(t, initSchemaTree(root), "more schema files")
+	require.NotContains(t, initSchemaTree(root), "table09.sql")
+}
+
+func TestInitCommandNamePreservesLocalBinary(t *testing.T) {
+	require.Equal(t, "'./schemabot'", initCommandName("schemabot", "./schemabot"))
+	require.Equal(t, "schemabot", initCommandName("schemabot", "schemabot"))
+	require.Equal(t, "sq schemabot", initCommandName("sq schemabot", "/tmp/sq-schemabot"))
+	require.Equal(t, "'/tmp/my cli/schemabot'", initCommandName("schemabot", "/tmp/my cli/schemabot"))
 }

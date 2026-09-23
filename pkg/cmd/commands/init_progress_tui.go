@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -140,9 +141,9 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 
 // initCompletion prints the next command with only the flags it needs: the
 // profile is named when the CLI would not resolve to it on its own.
-func initCompletion(result *initResult, environment, defaultProfile string) string {
+func initCompletion(result *initResult, environment, defaultProfile, invocation string) string {
 	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
-	next := fmt.Sprintf("%s plan -s %s -e %s", cliname.Name(), quote(result.SchemaDir), quote(environment))
+	next := fmt.Sprintf("%s plan -s %s -e %s", invocation, quote(result.SchemaDir), quote(environment))
 	if result.Profile != defaultProfile {
 		next += " --profile " + quote(result.Profile)
 	}
@@ -150,5 +151,82 @@ func initCompletion(result *initResult, environment, defaultProfile string) stri
 	if result.Tables == 1 {
 		noun = "table"
 	}
-	return fmt.Sprintf("\n  ✓ Your schema is ready\n\n  %d %s · %s\n  Baseline plan: no changes.\n\n  Make your first edit, then review the plan:\n\n    %s\n\n", result.Tables, noun, result.SchemaDir, next)
+	return fmt.Sprintf("\n  ✓ Your schema is ready\n\n  %d %s · Baseline plan: no changes.\n\n%s\n  Make your first edit, then review the plan:\n\n    %s\n\n", result.Tables, noun, initSchemaTree(result.SchemaDir), next)
+}
+
+// Preview a bounded number of SQL files, without following directory symlinks.
+func initSchemaTree(root string) string {
+	type node struct {
+		name     string
+		children []*node
+	}
+	tree := &node{}
+	count := 0
+	more := false
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !entry.Type().IsRegular() || filepath.Ext(path) != ".sql" {
+			return nil
+		}
+		if count == 8 {
+			more = true
+			return fs.SkipAll
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		parent := tree
+		for part := range strings.SplitSeq(relative, string(filepath.Separator)) {
+			var child *node
+			for _, candidate := range parent.children {
+				if candidate.name == part {
+					child = candidate
+					break
+				}
+			}
+			if child == nil {
+				child = &node{name: part}
+				parent.children = append(parent.children, child)
+			}
+			parent = child
+		}
+		count++
+		return nil
+	})
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		absolute = root
+	}
+	var b strings.Builder
+	b.WriteString("  " + initTerminalText(absolute) + string(filepath.Separator) + "\n")
+	var render func(*node, string)
+	render = func(parent *node, prefix string) {
+		for i, child := range parent.children {
+			branch, continuation := "├── ", "│   "
+			if i == len(parent.children)-1 {
+				branch, continuation = "└── ", "    "
+			}
+			suffix := ""
+			if len(child.children) > 0 {
+				suffix = "/"
+			}
+			b.WriteString("  " + prefix + branch + initTerminalText(child.name) + suffix + "\n")
+			render(child, prefix+continuation)
+		}
+	}
+	render(tree, "")
+	if more {
+		b.WriteString("  … more schema files in this folder\n")
+	}
+	return b.String()
+}
+
+func initCommandName(name, executable string) string {
+	if name == "schemabot" && strings.ContainsAny(executable, `/\`) {
+		return "'" + strings.ReplaceAll(executable, "'", "'\"'\"'") + "'"
+	}
+	return name
 }

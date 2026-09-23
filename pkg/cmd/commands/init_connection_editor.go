@@ -244,6 +244,7 @@ func (m *initWizard) connectionEditorView() string {
 			help = "enter retry · shift+tab back · esc cancel"
 		case m.connectionChecked:
 			b.WriteString("\n\n" + success.Render("✓ Connected"))
+			help = "shift+tab back · esc cancel"
 		default:
 			help = "enter check connection · shift+tab back · esc cancel"
 		}
@@ -256,7 +257,7 @@ func (m *initWizard) connectionEditorView() string {
 
 func initConnectionLabel(ref string) string {
 	if strings.HasPrefix(ref, "draft:") {
-		return "Entered connection (save in a private local file)"
+		return "Local credential file"
 	}
 	return initTerminalText(ref)
 }

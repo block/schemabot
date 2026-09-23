@@ -46,6 +46,10 @@ func initConnectionDestination(engine, dsn string) string {
 	return fmt.Sprintf("Host: %q\nDatabase: %q", host, database)
 }
 
+type initConnectionAdvanceMsg struct {
+	generation, step int
+}
+
 type initConnectionMsg struct {
 	generation int
 	err        error
@@ -53,6 +57,9 @@ type initConnectionMsg struct {
 
 func (m *initWizard) checkConnection() tea.Cmd {
 	m.err = ""
+	if m.step == 3 {
+		m.applicationConnected = false
+	}
 	m.checkingConnection = true
 	m.connectionChecked = false
 	m.generation++

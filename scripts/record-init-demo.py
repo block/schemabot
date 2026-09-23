@@ -29,7 +29,7 @@ parser.add_argument('--integrated', action='store_true')
 parser.add_argument('--engine', choices=['mysql', 'postgres'], default='postgres')
 args = parser.parse_args()
 binary = str(Path(args.binary).resolve())
-work = Path(tempfile.mkdtemp(prefix='schemabot-init-demo-'))
+work = Path(tempfile.mkdtemp(prefix='shop-demo-', dir='/tmp'))
 (work / 'home').mkdir()
 env = dict(os.environ, HOME=str(work / 'home'), SCHEMABOT_PROFILE='', SCHEMABOT_ENDPOINT='', SCHEMABOT_TOKEN='', TERM='xterm-256color', COLORTERM='truecolor', CLICOLOR_FORCE='1', NO_COLOR='', COLORFGBG='0;15')
 pasted_connection = env.get('DATABASE_URL', '')
@@ -39,24 +39,24 @@ master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
 screen = pyte.Screen(88, 24)
 stream = pyte.Stream(screen)
-process = subprocess.Popen([binary, 'init'], cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
+process = subprocess.Popen([binary, '--cli-name', 'schemabot', 'init'], cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
 os.close(slave)
 # Send individual keystrokes while continuing to read the terminal, so the
 # recording captures typing, cursor movement, and checkbox changes as they happen.
 engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [(0.9, '\x1b[B'), (0.7, '\x1b[A'), (0.7, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
 if args.paste_connection:
-    steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.035, c) for c in pasted_connection] + [(1.0, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+    steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.035, c) for c in pasted_connection] + [(1.0, '\r')])])
 else:
-    steps.extend([('Connect your database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+    steps.extend([('Connect your database', [(1.5, '\r')])])
 if args.integrated:
     steps.append(('Where should SchemaBot store its own data?', [(3.0, '\r')]))
 else:
-    steps.extend([('Where should SchemaBot store its own data?', [(2.0, '\x1b[B'), (1.5, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
+    steps.extend([('Where should SchemaBot store its own data?', [(2.0, '\x1b[B'), (1.5, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')])])
 
 if args.engine == 'postgres':
     steps.append(('space select', [(0.8, ' '), (0.8, '\x1b[B'), (0.8, ' '), (1.0, '\r')]))
-steps.append(('Ready when you are', [(2.0, '\r')]))
+steps.append(('Review your setup', [(2.0, '\r')]))
 pending = []
 frames = []
 text = ''
