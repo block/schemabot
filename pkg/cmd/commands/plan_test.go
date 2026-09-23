@@ -766,3 +766,13 @@ func TestPlanOutputPreservesTargetDialect(t *testing.T) {
 		})
 	}
 }
+
+func TestWritePlanHeaderPostgres(t *testing.T) {
+	for _, engine := range []string{"postgres", "PostgreSQL"} {
+		output := captureStdout(func() {
+			templates.WritePlanHeader(templates.PlanHeaderData{Database: "shop", Engine: engine, IsMySQL: true})
+		})
+		assert.Contains(t, output, "PostgreSQL Schema Change Plan")
+		assert.NotContains(t, output, "MySQL Schema Change Plan")
+	}
+}

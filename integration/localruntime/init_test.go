@@ -5,6 +5,7 @@ package localruntime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	runtimehost "github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/localsetup"
 )
 
 // Initialization runs the installed CLI, creates its own private runtime and
@@ -26,8 +28,12 @@ func TestInitEngines(t *testing.T) {
 	defer cancelBuild()
 	output, err := exec.CommandContext(buildCtx, "go", "build", "-o", binary, "../../pkg/cmd").CombinedOutput()
 	require.NoError(t, err, string(output))
-	for _, engine := range []string{"mysql", "postgres"} {
-		t.Run(engine, func(t *testing.T) {
+	for _, setup := range []struct {
+		engine     string
+		integrated bool
+	}{{"mysql", false}, {"postgres", false}, {"mysql", true}, {"postgres", true}} {
+		engine := setup.engine
+		t.Run(fmt.Sprintf("%s/integrated=%t", engine, setup.integrated), func(t *testing.T) {
 			storageDSN, targetDSN, db := supervisorDatabase(t, engine)
 			execSQL(t, db, "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL)")
 			execSQL(t, db, "INSERT INTO widgets VALUES (1, 'keep me')")
@@ -36,6 +42,16 @@ func TestInitEngines(t *testing.T) {
 			namespace := "app"
 			if engine == "postgres" {
 				namespace = "public"
+			}
+			require.NoError(t, localsetup.CheckConnection(t.Context(), engine, targetDSN))
+			discovered, err := localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
+			require.NoError(t, err)
+			require.Equal(t, []string{namespace}, discovered)
+			if engine == "postgres" {
+				execSQL(t, db, "CREATE SCHEMA analytics")
+				discovered, err = localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
+				require.NoError(t, err)
+				require.Contains(t, discovered, "analytics")
 			}
 			manager := runtimehost.Manager{Dir: filepath.Join(home, ".schemabot", "runtimes", "local"), Binary: binary, Version: "dev"}
 			t.Cleanup(func() {
@@ -50,11 +66,40 @@ func TestInitEngines(t *testing.T) {
 				cmd.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=", "INIT_TARGET="+targetDSN, "INIT_STORAGE="+storageDSN)
 				return cmd.CombinedOutput()
 			}
+			missingOutput, missingErr := run("init", "--non-interactive", "--json")
+			require.Error(t, missingErr)
+			var missing struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+				Missing []string `json:"missing"`
+			}
+			require.NoError(t, json.Unmarshal(missingOutput, &missing))
+			require.Equal(t, "missing_inputs", missing.Error.Code)
+			require.Contains(t, missing.Missing, "database")
 			args := []string{"init", "--database", "app", "--environment", "development", "--type", engine, "--dsn", "env:INIT_TARGET", "--storage-dsn", "env:INIT_STORAGE", "--schema-dir", root, "--namespace", namespace, "--profile", "project", "--json"}
+			if setup.integrated {
+				// A wizard-entered connection persists as a file reference and
+				// must work for later commands and repeated initialization too.
+				connectionFile := filepath.Join(t.TempDir(), "connection.dsn")
+				require.NoError(t, os.WriteFile(connectionFile, []byte(targetDSN), 0600))
+				args[slices.Index(args, "--dsn")+1] = "file:" + connectionFile
+				i := slices.Index(args, "--storage-dsn")
+				args = append(args[:i], append([]string{"--integrated"}, args[i+2:]...)...)
+			}
 			// A fresh installation works with the normal default profile too.
 			defaultArgs := slices.Clone(args)
 			profileIndex := slices.Index(defaultArgs, "--profile")
 			defaultArgs = append(defaultArgs[:profileIndex], defaultArgs[profileIndex+2:]...)
+			if setup.integrated {
+				execSQL(t, db, "CREATE DATABASE schemabot")
+				out, err := run(defaultArgs...)
+				require.Error(t, err, string(out))
+				require.Contains(t, string(out), "already exists")
+				require.NoFileExists(t, filepath.Join(manager.Dir, "runtime.yaml"))
+				execSQL(t, db, "DROP DATABASE schemabot")
+			}
 			output, err := run(defaultArgs...)
 			require.NoError(t, err, string(output))
 			output, err = run("databases")
@@ -95,7 +140,7 @@ func TestInitEngines(t *testing.T) {
 			require.True(t, os.IsNotExist(err))
 			config, err := os.ReadFile(filepath.Join(manager.Dir, "runtime.yaml"))
 			require.NoError(t, err)
-			require.Contains(t, string(config), "env:INIT_TARGET")
+			require.Contains(t, string(config), args[slices.Index(args, "--dsn")+1])
 			require.NotContains(t, string(config), targetDSN)
 			schemaPath := filepath.Join(root, namespace, "widgets.sql")
 			schema, err := os.ReadFile(schemaPath)
@@ -104,10 +149,11 @@ func TestInitEngines(t *testing.T) {
 			require.NoError(t, os.WriteFile(schemaPath, edited, 0600))
 			output, err = run(args...)
 			require.Error(t, err, string(output))
-			require.Contains(t, string(output), "existing files were preserved")
+			require.Contains(t, string(output), "still produce schema changes")
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
+			// Existing schema files are verified automatically, preserving harmless comments.
 			// Reuse must reject a real difference without changing the user's files.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.Error(t, err, string(output))
@@ -115,6 +161,9 @@ func TestInitEngines(t *testing.T) {
 			require.FileExists(t, filepath.Join(root, namespace, "notes.sql"))
 			// Explicit reuse accepts harmless formatting/comments without replacing files.
 			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))
+			output, err = run(args...)
+			require.NoError(t, err, string(output))
+			// The explicit flag remains supported for scripted callers.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.NoError(t, err, string(output))
 			after, err = os.ReadFile(schemaPath)
