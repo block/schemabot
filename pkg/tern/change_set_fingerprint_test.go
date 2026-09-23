@@ -155,10 +155,42 @@ func TestChangeSetFingerprint_MalformedSetHasNoKey(t *testing.T) {
 	require.Error(t, err)
 }
 
+// Work only means something under the grammar it was read with, so two change
+// sets canonicalized under different dialects were never compared and must not
+// group together however alike their DDL renders.
+func TestChangeSetFingerprint_DialectSplitsAGroup(t *testing.T) {
+	cs := protoNonShardedSet(&ternv1.TableChange{
+		TableName:  "users",
+		Ddl:        "ALTER TABLE users ADD COLUMN email varchar(255)",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		Namespace:  "testapp",
+	})
+
+	asMySQL, err := ChangeSetFingerprint(schema.DialectMySQL, cs)
+	require.NoError(t, err)
+	asPostgres, err := ChangeSetFingerprint(schema.DialectPostgres, cs)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, asMySQL, asPostgres)
+}
+
+// The zero value is a change set nothing has read, which is not the same thing
+// as a member that plans nothing. Keying the two alike would group members whose
+// plans were never canonicalized in with the members that genuinely have no work
+// to do.
+func TestCanonicalChangeSet_ZeroValueKeysApartFromAnEmptyPlan(t *testing.T) {
+	nothingToRun, err := Canonicalize(schema.DialectMySQL, ChangeSet{})
+	require.NoError(t, err)
+
+	var unread CanonicalChangeSet
+	assert.NotEqual(t, nothingToRun.Fingerprint(), unread.Fingerprint())
+}
+
 // The contract the grouping rests on: two members share a key exactly when the
 // comparison reports no difference between them. If these two ever disagree, a
 // comment would either split one plan across several blocks or render two
-// different plans as one.
+// different plans as one. It holds for both forms of each operation, because
+// both read the same canonical change set.
 func TestChangeSetFingerprint_AgreesWithCompareChangeSets(t *testing.T) {
 	restyled := protoNonShardedSet(&ternv1.TableChange{
 		TableName:  "users",
@@ -187,6 +219,16 @@ func TestChangeSetFingerprint_AgreesWithCompareChangeSets(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, diff.Empty(), fingerprint(t, tc.baseline) == fingerprint(t, tc.candidate),
 				"fingerprint equality must agree with the comparison; diff: %+v", diff)
+
+			baseline, err := Canonicalize(schema.DialectMySQL, tc.baseline)
+			require.NoError(t, err)
+			candidate, err := Canonicalize(schema.DialectMySQL, tc.candidate)
+			require.NoError(t, err)
+			canonicalDiff, err := baseline.CompareTo(candidate)
+			require.NoError(t, err)
+			assert.Equal(t, canonicalDiff.Empty(), baseline.Fingerprint() == candidate.Fingerprint(),
+				"the value form must agree with itself; diff: %+v", canonicalDiff)
+			assert.Equal(t, diff, canonicalDiff, "the value form must agree with the one-shot comparison")
 		})
 	}
 }

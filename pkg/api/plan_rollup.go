@@ -101,9 +101,10 @@ type DeploymentRollupEntry struct {
 	// Two members share it exactly when tern.CompareChangeSets reports them
 	// identical.
 	//
-	// A member classified Match or Planned always has one: both classifications
-	// are reached through a self-comparison that proves the member's content
-	// canonicalizes, which is the same thing the fingerprint needs.
+	// Every member that classified as anything but errored has one, including a
+	// diverged member: reaching any of those classifications means the member's
+	// change set was canonicalized, and the key is read straight off that
+	// canonical form.
 	//
 	// It is empty for a member that errored, and that emptiness is not a group.
 	// Grouping on the raw value — keying a map by it — collects every errored
@@ -153,11 +154,16 @@ type PlanRollup struct {
 //
 // planning decides what a difference between members means. Under
 // PlanMirrored the primary (index 0) is the reviewed baseline and classifies
-// Match against itself, every other member is compared to it with
-// tern.CompareChangeSets, and a difference is drift that blocks. Under
-// PlanIndependent no member is compared to another: each was planned against
-// its own live schema, so every member that produced a usable diff classifies
-// Planned.
+// Match against itself, every other member is compared to it, and a difference
+// is drift that blocks. Under PlanIndependent no member is compared to another:
+// each was planned against its own live schema, so every member that produced a
+// usable diff classifies Planned.
+//
+// Under either planning every member's change set is canonicalized exactly once
+// with tern.Canonicalize, and the comparisons and grouping keys the rollup
+// publishes are read off those canonical forms. That is also the gate a member's
+// content passes: change content SchemaBot cannot read fails the member closed
+// there, before anything is concluded from it.
 //
 // The result fails closed under either planning: a contract mismatch, or any
 // member that errored, makes the rollup not Clean. Under PlanMirrored a
@@ -184,20 +190,27 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 
 	// The primary's database type selects the grammar every comparison in this
 	// rollup classifies and canonicalizes DDL with. An unregistered dialect makes
-	// the self-comparison below error, so a primary whose type maps to no known
-	// grammar fails the rollup closed rather than being parsed by a guess.
+	// canonicalizing the baseline below error, so a primary whose type maps to no
+	// known grammar fails the rollup closed rather than being parsed by a guess.
 	baselineDialect := schema.DialectForDatabaseType(diffs[0].DatabaseType)
 
 	// The baseline is usable only when the primary neither errored in the producer
-	// nor carries malformed content. A self-comparison surfaces malformed or
+	// nor carries malformed content. Canonicalizing it surfaces malformed or
 	// unparseable change content that would otherwise let a single-deployment
 	// rollup report clean, or classify the primary as a match, without a
-	// trustworthy comparison ever running. A self-comparison of well-formed
-	// content is provably empty, so it never false-diverges a legitimate baseline.
+	// trustworthy comparison ever running.
+	//
+	// The canonical form is what every member below is compared against and what
+	// the primary is keyed by, so the reviewed plan is parsed once for the whole
+	// rollup rather than once per member that is measured against it.
+	var baselineCanonical tern.CanonicalChangeSet
 	baselineCause := diffs[0].Err
 	if baselineCause == nil {
-		if _, err := tern.CompareChangeSets(baselineDialect, baseline, baseline); err != nil {
+		canonical, err := tern.Canonicalize(baselineDialect, baseline)
+		if err != nil {
 			baselineCause = err
+		} else {
+			baselineCanonical = canonical
 		}
 	}
 	baselineUsable := baselineCause == nil
@@ -210,6 +223,12 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			Deployment:   d.Deployment,
 			Target:       d.Target,
 		}
+		memberSet := tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}
+		// The canonical form of what this member would run, set by whichever branch
+		// classifies the member as still passing and read below to key it. A branch
+		// that leaves it unset is one that errored the entry, and an errored member
+		// is never keyed.
+		var memberCanonical tern.CanonicalChangeSet
 		switch {
 		case d.Err != nil:
 			entry.Class = DeploymentErrored
@@ -225,6 +244,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 				entry.Err = fmt.Errorf("reviewed primary plan is not a usable baseline: %w", baselineCause)
 				clean = false
 			} else {
+				memberCanonical = baselineCanonical
 				entry.Class = DeploymentMatch
 			}
 		case !baselineUsable:
@@ -247,74 +267,93 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 				d.DatabaseType, schema.DialectForDatabaseType(d.DatabaseType), diffs[0].DatabaseType, baselineDialect)
 			clean = false
 		default:
-			diff, err := tern.CompareChangeSets(baselineDialect, baseline, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
-			switch {
-			case err != nil:
-				entry.Class = DeploymentErrored
-				entry.Err = err
+			memberCanonical = classifyAgainstBaseline(&entry, baselineCanonical, baselineDialect, memberSet)
+			// Only an exact match passes. The branch classifies Match, Diverged or
+			// Errored, and both of the others block the review.
+			if entry.Class != DeploymentMatch {
 				clean = false
-			case !diff.Empty():
-				entry.Class = DeploymentDiverged
-				entry.Diff = diff
-				clean = false
-			default:
-				entry.Class = DeploymentMatch
 			}
 		}
-		if !recordMemberPlan(&entry, baselineDialect, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}) {
-			clean = false
-		}
-		// A blocked count is only as trustworthy as the plan it is read from. An
-		// errored entry's plan is the one the rollup just declared unusable, so
-		// it publishes no count rather than a precise-looking number a reviewer
-		// would read as a real refusal total. The class is read after the member
-		// is keyed, because a member that cannot be keyed errors there.
-		if entry.Class != DeploymentErrored {
-			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
-		}
+		recordMemberPlan(&entry, memberSet, memberCanonical)
 		entries[i] = entry
 	}
 
 	return PlanRollup{Entries: entries, Clean: clean, Planning: planning}, nil
 }
 
-// recordMemberPlan records what a classified member would run — its change set
-// and the key that groups it with members running the same work — and reports
-// whether the entry still passes.
+// classifyAgainstBaseline measures one member's change set against the reviewed
+// baseline, records the outcome on the entry, and returns the canonical form the
+// member is keyed by — the zero value for a member that errored, which is never
+// keyed.
 //
-// It is only reached for a member whose content a comparison already
-// canonicalized, so a fingerprint failure here contradicts that comparison. It
-// still fails the member closed rather than leaving the key empty: a member
-// SchemaBot cannot key is one it cannot group, and an ungrouped member renders
-// as work nobody reviewed.
-//
-// An errored member is left alone and reported as not passing. It has no plan to
-// describe, and overwriting its cause with a second one would bury the reason it
-// blocked. The caller has already failed that member closed, so the repeated
-// signal changes nothing; the point is that the result means the same thing for
-// every member, whichever branch classified it.
-func recordMemberPlan(entry *DeploymentRollupEntry, dialect schema.Dialect, cs tern.ChangeSet) bool {
-	if entry.Class == DeploymentErrored {
-		return false
-	}
-	fingerprint, err := tern.ChangeSetFingerprint(dialect, cs)
+// Canonicalizing the member is what reads its DDL, so content the member's own
+// grammar cannot parse fails it closed here rather than being compared as if it
+// had been understood. The comparison that follows reads two canonical forms and
+// parses nothing.
+func classifyAgainstBaseline(entry *DeploymentRollupEntry, baseline tern.CanonicalChangeSet, dialect schema.Dialect, member tern.ChangeSet) tern.CanonicalChangeSet {
+	canonical, err := tern.Canonicalize(dialect, member)
 	if err != nil {
 		entry.Class = DeploymentErrored
-		entry.Err = fmt.Errorf("member plan could not be keyed for grouping: %w", err)
-		return false
+		entry.Err = fmt.Errorf("deployment plan is not usable: %w", err)
+		return tern.CanonicalChangeSet{}
+	}
+	// Both sides were canonicalized under the primary's dialect, which the caller
+	// has already confirmed is this deployment's own, so this refuses nothing a
+	// well-formed rollup produces. It stays because a comparison that cannot be
+	// performed must never be reported as agreement.
+	diff, err := baseline.CompareTo(canonical)
+	if err != nil {
+		entry.Class = DeploymentErrored
+		entry.Err = fmt.Errorf("cannot compare the deployment's plan to the reviewed plan: %w", err)
+		return tern.CanonicalChangeSet{}
+	}
+	if !diff.Empty() {
+		entry.Class = DeploymentDiverged
+		entry.Diff = diff
+		return canonical
+	}
+	entry.Class = DeploymentMatch
+	return canonical
+}
+
+// recordMemberPlan records what a classified member would run: the change set
+// itself, the key that groups it with members running the same work, and the
+// count of changes its target will refuse.
+//
+// The key comes from the canonical form the member's classification already
+// built, so keying a member parses nothing and cannot fail on content that was
+// just read successfully. That is why this records rather than gates: the gate
+// is the canonicalization each classifying branch performs, and a member that
+// failed it arrives here already errored.
+//
+// An errored member is left alone. It has no plan to describe, and the count
+// would be read from the plan the rollup just declared unusable — a
+// precise-looking number a reviewer would take for a real refusal total. Its
+// empty key is not a group either: a reader must check Class before grouping,
+// or every errored member collects under one key and renders as members
+// agreeing on a plan.
+func recordMemberPlan(entry *DeploymentRollupEntry, cs tern.ChangeSet, canonical tern.CanonicalChangeSet) {
+	if entry.Class == DeploymentErrored {
+		return
 	}
 	entry.ChangeSet = cs
-	entry.PlanFingerprint = fingerprint
-	return true
+	entry.PlanFingerprint = canonical.Fingerprint()
+	entry.Blocked = countBlockedChanges(cs)
 }
 
 // rollupIndependentMembers classifies members that were each planned against
 // their own live schema. No member is compared to another, so a difference
 // between them is never drift. What still blocks is a member that could not be
 // planned at all: a producer error, or change content that will not parse under
-// the member's own grammar. Content is checked by comparing a member's change
-// set to itself, which is provably empty when the content is well-formed, so the
-// check surfaces malformed content without ever false-diverging a real plan.
+// the member's own grammar. Canonicalizing a member's change set is what reads
+// that content, so it surfaces a plan SchemaBot cannot make sense of without
+// ever measuring one member against another.
+//
+// The blocked count each member publishes matters more here than it does under
+// mirrored planning. Mirrored members hold the same change set by construction,
+// so the primary's count covers them all; independent members hold different
+// change sets, so this is the only place a non-primary member's refused DDL can
+// surface at review time.
 func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 	entries := make([]DeploymentRollupEntry, len(diffs))
 	clean := true
@@ -324,36 +363,28 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 			Deployment:   d.Deployment,
 			Target:       d.Target,
 		}
+		memberSet := tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}
+		var memberCanonical tern.CanonicalChangeSet
 		switch {
 		case d.Err != nil:
 			entry.Class = DeploymentErrored
 			entry.Err = d.Err
 			clean = false
 		default:
-			own := tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}
-			if _, err := tern.CompareChangeSets(schema.DialectForDatabaseType(d.DatabaseType), own, own); err != nil {
+			// Each member is read, and keyed, under its own grammar. Members here
+			// are never compared to each other, so nothing has established that
+			// they share a dialect the way the mirrored path's baseline does.
+			canonical, err := tern.Canonicalize(schema.DialectForDatabaseType(d.DatabaseType), memberSet)
+			if err != nil {
 				entry.Class = DeploymentErrored
 				entry.Err = fmt.Errorf("member plan is not usable: %w", err)
 				clean = false
 			} else {
+				memberCanonical = canonical
 				entry.Class = DeploymentPlanned
 			}
 		}
-		// Each member is keyed under its own grammar. Members here are never
-		// compared to each other, so nothing has established that they share a
-		// dialect the way the mirrored path's baseline does.
-		if !recordMemberPlan(&entry, schema.DialectForDatabaseType(d.DatabaseType), tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}) {
-			clean = false
-		}
-		// Same rule as the mirrored path: an errored entry's plan is the one just
-		// declared unusable, so it publishes no count. The count matters more
-		// here than it does there. Mirrored members hold the same change set by
-		// construction, so the primary's count covers them all; independent
-		// members hold different change sets, so this is the only place a
-		// non-primary member's refused DDL can surface at review time.
-		if entry.Class != DeploymentErrored {
-			entry.Blocked = countBlockedChanges(tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
-		}
+		recordMemberPlan(&entry, memberSet, memberCanonical)
 		entries[i] = entry
 	}
 	return PlanRollup{Entries: entries, Clean: clean, Planning: PlanIndependent}

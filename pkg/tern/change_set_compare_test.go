@@ -445,6 +445,78 @@ func TestCompareChangeSets_PostgresOnlyConstructDiverges(t *testing.T) {
 	require.Len(t, diff.UnexpectedInCandidate, 1)
 }
 
+// A rollup measures several members against one reviewed plan, so it reads that
+// plan once and reuses the canonical form. Every answer it gets is the one the
+// one-shot comparison gives, whichever member it is comparing and however many
+// comparisons that baseline has already taken part in.
+func TestCanonicalize_ReusedBaselineComparesLikeTheOneShotForm(t *testing.T) {
+	baseline := protoNonShardedSet(protoAlterUsersEmail())
+	candidates := []ChangeSet{
+		protoNonShardedSet(protoAlterUsersEmail()),
+		protoNonShardedSet(protoAlterUsersPhone()),
+		protoNonShardedSet(),
+		protoNonShardedSet(protoAlterUsersEmail(), protoAlterUsersPhone()),
+		protoNonShardedSet(protoAlterUsersEmail()),
+	}
+
+	canonicalBaseline, err := Canonicalize(schema.DialectMySQL, baseline)
+	require.NoError(t, err)
+
+	for i, candidate := range candidates {
+		canonicalCandidate, err := Canonicalize(schema.DialectMySQL, candidate)
+		require.NoError(t, err, "candidate %d", i)
+
+		reused, err := canonicalBaseline.CompareTo(canonicalCandidate)
+		require.NoError(t, err, "candidate %d", i)
+		oneShot, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
+		require.NoError(t, err, "candidate %d", i)
+
+		assert.Equal(t, oneShot, reused, "candidate %d", i)
+	}
+}
+
+// DDL only means what it means under the grammar it was read with, so two change
+// sets canonicalized under different dialects were never comparable. The
+// comparison refuses the pair rather than answering it: identical-looking DDL
+// read by two grammars would otherwise report an empty diff, which a caller
+// reads as the deployments agreeing.
+func TestCanonicalChangeSet_CompareToRefusesAnotherDialect(t *testing.T) {
+	cs := protoNonShardedSet(&ternv1.TableChange{
+		TableName:  "users",
+		Ddl:        "ALTER TABLE users ADD COLUMN email varchar(255)",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		Namespace:  "testapp",
+	})
+	mysqlSide, err := Canonicalize(schema.DialectMySQL, cs)
+	require.NoError(t, err)
+	postgresSide, err := Canonicalize(schema.DialectPostgres, cs)
+	require.NoError(t, err)
+
+	_, err = mysqlSide.CompareTo(postgresSide)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot compare a change set canonicalized as dialect")
+}
+
+// The zero value is not a change set that plans nothing; it is one nothing has
+// read. Comparing it fails closed rather than returning the empty diff two
+// genuinely empty plans produce, which a caller would take for agreement.
+func TestCanonicalChangeSet_CompareToRefusesTheZeroValue(t *testing.T) {
+	canonical, err := Canonicalize(schema.DialectMySQL, ChangeSet{})
+	require.NoError(t, err)
+
+	empty, err := canonical.CompareTo(canonical)
+	require.NoError(t, err)
+	require.True(t, empty.Empty(), "two readings of a change set that plans nothing agree")
+
+	var unread CanonicalChangeSet
+	_, err = unread.CompareTo(unread)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "never canonicalized")
+
+	_, err = canonical.CompareTo(unread)
+	require.Error(t, err)
+}
+
 // VSchema parity is symmetric: a namespace the candidate changes the vschema for
 // but the baseline does not surfaces in the unexpected direction.
 func TestCompareChangeSets_VSchemaUnexpectedDirection(t *testing.T) {
