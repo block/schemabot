@@ -7,6 +7,32 @@ The wizard and explicit CLI flags use the same setup workflow.
 
 ![SchemaBot setup, a schema edit, and the first plan](../assets/init-demo.gif)
 
+## Try without a database
+
+Run `schemabot init` in an empty project directory and choose **Try a sample MySQL database**
+or **Try a sample PostgreSQL database**. Docker must be running. SchemaBot starts a local
+container, seeds `customers` and `orders`, and uses the same import and verification flow.
+No connection string is needed.
+
+![Start a sample database, edit its schema, and preview a change](../assets/init-sample-demo.gif)
+
+For scripts, select the sample explicitly:
+
+```console
+$ schemabot init --sample --type mysql --non-interactive --json
+{"database":"shop","environment":"development","profile":"schemabot-sample-example","schema_dir":"/project/schema","plan_id":"plan-example","tables":2,"verified":true}
+```
+
+Use `--type postgres` for PostgreSQL. Names and paths vary by project. The completion screen
+prints your next command, including its profile. Each project gets its own sample and runtime;
+retrying setup keeps your data and schema edits. Samples listen only on `127.0.0.1`.
+
+Docker retains sample data across restarts. To stop the database, run `docker stop` with the
+container name printed during setup; rerun `init --sample` in the same project to start it again.
+When finished, stop its SchemaBot runtime with `schemabot local stop <container-name>` before
+removing the disposable database with `docker rm -v <container-name>`. Removing the container
+permanently deletes its sample data. Your schema files remain in your project.
+
 ## Before you start
 
 Use MySQL or PostgreSQL with an existing application database. You can paste a connection string or enter host, port, database, username, and password

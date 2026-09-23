@@ -1,3 +1,17 @@
+# Try SchemaBot
+
+From a fresh project directory, run `schemabot init` and choose a sample MySQL or PostgreSQL
+database. Docker supplies the database; SchemaBot handles the connection and imports two sample
+tables. Edit a schema file, preview with `schemabot plan`, and apply when ready. The wizard prints
+the exact command and profile for your project.
+
+From this repository, `make demo` creates a temporary project and starts the MySQL sample.
+Use `make demo ENGINE=postgres` for PostgreSQL. Neither path starts Vitess. See the
+[initialization guide](../docs/init.md#try-without-a-database) for lifecycle and cleanup details.
+
+The full developer environment remains available as `make demo-full`; the sections below
+cover those multi-environment examples.
+
 # Examples
 
 ## MySQL Test Schema
@@ -13,7 +27,7 @@ Run these commands from the repository root. The demo starts local MySQL contain
 make install
 
 # Start local environment (applies schema and seeds 10k rows)
-make demo
+make demo-full
 ```
 
 ### Using the CLI
