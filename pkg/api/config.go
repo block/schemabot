@@ -1282,8 +1282,16 @@ func (c *DirectExecutionConfig) Validate(context string) error {
 // direct-execution metadata here, so the forwarded keys and fields cannot
 // drift between paths.
 func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
-	if c == nil || !c.Enabled {
+	if c == nil {
 		return nil, nil
+	}
+	// An explicit opt-out states itself rather than rendering nothing.
+	// Absent and disabled mean different things — nothing here versus "this
+	// environment does not grant direct execution" — and a renderer that maps
+	// both to an empty map lets a server-wide grant overlay an opt-out that
+	// was written deliberately.
+	if !c.Enabled {
+		return map[string]string{engine.MetadataDirectExecution: "false"}, nil
 	}
 	md := map[string]string{
 		engine.MetadataDirectExecution:             "true",

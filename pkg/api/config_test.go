@@ -1433,13 +1433,20 @@ func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *test
 			"the server policy's lock timeout must not leak into an override that states none")
 	})
 
+	// An opt-out states itself rather than rendering nothing. Rendering
+	// nothing would make a deliberate opt-out indistinguishable from an
+	// environment that never mentioned the policy, and every consumer that
+	// layers the server-wide grant over an unstated policy would then
+	// overlay it onto the opt-out too.
 	t.Run("override opts out", func(t *testing.T) {
 		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
 
 		metadata, err := cfg.DirectExecutionMetadata(envConfig, storage.DatabaseTypeMySQL)
 
 		require.NoError(t, err)
-		assert.Empty(t, metadata)
+		assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "false"}, metadata)
+		assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows,
+			"an opt-out carries no bound: there is nothing for a bound to permit")
 	})
 }
 

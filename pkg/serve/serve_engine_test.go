@@ -183,6 +183,29 @@ func TestServerEngineMetadataLeavesATargetsOwnDirectExecutionPolicyWhole(t *test
 	assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds)
 }
 
+// An environment that opts out of a server-wide grant keeps its opt-out. The
+// single-database gRPC path resolves that environment's policy into the
+// metadata this composition receives, so an opt-out that rendered nothing
+// would read as "unstated" here and be overlaid by the server-wide grant —
+// executing a statement on a database whose configuration refused it.
+func TestServerEngineMetadataKeepsAnEnvironmentsOptOutOverTheServerPolicy(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+	}
+	optedOut, err := config.DirectExecutionMetadata(
+		&api.EnvironmentConfig{DirectExecution: &api.DirectExecutionConfig{Enabled: false}},
+		storage.DatabaseTypeMySQL,
+	)
+	require.NoError(t, err)
+
+	metadata, err := serverEngineMetadata(config, optedOut, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.Equal(t, "false", metadata[engine.MetadataDirectExecution],
+		"the server-wide grant must not overwrite a deliberate opt-out")
+	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows)
+}
+
 // With no policy configured, no direct execution key reaches the engine and
 // refused statements stay blocked.
 func TestServerEngineMetadataOmitsDirectExecutionByDefault(t *testing.T) {
