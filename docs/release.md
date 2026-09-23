@@ -92,6 +92,25 @@ Pushing a `vX.Y.Z` tag triggers two workflows:
 
 Nothing else is required. There is no manual artifact step.
 
+## Update Homebrew
+
+After the release artifacts are available, update the formula in
+[block/homebrew-tap](https://github.com/block/homebrew-tap). Its bump workflow downloads each
+platform archive, verifies its checksum, and opens a formula update for review:
+
+```bash
+gh workflow run bump-formula.yaml --repo block/homebrew-tap \
+  -f repo=block/schemabot -f formula=schemabot -f tag=vX.Y.Z
+```
+
+Replace `vX.Y.Z` with the tag just released. Merge the generated formula PR after its checks
+pass. Users then receive that release with `brew upgrade block/tap/schemabot`; Homebrew
+maintains the `schemabot` command on PATH. No wizard-created alias or symlink is needed.
+
+The formula supports Apple Silicon macOS and Linux arm64/amd64, matching the published
+archives. Verify `schemabot init` from a fresh application directory before advertising a
+new onboarding flow in the quick start.
+
 ## What the version number means
 
 Every version is a deployment. There are no tags cut and shelved, no numbers
