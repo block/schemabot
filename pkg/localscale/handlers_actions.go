@@ -5,14 +5,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
 func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, ref, err := s.resolveDeployAction(r)
+	_, ref, err := s.resolveDeployAction(r)
 	if err != nil {
 		return err
 	}
@@ -23,30 +25,33 @@ func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Reques
 		return err
 	}
 
-	switch info.deploymentState {
-	case dr.Queued, dr.InProgress, dr.PendingCutover, dr.Submitting:
-		// valid states for cancel
-	default:
+	if !CanCancelDeployRequest(info.deploymentState) {
 		return newHTTPError(http.StatusConflict, "cannot cancel: deploy request is in state %q", info.deploymentState)
 	}
 
-	// Cancel all Vitess migrations for this deploy
-	if info.migrationContext != "" {
-		if err := s.alterVitessMigrations(r.Context(), backend, info.migrationContext, "CANCEL"); err != nil {
-			return newHTTPError(http.StatusInternalServerError, "cancel migrations: %v", err)
-		}
-	}
-
-	// Set in_progress_cancel — the processor will advance to complete_cancel
-	// once all Vitess migrations reach terminal state.
+	// Recording the state is the whole of the handler's job. The processor
+	// issues CANCEL to Vitess on every tick a request spends in
+	// in_progress_cancel, so asking the engine here as well would only add a
+	// first attempt — one made on the caller's connection, against the shard
+	// whose silence is the reason the cancel was sent. A cancel must be
+	// answerable while the engine is not.
+	//
+	// The timestamp comes from Go rather than NOW() because the deadline it
+	// feeds is measured against a Go clock. A stored NOW() is the database
+	// session's wall clock, and an offset between the two reads as a cancel
+	// from the future: a deadline that never passes, on the one request that
+	// needs it to.
 	if err := s.execLog(r.Context(),
 		`UPDATE localscale_deploy_requests
-		 SET deployment_state = ?
+		 SET deployment_state = ?, cancel_requested_at = ?
 		 WHERE org = ? AND database_name = ? AND number = ?`,
-		dr.InProgressCancel, ref.org, ref.database, number,
+		dr.InProgressCancel, time.Now().UTC().Format(storedTimestampLayout),
+		ref.org, ref.database, number,
 	); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
+	s.logger.Info("deploy request cancel recorded", "number", number, "org", ref.org,
+		"database", ref.database, "from_state", info.deploymentState)
 
 	s.writeJSON(w, deployResponse(number, info.branch, dr.InProgressCancel, info.createdAt))
 	return nil
@@ -72,7 +77,7 @@ func (s *Server) handleApplyDeployRequest(w http.ResponseWriter, r *http.Request
 	// ALTER VITESS_MIGRATION ... COMPLETE triggers the cutover for all
 	// ready_to_complete migrations matching this context.
 	if info.migrationContext != "" {
-		if err := s.alterVitessMigrations(r.Context(), backend, info.migrationContext, "COMPLETE"); err != nil {
+		if err := s.alterVitessMigrations(r.Context(), backend, info.migrationContext, migrationActionComplete); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "complete migrations: %v", err)
 		}
 	}
@@ -354,100 +359,217 @@ func (s *Server) revertPendingVSchema(ctx context.Context, backend *databaseBack
 	return nil
 }
 
-// alterVitessMigrations runs ALTER VITESS_MIGRATION '<uuid>' <action> against
-// each migration's owning keyspace. action is "CANCEL", "COMPLETE", or "RETRY".
+// ALTER VITESS_MIGRATION actions SchemaBot issues.
+const (
+	migrationActionCancel   = "CANCEL"
+	migrationActionComplete = "COMPLETE"
+)
+
+// awaitingCompletion reports whether a row still has to be told to cut over.
+// Vitess clears postpone_completion the moment it accepts a COMPLETE, so a row
+// that is no longer postponed is already cutting over or already done.
+func awaitingCompletion(row map[string]string) bool {
+	return row["postpone_completion"] == "1"
+}
+
+// filterMigrations returns the rows that keep satisfies.
+func filterMigrations(migrations []map[string]string, keep func(map[string]string) bool) []map[string]string {
+	var kept []map[string]string
+	for _, m := range migrations {
+		if keep(m) {
+			kept = append(kept, m)
+		}
+	}
+	return kept
+}
+
+// distinctMigrationsByKeyspace reduces the rows to the distinct schema changes
+// of each keyspace. SHOW VITESS_MIGRATIONS reports a schema change once per
+// shard, and all of those rows carry the same UUID, so a statement addressed
+// at the keyspace covers every one of them.
+//
+// known reports whether a keyspace belongs to this backend; rows for any other
+// keyspace, and rows whose UUID would not be safe to interpolate, are dropped
+// with a warning. A row missing an identifier is an error: it cannot be
+// addressed at all, and acting on the rest would half-apply the operation.
+func distinctMigrationsByKeyspace(
+	migrations []map[string]string,
+	migrationContext string,
+	known func(keyspace string) bool,
+	logger *slog.Logger,
+) (map[string][]string, error) {
+	byKeyspace := make(map[string][]string)
+	seen := make(map[string]bool)
+	for _, m := range migrations {
+		uuid := m["migration_uuid"]
+		keyspace := m["_keyspace"]
+		if uuid == "" {
+			err := fmt.Errorf("schema change for context %s is missing uuid: keyspace=%q", migrationContext, keyspace)
+			logger.Warn("schema change control will fail because a row is missing its uuid", "keyspace", keyspace, "error", err)
+			return nil, err
+		}
+		if keyspace == "" {
+			err := fmt.Errorf("schema change for context %s is missing keyspace: uuid=%q", migrationContext, uuid)
+			logger.Warn("schema change control will fail because a row is missing its keyspace", "uuid", uuid, "error", err)
+			return nil, err
+		}
+		if err := validateSessionString(uuid); err != nil {
+			logger.Warn("skipping a row with an invalid UUID", "uuid", uuid, "error", err)
+			continue
+		}
+		if !known(keyspace) {
+			logger.Warn("unknown keyspace for schema change", "uuid", uuid, "keyspace", keyspace)
+			continue
+		}
+		if seen[keyspace+"/"+uuid] {
+			continue
+		}
+		seen[keyspace+"/"+uuid] = true
+		byKeyspace[keyspace] = append(byKeyspace[keyspace], uuid)
+	}
+	return byKeyspace, nil
+}
+
+// alterVitessMigrations runs ALTER VITESS_MIGRATION '<uuid>' <action> once per
+// schema change, on a keyspace-scoped connection. vtgate scatters it from
+// there, so every shard of the keyspace acts on it together: a cutover is one
+// command for the whole keyspace, not one command per shard.
+//
+// SHOW VITESS_MIGRATIONS reports a schema change once per shard, and all those
+// rows carry the same UUID, so they are reduced to the distinct UUIDs first.
+// Issuing the statement per row would send it to each shard as many times as
+// the keyspace has shards, and a duplicate that lands while a shard is cutting
+// over contends with the cutover holding that shard's tables locked — the two
+// sit on each other until the cutover's deadline, leaving the deploy request
+// in in_progress_cutover.
 func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBackend, migrationContext, action string) error {
 	migrations, err := s.showMigrations(ctx, backend, migrationContext)
 	if err != nil {
 		return err
 	}
-	targets := make(map[string][]string)
-	for _, m := range migrations {
-		uuid := m["migration_uuid"]
-		keyspace := m["_keyspace"]
-		shard := m["shard"]
-		if uuid == "" {
-			err := fmt.Errorf("migration for context %s is missing uuid: keyspace=%q shard=%q", migrationContext, keyspace, shard)
-			s.logger.Warn("migration control will fail because migration row is missing uuid", "keyspace", keyspace, "shard", shard, "error", err)
-			return err
+	// A schema change Vitess has already unpostponed is cutting over or done,
+	// and telling it again is the duplicate described above.
+	if action == migrationActionComplete {
+		migrations = filterMigrations(migrations, awaitingCompletion)
+		if len(migrations) == 0 {
+			s.logger.Debug("no schema change is waiting to be told to cut over",
+				"migration_context", migrationContext)
+			return nil
 		}
-		if keyspace == "" {
-			err := fmt.Errorf("migration for context %s is missing keyspace: uuid=%q shard=%q", migrationContext, uuid, shard)
-			s.logger.Warn("migration control will fail because migration row is missing keyspace", "uuid", uuid, "shard", shard, "error", err)
-			return err
-		}
-		if shard == "" {
-			err := fmt.Errorf("migration for context %s is missing shard: uuid=%q keyspace=%q", migrationContext, uuid, keyspace)
-			s.logger.Warn("migration control will fail because migration row is missing shard", "uuid", uuid, "keyspace", keyspace, "error", err)
-			return err
-		}
-		if err := validateSessionString(uuid); err != nil {
-			s.logger.Warn("skipping migration with invalid UUID", "uuid", uuid, "error", err)
-			continue
-		}
-		if _, ok := backend.vtgateDBs[keyspace]; !ok {
-			s.logger.Warn("unknown keyspace for migration", "uuid", uuid, "keyspace", keyspace)
-			continue
-		}
-		targets[keyspace] = append(targets[keyspace], uuid)
+	}
+	known := func(keyspace string) bool {
+		_, ok := backend.vtgateDBs[keyspace]
+		return ok
+	}
+	byKeyspace, err := distinctMigrationsByKeyspace(migrations, migrationContext, known, s.logger)
+	if err != nil {
+		return err
 	}
 
 	var firstErr error
-	for keyspace, uuids := range targets {
+	for keyspace, uuids := range byKeyspace {
 		db := backend.vtgateDBs[keyspace]
-		err := func() error {
-			for _, uuid := range uuids {
-				stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
-				if _, err := db.ExecContext(ctx, stmt); err != nil {
-					return fmt.Errorf("alter vitess_migration %s %s: %w", uuid, action, err)
+		for _, uuid := range uuids {
+			stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
+			execCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+			_, err := db.ExecContext(execCtx, stmt)
+			cancel()
+			if err != nil {
+				s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "uuid", uuid,
+					"action", action, "error", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("alter vitess_migration %s %s on %s: %w", uuid, action, keyspace, err)
 				}
+				continue
 			}
-			return nil
-		}()
-		if err != nil {
-			s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "action", action, "migration_count", len(uuids), "error", err)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("alter vitess_migration %s on %s: %w", action, keyspace, err)
-			}
-		} else {
-			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "action", action, "migration_count", len(uuids))
+			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "uuid", uuid, "action", action)
 		}
 	}
 	return firstErr
 }
 
-// showMigrations queries SHOW VITESS_MIGRATIONS for a context across all keyspaces
+// vitessQueryTimeout bounds one statement SchemaBot sends a shard about its
+// schema changes. A healthy shard answers in milliseconds; a shard whose
+// cutover has stopped responding answers never, and the caller that waits on
+// it is the single processor goroutine that drives every deploy request. One
+// unresponsive shard costs a tick under this bound and stalls the state
+// machine without it.
+const vitessQueryTimeout = 10 * time.Second
+
+// showMigrations queries SHOW VITESS_MIGRATIONS for a context on every shard
 // and returns the raw column maps with an added "_keyspace" field.
+//
+// The read is addressed to one shard at a time. Each shard keeps its own row
+// for a schema change, and vtgate will not scatter this statement: asked on a
+// connection scoped to a keyspace with more than one shard it answers
+// "Keyspace does not have exactly one shard" rather than reading any of them.
+// Control statements are the other way round and go to the keyspace, which
+// vtgate does scatter, so a cutover stays one command for all of its shards.
+//
+// A shard that does not answer fails the whole call. Its schema changes are
+// indistinguishable from schema changes that do not exist, and both callers
+// read the absence as a fact: the control path would address the shards that
+// answered and leave the rest of the operation unissued, and state derivation
+// would call a deploy complete on the strength of the shards it could see.
 func (s *Server) showMigrations(ctx context.Context, backend *databaseBackend, migrationContext string) ([]map[string]string, error) {
 	if err := validateSessionString(migrationContext); err != nil {
 		return nil, fmt.Errorf("invalid migration context: %w", err)
 	}
 	var result []map[string]string
-	var lastErr error
-	for keyspace, db := range backend.vtgateDBs {
-		rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS LIKE '"+migrationContext+"'")
-		if err != nil {
-			s.logger.Warn("show vitess_migrations failed", "keyspace", keyspace, "error", err)
-			lastErr = fmt.Errorf("show vitess_migrations for %s: %w", keyspace, err)
-			continue
+	for keyspace := range backend.vtgateDBs {
+		for _, shard := range buildShards(backend.shardCounts[keyspace]) {
+			rowMaps, err := s.showMigrationsOnShard(ctx, backend, keyspace, shard.Name, migrationContext)
+			if err != nil {
+				return nil, fmt.Errorf("show vitess_migrations for %s/%s: %w", keyspace, shard.Name, err)
+			}
+			for _, rm := range rowMaps {
+				rm["_keyspace"] = keyspace
+			}
+			result = append(result, rowMaps...)
 		}
-		rowMaps, err := scanDynamicRows(rows)
-		utils.CloseAndLog(rows)
-		if err != nil {
-			s.logger.Warn("scan vitess_migrations failed", "keyspace", keyspace, "error", err)
-			lastErr = fmt.Errorf("scan vitess_migrations for %s: %w", keyspace, err)
-			continue
-		}
-		for _, rm := range rowMaps {
-			rm["_keyspace"] = keyspace
-		}
-		result = append(result, rowMaps...)
-	}
-	// Return error only if ALL keyspaces failed
-	if len(result) == 0 && lastErr != nil {
-		return nil, lastErr
 	}
 	return result, nil
+}
+
+// showMigrationsOnShard reads one shard's rows for a context. Getting the
+// shard-targeted connection and reading it share one budget, so the whole read
+// is bounded rather than each of its round trips: the caller resolving a cancel
+// passes what is left of its own deadline, and that shorter one wins.
+func (s *Server) showMigrationsOnShard(
+	ctx context.Context,
+	backend *databaseBackend,
+	keyspace, shard, migrationContext string,
+) ([]map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+
+	conn, cleanup, err := s.vtgateTargetConn(ctx, backend, keyspace, shard)
+	if err != nil {
+		return nil, fmt.Errorf("shard-targeted conn: %w", err)
+	}
+	defer cleanup()
+	return showMigrationsOn(ctx, conn, migrationContext)
+}
+
+// rowQuerier is satisfied by both *sql.DB and the *sql.Conn a shard-targeted
+// read runs on, which has to stay one connection to keep its USE keyspace:shard.
+type rowQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// showMigrationsOn reads one target's rows within vitessQueryTimeout. The scan
+// shares the deadline with the query: rows are streamed, so a target that stops
+// answering part way through blocks the scan exactly as it would block the
+// query.
+func showMigrationsOn(ctx context.Context, db rowQuerier, migrationContext string) ([]map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS LIKE '"+migrationContext+"'")
+	if err != nil {
+		return nil, err
+	}
+	defer utils.CloseAndLog(rows)
+	return scanDynamicRows(rows)
 }
 
 func (s *Server) getMigrationInfos(ctx context.Context, backend *databaseBackend, migrationContext string) []migrationInfo {
