@@ -131,12 +131,17 @@ requirements come with those pieces:
 
 Engine notes:
 
-- **Sharded MySQL (Strata):** each shard's engine instance evaluates its own
-  estimate, so `max_table_rows` is a per-shard bound, and one over-bound or
-  unknown-size shard blocks the whole apply through the normal
-  any-shard-blocked aggregation. A direct statement that does run executes per
-  shard, not atomically across shards — the same property every sharded
-  change has.
+- **Sharded MySQL (Strata): not yet supported.** Config validation rejects the
+  policy on these databases at startup, and the server-wide policy does not
+  reach them. Two pieces are missing rather than one: the engine plans through
+  a sharded planner that emits no refusal verdict, and the per-shard delegate
+  it drives to execute a change is handed a target rather than the caller's
+  policy. Adopting it means a refusal detector in the sharded planner and
+  carrying the policy through to each shard, at which point `max_table_rows`
+  becomes a per-shard bound — one over-bound or unknown-size shard blocking
+  the whole apply through the normal any-shard-blocked aggregation, and a
+  direct statement that does run executing per shard rather than atomically
+  across shards, the same property every sharded change has.
 - **PlanetScale/Vitess: excluded by design.** Raw DDL against vtgate would
   bypass Vitess online DDL — schema tracking, revert, and the deploy
   workflow — which is the reason that engine exists. Config validation

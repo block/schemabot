@@ -741,6 +741,25 @@ only MySQL databases; an engine that adopts direct execution later reads the
 same policy rather than needing a second copy of it. See
 [Direct Execution → Engine compatibility](direct-execution.md#engine-compatibility).
 
+Should an engine ever need a field the others have no meaning for, it nests
+*inside* `direct_execution` under the engine's own name rather than moving the
+block into that engine's settings:
+
+```yaml
+direct_execution:
+  enabled: true
+  max_table_rows: 10000       # every engine
+  postgres:
+    some_engine_specific: v   # that engine only
+```
+
+This keeps the shared bounds stated once, in one place, for every engine —
+which is the property worth protecting, since `max_table_rows` is the only
+thing between a refused statement and an unbounded write outage. There is no
+such field today, and one should only be added where the value genuinely has
+no cross-engine meaning; a bound that any engine could honor belongs at the
+top of the block.
+
 ## Storage Dialect
 
 SchemaBot's internal storage database runs on MySQL by default. Set

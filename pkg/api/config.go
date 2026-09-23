@@ -3447,10 +3447,32 @@ func (c EnvironmentConfig) validateDirectExecution(context, databaseType string)
 }
 
 // directExecutionSupported reports whether an engine for this database type
-// consumes the direct execution policy. Only the MySQL engine routes
-// statements it refuses to native DDL.
+// routes the statements it refuses under the direct execution policy. A type
+// is listed here only once its engine reads the policy and applies both of its
+// bounds; anything else would turn a config that looks like a grant into a
+// silent no-op, which is what the gate exists to prevent.
+//
+// The MySQL engine is the one that does. Vitess is excluded by design: raw DDL
+// against vtgate bypasses Vitess online DDL, which is the reason that engine
+// exists. PostgreSQL is excluded because its engine has no refusal detector,
+// size estimator, or lock-bounded executor for the policy to drive. Strata is
+// excluded for the same reason: it plans through its own sharded planner
+// rather than through a refusal-detecting one, and the per-shard delegate it
+// drives receives a target DSN rather than the caller's policy.
 func directExecutionSupported(databaseType string) bool {
-	return databaseType == storage.DatabaseTypeMySQL
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return true
+	case storage.DatabaseTypeVitess, storage.DatabaseTypePostgres, storage.DatabaseTypeStrata:
+		return false
+	default:
+		// The type is open-world: an embedder registers its own engine for
+		// anything not built in, and nothing pins the policy contract on that
+		// registration. Take the conservative disposition — a statement the
+		// engine refuses stays blocked — rather than granting native DDL to an
+		// engine that may never read the bound.
+		return false
+	}
 }
 
 // validateServerDirectExecutionReachesAnEngine rejects a server-wide policy no

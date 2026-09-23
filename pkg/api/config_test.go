@@ -1215,28 +1215,60 @@ func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 	}
 }
 
-// direct_execution on a non-MySQL database is a startup config error rather
-// than a silently ignored grant: config that looks like it permits direct
-// execution must either take effect or fail loudly.
-func TestServerConfig_ValidateRejectsDirectExecutionOnNonMySQL(t *testing.T) {
-	cfg := ServerConfig{
-		Databases: map[string]DatabaseConfig{
-			"mydb": {
-				Type: "vitess",
-				Environments: map[string]EnvironmentConfig{
-					"staging": {
-						DSN:             "root@tcp(localhost)/mydb",
-						DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+// direct_execution on a database whose engine does not route refused
+// statements is a startup config error rather than a silently ignored grant:
+// config that looks like it permits direct execution must either take effect
+// or fail loudly. Every database type SchemaBot recognizes is covered, so a
+// type whose engine adopts direct execution has to be moved deliberately
+// rather than inheriting the grant by resembling MySQL.
+func TestServerConfig_ValidateRejectsDirectExecutionOnEnginesThatDoNotRouteIt(t *testing.T) {
+	for _, dbType := range []string{
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+	} {
+		t.Run(dbType, func(t *testing.T) {
+			cfg := ServerConfig{
+				ExperimentalStrataEnabled: true,
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: dbType,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {
+								DSN:             "root@tcp(localhost)/mydb",
+								DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+							},
+						},
 					},
 				},
-			},
-		},
-	}
+			}
 
-	err := cfg.Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
-	assert.Contains(t, err.Error(), "only supported for mysql databases")
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
+			assert.Contains(t, err.Error(), "only supported for mysql databases")
+		})
+	}
+}
+
+// The server-wide policy states no database type, so it is what reaches a
+// database that reaches no per-database block. It reaches only the engines
+// that route refused statements — dropping the global default on the rest is
+// how one statement of the policy covers a mixed fleet without granting
+// native DDL to an engine that would never apply its bound.
+func TestServerConfig_ResolveDirectExecutionReachesOnlyEnginesThatRouteIt(t *testing.T) {
+	policy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000}
+	cfg := ServerConfig{DirectExecution: policy}
+
+	assert.Same(t, policy, cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL))
+	for _, dbType := range []string{
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+		"an-embedder-registered-engine",
+	} {
+		assert.Nil(t, cfg.ResolveDirectExecution(nil, dbType), "the server-wide policy must not reach %s", dbType)
+	}
 }
 
 // A malformed direct_execution lock_acquisition_timeout is a startup config error —
