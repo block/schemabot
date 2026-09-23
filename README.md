@@ -106,6 +106,7 @@ Guides and reference:
 - [Architecture](./docs/architecture.md): Follow a change from start to finish
 - [Target credential self-heal](./docs/target-credential-self-heal.md): Understand target probes and credential rotation recovery
 - [Partition-aware index builds](./docs/partitioned-parent-index-flow.md): See the decision for online indexes on partitioned PostgreSQL tables
+- [Ideas behind SchemaBot](./docs/inspiration.md): The projects that helped shape it
 - [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
