@@ -64,8 +64,7 @@ PostgreSQL lists accessible application schemas. No results or a failed connecti
 with a chance to retry, edit the connection, or press `m` to enter namespaces manually.
 Explicit `--namespace` flags also bypass discovery. Discovery uses only the application connection. State metadata is initialized only after the final review.
 
-Use Shift+Tab from the review to edit any decision, or Escape to cancel. Explicit
-`--namespace` flags keep their supplied scope and bypass discovery.
+Press Shift+Tab to go back and change your choices, or Escape to cancel.
 
 SchemaBot imports into a temporary directory and verifies a no-change plan before publishing
 the files. A successful setup ends with:

@@ -151,7 +151,8 @@ func initCompletion(result *initResult, environment, defaultProfile, invocation 
 	if result.Tables == 1 {
 		noun = "table"
 	}
-	return fmt.Sprintf("\n  ✓ Your schema is ready\n\n  %d %s · Baseline plan: no changes.\n\n%s\n  Make your first edit, then review the plan:\n\n    %s\n\n", result.Tables, noun, initSchemaTree(result.SchemaDir), next)
+	heading := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1A7F37", Dark: "#3FB950"}).Render("✓ Your schema is ready")
+	return fmt.Sprintf("\n  %s\n\n  %d %s · Baseline plan: no changes.\n\n%s\n  Make your first edit, then review the plan:\n\n    %s\n\n", heading, result.Tables, noun, initSchemaTree(result.SchemaDir), next)
 }
 
 // Preview a bounded number of SQL files, without following directory symlinks.
