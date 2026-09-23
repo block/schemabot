@@ -822,10 +822,15 @@ type TableProgress struct {
 	ThrottleReason string
 	Shards         []ShardProgress // Per-shard breakdown (for Vitess)
 	IsInstant      bool            // True if using instant DDL
-	ProgressDetail string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
-	DDL            string          // The DDL statement being applied
-	StartedAt      *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
-	CompletedAt    *time.Time      // When execution completed (from engine)
+	// ProgressDetail is a free-text note an engine may attach to a table, such
+	// as a summary line from before per-table progress exists or a marker that
+	// a statement ran as native DDL outside the runner. It stops at the engine
+	// boundary: nothing parses it, the drive writes task rows that carry no
+	// detail column, and so it reaches no operator surface.
+	ProgressDetail string
+	DDL            string     // The DDL statement being applied
+	StartedAt      *time.Time // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
+	CompletedAt    *time.Time // When execution completed (from engine)
 }
 
 // ShardProgress tracks progress for a single shard.
