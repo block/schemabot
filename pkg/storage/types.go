@@ -1200,9 +1200,11 @@ type DirectExecutionPolicy struct {
 }
 
 // EngineMetadata renders the policy into the engine metadata keys that carry
-// it to the engine. A nil policy renders nothing, which is the same thing a
-// disabled one renders: an engine that reads no policy blocks every statement
-// it refuses.
+// it to the engine. A nil policy renders nothing: the apply recorded no
+// policy and the executing server's own configuration decides. A disabled
+// policy renders the enabled key as false, because an apply that recorded one
+// stated its opt-out and a surface that cannot read that back would overlay
+// its own grant onto it.
 func (p *DirectExecutionPolicy) EngineMetadata() map[string]string {
 	if p == nil {
 		return nil

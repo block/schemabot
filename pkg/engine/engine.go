@@ -672,12 +672,15 @@ const (
 // under all spell the keys identically — a plan's verdict and the apply that
 // acts on it cannot disagree because one surface omitted a key.
 //
-// A disabled policy renders nothing, which is what leaves a refused statement
-// blocked. A lock timeout of zero renders nothing, leaving the engine's own
-// default in effect.
+// A disabled policy renders the enabled key as false rather than rendering
+// nothing. Both leave a refused statement blocked on the engine that reads
+// them, but only the explicit key distinguishes an opt-out from a caller that
+// stated no policy at all — and a surface that cannot tell those apart
+// overlays its own grant onto the opt-out. A lock timeout of zero renders
+// nothing, leaving the engine's own default in effect.
 func DirectExecutionMetadata(enabled bool, maxTableRows, lockAcquisitionTimeoutSeconds int64) map[string]string {
 	if !enabled {
-		return nil
+		return map[string]string{MetadataDirectExecution: "false"}
 	}
 	md := map[string]string{
 		MetadataDirectExecution:             "true",

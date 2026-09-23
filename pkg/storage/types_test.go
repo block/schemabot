@@ -573,9 +573,11 @@ func TestApplyOptionsCarryTheAdmittedDirectExecutionPolicy(t *testing.T) {
 // The policy renders to metadata through one path, so an apply's durable
 // record and a server's configured policy cannot spell the keys differently.
 func TestDirectExecutionPolicyEngineMetadata(t *testing.T) {
-	assert.Nil(t, (*DirectExecutionPolicy)(nil).EngineMetadata())
-	assert.Nil(t, (&DirectExecutionPolicy{Enabled: false, MaxTableRows: 10000}).EngineMetadata(),
-		"a disabled policy renders nothing, which is what blocks a refused statement")
+	assert.Nil(t, (*DirectExecutionPolicy)(nil).EngineMetadata(),
+		"no policy at all renders nothing, leaving the executing server's configuration in force")
+	assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "false"},
+		(&DirectExecutionPolicy{Enabled: false, MaxTableRows: 10000}).EngineMetadata(),
+		"a disabled policy states its opt-out, so a surface reading it back cannot mistake it for an unstated one and overlay a grant")
 	assert.Equal(t, map[string]string{
 		engine.MetadataDirectExecution:             "true",
 		engine.MetadataDirectExecutionMaxTableRows: "10000",

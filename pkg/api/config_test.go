@@ -5515,10 +5515,11 @@ func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
 			"the override states its own bound and inherits no lock timeout")
 	})
 
-	t.Run("override that opts out states nothing", func(t *testing.T) {
+	t.Run("override that opts out travels as an opt-out", func(t *testing.T) {
 		policy, err := cfg.DirectExecutionPolicyFor("opted-out", "production", storage.DatabaseTypeMySQL)
 		require.NoError(t, err)
-		assert.Nil(t, policy)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy,
+			"stating nothing would let a grant on the server that runs the statement decide instead of the opt-out")
 	})
 
 	t.Run("engine that cannot honor it", func(t *testing.T) {

@@ -2013,13 +2013,6 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		// stored plan, so a re-plan of *that* plan withholds them too.
 		IgnoreTables: plan.IgnoreTables(),
 	}
-	// A policy that cannot be resolved is terminal for the same reason client
-	// resolution is: it is a config lookup that answers the same way on every
-	// attempt until an operator changes the configuration.
-	directExecution, err := s.config.DirectExecutionPolicyFor(req.Database, req.Environment, req.Type)
-	if err != nil {
-		return nil, terminalControlf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
-	}
 	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
 		Database:     req.Database,
 		Type:         req.Type,
@@ -2029,10 +2022,14 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		Environment:  req.Environment,
 		Target:       plan.Target,
 		IgnoreTables: req.IgnoreTables,
-		// A rollback's own statements are planned under the same policy as the
-		// apply it reverses, so reverting a direct change is not refused by a
-		// verdict the forward plan was allowed.
-		DirectExecution: tern.DirectExecutionPolicyProto(directExecution),
+		// A rollback's own statements are planned under the policy the apply
+		// it reverses was admitted under, read off that apply rather than
+		// resolved again from configuration. The two can differ: a rollback
+		// runs after the forward apply, and configuration changes in between.
+		// Re-resolving would let a grant withdrawn since dispatch refuse the
+		// statement that undoes a change it allowed, leaving the schema on
+		// the target the operator is trying to walk back.
+		DirectExecution: tern.DirectExecutionPolicyProto(apply.GetOptions().DirectExecution),
 	})
 	if err != nil {
 		// Mirror ExecutePlanProto's transport classification: only remote

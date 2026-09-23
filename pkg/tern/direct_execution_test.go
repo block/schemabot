@@ -109,7 +109,8 @@ func TestPlanHonorsAStatedDisabledPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, eng.planCredentials)
-	assert.Empty(t, eng.planCredentials.Metadata)
+	assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "false"}, eng.planCredentials.Metadata,
+		"the opt-out replaces the server's policy whole, and states itself rather than reading as unstated")
 }
 
 // A caller that states no policy leaves the executing server's own
@@ -196,7 +197,8 @@ func TestApplyHonorsADisabledPolicyRecordedOnTheApply(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, eng.applyCredentials)
-	assert.Empty(t, eng.applyCredentials.Metadata)
+	assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "false"}, eng.applyCredentials.Metadata,
+		"the recorded opt-out replaces the server's policy whole, and states itself rather than reading as unstated")
 }
 
 // An apply that recorded no policy leaves the executing server's own

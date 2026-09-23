@@ -706,6 +706,18 @@ this server's policy rather than its own, and an apply records the policy it
 was admitted under so a later drive routes it the same way. A request that
 states no policy leaves the executing server's own configuration in force.
 
+An opt out travels the same way a grant does. `enabled: false` is stated on
+the request rather than left out of it, because leaving it out is how a
+request says nothing at all — and a request that says nothing hands the
+decision to whatever the executing server is configured with, which on a data
+plane serving several control planes may be a grant the opted-out database
+was never meant to have.
+
+A rollback is planned under the policy its original apply was admitted under,
+read off that apply rather than resolved again. The two can differ: a
+rollback runs after the change it reverses, and withdrawing the grant in
+between would otherwise refuse the statement that undoes a change it allowed.
+
 A direct statement is synchronous, blocks writes to the table while it runs,
 and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
 bound. A refused statement runs directly only when the table's size is within

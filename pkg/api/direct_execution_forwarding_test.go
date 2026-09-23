@@ -103,3 +103,70 @@ func TestQueuedApplyRecordsTheResolvedDirectExecutionPolicy(t *testing.T) {
 		LockAcquisitionTimeoutSeconds: 5,
 	}, applies.apply.GetOptions().DirectExecution)
 }
+
+// A rollback re-plans under the policy its source apply was admitted under,
+// read off that apply rather than resolved again from configuration. A
+// rollback runs after the change it reverses, so an operator who narrowed or
+// withdrew the grant in between would otherwise find the statement that undoes
+// a direct change refused, leaving the schema they are trying to walk back on
+// the target.
+func TestExecuteRollbackPlanStatesTheSourceApplysDirectExecutionPolicy(t *testing.T) {
+	plans := &rollbackSourcePlanStore{source: rollbackSourcePlan()}
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan_rollback"}}
+
+	// The grant the apply ran under is gone from this server's configuration.
+	config := directExecutionServerConfig()
+	config.DirectExecution = nil
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, config, map[string]tern.Client{
+		DefaultDeployment + "/staging": client,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply_rollback", PlanID: 10,
+		Database: "payments", DatabaseType: storage.DatabaseTypeMySQL,
+		Repository: "org/repo", PullRequest: 7, Environment: "staging",
+		Deployment: DefaultDeployment, State: state.Apply.Completed,
+	}
+	apply.SetOptions(storage.ApplyOptions{DirectExecution: &storage.DirectExecutionPolicy{
+		Enabled:                       true,
+		MaxTableRows:                  10000,
+		LockAcquisitionTimeoutSeconds: 5,
+	}})
+
+	_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	require.NotNil(t, client.planReq)
+	policy := client.planReq.GetDirectExecution()
+	require.NotNil(t, policy, "the rollback re-plan must state the policy its source apply was admitted under")
+	assert.True(t, policy.GetEnabled())
+	assert.Equal(t, int64(10000), policy.GetMaxTableRows())
+	assert.Equal(t, int64(5), policy.GetLockAcquisitionTimeoutSeconds())
+}
+
+// An apply admitted with no policy stated leaves the rollback's re-plan
+// stating none either, so the server that runs the statement judges it under
+// its own configuration rather than under a grant this one has since acquired.
+func TestExecuteRollbackPlanStatesNoPolicyWhenTheSourceApplyRecordedNone(t *testing.T) {
+	plans := &rollbackSourcePlanStore{source: rollbackSourcePlan()}
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan_rollback"}}
+
+	// This server holds a grant the apply never ran under.
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, directExecutionServerConfig(), map[string]tern.Client{
+		DefaultDeployment + "/staging": client,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply_rollback", PlanID: 10,
+		Database: "payments", DatabaseType: storage.DatabaseTypeMySQL,
+		Repository: "org/repo", PullRequest: 7, Environment: "staging",
+		Deployment: DefaultDeployment, State: state.Apply.Completed,
+	}
+
+	_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	require.NotNil(t, client.planReq)
+	assert.Nil(t, client.planReq.GetDirectExecution(),
+		"a grant acquired after the apply must not reach the rollback of a change it never covered")
+}
