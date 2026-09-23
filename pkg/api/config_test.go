@@ -5323,3 +5323,54 @@ func TestServerConfig_MemberPlanningFor(t *testing.T) {
 		assert.Contains(t, err.Error(), "missing")
 	})
 }
+
+// A server-wide policy is expected to be partly inert on a mixed fleet, but a
+// policy that reaches no engine at all is one an operator believes is in force
+// and that will never route a statement.
+func TestServerConfig_ValidateRejectsAServerDirectExecutionNoEngineCanHonor(t *testing.T) {
+	policy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000}
+
+	t.Run("no registered database can honor it", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+			},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "which no registered database can honor")
+	})
+
+	t.Run("one database that can honor it is enough", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+				"payments": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/payments"},
+				}},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("a disabled policy reaches nothing on purpose", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: &DirectExecutionConfig{Enabled: false},
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+}

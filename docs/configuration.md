@@ -723,7 +723,23 @@ silently carried in config.
 The server-wide policy is held to the same shape rules but is not rejected
 alongside other engines: it names no database type, so a server that drives
 MySQL and PostgreSQL can state one policy, and it reaches only the engines
-that consume it.
+that consume it. It is rejected when it reaches *nothing* — an enabled policy
+on a server with no `target_resolver` and no registered database whose engine
+can honor it fails startup, the same way a per-database block on the wrong
+engine does. A server holding a `target_resolver` is exempt, because the
+engines behind its targets are not knowable from config.
+
+`direct_execution` is a policy rather than an engine setting, which is why it
+sits beside `pending_drops` at the top level rather than inside an engine
+block like `spirit`, `planetscale`, or `postgres`. Its two fields mean the
+same thing on any engine — a blast-radius bound in rows, and a bound on lock
+acquisition — and each engine supplies only the three pieces that are
+genuinely its own: which statements it refuses, how it estimates a table's
+size, and which native session timeout the lock bound maps to. Today the
+MySQL engine is the only one that implements those, so the policy reaches
+only MySQL databases; an engine that adopts direct execution later reads the
+same policy rather than needing a second copy of it. See
+[Direct Execution → Engine compatibility](direct-execution.md#engine-compatibility).
 
 ## Storage Dialect
 

@@ -1923,6 +1923,9 @@ func (c *ServerConfig) Validate() error {
 	if err := c.DirectExecution.Validate("server config"); err != nil {
 		return err
 	}
+	if err := c.validateServerDirectExecutionReachesAnEngine(); err != nil {
+		return err
+	}
 	if err := validateRateLimits(c.RateLimits); err != nil {
 		return err
 	}
@@ -3448,6 +3451,32 @@ func (c EnvironmentConfig) validateDirectExecution(context, databaseType string)
 // statements it refuses to native DDL.
 func directExecutionSupported(databaseType string) bool {
 	return databaseType == storage.DatabaseTypeMySQL
+}
+
+// validateServerDirectExecutionReachesAnEngine rejects a server-wide policy no
+// engine on this server can honor. The policy is engine-agnostic by design and
+// is expected to be partly inert on a mixed fleet — that is what lets one
+// statement of it cover every database. Reaching nothing at all is different:
+// it is a policy an operator believes is in force and that will never route a
+// statement, which is the same failure a per-database block on the wrong
+// engine is rejected for.
+//
+// A target resolver is the exemption. Its targets are resolved per request and
+// their engines are not knowable from config, so a server holding one can
+// state a policy for databases it has never seen.
+func (c *ServerConfig) validateServerDirectExecutionReachesAnEngine() error {
+	if c.DirectExecution == nil || !c.DirectExecution.Enabled {
+		return nil
+	}
+	if c.TargetResolver.Enabled() {
+		return nil
+	}
+	for _, db := range c.DatabaseConfigs() {
+		if directExecutionSupported(db.Type) {
+			return nil
+		}
+	}
+	return fmt.Errorf("server config sets direct_execution, which no registered database can honor: it is only supported for %s databases", storage.DatabaseTypeMySQL)
 }
 
 // ResolveDirectExecution returns the direct execution policy in force for one
