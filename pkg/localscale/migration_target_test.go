@@ -45,7 +45,7 @@ func TestAwaitingCompletionSelectsOnlyPostponedShards(t *testing.T) {
 
 func allKeyspacesKnown(string) bool { return true }
 
-// A migration on a sharded keyspace runs once per shard and reports one row
+// A schema change on a sharded keyspace runs once per shard and reports one row
 // per shard, all carrying the same UUID. Each row is one shard's piece of the
 // work and has to resolve to its own target: grouping by keyspace alone leaves
 // two sends addressed at the whole keyspace, and since vtgate scatters each of
