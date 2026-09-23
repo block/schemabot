@@ -8,6 +8,10 @@ import (
 	"sort"
 	"strings"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -39,8 +43,23 @@ func (s *Service) pullTargetSchema(
 	namespaces []string,
 	catalogDetail ternv1.PullCatalogDetail,
 ) (*ternv1.PullSchemaResponse, error) {
+	// Each member gets its own span rather than recording on the caller's. A
+	// rollout pulls its members concurrently, so one span per member is what
+	// attributes a slow or failing read to the member that owns it; statuses from
+	// several members on one shared span would describe whichever finished last.
+	ctx, span := otel.Tracer("schemabot").Start(ctx, "pullTargetSchema",
+		trace.WithAttributes(
+			attribute.String("database", req.Database),
+			attribute.String("environment", req.Environment),
+			attribute.String("deployment", target.Deployment),
+			attribute.String("target", target.Target),
+		))
+	defer span.End()
+
 	client, err := s.TernClient(target.Deployment, req.Environment)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve tern client failed")
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
@@ -72,6 +91,8 @@ func (s *Service) pullTargetSchema(
 			CatalogDetail: catalogDetail,
 		})
 		if pullErr != nil {
+			span.RecordError(pullErr, trace.WithAttributes(attribute.String("namespace", namespace)))
+			span.SetStatus(otelcodes.Error, "pull schema failed")
 			s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
 				"database", req.Database,
 				"type", target.DatabaseType,
@@ -104,9 +125,13 @@ func (s *Service) pullTargetSchema(
 			return nil, pullErr
 		}
 		if err := mergePullSchemaResponse(merged, resp, namespace); err != nil {
+			span.RecordError(err, trace.WithAttributes(attribute.String("namespace", namespace)))
+			span.SetStatus(otelcodes.Error, "merge pull schema response")
 			return nil, err
 		}
 	}
+
+	span.SetAttributes(attribute.Int("table_count", int(merged.TableCount)))
 	return merged, nil
 }
 
