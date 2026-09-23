@@ -88,7 +88,13 @@ Not every engine supports every feature, and some share a verb without sharing i
 
 ## Quick Start
 
-Grab the CLI from [Releases](#releases). From your application’s project directory, run:
+Install with [Homebrew](https://brew.sh/) on Apple Silicon macOS or Linux:
+
+```bash
+brew install block/tap/schemabot
+```
+
+Other installation options are available from [Releases](#releases). From your application’s project directory, run:
 
 ```bash
 schemabot init
