@@ -183,8 +183,17 @@ func hasVSchemaData(s sql.NullString) bool {
 
 // buildDDLStrategy constructs the Vitess online DDL strategy string.
 // If instantDDL is true, --prefer-instant-ddl is used; otherwise --postpone-completion.
+//
+// --analyze-table is deliberately absent. It runs ANALYZE TABLE on the shadow
+// table inside the cutover preparation, which replicates and briefly blocks
+// the table for writes, so the stream the cutover is about to wait on falls
+// behind. A stream that is behind at that moment reads the sentry table's DDL
+// after the cutover has locked the tables, reloads its schema, and blocks on
+// the locked table -- and the cutover is waiting on that same stream. The
+// statistics it produces are there for a replica promoted right after a
+// production cutover, which is not what this local backend is for.
 func buildDDLStrategy(instantDDL bool) string {
-	const baseFlags = " --in-order-completion --allow-zero-in-date --analyze-table" +
+	const baseFlags = " --in-order-completion --allow-zero-in-date" +
 		" --force-cut-over-after=1ms --cut-over-threshold=15s" +
 		" --singleton-context --allow-concurrent"
 
