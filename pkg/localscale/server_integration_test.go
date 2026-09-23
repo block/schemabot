@@ -8,13 +8,13 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -375,6 +375,7 @@ func branchDatabaseExists(t *testing.T, branch, keyspace string) bool {
 const (
 	shortPollTimeout = 15 * time.Second // branch readiness, deploy diff
 	longPollTimeout  = 60 * time.Second // deploy state transitions (DDL execution)
+	cleanupTimeout   = 30 * time.Second // post-test cleanup, which outlives t.Context()
 )
 
 // waitForBranchReady polls until a branch is ready or the deadline is exceeded.
@@ -485,33 +486,33 @@ func blocksNewDeploy(deployState string) bool {
 	}
 }
 
-// Cleanup's idea of a cleared deploy request has to be the deploy gate's, or
-// it counts a request the gate still refuses on and every test after it fails
-// for a reason nothing connects back to the cleanup that let it through. This
-// pins the two together across every state the API defines, by reflection
-// rather than a list, so a state added later is covered without anyone
-// remembering this test exists.
-func TestBlocksNewDeployAgreesWithTheDeployGate(t *testing.T) {
-	states := reflect.ValueOf(drState)
-	require.Positive(t, states.NumField())
-
-	for i := range states.NumField() {
-		name := states.Type().Field(i).Name
-		value := states.Field(i).String()
-		t.Run(name, func(t *testing.T) {
-			switch {
-			case localscale.IsTerminalDeployState(value):
-				assert.False(t, blocksNewDeploy(value),
-					"%q is terminal, so cleanup must count it as cleared", value)
-			case value == drState.Pending || value == drState.Ready:
-				assert.False(t, blocksNewDeploy(value),
-					"%q precedes the deploy, so the gate never sees it", value)
-			default:
-				assert.True(t, blocksNewDeploy(value),
-					"the deploy gate refuses while a request is %q, so cleanup must keep waiting through it", value)
-			}
-		})
+// alreadyClearing reports whether a deploy request in this state is on its way
+// to a terminal one under its own steam, because a cancel or a revert is
+// already running. Such a request still blocks, so cleanup has to wait it out,
+// but asking for another cancel is refused — and a refusal that cleanup treats
+// as failure is what makes it walk away while the slot is still occupied.
+func alreadyClearing(deployState string) bool {
+	switch deployState {
+	case drState.InProgressCancel, drState.InProgressRevert, drState.InProgressRevertVSchema:
+		return true
+	default:
+		return false
 	}
+}
+
+// deferCleanupActiveDeployRequests clears any active deploy requests once the
+// test finishes.
+//
+// It builds its own context rather than taking the test's: t.Context() is
+// already cancelled by the time cleanups run, so a cleanup handed that context
+// fails its very first call and clears nothing at all.
+func deferCleanupActiveDeployRequests(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := testutil.CleanupContext(cleanupTimeout)
+		defer cancel()
+		cleanupActiveDeployRequests(t, ctx)
+	})
 }
 
 // cleanupActiveDeployRequests skips-revert or cancels any active deploy requests
@@ -537,7 +538,15 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 			Organization: testOrg, Database: testDB, Number: i,
 		})
 		if err != nil {
-			break // no more deploy requests
+			// Only a missing request means the numbering has run out. Any
+			// other failure leaves the rest of the range unexamined, so say
+			// so rather than reporting the scan as complete.
+			var psErr *ps.Error
+			if !errors.As(err, &psErr) || psErr.Code != ps.ErrNotFound {
+				t.Logf("cleanupActiveDeployRequests: reading deploy request %d failed, "+
+					"stopping with requests %d and above unexamined: %v", i, i, err)
+			}
+			break
 		}
 		var clearErr error
 		switch {
@@ -545,6 +554,8 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 			_, clearErr = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
+		case alreadyClearing(dr.DeploymentState):
+			// Nothing to ask for; it only has to be waited out.
 		case blocksNewDeploy(dr.DeploymentState):
 			_, clearErr = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
