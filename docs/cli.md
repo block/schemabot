@@ -224,7 +224,9 @@ CREATE TABLE `orders` (
 ```
 
 `pull` prints SQL by default. It reads the environment's primary deployment;
-it is not a comparison of every replica or shard. Use the
+it is not a comparison of every replica or shard. An environment that lists
+`targets` is the exception: its members each hold their own schema, so a pull
+reads every one of them and reports how they differ. Use the
 [schema intelligence guide](schema-intelligence.md#whats-in-this-database)
 for namespace and table filters, structured columns and indexes, and lint
 findings, each with output examples.

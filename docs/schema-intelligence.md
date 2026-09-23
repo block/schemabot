@@ -167,6 +167,11 @@ shard independently; it does not prove every copy in the fleet matches.
 The primary is first in the configured rollout order, otherwise first
 alphabetically. The pull request has no deployment selector.
 
+The one exception is an environment that lists `targets`, whose members each
+hold their own schema. There a pull reads every target and reports how they
+differ, because no single target's schema speaks for the environment. See
+[Databases that span several targets](#databases-that-span-several-targets).
+
 ### Read structured columns and indexes
 
 A normal
@@ -378,9 +383,14 @@ this array rather than deriving it from target names.
 
 An empty `diverged_tables` means the two targets genuinely agree. It never means
 the comparison was skipped: a target that cannot be pulled, or whose DDL cannot
-be parsed, fails the whole pull rather than being reported as converged. Tables
-are compared by their canonical parsed form, so formatting differences are not
-divergence.
+be parsed, fails the whole pull rather than being reported as converged.
+
+Tables are compared by their canonical parsed form, so a difference in
+whitespace or keyword case is not divergence. The canonical form preserves the
+order clauses were written in, so two targets holding the same columns and
+indexes in a different order are reported as `differs`. The comparison errs
+toward reporting: it will send you to look at a table that turns out to agree,
+but it will not call two different schemas equal.
 
 An environment that does not list `targets` carries no `targets` array at all.
 

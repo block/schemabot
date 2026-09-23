@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 
+	"golang.org/x/sync/errgroup"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
@@ -16,6 +19,12 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
 )
+
+// pullMemberConcurrency bounds how many rollout members are pulled at once. Each
+// member costs one live-schema read per namespace against an often remote
+// target, so a cap keeps a wide environment's pull from opening an unbounded
+// number of concurrent connections across regions.
+const pullMemberConcurrency = 4
 
 // pullTargetSchema fetches one execution target's live schema, one call per
 // namespace, and merges the results into a single response.
@@ -145,6 +154,16 @@ func (s *Service) pullMemberDivergence(
 	if err != nil {
 		return nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
+	// The caller resolved the primary from its own read of the config; this is a
+	// second read, and a config reloaded in between could have re-mapped the
+	// environment. If the primary is no longer among the members, the loop below
+	// would pull it again as an ordinary member and return a member set with
+	// nothing marked primary — a response describing an environment that does not
+	// exist in either config. Fail instead of reporting it.
+	if !containsMember(targets, primary) {
+		return nil, fmt.Errorf("pull for %s/%s resolves rollout members %s, which do not include the primary %s the schema was pulled from; the environment's routing changed during the pull, so re-run it",
+			req.Database, req.Environment, memberIDs(targets), primary.MemberID())
+	}
 
 	dialect := schema.DialectForDatabaseType(primary.DatabaseType)
 	parser, err := ddl.ParserForDialect(dialect)
@@ -156,36 +175,69 @@ func (s *Service) pullMemberDivergence(
 		return nil, fmt.Errorf("canonicalize schema of rollout member %s: %w", primary.MemberID(), err)
 	}
 
-	members := make([]*apitypes.TargetDivergence, 0, len(targets))
-	for _, target := range targets {
+	// Members are pulled concurrently under a small cap. Each one is a live-schema
+	// read per namespace against an often remote target, so a serial fan-out costs
+	// a wide environment the sum of its members' read times on every pull. Results
+	// are written into fixed positions, so the response keeps configuration order
+	// whatever order the reads finish in.
+	members := make([]*apitypes.TargetDivergence, len(targets))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(pullMemberConcurrency)
+
+	for i, target := range targets {
 		// The primary is already pulled — its schema is what every other member
 		// is compared against — so it is recorded from the schema in hand rather
 		// than fetched a second time, and carries no comparison against itself.
 		if target.MemberID() == primary.MemberID() {
-			members = append(members, &apitypes.TargetDivergence{
+			members[i] = &apitypes.TargetDivergence{
 				Deployment: target.Deployment,
 				Target:     target.Target,
 				TableCount: primarySchema.TableCount,
 				Primary:    true,
-			})
+			}
 			continue
 		}
-		memberSchema, err := s.pullTargetSchema(ctx, req, target, namespaces, catalogDetail)
-		if err != nil {
-			return nil, fmt.Errorf("pull rollout member %s: %w", target.MemberID(), err)
-		}
-		memberTables, err := canonicalTablesByNamespace(parser, memberSchema)
-		if err != nil {
-			return nil, fmt.Errorf("canonicalize schema of rollout member %s: %w", target.MemberID(), err)
-		}
-		members = append(members, &apitypes.TargetDivergence{
-			Deployment:     target.Deployment,
-			Target:         target.Target,
-			TableCount:     memberSchema.TableCount,
-			DivergedTables: divergedTables(primaryTables, memberTables),
+		g.Go(func() error {
+			memberSchema, err := s.pullTargetSchema(gctx, req, target, namespaces, catalogDetail)
+			if err != nil {
+				return fmt.Errorf("pull rollout member %s: %w", target.MemberID(), err)
+			}
+			memberTables, err := canonicalTablesByNamespace(parser, memberSchema)
+			if err != nil {
+				return fmt.Errorf("canonicalize schema of rollout member %s: %w", target.MemberID(), err)
+			}
+			members[i] = &apitypes.TargetDivergence{
+				Deployment:     target.Deployment,
+				Target:         target.Target,
+				TableCount:     memberSchema.TableCount,
+				DivergedTables: divergedTables(primaryTables, memberTables),
+			}
+			return nil
 		})
 	}
+	// One member's failure fails the pull. Reporting the members that did succeed
+	// would describe the environment as compared when part of it was not, which is
+	// the reading this whole comparison exists to prevent.
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
 	return members, nil
+}
+
+// containsMember reports whether a member set contains one specific member.
+func containsMember(targets []routing.ExecutionTarget, want routing.ExecutionTarget) bool {
+	return slices.ContainsFunc(targets, func(target routing.ExecutionTarget) bool {
+		return target.MemberID() == want.MemberID()
+	})
+}
+
+// memberIDs names a member set for an error message.
+func memberIDs(targets []routing.ExecutionTarget) string {
+	ids := make([]string, 0, len(targets))
+	for _, target := range targets {
+		ids = append(ids, target.MemberID())
+	}
+	return strings.Join(ids, ", ")
 }
 
 // namespaceTable identifies one pulled table within its namespace.
@@ -196,8 +248,17 @@ type namespaceTable struct {
 
 // canonicalTablesByNamespace reduces a pulled schema to the canonical form of
 // each table's DDL, which is what two targets are compared by: a difference in
-// whitespace, keyword case, or clause order is the same schema, and must not be
-// reported as divergence.
+// whitespace or keyword case is the same schema, and must not be reported as
+// divergence.
+//
+// Canonicalization re-renders the parsed tree in the order it was written, so it
+// does not reorder clauses. Two targets holding the same columns and indexes in
+// a different order therefore compare as different and are reported as diverged.
+// That over-reports rather than under-reports — the comparison never calls two
+// different schemas equal — so an operator is sent to look at a table that turns
+// out to agree, which costs attention rather than correctness. Making the
+// comparison order-insensitive belongs in the dialect's canonical form, where
+// every consumer of it would benefit, not in a set comparison built here.
 //
 // A table whose DDL the dialect's parser cannot canonicalize fails the request.
 // Comparing raw text for it would report every formatting difference as a

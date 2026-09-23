@@ -844,6 +844,7 @@ type mockTernClient struct {
 	pullSchemaErr  error
 	pullSchemaReq  *ternv1.PullSchemaRequest
 	pullSchemaReqs []*ternv1.PullSchemaRequest
+	pullSchemaMu   sync.Mutex
 	pullSchemaHook func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
 	applyResp      *ternv1.ApplyResponse
 	applyErr       error
@@ -893,8 +894,12 @@ type mockTernClient struct {
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	// A multi-target pull fans its members out concurrently, so several
+	// goroutines record through this one client.
+	m.pullSchemaMu.Lock()
 	m.pullSchemaReq = req
 	m.pullSchemaReqs = append(m.pullSchemaReqs, req)
+	m.pullSchemaMu.Unlock()
 	if m.pullSchemaHook != nil {
 		return m.pullSchemaHook(req)
 	}

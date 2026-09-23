@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -79,12 +81,17 @@ func newPerTargetPullClient(byTarget map[string]*ternv1.PullSchemaResponse, errs
 	return c
 }
 
-// pulledTargetsOf returns the targets a fan-out actually pulled, in call order.
+// pulledTargets returns the targets a fan-out actually pulled, sorted. Members
+// are pulled concurrently, so the order they arrive in is not a property worth
+// asserting — which targets were read is.
 func (c *perTargetPullClient) pulledTargets() []string {
+	c.pullSchemaMu.Lock()
+	defer c.pullSchemaMu.Unlock()
 	out := make([]string, 0, len(c.pullSchemaReqs))
 	for _, req := range c.pullSchemaReqs {
 		out = append(out, req.Target)
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -213,6 +220,64 @@ func TestExecutePullSchema_FormattingIsNotDivergence(t *testing.T) {
 
 	require.Len(t, resp.Targets, 2)
 	assert.Empty(t, resp.Targets[1].DivergedTables, "the same schema written differently is the same schema")
+}
+
+// Canonicalization re-renders the parsed tree in the order it was written, so
+// two targets holding the same indexes in a different order are reported as
+// diverged. The comparison over-reports rather than under-reports: an operator
+// is sent to look at a table that turns out to agree, which is the safe
+// direction for a report whose whole purpose is to surface differences.
+func TestExecutePullSchema_ClauseOrderReadsAsDivergence(t *testing.T) {
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{
+			"users": "CREATE TABLE `users` (`id` bigint NOT NULL, `a` int, `b` int, PRIMARY KEY (`id`), KEY `ka` (`a`), KEY `kb` (`b`));",
+		}),
+		"testapp-002": pulledTables(map[string]string{
+			"users": "CREATE TABLE `users` (`id` bigint NOT NULL, `a` int, `b` int, PRIMARY KEY (`id`), KEY `kb` (`b`), KEY `ka` (`a`));",
+		}),
+	}, nil)
+	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
+	require.NoError(t, err)
+
+	require.Len(t, resp.Targets, 2)
+	require.Len(t, resp.Targets[1].DivergedTables, 1)
+	assert.Equal(t, "users", resp.Targets[1].DivergedTables[0].Table)
+	assert.Equal(t, "differs", resp.Targets[1].DivergedTables[0].Difference)
+}
+
+// The primary is resolved by the caller and the member set is resolved again
+// here, so a config reloaded between the two reads could drop the primary out
+// of the environment. Reporting the members anyway would return a set with
+// nothing marked primary, describing an environment that exists in neither
+// config, so the pull fails instead.
+// Exercised against pullMemberDivergence directly: the mismatch it guards
+// against needs the config to move between the caller's resolution and this
+// one, which a single call through ExecutePullSchema cannot stage, since both
+// reads would see the same moved config and agree with each other.
+func TestPullMemberDivergence_PrimaryMissingFromMembersFailsThePull(t *testing.T) {
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-002": pulledTables(map[string]string{"users": pullUsersDDL}),
+	}, nil)
+	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	// The primary the schema was pulled from is not among the members this call
+	// resolves, the shape a config reloaded mid-pull would leave behind.
+	stalePrimary := routing.ExecutionTarget{
+		Deployment:   "eu",
+		Target:       "testapp-retired",
+		DatabaseType: storage.DatabaseTypeMySQL,
+	}
+
+	_, err := svc.pullMemberDivergence(t.Context(), pullRequest(), stalePrimary,
+		pulledTables(map[string]string{"users": pullUsersDDL}), []string{"testapp"},
+		ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "do not include the primary eu/testapp-retired")
+	assert.Contains(t, err.Error(), "eu/testapp-001, eu/testapp-002", "the error names the members it did resolve")
 }
 
 // A target that cannot be pulled fails the request. Returning the primary's
