@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // planDeploymentDiffConcurrency bounds how many deployments are diffed at once.
@@ -174,6 +175,10 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 	if req.SourceTrusted {
 		trustedSchemaPath = req.SchemaPath
 	}
+	directExecution, err := s.config.DirectExecutionPolicyFor(req.Database, req.Environment, target.DatabaseType)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
+	}
 	ternReq := &ternv1.PlanRequest{
 		Database:    req.Database,
 		Type:        target.DatabaseType,
@@ -195,6 +200,10 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
+		// A member's diff is judged under the same policy as the primary's,
+		// so a refused statement reads as the same verdict on every member
+		// rather than as drift between them.
+		DirectExecution: tern.DirectExecutionPolicyProto(directExecution),
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest

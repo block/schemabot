@@ -3,8 +3,10 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1169,12 +1171,43 @@ type ApplyOptions struct {
 	// Defaults to the apply database when empty.
 	Target string `json:"target,omitempty"`
 
+	// DirectExecution is the direct execution policy this apply was admitted
+	// under, recorded at creation from the dispatching caller. It is durable
+	// because the drive that acts on it can be a later one on another pod:
+	// the caller's policy arrives once, with the dispatch, while routing a
+	// refused statement is decided every time a drive reaches it. Nil means
+	// the caller stated no policy and the executing server's own
+	// configuration decides.
+	DirectExecution *DirectExecutionPolicy `json:"direct_execution,omitempty"`
+
 	// Rollback marks an apply that reverts a previously applied schema change
 	// (executed from a rollback plan). It is durable so any terminal path can
 	// distinguish a rollback from an ordinary apply: a completed rollback must
 	// leave the required check action_required (the PR's change has been reverted
 	// and must not merge as-is), not success.
 	Rollback bool `json:"rollback,omitempty"`
+}
+
+// DirectExecutionPolicy is an apply's durable record of the direct execution
+// policy its dispatch was admitted under. It mirrors the policy the caller
+// sent rather than restating the rules: the engine reading it back off the
+// metadata keys is what enforces them, including refusing an enabled policy
+// that carries no row bound.
+type DirectExecutionPolicy struct {
+	Enabled                       bool  `json:"enabled"`
+	MaxTableRows                  int64 `json:"max_table_rows,omitempty"`
+	LockAcquisitionTimeoutSeconds int64 `json:"lock_acquisition_timeout_seconds,omitempty"`
+}
+
+// EngineMetadata renders the policy into the engine metadata keys that carry
+// it to the engine. A nil policy renders nothing, which is the same thing a
+// disabled one renders: an engine that reads no policy blocks every statement
+// it refuses.
+func (p *DirectExecutionPolicy) EngineMetadata() map[string]string {
+	if p == nil {
+		return nil
+	}
+	return engine.DirectExecutionMetadata(p.Enabled, p.MaxTableRows, p.LockAcquisitionTimeoutSeconds)
 }
 
 // ControlOperation identifies a user-requested control operation.
@@ -1337,7 +1370,31 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 		Target:       options["target"],
 		Rollback:     options["rollback"] == "true",
 	}
+	opts.DirectExecution = directExecutionPolicyFromMap(options)
 	return opts
+}
+
+// directExecutionPolicyFromMap reads the direct execution policy back out of
+// an options map. A map carrying none of the keys states no policy, which is
+// distinct from one that states the policy disabled: the first defers to the
+// executing server's configuration, the second overrides it.
+//
+// A malformed number reads as zero rather than failing here. The engine
+// refuses an enabled policy whose row bound is not positive, so a garbled
+// bound blocks the statement instead of widening it — the one direction this
+// is allowed to fail in.
+func directExecutionPolicyFromMap(options map[string]string) *DirectExecutionPolicy {
+	raw, ok := options[engine.MetadataDirectExecution]
+	if !ok {
+		return nil
+	}
+	maxRows, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionMaxTableRows], 10, 64)
+	lockWait, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds], 10, 64)
+	return &DirectExecutionPolicy{
+		Enabled:                       raw == "true",
+		MaxTableRows:                  maxRows,
+		LockAcquisitionTimeoutSeconds: lockWait,
+	}
 }
 
 // GroupsEngineExecution reports whether an apply against databaseType hands the
@@ -1390,6 +1447,14 @@ func (opts ApplyOptions) Map() map[string]string {
 	}
 	if opts.Rollback {
 		options["rollback"] = "true"
+	}
+	if policy := opts.DirectExecution; policy != nil {
+		// A disabled policy still states itself, so the drive can tell "the
+		// caller turned direct execution off for this apply" from "the caller
+		// said nothing"; the engine reads the same absent-or-false as blocked
+		// either way.
+		options[engine.MetadataDirectExecution] = strconv.FormatBool(policy.Enabled)
+		maps.Copy(options, policy.EngineMetadata())
 	}
 	return options
 }

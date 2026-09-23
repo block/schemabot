@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -663,6 +664,42 @@ const (
 	// default when the key is absent.
 	MetadataDirectExecutionLockAcquisitionTimeoutSeconds = "direct_execution_lock_acquisition_timeout_seconds"
 )
+
+// DirectExecutionMetadata renders a direct execution policy into the metadata
+// keys above. It is the one place the policy becomes metadata, so the server
+// config that states it, the wire that forwards it to the target that runs
+// the statement, and an apply's durable record of the policy it was admitted
+// under all spell the keys identically — a plan's verdict and the apply that
+// acts on it cannot disagree because one surface omitted a key.
+//
+// A disabled policy renders nothing, which is what leaves a refused statement
+// blocked. A lock timeout of zero renders nothing, leaving the engine's own
+// default in effect.
+func DirectExecutionMetadata(enabled bool, maxTableRows, lockAcquisitionTimeoutSeconds int64) map[string]string {
+	if !enabled {
+		return nil
+	}
+	md := map[string]string{
+		MetadataDirectExecution:             "true",
+		MetadataDirectExecutionMaxTableRows: strconv.FormatInt(maxTableRows, 10),
+	}
+	if lockAcquisitionTimeoutSeconds > 0 {
+		md[MetadataDirectExecutionLockAcquisitionTimeoutSeconds] = strconv.FormatInt(lockAcquisitionTimeoutSeconds, 10)
+	}
+	return md
+}
+
+// DirectExecutionKeys are the metadata keys carrying the policy. They move as
+// one: a surface that states any of them states the whole policy, so a
+// default from elsewhere is never merged in to supply the bound a grant left
+// out.
+func DirectExecutionKeys() []string {
+	return []string{
+		MetadataDirectExecution,
+		MetadataDirectExecutionMaxTableRows,
+		MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
+	}
+}
 
 // ApplyRequest contains the input for starting a schema change.
 // On first apply, set the resume context to group related DDL.

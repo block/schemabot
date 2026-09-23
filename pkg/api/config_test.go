@@ -5475,3 +5475,61 @@ func TestServerConfig_ValidateRejectsAServerDirectExecutionNoEngineCanHonor(t *t
 		assert.NoError(t, cfg.Validate())
 	})
 }
+
+// A control plane resolves the policy by database and environment so it can
+// state it on the request. A database it does not register — every target a
+// server reaches through its target resolver — carries the server-wide policy,
+// which is the only policy such a target can have.
+func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
+	cfg := ServerConfig{
+		DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},
+		Databases: map[string]DatabaseConfig{
+			"overridden": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 50}},
+			}},
+			"opted-out": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {DirectExecution: &DirectExecutionConfig{Enabled: false}},
+			}},
+			"inherits": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {},
+			}},
+		},
+	}
+
+	t.Run("unregistered database carries the server-wide policy", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("resolved-at-request-time", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeoutSeconds: 10}, policy)
+	})
+
+	t.Run("registered database with no block inherits it", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("inherits", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeoutSeconds: 10}, policy)
+	})
+
+	t.Run("override replaces it whole", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("overridden", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 50}, policy,
+			"the override states its own bound and inherits no lock timeout")
+	})
+
+	t.Run("override that opts out states nothing", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("opted-out", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, policy)
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("inherits", "production", storage.DatabaseTypeVitess)
+		require.NoError(t, err)
+		assert.Nil(t, policy)
+	})
+
+	t.Run("no server-wide policy leaves refused statements blocked", func(t *testing.T) {
+		policy, err := (&ServerConfig{}).DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, policy)
+	})
+}

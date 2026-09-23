@@ -28,6 +28,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 const applyOperationKeyMaxLen = 255
@@ -707,6 +708,14 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		return nil, nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
+	directExecution, err := s.config.DirectExecutionPolicyFor(req.Database, req.Environment, resolvedTarget.DatabaseType)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "direct execution policy")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		return nil, nil, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
+	}
 	ternReq := &ternv1.PlanRequest{
 		Database:          req.Database,
 		Type:              resolvedTarget.DatabaseType,
@@ -720,6 +729,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
+		// The verdict on a statement the engine refuses belongs to this
+		// server's configuration, wherever the statement runs. A data plane
+		// resolving an opaque target has no registration for the database to
+		// read a policy from, so an unstated one leaves it blocked there.
+		DirectExecution: tern.DirectExecutionPolicyProto(directExecution),
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest
@@ -1384,6 +1398,16 @@ func (s *Service) createStoredApply(
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
+	// The apply records the policy it was admitted under, from configuration
+	// and never from the caller's options. Recording it here is what lets the
+	// drive that eventually runs the statement — a later one, possibly on
+	// another pod or after this server has been reconfigured — route it under
+	// the policy this admission was judged against.
+	directExecution, err := s.config.DirectExecutionPolicyFor(plan.Database, req.Environment, plan.DatabaseType)
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", plan.Database, req.Environment, err)
+	}
+	applyOpts.DirectExecution = directExecution
 	// Blocked changes reject before unsafe changes because no opt-in can make a
 	// statement the engine refuses executable.
 	if err := plan.BlockedApplyError(); err != nil {
@@ -1989,6 +2013,13 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		// stored plan, so a re-plan of *that* plan withholds them too.
 		IgnoreTables: plan.IgnoreTables(),
 	}
+	// A policy that cannot be resolved is terminal for the same reason client
+	// resolution is: it is a config lookup that answers the same way on every
+	// attempt until an operator changes the configuration.
+	directExecution, err := s.config.DirectExecutionPolicyFor(req.Database, req.Environment, req.Type)
+	if err != nil {
+		return nil, terminalControlf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
+	}
 	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
 		Database:     req.Database,
 		Type:         req.Type,
@@ -1998,6 +2029,10 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		Environment:  req.Environment,
 		Target:       plan.Target,
 		IgnoreTables: req.IgnoreTables,
+		// A rollback's own statements are planned under the same policy as the
+		// apply it reverses, so reverting a direct change is not refused by a
+		// verdict the forward plan was allowed.
+		DirectExecution: tern.DirectExecutionPolicyProto(directExecution),
 	})
 	if err != nil {
 		// Mirror ExecutePlanProto's transport classification: only remote

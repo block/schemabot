@@ -603,6 +603,7 @@ func (c *LocalClient) remapsPostgresNamespaces() bool {
 }
 
 func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
 		return eng.Apply(ctx, req)
 	}
@@ -1858,6 +1859,10 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 	if req.GroupedExecution != nil {
 		groupedExecution = req.GetGroupedExecution()
 	}
+	// The plan's execution-mode verdict has to be the one the apply will be
+	// judged by, so a refused statement is resolved against the caller's
+	// policy here exactly as the apply resolves it later.
+	creds = credentialsWithStatedDirectExecution(creds, req.GetDirectExecution())
 	return eng.Plan(ctx, &engine.PlanRequest{
 		Database:         database,
 		DatabaseType:     c.config.Type,
@@ -2711,6 +2716,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 
 	applyOpts := storage.ApplyOptionsFromMap(req.Options)
 	applyOpts.Target = plan.Target
+	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -2918,6 +2924,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// target string the request carried.
 	applyOpts := storage.ApplyOptionsFromMap(options)
 	applyOpts.Target = plan.Target
+	// The policy is taken from the request's own field and never from its
+	// option map, which is operator-supplied: a caller that could name its own
+	// direct execution policy in an option would be granting itself the thing
+	// the server's configuration exists to bound. A request that states none
+	// clears the field, so the executing server's configuration decides.
+	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,

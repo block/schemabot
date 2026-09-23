@@ -19,7 +19,6 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
-	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
@@ -1285,29 +1284,38 @@ func (c *DirectExecutionConfig) Validate(context string) error {
 // direct-execution metadata here, so the forwarded keys and fields cannot
 // drift between paths.
 func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
+	policy, err := c.Policy()
+	if err != nil {
+		return nil, err
+	}
+	return policy.EngineMetadata(), nil
+}
+
+// Policy resolves the configured policy into the resolved form the rest of
+// the system carries it in: forwarded to the server that will run the
+// statement, and recorded on the apply that statement belongs to.
+//
+// Nil means the configuration states nothing, and a request that states
+// nothing leaves refused statements blocked wherever it lands. A configured
+// block that is disabled is not nothing: it is an opt-out, and it resolves to
+// a disabled policy so that it travels and overrides a grant the server that
+// runs the statement holds of its own.
+func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error) {
 	if c == nil {
 		return nil, nil
 	}
-	// An explicit opt-out states itself rather than rendering nothing.
-	// Absent and disabled mean different things — nothing here versus "this
-	// environment does not grant direct execution" — and a renderer that maps
-	// both to an empty map lets a server-wide grant overlay an opt-out that
-	// was written deliberately.
 	if !c.Enabled {
-		return map[string]string{engine.MetadataDirectExecution: "false"}, nil
-	}
-	md := map[string]string{
-		engine.MetadataDirectExecution:             "true",
-		engine.MetadataDirectExecutionMaxTableRows: strconv.FormatInt(c.MaxTableRows, 10),
+		return &storage.DirectExecutionPolicy{Enabled: false}, nil
 	}
 	lockWaitSeconds, err := c.lockAcquisitionTimeoutSeconds()
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct_execution lock_acquisition_timeout: %w", err)
 	}
-	if lockWaitSeconds > 0 {
-		md[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds] = strconv.FormatInt(lockWaitSeconds, 10)
-	}
-	return md, nil
+	return &storage.DirectExecutionPolicy{
+		Enabled:                       true,
+		MaxTableRows:                  c.MaxTableRows,
+		LockAcquisitionTimeoutSeconds: lockWaitSeconds,
+	}, nil
 }
 
 // lockAcquisitionTimeoutSeconds parses the configured lock acquisition
@@ -3553,6 +3561,24 @@ func (c *ServerConfig) ResolveDirectExecution(envConfig *EnvironmentConfig, data
 // without also honoring the server-wide policy behind it.
 func (c *ServerConfig) DirectExecutionMetadata(envConfig *EnvironmentConfig, databaseType string) (map[string]string, error) {
 	return c.ResolveDirectExecution(envConfig, databaseType).EngineMetadata()
+}
+
+// DirectExecutionPolicy resolves the policy in force for one database
+// environment into the form forwarded to a server that runs the statement
+// elsewhere. A remote data plane resolves its targets from an opaque
+// identifier and holds no registration for the database, so without the
+// forwarded policy it has only its own server-wide configuration to judge a
+// refused statement by.
+func (c *ServerConfig) DirectExecutionPolicy(envConfig *EnvironmentConfig, databaseType string) (*storage.DirectExecutionPolicy, error) {
+	return c.ResolveDirectExecution(envConfig, databaseType).Policy()
+}
+
+// DirectExecutionPolicyFor resolves the policy for a database and environment
+// by name. A database this server does not register — every target it reaches
+// through its target resolver — has no environment block to override with, so
+// it carries the server-wide policy.
+func (c *ServerConfig) DirectExecutionPolicyFor(database, environment, databaseType string) (*storage.DirectExecutionPolicy, error) {
+	return c.DirectExecutionPolicy(c.DatabaseEnvironment(database, environment), databaseType)
 }
 
 func (c *DSNFromConfig) Validate(context string) error {

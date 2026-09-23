@@ -536,3 +536,49 @@ func TestPlanIgnoreTables(t *testing.T) {
 	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, plan.IgnoreTables(),
 		"the union, sorted and deduplicated, so a re-plan withholds each table once")
 }
+
+// An apply records the direct execution policy its dispatch was admitted
+// under, and hands the drive the engine metadata keys that carry it — the
+// drive can be a later one, on another pod, so the policy has to survive
+// storage rather than be re-derived.
+func TestApplyOptionsCarryTheAdmittedDirectExecutionPolicy(t *testing.T) {
+	admitted := ApplyOptions{DirectExecution: &DirectExecutionPolicy{
+		Enabled:                       true,
+		MaxTableRows:                  10000,
+		LockAcquisitionTimeoutSeconds: 5,
+	}}
+
+	options := admitted.Map()
+	assert.Equal(t, "true", options[engine.MetadataDirectExecution])
+	assert.Equal(t, "10000", options[engine.MetadataDirectExecutionMaxTableRows])
+	assert.Equal(t, "5", options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds])
+	assert.Equal(t, admitted.DirectExecution, ApplyOptionsFromMap(options).DirectExecution)
+
+	// A disabled policy still states itself, so a drive can tell an apply
+	// admitted with direct execution turned off from one whose caller said
+	// nothing about it.
+	disabled := ApplyOptions{DirectExecution: &DirectExecutionPolicy{Enabled: false}}
+	disabledOptions := disabled.Map()
+	assert.Equal(t, "false", disabledOptions[engine.MetadataDirectExecution])
+	assert.NotContains(t, disabledOptions, engine.MetadataDirectExecutionMaxTableRows)
+	assert.Equal(t, disabled.DirectExecution, ApplyOptionsFromMap(disabledOptions).DirectExecution)
+
+	// Saying nothing is its own state: the executing server's configuration
+	// decides, and nothing in the options map claims otherwise.
+	silent := ApplyOptions{DeferCutover: true}.Map()
+	assert.NotContains(t, silent, engine.MetadataDirectExecution)
+	assert.Nil(t, ApplyOptionsFromMap(silent).DirectExecution)
+}
+
+// The policy renders to metadata through one path, so an apply's durable
+// record and a server's configured policy cannot spell the keys differently.
+func TestDirectExecutionPolicyEngineMetadata(t *testing.T) {
+	assert.Nil(t, (*DirectExecutionPolicy)(nil).EngineMetadata())
+	assert.Nil(t, (&DirectExecutionPolicy{Enabled: false, MaxTableRows: 10000}).EngineMetadata(),
+		"a disabled policy renders nothing, which is what blocks a refused statement")
+	assert.Equal(t, map[string]string{
+		engine.MetadataDirectExecution:             "true",
+		engine.MetadataDirectExecutionMaxTableRows: "10000",
+	}, (&DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000}).EngineMetadata(),
+		"an unset lock bound leaves the engine's own default in effect")
+}
