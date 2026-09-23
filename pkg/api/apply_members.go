@@ -8,12 +8,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// memberPlanLookupLimit bounds the plan listing that resolves member plans. The
-// listing is already narrowed to one review round, which stores one plan per
-// member, so the limit only has to cover the widest environment a single round
-// can address.
-const memberPlanLookupLimit = 200
-
 // applyMember is one rollout member of an apply together with the plan its work
 // is built from. Members of an environment whose members hold the same schema
 // all carry the apply's own plan; a member that was planned against its own live
@@ -122,6 +116,12 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 //
 // An empty result means the round planned no member on its own, which is how a
 // mirrored round reads: it is the answer, not a lookup that came up short.
+//
+// The listing takes no row cap. Naming the round is what bounds it, and its
+// members are exactly what this lookup must see: a cap could only cut members
+// off the end, and a member the listing dropped is indistinguishable here from
+// one the round never planned, which is reported to the operator as an
+// unplanned target and sends them to re-plan a round that was planned fine.
 func (s *Service) memberPlansForReviewRound(ctx context.Context, plan *storage.Plan, environment string) (map[string]*storage.Plan, error) {
 	if plan.PlanIdentifier == "" {
 		return nil, fmt.Errorf("apply for %s/%s addresses several targets but its plan has no identifier to match member plans against",
@@ -133,7 +133,6 @@ func (s *Service) memberPlansForReviewRound(ctx context.Context, plan *storage.P
 		Repository:            plan.Repository,
 		PullRequest:           plan.PullRequest,
 		PrimaryPlanIdentifier: plan.PlanIdentifier,
-		Limit:                 memberPlanLookupLimit,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list member plans for %s/%s round %s: %w", plan.Database, environment, plan.PlanIdentifier, err)

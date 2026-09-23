@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -476,14 +477,45 @@ func TestPlans(t *testing.T, h Harness) {
 		assert.Len(t, unfiltered, 4, "an unfiltered listing still sees every round")
 	})
 
-	t.Run("List_RejectsNonPositiveLimit", func(t *testing.T) {
+	t.Run("List_RejectsNonPositiveLimitWithoutARound", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		// An unbounded listing is refused rather than silently returning
-		// nothing or everything.
+		// An open-ended listing with no row cap is refused rather than silently
+		// returning nothing or everything.
 		_, err := store.Plans().List(ctx, storage.ListPlansOptions{})
 		require.ErrorContains(t, err, "limit must be positive")
+	})
+
+	t.Run("List_ByRoundNeedsNoLimit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A round names the rows it wants, so it bounds the listing on its own
+		// and every member of the round comes back. Capping the rows could only
+		// drop members the caller must see.
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+		const memberCount = 25
+		for i := range memberCount {
+			_, err := store.Plans().Create(ctx, &storage.Plan{
+				PlanIdentifier:        fmt.Sprintf("plan_member_%02d", i),
+				Database:              "commerce",
+				DatabaseType:          storage.DatabaseTypeMySQL,
+				Environment:           "production",
+				Deployment:            "eu",
+				Target:                fmt.Sprintf("commerce-%03d", i),
+				Repository:            "org/repo",
+				PullRequest:           7,
+				HeadSHA:               "sha_head",
+				PrimaryPlanIdentifier: "plan_reviewed",
+				CreatedAt:             base.Add(time.Duration(i) * time.Second),
+			})
+			require.NoError(t, err)
+		}
+
+		members, err := store.Plans().List(ctx, storage.ListPlansOptions{PrimaryPlanIdentifier: "plan_reviewed"})
+		require.NoError(t, err)
+		assert.Len(t, members, memberCount, "a round-filtered listing returns every member plan of the round")
 	})
 
 	t.Run("List_RejectsPullRequestWithoutRepository", func(t *testing.T) {

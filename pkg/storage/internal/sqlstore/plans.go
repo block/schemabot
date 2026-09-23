@@ -126,8 +126,13 @@ func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]
 	opts.Environment = storage.CanonicalKey(opts.Environment)
 	opts.Repository = storage.CanonicalKey(opts.Repository)
 
-	if opts.Limit <= 0 {
-		return nil, fmt.Errorf("list plans for database %q environment %q: limit must be positive, got %d", opts.Database, opts.Environment, opts.Limit)
+	// A listing with no row cap is refused unless it names one review round.
+	// Browsing plans is open-ended and needs a page size, and an uncapped browse
+	// would scan the table. A round is a point lookup: its members are what the
+	// caller asked for, so capping the rows could only drop members it must see,
+	// and no cap it could pass would be derived from anything.
+	if opts.Limit <= 0 && opts.PrimaryPlanIdentifier == "" {
+		return nil, fmt.Errorf("list plans for database %q environment %q: limit must be positive unless a review round is named, got %d", opts.Database, opts.Environment, opts.Limit)
 	}
 	if opts.PullRequest > 0 && opts.Repository == "" {
 		return nil, fmt.Errorf("list plans for pull request %d: a repository filter is required, since a pull request number is only meaningful within one repository", opts.PullRequest)
@@ -164,8 +169,11 @@ func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
-	args = append(args, opts.Limit)
+	query += " ORDER BY created_at DESC, id DESC"
+	if opts.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, opts.Limit)
+	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
