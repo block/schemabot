@@ -496,37 +496,66 @@ func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBac
 // machine without it.
 const vitessQueryTimeout = 10 * time.Second
 
-// showMigrations queries SHOW VITESS_MIGRATIONS for a context across all keyspaces
+// showMigrations queries SHOW VITESS_MIGRATIONS for a context on every shard
 // and returns the raw column maps with an added "_keyspace" field.
 //
-// A keyspace that does not answer fails the whole call. Its schema changes are
+// The read is addressed to one shard at a time. Each shard keeps its own row
+// for a schema change, and vtgate will not scatter this statement: asked on a
+// connection scoped to a keyspace with more than one shard it answers
+// "Keyspace does not have exactly one shard" rather than reading any of them.
+// Control statements are the other way round and go to the keyspace, which
+// vtgate does scatter, so a cutover stays one command for all of its shards.
+//
+// A shard that does not answer fails the whole call. Its schema changes are
 // indistinguishable from schema changes that do not exist, and both callers
 // read the absence as a fact: the control path would address the shards that
 // answered and leave the rest of the operation unissued, and state derivation
-// would call a deploy complete on the strength of the keyspaces it could see.
+// would call a deploy complete on the strength of the shards it could see.
 func (s *Server) showMigrations(ctx context.Context, backend *databaseBackend, migrationContext string) ([]map[string]string, error) {
 	if err := validateSessionString(migrationContext); err != nil {
 		return nil, fmt.Errorf("invalid migration context: %w", err)
 	}
 	var result []map[string]string
-	for keyspace, db := range backend.vtgateDBs {
-		rowMaps, err := showMigrationsOn(ctx, db, migrationContext)
-		if err != nil {
-			return nil, fmt.Errorf("show vitess_migrations for %s: %w", keyspace, err)
+	for keyspace := range backend.vtgateDBs {
+		for _, shard := range buildShards(backend.shardCounts[keyspace]) {
+			rowMaps, err := s.showMigrationsOnShard(ctx, backend, keyspace, shard.Name, migrationContext)
+			if err != nil {
+				return nil, fmt.Errorf("show vitess_migrations for %s/%s: %w", keyspace, shard.Name, err)
+			}
+			for _, rm := range rowMaps {
+				rm["_keyspace"] = keyspace
+			}
+			result = append(result, rowMaps...)
 		}
-		for _, rm := range rowMaps {
-			rm["_keyspace"] = keyspace
-		}
-		result = append(result, rowMaps...)
 	}
 	return result, nil
+}
+
+// showMigrationsOnShard reads one shard's rows for a context.
+func (s *Server) showMigrationsOnShard(
+	ctx context.Context,
+	backend *databaseBackend,
+	keyspace, shard, migrationContext string,
+) ([]map[string]string, error) {
+	conn, cleanup, err := s.vtgateTargetConn(ctx, backend, keyspace, shard)
+	if err != nil {
+		return nil, fmt.Errorf("shard-targeted conn: %w", err)
+	}
+	defer cleanup()
+	return showMigrationsOn(ctx, conn, migrationContext)
 }
 
 // showMigrationsOn reads one keyspace's rows within vitessQueryTimeout. The
 // scan shares the deadline with the query: rows are streamed, so a shard that
 // stops answering part way through blocks the scan exactly as it would block
 // the query.
-func showMigrationsOn(ctx context.Context, db *sql.DB, migrationContext string) ([]map[string]string, error) {
+// rowQuerier is satisfied by both *sql.DB and the *sql.Conn a shard-targeted
+// read runs on, which has to stay one connection to keep its USE keyspace:shard.
+type rowQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func showMigrationsOn(ctx context.Context, db rowQuerier, migrationContext string) ([]map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
 	defer cancel()
 	rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS LIKE '"+migrationContext+"'")
