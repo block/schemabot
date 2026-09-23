@@ -243,3 +243,131 @@ func TestServerEngineMetadataDoesNotMutateResolvedMetadata(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"organization": "acme"}, resolved)
 }
+
+// The helper that composes the server policy is only worth having if the
+// factory that builds every data-plane client actually delivers its result.
+// This asserts the client's own metadata rather than the helper's return, so
+// a factory that composes the policy and then discards it is caught.
+func TestGRPCLocalClientFactoryDeliversTheDirectExecutionPolicy(t *testing.T) {
+	factory := grpcLocalClientFactory(&api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "5s"},
+	}, nil, nil)
+
+	client, err := factory(tern.LocalConfig{
+		Database:  "payments",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "root@tcp(localhost:3306)/payments",
+	}, mysqlstore.New(nil), slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+
+	local, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	metadata := local.Metadata()
+	assert.Equal(t, "true", metadata[engine.MetadataDirectExecution])
+	assert.Equal(t, "10000", metadata[engine.MetadataDirectExecutionMaxTableRows])
+	assert.Equal(t, "5", metadata[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds])
+}
+
+// A resolved target that states its own policy keeps it through the factory,
+// so the client the data plane runs is the one the target's own opt-out or
+// grant describes rather than the server's.
+func TestGRPCLocalClientFactoryDeliversAResolvedTargetsOwnOptOut(t *testing.T) {
+	factory := grpcLocalClientFactory(&api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+	}, nil, nil)
+
+	client, err := factory(tern.LocalConfig{
+		Database:  "payments",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "root@tcp(localhost:3306)/payments",
+		Metadata:  map[string]string{engine.MetadataDirectExecution: "false"},
+	}, mysqlstore.New(nil), slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+
+	local, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	metadata := local.Metadata()
+	assert.Equal(t, "false", metadata[engine.MetadataDirectExecution])
+	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows)
+}
+
+// Single-database gRPC mode selects one local-DSN database and serves it
+// directly. The environment's own policy has to be resolved against the
+// server-wide one on the way in, or a grant stated once for the whole server
+// never reaches the only database this process serves.
+func TestBuildGRPCTernClientCarriesTheServerWideDirectExecutionPolicy(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "5s"},
+		Databases: map[string]api.DatabaseConfig{
+			"payments": {
+				Type:         storage.DatabaseTypeMySQL,
+				Environments: map[string]api.EnvironmentConfig{"staging": {DSN: "root@tcp(localhost:3306)/payments"}},
+			},
+		},
+	}
+
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), slog.New(slog.DiscardHandler), "staging", nil)
+	require.NoError(t, err)
+
+	local, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	metadata := local.Metadata()
+	assert.Equal(t, "true", metadata[engine.MetadataDirectExecution])
+	assert.Equal(t, "10000", metadata[engine.MetadataDirectExecutionMaxTableRows])
+	assert.Equal(t, "5", metadata[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds])
+}
+
+// The single database this process serves keeps its own opt-out, which is the
+// direction that matters: a grant laid over an environment that refused it is
+// native blocking DDL on a table whose configuration said no.
+func TestBuildGRPCTernClientKeepsTheEnvironmentsOptOut(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+		Databases: map[string]api.DatabaseConfig{
+			"payments": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]api.EnvironmentConfig{"staging": {
+					DSN:             "root@tcp(localhost:3306)/payments",
+					DirectExecution: &api.DirectExecutionConfig{Enabled: false},
+				}},
+			},
+		},
+	}
+
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), slog.New(slog.DiscardHandler), "staging", nil)
+	require.NoError(t, err)
+
+	local, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	metadata := local.Metadata()
+	assert.Equal(t, "false", metadata[engine.MetadataDirectExecution])
+	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows)
+}
+
+// An environment that states its own bound reaches the client with that
+// bound, not the server's. The factory behind this path only knows the
+// server-wide policy, so the environment's override has to be resolved here
+// or the single database this process serves silently runs under the wrong
+// blast-radius cap.
+func TestBuildGRPCTernClientCarriesTheEnvironmentsOwnBound(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+		Databases: map[string]api.DatabaseConfig{
+			"payments": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]api.EnvironmentConfig{"staging": {
+					DSN:             "root@tcp(localhost:3306)/payments",
+					DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 500},
+				}},
+			},
+		},
+	}
+
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), slog.New(slog.DiscardHandler), "staging", nil)
+	require.NoError(t, err)
+
+	local, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	assert.Equal(t, "500", local.Metadata()[engine.MetadataDirectExecutionMaxTableRows],
+		"the override replaces the server-wide bound rather than being overlaid by it")
+}

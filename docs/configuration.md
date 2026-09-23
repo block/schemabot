@@ -692,6 +692,15 @@ it runs under, and `enabled: false` is a complete opt out. A resolved target
 whose own connection metadata carries any direct execution key is treated the
 same way: it states the whole policy, and the server-wide one does not apply.
 
+State the policy on the server that runs the engine. Where a database
+executes in-process, that is this config and there is nothing more to do. On
+a deployment whose applies execute on a remote data plane, the routing server
+hands that data plane a target to connect to, not a policy, so a block
+written only on the routing server is read by nothing: an enabled one never
+routes a statement, and an opt-out never reaches the server it was meant to
+constrain. Write both the server-wide policy and any override on the data
+plane until the routing server forwards them.
+
 A direct statement is synchronous, blocks writes to the table while it runs,
 and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
 bound. A refused statement runs directly only when the table's size is within

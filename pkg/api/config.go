@@ -3474,11 +3474,13 @@ func directExecutionSupported(databaseType string) bool {
 	case storage.DatabaseTypeVitess, storage.DatabaseTypePostgres, storage.DatabaseTypeStrata:
 		return false
 	default:
-		// The type is open-world: an embedder registers its own engine for
-		// anything not built in, and nothing pins the policy contract on that
-		// registration. Take the conservative disposition — a statement the
-		// engine refuses stays blocked — rather than granting native DDL to an
-		// engine that may never read the bound.
+		// Reached through a target resolver rather than through `databases:`,
+		// whose type allowlist admits only the cases above. A resolver names
+		// the engine behind each target it returns, an embedder registers
+		// that engine, and nothing pins the policy contract on either. Take
+		// the conservative disposition — a statement the engine refuses stays
+		// blocked — rather than granting native DDL to an engine that may
+		// never read the bound.
 		return false
 	}
 }

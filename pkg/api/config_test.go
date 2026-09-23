@@ -1271,6 +1271,49 @@ func TestServerConfig_ResolveDirectExecutionReachesOnlyEnginesThatRouteIt(t *tes
 	}
 }
 
+// ResolveDirectExecution returns an environment's own block without passing
+// it through the engine filter, which is safe only because validation refuses
+// that block on every type the filter excludes. The two functions read the
+// same predicate, and this asserts the link directly: for each type a
+// database may be registered as, the filter's answer and validation's answer
+// agree. Relaxing either side alone would let a block validation accepted
+// resolve onto an engine that never applies its bound.
+func TestServerConfig_DirectExecutionEngineFilterAndValidationAgree(t *testing.T) {
+	// The types Validate() admits in databases:. Anything else is rejected
+	// before the direct execution rules are reached.
+	for _, dbType := range []string{
+		storage.DatabaseTypeMySQL,
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+	} {
+		t.Run(dbType, func(t *testing.T) {
+			block := &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000}
+			cfg := ServerConfig{
+				ExperimentalStrataEnabled: true,
+				Storage:                   StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: dbType,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: block},
+						},
+					},
+				},
+			}
+			err := cfg.Validate()
+
+			if directExecutionSupported(dbType) {
+				require.NoError(t, err)
+				assert.Same(t, block, cfg.ResolveDirectExecution(&EnvironmentConfig{DirectExecution: block}, dbType))
+				return
+			}
+			require.Error(t, err, "an environment block on %s must be refused, because ResolveDirectExecution will return it unfiltered", dbType)
+			assert.Contains(t, err.Error(), "only supported for mysql databases")
+		})
+	}
+}
+
 // A malformed direct_execution lock_acquisition_timeout is a startup config error —
 // even on a disabled block — so a bad bound is never silently carried until
 // the policy is enabled. MySQL lock timeouts have second granularity, so the
@@ -5395,6 +5438,25 @@ func TestServerConfig_ValidateRejectsAServerDirectExecutionNoEngineCanHonor(t *t
 				"payments": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
 					"staging": {DSN: "root@tcp(localhost)/payments"},
 				}},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("a target resolver exempts the policy from the registry", func(t *testing.T) {
+		// A data plane resolves its targets per request and holds no
+		// registration for the databases behind them, so the loop over
+		// registered databases finds nothing to honor the policy. This is the
+		// deployment shape the server-wide policy exists for, and refusing to
+		// start on it would make the policy unusable exactly where it is
+		// needed.
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			TargetResolver: TargetResolverConfig{
+				Targets: map[string]inventory.StaticTarget{
+					"dsid-orders-prod": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(localhost:3306)/"},
+				},
 			},
 		}
 		assert.NoError(t, cfg.Validate())

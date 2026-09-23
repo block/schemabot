@@ -3098,6 +3098,14 @@ func (c *LocalClient) Engine() engine.Engine {
 	return c.getEngine()
 }
 
+// Metadata returns the engine metadata this client runs under, exposed for
+// the same reason as Engine: a caller that assembles a LocalClient can verify
+// that the server policy it composed actually reached the client, rather than
+// only that the composition helper returns the right map.
+func (c *LocalClient) Metadata() map[string]string {
+	return maps.Clone(c.config.Metadata)
+}
+
 // Progress returns detailed progress for an active schema change.
 // Returns ALL tasks for the current apply: completed, running, and pending.
 // req.ApplyId is required so progress is always scoped to a single apply.
