@@ -43,11 +43,8 @@ the engine applies a short default when it is not set.
 
 The policy is configured server-wide, and a database environment may override
 it (see [Configuration → Direct Execution](configuration.md#direct-execution)).
-A server-wide policy is what a data-plane server states, because the targets it
-resolves through its `target_resolver` are addressed by an opaque identifier
-and carry no per-database registration to state a policy in. At plan time,
-each engine-refused statement is resolved against the policy in force, and the
-plan records a per-table execution-mode verdict:
+At plan time, each engine-refused statement is resolved against the policy in
+force, and the plan records a per-table execution-mode verdict:
 
 ```diagram
 engine refuses statement (e.g. primary-key reshape)
@@ -66,6 +63,70 @@ verdict cannot go stale between plan and execution — a table that grew past
 the bound after planning is blocked at apply, not run. Statements the policy
 does not route stay blocked and keep the blocked-apply gate behavior: the
 apply is rejected up front with the engine's refusal reason.
+
+### The policy travels with the request
+
+The server that runs the statement is not always the one whose configuration
+states the policy. A control plane routes a database to a remote deployment
+over gRPC, and that deployment resolves its targets from an opaque identifier:
+it holds no registration for the database and so has nothing of its own to
+judge a refused statement by. The resolved policy therefore travels on the
+request, and the executing server judges the statement under the policy it was
+sent:
+
+```diagram
+control plane                              executing server
+─────────────                              ────────────────
+config: server-wide policy
+  + optional environment override
+        │
+        ├── plan ─────── policy on the request ──► verdict per table
+        │                                                 │
+        │                                    recorded on the plan row
+        │                                                 │
+        │      ┌──────────────────────────────────────────┘
+        │      ▼
+        └── apply ────── policy on the request ──► recorded on the apply
+                                                          │
+                                   a later drive, another pod, after a restart
+                                                          │
+                                                          ▼
+                                                   routed under the
+                                                   recorded policy
+```
+
+An apply records the policy it was admitted under rather than re-deriving one
+each time it is driven, because the drive that routes the statement can be a
+later one, on another pod, after the server has been reconfigured. The policy
+is read from the request's own field and never from its option map, which is
+operator-supplied: a caller able to name its own policy there would be
+granting itself the thing the configuration exists to bound.
+
+A request that states no policy leaves the executing server's own
+configuration in force, which with none configured leaves every statement the
+engine refuses blocked.
+
+### The plan carries the policy its verdicts were judged under
+
+An apply's policy comes off the plan it is created from, not from a second
+resolution at admission. The two steps are separated by however long review
+takes, and the configuration can change in between: a grant narrowed or
+withdrawn after review would otherwise refuse a statement the operator was
+shown as direct, and a grant acquired after review would run one they were
+shown as blocked. Recording it on the plan makes the verdict the operator
+reviewed and the policy the statement runs under the same one.
+
+The gap is widest for a rollback, which is planned when the change it reverses
+completes and confirmed by an operator later, holding only the pinned plan.
+Its plan records the policy of the apply it reverses, so the statement that
+undoes a direct change runs under the grant that allowed the change, rather
+than leaving the schema the operator is walking back on the target because the
+grant lapsed in between.
+
+A plan judged under no grant records a disabled policy rather than nothing,
+so a plan row holding nothing means exactly one thing: it predates the record,
+and its apply resolves a policy from configuration the way admission always
+did.
 
 ## The size bound
 

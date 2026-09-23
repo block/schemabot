@@ -136,6 +136,11 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		// where it was planned, so an entry naming a table only this
 		// deployment holds withholds it here too.
 		IgnoreTables: req.GetIgnoreTables(),
+		// The guard compares the reviewed DDL against this re-plan, so the
+		// re-plan has to be judged under the dispatch's own policy. Under a
+		// different one a statement the reviewed plan routed directly comes
+		// back blocked, and the guard reads that as drift.
+		DirectExecution: req.GetDirectExecution(),
 	}, c.config.Database, schemaFiles)
 	if err != nil {
 		return replannedChanges{}, fmt.Errorf("recompute local plan: %w", err)

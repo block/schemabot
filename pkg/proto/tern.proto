@@ -487,6 +487,29 @@ message PlanRequest {
   // actually withheld through exempt_tables on the response, and refuses a
   // table the config withholds that a schema file also declares.
   repeated string ignore_tables = 13;
+  // The caller's resolved direct execution policy for this database and
+  // environment. A control plane forwards it so the target that runs the
+  // statement judges it under the policy the control plane's config states.
+  // Absent means the caller states no policy and the executing server's own
+  // configuration decides, which with none configured leaves every statement
+  // the engine refuses blocked.
+  DirectExecutionPolicy direct_execution = 14;
+}
+
+// DirectExecutionPolicy permits statements an engine deterministically refuses
+// to run verbatim as native DDL, bounded by the target table's size. Engines
+// that do not implement direct execution ignore it.
+message DirectExecutionPolicy {
+  // Whether refused statements may run directly at all.
+  bool enabled = 1;
+  // The fail-closed size bound: a refused statement runs directly only when
+  // the target table is at or below this row count. Required (positive) when
+  // enabled — a grant carrying no bound is refused, never treated as
+  // unbounded — and a table whose size cannot be measured is blocked.
+  int64 max_table_rows = 2;
+  // How long each direct statement waits to acquire its locks before failing
+  // with a retryable busy-table error. Zero leaves the engine's own default.
+  int64 lock_acquisition_timeout_seconds = 3;
 }
 
 // TableChange represents a DDL change to a table.
@@ -678,6 +701,11 @@ message ApplyRequest {
   // own record travels rather than the current config, so the comparison is
   // against what was reviewed.
   repeated string ignore_tables = 13;
+  // The caller's resolved direct execution policy, as for PlanRequest. The
+  // data plane records it on the apply it creates, so the drive that picks
+  // the apply up later — on another pod, or after a restart — routes under
+  // the policy the dispatch was admitted under rather than re-deriving one.
+  DirectExecutionPolicy direct_execution = 14;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a

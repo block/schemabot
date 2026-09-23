@@ -672,12 +672,11 @@ direct_execution:
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
 
-This is the only way to state a policy for a database a data-plane server
-resolves through its `target_resolver`: those targets are addressed by an
-opaque identifier and have no `databases` entry to carry a policy of their
-own. It is also the form to reach for on a fleet — a per-database block for
-every database is the same policy written many times, and each copy is one
-more place for the row bound to drift.
+This is the form to reach for on a fleet: a per-database block for every
+database is the same policy written many times, and each copy is one more
+place for the row bound to drift. It is also what covers a database with no
+`databases` entry at all — one a data-plane server resolves through its
+`target_resolver`, addressed by an opaque identifier.
 
 A database environment may override the server-wide policy:
 
@@ -699,14 +698,25 @@ it runs under, and `enabled: false` is a complete opt out. A resolved target
 whose own connection metadata carries any direct execution key is treated the
 same way: it states the whole policy, and the server-wide one does not apply.
 
-State the policy on the server that runs the engine. Where a database
-executes in-process, that is this config and there is nothing more to do. On
-a deployment whose applies execute on a remote data plane, the routing server
-hands that data plane a target to connect to, not a policy, so a block
-written only on the routing server is read by nothing: an enabled one never
-routes a statement, and an opt-out never reaches the server it was meant to
-constrain. Write both the server-wide policy and any override on the data
-plane until the routing server forwards them.
+State the policy on the server that holds the configuration. The resolved
+policy is stated on every plan and apply request, so it reaches a database
+this server routes to a remote deployment over gRPC as well as one it
+executes in process: the deployment that runs the statement judges it under
+this server's policy rather than its own, and an apply records the policy it
+was admitted under so a later drive routes it the same way. A request that
+states no policy leaves the executing server's own configuration in force.
+
+An opt out travels the same way a grant does. `enabled: false` is stated on
+the request rather than left out of it, because leaving it out is how a
+request says nothing at all — and a request that says nothing hands the
+decision to whatever the executing server is configured with, which on a data
+plane serving several control planes may be a grant the opted-out database
+was never meant to have.
+
+A rollback is planned under the policy its original apply was admitted under,
+read off that apply rather than resolved again. The two can differ: a
+rollback runs after the change it reverses, and withdrawing the grant in
+between would otherwise refuse the statement that undoes a change it allowed.
 
 A direct statement is synchronous, blocks writes to the table while it runs,
 and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
@@ -775,6 +785,15 @@ thing between a refused statement and an unbounded write outage. There is no
 such field today, and one should only be added where the value genuinely has
 no cross-engine meaning; a bound that any engine could honor belongs at the
 top of the block.
+
+Changing the policy does not retroactively change plans already reviewed
+under the old one. A plan records the policy its execution verdicts were
+judged against, and the apply created from it runs under that record rather
+than under a policy resolved again at admission, so narrowing or withdrawing
+a grant takes effect on the next plan instead of on a change an operator has
+already reviewed. See
+[Direct Execution → The plan carries the policy its verdicts were judged
+under](direct-execution.md#the-plan-carries-the-policy-its-verdicts-were-judged-under).
 
 ## Storage Dialect
 
