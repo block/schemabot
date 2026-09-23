@@ -187,7 +187,7 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	switch na.Kind {
 	case presentation.NextActionCutover:
 		writeFooterAction(sb,
-			fmt.Sprintf("To cut over `%s`:", na.Name),
+			fmt.Sprintf("To cut over %s:", inlineCode(na.Name)),
 			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))

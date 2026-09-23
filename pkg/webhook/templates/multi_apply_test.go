@@ -680,9 +680,10 @@ func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *t
 // own into either: an operator reads this comment to decide whether to cut over
 // or cancel a change that is already touching a database.
 func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown(t *testing.T) {
+	hostile := "us`\n## Injected [click](https://example.invalid)"
 	model := presentation.Derive([]presentation.Operation{
 		rollingOp("eu", so.Running),
-		rollingOp("us`\n## Injected [click](https://example.invalid)", so.Running),
+		rollingOp(hostile, so.Running),
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
@@ -703,4 +704,16 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 	// The section header is read as HTML, so the name is escaped rather than
 	// fenced, matching how this comment names a member everywhere else in a tag.
 	assert.Contains(t, out, "<summary>🔄 us` ## Injected [click](https://example.invalid) — running table copy</summary>")
+
+	// The next-action line names a member in markdown prose too, and is the line
+	// an operator reads to decide which member to cut over.
+	cutover := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			{Deployment: hostile, State: so.WaitingForCutover, Barrier: true},
+		}),
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+	assert.NotContains(t, cutover, "\n## Injected")
+	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
 }
