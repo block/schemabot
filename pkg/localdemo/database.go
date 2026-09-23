@@ -10,8 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"log/slog"
 	"net"
 	"net/url"
@@ -180,7 +178,7 @@ func Ensure(ctx context.Context, project, engine string) (Database, error) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if ready(readyCtx, engine, result.StorageDSN) == nil {
+		if containerReady(readyCtx, name, engine) && ready(readyCtx, engine, result.StorageDSN) == nil {
 			return result, nil
 		}
 		select {
@@ -197,7 +195,7 @@ func ready(ctx context.Context, engine, dsn string) error {
 	var db *sql.DB
 	var err error
 	if engine == "mysql" {
-		db, err = mysqlconn.Open(dsn, func(cfg *mysql.Config) { cfg.Logger = log.New(io.Discard, "", 0) })
+		db, err = mysqlconn.Open(dsn)
 	} else {
 		db, err = postgresconn.Open(dsn)
 	}
@@ -255,4 +253,17 @@ func localDockerEndpoint(endpoint string) bool {
 	}
 	u, err := url.Parse(endpoint)
 	return err == nil && u.Scheme == "tcp" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")
+}
+
+// Probe inside the container until first-boot initialization finishes. Docker's
+// published port can accept a TCP connection before MySQL can greet a client.
+func containerReady(ctx context.Context, name, engine string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	args := []string{"exec", name, "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres", "-d", "schemabot"}
+	if engine == "mysql" {
+		args = []string{"exec", name, "sh", "-c", `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -h127.0.0.1 -Dschemabot -Nse 'SELECT 1'`}
+	}
+	_, err := run(ctx, nil, args...)
+	return err == nil
 }
