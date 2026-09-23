@@ -5013,6 +5013,60 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="summary-failed-on-a-data-plane-engine-logs"></a><strong>Summary: Failed On A Data Plane (Engine Logs)</strong></summary>
+
+
+## ❌ Schema Change Failed — Staging
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
+
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
+
+> ❌ **Error:** The schema change failed on the target; the engine&#39;s account of it is in the logs below. (error 1265)
+
+1 of 2 tables completed before failure.
+
+**`users`** — Failed at 30.00%
+```sql
+ALTER TABLE `users` MODIFY COLUMN `nickname` varchar(32) NOT NULL;
+```
+
+**`orders`** — Completed
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+<details>
+<summary>Show logs (8 entries)</summary>
+
+```text
+== apply logs ==
+2026-03-15 14:22:00 UTC [INF] Apply dispatched to data plane [queued -> running]
+2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
+2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
+
+== engine logs: shard-a ==
+2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
+2026-03-15 14:24:00 UTC [INF] [users] copy progress: 12.4% 181812/1466232 rows, eta 21m
+2026-03-15 14:27:00 UTC [INF] [users] copy progress: 30.0% 439870/1466232 rows, eta 14m
+2026-03-15 14:27:40 UTC [WRN] [users] unsafe warning 1265: Data truncated for column 'nickname' at row 1
+2026-03-15 14:27:41 UTC [ERR] [users] aborting: the copy would change values that are already in the table
+```
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="summary-stopped"></a><strong>Summary: Stopped</strong></summary>
 
 
@@ -7685,6 +7739,37 @@ _No details available yet._
 <summary>⏸️ ca — halted — us failed</summary>
 
 _No details available yet._
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="engine-logs-fold-two-data-planes"></a><strong>Engine Logs Fold: Two Data Planes</strong></summary>
+
+
+
+<details>
+<summary>Show logs (11 entries)</summary>
+
+```text
+== apply logs ==
+2026-03-15 14:22:00 UTC [INF] Apply dispatched to data plane [queued -> running]
+2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
+2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
+
+== engine logs: shard-a, target: cluster-a ==
+2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
+2026-03-15 14:24:00 UTC [INF] [users] copy progress: 12.4% 181812/1466232 rows, eta 21m
+2026-03-15 14:27:00 UTC [INF] [users] copy progress: 30.0% 439870/1466232 rows, eta 14m
+2026-03-15 14:27:40 UTC [WRN] [users] unsafe warning 1265: Data truncated for column 'nickname' at row 1
+2026-03-15 14:27:41 UTC [ERR] [users] aborting: the copy would change values that are already in the table
+
+== engine logs: shard-b, target: cluster-b ==
+2026-03-15 14:22:30 UTC [INF] [users] copy starting: 1192044 rows estimated, 4 threads
+2026-03-15 14:27:00 UTC [INF] [users] copy complete: 1192044 rows
+2026-03-15 14:28:00 UTC [INF] [users] cutover complete
+```
 
 </details>
 </details>

@@ -32,7 +32,11 @@ type CommentObserver struct {
 	deferCutover   bool
 	supportChannel api.SupportChannelConfig
 	tenant         string
-	logger         interface {
+	// engineLogs reads the engine's own lines back from the data planes that
+	// ran an apply, for the engine-logs fold on a failed apply's summary.
+	// Nil where no reader was wired; see EngineLogReader.
+	engineLogs EngineLogReader
+	logger     interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
@@ -154,6 +158,12 @@ type CommentObserverConfig struct {
 	// deployments.
 	Tenant string
 
+	// EngineLogs reads the engine's own lines back from the data planes that
+	// ran an apply, so a failed apply's summary comment carries the engine's
+	// account of the failure alongside SchemaBot's. Optional — nil leaves the
+	// engine-logs fold off the summary.
+	EngineLogs EngineLogReader
+
 	Logger interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
@@ -225,6 +235,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		deferCutover:   cfg.DeferCutover,
 		supportChannel: cfg.SupportChannel,
 		tenant:         cfg.Tenant,
+		engineLogs:     cfg.EngineLogs,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -729,16 +740,33 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 // section, appended after whichever layout rendered, so triage data lands on
 // the PR without an extra operator step.
 func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
-	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
-	} else {
-		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
 	}
-	body += controlRejectionSection(ctx, o.stor, o.logger, apply, body)
-	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)
+	// Everything read from storage is resolved once, before the body is
+	// rendered: summaryWithFailureLogs can render it twice, and a best-effort
+	// read that failed on the second pass would silently drop a section from
+	// the body actually posted.
+	var released bool
+	var display map[int64]operationDisplay
+	var vschemaDiffs map[string]string
+	if opsErr == nil {
+		released = o.resolveReleased(apply, ops)
+		display = o.resolveDisplay(apply, ops)
+		vschemaDiffs = o.resolveVSchemaDiffs(apply, ops)
+	}
+	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
+	renderBody := func(apply *storage.Apply) string {
+		var body string
+		if opsErr != nil {
+			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
+		} else {
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, vschemaDiffs, o.tenant)
+		}
+		return body + renderControlRejections(rejections, o.logger, apply, body)
+	}
+	return summaryWithFailureLogs(ctx, o.stor, o.engineLogs, o.logger, apply, renderBody)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

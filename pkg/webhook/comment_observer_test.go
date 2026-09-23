@@ -41,14 +41,20 @@ func (s *stubApplyOperationStore) GetEngineResumeState(_ context.Context, opID i
 // other store would panic, keeping the test honest about the path it covers.
 type stubStorage struct {
 	storage.Storage
-	ops     storage.ApplyOperationStore
-	applies storage.ApplyStore
-	settled []*storage.ApplyControlRequest
+	ops       storage.ApplyOperationStore
+	applies   storage.ApplyStore
+	applyLogs storage.ApplyLogStore
+	settled   []*storage.ApplyControlRequest
+	// settledReads counts the settled-control-request reads, so a test can
+	// pin that rendering a comment body twice still reads storage once.
+	settledReads *int
 }
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
 func (s *stubStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *stubStorage) ApplyLogs() storage.ApplyLogStore { return s.applyLogs }
 
 // stubApplyStore serves the authority gate's fresh re-read of the apply row
 // from a fixed result.
@@ -65,7 +71,7 @@ func (s *stubApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
 
 func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
-	return stubControlRequestStore{settled: s.settled}
+	return stubControlRequestStore{settled: s.settled, reads: s.settledReads}
 }
 
 // stubControlRequestStore supplies the settled-control-request read the comment
@@ -73,9 +79,13 @@ func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
 type stubControlRequestStore struct {
 	storage.ControlRequestStore
 	settled []*storage.ApplyControlRequest
+	reads   *int
 }
 
 func (s stubControlRequestStore) ListSettled(context.Context, int64) ([]*storage.ApplyControlRequest, error) {
+	if s.reads != nil {
+		*s.reads++
+	}
 	return s.settled, nil
 }
 

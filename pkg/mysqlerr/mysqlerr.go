@@ -24,6 +24,7 @@ import (
 	"net"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/block/mysql"
 )
@@ -32,6 +33,27 @@ import (
 // rather than guessing at it, so callers are expected to log the underlying
 // error with the target identifiers.
 const Generic = "The schema change failed on the target; see the server logs for the reason."
+
+// GenericRenderedLogs is what an unrecognized failure reports on a surface
+// that carries the engine's own lines with it. It says the same thing Generic
+// says — this package still has no account of the code — but sends the reader
+// to the logs in front of them rather than to a server they may not be able to
+// reach. Only a surface that renders those lines may use it: see
+// PointToRenderedLogs.
+const GenericRenderedLogs = "The schema change failed on the target; the engine's account of it is in the logs below."
+
+// PointToRenderedLogs rewrites a reason for a surface that renders the
+// engine's own lines beside it. Only the generic sentence is rewritten, and
+// only its pointer: a reason chosen by code already says what an operator
+// should do, and the connection-family sentences send them to a server log for
+// a failure the engine never got far enough to describe. A reason this package
+// did not write, or one that points somewhere else, is returned unchanged.
+func PointToRenderedLogs(reason string) string {
+	if !strings.HasPrefix(reason, Generic) {
+		return reason
+	}
+	return GenericRenderedLogs + strings.TrimPrefix(reason, Generic)
+}
 
 // Unreachable is what a failure to reach the target at all reports. It is kept
 // apart from Generic because the two send an operator to different places: one
@@ -229,10 +251,11 @@ func render(code int) string {
 // that a rendered reason is one of them.
 func Authored() map[string]bool {
 	all := map[string]bool{
-		Generic:        true,
-		Unreachable:    true,
-		ConnectionLost: true,
-		Timeout:        true,
+		Generic:             true,
+		GenericRenderedLogs: true,
+		Unreachable:         true,
+		ConnectionLost:      true,
+		Timeout:             true,
 	}
 	for _, reason := range reasons {
 		all[reason] = true

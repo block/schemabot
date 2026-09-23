@@ -39,6 +39,12 @@ const GitHubIssueCommentMaxChars = 65536
 // line.
 const MinRenderedLogLineChars = len("2006-01-02 15:04:05 UTC [] ") + 1
 
+// groupSeparator sets one group's lines apart from the next inside the fenced
+// block. It is charged to the budget per group, not to the fixed chrome
+// reserve, because how much of it the section renders depends on how many
+// groups survive.
+const groupSeparator = "\n\n"
+
 // sectionChromeChars reserves room within the budget for the section's own
 // markup: the details/summary fold, the omitted-entries note, and the code
 // fences.
@@ -50,49 +56,232 @@ const sectionChromeChars = 256
 // against it to skip loading entries that could never render.
 const MinFailureLogsSectionChars = 512
 
-// RenderRecentFailureLogs renders the collapsed logs section appended to a
-// failed apply's summary comment, formatted like the CLI logs output
-// (timestamp, level tag, message, state transition). The fold is labeled
-// "Show logs" when it carries the apply's complete log history and "Show
-// recent logs" when it is a tail — hasOlder reports that entries older than
-// entries[0] exist but were not loaded. The section spends at most available characters —
-// the room the rest of the comment leaves under GitHub's size limit, so a
-// large summary body shrinks the fold instead of pushing the comment over the
-// limit. Returns "" when there are no entries or no meaningful room, so the
-// summary renders unchanged.
-func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder bool) string {
-	if len(entries) == 0 {
+// LogGroupData is one account of an apply inside the logs fold: SchemaBot's
+// own log for it, or one data plane's engine lines for it. Groups are rendered
+// one after another under their own headings rather than interleaved by
+// timestamp. Each account is written by a different process against a
+// different clock, so a merged stream would assert an ordering between them
+// that nothing establishes — an engine line could sort above the transition
+// that started it, and read as though the engine ran first.
+type LogGroupData struct {
+	// Label names the account inside the fenced block, without the surrounding
+	// markers: "apply logs", "engine logs: region-a". It renders only when the
+	// fold carries more than one group, so the common single-account fold
+	// reads as a plain log.
+	Label string
+	// Entries are the group's lines, oldest first.
+	Entries []LogEntryData
+	// HasOlder reports that the group has lines older than Entries, so the
+	// fold can say it shows a tail rather than the whole account.
+	HasOlder bool
+}
+
+// MaxGroupLabelChars bounds what one group heading costs the budget. A label
+// longer than this is clamped rather than allowed to eat the lines it exists
+// to introduce. A caller composing a label keeps it inside this by clamping
+// each of its parts with ElideMiddle, so the clamp here is a backstop.
+const MaxGroupLabelChars = 64
+
+// MaxGroupLabelPartChars bounds one name inside a composed group label — a
+// deployment or a target. A caller composing a label from several names clamps
+// each of them with ElideMiddle before joining, so the label arrives within
+// MaxGroupLabelChars and the heading's own clamp never has to cut it.
+const MaxGroupLabelPartChars = 20
+
+// ElideMiddle shortens text to at most maxBytes by replacing its middle with
+// an ellipsis, keeping both ends. Names that identify a deployment or a target
+// share long prefixes and differ at the tail, so cutting the tail off makes
+// two distinct names render identically — which is the one thing a heading
+// that exists to tell them apart must not do.
+func ElideMiddle(text string, maxBytes int) string {
+	const ellipsis = "…"
+	if len(text) <= maxBytes {
+		return text
+	}
+	if maxBytes <= len(ellipsis) {
+		return truncateToBytes(text, maxBytes)
+	}
+	keep := maxBytes - len(ellipsis)
+	head := keep / 2
+	tail := keep - head
+	return truncateToBytes(text, head) + ellipsis + tailBytes(text, tail)
+}
+
+// tailBytes returns the last maxBytes of text without splitting a UTF-8 rune.
+func tailBytes(text string, maxBytes int) string {
+	if len(text) <= maxBytes {
+		return text
+	}
+	cut := len(text) - maxBytes
+	for cut < len(text) && !utf8.RuneStart(text[cut]) {
+		cut++
+	}
+	return text[cut:]
+}
+
+// RenderFailureLogs renders the collapsed logs section appended to a failed
+// apply's summary comment, formatted like the CLI logs output (timestamp,
+// level tag, message, state transition). Every account of the apply shares the
+// one fold: SchemaBot's log for it, and the engine's own lines from each data
+// plane that ran it, each under its own heading. One fold means an operator
+// opens one thing to triage a failure, and headings keep each account's
+// ordering its own.
+//
+// The fold is labeled "Show logs" when it carries every line of every group
+// and "Show recent logs" when any group is a tail — a group's HasOlder reports
+// that lines older than its first exist but were not loaded. The section
+// spends at most available characters, the room the rest of the comment leaves
+// under GitHub's size limit, so a large summary body shrinks the fold instead
+// of pushing the comment over the limit. Returns "" when no group carried a
+// line or there is no meaningful room, so the summary renders unchanged.
+func RenderFailureLogs(groups []LogGroupData, available int) string {
+	groups = groupsWithEntries(groups)
+	if len(groups) == 0 {
 		return ""
 	}
 	if available < MinFailureLogsSectionChars {
 		return ""
 	}
-	budget := available
-
-	lines := make([]string, len(entries))
-	for i, entry := range entries {
-		lines[i] = formatLogEntryLine(entry)
+	groups, headings, budget, droppedGroups := groupsWithinBudget(groups, available)
+	if len(groups) == 0 {
+		return ""
 	}
-	lines, omitted := trimLogLinesToBudget(lines, budget-sectionChromeChars)
+	// Every group gets an equal share of what is left, so the first account
+	// rendered cannot spend the room the others needed and leave a fan-out
+	// reading like a single-region failure.
+	share := budget / len(groups)
+
+	var blocks []string
+	total := 0
+	omitted := 0
+	hasOlder := droppedGroups > 0
+	for i, group := range groups {
+		lines := make([]string, len(group.Entries))
+		for j, entry := range group.Entries {
+			lines[j] = formatLogEntryLine(entry)
+		}
+		lines, dropped := trimLogLinesToBudget(lines, share)
+		omitted += dropped
+		hasOlder = hasOlder || group.HasOlder
+		total += len(lines)
+		if headings != nil {
+			lines = append([]string{headings[i]}, lines...)
+		}
+		blocks = append(blocks, strings.Join(lines, "\n"))
+	}
 
 	label := "Show logs"
 	if hasOlder || omitted > 0 {
 		label = "Show recent logs"
 	}
 	noun := "entries"
-	if len(lines) == 1 {
+	if total == 1 {
 		noun = "entry"
 	}
-	section := fmt.Sprintf("\n<details>\n<summary>%s (%d %s)</summary>\n\n", label, len(lines), noun)
-	if omitted > 0 {
-		note := fmt.Sprintf("_%d earlier entries omitted to fit the comment size limit", omitted)
-		if hasOlder {
-			note += " (older entries also exist)"
-		}
-		section += note + "._\n\n"
+	section := fmt.Sprintf("\n<details>\n<summary>%s (%d %s)</summary>\n\n", label, total, noun)
+	if note := omissionNote(omitted, droppedGroups, hasOlder); note != "" {
+		section += note
 	}
-	section += "```text\n" + strings.Join(lines, "\n") + "\n```\n\n</details>\n"
+	section += "```text\n" + strings.Join(blocks, groupSeparator) + "\n```\n\n</details>\n"
 	return section
+}
+
+// groupsWithinBudget decides how many groups the fold can carry and what the
+// headings cost it. Headings render only when more than one group survives, so
+// a fold that ends up carrying one account reads as a plain log.
+//
+// A fold too small to give every group a renderable share keeps the groups it
+// can and reports the rest as dropped, rather than emitting a heading and an
+// ellipsis for each: the headings and truncation markers alone can outgrow the
+// room the whole section was given, and a section that overruns its budget
+// pushes the comment past GitHub's cap and costs the operator the summary
+// itself. The earliest groups are kept, so what survives is the apply's own
+// account before any data plane's.
+func groupsWithinBudget(groups []LogGroupData, available int) (kept []LogGroupData, headings []string, budget int, dropped int) {
+	// A group's heading does not depend on how many groups survive, so they
+	// are built once and the loop below slices them. Building them per
+	// iteration would rebuild and re-sanitize every heading each time the fold
+	// narrows by one, which is quadratic in the width of the fan-out.
+	all, costUpTo := groupHeadings(groups)
+	for n := len(groups); n > 0; n-- {
+		budget = available - sectionChromeChars
+		headings = nil
+		if n > 1 {
+			// The headings, the newline joining each to the lines below, and
+			// the blank line between each pair of groups come out of the
+			// budget before it is shared, so a headed fold cannot overrun the
+			// room a bare one would have fitted in. Everything the section
+			// adds per group has to be charged per group: the fixed chrome
+			// reserve does not grow with the fan-out, so a wide one would
+			// otherwise spend room the reserve never held.
+			headings = all[:n]
+			budget -= costUpTo[n] + len(groupSeparator)*(n-1)
+		}
+		if budget/n >= MinRenderedLogLineChars {
+			return groups[:n], headings, budget, len(groups) - n
+		}
+	}
+	return nil, nil, 0, len(groups)
+}
+
+// groupHeadings renders every group's heading and, alongside them, what the
+// first n of them cost the budget: the heading itself plus the newline joining
+// it to the lines below. costUpTo is indexed by the number of headings, so
+// costUpTo[n] is what a fold of n groups spends on them.
+func groupHeadings(groups []LogGroupData) (headings []string, costUpTo []int) {
+	headings = make([]string, len(groups))
+	costUpTo = make([]int, len(groups)+1)
+	for i, group := range groups {
+		headings[i] = groupHeading(group.Label)
+		costUpTo[i+1] = costUpTo[i] + len(headings[i]) + 1
+	}
+	return headings, costUpTo
+}
+
+// groupHeading introduces one account's lines inside the fenced block. The
+// label is sanitized like any other text in the fence: it is assembled from
+// server configuration rather than from a log line, but it shares the fence
+// with text the engine wrote and nothing in it should be able to close it.
+func groupHeading(label string) string {
+	return "== " + truncateToBytes(sanitizeLogText(label), MaxGroupLabelChars) + " =="
+}
+
+// groupsWithEntries drops the groups that carried no line, so an account that
+// answered with nothing does not turn into an empty headed block.
+func groupsWithEntries(groups []LogGroupData) []LogGroupData {
+	kept := make([]LogGroupData, 0, len(groups))
+	for _, group := range groups {
+		if len(group.Entries) > 0 {
+			kept = append(kept, group)
+		}
+	}
+	return kept
+}
+
+// omissionNote says what the fold left out, so a reader never takes a trimmed
+// fold for the complete account. It covers both ways the section sheds
+// content under a tight budget: lines dropped from the front of a group, and
+// whole groups that could not be given a renderable share.
+func omissionNote(omitted, droppedGroups int, hasOlder bool) string {
+	var parts []string
+	if omitted > 0 {
+		parts = append(parts, fmt.Sprintf("%d earlier entries omitted", omitted))
+	}
+	if droppedGroups > 0 {
+		noun := "sources"
+		if droppedGroups == 1 {
+			noun = "source"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s omitted", droppedGroups, noun))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	note := "_" + strings.Join(parts, " and ") + " to fit the comment size limit"
+	if hasOlder {
+		note += " (older entries also exist)"
+	}
+	return note + "._\n\n"
 }
 
 // formatLogEntryLine renders one log entry in the CLI logs format, minus the
@@ -100,7 +289,7 @@ func RenderRecentFailureLogs(entries []LogEntryData, available int, hasOlder boo
 func formatLogEntryLine(entry LogEntryData) string {
 	line := fmt.Sprintf("%s %s %s",
 		entry.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
-		LogLevelTag(entry.Level),
+		LogLevelTag(sanitizeLogLevel(entry.Level)),
 		sanitizeLogText(entry.Message))
 	if entry.OldState != "" && entry.NewState != "" {
 		line += fmt.Sprintf(" [%s -> %s]", sanitizeLogText(entry.OldState), sanitizeLogText(entry.NewState))
@@ -128,6 +317,22 @@ func sanitizeLogText(text string) string {
 	}
 	text = redactConnectionDetails(text)
 	return text
+}
+
+// maxLogLevelChars bounds an unrecognized level's contribution to a rendered
+// line. A level is a short word; anything longer is a value that does not
+// belong in the column and must not crowd out the message beside it.
+const maxLogLevelChars = 16
+
+// sanitizeLogLevel makes an unrecognized level safe to render in the level
+// column. A level arrives from the same storage as the message and, for a
+// remotely driven apply, crosses the same data-plane boundary, so it is
+// untrusted for the same reasons: a newline would break the one-line-per-entry
+// format and a backtick run would close the fence the level sits inside. The
+// recognized levels map to fixed tags and never reach this, so the cost lands
+// only on a level nothing authored.
+func sanitizeLogLevel(level string) string {
+	return truncateToBytes(sanitizeLogText(level), maxLogLevelChars)
 }
 
 // LogLevelTag returns the bracketed apply-log level indicator without colors:
@@ -198,5 +403,35 @@ func sampleFailureLogEntries(failedTable, failureMessage string) []LogEntryData 
 		{CreatedAt: start.Add(3 * time.Minute), Level: "warn", Message: "Copy throttled by replication lag (1.2s)"},
 		{CreatedAt: start.Add(6 * time.Minute), Level: "error", Message: "Task failed: " + failureMessage},
 		{CreatedAt: start.Add(7 * time.Minute), Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"},
+	}
+}
+
+// sampleRemoteFailureLogEntries returns the control-plane tail of an apply a
+// data plane drove: the same lifecycle as sampleFailureLogEntries, minus the
+// engine lines, which for a remote drive land in the data plane's storage and
+// reach the PR through the engine-logs fold instead. The failure it reports is
+// the sentence SchemaBot wrote for the target's error code, because the
+// target's own words never leave the server log.
+func sampleRemoteFailureLogEntries(failedTable, failureReason string) []LogEntryData {
+	start := sampleTime().Add(-8 * time.Minute)
+	return []LogEntryData{
+		{CreatedAt: start, Level: "info", Message: "Apply dispatched to data plane", OldState: "queued", NewState: "running"},
+		{CreatedAt: start.Add(20 * time.Second), Level: "info", Message: "Task started: schema change on `" + failedTable + "`"},
+		{CreatedAt: start.Add(6 * time.Minute), Level: "error", Message: "Apply failed: " + failureReason, OldState: "running", NewState: "failed"},
+	}
+}
+
+// sampleEngineFailureLogEntries returns the engine's own account of the same
+// failure: the copy it started, the warning the target raised on a row it
+// could not convert, and the abort that followed.
+func sampleEngineFailureLogEntries(failedTable, failedColumn string) []LogEntryData {
+	start := sampleTime().Add(-8 * time.Minute)
+	prefix := "[" + failedTable + "] "
+	return []LogEntryData{
+		{CreatedAt: start.Add(25 * time.Second), Level: "info", Message: prefix + "copy starting: 1466232 rows estimated, 4 threads"},
+		{CreatedAt: start.Add(2 * time.Minute), Level: "info", Message: prefix + "copy progress: 12.4% 181812/1466232 rows, eta 21m"},
+		{CreatedAt: start.Add(5 * time.Minute), Level: "info", Message: prefix + "copy progress: 30.0% 439870/1466232 rows, eta 14m"},
+		{CreatedAt: start.Add(5*time.Minute + 40*time.Second), Level: "warn", Message: prefix + "unsafe warning 1265: Data truncated for column '" + failedColumn + "' at row 1"},
+		{CreatedAt: start.Add(5*time.Minute + 41*time.Second), Level: "error", Message: prefix + "aborting: the copy would change values that are already in the table"},
 	}
 }

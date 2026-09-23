@@ -309,7 +309,9 @@ table, namespace, keyspace, shard, schema path, database, check name — flatten
 delimited past any backtick run inside it (`pkg/webhook/templates/fence.go`, exercised across
 its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`); the Check Run
 summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
-clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handler.go`).
+clamp (`pkg/webhook/plan_drift.go`); the log-text sanitizer applied to every line, level, and
+group heading in the failed-summary log fold (`pkg/webhook/templates/failure_logs.go`); the
+request body limit (`pkg/webhook/handler.go`).
 
 ### AV-9: SchemaBot never destroys its own storage to start
 

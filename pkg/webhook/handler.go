@@ -334,6 +334,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					ApplyLease:     apply.Lease(),
 					SupportChannel: h.supportChannel(),
 					Tenant:         h.deploymentTenant(),
+					EngineLogs:     h.engineLogReader(),
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
 						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
@@ -374,6 +375,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				ApplyID:        apply.ID,
 				SupportChannel: h.supportChannel(),
 				Tenant:         h.deploymentTenant(),
+				EngineLogs:     h.engineLogReader(),
 				Logger:         logger,
 				OnTerminalHook: func(a *storage.Apply) {
 					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
@@ -704,10 +706,19 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			ops = nil
 		}
+		// Everything read from storage is resolved once, before the body is
+		// rendered: summaryWithFailureLogs can render it twice, and a
+		// best-effort read that failed on the second pass would silently drop
+		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
-		summaryBase += controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
-		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
+		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops)
+		vschemaDiffs := resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops)
+		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
+		renderBody := func(apply *storage.Apply) string {
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, vschemaDiffs, h.deploymentTenant())
+			return body + renderControlRejections(rejections, h.logger, apply, body)
+		}
+		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
 	}
 }

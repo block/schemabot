@@ -814,26 +814,34 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr                error
-	planResp                 *ternv1.PlanResponse
-	planErr                  error
-	planReq                  *ternv1.PlanRequest
-	planDiffResp             *ternv1.PlanDiffResponse
-	planDiffErr              error
-	planDiffReq              *ternv1.PlanRequest
-	pullSchemaResp           *ternv1.PullSchemaResponse
-	pullSchemaErr            error
-	pullSchemaReq            *ternv1.PullSchemaRequest
-	pullSchemaReqs           []*ternv1.PullSchemaRequest
-	pullSchemaHook           func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
-	applyResp                *ternv1.ApplyResponse
-	applyErr                 error
-	applyReq                 *ternv1.ApplyRequest
-	progressResp             *ternv1.ProgressResponse
-	progressErr              error
-	progressReq              *ternv1.ProgressRequest
-	logsReqs                 []*ternv1.LogsRequest
-	logsHook                 func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
+	healthErr      error
+	planResp       *ternv1.PlanResponse
+	planErr        error
+	planReq        *ternv1.PlanRequest
+	planDiffResp   *ternv1.PlanDiffResponse
+	planDiffErr    error
+	planDiffReq    *ternv1.PlanRequest
+	pullSchemaResp *ternv1.PullSchemaResponse
+	pullSchemaErr  error
+	pullSchemaReq  *ternv1.PullSchemaRequest
+	pullSchemaReqs []*ternv1.PullSchemaRequest
+	pullSchemaHook func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+	applyResp      *ternv1.ApplyResponse
+	applyErr       error
+	applyReq       *ternv1.ApplyRequest
+	progressResp   *ternv1.ProgressResponse
+	progressErr    error
+	progressReq    *ternv1.ProgressRequest
+	// logsMu guards logsReqs: an apply that fanned out reads its data planes
+	// concurrently, so one client can serve several reads at once.
+	logsMu   sync.Mutex
+	logsReqs []*ternv1.LogsRequest
+	logsHook func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
+	// logsStall, when set, holds every Logs call open until it is closed or
+	// the call's own context expires, so a test can stall a data plane the way
+	// an unreachable one stalls: the call fails on its deadline rather than
+	// running on past it.
+	logsStall                chan struct{}
 	stopResp                 *ternv1.StopResponse
 	stopErr                  error
 	stopReq                  *ternv1.StopRequest // captured request
@@ -904,8 +912,24 @@ func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressReque
 	}
 	return nil, m.progressErr
 }
-func (m *mockTernClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+func (m *mockTernClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	// A real client fails a call made on an expired context rather than
+	// answering it, which is what makes a caller's deadline mean anything.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.logsMu.Lock()
 	m.logsReqs = append(m.logsReqs, req)
+	m.logsMu.Unlock()
+	// A stalled data plane holds the call open until its deadline passes, as a
+	// real one does — it does not keep running after the caller has given up.
+	if m.logsStall != nil {
+		select {
+		case <-m.logsStall:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if m.logsHook != nil {
 		return m.logsHook(req)
 	}

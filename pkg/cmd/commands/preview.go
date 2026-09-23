@@ -121,7 +121,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentSummaryStopped,
 		templates.PreviewCommentSummaryCompletedLarge, templates.PreviewCommentSummaryVitessVSchema,
 		templates.PreviewCommentSummaryVitessVSchemaOnly,
-		templates.PreviewCommentSummaryFailedLarge,
+		templates.PreviewCommentSummaryFailedLarge, templates.PreviewCommentSummaryFailedEngineLogs,
 		templates.PreviewCommentSummaryMultiNSFailed, templates.PreviewCommentSummaryMultiNSCompleted,
 		templates.PreviewCommentAll:
 		templates.PreviewCLIOutput(previewType)

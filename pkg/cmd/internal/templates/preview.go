@@ -195,6 +195,7 @@ const (
 	PreviewCommentSummaryVitessVSchema     PreviewType = "comment_summary_vitess_vschema"      // Summary: completed Vitess DDL + VSchema
 	PreviewCommentSummaryVitessVSchemaOnly PreviewType = "comment_summary_vitess_vschema_only" // Summary: completed Vitess VSchema-only
 	PreviewCommentSummaryFailedLarge       PreviewType = "comment_summary_failed_large"        // Summary: failed (8 tables, rollup)
+	PreviewCommentSummaryFailedEngineLogs  PreviewType = "comment_summary_failed_engine_logs"  // Summary: failed on a data plane, with the engine-logs fold
 	PreviewCommentSummaryMultiNSFailed     PreviewType = "comment_summary_multi_ns_failed"     // Summary: failed (multi-namespace)
 	PreviewCommentSummaryMultiNSCompleted  PreviewType = "comment_summary_multi_ns_completed"  // Summary: completed (multi-namespace)
 	PreviewCommentAll                      PreviewType = "comment_all"                         // Show all comment template previews
