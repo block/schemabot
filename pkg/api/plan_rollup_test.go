@@ -488,6 +488,27 @@ func TestRollupDeploymentDiffs_IndependentUnparseableMemberBlocks(t *testing.T) 
 	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
 	require.Error(t, rollup.Entries[1].Err)
 	assert.Contains(t, rollup.Entries[1].Err.Error(), "not usable")
+	assert.Empty(t, rollup.Entries[1].PlanFingerprint, "a member whose plan could not be read has no key to group it by")
+}
+
+// A mirrored member whose change content will not parse under the reviewed
+// plan's grammar blocks on that content, and carries neither a key nor a plan:
+// the comparison it would have taken part in never happened, so grouping or
+// rendering it would show work nobody could read.
+func TestRollupDeploymentDiffs_UnreadableMirroredMemberCarriesNoPlan(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
+		rollupDeployment("au", rollupAlterUsers("this is not valid DDL at all")),
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+	require.NoError(t, err)
+	assert.False(t, rollup.Clean)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+	assert.Contains(t, rollup.Entries[1].Err.Error(), "not usable")
+	assert.Empty(t, rollup.Entries[1].PlanFingerprint)
+	assert.Empty(t, rollup.Entries[1].ChangeSet.Changes)
+	assert.NotEmpty(t, rollup.Entries[0].PlanFingerprint, "the reviewed primary is still readable and still keyed")
 }
 
 // Every member that classified carries the plan it would run and a key for it,

@@ -56,51 +56,89 @@ func (d ChangeSetDiff) Empty() bool {
 		len(d.UnexpectedVSchema) == 0
 }
 
-// CompareChangeSets reports how candidate differs from baseline, comparing table
-// DDL by canonicalized form and vschema by per-namespace parity. The dialect
-// selects the grammar both change sets are classified and canonicalized with,
-// so a PostgreSQL deployment's DDL is never judged by the MySQL parser; both
-// sides of a comparison are always the same dialect, since comparing DDL
-// canonicalized under different grammars proves nothing.
+// CanonicalChangeSet is a change set reduced to the form every question about it
+// is actually answered from: the multiset of table DDL changes keyed by their
+// canonicalized text, and the set of namespaces whose vschema changes. Parsing
+// and canonicalizing the DDL is the expensive part of comparing or keying a
+// change set, so a caller with more than one question to ask canonicalizes once
+// and asks them of the result.
+//
+// It remembers the dialect it was canonicalized under, because its content only
+// means what it means under that grammar. The zero value is not a canonicalized
+// change set and is not a change set that plans nothing: it carries no dialect,
+// so CompareTo refuses it and Fingerprint keys it apart from every change set
+// Canonicalize produced.
+type CanonicalChangeSet struct {
+	dialect schema.Dialect
+	changes driftChangeMultiset
+	vschema map[string]bool
+}
+
+// Canonicalize reduces a change set to the form comparisons and grouping keys
+// are built from. The dialect selects the grammar the statements are classified
+// and canonicalized with, so a PostgreSQL deployment's DDL is never judged by
+// the MySQL parser.
 //
 // It fails closed: an unregistered dialect, malformed proto (nil entries, empty
 // shard/table names, a vschema change carrying table DDL, an inconsistent
 // sharded/non-sharded shape) and DDL that cannot be canonicalized (unparseable,
 // multi-statement, or non-DDL) return an error, so a caller can treat the
-// deployment as blocking rather than mistake a comparison it could not perform
-// for agreement.
-func CompareChangeSets(dialect schema.Dialect, baseline, candidate ChangeSet) (ChangeSetDiff, error) {
+// deployment as blocking rather than mistake a change set it could not read for
+// one that agrees with another.
+func Canonicalize(dialect schema.Dialect, cs ChangeSet) (CanonicalChangeSet, error) {
 	parser, err := ddl.ParserForDialect(dialect)
 	if err != nil {
-		return ChangeSetDiff{}, err
+		return CanonicalChangeSet{}, err
 	}
-	baseMS, baseVS, err := changeSetMultiset(parser, baseline)
+	return canonicalizeWith(dialect, parser, cs)
+}
+
+// canonicalizeWith is Canonicalize with the dialect's parser already resolved,
+// so a caller canonicalizing several change sets under one dialect resolves it
+// once and keeps an unregistered dialect reportable as its own cause rather than
+// as a failure of whichever change set happened to be read first.
+func canonicalizeWith(dialect schema.Dialect, parser ddl.StatementParser, cs ChangeSet) (CanonicalChangeSet, error) {
+	ms, vschema, err := changeSetMultiset(parser, cs)
 	if err != nil {
-		return ChangeSetDiff{}, fmt.Errorf("baseline change set: %w", err)
+		return CanonicalChangeSet{}, err
 	}
-	candMS, candVS, err := changeSetMultiset(parser, candidate)
-	if err != nil {
-		return ChangeSetDiff{}, fmt.Errorf("candidate change set: %w", err)
+	return CanonicalChangeSet{dialect: dialect, changes: ms, vschema: vschema}, nil
+}
+
+// CompareTo reports how candidate differs from the receiver, which is the
+// baseline: table DDL by canonicalized form, vschema by per-namespace parity.
+// Both sides are already canonicalized, so it parses nothing.
+//
+// Both sides must have been canonicalized under the same dialect. DDL
+// canonicalized under different grammars proves nothing about agreement — and
+// the zero value was canonicalized under none — so a mismatched pair is an
+// error rather than a diff a caller would read as drift or as a match.
+func (c CanonicalChangeSet) CompareTo(candidate CanonicalChangeSet) (ChangeSetDiff, error) {
+	if c.dialect != candidate.dialect {
+		return ChangeSetDiff{}, fmt.Errorf("cannot compare a change set canonicalized as dialect %q to one canonicalized as dialect %q", c.dialect, candidate.dialect)
+	}
+	if c.dialect == "" {
+		return ChangeSetDiff{}, fmt.Errorf("change set carries no dialect; it was never canonicalized")
 	}
 
 	diff := ChangeSetDiff{}
-	for key, want := range baseMS {
-		if candMS[key] < want {
+	for key, want := range c.changes {
+		if candidate.changes[key] < want {
 			diff.MissingFromCandidate = append(diff.MissingFromCandidate, itemFromDriftKey(key))
 		}
 	}
-	for key, have := range candMS {
-		if have > baseMS[key] {
+	for key, have := range candidate.changes {
+		if have > c.changes[key] {
 			diff.UnexpectedInCandidate = append(diff.UnexpectedInCandidate, itemFromDriftKey(key))
 		}
 	}
-	for ns := range baseVS {
-		if !candVS[ns] {
+	for ns := range c.vschema {
+		if !candidate.vschema[ns] {
 			diff.MissingVSchema = append(diff.MissingVSchema, ns)
 		}
 	}
-	for ns := range candVS {
-		if !baseVS[ns] {
+	for ns := range candidate.vschema {
+		if !c.vschema[ns] {
 			diff.UnexpectedVSchema = append(diff.UnexpectedVSchema, ns)
 		}
 	}
@@ -110,6 +148,31 @@ func CompareChangeSets(dialect schema.Dialect, baseline, candidate ChangeSet) (C
 	sort.Strings(diff.MissingVSchema)
 	sort.Strings(diff.UnexpectedVSchema)
 	return diff, nil
+}
+
+// CompareChangeSets reports how candidate differs from baseline, canonicalizing
+// both under the dialect's grammar and comparing the results. Both sides of a
+// comparison are always the same dialect, since comparing DDL canonicalized
+// under different grammars proves nothing.
+//
+// It is the one-shot form of Canonicalize plus CompareTo, and fails closed on
+// everything they do. A caller that also needs a grouping key for either side,
+// or that compares one baseline to several candidates, should canonicalize once
+// and compare the values instead of parsing the same change set again here.
+func CompareChangeSets(dialect schema.Dialect, baseline, candidate ChangeSet) (ChangeSetDiff, error) {
+	parser, err := ddl.ParserForDialect(dialect)
+	if err != nil {
+		return ChangeSetDiff{}, err
+	}
+	base, err := canonicalizeWith(dialect, parser, baseline)
+	if err != nil {
+		return ChangeSetDiff{}, fmt.Errorf("baseline change set: %w", err)
+	}
+	cand, err := canonicalizeWith(dialect, parser, candidate)
+	if err != nil {
+		return ChangeSetDiff{}, fmt.Errorf("candidate change set: %w", err)
+	}
+	return base.CompareTo(cand)
 }
 
 // changeSetMultiset builds the table DDL multiset and the set of vschema-changed
