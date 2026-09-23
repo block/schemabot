@@ -1279,10 +1279,12 @@ func (c *DirectExecutionConfig) Validate(context string) error {
 }
 
 // EngineMetadata resolves the policy into the engine metadata keys a
-// data-plane client forwards with request credentials. Returns nil when the
-// policy is absent or disabled. Every client assembly path must build its
-// direct-execution metadata here, so the forwarded keys and fields cannot
-// drift between paths.
+// data-plane client forwards with request credentials. An absent policy
+// renders nothing; a configured block that is disabled renders the enabled
+// key as false, so a consumer can tell an opt-out from a configuration that
+// said nothing and does not overlay a server-wide grant onto it. Every client
+// assembly path must build its direct execution metadata here, so the
+// forwarded keys and fields cannot drift between paths.
 func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
 	policy, err := c.Policy()
 	if err != nil {
