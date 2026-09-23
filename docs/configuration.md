@@ -650,11 +650,29 @@ local-mode MySQL and `cleanup_enabled: true`.
 For MySQL databases executed by the Spirit engine, some ALTER statements are
 deterministically refused by the engine — for example dropping a primary key or
 adding a foreign key, which its online copy cannot preserve. By default those
-statements block the apply. The per-database-environment `direct_execution`
-policy lets a refused statement instead run verbatim as native MySQL DDL when
-the target table is small enough. See
-[Direct Execution](direct-execution.md) for how routing works and what other
-engines need to adopt it:
+statements block the apply. The `direct_execution` policy lets a refused
+statement instead run verbatim as native MySQL DDL when the target table is
+small enough. See [Direct Execution](direct-execution.md) for how routing
+works and what other engines need to adopt it.
+
+Set it at the top level of the server config to state one policy for every
+MySQL database the server drives:
+
+```yaml
+direct_execution:
+  enabled: true           # default: false
+  max_table_rows: 100000  # required (positive) when enabled
+  lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
+```
+
+This is the only way to state a policy for a database a data-plane server
+resolves through its `target_resolver`: those targets are addressed by an
+opaque identifier and have no `databases` entry to carry a policy of their
+own. It is also the form to reach for on a fleet — a per-database block for
+every database is the same policy written many times, and each copy is one
+more place for the row bound to drift.
+
+A database environment may override the server-wide policy:
 
 ```yaml
 databases:
@@ -664,10 +682,15 @@ databases:
       staging:
         dsn: "file:/run/secrets/payments-staging-dsn"
         direct_execution:
-          enabled: true           # default: false
-          max_table_rows: 100000  # required (positive) when enabled
-          lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
+          enabled: true
+          max_table_rows: 1000
 ```
+
+An override replaces the server-wide policy whole rather than merging into
+it, so an environment that enables direct execution always states the bound
+it runs under, and `enabled: false` is a complete opt out. A resolved target
+whose own connection metadata carries any direct execution key is treated the
+same way: it states the whole policy, and the server-wide one does not apply.
 
 A direct statement is synchronous, blocks writes to the table while it runs,
 and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
@@ -690,11 +713,17 @@ apply fails fast with a retryable "table is busy" error instead. Lower it for
 environments where even a short stall is unacceptable; the value must be a
 whole number of seconds (at least `1s`).
 
-Config validation fails at startup when a `direct_execution` block — even a
-disabled one — is set on a non-MySQL database, when the policy is enabled
-without a positive `max_table_rows`, or when `lock_acquisition_timeout` is malformed
-(not a duration, under a second, or not whole seconds). A policy that can
-never take effect is never silently carried in config.
+Config validation fails at startup when a per-database `direct_execution`
+block — even a disabled one — is set on a non-MySQL database, when a policy is
+enabled without a positive `max_table_rows`, or when
+`lock_acquisition_timeout` is malformed (not a duration, under a second, or
+not whole seconds). A per-database policy that can never take effect is never
+silently carried in config.
+
+The server-wide policy is held to the same shape rules but is not rejected
+alongside other engines: it names no database type, so a server that drives
+MySQL and PostgreSQL can state one policy, and it reaches only the engines
+that consume it.
 
 ## Storage Dialect
 

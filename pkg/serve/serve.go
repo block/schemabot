@@ -31,6 +31,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/drain"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/inventory"
@@ -1197,7 +1198,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
-	metadata, err := envConfig.DirectExecution.EngineMetadata()
+	metadata, err := config.DirectExecutionMetadata(&envConfig, dbConfig.Type)
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct_execution metadata for %s/%s: %w", dbName, env, err)
 	}
@@ -1215,33 +1216,19 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 }
 
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level
-// policy (pending drops) and the embedder-supplied engine factories to every
-// LocalClient the data plane builds, so the router and single-database paths
-// share identical execution semantics and can resolve custom database types.
+// policy (pending drops, direct execution) and the embedder-supplied engine
+// factories to every LocalClient the data plane builds, so the router and
+// single-database paths share identical execution semantics and can resolve
+// custom database types.
 func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string), engineFactories map[string]tern.EngineFactory) tern.LocalClientFactory {
-	pendingDrops := strconv.FormatBool(config.PendingDropsEnabled())
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
-		spiritMetadata, err := config.SpiritMetadata()
+		metadata, err := serverEngineMetadata(config, cfg.Metadata, cfg.Type)
 		if err != nil {
-			return nil, fmt.Errorf("resolve spirit config for database %q: %w", cfg.Database, err)
+			return nil, fmt.Errorf("resolve server policy for database %q: %w", cfg.Database, err)
 		}
-		if cfg.Metadata == nil {
-			cfg.Metadata = map[string]string{}
-		}
+		cfg.Metadata = metadata
 		cfg.PostgresNativeSafeTableSizeLimitBytes = config.Postgres.NativeSafeTableSizeLimit()
 		cfg.PostgresConcurrentIndexMaxDuration = config.Postgres.ConcurrentIndexMaxDurationOrDefault()
-		// Stated either way rather than only when disabled: a data plane that
-		// predates the opt-in default reads an absent key as "quarantine", so
-		// leaving it out during a rolling deploy would quarantine on a
-		// deployment that has turned the quarantine off.
-		cfg.Metadata["pending_drops"] = pendingDrops
-		// Server-level spirit overrides are defaults; a database's own
-		// metadata entry for the same key wins.
-		for key, value := range spiritMetadata {
-			if _, ok := cfg.Metadata[key]; !ok {
-				cfg.Metadata[key] = value
-			}
-		}
 		if cfg.WakeOperator == nil {
 			cfg.WakeOperator = wakeOperator
 		}
@@ -1257,6 +1244,61 @@ func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIde
 		}
 		return tern.NewLocalClient(cfg, st, logger)
 	}
+}
+
+// serverEngineMetadata composes the engine metadata a data-plane LocalClient
+// runs under: the resolved target's own metadata, overlaid with this server's
+// pending drops, Spirit, and direct execution policy. It returns a new map so
+// the caller's is never mutated.
+func serverEngineMetadata(config *api.ServerConfig, resolved map[string]string, databaseType string) (map[string]string, error) {
+	spiritMetadata, err := config.SpiritMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve spirit config: %w", err)
+	}
+	directMetadata, err := config.DirectExecutionMetadata(nil, databaseType)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution config: %w", err)
+	}
+	metadata := maps.Clone(resolved)
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	// Stated either way rather than only when disabled: a data plane that
+	// predates the opt-in default reads an absent key as "quarantine", so
+	// leaving it out during a rolling deploy would quarantine on a deployment
+	// that has turned the quarantine off.
+	metadata["pending_drops"] = strconv.FormatBool(config.PendingDropsEnabled())
+	// Server-level spirit overrides are defaults; a database's own metadata
+	// entry for the same key wins.
+	for key, value := range spiritMetadata {
+		if _, ok := metadata[key]; !ok {
+			metadata[key] = value
+		}
+	}
+	// The direct execution keys are one policy, not three independent
+	// defaults: a resolved target that states any of them states the whole
+	// policy, and the server-wide one does not apply. Merging key by key
+	// would let a target enable direct execution while taking its row bound
+	// from somewhere else, which is the pairing the bound exists to prevent.
+	if !hasDirectExecutionPolicy(metadata) {
+		maps.Copy(metadata, directMetadata)
+	}
+	return metadata, nil
+}
+
+// hasDirectExecutionPolicy reports whether resolved target metadata already
+// states a direct execution policy of its own.
+func hasDirectExecutionPolicy(metadata map[string]string) bool {
+	for _, key := range []string{
+		engine.MetadataDirectExecution,
+		engine.MetadataDirectExecutionMaxTableRows,
+		engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
+	} {
+		if _, ok := metadata[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {

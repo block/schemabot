@@ -146,3 +146,77 @@ func TestGRPCLocalClientFactoryFailsClosedForUnregisteredType(t *testing.T) {
 	assert.ErrorContains(t, err, "no engine registered",
 		"a custom database type with no registered engine must fail closed")
 }
+
+// A server-wide direct execution policy reaches every MySQL target the data
+// plane resolves per request, which is the only way those targets can carry
+// one: they are resolved from an opaque identifier and have no per-database
+// registration on this server to state a policy in.
+func TestServerEngineMetadataAppliesServerDirectExecutionPolicy(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},
+	}
+
+	metadata, err := serverEngineMetadata(config, map[string]string{"organization": "acme"}, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.Equal(t, "true", metadata[engine.MetadataDirectExecution])
+	assert.Equal(t, "10000", metadata[engine.MetadataDirectExecutionMaxTableRows])
+	assert.Equal(t, "10", metadata[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds])
+	assert.Equal(t, "acme", metadata["organization"], "the resolved target's own metadata survives the overlay")
+}
+
+// A resolved target that states any part of a direct execution policy states
+// all of it: the server-wide policy is not merged in alongside, so the target
+// can never enable direct execution under a row bound configured elsewhere.
+func TestServerEngineMetadataLeavesATargetsOwnDirectExecutionPolicyWhole(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},
+	}
+	resolved := map[string]string{engine.MetadataDirectExecution: "true"}
+
+	metadata, err := serverEngineMetadata(config, resolved, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.Equal(t, "true", metadata[engine.MetadataDirectExecution])
+	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows,
+		"a target stating its own policy must not inherit the server-wide row bound; the engine blocks a bound-less grant")
+	assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds)
+}
+
+// With no policy configured, no direct execution key reaches the engine and
+// refused statements stay blocked.
+func TestServerEngineMetadataOmitsDirectExecutionByDefault(t *testing.T) {
+	metadata, err := serverEngineMetadata(&api.ServerConfig{}, nil, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.NotContains(t, metadata, engine.MetadataDirectExecution)
+	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows)
+}
+
+// The server-wide policy reaches only the engines that consume it, so a
+// deployment that drives MySQL alongside other engines can state one policy
+// without handing keys to engines that would ignore them.
+func TestServerEngineMetadataSkipsDirectExecutionForOtherEngines(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+	}
+
+	metadata, err := serverEngineMetadata(config, nil, storage.DatabaseTypeVitess)
+
+	require.NoError(t, err)
+	assert.NotContains(t, metadata, engine.MetadataDirectExecution)
+}
+
+// Composing the metadata never mutates the resolved target's map, which the
+// router clones per request from its cached inventory entry.
+func TestServerEngineMetadataDoesNotMutateResolvedMetadata(t *testing.T) {
+	config := &api.ServerConfig{
+		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+	}
+	resolved := map[string]string{"organization": "acme"}
+
+	_, err := serverEngineMetadata(config, resolved, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"organization": "acme"}, resolved)
+}

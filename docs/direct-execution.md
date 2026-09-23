@@ -41,14 +41,17 @@ the engine applies a short default when it is not set.
 
 ## Routing
 
-The policy is configured per database environment (see
-[Configuration → Direct Execution](configuration.md#direct-execution)). At
-plan time, each engine-refused statement is resolved against it, and the plan
-records a per-table execution-mode verdict:
+The policy is configured server-wide, and a database environment may override
+it (see [Configuration → Direct Execution](configuration.md#direct-execution)).
+A server-wide policy is what a data-plane server states, because the targets it
+resolves through its `target_resolver` are addressed by an opaque identifier
+and carry no per-database registration to state a policy in. At plan time,
+each engine-refused statement is resolved against the policy in force, and the
+plan records a per-table execution-mode verdict:
 
 ```diagram
 engine refuses statement (e.g. primary-key reshape)
-        │ direct_execution policy for this database/environment?
+        │ direct_execution policy in force for this database/environment?
         ├─ absent or disabled ───────────────► blocked
         ├─ table row count unavailable ──────► blocked
         ├─ estimated rows > max_table_rows ──► blocked
@@ -69,7 +72,14 @@ apply is rejected up front with the engine's refusal reason.
 `max_table_rows` is the blast-radius cap. How long writes stay blocked during
 native DDL is roughly proportional to table size, so the bound expresses "only
 run this on tables small enough that the write outage is acceptable" — and the
-operator enabling the policy decides what that means per environment.
+operator enabling the policy decides what that means for the fleet, or for one
+environment that overrides it.
+
+The bound travels with the grant. An override states its own
+`max_table_rows` rather than inheriting one, because a policy assembled from
+two sources can enable direct execution in one place under a bound written in
+another — and the bound is the only thing standing between a refused
+statement and an unbounded write outage.
 
 The gate runs in two steps. The first reads `information_schema` `TABLE_ROWS`,
 the InnoDB optimizer's sampled estimate, with statistics caching disabled
@@ -98,9 +108,11 @@ reshaping any shared surface:
 - **The PR workflow** keys purely off the execution mode recorded on table
   changes and aggregates across shards, so any engine that emits a `direct`
   verdict inherits the same disclosure and consent UX with no webhook changes.
-- **Config validation is the opt-in gate.** A `direct_execution` block is only
-  accepted on databases whose engine implements routing; on any other engine
-  it fails at startup rather than being silently ignored.
+- **Config validation is the opt-in gate.** A per-database `direct_execution`
+  block is only accepted on databases whose engine implements routing; on any
+  other engine it fails at startup rather than being silently ignored. The
+  server-wide policy names no database type, so it is accepted alongside every
+  engine and reaches only the ones that consume it.
 
 An engine that adopts direct execution owns three pieces: its **refusal
 detector** (which statements it deterministically cannot run), its **size

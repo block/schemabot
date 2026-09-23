@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
@@ -1296,6 +1297,129 @@ func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 			require.NoError(t, cfg.Validate())
 		})
 	}
+}
+
+// The server-wide policy is held to the same shape rules as a per-database
+// block: enabling it without a row bound, or with a lock timeout that cannot
+// be applied with second granularity, fails startup.
+func TestServerConfig_ValidateRejectsMalformedServerDirectExecution(t *testing.T) {
+	for name, tc := range map[string]struct {
+		direct  *DirectExecutionConfig
+		wantErr string
+	}{
+		"enabled without bound":    {&DirectExecutionConfig{Enabled: true}, "a positive bound is required"},
+		"negative bound":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: -1}, "a positive bound is required"},
+		"sub-second lock timeout":  {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
+		"malformed while disabled": {&DirectExecutionConfig{LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				DirectExecution: tc.direct,
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Contains(t, err.Error(), "server config")
+		})
+	}
+}
+
+// A server-wide policy coexists with databases whose engine cannot honor it.
+// Unlike a per-database block — which is rejected on a non-MySQL database so
+// a deliberate grant is never silently ignored — the server-wide policy
+// states a fleet default and simply never reaches those engines.
+func TestServerConfig_ValidateAcceptsServerDirectExecutionAlongsideOtherEngines(t *testing.T) {
+	cfg := ServerConfig{
+		DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type:         "mysql",
+				Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+			},
+			"shardeddb": {
+				Type:         "vitess",
+				Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/shardeddb"}},
+			},
+		},
+	}
+
+	require.NoError(t, cfg.Validate())
+}
+
+// The server-wide policy reaches every MySQL database the server drives,
+// including one a data plane resolves per request with no registration of its
+// own, and reaches no engine that cannot honor it.
+func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
+	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}
+	cfg := ServerConfig{DirectExecution: serverPolicy}
+
+	t.Run("registered mysql database", func(t *testing.T) {
+		assert.Same(t, serverPolicy, cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("unregistered database resolved per request", func(t *testing.T) {
+		assert.Same(t, serverPolicy, cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		assert.Nil(t, cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeVitess))
+	})
+
+	t.Run("metadata carries the whole policy", func(t *testing.T) {
+		metadata, err := cfg.DirectExecutionMetadata(nil, storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			engine.MetadataDirectExecution:                              "true",
+			engine.MetadataDirectExecutionMaxTableRows:                  "10000",
+			engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds: "10",
+		}, metadata)
+	})
+}
+
+// A database environment's own block replaces the server-wide policy whole
+// rather than merging into it, so an override can neither inherit a row bound
+// it does not state nor be overruled when it opts out.
+func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *testing.T) {
+	cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}}
+
+	t.Run("override states its own bound", func(t *testing.T) {
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 50}}
+
+		metadata, err := cfg.DirectExecutionMetadata(envConfig, storage.DatabaseTypeMySQL)
+
+		require.NoError(t, err)
+		assert.Equal(t, "50", metadata[engine.MetadataDirectExecutionMaxTableRows])
+		assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
+			"the server policy's lock timeout must not leak into an override that states none")
+	})
+
+	t.Run("override opts out", func(t *testing.T) {
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+
+		metadata, err := cfg.DirectExecutionMetadata(envConfig, storage.DatabaseTypeMySQL)
+
+		require.NoError(t, err)
+		assert.Empty(t, metadata)
+	})
+}
+
+// With no policy configured anywhere, refused statements stay blocked: the
+// engine metadata carries no direct execution keys at all.
+func TestServerConfig_ResolveDirectExecutionDefaultsToBlocked(t *testing.T) {
+	cfg := ServerConfig{}
+
+	metadata, err := cfg.DirectExecutionMetadata(&EnvironmentConfig{}, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.Empty(t, metadata)
 }
 
 // A well-formed revert_window_duration parses to the configured window.
