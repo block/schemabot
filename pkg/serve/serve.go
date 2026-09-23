@@ -23,7 +23,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/block/mysql"
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"google.golang.org/grpc"
@@ -891,7 +891,10 @@ func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig, 
 	switch dialect {
 	case schema.DialectMySQL:
 		return mysqlconn.OpenReloadable(dsn, reload,
-			mysqlconn.WithConnectTimeout(connectTimeout))
+			mysqlconn.WithConnectTimeout(connectTimeout),
+			// Stored plans, locks, and applies scan timestamps into time.Time.
+			// This is a storage requirement, including after credential reload.
+			func(cfg *mysql.Config) { cfg.ParseTime = true })
 	case schema.DialectPostgres:
 		// The storage pool carries a statement budget of its own so steady-state
 		// storage queries run under a value SchemaBot states rather than
