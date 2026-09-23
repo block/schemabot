@@ -45,27 +45,24 @@ func TestAwaitingCompletionSelectsOnlyPostponedShards(t *testing.T) {
 
 func allKeyspacesKnown(string) bool { return true }
 
-// A schema change on a sharded keyspace runs once per shard and reports one row
-// per shard, all carrying the same UUID. Each row is one shard's piece of the
-// work and has to resolve to its own target: grouping by keyspace alone leaves
-// two sends addressed at the whole keyspace, and since vtgate scatters each of
-// them, every shard receives the statement twice.
-func TestGroupMigrationsByShardAddressesEveryShard(t *testing.T) {
+// A schema change on a sharded keyspace runs once per shard and reports one
+// row per shard, all carrying the same UUID. One statement addressed at the
+// keyspace cuts every shard over, so the rows collapse to that one UUID:
+// sending one statement per row would have vtgate scatter each of them, and
+// every shard would receive the statement once per shard of the keyspace.
+func TestDistinctMigrationsByKeyspaceSendsOneStatementPerSchemaChange(t *testing.T) {
 	migrations := []map[string]string{
 		migrationRow("testapp_sharded", "-80", "abc"),
 		migrationRow("testapp_sharded", "80-", "abc"),
 	}
 
-	targets, err := groupMigrationsByShard(migrations, "ctx", allKeyspacesKnown, quietLogger())
+	byKeyspace, err := distinctMigrationsByKeyspace(migrations, "ctx", allKeyspacesKnown, quietLogger())
 	require.NoError(t, err)
 
-	assert.Equal(t, map[migrationTarget][]string{
-		{keyspace: "testapp_sharded", shard: "-80"}: {"abc"},
-		{keyspace: "testapp_sharded", shard: "80-"}: {"abc"},
-	}, targets)
+	assert.Equal(t, map[string][]string{"testapp_sharded": {"abc"}}, byKeyspace)
 }
 
-func TestGroupMigrationsByShardKeepsKeyspacesApart(t *testing.T) {
+func TestDistinctMigrationsByKeyspaceKeepsKeyspacesApart(t *testing.T) {
 	migrations := []map[string]string{
 		migrationRow("testapp", "0", "one"),
 		migrationRow("testapp_sharded", "-80", "two"),
@@ -73,20 +70,19 @@ func TestGroupMigrationsByShardKeepsKeyspacesApart(t *testing.T) {
 		migrationRow("testapp_sharded", "-80", "three"),
 	}
 
-	targets, err := groupMigrationsByShard(migrations, "ctx", allKeyspacesKnown, quietLogger())
+	byKeyspace, err := distinctMigrationsByKeyspace(migrations, "ctx", allKeyspacesKnown, quietLogger())
 	require.NoError(t, err)
 
-	assert.Equal(t, map[migrationTarget][]string{
-		{keyspace: "testapp", shard: "0"}:           {"one"},
-		{keyspace: "testapp_sharded", shard: "-80"}: {"two", "three"},
-		{keyspace: "testapp_sharded", shard: "80-"}: {"two"},
-	}, targets)
+	assert.Equal(t, map[string][]string{
+		"testapp":         {"one"},
+		"testapp_sharded": {"two", "three"},
+	}, byKeyspace)
 }
 
 // A row that cannot be addressed stops the whole operation. Acting on the rows
-// around it would complete some shards of a cutover and abandon the one whose
+// around it would cut some schema changes over and abandon the one whose
 // address was unreadable, which is the state this addressing exists to avoid.
-func TestGroupMigrationsByShardRejectsUnaddressableRows(t *testing.T) {
+func TestDistinctMigrationsByKeyspaceRejectsUnaddressableRows(t *testing.T) {
 	tests := []struct {
 		name string
 		row  map[string]string
@@ -94,16 +90,15 @@ func TestGroupMigrationsByShardRejectsUnaddressableRows(t *testing.T) {
 	}{
 		{"no uuid", migrationRow("testapp_sharded", "-80", ""), "missing uuid"},
 		{"no keyspace", migrationRow("", "-80", "abc"), "missing keyspace"},
-		{"no shard", migrationRow("testapp_sharded", "", "abc"), "missing shard"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			targets, err := groupMigrationsByShard(
+			byKeyspace, err := distinctMigrationsByKeyspace(
 				[]map[string]string{migrationRow("testapp", "0", "fine"), tt.row},
 				"ctx", allKeyspacesKnown, quietLogger())
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.want)
-			assert.Nil(t, targets, "no target may be returned alongside an error, or the caller acts on a subset")
+			assert.Nil(t, byKeyspace, "no target may be returned alongside an error, or the caller acts on a subset")
 		})
 	}
 }
@@ -111,7 +106,7 @@ func TestGroupMigrationsByShardRejectsUnaddressableRows(t *testing.T) {
 // A row SchemaBot cannot act on is dropped rather than failing the operation:
 // it belongs to a keyspace this backend does not serve, or carries a UUID that
 // would not be safe to interpolate into the statement.
-func TestGroupMigrationsByShardDropsRowsItCannotActOn(t *testing.T) {
+func TestDistinctMigrationsByKeyspaceDropsRowsItCannotActOn(t *testing.T) {
 	migrations := []map[string]string{
 		migrationRow("testapp", "0", "keep"),
 		migrationRow("elsewhere", "0", "other-keyspace"),
@@ -119,12 +114,10 @@ func TestGroupMigrationsByShardDropsRowsItCannotActOn(t *testing.T) {
 	}
 	known := func(keyspace string) bool { return keyspace == "testapp" }
 
-	targets, err := groupMigrationsByShard(migrations, "ctx", known, quietLogger())
+	byKeyspace, err := distinctMigrationsByKeyspace(migrations, "ctx", known, quietLogger())
 	require.NoError(t, err)
 
-	assert.Equal(t, map[migrationTarget][]string{
-		{keyspace: "testapp", shard: "0"}: {"keep"},
-	}, targets)
+	assert.Equal(t, map[string][]string{"testapp": {"keep"}}, byKeyspace)
 }
 
 // A cancel resolves on its deadline whether or not the engine ever answers.

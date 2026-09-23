@@ -365,13 +365,6 @@ const (
 	migrationActionComplete = "COMPLETE"
 )
 
-// migrationTarget is the shard a row belongs to. A single schema change runs
-// once per shard of its keyspace, so the shard is part of its address.
-type migrationTarget struct {
-	keyspace string
-	shard    string
-}
-
 // awaitingCompletion reports whether a row still has to be told to cut over.
 // Vitess clears postpone_completion the moment it accepts a COMPLETE, so a row
 // that is no longer postponed is already cutting over or already done.
@@ -390,38 +383,34 @@ func filterMigrations(migrations []map[string]string, keep func(map[string]strin
 	return kept
 }
 
-// groupMigrationsByShard addresses each row to the shard that runs it. One
-// schema change appears once per shard of its keyspace, so grouping by
-// keyspace alone both loses the address and repeats the UUID once per shard.
+// distinctMigrationsByKeyspace reduces the rows to the distinct schema changes
+// of each keyspace. SHOW VITESS_MIGRATIONS reports a schema change once per
+// shard, and all of those rows carry the same UUID, so a statement addressed
+// at the keyspace covers every one of them.
 //
 // known reports whether a keyspace belongs to this backend; rows for any other
 // keyspace, and rows whose UUID would not be safe to interpolate, are dropped
 // with a warning. A row missing an identifier is an error: it cannot be
 // addressed at all, and acting on the rest would half-apply the operation.
-func groupMigrationsByShard(
+func distinctMigrationsByKeyspace(
 	migrations []map[string]string,
 	migrationContext string,
 	known func(keyspace string) bool,
 	logger *slog.Logger,
-) (map[migrationTarget][]string, error) {
-	targets := make(map[migrationTarget][]string)
+) (map[string][]string, error) {
+	byKeyspace := make(map[string][]string)
+	seen := make(map[string]bool)
 	for _, m := range migrations {
 		uuid := m["migration_uuid"]
 		keyspace := m["_keyspace"]
-		shard := m["shard"]
 		if uuid == "" {
-			err := fmt.Errorf("schema change for context %s is missing uuid: keyspace=%q shard=%q", migrationContext, keyspace, shard)
-			logger.Warn("schema change control will fail because a row is missing its uuid", "keyspace", keyspace, "shard", shard, "error", err)
+			err := fmt.Errorf("schema change for context %s is missing uuid: keyspace=%q", migrationContext, keyspace)
+			logger.Warn("schema change control will fail because a row is missing its uuid", "keyspace", keyspace, "error", err)
 			return nil, err
 		}
 		if keyspace == "" {
-			err := fmt.Errorf("schema change for context %s is missing keyspace: uuid=%q shard=%q", migrationContext, uuid, shard)
-			logger.Warn("schema change control will fail because a row is missing its keyspace", "uuid", uuid, "shard", shard, "error", err)
-			return nil, err
-		}
-		if shard == "" {
-			err := fmt.Errorf("schema change for context %s is missing shard: uuid=%q keyspace=%q", migrationContext, uuid, keyspace)
-			logger.Warn("schema change control will fail because a row is missing its shard", "uuid", uuid, "keyspace", keyspace, "error", err)
+			err := fmt.Errorf("schema change for context %s is missing keyspace: uuid=%q", migrationContext, uuid)
+			logger.Warn("schema change control will fail because a row is missing its keyspace", "uuid", uuid, "error", err)
 			return nil, err
 		}
 		if err := validateSessionString(uuid); err != nil {
@@ -432,35 +421,38 @@ func groupMigrationsByShard(
 			logger.Warn("unknown keyspace for schema change", "uuid", uuid, "keyspace", keyspace)
 			continue
 		}
-		target := migrationTarget{keyspace: keyspace, shard: shard}
-		targets[target] = append(targets[target], uuid)
+		if seen[keyspace+"/"+uuid] {
+			continue
+		}
+		seen[keyspace+"/"+uuid] = true
+		byKeyspace[keyspace] = append(byKeyspace[keyspace], uuid)
 	}
-	return targets, nil
+	return byKeyspace, nil
 }
 
-// alterVitessMigrations runs ALTER VITESS_MIGRATION '<uuid>' <action> once
-// against each shard that is still waiting for it.
+// alterVitessMigrations runs ALTER VITESS_MIGRATION '<uuid>' <action> once per
+// schema change, on a keyspace-scoped connection. vtgate scatters it from
+// there, so every shard of the keyspace acts on it together: a cutover is one
+// command for the whole keyspace, not one command per shard.
 //
-// Delivering the statement exactly once per shard is the point. On a
-// keyspace-scoped connection vtgate scatters it to every shard, while
-// SHOW VITESS_MIGRATIONS reports a schema change once per shard, so issuing it
-// per row would send it to each shard as many times as the keyspace has
-// shards. A duplicate that lands while a shard is cutting over contends with
-// the cutover holding that shard's tables locked, and the two sit on each
-// other until the cutover's deadline — leaving the deploy request in
-// in_progress_cutover. A shard-targeted connection keeps the statement to the
-// one shard whose row called for it.
+// SHOW VITESS_MIGRATIONS reports a schema change once per shard, and all those
+// rows carry the same UUID, so they are reduced to the distinct UUIDs first.
+// Issuing the statement per row would send it to each shard as many times as
+// the keyspace has shards, and a duplicate that lands while a shard is cutting
+// over contends with the cutover holding that shard's tables locked — the two
+// sit on each other until the cutover's deadline, leaving the deploy request
+// in in_progress_cutover.
 func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBackend, migrationContext, action string) error {
 	migrations, err := s.showMigrations(ctx, backend, migrationContext)
 	if err != nil {
 		return err
 	}
-	// A shard that has already been told to complete is cutting over or done,
+	// A schema change Vitess has already unpostponed is cutting over or done,
 	// and telling it again is the duplicate described above.
 	if action == migrationActionComplete {
 		migrations = filterMigrations(migrations, awaitingCompletion)
 		if len(migrations) == 0 {
-			s.logger.Debug("no shard is waiting to be told to cut over",
+			s.logger.Debug("no schema change is waiting to be told to cut over",
 				"migration_context", migrationContext)
 			return nil
 		}
@@ -469,39 +461,28 @@ func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBac
 		_, ok := backend.vtgateDBs[keyspace]
 		return ok
 	}
-	targets, err := groupMigrationsByShard(migrations, migrationContext, known, s.logger)
+	byKeyspace, err := distinctMigrationsByKeyspace(migrations, migrationContext, known, s.logger)
 	if err != nil {
 		return err
 	}
 
 	var firstErr error
-	for target, uuids := range targets {
-		err := func() error {
-			conn, cleanup, err := s.vtgateTargetConn(ctx, backend, target.keyspace, target.shard)
+	for keyspace, uuids := range byKeyspace {
+		db := backend.vtgateDBs[keyspace]
+		for _, uuid := range uuids {
+			stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
+			execCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+			_, err := db.ExecContext(execCtx, stmt)
+			cancel()
 			if err != nil {
-				return fmt.Errorf("shard-targeted conn: %w", err)
-			}
-			defer cleanup()
-			for _, uuid := range uuids {
-				stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
-				execCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
-				_, err := conn.ExecContext(execCtx, stmt)
-				cancel()
-				if err != nil {
-					return fmt.Errorf("alter vitess_migration %s %s: %w", uuid, action, err)
+				s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "uuid", uuid,
+					"action", action, "error", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("alter vitess_migration %s %s on %s: %w", uuid, action, keyspace, err)
 				}
+				continue
 			}
-			return nil
-		}()
-		if err != nil {
-			s.logger.Warn("alter vitess_migration failed", "keyspace", target.keyspace, "shard", target.shard,
-				"action", action, "migration_count", len(uuids), "error", err)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("alter vitess_migration %s on %s/%s: %w", action, target.keyspace, target.shard, err)
-			}
-		} else {
-			s.logger.Info("alter vitess_migration", "keyspace", target.keyspace, "shard", target.shard,
-				"action", action, "migration_count", len(uuids))
+			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "uuid", uuid, "action", action)
 		}
 	}
 	return firstErr
