@@ -489,6 +489,11 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 	t.Helper()
 	start := time.Now()
 	cleaned := 0
+	// One budget for all the waiting this cleanup does, not one per request:
+	// a shard that wedges several deploys must not spend a multiple of it
+	// between tests. Once it is gone, each remaining request is read once and
+	// reported at whatever state it is actually in.
+	waitDeadline := start.Add(shortPollTimeout)
 	// Scan all deploy requests and skip-revert or cancel any that are active
 	for i := uint64(1); i <= 100; i++ {
 		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
@@ -519,7 +524,7 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 				i, dr.DeploymentState, clearErr)
 			continue
 		}
-		if last, ok := waitForDeployCleared(ctx, i); !ok {
+		if last, ok := waitForDeployCleared(ctx, i, waitDeadline); !ok {
 			t.Logf("cleanupActiveDeployRequests: deploy request %d did not clear, last state %q; "+
 				"it will block every deploy that follows", i, last)
 			continue
@@ -531,11 +536,12 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 	}
 }
 
-// waitForDeployCleared waits for a deploy request to stop occupying the active
-// slot, returning the last state it saw and whether it cleared. It reports
-// rather than failing so the caller can name the request in one message.
-func waitForDeployCleared(ctx context.Context, number uint64) (string, bool) {
-	deadline := time.Now().Add(shortPollTimeout)
+// waitForDeployCleared waits, until the caller's shared deadline, for a deploy
+// request to stop occupying the active slot. It returns the last state it saw
+// and whether it cleared, reporting rather than failing so the caller can name
+// the request in one message. A deadline already passed still reads once, so
+// the state it reports is the current one either way.
+func waitForDeployCleared(ctx context.Context, number uint64, deadline time.Time) (string, bool) {
 	last := ""
 	for {
 		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
