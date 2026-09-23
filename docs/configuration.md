@@ -287,7 +287,7 @@ A database that lives on more than one target replaces the scalar `target` with 
 
 > **MySQL only.** `targets` is rejected at startup on any other database type. Addressing N targets has to be represented on every operator-facing surface — the plan comment, progress, the terminal summary — and that presentation is built per engine, so the feature is enabled per engine as the work lands.
 
-> **Review only in this release.** An environment's targets are each planned against their own live schema, and a difference between them no longer blocks the review. Apply is not there yet: it still runs the reviewed plan on every member, so an environment whose targets hold different schemas would run one target's DDL against another. Do not configure `targets` on an environment whose targets can diverge until per-member apply lands.
+> **Presentation is still landing.** An environment's targets are each planned against their own live schema, and the apply runs each member against the plan that member was planned for, so one target's DDL is never run against another. What is not finished is how a rollout reads on the pull request: the plan comment, progress, and the terminal summary still describe the environment as a whole rather than naming each member and attributing its work to it. A multi-target rollout is safe to run before those surfaces land, but coarse to read.
 
 ```yaml
 databases:
