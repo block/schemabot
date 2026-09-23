@@ -96,7 +96,7 @@ schemabot init
 
 ![Connect a database with the SchemaBot wizard and review your first schema change plan](./assets/init-demo.gif)
 
-The wizard connects to your MySQL or PostgreSQL database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit, run `schemabot plan`, and you are working the way the PR workflow does. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
+The wizard connects to your MySQL or PostgreSQL database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit and run `schemabot plan` to preview changes. Run `schemabot apply` when you’re ready to apply them. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
 
 Want to try SchemaBot with demo databases? See the [examples guide](./examples/README.md).
 
