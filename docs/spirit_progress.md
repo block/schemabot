@@ -130,10 +130,12 @@ Two properties matter for display:
 
 Key types: `engine.ProgressResult`, `engine.TableProgress` (`pkg/engine/engine.go`).
 
-`engine.TableProgress.ProgressDetail` is a free-text note for a human, never a
-data channel: Spirit's `Summary` line while the runner has no per-table progress
-yet, or a marker that a statement ran as native DDL outside the runner. Nothing
-downstream parses it, and the drive does not persist it.
+`engine.TableProgress.ProgressDetail` is a free-text note an engine may attach
+to a table: Spirit's `Summary` line while the runner has no per-table progress
+yet, or a marker that a statement ran as native DDL outside the runner. It stops
+at the engine boundary. Nothing parses it, and the drive writes task rows that
+carry no detail column, so the note reaches no operator surface and the
+`progress_detail` field on the wire is empty on every response.
 
 When no runner exists (engine stopped, no active schema change), returns `StatePending` with
 message `"No active schema change"`.
