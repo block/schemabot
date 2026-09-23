@@ -147,6 +147,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint())
+	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 
@@ -368,12 +369,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// than letting the post-loop aggregate recompute from stale stored rows.
 	driftBlockUnstored := map[string]string{}
 	multiEnvData := templates.MultiEnvPlanCommentData{
-		RequestedBy:  requestedBy,
-		Tenant:       tenant,
-		AgentHint:    h.agentHint(),
-		Environments: environments,
-		Plans:        make(map[string]*templates.PlanCommentData),
-		Errors:       make(map[string]string),
+		RequestedBy:    requestedBy,
+		Tenant:         tenant,
+		ScopedDatabase: planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan),
+		AgentHint:      h.agentHint(),
+		Environments:   environments,
+		Plans:          make(map[string]*templates.PlanCommentData),
+		Errors:         make(map[string]string),
 	}
 
 	for _, env := range environments {
@@ -463,6 +465,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
+		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
@@ -886,6 +889,21 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 		}
 	}
 	return discarded, adopted, running
+}
+
+// planCommentDatabaseFlag returns the database a plan comment's copy-paste
+// commands name. An operator who scoped their command with -d is answered with
+// the same scope, and an unscoped one with an unscoped command. An auto-plan
+// has no operator to answer, and posts a separate comment for every database
+// the pull request touches, so its commands name the database its own comment
+// is about: unnamed, two comments differ only in a metadata line while their
+// one actionable line is the same bare command, which the repository's own
+// ambiguity then rejects.
+func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoPlan bool) string {
+	if isAutoPlan {
+		return resolvedDatabase
+	}
+	return requestedDatabase
 }
 
 // buildPlanCommentData converts plan results into template data.

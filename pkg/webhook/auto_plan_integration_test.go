@@ -80,7 +80,7 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Contains(t, body, "**Tenant**: `alpha`")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
-		assert.Contains(t, body, "schemabot apply -e staging --tenant alpha")
+		assert.Contains(t, body, fmt.Sprintf("schemabot apply -e staging -d %s --tenant alpha", dbName))
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for auto-plan comment")
 	}

@@ -134,6 +134,7 @@ func (h *Handler) executeApply(
 	// would only force a manual unlock after the schema is rewritten.
 	if planResp.HasBlockedChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData.ScopedDatabase = result.Database
 		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
 		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
@@ -230,6 +231,7 @@ func (h *Handler) executeApply(
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData.ScopedDatabase = result.Database
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
@@ -392,6 +394,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	cause *templates.PausedApplyCauseData,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	commentData.ScopedDatabase = result.Database
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
