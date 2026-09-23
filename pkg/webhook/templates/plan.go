@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -218,7 +219,11 @@ type DeploymentDriftData struct {
 // reviewed primary plan.
 type DeploymentDriftEntry struct {
 	Deployment string
-	Primary    bool
+	// Target is the member's target within its deployment. One deployment can
+	// address several targets, so the deployment name alone does not always name
+	// the member.
+	Target  string
+	Primary bool
 	// Class is "match", "planned", "diverged", or "errored".
 	Class string
 	// Blocked is the number of changes this member will refuse at apply.
@@ -226,6 +231,18 @@ type DeploymentDriftEntry struct {
 	// Detail is a short human explanation for a diverged or errored member;
 	// empty for a member that passed.
 	Detail string
+}
+
+// driftMemberNames renders each rollup entry the way an operator addresses it,
+// index-parallel to the entries. The naming rule is shared with every other
+// member-facing surface, so a deployment that addresses several targets is named
+// the same way in the plan comment, the check summary, and the progress comment.
+func driftMemberNames(entries []DeploymentDriftEntry) []string {
+	members := make([]routing.ExecutionTarget, len(entries))
+	for i, e := range entries {
+		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
+	}
+	return routing.DisplayNames(members)
 }
 
 // applyingWithoutConfirmation reports whether this comment announces an apply
@@ -1157,22 +1174,25 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
+	// One deployment can address several targets, so the deployment name alone
+	// does not always say which member a line belongs to. The shared naming rule
+	// adds the target only where it disambiguates.
+	//
+	// A member name is assembled from server config, so it reaches this comment
+	// as text SchemaBot did not choose. Rendering every one as a code span keeps
+	// a name carrying a backtick or a line break from closing the span it sits
+	// in and writing markdown of its own into a comment operators act on.
+	names := inlineCodeList(driftMemberNames(drift.Deployments))
 	switch {
 	case drift.Clean && drift.Independent:
 		// Independent members were deliberately never compared to each other, so
 		// the mirrored headline would assert agreement the rollup did not check.
 		// It says what was actually established: every target has a plan.
-		//
-		// The members are not named here the way the mirrored line names them.
-		// Mirrored members are distinct deployments, so their names identify
-		// them; independent members usually share one deployment and differ by
-		// target, which this entry does not carry, so the same list would name
-		// one deployment once per target and identify nothing.
-		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** — each target holds its own schema, so their plans are not expected to match.\n\n",
-			len(drift.Deployments))
+		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
+			len(drift.Deployments), strings.Join(names, ", "))
 	case drift.Clean:
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
-			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
+			len(drift.Deployments), strings.Join(names, ", "))
 	case drift.Independent:
 		// A member that could not be planned blocks under either contract, but
 		// only mirrored members can be out of agreement with each other. Calling
@@ -1188,8 +1208,8 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	if drift.Clean && !anyDeploymentBlocked(drift.Deployments) {
 		return
 	}
-	for _, d := range drift.Deployments {
-		name := "`" + d.Deployment + "`"
+	for i, d := range drift.Deployments {
+		name := names[i]
 		if d.Primary {
 			name += " (primary)"
 		}
@@ -1239,15 +1259,6 @@ func driftDetailSuffix(detail string) string {
 		return ""
 	}
 	return " — " + detail
-}
-
-// joinDeploymentNames lists deployment names for the uniform drift line.
-func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
-	names := make([]string, len(deployments))
-	for i, d := range deployments {
-		names[i] = d.Deployment
-	}
-	return strings.Join(names, ", ")
 }
 
 // writeBlockedChanges writes the section for statements the engine refuses,

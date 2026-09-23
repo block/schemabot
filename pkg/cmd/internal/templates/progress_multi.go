@@ -41,6 +41,7 @@ func progressOperationsForPresentation(ops []ProgressOperation, released bool) [
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
 			Deployment:        op.Deployment,
+			Target:            op.Target,
 			State:             op.State,
 			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
@@ -90,35 +91,37 @@ func writeMultiDeploymentFirstFailure(failure *presentation.Deployment) {
 		return
 	}
 	if failure.Error == "" {
-		fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s%s\n", ANSIRed, failure.Deployment, ANSIReset)
+		fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s%s\n", ANSIRed, failure.Name, ANSIReset)
 		return
 	}
-	fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s — %s%s\n", ANSIRed, failure.Deployment, failure.Error, ANSIReset)
+	fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s — %s%s\n", ANSIRed, failure.Name, failure.Error, ANSIReset)
 }
 
 func writeMultiDeploymentNextAction(next presentation.NextAction) {
 	switch next.Kind {
 	case presentation.NextActionCutover:
-		fmt.Printf("\n  Next: cut over %s\n", next.Deployment)
+		fmt.Printf("\n  Next: cut over %s\n", next.Name)
 	case presentation.NextActionResume:
 		fmt.Println("\n  Next: resume apply")
 	case presentation.NextActionReviewFailure:
-		if next.Deployment == "" {
+		if next.Name == "" {
 			fmt.Println("\n  Next: review failure")
 			return
 		}
-		fmt.Printf("\n  Next: review failure in %s\n", next.Deployment)
+		fmt.Printf("\n  Next: review failure in %s\n", next.Name)
 	case presentation.NextActionNone:
 	}
 }
 
 func writeDeploymentProgressSection(deployment presentation.Deployment, op ProgressOperation, data ProgressData) {
-	fmt.Printf("%s %s", deployment.Emoji, deployment.Deployment)
+	fmt.Printf("%s %s", deployment.Emoji, deployment.Name)
 	if op.OperationKey != "" {
 		fmt.Printf(" · %s", op.OperationKey)
 	}
 	fmt.Printf(" — %s", deployment.Label)
-	if target := sectionTarget(op, data.Operations); target != "" {
+	// A member whose name already carries its target does not repeat it in the
+	// trailing parenthetical.
+	if target := sectionTarget(op, data.Operations); target != "" && deployment.Name == deployment.Deployment {
 		fmt.Printf(" (%s)", target)
 	}
 	fmt.Println()
@@ -127,7 +130,7 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 	if op.ExternalOperationID != "" {
 		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, op.ExternalOperationID, ANSIReset)
 	}
-	if externalID := sectionExternalID(op, data.Operations); externalID != "" {
+	if externalID := SectionExternalID(op, data.Operations); externalID != "" {
 		fmt.Printf("  %sExternal apply ID: %s%s\n", ANSIDim, externalID, ANSIReset)
 	}
 
@@ -151,35 +154,52 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 }
 
 // sectionTarget resolves the target shown in a section header: the section's
-// own operation when set, falling back to any same-deployment sibling — the
-// target is deployment-level routing, identical across a keyed apply's
-// operations.
+// own operation when set, falling back to the one its deployment shares.
 func sectionTarget(op ProgressOperation, ops []ProgressOperation) string {
 	if op.Target != "" {
 		return op.Target
 	}
-	for _, sibling := range ops {
-		if sibling.Deployment == op.Deployment && sibling.Target != "" {
-			return sibling.Target
-		}
-	}
-	return ""
+	return sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.Target })
 }
 
-// sectionExternalID resolves the external apply ID shown in a section: the
-// section's own operation when set, falling back to any same-deployment
-// sibling — a keyed apply's operations share one data-plane apply, so a
-// not-yet-dispatched operation still shows the deployment's shared ID.
-func sectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
+// SectionExternalID resolves the external apply ID shown for a rollout member:
+// the member's own operation when set, falling back to the one its deployment
+// shares. It is exported because the progress renderer and the watch TUI both
+// label a member with it, and a member must not be told two different apply IDs
+// depending on which surface an operator is reading.
+func SectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
 	if op.ExternalID != "" {
 		return op.ExternalID
 	}
+	return sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.ExternalID })
+}
+
+// sharedAcrossDeployment returns the value every operation of op's deployment
+// agrees on, and "" when they carry more than one.
+//
+// A keyed apply runs several operations of one deployment against one target
+// and through one data-plane apply, so an operation that has not dispatched yet
+// can take its value from a sibling. A deployment that addresses several targets
+// has no such shared value: taking one there would label a member with another
+// target's apply, telling an operator to go look at a member they are not
+// watching. Showing nothing is the honest answer, and it resolves on the next
+// poll once the operation dispatches and carries its own.
+func sharedAcrossDeployment(op ProgressOperation, ops []ProgressOperation, valueOf func(ProgressOperation) string) string {
+	shared := ""
 	for _, sibling := range ops {
-		if sibling.Deployment == op.Deployment && sibling.ExternalID != "" {
-			return sibling.ExternalID
+		if sibling.Deployment != op.Deployment {
+			continue
 		}
+		value := valueOf(sibling)
+		if value == "" {
+			continue
+		}
+		if shared != "" && shared != value {
+			return ""
+		}
+		shared = value
 	}
-	return ""
+	return shared
 }
 
 func activeTablesForDeployment(tables []TableProgress, deployment string) []TableProgress {

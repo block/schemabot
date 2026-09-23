@@ -57,10 +57,10 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.NotContains(t, out, "--deployment")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
-	assert.Contains(t, out, "- 🟢 eu — ready for cutover — next in order")
-	assert.Contains(t, out, "- 🔄 us — running table copy")
-	assert.Contains(t, out, "- ⏳ au — waiting for us")
-	assert.Contains(t, out, "- ⏳ ca — waiting for us")
+	assert.Contains(t, out, "- 🟢 `eu` — ready for cutover — next in order")
+	assert.Contains(t, out, "- 🔄 `us` — running table copy")
+	assert.Contains(t, out, "- ⏳ `au` — waiting for us")
+	assert.Contains(t, out, "- ⏳ `ca` — waiting for us")
 
 	// Active/ready deployments default open; queued ones default collapsed.
 	assert.Contains(t, out, "<details open>\n<summary>🟢 eu — ready for cutover — next in order</summary>")
@@ -92,8 +92,8 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	assert.Contains(t, out, "To retry:")
 	assert.Contains(t, out, "schemabot apply -e production")
 	assert.NotContains(t, out, "schemabot revert")
-	assert.Contains(t, out, "- ❌ us — failed")
-	assert.Contains(t, out, "- ⏸️ au — halted — us failed")
+	assert.Contains(t, out, "- ❌ `us` — failed")
+	assert.Contains(t, out, "- ⏸️ `au` — halted — us failed")
 	assert.Contains(t, out, "<details open>\n<summary>⏸️ au — halted — us failed</summary>")
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
@@ -118,8 +118,8 @@ func TestRenderMultiDeploymentApplyComment_UsesOneRenderTimestamp(t *testing.T) 
 		ApplyID:     "apply-123",
 		Environment: "production",
 		RequestedBy: "aparajon",
-		Details: map[string]ApplyStatusCommentData{
-			"us": {
+		Details: []*ApplyStatusCommentData{
+			{
 				Database:    "payments_us",
 				Environment: "production",
 				State:       state.Apply.Running,
@@ -182,7 +182,7 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "Schema Change Failed")
 	// A later deployment is still running while siblings have failed.
-	assert.Contains(t, out, "- 🔄 au — running table copy")
+	assert.Contains(t, out, "- 🔄 `au` — running table copy")
 	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
 	// Only the earliest failure is lifted to the header.
 	assert.NotContains(t, out, "First failure:** <code>eu</code>")
@@ -247,8 +247,10 @@ func TestRenderMultiDeploymentApplyComment_DetailsReuseSingleRenderer(t *testing
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "production",
-		Details: map[string]ApplyStatusCommentData{
-			"us": {
+		Details: []*ApplyStatusCommentData{
+			// eu has no detail yet, so its section renders the placeholder.
+			nil,
+			{
 				Database: "payments_us",
 				State:    state.Apply.Running,
 				Tables: []TableProgressData{
@@ -263,7 +265,7 @@ func TestRenderMultiDeploymentApplyComment_DetailsReuseSingleRenderer(t *testing
 	assert.Contains(t, out, "orders")
 	// Completed deployment with no detail still renders its summary line + section,
 	// with a placeholder body rather than an empty <details>.
-	assert.Contains(t, out, "- ✅ eu — completed")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
 	assert.Contains(t, out, "<details>\n<summary>✅ eu — completed</summary>")
 	assert.Contains(t, out, "_No details available yet._")
 }
@@ -282,8 +284,8 @@ func TestRenderMultiDeploymentApplySummaryComment_CompletedReusesSummaryRenderer
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "production",
-		Details: map[string]ApplyStatusCommentData{
-			"eu": {
+		Details: []*ApplyStatusCommentData{
+			{
 				Database:    "payments_eu",
 				Environment: "production",
 				State:       state.Apply.Completed,
@@ -291,7 +293,7 @@ func TestRenderMultiDeploymentApplySummaryComment_CompletedReusesSummaryRenderer
 					{TableName: "orders", Status: state.Task.Completed},
 				},
 			},
-			"us": {
+			{
 				Database:    "payments_us",
 				Environment: "production",
 				State:       state.Apply.Completed,
@@ -305,8 +307,8 @@ func TestRenderMultiDeploymentApplySummaryComment_CompletedReusesSummaryRenderer
 	// Aggregate terminal header and per-deployment summary list, as the status
 	// comment, so an operator sees rollout outcome at a glance.
 	assert.Contains(t, out, "## ✅ Schema Change Applied")
-	assert.Contains(t, out, "- ✅ eu — completed")
-	assert.Contains(t, out, "- ✅ us — completed")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
+	assert.Contains(t, out, "- ✅ `us` — completed")
 
 	// Each <details> body is the summary renderer's output, not the status one.
 	assert.Contains(t, out, "Applied successfully — your schema change is live!")
@@ -328,14 +330,14 @@ func TestRenderMultiDeploymentApplyComment_DetailsOmitDuplicateHeadline(t *testi
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "production",
-		Details: map[string]ApplyStatusCommentData{
-			"eu": {
+		Details: []*ApplyStatusCommentData{
+			{
 				Database:    "payments_eu",
 				Environment: "production",
 				State:       state.Apply.Completed,
 				Tables:      []TableProgressData{{TableName: "orders", Status: state.Task.Completed}},
 			},
-			"us": {
+			{
 				Database:    "payments_us",
 				Environment: "production",
 				State:       state.Apply.Running,
@@ -364,14 +366,14 @@ func TestRenderMultiDeploymentApplySummaryComment_DetailsOmitDuplicateHeadline(t
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "production",
-		Details: map[string]ApplyStatusCommentData{
-			"eu": {
+		Details: []*ApplyStatusCommentData{
+			{
 				Database:    "payments_eu",
 				Environment: "production",
 				State:       state.Apply.Completed,
 				Tables:      []TableProgressData{{TableName: "orders", Status: state.Task.Completed}},
 			},
-			"us": {
+			{
 				Database:    "payments_us",
 				Environment: "production",
 				State:       state.Apply.Completed,
@@ -397,8 +399,10 @@ func TestRenderMultiDeploymentApplySummaryComment_FailedDeploymentSummary(t *tes
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "production",
-		Details: map[string]ApplyStatusCommentData{
-			"us": {
+		Details: []*ApplyStatusCommentData{
+			// eu carries no summary detail; only the failed member's is asserted.
+			nil,
+			{
 				Database:     "payments_us",
 				Environment:  "production",
 				State:        state.Apply.Failed,
@@ -431,8 +435,8 @@ func TestRenderMultiDeploymentApplyComment_PreflightFailureHasNoProgressBar(t *t
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "qa",
-		Details: map[string]ApplyStatusCommentData{
-			"apse2": {
+		Details: []*ApplyStatusCommentData{
+			{
 				Database:    "profiles_db",
 				Environment: "qa",
 				State:       state.Apply.Failed,
@@ -461,9 +465,9 @@ func TestRenderMultiDeploymentApplyComment_HaltedDetailUsesDerivedStatus(t *test
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "qa",
-		Details: map[string]ApplyStatusCommentData{
-			"apse2": {Database: "app_db", Environment: "qa", State: state.Apply.Failed},
-			"euwe1": {Database: "app_db", Environment: "qa", State: state.Apply.Pending},
+		Details: []*ApplyStatusCommentData{
+			{Database: "app_db", Environment: "qa", State: state.Apply.Failed},
+			{Database: "app_db", Environment: "qa", State: state.Apply.Pending},
 		},
 	})
 
@@ -486,9 +490,9 @@ func TestRenderMultiDeploymentApplyComment_PendingDetailUsesDerivedStatus(t *tes
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "staging",
-		Details: map[string]ApplyStatusCommentData{
-			"eu": {Database: "app_db", Environment: "staging", State: state.Apply.Running},
-			"us": {Database: "app_db", Environment: "staging", State: state.Apply.Pending},
+		Details: []*ApplyStatusCommentData{
+			{Database: "app_db", Environment: "staging", State: state.Apply.Running},
+			{Database: "app_db", Environment: "staging", State: state.Apply.Pending},
 		},
 	})
 
@@ -510,9 +514,9 @@ func TestRenderMultiDeploymentApplyComment_DerivedStatusEscapesLabel(t *testing.
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "staging",
-		Details: map[string]ApplyStatusCommentData{
-			"eu<b>": {Database: "app_db", Environment: "staging", State: state.Apply.Running},
-			"us":    {Database: "app_db", Environment: "staging", State: state.Apply.Pending},
+		Details: []*ApplyStatusCommentData{
+			{Database: "app_db", Environment: "staging", State: state.Apply.Running},
+			{Database: "app_db", Environment: "staging", State: state.Apply.Pending},
 		},
 	})
 
@@ -529,8 +533,8 @@ func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, ApplyID: "apply-123", Environment: "staging"})
 	require.Len(t, model.Deployments, 2)
-	assert.Contains(t, out, "- us — some_engine_state")
-	assert.NotContains(t, out, "-  us")
+	assert.Contains(t, out, "- `us` — some_engine_state")
+	assert.NotContains(t, out, "-  `us`")
 }
 
 // When the rollup has no pending operator action, no next-action block is written.
@@ -604,4 +608,112 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureErrorSanitized(t *testing
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
 	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — dial tcp [endpoint redacted]: refused second line\n",
 		"the first-failure line stays on one line")
+}
+
+// memberOp builds a rolling operation for one rollout member, addressing a
+// target within its deployment.
+func memberOp(dep, target, st string) presentation.Operation {
+	return presentation.Operation{Deployment: dep, Target: target, State: st}
+}
+
+// When one deployment addresses several targets, each member gets its own
+// summary line, its own <details> section, and its own body — the deployment
+// name alone would label two sections identically, and pairing details by name
+// would give both members the same body.
+func TestRenderMultiDeploymentApplyComment_MultiTargetMembersRenderSeparately(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		memberOp("primary", "testapp-001", so.Completed),
+		memberOp("primary", "testapp-002", so.Running),
+		memberOp("eu-west", "orders-eu", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "testapp_001", State: state.Apply.Completed},
+			{
+				Database: "testapp_002",
+				State:    state.Apply.Running,
+				Tables: []TableProgressData{
+					{TableName: "orders", Status: state.Task.Running, PercentComplete: 42, RowsCopied: 420, RowsTotal: 1000},
+				},
+			},
+			nil,
+		},
+	})
+
+	// Both members of "primary" are named in full; the single-target sibling is not.
+	assert.Contains(t, out, "- ✅ `primary/testapp-001` — completed")
+	assert.Contains(t, out, "- 🔄 `primary/testapp-002` — running table copy")
+	assert.Contains(t, out, "- ⏳ `eu-west` — waiting for primary/testapp-002")
+	assert.Contains(t, out, "<details>\n<summary>✅ primary/testapp-001 — completed</summary>")
+	assert.Contains(t, out, "<details open>\n<summary>🔄 primary/testapp-002 — running table copy</summary>")
+
+	// Each member's body is its own: the details are paired positionally, so the
+	// two members of one deployment do not collapse onto a single body.
+	assert.Contains(t, out, "**Database**: `testapp_001`")
+	assert.Contains(t, out, "**Database**: `testapp_002`")
+	assert.Equal(t, 1, strings.Count(out, "**Database**: `testapp_002`"))
+	assert.Contains(t, out, "_No details available yet._")
+}
+
+// A cutover suggestion names the member it applies to, so an operator reading it
+// on a deployment with several targets knows which one is parked at the barrier.
+func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Completed, Barrier: true},
+		{Deployment: "primary", Target: "testapp-002", State: so.WaitingForCutover, Barrier: true},
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.Contains(t, out, "To cut over `primary/testapp-002`:")
+}
+
+// A member name is assembled from server config, so it reaches the comment as
+// text SchemaBot did not choose. The summary list is plain markdown and the
+// section header is HTML, and a name has to be unable to write structure of its
+// own into either: an operator reads this comment to decide whether to cut over
+// or cancel a change that is already touching a database.
+func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown(t *testing.T) {
+	hostile := "us`\n## Injected [click](https://example.invalid)"
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Running),
+		rollingOp(hostile, so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	// Flattening runs at both surfaces, so no name reaches the start of a line:
+	// it can neither open a heading nor break the list item or the <summary> tag
+	// it sits in.
+	assert.NotContains(t, out, "\n## Injected", "a name must not start a heading of its own")
+
+	// The summary list is markdown, so the name is fenced in a backtick run
+	// longer than any run it carries — inside the span the heading marker and
+	// the link are text, not structure.
+	assert.Contains(t, out, "- 🔄 `` us` ## Injected [click](https://example.invalid) `` — running table copy")
+
+	// The section header is read as HTML, so the name is escaped rather than
+	// fenced, matching how this comment names a member everywhere else in a tag.
+	assert.Contains(t, out, "<summary>🔄 us` ## Injected [click](https://example.invalid) — running table copy</summary>")
+
+	// The next-action line names a member in markdown prose too, and is the line
+	// an operator reads to decide which member to cut over.
+	cutover := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			{Deployment: hostile, State: so.WaitingForCutover, Barrier: true},
+		}),
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+	assert.NotContains(t, cutover, "\n## Injected")
+	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
 }

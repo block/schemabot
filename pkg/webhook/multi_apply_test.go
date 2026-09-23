@@ -35,7 +35,7 @@ func TestFormatApplyStatusComment_OneOperationRendersSingle(t *testing.T) {
 	}
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "")
 	assert.NotContains(t, out, "**Deployments**:")
-	assert.NotContains(t, out, "- 🔄 eu")
+	assert.NotContains(t, out, "- 🔄 `eu`")
 }
 
 // An apply that fans out across two deployments renders the aggregate header,
@@ -48,8 +48,8 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "")
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
-	assert.Contains(t, out, "- ✅ eu — completed")
-	assert.Contains(t, out, "- 🔄 us — running table copy")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
+	assert.Contains(t, out, "- 🔄 `us` — running table copy")
 }
 
 // An apply that failed under on_failure=pause with a held sibling renders the
@@ -91,7 +91,7 @@ func TestFormatApplySummaryComment_OneOperationRendersSingle(t *testing.T) {
 	}
 	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, nil, "")
 	assert.NotContains(t, out, "**Deployments**:")
-	assert.NotContains(t, out, "- ✅ eu")
+	assert.NotContains(t, out, "- ✅ `eu`")
 }
 
 // An apply that fans out across two deployments renders the aggregate terminal
@@ -105,8 +105,8 @@ func TestFormatApplySummaryComment_MultipleOperationsRendersMulti(t *testing.T) 
 	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, nil, "")
 	assert.Contains(t, out, "## ✅ Schema Change Applied")
 	assert.Contains(t, out, "**Deployments**: 2 completed")
-	assert.Contains(t, out, "- ✅ eu — completed")
-	assert.Contains(t, out, "- ✅ us — completed")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
+	assert.Contains(t, out, "- ✅ `us` — completed")
 }
 
 // Each deployment's tasks are routed into that deployment's section only, by
@@ -122,10 +122,10 @@ func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
 	}
 	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, nil, "")
 
-	require.Len(t, data.Details["eu"].Tables, 1)
-	assert.Equal(t, "customers", data.Details["eu"].Tables[0].TableName)
-	require.Len(t, data.Details["us"].Tables, 1)
-	assert.Equal(t, "orders", data.Details["us"].Tables[0].TableName)
+	require.Len(t, data.Details[0].Tables, 1)
+	assert.Equal(t, "customers", data.Details[0].Tables[0].TableName)
+	require.Len(t, data.Details[1].Tables, 1)
+	assert.Equal(t, "orders", data.Details[1].Tables[0].TableName)
 }
 
 // Per-shard rows are scoped to their owning deployment: when two deployments
@@ -152,12 +152,12 @@ func TestBuildMultiApplyData_ScopesShardsByOperation(t *testing.T) {
 
 	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, shardsByTable, "")
 
-	require.Len(t, data.Details["eu"].Tables, 1)
-	require.Len(t, data.Details["eu"].Tables[0].Shards, 1)
-	assert.Equal(t, "-80", data.Details["eu"].Tables[0].Shards[0].Shard)
-	require.Len(t, data.Details["us"].Tables, 1)
-	require.Len(t, data.Details["us"].Tables[0].Shards, 1)
-	assert.Equal(t, "80-", data.Details["us"].Tables[0].Shards[0].Shard)
+	require.Len(t, data.Details[0].Tables, 1)
+	require.Len(t, data.Details[0].Tables[0].Shards, 1)
+	assert.Equal(t, "-80", data.Details[0].Tables[0].Shards[0].Shard)
+	require.Len(t, data.Details[1].Tables, 1)
+	require.Len(t, data.Details[1].Tables[0].Shards, 1)
+	assert.Equal(t, "80-", data.Details[1].Tables[0].Shards[0].Shard)
 }
 
 // The per-deployment section reflects the operation's own state and error, not

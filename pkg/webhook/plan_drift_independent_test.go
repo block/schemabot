@@ -113,7 +113,13 @@ func TestReviewDriftComment_IndependentSurfacesBlockedMember(t *testing.T) {
 	assert.Equal(t, 1, rollup.Entries[1].Blocked, "the blocked change must be counted on the member that carries it")
 
 	assert.Contains(t, out, "Planned separately for all 2 targets")
-	assert.Contains(t, out, "`commerce` ✅ planned against its own schema · blocked: 1")
+	// Both members are addressed by one deployment, so the deployment name alone
+	// would render them as two identical lines and leave the reviewer unable to
+	// tell which target holds the refused change.
+	assert.Contains(t, out, "`commerce/orders-002` ✅ planned against its own schema · blocked: 1",
+		"the blocked count names the member that carries it")
+	assert.Contains(t, out, "`commerce/orders-001` (primary) ✅ planned against its own schema\n",
+		"the member carrying nothing blocked is named too, and reports no count")
 	assert.NotContains(t, out, "could not verify",
 		"a planned member is not an unverifiable one")
 }

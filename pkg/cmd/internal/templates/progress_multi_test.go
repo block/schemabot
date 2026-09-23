@@ -163,3 +163,78 @@ func assertLess(t *testing.T, output, left, right string) {
 	assert.NotEqual(t, -1, rightIndex, "expected output to contain %q", right)
 	assert.Less(t, leftIndex, rightIndex, "expected %q before %q", left, right)
 }
+
+// One deployment can address several targets, each running its own copy of the
+// change. Every member is named by its routing pair so no two sections carry the
+// same heading, while a sibling deployment that addresses a single target keeps
+// its plain name.
+func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-multi-target",
+			Environment: "staging",
+			State:       state.Apply.Running,
+			Operations: []ProgressOperation{
+				{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "eu-west", Target: "orders-eu", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "✅ primary/testapp-001 — completed")
+	assert.Contains(t, output, "🔄 primary/testapp-002 — running table copy")
+	assert.Contains(t, output, "⏳ eu-west — waiting for primary/testapp-002 (orders-eu)")
+
+	// A name that already carries the target does not repeat it in the
+	// trailing parenthetical.
+	assert.NotContains(t, output, "primary/testapp-001 — completed (testapp-001)")
+	assert.NotContains(t, output, "primary/testapp-002 — running table copy (testapp-002)")
+}
+
+// A keyed apply runs several operations of one deployment through one
+// data-plane apply, so an operation that has not dispatched yet is labelled
+// with the apply ID its siblings already carry rather than with nothing.
+func TestSectionExternalID_KeyedApplyBorrowsTheDeploymentsSharedID(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "eu", Target: "orders-eu", OperationKey: "shard-1", ExternalID: "ps-1"},
+		{Deployment: "eu", Target: "orders-eu", OperationKey: "shard-2"},
+	}
+
+	assert.Equal(t, "ps-1", SectionExternalID(ops[1], ops))
+	assert.Equal(t, "orders-eu", sectionTarget(ops[1], ops))
+}
+
+// A deployment addressing several targets runs each member through its own
+// data-plane apply, so there is no shared ID to borrow. A member that has not
+// dispatched shows nothing rather than a sibling target's apply ID, which would
+// send an operator to watch a member they did not ask about; the member's own
+// ID appears on the next poll once it dispatches.
+func TestSectionExternalID_MultiTargetMemberBorrowsNothing(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "primary", Target: "testapp-001", ExternalID: "ps-1"},
+		{Deployment: "primary", Target: "testapp-002", ExternalID: "ps-2"},
+		{Deployment: "primary", Target: "testapp-003"},
+	}
+
+	assert.Equal(t, "", SectionExternalID(ops[2], ops),
+		"a member must not be labelled with another target's apply ID")
+	assert.Equal(t, "ps-2", SectionExternalID(ops[1], ops), "a member's own ID still wins")
+
+	undispatched := ProgressOperation{Deployment: "primary"}
+	assert.Equal(t, "", SectionExternalID(undispatched, ops))
+	assert.Equal(t, "", sectionTarget(undispatched, ops),
+		"a member must not be labelled with another target of its deployment")
+}
+
+// A sibling of another deployment never supplies either value, whatever it
+// carries.
+func TestSectionExternalID_IgnoresOtherDeployments(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "eu", Target: "orders-eu", ExternalID: "ps-1"},
+		{Deployment: "us"},
+	}
+
+	assert.Equal(t, "", SectionExternalID(ops[1], ops))
+	assert.Equal(t, "", sectionTarget(ops[1], ops))
+}
