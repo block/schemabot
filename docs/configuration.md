@@ -786,6 +786,15 @@ such field today, and one should only be added where the value genuinely has
 no cross-engine meaning; a bound that any engine could honor belongs at the
 top of the block.
 
+Changing the policy does not retroactively change plans already reviewed
+under the old one. A plan records the policy its execution verdicts were
+judged against, and the apply created from it runs under that record rather
+than under a policy resolved again at admission, so narrowing or withdrawing
+a grant takes effect on the next plan instead of on a change an operator has
+already reviewed. See
+[Direct Execution → The plan carries the policy its verdicts were judged
+under](direct-execution.md#the-plan-carries-the-policy-its-verdicts-were-judged-under).
+
 ## Storage Dialect
 
 SchemaBot's internal storage database runs on MySQL by default. Set

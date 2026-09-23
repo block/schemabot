@@ -592,6 +592,19 @@ type Plan struct {
 	// whose members all run the reviewed plan.
 	PrimaryPlanIdentifier string
 
+	// DirectExecution is the direct execution policy this plan's execution
+	// verdicts were computed under. An apply created from the plan runs under
+	// it rather than under a policy resolved again at admission, so the
+	// verdict the operator reviewed and the policy the statement runs under
+	// are the same one even when the configuration changes in between — which
+	// it routinely has by the time a rollback reverses a change.
+	//
+	// A plan judged under no grant records a disabled policy rather than
+	// nothing, so nil distinguishes exactly one case: a plan created before
+	// this column existed, whose policy is resolved from configuration at
+	// admission the way it always was.
+	DirectExecution *DirectExecutionPolicy
+
 	// CreatedAt is when the plan was generated.
 	CreatedAt time.Time
 }

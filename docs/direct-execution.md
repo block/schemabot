@@ -81,7 +81,11 @@ config: server-wide policy
   + optional environment override
         │
         ├── plan ─────── policy on the request ──► verdict per table
-        │
+        │                                                 │
+        │                                    recorded on the plan row
+        │                                                 │
+        │      ┌──────────────────────────────────────────┘
+        │      ▼
         └── apply ────── policy on the request ──► recorded on the apply
                                                           │
                                    a later drive, another pod, after a restart
@@ -101,6 +105,28 @@ granting itself the thing the configuration exists to bound.
 A request that states no policy leaves the executing server's own
 configuration in force, which with none configured leaves every statement the
 engine refuses blocked.
+
+### The plan carries the policy its verdicts were judged under
+
+An apply's policy comes off the plan it is created from, not from a second
+resolution at admission. The two steps are separated by however long review
+takes, and the configuration can change in between: a grant narrowed or
+withdrawn after review would otherwise refuse a statement the operator was
+shown as direct, and a grant acquired after review would run one they were
+shown as blocked. Recording it on the plan makes the verdict the operator
+reviewed and the policy the statement runs under the same one.
+
+The gap is widest for a rollback, which is planned when the change it reverses
+completes and confirmed by an operator later, holding only the pinned plan.
+Its plan records the policy of the apply it reverses, so the statement that
+undoes a direct change runs under the grant that allowed the change, rather
+than leaving the schema the operator is walking back on the target because the
+grant lapsed in between.
+
+A plan judged under no grant records a disabled policy rather than nothing,
+so a plan row holding nothing means exactly one thing: it predates the record,
+and its apply resolves a policy from configuration the way admission always
+did.
 
 ## The size bound
 
