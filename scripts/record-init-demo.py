@@ -31,6 +31,7 @@ args = parser.parse_args()
 binary = str(Path(args.binary).resolve())
 work = Path(tempfile.mkdtemp(prefix='shop-demo-', dir='/tmp'))
 (work / 'home').mkdir()
+(work / 'schemabot').symlink_to(binary)
 env = dict(os.environ, HOME=str(work / 'home'), SCHEMABOT_PROFILE='', SCHEMABOT_ENDPOINT='', SCHEMABOT_TOKEN='', TERM='xterm-256color', COLORTERM='truecolor', CLICOLOR_FORCE='1', NO_COLOR='', COLORFGBG='0;15')
 pasted_connection = env.get('DATABASE_URL', '')
 if args.paste_connection:
@@ -39,7 +40,7 @@ master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
 screen = pyte.Screen(88, 24)
 stream = pyte.Stream(screen)
-process = subprocess.Popen([binary, '--cli-name', 'schemabot', 'init'], cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
+process = subprocess.Popen(['./schemabot', 'init'], cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
 os.close(slave)
 # Send individual keystrokes while continuing to read the terminal, so the
 # recording captures typing, cursor movement, and checkbox changes as they happen.

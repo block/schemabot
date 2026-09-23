@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -226,6 +227,13 @@ func initSchemaTree(root string) string {
 
 func initCommandName(name, executable string) string {
 	if name == "schemabot" && strings.ContainsAny(executable, `/\`) {
+		if installed, err := exec.LookPath(name); err == nil {
+			currentInfo, currentErr := os.Stat(executable)
+			installedInfo, installedErr := os.Stat(installed)
+			if currentErr == nil && installedErr == nil && os.SameFile(currentInfo, installedInfo) {
+				return name
+			}
+		}
 		return "'" + strings.ReplaceAll(executable, "'", "'\"'\"'") + "'"
 	}
 	return name

@@ -78,7 +78,11 @@ func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 	if defaultProfile == "" {
 		defaultProfile = "default"
 	}
-	fmt.Print(initCompletion(&display, cmd.Environment, defaultProfile, initCommandName(cliname.Name(), os.Args[0])))
+	invocation := cliname.Name()
+	if cliname.FromArgs(os.Args[1:]) == "" {
+		invocation = initCommandName(invocation, os.Args[0])
+	}
+	fmt.Print(initCompletion(&display, cmd.Environment, defaultProfile, invocation))
 	return nil
 }
 

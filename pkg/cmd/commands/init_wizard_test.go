@@ -534,3 +534,18 @@ func TestInitCommandNamePreservesLocalBinary(t *testing.T) {
 	require.Equal(t, "sq schemabot", initCommandName("sq schemabot", "/tmp/sq-schemabot"))
 	require.Equal(t, "'/tmp/my cli/schemabot'", initCommandName("schemabot", "/tmp/my cli/schemabot"))
 }
+
+func TestInitCommandNameUsesMatchingPATHBinary(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	require.NoError(t, os.Mkdir(bin, 0700))
+	executable := filepath.Join(dir, "schemabot-current")
+	require.NoError(t, os.WriteFile(executable, []byte("#!/bin/sh\n"), 0700))
+	installed := filepath.Join(bin, "schemabot")
+	require.NoError(t, os.Symlink(executable, installed))
+	t.Setenv("PATH", bin)
+	require.Equal(t, "schemabot", initCommandName("schemabot", executable))
+	require.NoError(t, os.Remove(installed))
+	require.NoError(t, os.WriteFile(installed, []byte("#!/bin/sh\n"), 0700))
+	require.Equal(t, "'"+executable+"'", initCommandName("schemabot", executable))
+}
