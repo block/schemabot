@@ -32,7 +32,7 @@ E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 # reproducing on CI runners.
 export COMPOSE_BAKE := false
 
-.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -245,7 +245,15 @@ endif
 #   make demo              # Start and apply MySQL + Vitess schema (wipes data)
 #   make demo KEEP_DATA=1  # Restart without wiping data (preserves seeded rows)
 #   make demo SKIP_APPLY=1 # Start server only, skip schema applies (for debugging)
-demo:
+# Start a sample through the same onboarding path as an installed CLI.
+# Use ENGINE=postgres for PostgreSQL. The printed path is your demo project.
+demo: build
+	@demo_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/schemabot-demo.XXXXXX"); \
+	echo "Demo project: $$demo_dir"; \
+	cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type $(or $(ENGINE),mysql)
+
+# Full developer environment, including LocalScale and multiple deployments.
+demo-full:
 	@# Reset schema files to baseline so the demo starts clean.
 	@./scripts/generate-schema-change.sh reset 2>/dev/null || true
 	@./scripts/generate-schema-change.sh reset --vitess 2>/dev/null || true

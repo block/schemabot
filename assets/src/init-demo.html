@@ -11,7 +11,7 @@ window.renderFrame=(t,dt)=>{
  for(let i=0;i<3;i++)document.getElementById('s'+i).className='step '+(i===phase?'active':i<phase?'done':'');
  let lines;
  if(phase===0){
-  if(t<2){document.getElementById('content').innerHTML='<div class=cmd>'+escape('$ schemabot init'.slice(0,Math.floor(t*10)))+'▌</div>';document.getElementById('caption').textContent='Start with schemabot init';return;}
+  if(t<2){document.getElementById('content').innerHTML='<div class=cmd>'+escape(('$ '+(recording.init_command||'schemabot init')).slice(0,Math.floor(t*10)))+'▌</div>';document.getElementById('caption').textContent='Start with schemabot init';return;}
   const frames=recording.wizard_frames;
   const recordedTime=Math.min(Math.max(0,t-2)/25,1)*frames[frames.length-1].time;
   const frame=frames.filter(f=>f.time<=recordedTime).at(-1)||frames[0];
@@ -30,7 +30,7 @@ window.renderFrame=(t,dt)=>{
   lines=[recording.schema_file,'',...clean(recording.diff).trimEnd().split('\n').slice(2)];
   document.getElementById('caption').textContent='Give email addresses more room.';
  }else{
-  if(t<38){lines=['$ schemabot plan -s schema -e development'.slice(0,Math.floor((t-36)*23))+'▌'];}else lines=['$ schemabot plan -s schema -e development','',...recording.plan.replace(/\r/g,'').trimEnd().split('\n')];
+  if(t<38){lines=[('$ '+(recording.plan_command||'schemabot plan -s schema -e development')).slice(0,Math.floor((t-36)*23))+'▌'];}else lines=['$ '+(recording.plan_command||'schemabot plan -s schema -e development'),'',...recording.plan.replace(/\r/g,'').trimEnd().split('\n')];
   document.getElementById('caption').textContent='The next change is a plan you can review.';
  }
  const html=lines.map(line=>{
