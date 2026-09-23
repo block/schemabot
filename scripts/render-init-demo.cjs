@@ -7,7 +7,9 @@ const {pathToFileURL}=require('node:url');
 const {chromium}=require('playwright');
 (async()=>{
  const root=path.resolve(__dirname,'..'),tmp=fs.mkdtempSync(path.join(os.tmpdir(),'init-gif-'));
- const recording=JSON.parse(fs.readFileSync(path.join(root,'assets/src/init-demo-recording.json')));
+ const name=process.argv[2]||'init-demo';
+ if(!/^init-(vitess-)?demo$/.test(name))throw new Error('Use init-demo or init-vitess-demo');
+ const recording=JSON.parse(fs.readFileSync(path.join(root,'assets/src/'+name+'-recording.json')));
  if(!recording.wizard.includes('Baseline plan: no changes.')||!recording.plan.includes('ALTER'))throw new Error('Record a successful real wizard and plan first');
  const chrome=process.env.CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
  const browser=await chromium.launch({headless:true,...(fs.existsSync(chrome)?{executablePath:chrome}:{})});
@@ -26,7 +28,7 @@ const {chromium}=require('playwright');
   }
   const palette=path.join(tmp,'palette.png');
   execFileSync('magick',[...frames.filter((_,i)=>i%5===0).map(f=>f.path),'-append','-colors','256','-unique-colors',palette]);
-  const out=path.join(root,'assets/init-demo.gif');
+  const out=path.join(root,'assets/'+name+'.gif');
   execFileSync('magick',['-loop','0',...frames.flatMap(f=>['-delay',String(f.delay),f.path]),'+dither','-remap',palette,'-layers','OptimizePlus',out]);
   console.log(out,fs.statSync(out).size,'bytes');console.log('Preview frames:',tmp);
  }finally{await browser.close()}

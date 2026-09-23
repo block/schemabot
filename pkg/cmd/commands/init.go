@@ -97,7 +97,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, fmt.Errorf("choose --integrated or --storage-dsn, not both")
 	}
 	if cmd.Type == "vitess" && cmd.Integrated {
-		return nil, fmt.Errorf("Vitess needs a separate MySQL state database; use --storage-dsn")
+		return nil, fmt.Errorf("vitess needs a separate MySQL state database; use --storage-dsn")
 	}
 	storage := api.StorageConfig{Dialect: initStorageDialect(cmd.Type), DSN: cmd.StorageDSN}
 	if cmd.Integrated {

@@ -6,6 +6,7 @@ The target must contain users(id, email varchar(255)): public.users for Postgres
 shop.users for MySQL. Postgres also needs an empty analytics namespace. No apply is issued.
 """
 import argparse
+import codecs
 import difflib
 import errno
 import fcntl
@@ -26,7 +27,9 @@ parser.add_argument('--binary', required=True)
 parser.add_argument('--output', required=True)
 parser.add_argument('--paste-connection', action='store_true')
 parser.add_argument('--integrated', action='store_true')
-parser.add_argument('--engine', choices=['mysql', 'postgres'], default='postgres')
+parser.add_argument('--api-url', default='')
+parser.add_argument('--organization', default='demo')
+parser.add_argument('--engine', choices=['mysql', 'postgres', 'vitess'], default='postgres')
 args = parser.parse_args()
 binary = str(Path(args.binary).resolve())
 work = Path(tempfile.mkdtemp(prefix='shop-demo-', dir='/tmp'))
@@ -40,17 +43,24 @@ master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
 screen = pyte.Screen(88, 24)
 stream = pyte.Stream(screen)
-process = subprocess.Popen(['./schemabot', 'init'], cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
+command = ['./schemabot', 'init']
+if args.api_url:
+    command += ['--api-url', args.api_url]
+process = subprocess.Popen(command, cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
 os.close(slave)
 # Send individual keystrokes while continuing to read the terminal, so the
 # recording captures typing, cursor movement, and checkbox changes as they happen.
 engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [(0.9, '\x1b[B'), (0.7, '\x1b[A'), (0.7, '\r')]
+if args.engine == 'vitess':
+    engine_keys = [(0.9, '\x1b[A'), (0.8, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
 if args.paste_connection:
     steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.035, c) for c in pasted_connection] + [(1.0, '\r')])])
 else:
     steps.extend([('Connect your database', [(1.5, '\r')])])
-if args.integrated:
+if args.engine == 'vitess':
+    steps.extend([('PlanetScale organization', [(0.25, c) for c in args.organization] + [(0.7, '\r')]), ('Connect the PlanetScale API', [(1.5, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')])])
+elif args.integrated:
     steps.append(('Where should SchemaBot store its own data?', [(3.0, '\r')]))
 else:
     steps.extend([('Where should SchemaBot store its own data?', [(2.0, '\x1b[B'), (1.5, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')])])
@@ -61,6 +71,7 @@ steps.append(('Review your setup', [(2.0, '\r')]))
 pending = []
 frames = []
 text = ''
+decoder = codecs.getincrementaldecoder('utf-8')('replace')
 seen = 0
 start = time.monotonic()
 try:
@@ -78,7 +89,7 @@ try:
                 raise
             if not data:
                 break
-            chunk = data.decode('utf-8', errors='replace')
+            chunk = decoder.decode(data)
             text += chunk
             if '\x1b]11;' in chunk:
                 os.write(master, b'\x1b]11;rgb:ffff/ffff/ffff\x1b\\')

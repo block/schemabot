@@ -51,6 +51,14 @@ Private databases do not need a public endpoint. Run SchemaBot somewhere that ca
 them: on your VPN, through an existing tunnel, or on a machine inside the private network.
 If a connection check fails, keep the wizard open, restore access, and retry.
 
+## Vitess and PlanetScale
+
+Connect your vtgate endpoint, choose your PlanetScale organization, and verify a service-token
+reference. SchemaBot discovers keyspaces from the `main` branch and keeps its own data in a
+separate MySQL database.
+
+![Connect a Vitess database, verify its schema, and preview a change](../assets/init-vitess-demo.gif)
+
 ## Follow the wizard
 
 The wizard detects an available connection and offers **Use this connection**, or lets you
