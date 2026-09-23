@@ -44,11 +44,11 @@ func greenfieldStatements(prefix string, n int) []string {
 
 func greenfieldPlan(env, prefix string, tables int) PlanCommentData {
 	return PlanCommentData{
-		Database:     "everlog",
+		Database:     "ledger",
 		Environment:  env,
 		DatabaseType: "mysql",
 		IsMySQL:      true,
-		Changes:      []KeyspaceChangeData{{Keyspace: "everlog_" + env, Statements: greenfieldStatements(prefix, tables)}},
+		Changes:      []KeyspaceChangeData{{Keyspace: "ledger_" + env, Statements: greenfieldStatements(prefix, tables)}},
 	}
 }
 
@@ -56,7 +56,7 @@ func greenfieldTables(prefix string, n int, status string) []TableProgressData {
 	tables := make([]TableProgressData, 0, n)
 	for i := range n {
 		tables = append(tables, TableProgressData{
-			Namespace: "everlog_production",
+			Namespace: "ledger_production",
 			TableName: fmt.Sprintf("%s_%03d", prefix, i),
 			DDL:       greenfieldCreate(prefix, i),
 			Status:    status,
@@ -101,7 +101,7 @@ func TestMultiEnvPlanCommentSharesOneDDLBudgetAcrossEnvironments(t *testing.T) {
 	staging := greenfieldPlan("staging", "staging_events", 100)
 	production := greenfieldPlan("production", "events", 100)
 	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "everlog",
+		Database:     "ledger",
 		DatabaseType: "mysql",
 		IsMySQL:      true,
 		Environments: []string{"staging", "production"},
@@ -122,9 +122,9 @@ func TestMultiEnvPlanCommentSharesOneDDLBudgetAcrossEnvironments(t *testing.T) {
 func TestMultiEnvPlanCommentBudgetsIdenticalPlansAsOneSection(t *testing.T) {
 	staging := greenfieldPlan("staging", "events", 41)
 	production := greenfieldPlan("production", "events", 41)
-	staging.Changes[0].Keyspace, production.Changes[0].Keyspace = "everlog", "everlog"
+	staging.Changes[0].Keyspace, production.Changes[0].Keyspace = "ledger", "ledger"
 	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "everlog",
+		Database:     "ledger",
 		DatabaseType: "mysql",
 		IsMySQL:      true,
 		Environments: []string{"staging", "production"},
@@ -144,7 +144,7 @@ func TestMultiEnvPlanCommentBudgetsIdenticalPlansAsOneSection(t *testing.T) {
 func TestMultiEnvPlanCommentKeepsPlansApartThatDifferPastTheCut(t *testing.T) {
 	staging := greenfieldPlan("staging", "events", 200)
 	production := greenfieldPlan("production", "events", 200)
-	staging.Changes[0].Keyspace, production.Changes[0].Keyspace = "everlog", "everlog"
+	staging.Changes[0].Keyspace, production.Changes[0].Keyspace = "ledger", "ledger"
 	statements := production.Changes[0].Statements
 	last := len(statements) - 1
 	statements[last] = strings.Replace(statements[last], "`currency` char(3)", "`currency` char(4)", 1)
@@ -152,7 +152,7 @@ func TestMultiEnvPlanCommentKeepsPlansApartThatDifferPastTheCut(t *testing.T) {
 	require.Greater(t, len(RenderPlanComment(staging)), commentBodyLimit-256, "each plan alone overfills a comment")
 
 	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "everlog",
+		Database:     "ledger",
 		DatabaseType: "mysql",
 		IsMySQL:      true,
 		Environments: []string{"staging", "production"},
@@ -173,7 +173,7 @@ func TestApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
 
 	t.Run("progress", func(t *testing.T) {
 		body := RenderApplyStatusComment(ApplyStatusCommentData{
-			Database:    "everlog",
+			Database:    "ledger",
 			Environment: "production",
 			Engine:      "Spirit",
 			State:       state.Apply.Running,
@@ -186,7 +186,7 @@ func TestApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
 
 	t.Run("failed summary", func(t *testing.T) {
 		body := RenderApplySummaryComment(ApplyStatusCommentData{
-			Database:     "everlog",
+			Database:     "ledger",
 			Environment:  "production",
 			Engine:       "Spirit",
 			State:        state.Apply.Failed,
@@ -200,7 +200,7 @@ func TestApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
 
 	t.Run("a greenfield apply renders every table's DDL", func(t *testing.T) {
 		body := RenderApplySummaryComment(ApplyStatusCommentData{
-			Database:    "everlog",
+			Database:    "ledger",
 			Environment: "production",
 			Engine:      "Spirit",
 			State:       state.Apply.Completed,
