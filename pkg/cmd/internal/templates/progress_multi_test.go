@@ -284,3 +284,34 @@ func TestWriteProgressMultiTargetSectionsAreMemberScoped(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(output, "users_001"))
 	assert.Equal(t, 1, strings.Count(output, "users_002"))
 }
+
+// A keyed apply's operations share one target, and an operation that has not
+// dispatched yet has not recorded it. Its header inherits the target from the
+// sibling that has, but its tables are still selected on the empty target the
+// rows themselves carry — selecting on the inherited value would look for a
+// target no row has and leave the member showing no table progress at all.
+func TestWriteProgressKeyedMemberListsTablesUnderAnInheritedTarget(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-keyed",
+			Environment: "staging",
+			State:       state.Apply.Running,
+			Operations: []ProgressOperation{
+				{Deployment: "eu", Target: "orders-eu", OperationKey: "shard-1", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "eu", OperationKey: "shard-2", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "eu", Target: "orders-eu", TableName: "orders_1", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
+				{Deployment: "eu", TableName: "orders_2", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
+			},
+		})
+	})
+
+	// The header shows the inherited target on the operation that has none.
+	assert.Equal(t, 2, strings.Count(output, "(orders-eu)"))
+	// Each operation still lists its own table.
+	assertLess(t, output, "shard-1", "orders_1")
+	assertLess(t, output, "shard-2", "orders_2")
+	assert.Equal(t, 1, strings.Count(output, "orders_1"))
+	assert.Equal(t, 1, strings.Count(output, "orders_2"))
+}

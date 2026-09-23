@@ -110,6 +110,9 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 		fmt.Fprintf(b, "  %s\n", errStyle.Render(deployment.Error))
 	}
 
+	// The selector takes the member's recorded target, not the resolved one the
+	// header shows: a table row carries whatever its own operation carried, so
+	// matching an inherited value would look for a target the rows do not have.
 	tables := tablesForMember(m.tables, deployment.Deployment, deployment.Target)
 	if len(tables) > 0 && !state.IsSetupPhase(m.state) {
 		sortTablesByProgress(tables)

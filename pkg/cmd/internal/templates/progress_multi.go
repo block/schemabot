@@ -138,6 +138,9 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 		fmt.Printf("  %s%s%s\n", ANSIRed, deployment.Error, ANSIReset)
 	}
 
+	// The selector takes the member's recorded target, not the resolved one the
+	// header shows: a table row carries whatever its own operation carried, so
+	// matching an inherited value would look for a target the rows do not have.
 	tables := activeTablesForMember(data.Tables, deployment.Deployment, deployment.Target)
 	if len(tables) > 0 && !state.IsSetupPhase(data.State) {
 		sortActiveTables(tables)
