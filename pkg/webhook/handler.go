@@ -766,7 +766,7 @@ func (h *Handler) postClaimedSummaryComment(ctx context.Context, apply *storage.
 		return
 	}
 
-	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(apply.Repository, apply.PullRequest, body))
 	if err != nil {
 		h.logger.Error("failed to post reconciled summary comment; releasing summary claim",
 			append(apply.LogAttrs(), "error", err)...)

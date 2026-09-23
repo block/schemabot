@@ -51,7 +51,7 @@ func TestWriteSQLFencedBlock(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out strings.Builder
-			writeSQLFencedBlock(&out, tt.content, newDDLBlockBudget(1))
+			writeSQLFencedBlock(&out, tt.content, newDDLBlockBudget(1, commentBodyLimit))
 
 			assert.Equal(t, tt.expected, out.String())
 			lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
@@ -172,7 +172,7 @@ func TestFitSQLBlock(t *testing.T) {
 			assert.Equal(t, tt.expected, got)
 			assert.Equal(t, tt.truncated, truncated)
 			var out strings.Builder
-			writeSQLFencedBlock(&out, got, newDDLBlockBudget(1))
+			writeSQLFencedBlock(&out, got, newDDLBlockBudget(1, commentBodyLimit))
 			assert.LessOrEqual(t, len(out.String()), tt.budget)
 		})
 	}
@@ -211,14 +211,14 @@ func TestDDLBlocksContainHostileIdentifier(t *testing.T) {
 
 	t.Run("plan", func(t *testing.T) {
 		var out strings.Builder
-		writePlanDDLBlock(&out, []string{hostileDDL}, schema.DialectPostgres, newDDLBlockBudget(1))
+		writePlanDDLBlock(&out, []string{hostileDDL}, schema.DialectPostgres, newDDLBlockBudget(1, commentBodyLimit))
 
 		assert.Equal(t, expectedBlock+"\n", out.String())
 	})
 
 	t.Run("apply row", func(t *testing.T) {
 		var out strings.Builder
-		writeDDLLine(&out, schema.DialectPostgres, hostileDDL, newDDLBlockBudget(1))
+		writeDDLLine(&out, schema.DialectPostgres, hostileDDL, newDDLBlockBudget(1, commentBodyLimit))
 
 		assert.Equal(t, "\n"+expectedBlock, out.String())
 	})
@@ -229,7 +229,7 @@ func TestDDLBlocksContainHostileIdentifier(t *testing.T) {
 			TableName: "x\n```\n# injected",
 			Status:    state.Task.Completed,
 			DDL:       hostileDDL,
-		}, false, newDDLBlockBudget(1))
+		}, false, newDDLBlockBudget(1, commentBodyLimit))
 
 		assert.Equal(t, "**```` x ``` # injected ````**\n"+expectedBlock+"\n", out.String())
 	})

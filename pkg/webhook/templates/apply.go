@@ -186,7 +186,16 @@ func RenderApplyStatusComment(data ApplyStatusCommentData) string {
 	return renderApplyStatusComment(data, true, currentTimestamp())
 }
 
+// renderApplyStatusComment renders the progress comment with its DDL taking
+// the room the rest of the comment leaves, less the reserve kept for the
+// sections the poster appends.
 func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bool, renderedAt string) string {
+	return renderWithinCommentLimit(countTablesWithDDL(data.Tables), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderApplyStatusCommentBody(data, includeLastUpdated, renderedAt, budget)
+	})
+}
+
+func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdated bool, renderedAt string, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Header varies by state
@@ -214,7 +223,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// Per-table progress section
 	if len(data.Tables) > 0 {
-		writeTableProgressSection(&sb, data)
+		writeTableProgressSection(&sb, data, budget)
 	}
 
 	// VSchema application status, surfaced from engine metadata rather than as a
@@ -688,7 +697,7 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 // (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, rows
 // are ordered by sortProgressRows: active/running first, then pending, then
 // completed/terminal last, with a table's rows kept together.
-func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData) {
+func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {
 	// During the resume window the per-table percents are indeterminate (the data
 	// plane has not reported continuation vs fresh copy yet), so the aggregate
 	// running-percent summary would surface stale pre-stop numbers. The per-table
@@ -699,7 +708,6 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 	sb.WriteString("\n")
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
-	budget := newDDLBlockBudget(countTablesWithDDL(data.Tables))
 
 	for _, group := range groupTablesByNamespace(data.Tables) {
 		// Label the group by namespace when one is set. The bold metadata-style
@@ -1405,6 +1413,12 @@ func writeFooterAction(sb *strings.Builder, label, command string) {
 // This is posted as a new comment separate from the progress comment, providing a
 // concise outcome record with apply ID and table results.
 func RenderApplySummaryComment(data ApplyStatusCommentData) string {
+	return renderWithinCommentLimit(countTablesWithDDL(data.Tables), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderApplySummaryComment(data, budget)
+	})
+}
+
+func renderApplySummaryComment(data ApplyStatusCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	completedCount, failedCount := countTableOutcomes(data.Tables)
@@ -1412,13 +1426,13 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 
 	switch data.State {
 	case state.Apply.Completed:
-		writeSummaryCompleted(&sb, data, totalTables)
+		writeSummaryCompleted(&sb, data, totalTables, budget)
 	case state.Apply.Failed:
-		writeSummaryFailed(&sb, data, completedCount, failedCount, totalTables)
+		writeSummaryFailed(&sb, data, completedCount, failedCount, totalTables, budget)
 	case state.Apply.Stopped:
-		writeSummaryStopped(&sb, data, completedCount, totalTables)
+		writeSummaryStopped(&sb, data, completedCount, totalTables, budget)
 	case state.Apply.Cancelled:
-		writeSummaryCancelled(&sb, data, completedCount, totalTables)
+		writeSummaryCancelled(&sb, data, completedCount, totalTables, budget)
 	default:
 		writeEnvironmentTitle(&sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
 		writeSummaryMetadata(&sb, data)
@@ -1440,13 +1454,13 @@ func countTableOutcomes(tables []TableProgressData) (completed, failed int) {
 	return
 }
 
-func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, totalTables int) {
+func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, totalTables int, budget *ddlBlockBudget) {
 	writeApplyHeader(sb, data)
 	writeSummaryCompletedMetadata(sb, data)
 	// A VSchema update counts as a schema change alongside table changes, so the
 	// singular/plural wording reflects the total operation count.
 	writeSuccessBlock(sb, completedOutcomeMessage(totalTables+len(data.VSchemaChanges) == 1, data.Rollback))
-	writeCompletedSummaryDetails(sb, data)
+	writeCompletedSummaryDetails(sb, data, budget)
 }
 
 // completedOutcomeMessage is the completed summary's outcome line, shared by
@@ -1472,7 +1486,7 @@ func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentD
 	sb.WriteString("\n")
 }
 
-func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, _, totalTables int) {
+func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, _, totalTables int, budget *ddlBlockBudget) {
 	writeApplyHeader(sb, data)
 	writeSummaryMetadata(sb, data)
 
@@ -1484,11 +1498,11 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 		fmt.Fprintf(sb, "\n%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
-	writeSummaryTableList(sb, data)
+	writeSummaryTableList(sb, data, budget)
 	writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
-func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int) {
+func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int, budget *ddlBlockBudget) {
 	writeApplyHeader(sb, data)
 	writeSummaryMetadata(sb, data)
 
@@ -1496,7 +1510,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 		fmt.Fprintf(sb, "\n%d of %d %s completed before stop.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
-	writeSummaryTableList(sb, data)
+	writeSummaryTableList(sb, data, budget)
 	writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 
@@ -1504,7 +1518,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 // change. Unlike a stopped change, a cancelled one is permanent (e.g. a
 // PlanetScale deploy request that was cancelled), so the summary offers no resume
 // command and directs the operator to open a new schema change.
-func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int) {
+func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int, budget *ddlBlockBudget) {
 	writeApplyHeader(sb, data)
 	writeSummaryMetadata(sb, data)
 
@@ -1516,7 +1530,7 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 		fmt.Fprintf(sb, "\n%d of %d %s completed before cancellation.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
-	writeSummaryTableList(sb, data)
+	writeSummaryTableList(sb, data, budget)
 	sb.WriteString("\n---\n\n")
 	sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 }
@@ -1599,7 +1613,7 @@ func formatDuration(d time.Duration) string {
 	return strings.Join(parts, " ")
 }
 
-func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData) {
+func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {
 	if len(data.Tables) == 0 && len(data.VSchemaChanges) == 0 {
 		// No per-operation detail to collapse (e.g. a task-less apply that found
 		// no changes). Still surface the Apply ID so the summary stays auditable.
@@ -1615,7 +1629,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	}
 	writeCompletedNamespaceSummary(sb, data)
 	if len(data.Tables) > 0 {
-		writeSummaryTableListWithOptions(sb, data, false)
+		writeSummaryTableListWithOptions(sb, data, false, budget)
 	}
 	writeVSchemaStatus(sb, data.VSchemaChanges)
 	sb.WriteString("</details>\n")
@@ -1697,17 +1711,16 @@ func displayNamespace(namespace, database string) string {
 // writeSummaryTableList writes table outcomes with inline DDL, grouped by namespace.
 // Failed/stopped tables are listed first within each group.
 // For 6+ tables, each namespace group is collapsible.
-func writeSummaryTableList(sb *strings.Builder, data ApplyStatusCommentData) {
-	writeSummaryTableListWithOptions(sb, data, true)
+func writeSummaryTableList(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {
+	writeSummaryTableListWithOptions(sb, data, true, budget)
 }
 
-func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusCommentData, collapseNamespaceGroups bool) {
+func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusCommentData, collapseNamespaceGroups bool, budget *ddlBlockBudget) {
 	if len(data.Tables) == 0 {
 		return
 	}
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
-	budget := newDDLBlockBudget(countTablesWithDDL(data.Tables))
 
 	// What went wrong leads, then what landed, then what never ran — and a
 	// table's rows stay together so the reader meets each table once.

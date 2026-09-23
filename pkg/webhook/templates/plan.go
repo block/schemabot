@@ -303,8 +303,15 @@ type KeyspaceShardChange struct {
 	Satisfied bool
 }
 
-// RenderPlanComment renders the plan comment markdown.
+// RenderPlanComment renders the plan comment markdown. The DDL takes every
+// byte the rest of the comment leaves under GitHub's size limit.
 func RenderPlanComment(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderPlanComment(data, budget)
+	})
+}
+
+func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Header
@@ -351,7 +358,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	}
 
 	// Detailed changes
-	writeKeyspaceChanges(&sb, data)
+	writeKeyspaceChanges(&sb, data, budget)
 
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
@@ -924,7 +931,9 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 	return counts
 }
 
-func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
+// writeKeyspaceChanges renders each keyspace's DDL and VSchema changes, with
+// the DDL blocks drawing on the comment's shared budget.
+func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget) {
 	// The DDL blocks below format statements under the plan's own dialect so
 	// they are never reformatted under another family's grammar.
 	dialect := schema.DialectForDatabaseType(data.DatabaseType)
@@ -948,7 +957,6 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 		}
 	}
 	diffBudget := vschemaDiffBudget(diffCount)
-	ddlBudget := newDDLBlockBudget(countPlanDDLBlocks(data.Changes))
 
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
@@ -976,9 +984,9 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if hasDDLChanges {
 			if len(ks.Shards) > 0 {
-				writeShardedPlanDDL(sb, ks.Shards, dialect, ddlBudget)
+				writeShardedPlanDDL(sb, ks.Shards, dialect, budget)
 			} else {
-				writePlanDDLBlock(sb, ks.Statements, dialect, ddlBudget)
+				writePlanDDLBlock(sb, ks.Statements, dialect, budget)
 			}
 		}
 	}
@@ -1687,7 +1695,49 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	if plan, ok := singleEnvironmentPlan(data); ok {
 		return RenderPlanComment(plan)
 	}
+	return renderWithinCommentLimit(countMultiEnvPlanDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {
+		return renderMultiEnvPlanComment(data, budget)
+	})
+}
 
+// countEnvsWithChanges counts the environments whose plan carries a change.
+func countEnvsWithChanges(data MultiEnvPlanCommentData) int {
+	envsWithChanges := 0
+	for _, env := range data.Environments {
+		if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
+			envsWithChanges++
+		}
+	}
+	return envsWithChanges
+}
+
+// multiEnvPlansRenderOnce reports whether the environments' plans are
+// identical and so render as one section under a combined header.
+func multiEnvPlansRenderOnce(data MultiEnvPlanCommentData) bool {
+	return len(data.Errors) == 0 && countEnvsWithChanges(data) >= 2 && allPlansIdentical(data)
+}
+
+// countMultiEnvPlanDDLBlocks counts the DDL blocks a multi-environment plan
+// comment renders — the shared section's blocks when the plans are identical,
+// otherwise every rendered environment's own — so the comment's DDL budget is
+// shared across exactly those blocks.
+func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
+	if multiEnvPlansRenderOnce(data) {
+		return countPlanDDLBlocks(data.Plans[data.Environments[0]].Changes)
+	}
+	count := 0
+	for _, env := range data.Environments {
+		if _, hasErr := data.Errors[env]; hasErr {
+			continue
+		}
+		if plan, ok := data.Plans[env]; ok && plan != nil {
+			count += countPlanDDLBlocks(plan.Changes)
+		}
+	}
+	return count
+}
+
+func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Header
@@ -1701,13 +1751,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	})
 	sb.WriteString("\n")
 
-	// Check which environments have changes
-	envsWithChanges := 0
-	for _, env := range data.Environments {
-		if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
-			envsWithChanges++
-		}
-	}
+	envsWithChanges := countEnvsWithChanges(data)
 	hasErrors := len(data.Errors) > 0
 
 	// If no environments have changes and no errors, show simple message — unless
@@ -1726,11 +1770,10 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
-	// Check if all environments have identical plans (for deduplication)
-	if !hasErrors && envsWithChanges >= 2 && allPlansIdentical(data) {
+	if multiEnvPlansRenderOnce(data) {
 		// Identical plans: render once with combined header
 		fmt.Fprintf(&sb, "### %s\n\n", capitalizeEnvNames(data.Environments))
-		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]])
+		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]], budget)
 	} else {
 		// Separate sections per environment
 		for _, env := range data.Environments {
@@ -1748,7 +1791,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 				continue
 			}
 
-			writeEnvironmentPlanSection(&sb, plan)
+			writeEnvironmentPlanSection(&sb, plan, budget)
 		}
 	}
 
@@ -1837,7 +1880,7 @@ func titleDatabaseType(databaseType string) string {
 }
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
-func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
+func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's reviewed primary plan is a clean no-op.
@@ -1860,9 +1903,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	// than one is collapsed so the DDL doesn't dominate the comment while the
 	// unsafe/lint warnings and summary below stay visible at a glance.
 	if totalChanges == 1 {
-		writeKeyspaceChanges(sb, *plan)
+		writeKeyspaceChanges(sb, *plan, budget)
 	} else {
-		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements)
+		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements, budget)
 	}
 
 	// Blocked changes — statements the engine refuses; the apply will fail on
@@ -1919,13 +1962,13 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 // diffs for non-MySQL keyspaces — inside a collapsed <details> block. The
 // summary line carries the statement count so reviewers can gauge the size of
 // the change without expanding it.
-func writeCollapsibleKeyspaceChanges(sb *strings.Builder, plan PlanCommentData, totalStatements int) {
+func writeCollapsibleKeyspaceChanges(sb *strings.Builder, plan PlanCommentData, totalStatements int, budget *ddlBlockBudget) {
 	summary := "Show changes"
 	if totalStatements > 0 {
 		summary = fmt.Sprintf("Show SQL (%d %s)", totalStatements, pluralize("statement", totalStatements))
 	}
 	fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n\n", summary)
-	writeKeyspaceChanges(sb, plan)
+	writeKeyspaceChanges(sb, plan, budget)
 	sb.WriteString("</details>\n\n")
 }
 
@@ -2060,11 +2103,13 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 // them while the statements match. Comparing what the section says is the only
 // comparison that stays right as sections gain disclosures — a field-by-field
 // version silently drops each one added after it was written, and drops it from
-// the comment operators apply from.
+// the comment operators apply from. The sections are compared whole, never as
+// they would be cut to fit the comment: cut to the same length, two plans that
+// agree up to the cut and differ after it would read as one.
 func plansIdentical(a, b *PlanCommentData) bool {
 	var renderedA, renderedB strings.Builder
-	writeEnvironmentPlanSection(&renderedA, a)
-	writeEnvironmentPlanSection(&renderedB, b)
+	writeEnvironmentPlanSection(&renderedA, a, newUnboundedDDLBudget(countPlanDDLBlocks(a.Changes)))
+	writeEnvironmentPlanSection(&renderedB, b, newUnboundedDDLBudget(countPlanDDLBlocks(b.Changes)))
 	return renderedA.String() == renderedB.String()
 }
 

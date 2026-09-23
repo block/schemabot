@@ -106,10 +106,31 @@ func TestWebhookIgnoresUnknownEvents(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "ignored")
 }
 
+// A body larger than GitHub accepts is posted as the oversized-comment notice,
+// which keeps the comment's heading and, like any error comment, carries the
+// support footer.
+func TestRenderPRCommentReplacesAnOversizedBody(t *testing.T) {
+	cfg := &api.ServerConfig{
+		SupportChannel: api.SupportChannelConfig{
+			Name: "#schema-help",
+			URL:  "https://example.com/schema-help",
+		},
+	}
+	h := &Handler{service: api.New(nil, cfg, nil, testLogger()), logger: testLogger()}
+	body := "## Schema Change Apply — Production\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
+
+	posted := h.renderPRComment("octo/repo", 7, body)
+
+	assert.LessOrEqual(t, len(posted), templates.GitHubIssueCommentMaxChars)
+	assert.True(t, strings.HasPrefix(posted, "## Schema Change Apply — Production\n"), posted)
+	assert.Contains(t, posted, "too large to post")
+	assert.Contains(t, posted, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+}
+
 func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 	t.Run("disabled without service config", func(t *testing.T) {
 		h := &Handler{}
-		assert.Equal(t, "hello", h.renderPRComment("hello"))
+		assert.Equal(t, "hello", h.renderPRComment("octo/repo", 7, "hello"))
 	})
 
 	t.Run("does not append to normal comments", func(t *testing.T) {
@@ -121,7 +142,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("hello\n")
+		body := h.renderPRComment("octo/repo", 7, "hello\n")
 
 		assert.Equal(t, "hello\n", body)
 	})
@@ -135,7 +156,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderHelpComment())
+		body := h.renderPRComment("octo/repo", 7, templates.RenderHelpComment())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -149,7 +170,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderInvalidCommand())
+		body := h.renderPRComment("octo/repo", 7, templates.RenderInvalidCommand())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -163,7 +184,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.PreviewCommentApplyFailed())
+		body := h.renderPRComment("octo/repo", 7, templates.PreviewCommentApplyFailed())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -177,7 +198,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderSchemaChangeReconciliationRequired(templates.SchemaChangeReconciliationData{
+		body := h.renderPRComment("octo/repo", 7, templates.RenderSchemaChangeReconciliationRequired(templates.SchemaChangeReconciliationData{
 			RequestedBy: "alice",
 			Timestamp:   "2026-06-14 12:34:56",
 			Items: []templates.SchemaChangeReconciliationItem{{
@@ -200,7 +221,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderHelpComment())
+		body := h.renderPRComment("octo/repo", 7, templates.RenderHelpComment())
 
 		assert.Contains(t, body, `[team\]ops\\help](https://example.com/support)`)
 	})
@@ -214,8 +235,8 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		once := h.renderPRComment(templates.RenderHelpComment())
-		twice := h.renderPRComment(once)
+		once := h.renderPRComment("octo/repo", 7, templates.RenderHelpComment())
+		twice := h.renderPRComment("octo/repo", 7, once)
 
 		assert.Equal(t, once, twice)
 	})
@@ -229,7 +250,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+		body := h.renderPRComment("octo/repo", 7, "## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
 
 		assert.NotContains(t, body, "Support:")
 	})
@@ -243,7 +264,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.PreviewCommentUnsafeBlocked())
+		body := h.renderPRComment("octo/repo", 7, templates.PreviewCommentUnsafeBlocked())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -257,7 +278,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+		body := h.renderPRComment("octo/repo", 7, templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
 			{SchemaPath: "services/orders/schema", Database: "orders"},
 		}))
 
@@ -273,7 +294,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderPlanComment(templates.PlanCommentData{
+		body := h.renderPRComment("octo/repo", 7, templates.RenderPlanComment(templates.PlanCommentData{
 			Database:    "orders",
 			SchemaName:  "orders",
 			Environment: "staging",

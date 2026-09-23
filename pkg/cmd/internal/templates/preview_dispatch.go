@@ -188,6 +188,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentHelp())
 	case PreviewCommentSupportChannel:
 		fmt.Print(webhooktemplates.PreviewCommentSupportChannel())
+	case PreviewCommentOversized:
+		fmt.Print(webhooktemplates.PreviewCommentOversized())
 	case PreviewCommentErrors:
 		previewCommentErrorsOutput()
 	case PreviewCommentUnsafeBlocked:
