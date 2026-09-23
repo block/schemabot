@@ -53,6 +53,16 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 	// not required to have — the same reason the caller falls back to the plan's
 	// stored target when config does not resolve the environment.
 	if len(targets) == 1 {
+		// The lone target must be the one the plan was produced for. Pairing it
+		// with the apply's plan is only sound because they are the same member;
+		// were the route to resolve some other target, this would run the
+		// primary's DDL against a target nothing planned, which is the failure
+		// the per-member pairing below exists to prevent.
+		if targets[0].Deployment != plan.Deployment || targets[0].Target != plan.Target {
+			return nil, fmt.Errorf("apply for %s/%s resolves to the single rollout member %s, but its plan %s was produced for %s; re-plan the environment so the apply runs the plan its target was planned for",
+				plan.Database, environment, targets[0].MemberID(),
+				plan.PlanIdentifier, routing.ExecutionTarget{Deployment: plan.Deployment, Target: plan.Target}.MemberID())
+		}
 		return []applyMember{{Target: targets[0], Plan: plan}}, nil
 	}
 

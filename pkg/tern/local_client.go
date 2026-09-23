@@ -605,6 +605,12 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 	if !c.remapsPostgresNamespaces() {
 		return eng.Apply(ctx, req)
 	}
+	// Remapping rewrites the caller's request, so it is done on a copy: the
+	// caller keeps its logical namespaces, which is what it reports and stores.
+	// A shallow copy is enough because both rewritten fields are replaced
+	// outright rather than mutated in place — Changes through a cloned slice
+	// whose elements are values, SchemaFiles through a freshly built map — so
+	// nothing the copy shares with the original is written to.
 	requestCopy := *req
 	requestCopy.Changes = slices.Clone(req.Changes)
 	for i := range requestCopy.Changes {

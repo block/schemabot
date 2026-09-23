@@ -1692,8 +1692,11 @@ func settleConvergedMemberOperations(groups []*storage.ApplyOperationWithTasks, 
 		if len(group.Tasks) > 0 {
 			continue
 		}
+		// Completed, but never started: no driver claimed it and nothing ran on
+		// its target. Leaving StartedAt unset is what distinguishes it from an
+		// apply that ran and finished instantly, and keeps it out of the
+		// earliest-start calculation the apply's progress summary makes.
 		group.Operation.State = state.ApplyOperation.Completed
-		group.Operation.StartedAt = &now
 		group.Operation.CompletedAt = &now
 	}
 }

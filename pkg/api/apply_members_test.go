@@ -129,6 +129,24 @@ func TestResolveApplyMembers_SingleMemberNeedsNoDatabaseConfig(t *testing.T) {
 	assert.Same(t, plan, members[0].Plan)
 }
 
+// A lone rollout member runs the apply's plan without a lookup, which is only
+// sound when that member is the target the plan was produced for. A route that
+// resolves to some other target is refused rather than running the primary's
+// DDL against a target nothing planned.
+func TestResolveApplyMembers_SingleMemberMustBeThePlansOwnTarget(t *testing.T) {
+	plans := &listingPlanStore{listErr: errors.New("a single member needs no member-plan lookup")}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, &ServerConfig{}, map[string]tern.Client{}, logger)
+	plan := primaryPlanRow("testapp-001")
+
+	_, err := svc.resolveApplyMembers(t.Context(), plan, "production", []routing.ExecutionTarget{
+		{DatabaseType: plan.DatabaseType, Deployment: plan.Deployment, Target: "testapp-002"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "eu/testapp-002", "the refusal names the target that was resolved")
+	assert.Contains(t, err.Error(), "eu/testapp-001", "and the target the plan was produced for")
+}
+
 // Each target of a multi-target environment runs the plan stored for that
 // target in the review round the apply's own plan is the reviewed plan of.
 func TestResolveApplyMembers_IndependentMembersRunTheirOwnPlans(t *testing.T) {
@@ -325,7 +343,7 @@ func TestBuildApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t *testi
 	converged := groups[1].Operation
 	assert.Empty(t, groups[1].Tasks, "a converged member has no work to drive")
 	assert.Equal(t, state.ApplyOperation.Completed, converged.State)
-	require.NotNil(t, converged.StartedAt)
+	assert.Nil(t, converged.StartedAt, "a converged member never started: nothing ran on its target")
 	require.NotNil(t, converged.CompletedAt)
 	assert.Equal(t, pershardTestTime(), *converged.CompletedAt)
 }

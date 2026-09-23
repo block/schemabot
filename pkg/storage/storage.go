@@ -542,8 +542,8 @@ type PlanStore interface {
 	// rationale). Returned plans omit SchemaFiles — the full desired-schema
 	// DDL is the bulk of a plan row and listings never need it; fetch a single
 	// plan via Get for the complete record. Returns an error when opts.Limit
-	// is not positive, or when opts.PullRequest is set without
-	// opts.Repository.
+	// is not positive and opts.PrimaryPlanIdentifier is unset, or when
+	// opts.PullRequest is set without opts.Repository.
 	List(ctx context.Context, opts ListPlansOptions) ([]*Plan, error)
 
 	// Delete removes a plan by ID.
