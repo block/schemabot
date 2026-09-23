@@ -11,30 +11,34 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/localsetup"
 )
 
-// InitCmd uses explicit inputs for the shared initialization workflow. A future
-// wizard can collect the same inputs without implementing a second setup path.
+// InitCmd accepts explicit inputs or collects missing decisions in a terminal.
+// Both routes use the same initialization workflow.
 type InitCmd struct {
-	ReuseSchema bool     `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
-	Database    string   `short:"d" required:"" help:"Name to register for this database"`
-	Environment string   `short:"e" required:"" help:"Environment to initialize"`
-	Type        string   `required:"" enum:"mysql,postgres" help:"Database engine: mysql or postgres"`
-	DSN         string   `required:"" help:"Target connection as env:VARIABLE (credentials stay out of schema files)"`
-	StorageDSN  string   `name:"storage-dsn" required:"" help:"Existing separate state database as env:VARIABLE; startup initializes SchemaBot metadata tables"`
-	SchemaDir   string   `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
-	Namespaces  []string `name:"namespace" required:"" help:"Explicit namespace to import; repeat for multiple namespaces"`
-	Runtime     string   `default:"local" help:"Local runtime identity"`
-	JSON        bool     `name:"json" help:"Return the verified setup result as JSON"`
+	NonInteractive bool         `name:"non-interactive" help:"Never prompt; report missing inputs instead"`
+	interactive    bool         `kong:"-"`
+	progress       func(string) `kong:"-"`
+	ReuseSchema    bool         `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
+	Database       string       `short:"d" help:"Name to register for this database"`
+	Environment    string       `short:"e" help:"Environment to initialize"`
+	Type           string       `help:"Database engine: mysql or postgres"`
+	DSN            string       `help:"Target connection as env:VARIABLE or file:/absolute/path (credentials stay out of schema files)"`
+	Integrated     bool         `help:"Create a separate schemabot database on the application server for SchemaBot state"`
+	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE or file:/absolute/path; startup initializes SchemaBot metadata tables"`
+	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
+	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
+	Runtime        string       `default:"local" help:"Local runtime identity"`
+	JSON           bool         `name:"json" help:"Return the verified setup result as JSON"`
 }
 
 type initResult struct {
@@ -48,14 +52,37 @@ type initResult struct {
 }
 
 func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
-	result, err := cmd.initialize(ctx, g)
+	if err := cmd.collectInputs(ctx, g); err != nil {
+		if cmd.JSON && !errors.Is(err, ErrSilent) {
+			return client.ExitWithJSON("initialization_error", err.Error())
+		}
+		return err
+	}
+	result, err := cmd.initializeWithUI(ctx, g)
 	if err != nil {
+		if cmd.JSON {
+			return client.ExitWithJSON("initialization_error", err.Error())
+		}
 		return err
 	}
 	if cmd.JSON {
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
-	fmt.Printf("Imported %d tables into %s.\nBaseline plan: no changes.\nProfile %q is ready. Edit the schema, then run a plan.\n", result.Tables, result.SchemaDir, result.Profile)
+	display := *result
+	display.SchemaDir = cmd.SchemaDir
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load CLI configuration after initialization: %w", err)
+	}
+	defaultProfile := cfg.DefaultProfile
+	if defaultProfile == "" {
+		defaultProfile = "default"
+	}
+	invocation := cliname.Name()
+	if cliname.FromArgs(os.Args[1:]) == "" {
+		invocation = initCommandName(invocation, os.Args[0])
+	}
+	fmt.Print(initCompletion(&display, cmd.Environment, defaultProfile, invocation))
 	return nil
 }
 
@@ -63,9 +90,17 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if g.Endpoint != "" || g.Token != "" || os.Getenv("SCHEMABOT_ENDPOINT") != "" || os.Getenv("SCHEMABOT_TOKEN") != "" {
 		return nil, fmt.Errorf("local initialization cannot be combined with endpoint or authentication overrides")
 	}
-	for _, ref := range []string{cmd.DSN, cmd.StorageDSN} {
-		if !strings.HasPrefix(ref, "env:") || strings.TrimSpace(strings.TrimPrefix(ref, "env:")) == "" {
-			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE references")
+	if cmd.Integrated && cmd.StorageDSN != "" {
+		return nil, fmt.Errorf("choose --integrated or --storage-dsn, not both")
+	}
+	storage := api.StorageConfig{Dialect: cmd.Type, DSN: cmd.StorageDSN}
+	if cmd.Integrated {
+		storage.DSN = cmd.DSN
+		storage.Database = "schemabot"
+	}
+	for _, ref := range []string{cmd.DSN, storage.DSN} {
+		if !validInitConnectionReference(ref) {
+			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE or file:/absolute/path references")
 		}
 	}
 	namespaces, err := onboardPullNamespaces(cmd.Namespaces)
@@ -80,11 +115,13 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if existing, ok := cfg.Profiles[profile]; ok && !reflect.DeepEqual(existing, client.Profile{LocalRuntime: cmd.Runtime}) {
 		return nil, fmt.Errorf("profile %q already has a different connection; choose another --profile", profile)
 	}
-	root, err := filepath.Abs(cmd.SchemaDir)
+	reuse, err := initSchemaReuse(cmd.SchemaDir)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateInitSchemaDestination(root); err != nil {
+	cmd.ReuseSchema = cmd.ReuseSchema || reuse
+	root, err := filepath.Abs(cmd.SchemaDir)
+	if err != nil {
 		return nil, err
 	}
 	// Stage beside the destination so publication remains an atomic rename.
@@ -125,16 +162,33 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	manager := localruntime.Manager{Dir: dir, Binary: binary, Version: g.Version}
-	for _, ref := range []string{cmd.DSN, cmd.StorageDSN} {
-		if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(ref, "env:"))); err != nil {
-			return nil, fmt.Errorf("check %s before registering runtime: %w", ref, err)
+	cmd.reportProgress("Setting up your database connection...")
+	targetDSN, err := resolveInitConnection(cmd.DSN)
+	if err != nil {
+		return nil, err
+	}
+	if err := localsetup.CheckConnection(ctx, cmd.Type, targetDSN); err != nil {
+		return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.DSN, err)
+	}
+	registration := localsetup.Registration{
+		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
+		Connection: api.EnvironmentConfig{DSN: cmd.DSN}, Storage: storage,
+	}
+	if cmd.Integrated {
+		cmd.reportProgress("Preparing a separate schemabot database on your server...")
+		if err := localsetup.PrepareIntegratedStorage(ctx, manager, registration); err != nil {
+			return nil, err
+		}
+	} else {
+		stateDSN, err := resolveInitConnection(cmd.StorageDSN)
+		if err != nil {
+			return nil, err
+		}
+		if err := localsetup.CheckConnection(ctx, cmd.Type, stateDSN); err != nil {
+			return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err)
 		}
 	}
-	_, err = localsetup.Register(manager, localsetup.Registration{
-		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
-		Connection: api.EnvironmentConfig{DSN: cmd.DSN},
-		Storage:    api.StorageConfig{Dialect: cmd.Type, DSN: cmd.StorageDSN},
-	})
+	_, err = localsetup.Register(manager, registration)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +200,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 }
 
 func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces []string, exclusions client.PlanExclusions) (*initResult, error) {
+	cmd.reportProgress("Starting SchemaBot...")
 	startupCtx, cancelStartup := context.WithTimeout(ctx, 30*time.Second)
 	connection, err := manager.Ensure(startupCtx)
 	cancelStartup()
@@ -153,7 +208,8 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		return nil, err
 	}
 	client.SetLocalAuth(connection.Token, connection.Endpoint)
-	pulled, err := client.CallPullSchemaAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, namespaces...)
+	cmd.reportProgress("Reading your live schema...")
+	pulled, err := client.CallPullSchemaAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{Namespaces: namespaces})
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
 	}
@@ -166,13 +222,15 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 			return nil, err
 		}
 	}
-	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false)
+	cmd.reportProgress("Checking that your schema files match...")
+	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	cmd.reportProgress("Saving your schema files and connection...")
 	if err := publishVerifiedInitSchema(stage, root, baseline, cmd.Database, cmd.Environment); err != nil {
 		return nil, err
 	}
@@ -291,6 +349,12 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 		return nil
 	})
 	return result, err
+}
+
+func (cmd *InitCmd) reportProgress(message string) {
+	if cmd.progress != nil {
+		cmd.progress(message)
+	}
 }
 
 func retainedInitError(err error) error {

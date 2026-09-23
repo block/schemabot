@@ -174,8 +174,8 @@ func TestFormatStatusCommentRoutesMultiDeployment(t *testing.T) {
 	body := o.formatStatusComment(runningApply(), nil)
 
 	assert.Contains(t, body, "**Deployments**: 1 completed, 1 running")
-	assert.Contains(t, body, "- ✅ eu — completed")
-	assert.Contains(t, body, "- 🔄 us — running table copy")
+	assert.Contains(t, body, "- ✅ `eu` — completed")
+	assert.Contains(t, body, "- 🔄 `us` — running table copy")
 }
 
 // A single-operation apply (every apply today, until fan-out lands) renders the
@@ -215,8 +215,8 @@ func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.Contains(t, body, "**Deployments**: 2 completed")
-	assert.Contains(t, body, "- ✅ eu — completed")
-	assert.Contains(t, body, "- ✅ us — completed")
+	assert.Contains(t, body, "- ✅ `eu` — completed")
+	assert.Contains(t, body, "- ✅ `us` — completed")
 }
 
 // A single-operation terminal apply renders the single-deployment summary

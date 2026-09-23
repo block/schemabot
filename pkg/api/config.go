@@ -211,6 +211,17 @@ type ServerConfig struct {
 	// key wins over this server-level value.
 	Spirit SpiritConfig `yaml:"spirit,omitempty"`
 
+	// DirectExecution is the server-wide direct execution policy. It applies
+	// to every MySQL database this server plans and applies, including the
+	// ones a data plane resolves through its target resolver, which carry no
+	// per-database config at all. A database environment's own
+	// direct_execution block replaces this policy whole rather than merging
+	// field by field, so an override can never enable direct execution while
+	// inheriting a row bound stated somewhere else, and an override that
+	// disables it is a complete opt out. Unset (the default) leaves refused
+	// statements blocked everywhere.
+	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
+
 	// PlanetScale configures process-wide behavior for the Vitess engine's
 	// connections to PlanetScale-compatible endpoints. It applies to every
 	// Vitess database this server drives, unlike the per-database tls block,
@@ -663,6 +674,9 @@ type GitHubAppConfig = GitHubConfig
 
 // StorageConfig configures SchemaBot's internal storage database.
 type StorageConfig struct {
+	// Database selects a separate database while retaining the DSN secret reference.
+	Database string `yaml:"database,omitempty"`
+
 	// DSN is the MySQL connection string for SchemaBot's internal database.
 	// Can be a direct DSN or a reference (e.g., "env:MYSQL_DSN" to read from env var).
 	DSN string `yaml:"dsn"`
@@ -1193,11 +1207,14 @@ type EnvironmentConfig struct {
 	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
 	// When enabled, a refused statement whose table's estimated row count is
 	// within max_table_rows runs verbatim as native MySQL DDL: synchronous,
-	// blocking writes to the table while it runs, and not revertible. When
-	// unset or disabled (the default), refused statements are blocked. Only
+	// blocking writes to the table while it runs, and not revertible. Only
 	// valid for MySQL databases: setting this block on any other database
 	// type fails config validation, even when disabled, so a policy that can
 	// never take effect is never silently carried in config.
+	//
+	// This block overrides the server-wide policy whole for this environment.
+	// Unset, the server-wide policy applies; set and disabled, this
+	// environment opts out of it.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
 
 	// For PlanetScale/Vitess:
@@ -1244,14 +1261,40 @@ type DirectExecutionConfig struct {
 	LockAcquisitionTimeout string `yaml:"lock_acquisition_timeout,omitempty"`
 }
 
+// Validate ensures a configured direct execution policy is well-formed.
+// Enabling direct execution requires a positive max_table_rows bound so the
+// size gate can never be accidentally unbounded. The lock timeout is checked
+// even while the policy is disabled, so a malformed value fails at startup
+// rather than the first time someone enables the policy.
+func (c *DirectExecutionConfig) Validate(context string) error {
+	if c == nil {
+		return nil
+	}
+	if c.Enabled && c.MaxTableRows <= 0 {
+		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required)", context, c.MaxTableRows)
+	}
+	if _, err := c.lockAcquisitionTimeoutSeconds(); err != nil {
+		return fmt.Errorf("%s direct_execution: %w", context, err)
+	}
+	return nil
+}
+
 // EngineMetadata resolves the policy into the engine metadata keys a
 // data-plane client forwards with request credentials. Returns nil when the
 // policy is absent or disabled. Every client assembly path must build its
 // direct-execution metadata here, so the forwarded keys and fields cannot
 // drift between paths.
 func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
-	if c == nil || !c.Enabled {
+	if c == nil {
 		return nil, nil
+	}
+	// An explicit opt-out states itself rather than rendering nothing.
+	// Absent and disabled mean different things — nothing here versus "this
+	// environment does not grant direct execution" — and a renderer that maps
+	// both to an empty map lets a server-wide grant overlay an opt-out that
+	// was written deliberately.
+	if !c.Enabled {
+		return map[string]string{engine.MetadataDirectExecution: "false"}, nil
 	}
 	md := map[string]string{
 		engine.MetadataDirectExecution:             "true",
@@ -1884,6 +1927,15 @@ func (c *ServerConfig) Validate() error {
 		if _, err := c.PendingDropsRetention(); err != nil {
 			return err
 		}
+	}
+	// The server-wide policy carries no database type, so unlike a
+	// per-database block it is not rejected on a server that also registers
+	// non-MySQL databases: it simply never reaches their engines.
+	if err := c.DirectExecution.Validate("server config"); err != nil {
+		return err
+	}
+	if err := c.validateServerDirectExecutionReachesAnEngine(); err != nil {
+		return err
 	}
 	if err := validateRateLimits(c.RateLimits); err != nil {
 		return err
@@ -3298,6 +3350,14 @@ func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
 // STORAGE_DSN environment variable, then to MYSQL_DSN, which is honored for
 // every storage dialect as the legacy fallback name.
 func (c *ServerConfig) StorageDSN() (string, error) {
+	dsn, err := c.resolveStorageDSN()
+	if err != nil || c.Storage.Database == "" {
+		return dsn, err
+	}
+	return storageDatabaseDSN(c.Storage.Dialect, dsn, c.Storage.Database)
+}
+
+func (c *ServerConfig) resolveStorageDSN() (string, error) {
 	if c.Storage.DSNFrom != nil {
 		return c.Storage.DSNFrom.Resolve()
 	}
@@ -3399,18 +3459,100 @@ func (c EnvironmentConfig) validateDirectExecution(context, databaseType string)
 	if c.DirectExecution == nil {
 		return nil
 	}
-	if databaseType != storage.DatabaseTypeMySQL {
+	if !directExecutionSupported(databaseType) {
 		return fmt.Errorf("%s sets direct_execution, which is only supported for %s databases (type is %q)", context, storage.DatabaseTypeMySQL, databaseType)
 	}
-	if c.DirectExecution.Enabled && c.DirectExecution.MaxTableRows <= 0 {
-		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required)", context, c.DirectExecution.MaxTableRows)
+	return c.DirectExecution.Validate(context)
+}
+
+// directExecutionSupported reports whether an engine for this database type
+// routes the statements it refuses under the direct execution policy. A type
+// is listed here only once its engine reads the policy and applies both of its
+// bounds; anything else would turn a config that looks like a grant into a
+// silent no-op, which is what the gate exists to prevent.
+//
+// The MySQL engine is the one that does. Vitess is excluded by design: raw DDL
+// against vtgate bypasses Vitess online DDL, which is the reason that engine
+// exists. PostgreSQL is excluded because its engine has no refusal detector,
+// size estimator, or lock-bounded executor for the policy to drive. Strata is
+// excluded for the same reason: it plans through its own sharded planner
+// rather than through a refusal-detecting one, and the per-shard delegate it
+// drives receives a target DSN rather than the caller's policy.
+func directExecutionSupported(databaseType string) bool {
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return true
+	case storage.DatabaseTypeVitess, storage.DatabaseTypePostgres, storage.DatabaseTypeStrata:
+		return false
+	default:
+		// Reached through a target resolver rather than through `databases:`,
+		// whose type allowlist admits only the cases above. A resolver names
+		// the engine behind each target it returns, an embedder registers
+		// that engine, and nothing pins the policy contract on either. Take
+		// the conservative disposition — a statement the engine refuses stays
+		// blocked — rather than granting native DDL to an engine that may
+		// never read the bound.
+		return false
 	}
-	// Validated even when the block is disabled: a malformed value must fail
-	// at startup, never be silently carried until the policy is enabled.
-	if _, err := c.DirectExecution.lockAcquisitionTimeoutSeconds(); err != nil {
-		return fmt.Errorf("%s direct_execution: %w", context, err)
+}
+
+// validateServerDirectExecutionReachesAnEngine rejects a server-wide policy no
+// engine on this server can honor. The policy is engine-agnostic by design and
+// is expected to be partly inert on a mixed fleet — that is what lets one
+// statement of it cover every database. Reaching nothing at all is different:
+// it is a policy an operator believes is in force and that will never route a
+// statement, which is the same failure a per-database block on the wrong
+// engine is rejected for.
+//
+// A target resolver is the exemption. Its targets are resolved per request and
+// their engines are not knowable from config, so a server holding one can
+// state a policy for databases it has never seen.
+func (c *ServerConfig) validateServerDirectExecutionReachesAnEngine() error {
+	if c.DirectExecution == nil || !c.DirectExecution.Enabled {
+		return nil
 	}
-	return nil
+	if c.TargetResolver.Enabled() {
+		return nil
+	}
+	for _, db := range c.DatabaseConfigs() {
+		if directExecutionSupported(db.Type) {
+			return nil
+		}
+	}
+	return fmt.Errorf("server config sets direct_execution, which no registered database can honor: it is only supported for %s databases", storage.DatabaseTypeMySQL)
+}
+
+// ResolveDirectExecution returns the direct execution policy in force for one
+// database environment: the environment's own block when it states one,
+// otherwise the server-wide policy. The override replaces the server policy
+// whole, so an environment that states the policy disabled opts out of a
+// global grant instead of inheriting its bound.
+//
+// The server-wide policy reaches only the engines that can honor it. An
+// explicit per-database block is rejected at startup on every other database
+// type, so this filter can only ever drop the global default, never a
+// deliberate per-database grant — which is the silent-ignore that validation
+// exists to prevent.
+//
+// envConfig is nil for a database this server holds no registration for,
+// which is the ordinary shape on a data plane: it resolves an opaque target
+// per request and has only the server-wide policy to go on.
+func (c *ServerConfig) ResolveDirectExecution(envConfig *EnvironmentConfig, databaseType string) *DirectExecutionConfig {
+	if envConfig != nil && envConfig.DirectExecution != nil {
+		return envConfig.DirectExecution
+	}
+	if !directExecutionSupported(databaseType) {
+		return nil
+	}
+	return c.DirectExecution
+}
+
+// DirectExecutionMetadata resolves the policy in force for one database
+// environment into engine metadata entries. It is the single entry point for
+// every client assembly path, so no path can read the per-database block
+// without also honoring the server-wide policy behind it.
+func (c *ServerConfig) DirectExecutionMetadata(envConfig *EnvironmentConfig, databaseType string) (map[string]string, error) {
+	return c.ResolveDirectExecution(envConfig, databaseType).EngineMetadata()
 }
 
 func (c *DSNFromConfig) Validate(context string) error {

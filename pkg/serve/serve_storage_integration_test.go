@@ -3,8 +3,13 @@
 package serve
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/testcontainers/testcontainers-go"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -166,4 +171,35 @@ func TestBuildCarriesLocalHostingToTheStorageSchemaAdapter(t *testing.T) {
 	require.True(t, ok, "the server registers its own adapter")
 	assert.NoError(t, deployedAdapter.checkDestructiveOptIn(true),
 		"the same request is honored on a normally hosted server")
+}
+
+func TestConnectStorageMySQLReadsPlanTimestamps(t *testing.T) {
+	ctx := t.Context()
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", "schemabot"), Started: true,
+	})
+	require.NoError(t, err)
+	testcontainers.CleanupContainer(t, container)
+	dsn, err := testutil.MySQLDSN(ctx, container, "schemabot")
+	require.NoError(t, err)
+	for i, option := range []string{"", "?parseTime=false", "?parseTime=true"} {
+		t.Run(fmt.Sprintf("option_%d", i), func(t *testing.T) {
+			cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: dsn + option}}
+			db, _, err := connectStorage(t.Context(), cfg, schema.DialectMySQL, slog.New(slog.DiscardHandler))
+			require.NoError(t, err)
+			t.Cleanup(func() { utils.CloseAndLog(db) })
+			store, err := newStore(schema.DialectMySQL, db)
+			require.NoError(t, err)
+			plan := &storage.Plan{PlanIdentifier: fmt.Sprintf("timestamp-plan-%d", i), Database: "app", DatabaseType: "mysql", Environment: "development", CreatedAt: time.Now().UTC().Truncate(time.Second)}
+			_, err = store.Plans().Create(t.Context(), plan)
+			require.NoError(t, err)
+			loaded, err := store.Plans().Get(t.Context(), plan.PlanIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, loaded)
+			require.True(t, plan.CreatedAt.Equal(loaded.CreatedAt))
+			var now time.Time
+			require.NoError(t, db.QueryRowContext(t.Context(), "SELECT NOW(6)").Scan(&now))
+			require.False(t, now.IsZero())
+		})
+	}
 }

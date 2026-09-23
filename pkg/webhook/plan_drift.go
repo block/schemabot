@@ -89,6 +89,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 	for i, e := range rollup.Entries {
 		entry := templates.DeploymentDriftEntry{
 			Deployment: e.Deployment,
+			Target:     e.Target,
 			Primary:    i == 0,
 			Class:      e.Class.String(),
 			Blocked:    e.Blocked,
@@ -137,6 +138,16 @@ func describeDriftDiff(diff tern.ChangeSetDiff) string {
 	return strings.Join(parts, ", ") + " change(s) vs the reviewed plan"
 }
 
+// rollupMemberNames renders each rollup entry the way an operator addresses it,
+// index-parallel to rollup.Entries.
+func rollupMemberNames(rollup api.PlanRollup) []string {
+	members := make([]routing.ExecutionTarget, len(rollup.Entries))
+	for i, e := range rollup.Entries {
+		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
+	}
+	return routing.DisplayNames(members)
+}
+
 // maxDriftSummaryLen bounds the stored drift summary to the checks table's
 // change_summary column width. The summary is truncated on a rune boundary so it
 // never exceeds the column or splits a multibyte character.
@@ -153,13 +164,17 @@ const maxDriftSummaryLen = 255
 // differ would point the incident at the wrong thing.
 func summarizeReviewDrift(rollup api.PlanRollup) string {
 	independent := rollup.Planning == api.PlanIndependent
+	// One deployment can address several targets, so the deployment name alone
+	// does not always say which member failed. The shared naming rule adds the
+	// target only where it disambiguates.
+	names := rollupMemberNames(rollup)
 	var diverged, errored []string
-	for _, entry := range rollup.Entries {
+	for i, entry := range rollup.Entries {
 		switch entry.Class {
 		case api.DeploymentDiverged:
-			diverged = append(diverged, entry.Deployment)
+			diverged = append(diverged, names[i])
 		case api.DeploymentErrored:
-			errored = append(errored, entry.Deployment)
+			errored = append(errored, names[i])
 		}
 	}
 
@@ -185,6 +200,8 @@ func summarizeReviewDrift(rollup api.PlanRollup) string {
 		}
 		return "drift blocks apply: deployments differ from the reviewed plan"
 	}
+	// Targets that hold their own schemas are never expected to agree, so their
+	// failure is an unplanned target, not drift between them.
 	if independent {
 		return clampDriftSummary("blocks apply — " + strings.Join(parts, "; "))
 	}

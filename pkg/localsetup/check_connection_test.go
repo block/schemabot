@@ -2,6 +2,7 @@ package localsetup
 
 import (
 	"context"
+	"errors"
 	"net"
 	"syscall"
 	"testing"
@@ -20,9 +21,21 @@ func TestConnectionErrorsNeverExposeDSN(t *testing.T) {
 			err := CheckConnection(t.Context(), engine, dsn)
 			require.Error(t, err)
 			require.NotContains(t, err.Error(), secret)
+			_, err = DiscoverNamespaces(t.Context(), engine, dsn)
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), secret)
 			require.Error(t, CheckConnection(t.Context(), engine, ""))
+			_, err = DiscoverNamespaces(t.Context(), engine, "")
+			require.Error(t, err)
 		})
 	}
+}
+
+func TestConnectionErrorRetainsCause(t *testing.T) {
+	cause := errors.New("driver detail with private connection material")
+	err := &setupConnectionError{message: "Check the connection", cause: cause}
+	require.ErrorIs(t, err, cause)
+	require.EqualError(t, err, "Check the connection: connection could not be verified")
 }
 
 func TestConnectionFailureCategories(t *testing.T) {

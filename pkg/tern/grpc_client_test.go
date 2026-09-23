@@ -9449,3 +9449,43 @@ func TestGRPCClient_StoppedTasklessOperationStaysStoppedWithoutAStartRequest(t *
 	assert.True(t, state.IsState(operations.ops[operationID].State, state.ApplyOperation.Stopped),
 		"the operation stays stopped, but is %q", operations.ops[operationID].State)
 }
+
+// A rollout member planned against its own live schema names its plan on its
+// operation row, and the dispatch must run that plan rather than the apply's —
+// the apply's plan describes the primary's target, so dispatching it would send
+// one target's DDL to another and record the wrong plan identifier against the
+// member's work.
+func TestApplyTaskScopePlanID(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 10}
+
+	t.Run("a whole-apply drive runs the apply's plan", func(t *testing.T) {
+		planID, err := applyTaskScope{}.planID(apply)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), planID)
+	})
+
+	t.Run("a member that shares the reviewed plan runs the apply's plan", func(t *testing.T) {
+		scope := applyTaskScope{operation: &storage.ApplyOperation{ID: 1, Target: "testapp-001"}}
+		planID, err := scope.planID(apply)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), planID)
+	})
+
+	t.Run("a member planned on its own runs its own plan", func(t *testing.T) {
+		scope := applyTaskScope{operation: &storage.ApplyOperation{ID: 2, Target: "testapp-002", PlanID: 11}}
+		planID, err := scope.planID(apply)
+		require.NoError(t, err)
+		assert.Equal(t, int64(11), planID)
+	})
+
+	t.Run("an operation with no plan on either row is not dispatchable", func(t *testing.T) {
+		scope := applyTaskScope{operation: &storage.ApplyOperation{ID: 3, Deployment: "eu"}}
+		_, err := scope.planID(&storage.Apply{ApplyIdentifier: "apply-2"})
+		require.Error(t, err)
+	})
+
+	t.Run("a whole-apply drive with no plan is not dispatchable", func(t *testing.T) {
+		_, err := applyTaskScope{}.planID(&storage.Apply{ApplyIdentifier: "apply-3"})
+		require.Error(t, err)
+	})
+}

@@ -606,6 +606,12 @@ func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, re
 	if !c.remapsPostgresNamespaces() {
 		return eng.Apply(ctx, req)
 	}
+	// Remapping rewrites the caller's request, so it is done on a copy: the
+	// caller keeps its logical namespaces, which is what it reports and stores.
+	// A shallow copy is enough because both rewritten fields are replaced
+	// outright rather than mutated in place — Changes through a cloned slice
+	// whose elements are values, SchemaFiles through a freshly built map — so
+	// nothing the copy shares with the original is written to.
 	requestCopy := *req
 	requestCopy.Changes = slices.Clone(req.Changes)
 	for i := range requestCopy.Changes {
@@ -3090,6 +3096,14 @@ func (c *LocalClient) getEngine() engine.Engine {
 // configured actually reached it.
 func (c *LocalClient) Engine() engine.Engine {
 	return c.getEngine()
+}
+
+// Metadata returns the engine metadata this client runs under, exposed for
+// the same reason as Engine: a caller that assembles a LocalClient can verify
+// that the server policy it composed actually reached the client, rather than
+// only that the composition helper returns the right map.
+func (c *LocalClient) Metadata() map[string]string {
+	return maps.Clone(c.config.Metadata)
 }
 
 // Progress returns detailed progress for an active schema change.

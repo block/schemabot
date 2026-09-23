@@ -33,8 +33,8 @@ func stageExistingInitSchema(root, stage, database, engine, environment string, 
 	if err != nil {
 		return client.PlanExclusions{}, err
 	}
-	if cfg.Database != database || cfg.Type != engine {
-		return client.PlanExclusions{}, fmt.Errorf("existing schema configuration names a different database or engine")
+	if err := checkInitSchemaIdentity(cfg, root, database, engine); err != nil {
+		return client.PlanExclusions{}, err
 	}
 	files, _, err := schema.GroupFilesByNamespace(snapshot, filepath.Base(root), environment, cfg.IgnoreNamespaces)
 	if err != nil {
@@ -69,4 +69,23 @@ func validateInitSchemaDestination(root string) error {
 		return fmt.Errorf("choose an empty --schema-dir or provide a valid schemabot.yaml to reuse your files: %w", err)
 	}
 	return nil
+}
+
+func checkInitSchemaIdentity(cfg *CLIConfig, root, database, engine string) error {
+	if cfg.Database != database || cfg.Type != engine {
+		return fmt.Errorf("%q is configured for %q (%s), but you selected %q (%s). Choose another folder, or go back and use the existing project’s database and engine", root, cfg.Database, cfg.Type, database, engine)
+	}
+	return nil
+}
+
+func validateInitSchemaReuse(root, database, engine string) (bool, error) {
+	reuse, err := initSchemaReuse(root)
+	if err != nil || !reuse {
+		return reuse, err
+	}
+	cfg, err := LoadCLIConfig(root)
+	if err != nil {
+		return false, err
+	}
+	return true, checkInitSchemaIdentity(cfg, root, database, engine)
 }

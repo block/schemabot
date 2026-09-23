@@ -167,6 +167,11 @@ shard independently; it does not prove every copy in the fleet matches.
 The primary is first in the configured rollout order, otherwise first
 alphabetically. The pull request has no deployment selector.
 
+The one exception is an environment that lists `targets`, whose members each
+hold their own schema. There a pull reads every target and reports how they
+differ, because no single target's schema speaks for the environment. See
+[Databases that span several targets](#databases-that-span-several-targets).
+
 ### Read structured columns and indexes
 
 A normal
@@ -309,6 +314,85 @@ question.
 A clean audit returns `lint: []`; an omitted field means lint was not requested.
 Pull runs schema-shape rules only. Rules about proposed changes, such as unsafe
 drops, require a plan. See [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
+
+### Databases that span several targets
+
+A database whose environment lists `targets` addresses several targets at once,
+and each holds its own schema. There is no single live schema to return, so a
+pull returns the primary target's — the one a caller materializes — plus a
+`targets` array naming every target the environment addresses and how each of
+the others differs from the primary.
+
+```sh
+schemabot pull -d shop -e production
+```
+
+```sql
+-- Target `shop-001` — primary target, whose schema is below
+-- Target `shop-002` — same schema as the primary target
+-- Target `shop-003` — 2 tables differ from the primary target
+--   shop.audit_log: differs
+--   shop.order_events: missing
+```
+
+<details>
+<summary>API equivalent</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production"}
+```
+
+```json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "production",
+  "table_count": 4,
+  "namespaces": {
+    "shop": {"tables": {"…": "CREATE TABLE …"}}
+  },
+  "targets": [
+    {"deployment": "commerce-a", "target": "shop-001", "table_count": 4, "primary": true},
+    {"deployment": "commerce-a", "target": "shop-002", "table_count": 4},
+    {"deployment": "commerce-a", "target": "shop-003", "table_count": 3, "diverged_tables": [
+      {"namespace": "shop", "table": "audit_log", "difference": "differs"},
+      {"namespace": "shop", "table": "order_events", "difference": "only_on_primary"}
+    ]}
+  ]
+}
+```
+
+</details>
+
+Read the array as the environment's whole member set. Exactly one entry carries
+`"primary": true`, and it is the target whose schema is in `namespaces`; it
+never carries `diverged_tables`, because it is the baseline the others are
+compared against. A reconciling caller can take the member set straight from
+this array rather than deriving it from target names.
+
+`difference` is one of:
+
+| Value | Meaning |
+|---|---|
+| `differs` | both targets hold the table, with different DDL |
+| `only_on_primary` | only the primary target holds the table |
+| `only_on_target` | only this target holds the table |
+
+An empty `diverged_tables` means the two targets genuinely agree. It never means
+the comparison was skipped: a target that cannot be pulled, or whose DDL cannot
+be parsed, fails the whole pull rather than being reported as converged.
+
+Tables are compared by their canonical parsed form, so a difference in
+whitespace or keyword case is not divergence. The canonical form preserves the
+order clauses were written in, so two targets holding the same columns and
+indexes in a different order are reported as `differs`. The comparison errs
+toward reporting: it will send you to look at a table that turns out to agree,
+but it will not call two different schemas equal.
+
+An environment that does not list `targets` carries no `targets` array at all.
 
 ### Engine support
 
@@ -501,7 +585,12 @@ from the server's build phase and its counters; it stays below 100 until the
 apply completes and holds its last value between phases (see
 [postgresql.md](postgresql.md)).
 Sharded engines can add per-shard progress, and multi-deployment applies list
-operations with their deployment, target, state, and cutover policy.
+operations with their deployment, target, state, and cutover policy. A rollout's
+table entries carry `deployment` and `target`, naming the member whose copy the
+row reports. Attribute a table by the pair, never by `deployment` alone: one
+deployment can address several targets, each running its own copy of the change,
+so several rows for the same table share a deployment and differ only in their
+target. Both fields are absent on an apply that runs against a single target.
 The top-level `metadata` object carries engine-specific display fields when the
 engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
@@ -539,6 +628,54 @@ Response excerpt (illustrative values):
   ]
 }
 ```
+
+</details>
+
+<details>
+<summary>Multi-target rollout response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-75
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-75",
+  "database": "shop",
+  "environment": "production",
+  "engine": "spirit",
+  "state": "running",
+  "operations": [
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling"},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "rolling"}
+  ],
+  "tables": [
+    {
+      "table_name": "orders",
+      "deployment": "commerce-a",
+      "target": "shop-001",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
+      "status": "completed",
+      "percent_complete": 100
+    },
+    {
+      "table_name": "orders",
+      "deployment": "commerce-a",
+      "target": "shop-002",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
+      "status": "running",
+      "rows_copied": 2000000,
+      "rows_total": 8000000,
+      "percent_complete": 25
+    }
+  ]
+}
+```
+
+Both rows report the same table under the same deployment, and only `target`
+tells them apart.
 
 </details>
 

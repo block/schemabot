@@ -217,20 +217,23 @@ func TestApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
 func TestMultiDeploymentApplyCommentsShareOneDDLBudget(t *testing.T) {
 	withTemplateTimestamp(t, "2026-06-16 19:43:00 UTC")
 	limit := commentBodyLimit - applyCommentAppendReserve
-	details := map[string]ApplyStatusCommentData{}
 	ops := make([]presentation.Operation, 0, 3)
 	for _, dep := range []string{"us", "eu", "ap"} {
 		ops = append(ops, continuingOp(dep, so.Completed))
-		details[dep] = ApplyStatusCommentData{
-			Database:    "payments_" + dep,
+	}
+	model := presentation.Derive(ops)
+	details := make([]*ApplyStatusCommentData, 0, len(model.Deployments))
+	for _, d := range model.Deployments {
+		details = append(details, &ApplyStatusCommentData{
+			Database:    "payments_" + d.Deployment,
 			Environment: "production",
 			Engine:      "Spirit",
 			State:       state.Apply.Completed,
-			Tables:      greenfieldTables(dep+"_events", 60, state.Task.Completed),
-		}
+			Tables:      greenfieldTables(d.Deployment+"_events", 60, state.Task.Completed),
+		})
 	}
 	data := MultiDeploymentApplyData{
-		Model:       presentation.Derive(ops),
+		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "production",
 		Details:     details,

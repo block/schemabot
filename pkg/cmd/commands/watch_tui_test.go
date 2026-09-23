@@ -388,9 +388,9 @@ func multiDeploymentTUITestProgress() apitypes.ProgressResponse {
 			{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 		},
 		Tables: []*apitypes.TableProgressResponse{
-			{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
-			{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed},
-			{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
+			{Deployment: "us-east", Target: "orders-us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+			{Deployment: "eu-west", Target: "orders-eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed},
+			{Deployment: "ap-south", Target: "orders-ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
 		},
 	}
 }
@@ -723,4 +723,33 @@ func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
 	_, err := client.GetProgress(srv.URL, "test-apply-id")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "500")
+}
+
+// Two targets of one deployment each copy the same tables against their own
+// schema. The watch view lists each member's own copies under that member, so a
+// deployment addressing several targets does not show every copy twice.
+func TestWatchModel_MultiTargetSectionsScopeTablesToTheirMember(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testapp", "production", false)
+	m.applyID = "apply-multi-target"
+	m.state = state.Apply.Running
+	m.initialized = true
+	m.operations = []templates.ProgressOperation{
+		{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+	}
+	m.tables = []templates.TableProgress{
+		{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", Status: state.Task.Completed},
+		{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", Status: state.Task.Running},
+	}
+
+	view := m.View()
+
+	assertContainsInOrder(t, view,
+		"primary/testapp-001",
+		"users_001",
+		"primary/testapp-002",
+		"users_002",
+	)
+	assert.Equal(t, 1, strings.Count(view, "users_001"))
+	assert.Equal(t, 1, strings.Count(view, "users_002"))
 }

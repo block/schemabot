@@ -197,7 +197,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	}
 
 	sb.WriteString("**" + glyph.Escalation + " To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
-	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
+	applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
