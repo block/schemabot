@@ -136,6 +136,35 @@ func TestMultiEnvPlanCommentBudgetsIdenticalPlansAsOneSection(t *testing.T) {
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
 }
 
+// Whether two environments' plans are the same is decided on the whole plans,
+// not on what a comment has room to show of them: two greenfield plans that
+// agree for far more DDL than a comment holds and differ in their last table
+// render as two sections, each cut to fit, rather than as one combined section
+// that silently drops the environment that differs.
+func TestMultiEnvPlanCommentKeepsPlansApartThatDifferPastTheCut(t *testing.T) {
+	staging := greenfieldPlan("staging", "events", 200)
+	production := greenfieldPlan("production", "events", 200)
+	staging.Changes[0].Keyspace, production.Changes[0].Keyspace = "everlog", "everlog"
+	statements := production.Changes[0].Statements
+	last := len(statements) - 1
+	statements[last] = strings.Replace(statements[last], "`currency` char(3)", "`currency` char(4)", 1)
+	require.NotEqual(t, staging.Changes[0].Statements[last], statements[last])
+	require.Greater(t, len(RenderPlanComment(staging)), commentBodyLimit-256, "each plan alone overfills a comment")
+
+	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "everlog",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	assert.NotContains(t, body, "### Staging & Production")
+	assert.Contains(t, body, "### Staging")
+	assert.Contains(t, body, "### Production")
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+}
+
 // An apply comment leaves a fixed reserve under the limit for the sections the
 // poster appends after rendering — the rejected-command notice and, on a
 // failure, the recent-logs fold — so a large apply cannot crowd them out.

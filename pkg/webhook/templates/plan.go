@@ -2047,11 +2047,13 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 // them while the statements match. Comparing what the section says is the only
 // comparison that stays right as sections gain disclosures — a field-by-field
 // version silently drops each one added after it was written, and drops it from
-// the comment operators apply from.
+// the comment operators apply from. The sections are compared whole, never as
+// they would be cut to fit the comment: cut to the same length, two plans that
+// agree up to the cut and differ after it would read as one.
 func plansIdentical(a, b *PlanCommentData) bool {
 	var renderedA, renderedB strings.Builder
-	writeEnvironmentPlanSection(&renderedA, a, newDDLBlockBudget(countPlanDDLBlocks(a.Changes), commentBodyLimit))
-	writeEnvironmentPlanSection(&renderedB, b, newDDLBlockBudget(countPlanDDLBlocks(b.Changes), commentBodyLimit))
+	writeEnvironmentPlanSection(&renderedA, a, newUnboundedDDLBudget(countPlanDDLBlocks(a.Changes)))
+	writeEnvironmentPlanSection(&renderedB, b, newUnboundedDDLBudget(countPlanDDLBlocks(b.Changes)))
 	return renderedA.String() == renderedB.String()
 }
 

@@ -1,6 +1,9 @@
 package templates
 
-import "strings"
+import (
+	"math"
+	"strings"
+)
 
 // minimumFenceLength is the shortest backtick run CommonMark accepts as a
 // code fence.
@@ -57,6 +60,14 @@ type ddlBlockBudget struct {
 // render the given number of DDL blocks into at most limit bytes of DDL.
 func newDDLBlockBudget(blocks, limit int) *ddlBlockBudget {
 	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks}
+}
+
+// newUnboundedDDLBudget opens a budget no DDL can exhaust, for a render that is
+// compared rather than posted. Two sections cut to fit a comment share a prefix
+// wherever their statements do, so comparing the cut renders would call plans
+// identical that differ only past the cut; comparing the whole renders cannot.
+func newUnboundedDDLBudget(blocks int) *ddlBlockBudget {
+	return newDDLBlockBudget(blocks, math.MaxInt)
 }
 
 // renderWithinCommentLimit renders a comment so its DDL takes every byte the
