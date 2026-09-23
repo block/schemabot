@@ -162,10 +162,13 @@ qualify, and the second is the one operators do not expect:
 
 - Statements that lose data — `DROP TABLE`, or an `ALTER TABLE` containing
   `DROP COLUMN`.
-- Statements that remove an index. An index drop destroys no rows and completes
-  in milliseconds because it is metadata-only, and it can still take the
-  database down by regressing the plan of a query the rest of the fleet is
-  running.
+- Statements that remove a visible index. An index drop destroys no rows and
+  completes in milliseconds because it is metadata-only, and it can still take
+  the database down by regressing the plan of a query the rest of the fleet is
+  running. An index already made invisible is not refused: the optimizer has
+  stopped planning around it, so dropping it regresses nothing, and the next
+  boot drops it with no opt-in. Hiding a surplus index is the first half of
+  removing it, not a place to park it.
 
 The verdict is per statement, but the differ emits one combined `ALTER` per
 table, so a statement can carry a removal and an addition the starting binary
@@ -198,6 +201,16 @@ who issued a command and can be pointed at a real deployment's storage.
 A booting pod skips a statement nothing has permitted and converges the safe
 remainder, rather than take a deployment down over a table nobody asked it to
 drop. `storage apply` converges nothing instead, leaving the decision to you.
+
+**A `UNIQUE` index needs one more check before either removal path.** While a
+surplus unique index stands refused it still enforces uniqueness, so a rollback
+to a binary that declares it finds it in place and changes nothing. Once it is
+gone — dropped under the flag, or hidden and then dropped by the next boot —
+that guarantee goes with it: rows that would have collided can now be written,
+and a rollback to a binary declaring the index re-adds it as `ADD UNIQUE INDEX`,
+which fails on the first duplicate and fails that pod's startup with it. Before
+removing a unique index, be sure no release you might still roll back to
+declares it; if one does, keep the index and remove it in a later release.
 
 ## Ask what storage DDL is outstanding
 

@@ -485,6 +485,54 @@ func TestEnsureSchema_RefusesIndexDropByDefault(t *testing.T) {
 	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
 }
 
+// The refusal protects a visible index because the fleet's queries may plan
+// around it. An operator who has already made a surplus index invisible has
+// taken it out of planning, so its drop regresses nothing and is not
+// destructive: the next boot removes it under the default policy, with no
+// opt-in. This is the second half of the two-step removal the refusal's own
+// reason describes, and it holds for a unique index too — the index stops
+// enforcing uniqueness the moment it is gone, which is what the operator docs
+// tell operators to weigh before hiding one.
+func TestEnsureSchema_DropsAnInvisibleSurplusIndexByDefault(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	const surplusUniqueIndex = "uq_newer_binary"
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ADD UNIQUE INDEX `%s` (`id`, `environment`)", surplusUniqueIndex))
+	require.NoError(t, err)
+
+	// Visible, the unique surplus is refused like any other index.
+	require.NoError(t, EnsureSchema(dsn, logger))
+	require.True(t, testutil.IndexExists(t, db, sdb.Name, "tasks", surplusUniqueIndex),
+		"a visible surplus unique index must be refused, not dropped")
+	assert.Contains(t, logBuf.String(), "refusing destructive storage-schema change")
+	assert.Contains(t, logBuf.String(), surplusUniqueIndex)
+
+	// Hidden, it is no longer a plan the fleet depends on, and the boot drops it.
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ALTER INDEX `%s` INVISIBLE", surplusUniqueIndex))
+	require.NoError(t, err)
+
+	var dropBuf syncBuffer
+	dropLogger := slog.New(slog.NewTextHandler(&dropBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, dropLogger))
+
+	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "tasks", surplusUniqueIndex),
+		"an invisible surplus index must be dropped by the default policy: hidden, it regresses no query plan")
+	logs := dropBuf.String()
+	assert.NotContains(t, logs, "refusing destructive storage-schema change",
+		"dropping an invisible index is not a destructive refusal")
+	assert.Contains(t, logs, "DROP INDEX")
+	assert.Contains(t, logs, surplusUniqueIndex)
+}
+
 // Spirit's diff emits one combined ALTER per table, so an index drop reaches
 // the bootstrap bundled with whatever else that table drifted by — here a
 // column the starting binary requires. The index drop is withheld and the
