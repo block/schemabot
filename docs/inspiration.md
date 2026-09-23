@@ -29,9 +29,10 @@ forward with declarative schema files and a workflow built around pull requests.
 
 Tern, an internal tool at Block and another predecessor to SchemaBot, showed
 how a scheduler could run schema changes at large scale, with retries and
-controls for operators. That work helped shape what SchemaBot now calls the
-operator: the component that drives schema changes through execution while
-keeping people in control.
+controls for operators. Its operator CLI also helped shape how we think about
+managing running changes from the terminal. That work helped shape what
+SchemaBot now calls the operator: the component that drives schema changes
+through execution while keeping people in control.
 
 ## Kubernetes: reconcile desired state with reality
 
@@ -43,6 +44,18 @@ SchemaBot applies that model to database schemas. SQL files describe the desired
 schema, the live database shows what exists, and SchemaBot plans the difference.
 Review and safety gates govern applying that plan, and verification checks that
 the database matches the declaration.
+
+## Atlas: confidence in declarative schemas
+
+[Atlas](https://github.com/ariga/atlas) strengthened our belief in declarative
+schema changes. Its CLI also inspired us, from its approachable quick start to
+its polished experience for day-to-day operations.
+
+## Skeema: schema diffing and linting
+
+[Skeema](https://github.com/skeema/skeema)'s schema differ and lint rules helped
+shape our thinking about declarative schema changes: work out the SQL needed to
+reach the desired schema, and catch problems before that SQL runs.
 
 ## PlanetScale deploy requests: keep operators in control
 
@@ -65,6 +78,13 @@ live feedback, and controls that are easy to discover as you work.
 
 A schema change can take seconds or weeks. We want the terminal to make it clear
 what is happening, what needs your attention, and what you can do next.
+
+## Supabase: making databases approachable
+
+[Supabase](https://github.com/supabase/supabase) shows how easy it can be for
+anyone to get started with a database. We want that same accessibility for
+SchemaBot, and we hope to support Supabase directly so its users can bring
+schema changes into a GitOps workflow.
 
 ## Thank you
 
