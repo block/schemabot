@@ -1653,34 +1653,49 @@ func buildApplyOperationGroups(
 		if err != nil {
 			return nil, false, err
 		}
-		operation := newPendingApplyOperation(member, plan, operationKey, cutoverPolicy, onFailure, now)
-		if len(tasks) == 0 {
-			// A member planned on its own can already hold the reviewed change,
-			// so its plan has nothing left to run. The member still belongs to
-			// the rollout: dropping it would make the apply silently address
-			// fewer targets than the operator asked for, and a work operation
-			// with no tasks can never be driven, so it is recorded as the
-			// already-settled work it is.
-			settleConvergedMemberOperation(operation, now)
-		}
 		groups = append(groups, &storage.ApplyOperationWithTasks{
-			Operation: operation,
+			Operation: newPendingApplyOperation(member, plan, operationKey, cutoverPolicy, onFailure, now),
 			Tasks:     tasks,
 		})
 	}
+	settleConvergedMemberOperations(groups, now)
 	return groups, false, nil
 }
 
-// settleConvergedMemberOperation records a member that had nothing left to run
-// as completed at creation. It is the one operation shape that is terminal
-// before a driver ever claims it: there is no work to drive, and the alternative
-// shapes are both wrong — a pending row that no drive can satisfy halts the
-// rollout, and omitting the member entirely removes it from every per-member
-// surface the operator reads.
-func settleConvergedMemberOperation(operation *storage.ApplyOperation, now time.Time) {
-	operation.State = state.ApplyOperation.Completed
-	operation.StartedAt = &now
-	operation.CompletedAt = &now
+// settleConvergedMemberOperations records the members that had nothing left to
+// run as completed at creation, once the rollout is known to have work
+// somewhere. A member planned on its own can already hold the reviewed change,
+// so its plan has nothing left to run, and it still belongs to the rollout:
+// dropping it would make the apply silently address fewer targets than the
+// operator asked for, while a pending work operation with no tasks can never be
+// driven and would halt the rollout. So it is recorded as the already-settled
+// work it is.
+//
+// "Already settled" only means anything against an apply that is going
+// somewhere. When no member has work, the apply has nothing to drive at all,
+// and settling its operations would turn that into an apply admitted with every
+// operation terminal before a driver ever saw it — holding the database lock
+// with nothing left to resolve it. An apply must keep at least one drivable
+// operation, so an empty one is left pending for storage to refuse.
+func settleConvergedMemberOperations(groups []*storage.ApplyOperationWithTasks, now time.Time) {
+	drivable := false
+	for _, group := range groups {
+		if len(group.Tasks) > 0 {
+			drivable = true
+			break
+		}
+	}
+	if !drivable {
+		return
+	}
+	for _, group := range groups {
+		if len(group.Tasks) > 0 {
+			continue
+		}
+		group.Operation.State = state.ApplyOperation.Completed
+		group.Operation.StartedAt = &now
+		group.Operation.CompletedAt = &now
+	}
 }
 
 // buildNamespaceFinalizerOperations builds one task-less group_finalizer per

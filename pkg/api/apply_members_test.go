@@ -458,3 +458,69 @@ func TestCreateStoredApply_UnsafeMemberPlanNeedsTheOptIn(t *testing.T) {
 	assert.NotContains(t, fmt.Sprint(err), "allow_unsafe",
 		"the opt-in the operator gave covers every member's plan")
 }
+
+// A converged member is settled at creation because the rollout still has work
+// elsewhere, so the primary's own target being the converged one is no different
+// from a sibling's: the members that do carry DDL must still be driven.
+func TestBuildApplyOperationGroups_ConvergedPrimaryIsCompletedWhenASiblingHasWork(t *testing.T) {
+	applyPlan := primaryPlanRow("testapp-001")
+	siblingPlan := &storage.Plan{ID: 11, Deployment: "eu", Target: "testapp-002"}
+	siblingPlan.Namespaces = map[string]*storage.NamespacePlanData{
+		"testapp": {Tables: []storage.TableChange{{
+			Namespace: "testapp", Table: "users",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter",
+		}}},
+	}
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-001"}, Plan: applyPlan},
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}, Plan: siblingPlan},
+	}
+
+	groups, _, err := buildApplyOperationGroups(applyPlan, applyTaskChanges(applyPlan), members,
+		"production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	require.Len(t, groups, 2)
+
+	assert.Empty(t, groups[0].Tasks, "the primary's own target already holds the change")
+	assert.Equal(t, state.ApplyOperation.Completed, groups[0].Operation.State)
+
+	assert.Equal(t, state.ApplyOperation.Pending, groups[1].Operation.State)
+	require.Len(t, groups[1].Tasks, 1, "the sibling's own DDL is still driven")
+}
+
+// An apply whose every member is converged has nothing for any driver to claim.
+// Settling its operations would admit an apply that is terminal before a driver
+// ever sees it, holding the database lock with nothing left to resolve it, so
+// the operations stay pending and storage refuses the apply outright.
+func TestBuildApplyOperationGroups_ApplyWithNoWorkStaysPending(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		targets []string
+	}{
+		{name: "single member", targets: []string{"testapp-001"}},
+		{name: "mirrored members", targets: []string{"testapp-001", "testapp-002"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			applyPlan := primaryPlanRow("testapp-001")
+			members := make([]applyMember, 0, len(tc.targets))
+			for _, target := range tc.targets {
+				members = append(members, applyMember{
+					Target: routing.ExecutionTarget{Deployment: "eu", Target: target},
+					Plan:   applyPlan,
+				})
+			}
+
+			groups, _, err := buildApplyOperationGroups(applyPlan, applyTaskChanges(applyPlan), members,
+				"production", storage.ApplyOptions{}, "", "", pershardTestTime())
+			require.NoError(t, err)
+			require.Len(t, groups, len(tc.targets))
+
+			for i, group := range groups {
+				assert.Empty(t, group.Tasks, "group %d", i)
+				assert.Equal(t, state.ApplyOperation.Pending, group.Operation.State,
+					"group %d must stay pending so storage refuses an apply with no drivable work", i)
+				assert.Nil(t, group.Operation.CompletedAt, "group %d", i)
+			}
+		})
+	}
+}
