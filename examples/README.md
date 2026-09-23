@@ -6,6 +6,8 @@ The `mysql/schema/testapp/` directory contains example SQL files and a `schemabo
 
 ### Quick Start
 
+Run these commands from the repository root. The demo starts local MySQL containers, applies the sample schema, and seeds data.
+
 ```bash
 # Install the CLI
 make install
@@ -38,13 +40,16 @@ schemabot apply -y --endpoint http://localhost:13370
 ### Connect to MySQL
 
 ```bash
-make mysql DB=testapp
+make mysql               # SchemaBot storage (port 13371)
+make mysql DB=staging    # Staging testapp (port 13372)
+make mysql DB=production # Production testapp (port 13373)
 ```
 
 | Service | Endpoint |
 |---------|----------|
 | SchemaBot API | http://localhost:13370 |
-| TestApp MySQL | localhost:13372 |
+| Staging TestApp MySQL | localhost:13372 |
+| Production TestApp MySQL | localhost:13373 |
 | SchemaBot MySQL | localhost:13371 |
 
 Credentials: `root` / `testpassword`

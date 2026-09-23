@@ -38,7 +38,7 @@ func TestInitRequestsCancelInFlight(t *testing.T) {
 					_, err := CallPullSchemaAPIWithContext(ctx, server.URL, "shop", "postgres", "dev", PullSchemaOptions{})
 					done <- err
 				} else {
-					_, _, err := CallPlanAPIWithContext(ctx, server.URL, "shop", "postgres", "dev", dir, "", 0, nil, false)
+					_, _, err := CallPlanAPIWithContext(ctx, server.URL, "shop", "postgres", "dev", dir, "", 0, PlanExclusions{}, false)
 					done <- err
 				}
 			}()
