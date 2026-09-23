@@ -13,7 +13,7 @@ func (m *initWizard) storageChoiceView() string {
 	var b strings.Builder
 	if m.applicationConnected {
 		green := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1A7F37", Dark: "#3FB950"})
-		b.WriteString(green.Render("✓ Application database connected") + "\n\n")
+		b.WriteString(green.Render("✓ Database connected") + "\n\n")
 	}
 	b.WriteString(bold.Render("Where should SchemaBot store its own data?") + "\n\n")
 	for _, choice := range []struct {

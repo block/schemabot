@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -29,7 +30,7 @@ type initWizard struct {
 	draftConnections                         map[string]string
 	integrated, choosingStorage              bool
 	connectionSummary                        string
-	hasExistingSchema                        bool
+	existingProject                          string
 	originalNamespaces                       []string
 	checkingConnection, connectionChecked    bool
 	applicationConnected                     bool
@@ -70,6 +71,15 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
 		{"Connection profile", "Give this connection a profile name so you can use it again.", profile},
 	}}
+	if cfg, err := LoadCLIConfig(m.fields[6].value); err == nil {
+		if cmd.Type == "" {
+			m.fields[0].value = cfg.Type
+		}
+		if cmd.Database == "" {
+			m.fields[1].value = cfg.Database
+		}
+		m.existingProject = fmt.Sprintf("Found %s\n%s · %s", initTerminalText(filepath.Join(m.fields[6].value, "schemabot.yaml")), initTerminalText(cfg.Database), initTerminalText(cfg.Type))
+	}
 	m.integrated = cmd.Integrated || cmd.StorageDSN == ""
 	m.originalNamespaces = slices.Clone(cmd.Namespaces)
 	m.spinner = spinner.New()
@@ -89,14 +99,13 @@ func (m *initWizard) loadField() {
 	m.scroll = 0
 	m.connectionChecked = false
 	if m.step >= len(m.fields) {
-		reuse, err := initSchemaReuse(m.fields[6].value)
+		_, err := validateInitSchemaReuse(m.fields[6].value, m.fields[1].value, m.fields[0].value)
 		if err != nil {
 			m.step = 6
 			m.loadField()
 			m.err = err.Error()
 			return
 		}
-		m.hasExistingSchema = reuse
 		m.input.Blur()
 		return
 	}
@@ -143,7 +152,7 @@ func (m *initWizard) validate() string {
 		} else if err != nil && !os.IsNotExist(err) {
 			return "We couldn’t read that path: " + err.Error()
 		}
-		if _, err := initSchemaReuse(v); err != nil {
+		if _, err := validateInitSchemaReuse(v, m.fields[1].value, m.fields[0].value); err != nil {
 			return err.Error()
 		}
 
@@ -262,7 +271,7 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if m.step == len(m.fields) {
-				if _, err := initSchemaReuse(m.fields[6].value); err != nil {
+				if _, err := validateInitSchemaReuse(m.fields[6].value, m.fields[1].value, m.fields[0].value); err != nil {
 					m.step = 6
 					m.loadField()
 					m.err = err.Error()
@@ -335,6 +344,9 @@ func (m *initWizard) contentView() string {
 		} else if m.step != 3 && m.step != 4 {
 			b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
 		}
+		if m.step <= 1 && m.existingProject != "" {
+			b.WriteString(wrap.Render(muted.Render(m.existingProject)) + "\n\n")
+		}
 		if m.step == 3 || m.step == 4 {
 			b.WriteString(bold.Render(f.label) + "\n\n" + wrap.Render(m.connectionEditorView()))
 			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
@@ -389,7 +401,6 @@ func (m *initWizard) contentView() string {
 		row("Database", m.fields[1].value+" ("+m.fields[0].value+")")
 		row("Environment", m.fields[2].value)
 		row("Namespaces", m.fields[5].value)
-		row("Schema folder", m.fields[6].value)
 		row("Profile", m.fields[7].value)
 		if m.integrated {
 			row("Storage", "schemabot (new database, same server)")
@@ -398,9 +409,6 @@ func (m *initWizard) contentView() string {
 		}
 		if strings.HasPrefix(m.fields[3].value, "draft:") || !m.integrated && strings.HasPrefix(m.fields[4].value, "draft:") {
 			b.WriteString("\nCredentials will be saved outside your project in private, unencrypted\nfiles under ~/.schemabot/credentials.\n")
-		}
-		if m.hasExistingSchema {
-			b.WriteString("\n" + wrap.Render("This folder already has schema files. We’ll check them against your database without changing them.") + "\n")
 		}
 		b.WriteString("\n" + wrap.Render("We’ll set up SchemaBot and verify your schema files.") + "\n\n")
 		b.WriteString(blue.Render("enter finish setup") + muted.Render(" · shift+tab back · esc cancel"))
@@ -446,7 +454,7 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 	if !m.confirmed {
 		return ErrSilent
 	}
-	reuse, err := initSchemaReuse(m.fields[6].value)
+	reuse, err := validateInitSchemaReuse(m.fields[6].value, m.fields[1].value, m.fields[0].value)
 	if err != nil {
 		return err
 	}

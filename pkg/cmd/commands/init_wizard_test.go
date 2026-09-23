@@ -66,7 +66,7 @@ func TestInitWizardReviewExistingFilesAndCancel(t *testing.T) {
 	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 	m.step = len(m.fields)
 	m.loadField()
-	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "check them against your database without changing them")
+	require.Contains(t, m.View(), "Review your setup")
 	wizardKey(m, tea.KeyEsc)
 	require.False(t, m.confirmed)
 	require.True(t, m.cancelled)
@@ -557,4 +557,34 @@ func TestInitShellArg(t *testing.T) {
 	for _, value := range []string{"./schemabot", "schema", "development", "wizard-playground"} {
 		require.Equal(t, value, initShellArg(value))
 	}
+}
+
+func TestInitWizardDetectsExistingProjectBeforeReview(t *testing.T) {
+	root := t.TempDir()
+	original := []byte("database: shop\ntype: mysql\n")
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), original, 0600))
+	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
+	require.Equal(t, "shop", m.fields[1].value)
+	require.Equal(t, "mysql", m.fields[0].value)
+	require.Contains(t, m.View(), "Found")
+	for _, changed := range []int{0, 1} {
+		m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
+		m.fields[changed].value = "other"
+		m.step = len(m.fields)
+		m.loadField()
+		require.Equal(t, 6, m.step)
+		require.Contains(t, m.err, `configured for "shop" (mysql)`)
+		require.False(t, m.confirmed)
+		next := filepath.Join(t.TempDir(), "schema")
+		m.input.SetValue(next)
+		wizardKey(m, tea.KeyEnter)
+		require.Empty(t, m.err)
+		require.Equal(t, len(m.fields), m.step)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	require.Equal(t, original, data)
+	explicit := newInitWizard(&InitCmd{SchemaDir: root, Type: "postgres", Database: "other"}, "default", io.Discard)
+	require.Equal(t, "postgres", explicit.fields[0].value)
+	require.Equal(t, "other", explicit.fields[1].value)
 }

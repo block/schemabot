@@ -187,7 +187,7 @@ func TestInitConnectionAutoAdvance(t *testing.T) {
 			m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
 			if action == "advance" {
 				require.Equal(t, 4, m.step)
-				require.Contains(t, stripANSI(m.View()), "✓ Application database connected")
+				require.Contains(t, stripANSI(m.View()), "✓ Database connected")
 				require.Equal(t, "env:DATABASE_URL", m.fields[3].value)
 				require.False(t, m.confirmed)
 				m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
