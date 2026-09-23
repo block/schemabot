@@ -35,7 +35,7 @@ func TestFormatApplyStatusComment_OneOperationRendersSingle(t *testing.T) {
 	}
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "")
 	assert.NotContains(t, out, "**Deployments**:")
-	assert.NotContains(t, out, "- 🔄 eu")
+	assert.NotContains(t, out, "- 🔄 `eu`")
 }
 
 // An apply that fans out across two deployments renders the aggregate header,
@@ -48,8 +48,8 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "")
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 completed, 1 running")
-	assert.Contains(t, out, "- ✅ eu — completed")
-	assert.Contains(t, out, "- 🔄 us — running table copy")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
+	assert.Contains(t, out, "- 🔄 `us` — running table copy")
 }
 
 // An apply that failed under on_failure=pause with a held sibling renders the
@@ -91,7 +91,7 @@ func TestFormatApplySummaryComment_OneOperationRendersSingle(t *testing.T) {
 	}
 	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, nil, "")
 	assert.NotContains(t, out, "**Deployments**:")
-	assert.NotContains(t, out, "- ✅ eu")
+	assert.NotContains(t, out, "- ✅ `eu`")
 }
 
 // An apply that fans out across two deployments renders the aggregate terminal
@@ -105,8 +105,8 @@ func TestFormatApplySummaryComment_MultipleOperationsRendersMulti(t *testing.T) 
 	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, nil, "")
 	assert.Contains(t, out, "## ✅ Schema Change Applied")
 	assert.Contains(t, out, "**Deployments**: 2 completed")
-	assert.Contains(t, out, "- ✅ eu — completed")
-	assert.Contains(t, out, "- ✅ us — completed")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
+	assert.Contains(t, out, "- ✅ `us` — completed")
 }
 
 // Each deployment's tasks are routed into that deployment's section only, by

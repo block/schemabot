@@ -57,10 +57,10 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.NotContains(t, out, "--deployment")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
-	assert.Contains(t, out, "- 🟢 eu — ready for cutover — next in order")
-	assert.Contains(t, out, "- 🔄 us — running table copy")
-	assert.Contains(t, out, "- ⏳ au — waiting for us")
-	assert.Contains(t, out, "- ⏳ ca — waiting for us")
+	assert.Contains(t, out, "- 🟢 `eu` — ready for cutover — next in order")
+	assert.Contains(t, out, "- 🔄 `us` — running table copy")
+	assert.Contains(t, out, "- ⏳ `au` — waiting for us")
+	assert.Contains(t, out, "- ⏳ `ca` — waiting for us")
 
 	// Active/ready deployments default open; queued ones default collapsed.
 	assert.Contains(t, out, "<details open>\n<summary>🟢 eu — ready for cutover — next in order</summary>")
@@ -92,8 +92,8 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	assert.Contains(t, out, "To retry:")
 	assert.Contains(t, out, "schemabot apply -e production")
 	assert.NotContains(t, out, "schemabot revert")
-	assert.Contains(t, out, "- ❌ us — failed")
-	assert.Contains(t, out, "- ⏸️ au — halted — us failed")
+	assert.Contains(t, out, "- ❌ `us` — failed")
+	assert.Contains(t, out, "- ⏸️ `au` — halted — us failed")
 	assert.Contains(t, out, "<details open>\n<summary>⏸️ au — halted — us failed</summary>")
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
@@ -182,7 +182,7 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.NotContains(t, out, "Schema Change Failed")
 	// A later deployment is still running while siblings have failed.
-	assert.Contains(t, out, "- 🔄 au — running table copy")
+	assert.Contains(t, out, "- 🔄 `au` — running table copy")
 	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
 	// Only the earliest failure is lifted to the header.
 	assert.NotContains(t, out, "First failure:** <code>eu</code>")
@@ -265,7 +265,7 @@ func TestRenderMultiDeploymentApplyComment_DetailsReuseSingleRenderer(t *testing
 	assert.Contains(t, out, "orders")
 	// Completed deployment with no detail still renders its summary line + section,
 	// with a placeholder body rather than an empty <details>.
-	assert.Contains(t, out, "- ✅ eu — completed")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
 	assert.Contains(t, out, "<details>\n<summary>✅ eu — completed</summary>")
 	assert.Contains(t, out, "_No details available yet._")
 }
@@ -307,8 +307,8 @@ func TestRenderMultiDeploymentApplySummaryComment_CompletedReusesSummaryRenderer
 	// Aggregate terminal header and per-deployment summary list, as the status
 	// comment, so an operator sees rollout outcome at a glance.
 	assert.Contains(t, out, "## ✅ Schema Change Applied")
-	assert.Contains(t, out, "- ✅ eu — completed")
-	assert.Contains(t, out, "- ✅ us — completed")
+	assert.Contains(t, out, "- ✅ `eu` — completed")
+	assert.Contains(t, out, "- ✅ `us` — completed")
 
 	// Each <details> body is the summary renderer's output, not the status one.
 	assert.Contains(t, out, "Applied successfully — your schema change is live!")
@@ -533,8 +533,8 @@ func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, ApplyID: "apply-123", Environment: "staging"})
 	require.Len(t, model.Deployments, 2)
-	assert.Contains(t, out, "- us — some_engine_state")
-	assert.NotContains(t, out, "-  us")
+	assert.Contains(t, out, "- `us` — some_engine_state")
+	assert.NotContains(t, out, "-  `us`")
 }
 
 // When the rollup has no pending operator action, no next-action block is written.
@@ -644,9 +644,9 @@ func TestRenderMultiDeploymentApplyComment_MultiTargetMembersRenderSeparately(t 
 	})
 
 	// Both members of "primary" are named in full; the single-target sibling is not.
-	assert.Contains(t, out, "- ✅ primary/testapp-001 — completed")
-	assert.Contains(t, out, "- 🔄 primary/testapp-002 — running table copy")
-	assert.Contains(t, out, "- ⏳ eu-west — waiting for primary/testapp-002")
+	assert.Contains(t, out, "- ✅ `primary/testapp-001` — completed")
+	assert.Contains(t, out, "- 🔄 `primary/testapp-002` — running table copy")
+	assert.Contains(t, out, "- ⏳ `eu-west` — waiting for primary/testapp-002")
 	assert.Contains(t, out, "<details>\n<summary>✅ primary/testapp-001 — completed</summary>")
 	assert.Contains(t, out, "<details open>\n<summary>🔄 primary/testapp-002 — running table copy</summary>")
 
@@ -672,4 +672,35 @@ func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *t
 	})
 
 	assert.Contains(t, out, "To cut over `primary/testapp-002`:")
+}
+
+// A member name is assembled from server config, so it reaches the comment as
+// text SchemaBot did not choose. The summary list is plain markdown and the
+// section header is HTML, and a name has to be unable to write structure of its
+// own into either: an operator reads this comment to decide whether to cut over
+// or cancel a change that is already touching a database.
+func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Running),
+		rollingOp("us`\n## Injected [click](https://example.invalid)", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	// Flattening runs at both surfaces, so no name reaches the start of a line:
+	// it can neither open a heading nor break the list item or the <summary> tag
+	// it sits in.
+	assert.NotContains(t, out, "\n## Injected", "a name must not start a heading of its own")
+
+	// The summary list is markdown, so the name is fenced in a backtick run
+	// longer than any run it carries — inside the span the heading marker and
+	// the link are text, not structure.
+	assert.Contains(t, out, "- 🔄 `` us` ## Injected [click](https://example.invalid) `` — running table copy")
+
+	// The section header is read as HTML, so the name is escaped rather than
+	// fenced, matching how this comment names a member everywhere else in a tag.
+	assert.Contains(t, out, "<summary>🔄 us` ## Injected [click](https://example.invalid) — running table copy</summary>")
 }

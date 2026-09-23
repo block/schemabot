@@ -244,7 +244,7 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		if d.Open {
 			openAttr = " open"
 		}
-		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), html.EscapeString(d.Label))
+		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTagHTML(d), html.EscapeString(d.Label))
 		if detail := memberDetail(data.Details, i); detail != nil {
 			body := *detail
 			body.DerivedStatus = siblingDerivedStatus(d)
@@ -303,13 +303,30 @@ func stripLeadingHeading(body string) string {
 	return strings.TrimLeft(rest, "\n")
 }
 
-// deploymentTag renders the "<emoji> <member>" prefix, omitting the leading
-// space when a state has no glyph. The member is named by the derivation's
-// resolved name, so two targets of one deployment are labelled distinctly.
+// deploymentTag renders the "<emoji> <member>" prefix for a markdown line. The
+// member is named by the derivation's resolved name, so two targets of one
+// deployment are labelled distinctly.
+//
+// A member name is assembled from server config, so it reaches this comment as
+// text SchemaBot did not choose. Rendering it as a code span keeps a name
+// carrying a backtick or a line break from closing the span it sits in and
+// writing markdown of its own into a comment operators act on.
 func deploymentTag(d presentation.Deployment) string {
-	name := html.EscapeString(d.Name)
-	if d.Emoji == "" {
+	return glyphTag(d.Emoji, inlineCode(d.Name))
+}
+
+// deploymentTagHTML is deploymentTag for a <summary>, which GitHub reads as
+// HTML: the name is escaped rather than fenced, and flattened first so it
+// cannot carry a line break out of the tag it sits in.
+func deploymentTagHTML(d presentation.Deployment) string {
+	return glyphTag(d.Emoji, html.EscapeString(flattenIdentifier(d.Name)))
+}
+
+// glyphTag joins a state's glyph to an already-rendered name, omitting the
+// leading space when the state has no glyph.
+func glyphTag(emoji, name string) string {
+	if emoji == "" {
 		return name
 	}
-	return fmt.Sprintf("%s %s", d.Emoji, name)
+	return fmt.Sprintf("%s %s", emoji, name)
 }
