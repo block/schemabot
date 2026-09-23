@@ -101,7 +101,7 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 	if op.ExternalOperationID != "" {
 		fmt.Fprintf(b, "  External operation ID: %s\n", op.ExternalOperationID)
 	}
-	if externalID := externalIDForTUIMember(m.operations, op); externalID != "" {
+	if externalID := templates.SectionExternalID(op, m.operations); externalID != "" {
 		fmt.Fprintf(b, "  External apply ID: %s\n", externalID)
 	}
 
@@ -116,22 +116,6 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 		m.renderTables(b, tables)
 	}
 	b.WriteString("\n")
-}
-
-// externalIDForTUIMember resolves the external apply ID shown in a section: the
-// section's own operation when set, falling back to a sibling's — a keyed
-// apply's operations share one data-plane apply, so an operation that has not
-// dispatched yet still shows it.
-func externalIDForTUIMember(ops []templates.ProgressOperation, op templates.ProgressOperation) string {
-	if op.ExternalID != "" {
-		return op.ExternalID
-	}
-	for _, sibling := range ops {
-		if sibling.Deployment == op.Deployment && sibling.ExternalID != "" {
-			return sibling.ExternalID
-		}
-	}
-	return ""
 }
 
 func tablesForDeployment(tables []templates.TableProgress, deployment string) []templates.TableProgress {

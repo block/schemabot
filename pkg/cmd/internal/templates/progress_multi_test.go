@@ -191,3 +191,50 @@ func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
 	assert.NotContains(t, output, "primary/testapp-001 — completed (testapp-001)")
 	assert.NotContains(t, output, "primary/testapp-002 — running table copy (testapp-002)")
 }
+
+// A keyed apply runs several operations of one deployment through one
+// data-plane apply, so an operation that has not dispatched yet is labelled
+// with the apply ID its siblings already carry rather than with nothing.
+func TestSectionExternalID_KeyedApplyBorrowsTheDeploymentsSharedID(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "eu", Target: "orders-eu", OperationKey: "shard-1", ExternalID: "ps-1"},
+		{Deployment: "eu", Target: "orders-eu", OperationKey: "shard-2"},
+	}
+
+	assert.Equal(t, "ps-1", SectionExternalID(ops[1], ops))
+	assert.Equal(t, "orders-eu", sectionTarget(ops[1], ops))
+}
+
+// A deployment addressing several targets runs each member through its own
+// data-plane apply, so there is no shared ID to borrow. A member that has not
+// dispatched shows nothing rather than a sibling target's apply ID, which would
+// send an operator to watch a member they did not ask about; the member's own
+// ID appears on the next poll once it dispatches.
+func TestSectionExternalID_MultiTargetMemberBorrowsNothing(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "primary", Target: "testapp-001", ExternalID: "ps-1"},
+		{Deployment: "primary", Target: "testapp-002", ExternalID: "ps-2"},
+		{Deployment: "primary", Target: "testapp-003"},
+	}
+
+	assert.Equal(t, "", SectionExternalID(ops[2], ops),
+		"a member must not be labelled with another target's apply ID")
+	assert.Equal(t, "ps-2", SectionExternalID(ops[1], ops), "a member's own ID still wins")
+
+	undispatched := ProgressOperation{Deployment: "primary"}
+	assert.Equal(t, "", SectionExternalID(undispatched, ops))
+	assert.Equal(t, "", sectionTarget(undispatched, ops),
+		"a member must not be labelled with another target of its deployment")
+}
+
+// A sibling of another deployment never supplies either value, whatever it
+// carries.
+func TestSectionExternalID_IgnoresOtherDeployments(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "eu", Target: "orders-eu", ExternalID: "ps-1"},
+		{Deployment: "us"},
+	}
+
+	assert.Equal(t, "", SectionExternalID(ops[1], ops))
+	assert.Equal(t, "", sectionTarget(ops[1], ops))
+}
