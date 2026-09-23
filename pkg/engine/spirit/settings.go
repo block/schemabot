@@ -36,11 +36,15 @@ type Settings struct {
 	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
 	// reads, retries, and hot-range splitting instead of a checksum setup lock
 	// held over long-lived REPEATABLE READ snapshots. Cutover locking is
-	// unchanged either way. False — the zero value — is the default: a row
-	// updated continuously throughout the checksum is not yet supported, so
-	// the lockless checker can fail to converge where the snapshot one
-	// completes. Unlike the autoscaling kill switch this needs no tri-state,
-	// because absent and false both mean the same thing.
+	// unchanged either way. False — the zero value — is the default, because
+	// the lockless checker changes what an unverifiable copy costs: a
+	// continuously updated row is not yet supported and keeps the verify phase
+	// running, a confirmed divergence aborts the apply where the snapshot
+	// checker repairs the chunk and continues, and the phase reports no
+	// progress until its first clean pass. docs/configuration.md states the
+	// terms an operator accepts by enabling it. Unlike the autoscaling kill
+	// switch this needs no tri-state, because absent and false both mean the
+	// same thing.
 	EnableExperimentalLocklessChecksum bool
 
 	// CheckpointMaxAge bounds how old a checkpoint may be and still be
