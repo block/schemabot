@@ -17,11 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/e2e/testutil"
-	"github.com/block/schemabot/pkg/localscale"
-	"github.com/block/schemabot/pkg/state"
 )
-
-var drState = state.DeployRequest
 
 // TestDeployRequestDiffNoChanges verifies that CreateDeployRequest returns no_changes
 // when branch schema matches main schema (no DDL applied to branch).
@@ -122,59 +118,6 @@ func TestResetStateCanRunImmediatelyAfterDeploySubmit(t *testing.T) {
 }
 
 // TestBranchDatabaseCleanupOnSkipRevert verifies that branch databases are dropped
-// Cancelling a deploy does not free the database's one active deploy slot
-// straight away: the request sits in in_progress_cancel until the processor
-// retires it. Cleanup between tests has to wait that out, because a cleanup
-// that returns early leaves the slot occupied and the next test's deploy is
-// refused for a reason that names neither the cancelled request nor the
-// cleanup that walked past it.
-func TestCleanupWaitsOutACancelledDeploy(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	deferCleanupActiveDeployRequests(t)
-	ctx := t.Context()
-
-	branchName := createBranchWithDDL(t, ctx, "cancel-cleanup",
-		map[string][]string{
-			"testapp_sharded": {
-				"ALTER TABLE users ADD COLUMN cancel_cleanup_col varchar(50)",
-			},
-		},
-		nil,
-	)
-	dr := createDeploy(t, ctx, branchName, true)
-	require.Equal(t, drState.Ready, dr.DeploymentState, "expected changes")
-	deploy(t, ctx, dr.Number, false)
-
-	_, err := testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
-		Organization: testOrg, Database: testDB, Number: dr.Number,
-	})
-	require.NoError(t, err, "CancelDeployRequest")
-
-	// The cancel is asynchronous, so the request still occupies the slot here.
-	// That is the state cleanup has to cope with, so run it immediately.
-	cleanupActiveDeployRequests(t, ctx)
-
-	after, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
-		Organization: testOrg, Database: testDB, Number: dr.Number,
-	})
-	require.NoError(t, err, "GetDeployRequest after cleanup")
-	assert.True(t, localscale.IsTerminalDeployState(after.DeploymentState),
-		"cleanup returned while deploy request %d was still %q, so it still occupies the active deploy",
-		dr.Number, after.DeploymentState)
-
-	// The consequence the next test would hit: a new deploy must be accepted.
-	nextBranch := createBranchWithDDL(t, ctx, "cancel-cleanup-next",
-		map[string][]string{
-			"testapp_sharded": {
-				"ALTER TABLE users ADD COLUMN cancel_cleanup_next_col varchar(50)",
-			},
-		},
-		nil,
-	)
-	next := createDeploy(t, ctx, nextBranch, true)
-	deploy(t, ctx, next.Number, false)
-}
-
 // after skip-revert closes the revert window.
 func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())

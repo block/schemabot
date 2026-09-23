@@ -466,40 +466,6 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 	return result
 }
 
-// blocksNewDeploy reports whether a deploy request in this state occupies the
-// one active deploy a database is allowed, so that a later test's deploy is
-// refused until it clears.
-//
-// It asks the same question the deploy gate asks — whether the state is
-// terminal — rather than listing the blocking states over again. A list here
-// would be a second copy to find and update, and a state missing from it
-// reads as cleared while the gate still refuses on it.
-//
-// Pending and Ready are the exception: they precede the deploy, so the gate
-// never sees them and the processor never advances them.
-func blocksNewDeploy(deployState string) bool {
-	switch deployState {
-	case drState.Pending, drState.Ready:
-		return false
-	default:
-		return !localscale.IsTerminalDeployState(deployState)
-	}
-}
-
-// alreadyClearing reports whether a deploy request in this state is on its way
-// to a terminal one under its own steam, because a cancel or a revert is
-// already running. Such a request still blocks, so cleanup has to wait it out,
-// but asking for another cancel is refused — and a refusal that cleanup treats
-// as failure is what makes it walk away while the slot is still occupied.
-func alreadyClearing(deployState string) bool {
-	switch deployState {
-	case drState.InProgressCancel, drState.InProgressRevert, drState.InProgressRevertVSchema:
-		return true
-	default:
-		return false
-	}
-}
-
 // deferCleanupActiveDeployRequests clears any active deploy requests once the
 // test finishes.
 //
@@ -549,18 +515,18 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 			break
 		}
 		var clearErr error
-		switch {
-		case dr.DeploymentState == drState.CompletePendingRevert:
+		switch clearActionFor(dr.DeploymentState) {
+		case actionSkipRevert:
 			_, clearErr = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
-		case alreadyClearing(dr.DeploymentState):
-			// Nothing to ask for; it only has to be waited out.
-		case blocksNewDeploy(dr.DeploymentState):
+		case actionCancel:
 			_, clearErr = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
-		default:
+		case actionWaitOut:
+			// Nothing to ask for; it only has to be waited out.
+		case actionNone:
 			continue
 		}
 		// Reported rather than asserted: a wedged request fails the next test
