@@ -32,7 +32,7 @@ import (
 // the in-flight context.
 func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 
 	const keyspace = "testapp_sharded"
