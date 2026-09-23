@@ -13,6 +13,7 @@ CREATE TABLE `plans` (
   `plan_data` json NOT NULL,
   `head_sha` varchar(64) NOT NULL DEFAULT '',
   `primary_plan_identifier` varchar(255) NOT NULL DEFAULT '',
+  `direct_execution` json DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_plan_identifier` (`plan_identifier`),

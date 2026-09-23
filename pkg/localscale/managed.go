@@ -25,6 +25,38 @@ import (
 // so we create this user for branch proxy upstream connections.
 const managedMySQLTCPUser = "vt_dba_tcp"
 
+// managedLockWaitTimeout bounds how long a connection that has not set its own
+// lock_wait_timeout waits on a metadata lock.
+//
+// A cutover locks the table it is renaming and then waits for its vreplication
+// stream to stop. That stream's schema reload reads the same table, so it waits
+// on the lock the cutover holds, and the cutover waits on it: without a bound
+// the reload waits out mysqld's default of a year and the cutover never
+// returns, so Vitess never gets to fail the attempt and retry it. The cutover's
+// own connections set this value for themselves (to multiples of its threshold)
+// and are unaffected; this is the default every other connection inherits. It
+// sits above the cutover threshold so that nothing the cutover deliberately
+// waits for is cut short.
+const managedLockWaitTimeout = 20 * time.Second
+
+// writeManagedMyCnf writes the my.cnf overrides for the managed cluster's
+// mysqld and returns its path. vttest passes the file to mysqlctl, which
+// appends it to the config it generates, so only the values named here change.
+func writeManagedMyCnf(logger *slog.Logger) (string, error) {
+	dir := os.Getenv("VTDATAROOT")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	path := filepath.Join(dir, "localscale-extra.cnf")
+	contents := fmt.Sprintf("[mysqld]\nlock_wait_timeout=%d\n", int(managedLockWaitTimeout.Seconds()))
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		return "", fmt.Errorf("write %s: %w", path, err)
+	}
+	logger.Info("wrote mysqld overrides for the managed cluster",
+		"path", path, "lock_wait_timeout", managedLockWaitTimeout)
+	return path, nil
+}
+
 // managedCluster wraps a vttest.LocalCluster that was started by LocalScale.
 // It holds the extracted addresses needed to connect to the cluster.
 type managedCluster struct {
@@ -129,6 +161,11 @@ func startManagedCluster(ctx context.Context, keyspaces []KeyspaceConfig, logger
 		return nil, fmt.Errorf("ensure VTROOT: %w", err)
 	}
 
+	extraMyCnf, err := writeManagedMyCnf(logger)
+	if err != nil {
+		return nil, fmt.Errorf("write extra my.cnf: %w", err)
+	}
+
 	// Build VTTestTopology from keyspace configs.
 	topo := &vttestpb.VTTestTopology{}
 	for _, ks := range keyspaces {
@@ -145,7 +182,8 @@ func startManagedCluster(ctx context.Context, keyspaces []KeyspaceConfig, logger
 
 	cluster := &vttest.LocalCluster{
 		Config: vttest.Config{
-			Topology: topo,
+			Topology:   topo,
+			ExtraMyCnf: []string{extraMyCnf},
 
 			// Match vttestserver docker-compose flags exactly:
 			ForeignKeyMode:         "disallow",

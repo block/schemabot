@@ -2377,7 +2377,8 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 	// the recorded remote apply id lets us poll the existing remote apply instead
 	// of starting a duplicate.
 	if scope.remoteApplyID(apply) == "" {
-		options := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation).Map()
+		driveOptions := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation)
+		options := driveOptions.Map()
 		target := options["target"]
 		if target == "" {
 			target = apply.Database
@@ -2415,6 +2416,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 			GenerationOperationKeys: scope.generationOperationKeys(),
 			IgnoreTables:            plan.IgnoreTables(),
+			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
 		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
@@ -3224,7 +3226,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	// and single-operation drives get the apply's stored options unchanged, so
 	// the deployment-ordered cutover claim (OC-3) can later drive each parked
 	// operation through its swap in turn.
-	options := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation).Map()
+	driveOptions := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation)
+	options := driveOptions.Map()
 	target := options["target"]
 	if target == "" {
 		target = apply.Database
@@ -3247,6 +3250,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 		GenerationOperationKeys: scope.generationOperationKeys(),
 		IgnoreTables:            plan.IgnoreTables(),
+		// Restated as a field rather than left to ride in Options: the data
+		// plane admits the policy only from the field, so an option map that
+		// reached the control plane from anywhere else cannot grant one.
+		DirectExecution: DirectExecutionPolicyProto(driveOptions.DirectExecution),
 	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {

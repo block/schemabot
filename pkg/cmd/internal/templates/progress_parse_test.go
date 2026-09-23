@@ -181,20 +181,18 @@ func TestParseProgressResponseFiltersSpiritInternalTables(t *testing.T) {
 	assert.Equal(t, "users", data.Tables[0].TableName)
 }
 
-// Spirit's progress string is the freshest copy signal: when it parses, the
-// structured percent and row counts follow it so every consumer renders the
-// same numbers, and raw engine statuses normalize to canonical task states.
-func TestParseProgressResponsePrefersSpiritProgressStringAndNormalizesStatus(t *testing.T) {
+// The structured copy fields pass through untouched, and a raw engine phase
+// string normalizes to its canonical task state.
+func TestParseProgressResponseCarriesCopyFieldsAndNormalizesStatus(t *testing.T) {
 	result := &apitypes.ProgressResponse{
 		State: state.Apply.Running,
 		Tables: []*apitypes.TableProgressResponse{
 			{
 				TableName:       "users",
 				Status:          "copyRows",
-				RowsCopied:      100,
-				RowsTotal:       200,
-				PercentComplete: 50,
-				ProgressDetail:  "71436/221193 32.30% copyRows ETA TBD",
+				RowsCopied:      71436,
+				RowsTotal:       221193,
+				PercentComplete: 32,
 			},
 		},
 	}

@@ -11,6 +11,12 @@ import (
 // RenderRollbackPlanComment renders the rollback plan comment markdown.
 // Reuses PlanCommentData since rollback plans have the same structure as regular plans.
 func RenderRollbackPlanComment(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderRollbackPlanComment(data, budget)
+	})
+}
+
+func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Header
@@ -31,7 +37,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	}
 
 	// Detailed changes
-	writeKeyspaceChanges(&sb, data)
+	writeKeyspaceChanges(&sb, data, budget)
 
 	// Unsafe warning — rollback typically produces DROP operations
 	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")

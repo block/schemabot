@@ -1666,8 +1666,11 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 	return commentID, true, true
 }
 
+// renderPRComment finishes a comment body for posting on the observed PR: an
+// oversized body is replaced with the notice that fits, then the support
+// footer is appended.
 func (o *CommentObserver) renderPRComment(body string) string {
-	return appendSupportChannelFooter(body, o.supportChannel)
+	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, body), o.supportChannel)
 }
 
 // publishClaimedSummary posts the separate apply-level terminal summary

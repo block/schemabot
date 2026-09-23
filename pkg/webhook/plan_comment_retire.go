@@ -60,7 +60,7 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		return
 	}
 
-	commentID, nodeID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body))
+	commentID, nodeID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, body))
 	if err != nil {
 		h.logger.Error("failed to post plan comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)

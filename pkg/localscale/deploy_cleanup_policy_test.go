@@ -63,6 +63,43 @@ func clearActionFor(deployState string) clearAction {
 	}
 }
 
+// Cancel is the only lever cleanup has on a running deploy, and the only one
+// that frees the slot. A state cleanup answers with a cancel that the server
+// refuses leaves the request holding the slot with nothing left to try: every
+// test that deploys after it fails, each naming the held slot rather than the
+// refusal that caused it.
+func TestServerAcceptsCancelInEveryStateCleanupCancels(t *testing.T) {
+	cancelled := 0
+	for deployState, want := range wantClearAction {
+		if want != actionCancel {
+			continue
+		}
+		cancelled++
+		t.Run(deployState, func(t *testing.T) {
+			assert.True(t, localscale.CanCancelDeployRequest(deployState),
+				"cleanup cancels a deploy request in %q, but the server refuses a cancel in that state",
+				deployState)
+		})
+	}
+	require.Positive(t, cancelled, "no state expects a cancel, so this proves nothing")
+}
+
+// The converse: a state the server will still act on is one cleanup can free,
+// so cleanup must ask for something. Leaving it alone is the wedge, and it is
+// the answer a state reaches by default when nobody decided about it.
+func TestCleanupActsOnEveryStateTheServerWillStillCancel(t *testing.T) {
+	for deployState, want := range wantClearAction {
+		if !localscale.CanCancelDeployRequest(deployState) {
+			continue
+		}
+		t.Run(deployState, func(t *testing.T) {
+			assert.NotEqual(t, actionNone.String(), want.String(),
+				"the server would still act on a deploy request in %q, so cleanup can free the slot and should",
+				deployState)
+		})
+	}
+}
+
 // blocksNewDeploy reports whether a deploy request in this state occupies the
 // one active deploy a database is allowed, so that a later test's deploy is
 // refused until it clears.

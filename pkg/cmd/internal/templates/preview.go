@@ -147,6 +147,7 @@ const (
 	PreviewCommentMySQLMultiSchema             PreviewType = "comment_mysql_multi_schema"              // MySQL plan with multiple schema names
 	PreviewCommentHelp                         PreviewType = "comment_help"                            // Help command reference comment
 	PreviewCommentSupportChannel               PreviewType = "comment_support_channel"                 // Comment with support-channel footer
+	PreviewCommentOversized                    PreviewType = "comment_oversized"                       // Notice posted in place of a comment over GitHub's size cap
 	PreviewCommentErrors                       PreviewType = "comment_errors"                          // All error comment templates
 	PreviewCommentUnsafeBlocked                PreviewType = "comment_unsafe_blocked"                  // Unsafe changes blocked (no --allow-unsafe)
 	PreviewCommentDropColumnBlocked            PreviewType = "comment_drop_column_blocked"             // Drop column blocked with destructive-drop guidance

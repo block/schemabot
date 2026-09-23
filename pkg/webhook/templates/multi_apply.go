@@ -72,8 +72,27 @@ type MultiDeploymentApplyData struct {
 // The single-deployment case is intentionally not handled here: callers render
 // it with RenderApplyStatusComment so the title and detail vocabulary stay shared.
 func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
-	var sb strings.Builder
 	renderedAt := currentTimestamp()
+	return renderWithinCommentLimit(countDeploymentTablesWithDDL(data), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderMultiDeploymentApplyComment(data, renderedAt, budget)
+	})
+}
+
+// countDeploymentTablesWithDDL counts the DDL blocks the per-deployment detail
+// sections render between them, so one comment's DDL budget is shared across
+// every deployment rather than granted to each.
+func countDeploymentTablesWithDDL(data MultiDeploymentApplyData) int {
+	count := 0
+	for i := range data.Model.Deployments {
+		if detail := memberDetail(data.Details, i); detail != nil {
+			count += countTablesWithDDL(detail.Tables)
+		}
+	}
+	return count
+}
+
+func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt string, budget *ddlBlockBudget) string {
+	var sb strings.Builder
 
 	// Aggregate header: the stable in-place status title, identical to the
 	// single-deployment comment so the headline vocabulary stays shared.
@@ -88,7 +107,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	writeDeploymentSummaryList(&sb, data.Model.Deployments)
 
 	// Expandable per-deployment detail, in resolved order.
-	writeDeploymentSections(&sb, data, renderedAt)
+	writeDeploymentSections(&sb, data, renderedAt, budget)
 	if !state.IsTerminalApplyState(data.Model.State) {
 		writeLastUpdatedFooter(&sb, renderedAt)
 	}
@@ -106,6 +125,12 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 // The single-deployment case is intentionally not handled here: callers render
 // it with RenderApplySummaryComment so the title and detail vocabulary stay shared.
 func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) string {
+	return renderWithinCommentLimit(countDeploymentTablesWithDDL(data), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderMultiDeploymentApplySummaryComment(data, budget)
+	})
+}
+
+func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
@@ -117,7 +142,7 @@ func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) str
 	writeDeploymentSummaryList(&sb, data.Model.Deployments)
 
 	// Expandable per-deployment terminal summary, in resolved order.
-	writeDeploymentSummarySections(&sb, data)
+	writeDeploymentSummarySections(&sb, data, budget)
 
 	return sb.String()
 }
@@ -216,17 +241,19 @@ func writeDeploymentSummaryList(sb *strings.Builder, deps []presentation.Deploym
 
 // writeDeploymentSections writes the in-progress status detail per deployment,
 // reusing the single-deployment status renderer for each <details> body.
-func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData, renderedAt string) {
+func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData, renderedAt string, budget *ddlBlockBudget) {
 	writeDeploymentDetailSections(sb, data, func(detail ApplyStatusCommentData) string {
-		return renderApplyStatusComment(detail, false, renderedAt)
+		return renderApplyStatusCommentBody(detail, false, renderedAt, budget)
 	})
 }
 
 // writeDeploymentSummarySections writes the terminal summary detail per
 // deployment, reusing the single-deployment summary renderer for each <details>
 // body.
-func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApplyData) {
-	writeDeploymentDetailSections(sb, data, RenderApplySummaryComment)
+func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApplyData, budget *ddlBlockBudget) {
+	writeDeploymentDetailSections(sb, data, func(detail ApplyStatusCommentData) string {
+		return renderApplySummaryComment(detail, budget)
+	})
 }
 
 // writeDeploymentDetailSections writes a <details> block per deployment in

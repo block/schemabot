@@ -9,6 +9,8 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // planDeploymentDiffConcurrency bounds how many deployments are diffed at once.
@@ -31,6 +33,13 @@ type DeploymentPlanDiff struct {
 	Changes        []*ternv1.SchemaChange
 	Shards         []*ternv1.ShardPlan
 	LintViolations []*ternv1.LintViolation
+
+	// DirectExecution is the policy this member's diff was judged under. The
+	// member's stored plan records it, so the apply that dispatches this
+	// member runs its statements under the policy its verdicts were computed
+	// against. The primary's entry leaves it unset: its plan is the reviewed
+	// plan, already stored by the path that planned it.
+	DirectExecution *storage.DirectExecutionPolicy
 
 	Err error
 }
@@ -109,7 +118,22 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 		}
 
 		g.Go(func() error {
-			resp, err := s.planDeploymentDiff(gctx, req, target)
+			directExecution, err := s.config.DirectExecutionPolicyFor(req.Database, req.Environment, target.DatabaseType)
+			if err != nil {
+				policyErr := fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
+				s.logger.Warn("could not resolve the direct_execution policy for a rollout member; deployment will block the review rollup",
+					"database", req.Database,
+					"environment", req.Environment,
+					"deployment", target.Deployment,
+					"target", target.Target,
+					"error", policyErr)
+				metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "errored")
+				results[i].Err = policyErr
+				return nil
+			}
+			results[i].DirectExecution = directExecution
+
+			resp, err := s.planDeploymentDiff(gctx, req, target, directExecution)
 			if err != nil {
 				s.logger.Warn("plan deployment diff failed; deployment will block the review rollup",
 					"database", req.Database,
@@ -164,7 +188,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 // planDeploymentDiff runs the non-persisting PlanDiff RPC against a single
 // deployment, building the per-target request the same way ExecutePlan builds
 // the primary's plan request.
-func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, target routing.ExecutionTarget) (*ternv1.PlanDiffResponse, error) {
+func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, target routing.ExecutionTarget, directExecution *storage.DirectExecutionPolicy) (*ternv1.PlanDiffResponse, error) {
 	client, err := s.TernClient(target.Deployment, req.Environment)
 	if err != nil {
 		return nil, fmt.Errorf("tern client for deployment %q environment %q: %w", target.Deployment, req.Environment, err)
@@ -195,6 +219,10 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
+		// A member's diff is judged under the same policy as the primary's,
+		// so a refused statement reads as the same verdict on every member
+		// rather than as drift between them.
+		DirectExecution: tern.DirectExecutionPolicyProto(directExecution),
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest
