@@ -67,6 +67,33 @@ func CanCancelDeployRequest(deployState string) bool {
 	return !IsTerminalDeployState(deployState) && !alreadyCancelling[deployState]
 }
 
+// cancelResolveTimeout bounds how long a deploy request waits in
+// in_progress_cancel for the engine to confirm the cancel. A cancel the engine
+// has accepted lands in well under a second; one it never answers would
+// otherwise hold the database's single active deploy for as long as the server
+// runs, which is the wedge a cancel exists to undo.
+const cancelResolveTimeout = 10 * time.Second
+
+// cancelTimeRemaining reports how long a cancel recorded at the given stored
+// timestamp has left before its deadline, and whether that deadline can be
+// measured at all. Both the stored value and now are UTC, written and read by
+// the same Go clock, so the answer does not depend on the database session's
+// time zone.
+//
+// A request in in_progress_cancel with no readable timestamp was written by a
+// path that does not record one. It is left to the engine rather than resolved
+// against a deadline that cannot be measured.
+func cancelTimeRemaining(cancelRequestedAt sql.NullString, now time.Time) (time.Duration, bool) {
+	if !cancelRequestedAt.Valid || cancelRequestedAt.String == "" {
+		return 0, false
+	}
+	requestedAt, err := time.Parse(storedTimestampLayout, cancelRequestedAt.String)
+	if err != nil {
+		return 0, false
+	}
+	return cancelResolveTimeout - now.Sub(requestedAt), true
+}
+
 // runStateProcessor is a background goroutine that drives deploy request state
 // transitions by polling Vitess schema change statuses every 500ms. This replaces
 // the previous approach of deriving state lazily on each GET request.
@@ -102,6 +129,7 @@ type activeDeployRow struct {
 	instantDDLRequested    bool
 	branch                 string
 	revertExpiresAtStr     sql.NullString
+	cancelRequestedAtStr   sql.NullString
 	createdAtStr           string
 }
 
@@ -110,7 +138,8 @@ type activeDeployRow struct {
 func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	rows, err := s.metadataDB.QueryContext(ctx,
 		`SELECT org, database_name, number, deployment_state, migration_context, revert_migration_context,
-		        vschema_data, vschema_applied, auto_cutover, instant_ddl, branch, revert_expires_at, created_at
+		        vschema_data, vschema_applied, auto_cutover, instant_ddl, branch, revert_expires_at,
+		        cancel_requested_at, created_at
 		 FROM localscale_deploy_requests
 		 WHERE deployment_state IN ('submitting','queued','in_progress','pending_cutover','in_progress_cutover','in_progress_vschema','in_progress_cancel','in_progress_revert','in_progress_revert_vschema','complete_pending_revert')
 		 AND deployed = TRUE`)
@@ -123,7 +152,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	for rows.Next() {
 		var r activeDeployRow
 		if err := rows.Scan(&r.org, &r.database, &r.number, &r.deployState, &r.migrationContext, &r.revertMigrationContext,
-			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.instantDDLRequested, &r.branch, &r.revertExpiresAtStr, &r.createdAtStr); err != nil {
+			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.instantDDLRequested, &r.branch, &r.revertExpiresAtStr, &r.cancelRequestedAtStr, &r.createdAtStr); err != nil {
 			s.logger.Warn("processor: scan deploy request row", "error", err)
 			continue
 		}
@@ -249,6 +278,30 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 
 		case dr.InProgressCancel:
+			// The shard a cancel waits on is the one that has stopped
+			// answering, so the engine calls below are this branch's slowest
+			// part and must not be what decides whether the deadline passed.
+			// The deadline is read first, and then spent: what is left of it
+			// bounds this tick's engine work, so a shard that never answers
+			// costs the remainder of the deadline and not a statement timeout
+			// on top of it.
+			cancelCtx := ctx
+			if remaining, measurable := cancelTimeRemaining(r.cancelRequestedAtStr, time.Now().UTC()); measurable {
+				if remaining <= 0 {
+					s.logger.Error("cancel not confirmed by the engine within its deadline; "+
+						"reporting the deploy request failed and freeing the active deploy",
+						"number", r.number, "org", r.org, "database", r.database,
+						"migration_context", r.migrationContext, "deadline", cancelResolveTimeout)
+					if err := s.updateDeployState(ctx, ref, dr.CompleteError); err != nil {
+						s.logger.Error("processor: failed to resolve unconfirmed cancel",
+							"number", r.number, "error", err)
+					}
+					continue
+				}
+				var cancelDeadline context.CancelFunc
+				cancelCtx, cancelDeadline = context.WithTimeout(ctx, remaining)
+				defer cancelDeadline()
+			}
 			// Cancel phase: wait for all Vitess schema changes to reach terminal state.
 			if r.migrationContext == "" {
 				// No schema changes to cancel (e.g., cancelled during submitting)
@@ -265,10 +318,10 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 			// Re-issue CANCEL on every tick to handle the race where schema changes
 			// become visible after the initial cancel request.
-			if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, migrationActionCancel); err != nil {
+			if err := s.alterVitessMigrations(cancelCtx, backend, r.migrationContext, migrationActionCancel); err != nil {
 				s.logger.Warn("processor: re-cancel schema changes", "number", r.number, "error", err)
 			}
-			migrations := s.getMigrationInfos(ctx, backend, r.migrationContext)
+			migrations := s.getMigrationInfos(cancelCtx, backend, r.migrationContext)
 			if len(migrations) == 0 {
 				s.logger.Debug("processor: cancel waiting for schema changes to appear", "number", r.number, "migration_context", r.migrationContext)
 				continue

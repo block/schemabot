@@ -1,9 +1,11 @@
 package localscale
 
 import (
+	"database/sql"
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -123,4 +125,65 @@ func TestGroupMigrationsByShardDropsRowsItCannotActOn(t *testing.T) {
 	assert.Equal(t, map[migrationTarget][]string{
 		{keyspace: "testapp", shard: "0"}: {"keep"},
 	}, targets)
+}
+
+// A cancel resolves on its deadline whether or not the engine ever answers.
+// The stored timestamp and the clock it is compared against are both UTC, so
+// running under a session or host zone offset from UTC must not shift the
+// deadline — an offset in one direction never fires, which leaves the deploy
+// holding the slot it was cancelled to release.
+func TestCancelUnconfirmedSinceMeasuresAgainstTheStoredClock(t *testing.T) {
+	stored := func(at time.Time) sql.NullString {
+		return sql.NullString{String: at.UTC().Format(storedTimestampLayout), Valid: true}
+	}
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name         string
+		at           sql.NullString
+		now          time.Time
+		wantMeasured bool
+		wantPastDue  bool
+	}{
+		{"just requested", stored(now), now, true, false},
+		{"inside the deadline", stored(now.Add(-cancelResolveTimeout + time.Second)), now, true, false},
+		{"past the deadline", stored(now.Add(-cancelResolveTimeout - time.Second)), now, true, true},
+		{"never recorded", sql.NullString{}, now, false, false},
+		{"recorded empty", sql.NullString{String: "", Valid: true}, now, false, false},
+		{"unparseable", sql.NullString{String: "not a timestamp", Valid: true}, now, false, false},
+		{
+			"compared from a zone ahead of UTC",
+			stored(now.Add(-cancelResolveTimeout - time.Second)),
+			now.In(time.FixedZone("ahead", 9*60*60)),
+			true, true,
+		},
+		{
+			"compared from a zone behind UTC",
+			stored(now.Add(-cancelResolveTimeout - time.Second)),
+			now.In(time.FixedZone("behind", -7*60*60)),
+			true, true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			remaining, measurable := cancelTimeRemaining(tt.at, tt.now)
+			require.Equal(t, tt.wantMeasured, measurable)
+			if !measurable {
+				return
+			}
+			assert.Equal(t, tt.wantPastDue, remaining <= 0,
+				"remaining was %s", remaining)
+		})
+	}
+}
+
+// The remaining deadline also bounds the tick's own engine calls, so it has to
+// be a usable budget and not merely a sign.
+func TestCancelTimeRemainingCountsDownFromTheDeadline(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	at := sql.NullString{String: now.Add(-4 * time.Second).Format(storedTimestampLayout), Valid: true}
+
+	remaining, measurable := cancelTimeRemaining(at, now)
+	require.True(t, measurable)
+	assert.Equal(t, cancelResolveTimeout-4*time.Second, remaining)
 }

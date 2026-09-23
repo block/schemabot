@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
 func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, ref, err := s.resolveDeployAction(r)
+	_, ref, err := s.resolveDeployAction(r)
 	if err != nil {
 		return err
 	}
@@ -28,30 +29,29 @@ func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusConflict, "cannot cancel: deploy request is in state %q", info.deploymentState)
 	}
 
-	// Record the cancel before asking Vitess to act on it. The processor
-	// re-issues CANCEL on every tick while a request is in in_progress_cancel,
-	// so the statement below is the first of those attempts rather than the
-	// only one — and a deploy whose engine has stopped answering is exactly
-	// the one whose cancel must not be lost.
+	// Recording the state is the whole of the handler's job. The processor
+	// issues CANCEL to Vitess on every tick a request spends in
+	// in_progress_cancel, so asking the engine here as well would only add a
+	// first attempt — one made on the caller's connection, against the shard
+	// whose silence is the reason the cancel was sent. A cancel must be
+	// answerable while the engine is not.
+	//
+	// The timestamp comes from Go rather than NOW() because the deadline it
+	// feeds is measured against a Go clock. A stored NOW() is the database
+	// session's wall clock, and an offset between the two reads as a cancel
+	// from the future: a deadline that never passes, on the one request that
+	// needs it to.
 	if err := s.execLog(r.Context(),
 		`UPDATE localscale_deploy_requests
-		 SET deployment_state = ?
+		 SET deployment_state = ?, cancel_requested_at = ?
 		 WHERE org = ? AND database_name = ? AND number = ?`,
-		dr.InProgressCancel, ref.org, ref.database, number,
+		dr.InProgressCancel, time.Now().UTC().Format(storedTimestampLayout),
+		ref.org, ref.database, number,
 	); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
-
-	if info.migrationContext != "" {
-		if err := s.alterVitessMigrations(r.Context(), backend, info.migrationContext, migrationActionCancel); err != nil {
-			// Reported, not returned: the cancel is recorded and the processor
-			// owns it from here. Failing the request would tell the caller the
-			// cancel did not happen while the state says it did.
-			s.logger.Warn("cancel schema changes failed; the processor will retry",
-				"number", number, "org", ref.org, "database", ref.database,
-				"migration_context", info.migrationContext, "error", err)
-		}
-	}
+	s.logger.Info("deploy request cancel recorded", "number", number, "org", ref.org,
+		"database", ref.database, "from_state", info.deploymentState)
 
 	s.writeJSON(w, deployResponse(number, info.branch, dr.InProgressCancel, info.createdAt))
 	return nil
@@ -484,7 +484,10 @@ func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBac
 			defer cleanup()
 			for _, uuid := range uuids {
 				stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
-				if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				execCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+				_, err := conn.ExecContext(execCtx, stmt)
+				cancel()
+				if err != nil {
 					return fmt.Errorf("alter vitess_migration %s %s: %w", uuid, action, err)
 				}
 			}
@@ -504,6 +507,14 @@ func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBac
 	return firstErr
 }
 
+// vitessQueryTimeout bounds one statement SchemaBot sends a shard about its
+// schema changes. A healthy shard answers in milliseconds; a shard whose
+// cutover has stopped responding answers never, and the caller that waits on
+// it is the single processor goroutine that drives every deploy request. One
+// unresponsive shard costs a tick under this bound and stalls the state
+// machine without it.
+const vitessQueryTimeout = 10 * time.Second
+
 // showMigrations queries SHOW VITESS_MIGRATIONS for a context across all keyspaces
 // and returns the raw column maps with an added "_keyspace" field.
 //
@@ -518,14 +529,9 @@ func (s *Server) showMigrations(ctx context.Context, backend *databaseBackend, m
 	}
 	var result []map[string]string
 	for keyspace, db := range backend.vtgateDBs {
-		rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS LIKE '"+migrationContext+"'")
+		rowMaps, err := showMigrationsOn(ctx, db, migrationContext)
 		if err != nil {
 			return nil, fmt.Errorf("show vitess_migrations for %s: %w", keyspace, err)
-		}
-		rowMaps, err := scanDynamicRows(rows)
-		utils.CloseAndLog(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan vitess_migrations for %s: %w", keyspace, err)
 		}
 		for _, rm := range rowMaps {
 			rm["_keyspace"] = keyspace
@@ -533,6 +539,21 @@ func (s *Server) showMigrations(ctx context.Context, backend *databaseBackend, m
 		result = append(result, rowMaps...)
 	}
 	return result, nil
+}
+
+// showMigrationsOn reads one keyspace's rows within vitessQueryTimeout. The
+// scan shares the deadline with the query: rows are streamed, so a shard that
+// stops answering part way through blocks the scan exactly as it would block
+// the query.
+func showMigrationsOn(ctx context.Context, db *sql.DB, migrationContext string) ([]map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS LIKE '"+migrationContext+"'")
+	if err != nil {
+		return nil, err
+	}
+	defer utils.CloseAndLog(rows)
+	return scanDynamicRows(rows)
 }
 
 func (s *Server) getMigrationInfos(ctx context.Context, backend *databaseBackend, migrationContext string) []migrationInfo {
