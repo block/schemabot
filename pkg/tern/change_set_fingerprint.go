@@ -67,12 +67,22 @@ func ChangeSetFingerprint(dialect schema.Dialect, cs ChangeSet) (string, error) 
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-// fingerprintRecord joins one multiset entry's fields with a separator no field
-// can contain, so no pair of distinct entries can render to the same line. A
-// namespace, table, or DDL body can contain anything a schema author wrote,
-// which is why the separator is a control byte rather than a punctuation
-// character: joining on one that a field could contain would let two different
-// change sets collide into one fingerprint and be grouped as identical work.
+// fingerprintRecord renders one multiset entry's fields so that no pair of
+// distinct entries can render to the same line.
+//
+// A namespace, table, or DDL body can contain anything a schema author wrote,
+// including any byte a separator might be chosen from, so separating the fields
+// is not on its own enough: a field carrying the separator would move the
+// boundary and let a different tuple of fields render identically. Each field is
+// therefore length-prefixed, which fixes every boundary before any content is
+// read and leaves nothing a field's content can shift. The separator between a
+// length and its field only has to be a byte no decimal length can contain.
 func fingerprintRecord(fields ...string) string {
-	return strings.Join(fields, "\x1f")
+	var record strings.Builder
+	for _, field := range fields {
+		record.WriteString(strconv.Itoa(len(field)))
+		record.WriteByte(0x1f)
+		record.WriteString(field)
+	}
+	return record.String()
 }

@@ -91,15 +91,25 @@ type DeploymentRollupEntry struct {
 	// ChangeSet is what this member would run: the change set its own diff
 	// produced, or the reviewed plan's for the primary. Empty for a member that
 	// errored, which has no plan to describe.
+	//
+	// It holds the caller's own change and shard messages rather than copies of
+	// them, so a caller that mutates what it passed to RollupDeploymentDiffs
+	// mutates what every entry reports. Read it; do not write through it.
 	ChangeSet tern.ChangeSet
 	// PlanFingerprint keys ChangeSet by the work it would run, so a reader can
 	// group members that would run the same plan without comparing every pair.
 	// Two members share it exactly when tern.CompareChangeSets reports them
-	// identical. Empty for a member that errored.
+	// identical.
 	//
 	// A member classified Match or Planned always has one: both classifications
 	// are reached through a self-comparison that proves the member's content
 	// canonicalizes, which is the same thing the fingerprint needs.
+	//
+	// It is empty for a member that errored, and that emptiness is not a group.
+	// Grouping on the raw value — keying a map by it — collects every errored
+	// member under one key and renders them as members agreeing on a plan, which
+	// is the outcome keying nothing was meant to prevent. Check Class before
+	// grouping, and leave an errored member out.
 	PlanFingerprint string
 
 	// PlanIdentifier names the stored plan this member will run, set when the

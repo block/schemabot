@@ -105,6 +105,46 @@ func TestChangeSetFingerprint_SeparatesItsFields(t *testing.T) {
 	assert.NotEqual(t, fingerprint(t, sharded("app", "a1")), fingerprint(t, sharded("appa", "1")))
 }
 
+// Separating fields within a record is not enough on its own: a vschema record
+// is a prefix and a namespace with no internal structure, so two of them run
+// together into something a single longer namespace also renders. One member
+// changing the vschema of `a` and of `pp` does different work from one changing
+// the vschema of `avpp`, and a key that ran its records together would group
+// them as the same plan.
+func TestChangeSetFingerprint_SeparatesItsRecords(t *testing.T) {
+	vschemaOf := func(namespaces ...string) ChangeSet {
+		changes := make([]*ternv1.SchemaChange, 0, len(namespaces))
+		for _, ns := range namespaces {
+			changes = append(changes, &ternv1.SchemaChange{
+				Namespace: ns,
+				Metadata:  map[string]string{"vschema_changed": "true"},
+			})
+		}
+		return ChangeSet{Changes: changes}
+	}
+
+	assert.NotEqual(t, fingerprint(t, vschemaOf("a", "pp")), fingerprint(t, vschemaOf("avpp")))
+}
+
+// Separating fields is not enough either, because a field can hold the
+// separator. A namespace and a shard both come through as free-form strings, so
+// one carrying the separator moves the boundary between them and a different
+// pair renders the same way. The key length-prefixes each field, which fixes
+// every boundary before any content is read.
+func TestChangeSetFingerprint_AFieldCannotShiftItsOwnBoundary(t *testing.T) {
+	sharded := func(namespace, shard string) ChangeSet {
+		return ChangeSet{Shards: []*ternv1.ShardPlan{{
+			Namespace: namespace,
+			Shard:     shard,
+			Changes:   []*ternv1.TableChange{protoAlterUsersEmail()},
+		}}}
+	}
+
+	assert.NotEqual(t,
+		fingerprint(t, sharded("app\x1fa", "1")),
+		fingerprint(t, sharded("app", "a\x1f1")))
+}
+
 // A change set the comparison cannot canonicalize has no key. A caller must be
 // able to tell that apart from a key, so it can refuse to group the member
 // rather than group it with members it was never compared against.
