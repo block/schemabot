@@ -8,7 +8,7 @@ const {chromium}=require('playwright');
 (async()=>{
  const root=path.resolve(__dirname,'..'),tmp=fs.mkdtempSync(path.join(os.tmpdir(),'init-gif-'));
  const name=process.argv[2]||'init-demo';
- if(!/^init-(sample-)?demo$/.test(name))throw new Error('Use init-demo or init-sample-demo');
+ if(!/^init-((sample|vitess)-)?demo$/.test(name))throw new Error('Use init-demo, init-sample-demo, or init-vitess-demo');
  const recording=JSON.parse(fs.readFileSync(path.join(root,'assets/src/'+name+'-recording.json')));
  if(!recording.wizard.includes('Baseline plan: no changes.')||!recording.plan.includes('ALTER'))throw new Error('Record a successful real wizard and plan first');
  if(recording.sample&&!recording.wizard_frames.some(f=>f.rows.some(r=>r.map(s=>s.text).join('').includes('What would you like to try?'))))throw new Error('Sample recording must include the initial sample choice');
