@@ -6,14 +6,31 @@ import "strings"
 // code fence.
 const minimumFenceLength = 3
 
-// maxCommentDDLLen bounds the DDL rendered into one comment — every block's
-// statement text and fence lines together, a budget shared across the blocks
-// the comment renders rather than granted per block — so no run of statements
-// can carry a comment past GitHub's size limit. The fence grows with the
-// longest backtick run in a statement, so text made mostly of backticks
-// renders at three times its own length; budgeting the rendered block rather
-// than the statement keeps that growth inside the limit.
-const maxCommentDDLLen = 32768
+// CommentChromeHeadroom reserves room under GitHub's comment size cap for
+// markup added to the body after rendering (the support-channel footer) plus
+// margin, so an assembled comment never lands exactly at the limit. Config
+// validation caps the support-channel name and URL lengths so the rendered
+// footer always fits inside this reservation.
+const CommentChromeHeadroom = 1024
+
+// commentBodyLimit is the most a rendered comment body may hold: GitHub's cap
+// less the headroom kept for what the poster appends.
+const commentBodyLimit = GitHubIssueCommentMaxChars - CommentChromeHeadroom
+
+// applyCommentAppendReserve is the room an apply comment leaves for the
+// sections the poster appends after rendering: the rejected-command notice on
+// any apply comment and, on a failed apply's summary, the recent-logs fold.
+// The logs are what an operator triaging from the PR reads first, so the DDL
+// yields this much to them rather than filling the comment on its own.
+const applyCommentAppendReserve = 16384
+
+// commentFitPasses bounds the render passes a comment may take to fit under
+// its limit. The first pass offers the DDL every byte the limit allows; when
+// the rest of the comment turns out to need some of that room, the second
+// pass cuts the DDL budget by the overshoot, and the marker allowance charged
+// on that pass makes a third one unnecessary unless a comment renders more
+// DDL blocks than it announced.
+const commentFitPasses = 3
 
 // ddlTruncatedMarker follows a DDL block that was cut to fit the budget, so an
 // operator knows the statement shown is incomplete and where to look instead.
@@ -37,9 +54,35 @@ type ddlBlockBudget struct {
 }
 
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
-// render the given number of DDL blocks.
-func newDDLBlockBudget(blocks int) *ddlBlockBudget {
-	return &ddlBlockBudget{remaining: maxCommentDDLLen, blocksLeft: blocks}
+// render the given number of DDL blocks into at most limit bytes of DDL.
+func newDDLBlockBudget(blocks, limit int) *ddlBlockBudget {
+	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks}
+}
+
+// renderWithinCommentLimit renders a comment so its DDL takes every byte the
+// rest of the comment leaves under GitHub's size cap, less reserve bytes kept
+// for sections the poster appends afterwards. The first pass offers the DDL
+// the whole limit; a comment whose other sections fit alongside is done. When
+// the body overshoots, the DDL budget is cut by the overshoot plus a
+// truncation marker for every block not yet carrying one, so the next pass
+// fits. The render callback must produce the same non-DDL text on every pass:
+// only the budget it is handed changes.
+func renderWithinCommentLimit(blocks, reserve int, render func(*ddlBlockBudget) string) string {
+	limit := commentBodyLimit - reserve
+	ddlLimit := limit
+	var body string
+	for range commentFitPasses {
+		budget := newDDLBlockBudget(blocks, ddlLimit)
+		body = render(budget)
+		over := len(body) - limit
+		if over <= 0 {
+			return body
+		}
+		spent := ddlLimit - budget.remaining
+		unmarked := max(blocks-strings.Count(body, ddlTruncatedMarker), 0)
+		ddlLimit = max(spent-over-unmarked*len(ddlTruncatedMarker), 0)
+	}
+	return body
 }
 
 // take returns the share the next block may render into; the caller reports

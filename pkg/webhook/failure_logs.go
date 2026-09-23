@@ -12,13 +12,6 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// commentChromeHeadroom reserves room under GitHub's comment size cap for
-// markup added to the body after the section is appended (the support-channel
-// footer) plus margin, so the assembled comment never lands exactly at the
-// limit. Config validation caps the support-channel name and URL lengths so
-// the rendered footer always fits inside this reservation.
-const commentChromeHeadroom = 1024
-
 // failureSummaryLogLimit bounds the log load for a failed apply's summary
 // comment. It is derived, not a product choice: the comment's byte budget is
 // the real limit, and this is the most entries that could ever render within
@@ -27,7 +20,7 @@ const commentChromeHeadroom = 1024
 // far more rows than any comment can carry) without the load bound ever being
 // the reason a line is dropped. The newest entries are kept — the tail leading
 // up to the failure is what an operator triaging from the PR needs.
-const failureSummaryLogLimit = (templates.GitHubIssueCommentMaxChars - commentChromeHeadroom) / templates.MinRenderedLogLineChars
+const failureSummaryLogLimit = (templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom) / templates.MinRenderedLogLineChars
 
 // failureLogsLoadTimeout bounds the log load so a slow storage read degrades
 // to a summary without logs rather than delaying the terminal comment.
@@ -109,7 +102,7 @@ func summaryWithFailureLogs(ctx context.Context, stor storage.Storage, engineLog
 	if !state.IsState(apply.State, state.Apply.Failed) {
 		return body
 	}
-	available := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - len(body)
+	available := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - len(body)
 	if available < templates.MinFailureLogsSectionChars {
 		logger.Error("summary body leaves no room for the recent-logs section under the GitHub comment size limit; posting summary without recent logs",
 			append(apply.LogAttrs(), "summary_chars", len(body))...)
@@ -118,7 +111,7 @@ func summaryWithFailureLogs(ctx context.Context, stor storage.Storage, engineLog
 	groups := failureLogGroups(ctx, stor, engineLogs, logger, apply)
 	if pointed := applyPointingAtRenderedLogs(apply, groups); pointed != apply {
 		pointedBody := renderBody(pointed)
-		pointedRoom := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - len(pointedBody)
+		pointedRoom := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - len(pointedBody)
 		// The pointed sentence is longer than the one it replaces, so a body
 		// that only just cleared the check above can fail it now. Keeping the
 		// pointed body then would promise an account in the logs below and

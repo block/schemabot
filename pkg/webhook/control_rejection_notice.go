@@ -78,7 +78,7 @@ func renderControlRejections(rejections []templates.ControlRejectionData, logger
 	if section == "" {
 		return ""
 	}
-	if len(baseBody)+len(section) > templates.GitHubIssueCommentMaxChars-commentChromeHeadroom {
+	if len(baseBody)+len(section) > templates.GitHubIssueCommentMaxChars-templates.CommentChromeHeadroom {
 		logger.Error("comment body leaves no room for the rejected-command notice under the GitHub comment size limit; posting without it",
 			append(apply.LogAttrs(), "comment_chars", len(baseBody))...)
 		return ""
