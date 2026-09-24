@@ -756,11 +756,14 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 }
 
 // pauseHoldWindow is how long the pause test keeps checking that the later
-// deployment stays short of completed while the rollout is held. Under
-// cutover_policy: barrier the later deployment parks at waiting_for_cutover
-// behind its predecessor whatever on_failure says, so a single read taken the
-// moment the aggregate shows paused cannot tell a held rollout from one about
-// to cut over; watching across several poll intervals can.
+// deployment stays short of completed after the aggregate has reported paused
+// and before the operator releases it. Under cutover_policy: barrier the later
+// deployment parks at waiting_for_cutover behind its predecessor whatever
+// on_failure says, so a single read taken the moment the aggregate shows paused
+// cannot tell a held rollout from one about to cut over; watching across
+// several poll intervals can. The stretch before that — from apply acceptance
+// to the aggregate turning paused — is guarded inside the phase-1 poll itself,
+// so this window only has to cover the pause-to-release gap.
 const pauseHoldWindow = 3 * time.Second
 
 // TestGRPCMultiDeploy_OnFailurePauseRelease verifies that on_failure: pause
@@ -817,11 +820,16 @@ func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
 
 	// Phase 1: eu fails and the rollout pauses. The aggregate settles to the
 	// non-terminal paused state; the later deployment must not complete while
-	// the rollout is held.
+	// the rollout is held. The later deployment is checked on every tick, so
+	// the hold is guarded continuously from acceptance to paused rather than
+	// only sampled once the aggregate reports it.
 	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
 		func() bool {
 			ops := multiDeployOps(t, apply.ApplyID, first, second)
 			prog := grpcProgressByApplyID(t, apply.ApplyID)
+			require.Falsef(t, state.IsState(ops[second].State, state.Apply.Completed),
+				"pause violated: %s completed before the rollout was released (%s=%q apply=%q)",
+				second, first, ops[first].State, prog.State)
 			return failedApplyState(ops[first].State) &&
 				state.IsState(prog.State, state.Apply.Paused)
 		},
@@ -833,8 +841,9 @@ func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
 		},
 	)
 
-	// Keep watching the held deployment for a while: a rollout that cuts over
-	// shortly after the aggregate turns paused is a pause that did not hold.
+	// Keep watching the held deployment for a while after the aggregate turns
+	// paused and before the release: a rollout that cuts over shortly after
+	// reporting paused is a pause that did not hold.
 	for holdUntil := time.Now().Add(pauseHoldWindow); time.Now().Before(holdUntil); time.Sleep(testutil.PollInterval) {
 		held := multiDeployOps(t, apply.ApplyID, first, second)
 		require.Falsef(t, state.IsState(held[second].State, state.Apply.Completed),
@@ -874,11 +883,15 @@ func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
 
 	// The aggregate is projected by a parent-row CAS that runs after the
 	// per-deployment op rows are persisted, so it can briefly lag the terminal
-	// op states above; poll for it rather than asserting once.
+	// op states above; poll for it rather than asserting once. A released
+	// rollout stays released: every read between the release and the settled
+	// verdict must be something other than paused.
 	var prog grpcProgressResponse
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
 			prog = grpcProgressByApplyID(t, apply.ApplyID)
+			require.Falsef(t, state.IsState(prog.State, state.Apply.Paused),
+				"a released rollout must not return to paused, was %q", prog.State)
 			return failedApplyState(prog.State)
 		},
 		func() string {
