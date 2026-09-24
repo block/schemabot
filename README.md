@@ -61,7 +61,13 @@ These boundaries matter just as much for a coding agent as for a person. Give ag
 
 ## Quick Start
 
-Grab the CLI from [Releases](#releases). From your application’s project directory, run:
+Install with [Homebrew](https://brew.sh/) on Apple Silicon macOS or Linux:
+
+```bash
+brew install block/tap/schemabot
+```
+
+Other installation options are available from [Releases](#releases). From your application’s project directory, run:
 
 ```bash
 schemabot init
