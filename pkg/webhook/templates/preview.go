@@ -639,8 +639,10 @@ func PreviewCommentPlanRolloutConverging() string {
 
 // PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
 // whose reviewed target already holds the desired schema while other targets do
-// not. The reviewed plan is empty, so the comment renders no DDL — and names the
-// targets that are still missing the change rather than reading as a no-op.
+// not. The reviewed plan is empty, so the comment renders no DDL — and counts the
+// targets that are still missing the change rather than reading as a no-op. It
+// counts them rather than naming them: the rollup line lists every member, but
+// nothing here attributes a member to the group that still needs the change.
 func PreviewCommentPlanRolloutConvergedPrimary() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
