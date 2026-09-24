@@ -202,8 +202,9 @@ Engine notes:
   again: the Spirit engine's `ExecutionVerdicts` records, for a change planned
   against one shard primary, the verdict the Spirit engine's own plan would
   record there, from the same refusal check, policy, and size gate. Once both
-  pieces are in place, `max_table_rows` becomes a per-shard bound — one over-bound or unknown-size shard blocking
-  the whole apply through the normal any-shard-blocked aggregation, and a
+  pieces are in place, `max_table_rows` becomes a per-shard bound — one
+  over-bound or unknown-size shard blocking the whole apply through the normal
+  any-shard-blocked aggregation, and a
   direct statement that does run executing per shard rather than atomically
   across shards, the same property every sharded change has.
 - **PlanetScale/Vitess: excluded by design.** Raw DDL against vtgate would
