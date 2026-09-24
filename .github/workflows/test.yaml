@@ -510,7 +510,7 @@ jobs:
           - shard: ordered
             run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability|BarrierReleaseBounded)$$
           - shard: failure-policy
-            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue)$$
+            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue|OnFailurePauseRelease)$$
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"

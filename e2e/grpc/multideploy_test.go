@@ -755,6 +755,19 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }
 
+// pauseHoldWindow is how long the pause test keeps checking that the later
+// deployment stays short of completed while the rollout is held. Under
+// cutover_policy: barrier the later deployment parks at waiting_for_cutover
+// behind its predecessor whatever on_failure says, so a single read taken the
+// moment the aggregate shows paused cannot tell a held rollout from one about
+// to cut over; watching across several poll intervals can.
+const pauseHoldWindow = 3 * time.Second
+
+// TestGRPCMultiDeploy_OnFailurePauseRelease verifies that on_failure: pause
+// holds a fan-out rollout at the first failed deployment until an operator
+// releases it, and that the release lets the remaining deployment finish
+// without changing the apply's verdict.
+//
 // Scenario: testapp/production-pause fans out to [eu, us] with deployment_order
 // [eu, us], cutover_policy: barrier, and on_failure: pause. The earlier
 // deployment (eu) is seeded with duplicate data so adding a UNIQUE key fails its
@@ -796,6 +809,12 @@ func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
+	// The duplicate-row failure is retryable, so the earlier deployment would
+	// otherwise pause and re-run its engine attempt until the recovery budget
+	// is spent before settling failed — and the aggregate cannot read paused
+	// until it has.
+	multiDeploySpendRecoveryBudget(t, first)
+
 	// Phase 1: eu fails and the rollout pauses. The aggregate settles to the
 	// non-terminal paused state; the later deployment must not complete while
 	// the rollout is held.
@@ -814,9 +833,13 @@ func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
 		},
 	)
 
-	held := multiDeployOps(t, apply.ApplyID, first, second)
-	assert.Falsef(t, state.IsState(held[second].State, state.Apply.Completed),
-		"%s must not complete while the rollout is paused, was %q", second, held[second].State)
+	// Keep watching the held deployment for a while: a rollout that cuts over
+	// shortly after the aggregate turns paused is a pause that did not hold.
+	for holdUntil := time.Now().Add(pauseHoldWindow); time.Now().Before(holdUntil); time.Sleep(testutil.PollInterval) {
+		held := multiDeployOps(t, apply.ApplyID, first, second)
+		require.Falsef(t, state.IsState(held[second].State, state.Apply.Completed),
+			"%s must not complete while the rollout is paused, was %q", second, held[second].State)
+	}
 
 	// Release the paused rollout so the remaining deployment proceeds.
 	releaseResp := grpcPost(t, "/api/release", map[string]string{
@@ -849,8 +872,19 @@ func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
 	assert.Truef(t, state.IsState(final[second].State, state.Apply.Completed),
 		"%s should complete after release under on_failure: pause, was %q", second, final[second].State)
 
-	prog := grpcProgressByApplyID(t, apply.ApplyID)
-	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed after release, was %q", prog.State)
+	// The aggregate is projected by a parent-row CAS that runs after the
+	// per-deployment op rows are persisted, so it can briefly lag the terminal
+	// op states above; poll for it rather than asserting once.
+	var prog grpcProgressResponse
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			prog = grpcProgressByApplyID(t, apply.ApplyID)
+			return failedApplyState(prog.State)
+		},
+		func() string {
+			return fmt.Sprintf("aggregate apply state should be failed after release, was %q", prog.State)
+		},
+	)
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }
