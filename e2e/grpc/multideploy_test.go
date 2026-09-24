@@ -755,6 +755,106 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }
 
+// Scenario: testapp/production-pause fans out to [eu, us] with deployment_order
+// [eu, us], cutover_policy: barrier, and on_failure: pause. The earlier
+// deployment (eu) is seeded with duplicate data so adding a UNIQUE key fails its
+// copy; the later deployment (us) is healthy. Under pause, eu's failure holds
+// the rollout: the aggregate apply reports the non-terminal paused state and the
+// later deployment does not complete until a human releases it. After a release
+// control request, us proceeds and completes; the apply still settles to failed
+// — pause governs rollout continuation, not the pass/fail verdict.
+func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production-pause"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_pause")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+	}
+	// The earlier deployment gets identical names so adding UNIQUE(name) fails
+	// during its copy; the later deployment gets unique names so it completes.
+	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 2)
+	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 2)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT, UNIQUE KEY uniq_name (name));", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// Phase 1: eu fails and the rollout pauses. The aggregate settles to the
+	// non-terminal paused state; the later deployment must not complete while
+	// the rollout is held.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			prog := grpcProgressByApplyID(t, apply.ApplyID)
+			return failedApplyState(ops[first].State) &&
+				state.IsState(prog.State, state.Apply.Paused)
+		},
+		func() string {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			prog := grpcProgressByApplyID(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for %s failed + apply paused; %s=%q %s=%q apply=%q",
+				first, first, ops[first].State, second, ops[second].State, prog.State)
+		},
+	)
+
+	held := multiDeployOps(t, apply.ApplyID, first, second)
+	assert.Falsef(t, state.IsState(held[second].State, state.Apply.Completed),
+		"%s must not complete while the rollout is paused, was %q", second, held[second].State)
+
+	// Release the paused rollout so the remaining deployment proceeds.
+	releaseResp := grpcPost(t, "/api/release", map[string]string{
+		"environment": env,
+		"apply_id":    apply.ApplyID,
+	})
+	defer releaseResp.Body.Close()
+	var releaseResult grpcSimpleResponse
+	grpcDecodeJSON(t, releaseResp, &releaseResult)
+	require.Truef(t, releaseResult.Accepted, "release not accepted: %s", releaseResult.ErrorMessage)
+
+	// Phase 2: after release, us proceeds and completes; the apply settles to
+	// failed even though a sibling completed — pause governs rollout
+	// continuation, not the verdict.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			return failedApplyState(ops[first].State) &&
+				state.IsState(ops[second].State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			return fmt.Sprintf("waiting for %s failed + %s completed after release; %s=%q %s=%q",
+				first, second, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	final := multiDeployOps(t, apply.ApplyID, first, second)
+	assert.Truef(t, failedApplyState(final[first].State), "%s should be failed, was %q", first, final[first].State)
+	assert.Truef(t, state.IsState(final[second].State, state.Apply.Completed),
+		"%s should complete after release under on_failure: pause, was %q", second, final[second].State)
+
+	prog := grpcProgressByApplyID(t, apply.ApplyID)
+	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed after release, was %q", prog.State)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}
+
 // barrierReleaseDeadline bounds how long a deployment parked at the cutover
 // barrier may remain parked once its ordered predecessor has completed. Unlike
 // orderedCutoverDeadline, which spans the variable copy phases of the whole
