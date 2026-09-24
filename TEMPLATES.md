@@ -1654,7 +1654,7 @@ schemabot apply -e production
 
 ✅ **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
 
-⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, so an apply would not be a no-op.
+⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, and applying this plan will not run it for them.
 
 </details>
 

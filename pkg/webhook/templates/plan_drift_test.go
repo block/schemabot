@@ -269,12 +269,30 @@ func TestRenderPlanComment_DriftBeforeChangeList(t *testing.T) {
 }
 
 // AnyEnvHasDriftToShow drives the auto-plan comment-skip decision: it is true
-// only when an environment has drift that must be explained (diverged or
-// unverifiable), so a red check from drift is never left without a comment. A
-// clean or nil rollup is not "drift to show".
+// when an environment has drift that must be explained (diverged or
+// unverifiable) or is a rollout still converging, so a PR is never left with no
+// comment where the fleet does not hold the reviewed schema. A clean rollup
+// whose targets are all there, and a nil rollup, are not "drift to show".
 func TestAnyEnvHasDriftToShow(t *testing.T) {
 	drift := func(computed, clean bool) *DeploymentDriftData {
 		return &DeploymentDriftData{Computed: computed, Clean: clean}
+	}
+	converging := func() *DeploymentDriftData {
+		d := drift(true, true)
+		d.Independent = true
+		d.Plans = []DeploymentPlanGroup{
+			{Members: []string{"primary/testapp_1"}, Primary: true},
+			{Members: []string{"primary/testapp_2"}, Changes: convergingAlter()},
+		}
+		return d
+	}
+	converged := func() *DeploymentDriftData {
+		d := drift(true, true)
+		d.Independent = true
+		d.Plans = []DeploymentPlanGroup{
+			{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true},
+		}
+		return d
 	}
 	cases := []struct {
 		name  string
@@ -286,6 +304,8 @@ func TestAnyEnvHasDriftToShow(t *testing.T) {
 		{"diverged rollup", map[string]*PlanCommentData{"prod": {DeploymentDrift: drift(true, false)}}, true},
 		{"uncomputed rollup", map[string]*PlanCommentData{"prod": {DeploymentDrift: drift(false, false)}}, true},
 		{"nil plan", map[string]*PlanCommentData{"prod": nil}, false},
+		{"converging rollout", map[string]*PlanCommentData{"prod": {DeploymentDrift: converging()}}, true},
+		{"fully converged rollout", map[string]*PlanCommentData{"prod": {DeploymentDrift: converged()}}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -293,6 +313,68 @@ func TestAnyEnvHasDriftToShow(t *testing.T) {
 			assert.Equal(t, tc.want, AnyEnvHasDriftToShow(data))
 		})
 	}
+}
+
+func convergingAlter() []KeyspaceChangeData {
+	return []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+	}}
+}
+
+// A rollout partway through converging reaches the reviewer on the multi
+// environment comment too. Both environments' reviewed targets are already at
+// the desired schema while a target in production is not, so the comment cannot
+// collapse to the one green line that says no environment changes: that line is
+// what a reviewer merges on, and here it would be read as the whole fleet
+// holding this schema.
+func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) {
+	convergingDrift := func(others ...string) *DeploymentDriftData {
+		entries := []DeploymentDriftEntry{
+			{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+		}
+		for _, o := range others {
+			entries = append(entries, DeploymentDriftEntry{Deployment: "primary", Target: o, Class: "planned"})
+		}
+		return &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: entries,
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1"}, Primary: true},
+				{Members: []string{"primary/" + others[0]}, Changes: convergingAlter()},
+			},
+		}
+	}
+	convergedDrift := &DeploymentDriftData{
+		Computed: true, Clean: true, Independent: true,
+		Deployments: []DeploymentDriftEntry{
+			{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+			{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+		},
+		Plans: []DeploymentPlanGroup{
+			{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true},
+		},
+	}
+
+	data := MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{
+			"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, DeploymentDrift: convergedDrift},
+			"production": {Database: "testapp", Environment: "production", IsMySQL: true, DeploymentDrift: convergingDrift("testapp_2")},
+		},
+	}
+
+	out := RenderMultiEnvPlanComment(data)
+	assert.NotContains(t, out, "**No schema changes detected** for any environment.")
+	assert.Contains(t, out, "⚠️ **No schema changes for the reviewed target** — 1 target still needs this change, and applying this plan will not run it for them.")
+	// Staging is genuinely converged, so its own section keeps the green line.
+	assert.Contains(t, out, "✅ **No schema changes detected**")
+
+	// With every environment's rollout converged, the all-clear is correct and
+	// still renders.
+	data.Plans["production"] = &PlanCommentData{Database: "testapp", Environment: "production", IsMySQL: true, DeploymentDrift: convergedDrift}
+	assert.Contains(t, RenderMultiEnvPlanComment(data), "**No schema changes detected** for any environment.")
 }
 
 // When one deployment addresses several targets, the deployment name alone
@@ -541,12 +623,12 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotHeadlineAsNoOp(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.NotContains(t, out, "✅ **No schema changes detected**")
-	assert.Contains(t, out, "⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, so an apply would not be a no-op.")
+	assert.Contains(t, out, "⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, and applying this plan will not run it for them.")
 
 	// The same shape with a single other target agrees with itself on number.
 	data.DeploymentDrift.Deployments = data.DeploymentDrift.Deployments[:2]
 	data.DeploymentDrift.Plans[1].Members = []string{"primary/testapp_2"}
-	assert.Contains(t, RenderPlanComment(data), "⚠️ **No schema changes for the reviewed target** — 1 target still needs this change, so an apply would not be a no-op.")
+	assert.Contains(t, RenderPlanComment(data), "⚠️ **No schema changes for the reviewed target** — 1 target still needs this change, and applying this plan will not run it for them.")
 }
 
 // A rollout where every target is already at the desired schema is a no-op, and

@@ -162,8 +162,9 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			if tc == nil {
 				return nil, nil, fmt.Errorf("nil table change in namespace %q", ns)
 			}
-			// In the plan/proto representation a vschema change is signalled via
-			// Metadata["vschema_changed"] and carries no table DDL. A vschema table
+			// In the plan/proto representation a vschema change is signalled by the
+			// metadata keys HasVSchemaWork reads — a rendered diff, the changed
+			// flag, or both — and carries no table DDL. A vschema table
 			// change indicates malformed input (e.g. a change set built from an
 			// apply request's DdlChanges), so fail closed rather than skip it and
 			// risk a false match. Checked before the shard skip so a sharded

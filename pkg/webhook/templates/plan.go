@@ -238,6 +238,13 @@ type DeploymentDriftData struct {
 // DeploymentPlanGroup is the members of a rollout that would run the same plan.
 // Members share a group exactly when their plans are identical work, so a group
 // is what the comment can describe once and attribute to all of them.
+//
+// Identical work is what an apply would do to each member, not what each
+// member's plan looks like written down. Members are keyed on canonicalized
+// table DDL and on which namespaces change their VSchema, because a VSchema is
+// applied as the file the PR holds rather than as a computed delta: two members
+// given the same file are doing the same work even where their recorded diffs
+// differ, since a diff differs by where the member started.
 type DeploymentPlanGroup struct {
 	// Members names the group's members the way an operator addresses them, in
 	// rollout order.
@@ -888,21 +895,27 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 	}
 }
 
-// noChangesHeadline states what an empty reviewed plan means for the rollout an
-// apply would run on.
+// noChangesHeadline states what an empty reviewed plan means for the rest of the
+// rollout.
 //
 // On its own an empty plan reads as a no-op, and that is only established for
-// the target that was reviewed. An independent rollout plans each target
-// against its own live schema, so a primary already at the desired schema says
-// nothing about the rest: the apply can still run DDL on every other target. A
-// reviewer who takes the green line at face value merges believing nothing will
-// happen, so where some target still needs the change the headline says so.
+// the target that was reviewed. An independent rollout plans each target against
+// its own live schema, so a primary already at the desired schema says nothing
+// about the rest: other targets can still be missing the change. A reviewer who
+// takes the green line at face value merges believing the fleet holds this
+// schema, so where some target does not the headline says so.
+//
+// It says what is true of the targets, not what an apply would do about them.
+// An apply is gated on the reviewed target's own re-plan, so an empty reviewed
+// plan ends the command before any member runs — the unconverged targets named
+// here are not reconciled by applying this plan, and the headline must not read
+// as though they would be.
 func noChangesHeadline(drift *DeploymentDriftData) string {
 	changing := changingTargetCount(drift)
 	if changing == 0 {
 		return "✅ **No schema changes detected**"
 	}
-	return fmt.Sprintf("%s **No schema changes for the reviewed target** — %s this change, so an apply would not be a no-op.",
+	return fmt.Sprintf("%s **No schema changes for the reviewed target** — %s this change, and applying this plan will not run it for them.",
 		glyph.Attention, countedVerb(changing, "target still needs", "targets still need"))
 }
 
@@ -2212,8 +2225,16 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 
 // AnyEnvHasDriftToShow reports whether any environment has drift that must be
 // surfaced even when no environment plans changes: a deployment that diverged or
-// could not be verified. A clean uniform rollup is not "drift to show" — with no
-// changes anywhere the simple no-changes message is clearer.
+// could not be verified, or a rollout still converging. A clean uniform rollup
+// is not "drift to show" — with no changes anywhere the simple no-changes
+// message is clearer.
+//
+// A converging rollout passes its contract, so it is clean and says nothing here
+// on that count. It is still the one case where no environment planning changes
+// does not mean the fleet holds this schema: the reviewed target is at the
+// desired schema and another target is not. Callers consult this only when
+// nothing else would post a comment, so leaving it out is what decides whether
+// the reviewer is told at all.
 func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 	for _, env := range data.Environments {
 		plan, ok := data.Plans[env]
@@ -2222,6 +2243,9 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 		}
 		d := plan.DeploymentDrift
 		if !d.Computed || !d.Clean {
+			return true
+		}
+		if changingTargetCount(d) > 0 {
 			return true
 		}
 	}
