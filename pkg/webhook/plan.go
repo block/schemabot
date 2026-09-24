@@ -230,7 +230,10 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
 // commentID is the command comment to acknowledge once discovery commits this
 // deployment to acting; auto-plans pass zero (no comment to acknowledge).
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, postPlanComment bool, commentID int64) {
+// commandScopeDatabases is how many databases a bare command offered by this
+// comment would reach, which decides whether its commands have to name theirs;
+// only an auto-plan reads it.
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -371,7 +374,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:    requestedBy,
 		Tenant:         tenant,
-		ScopedDatabase: planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan),
+		ScopedDatabase: planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases),
 		AgentHint:      h.agentHint(),
 		Environments:   environments,
 		Plans:          make(map[string]*templates.PlanCommentData),
@@ -465,7 +468,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
-		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan)
+		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
@@ -892,18 +895,25 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 }
 
 // planCommentDatabaseFlag returns the database a plan comment's copy-paste
-// commands name. An operator who scoped their command with -d is answered with
-// the same scope, and an unscoped one with an unscoped command. An auto-plan
-// has no operator to answer, and posts a separate comment for every database
-// the pull request touches, so its commands name the database its own comment
-// is about: unnamed, two comments differ only in a metadata line while their
-// one actionable line is the same bare command, which the repository's own
-// ambiguity then rejects.
-func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoPlan bool) string {
-	if isAutoPlan {
+// commands name, empty when they are to stay unscoped.
+//
+// An operator who scoped their command with -d is answered with the same scope,
+// and an unscoped one with an unscoped command. An auto-plan has no operator to
+// answer, so it names a database only where a bare command would not resolve to
+// the one its comment is about: commandScopeDatabases counts what the pasted
+// command itself would reach, which is a wider set than the comment planned,
+// and above one the comment has to name its database or offer a command that
+// comes back ambiguous, or that acts on a database the comment never mentioned.
+// Scoping the single-database case too would put a flag in front of every
+// operator on every pull request to serve the few that need it.
+func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoPlan bool, commandScopeDatabases int) string {
+	if !isAutoPlan {
+		return requestedDatabase
+	}
+	if commandScopeDatabases > 1 {
 		return resolvedDatabase
 	}
-	return requestedDatabase
+	return ""
 }
 
 // buildPlanCommentData converts plan results into template data.
