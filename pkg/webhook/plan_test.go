@@ -1211,7 +1211,9 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 }
 
 // A plan comment's copy-paste commands name a database only where a bare
-// command would not resolve. For a command that is the -d the operator typed.
+// command would not resolve. For an operator's command that database is the -d
+// they typed, echoed back so the follow-up they are offered keeps the scope
+// they chose, and an unscoped command is answered with an unscoped one.
 // An auto-plan names the database its own comment plans when the pull request
 // touches several, because each comment's command would otherwise be the same
 // ambiguous line, and leaves it off when the pull request touches one, because
