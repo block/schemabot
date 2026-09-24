@@ -40,9 +40,9 @@ update its connection configuration, and verify it before restarting. Keep the o
 until the new connection is verified. Re-running `init` never replaces existing state storage.
 
 For Vitess, the application connection is your vtgate address, and the wizard also asks for the
-PlanetScale organization and a service token variable, `PLANETSCALE_TOKEN`, whose value is the
-token's `name:value`. SchemaBot opens deploy requests with that token and reads keyspaces from
-the `main` branch. Its own state lives in a MySQL database outside Vitess.
+PlanetScale organization and a [service token](#configure-the-planetscale-service-token).
+SchemaBot opens deploy requests with that token and reads keyspaces from the `main` branch.
+Its own state lives in a MySQL database outside Vitess.
 
 Setup initializes SchemaBot's metadata tables in the state database. Baseline planning also
 needs the engine's scratch privileges. Setup never applies application schema changes.
@@ -58,6 +58,53 @@ reference. SchemaBot discovers keyspaces from the `main` branch and keeps its ow
 separate MySQL database.
 
 ![Connect a Vitess database, verify its schema, and preview a change](../assets/init-vitess-demo.gif)
+
+### Configure the PlanetScale service token
+
+The service token lets SchemaBot manage branches and deploy requests through the PlanetScale
+API. It is separate from the username and password in your database connection string.
+
+1. In your PlanetScale organization's **Settings → Service tokens**, create a token for
+   SchemaBot. Copy its **ID** and **secret**; the display name is only a label.
+2. Choose **Edit token permissions → Add database access** and select the database you are
+   connecting. Grant the permissions below, then save. Scope access to this database.
+
+| Permission | What SchemaBot uses it for |
+| --- | --- |
+| `read_branch` | Discover keyspaces and read branch schemas and VSchemas. |
+| `create_branch` | Prepare a development branch for a schema change. |
+| `connect_branch` | Create credentials to run the proposed DDL on that development branch. |
+| `delete_branch` | Clean up development branches. |
+| `read_deploy_request` | Read deploy request state and progress. |
+| `create_deploy_request` | Open, queue, cut over, cancel, and revert deploy requests. |
+| `write_branch_vschema` | Stage VSchema changes on the development branch. |
+
+These permissions follow the [PlanetScale API reference](https://planetscale.com/docs/api/reference/service-tokens)
+and the operations SchemaBot performs. Organization-wide permissions and permission to delete
+production branches are not needed for this setup. If your database requires deploy-request
+approval, an eligible reviewer still needs to approve in PlanetScale; the token cannot approve
+its own requests. See [PlanetScale's approval rules](https://planetscale.com/docs/api/service-tokens#service-tokens-and-deploy-requests-approvals).
+
+3. Store the ID and secret together, separated by a colon. For example, a private file outside
+   your project at `/Users/alex/.config/schemabot/planetscale-token` contains just:
+
+   ```text
+   TOKEN_ID:TOKEN_SECRET
+   ```
+
+   Restrict the file to your user. On the **Connect the PlanetScale API** screen, enter:
+
+   ```text
+   file:/Users/alex/.config/schemabot/planetscale-token
+   ```
+
+   Or use `env:PLANETSCALE_TOKEN` if that variable already contains the same value. Set it
+   before launching the wizard, and keep it available to later SchemaBot commands. The
+   wizard's `name:value` wording refers to the token ID and secret, not its display name.
+
+The wizard checks the token by listing keyspaces on `main`. This confirms read access, not
+all of the write permissions above. If setup succeeds but an apply is denied, check the
+permissions on this token for this database. Setup does not create a deploy request to test them.
 
 ## Follow the wizard
 
