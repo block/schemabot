@@ -745,10 +745,19 @@ the PR. For each affected database and environment, SchemaBot stores an internal
 per-database record and then publishes or updates the aggregate check on the PR
 head SHA.
 
-If auto-plan finds changes, the internal records become `action_required` and
-the aggregate blocks. If auto-plan finds no changes, the records become
-`success` and the aggregate passes. Auto-plan skips the PR comment when every
-environment has no changes and no errors, but it still writes the check state.
+If auto-plan finds changes on any rollout member, the internal records become
+`action_required` and the aggregate blocks. If no member has changes, the
+records become `success` and the aggregate passes. Auto-plan skips the PR
+comment when no member in any environment has changes and nothing errored,
+but it still writes the check state.
+
+Two cases keep the comment even though no environment's reviewed plan has
+changes, because the reviewer needs to be told why the check is not passing. A
+deployment that diverged or could not be verified fails the check closed, and
+the comment explains the failure. A rollout of independent targets whose
+reviewed target is already at the desired schema, while another target is not,
+keeps the check pending (MG-12), and the comment is the only place that says
+how many targets still need the change.
 
 ### PR touches no managed schema files
 

@@ -228,7 +228,9 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 }
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
-// When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
+// When isAutoPlan is true and there is genuinely nothing to show, the comment is skipped to reduce
+// PR noise — which is narrower than "no environment has changes": a rollout still converging plans
+// no changes for the target that was reviewed and is not a no-op for the fleet.
 // commentID is the command comment to acknowledge once discovery commits this
 // deployment to acting; auto-plans pass zero (no comment to acknowledge).
 // commandScopeDatabases is how many databases a bare command offered by this

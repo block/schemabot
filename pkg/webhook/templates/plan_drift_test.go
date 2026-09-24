@@ -598,8 +598,8 @@ func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
 // A rollout whose reviewed target is already at the desired schema, while other
 // targets are not, must not headline as a no-op. The reviewed plan is empty, so
 // the comment shows no DDL; a reviewer who reads "no schema changes detected"
-// merges believing an apply does nothing, when it would run the change on every
-// target that has not had it yet.
+// merges believing the fleet holds this schema, when targets are still missing
+// it and applying this plan does not give it to them.
 func TestRenderPlanComment_ConvergedPrimaryDoesNotHeadlineAsNoOp(t *testing.T) {
 	alter := []KeyspaceChangeData{{
 		Keyspace:   "testapp",
