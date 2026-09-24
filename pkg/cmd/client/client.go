@@ -392,11 +392,14 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 		return nil, err
 	}
 
-	// The operator's flags arrive in whatever case they were typed, and a
-	// stored row written before storage folded its keys is still matched by a
-	// case-insensitive collation and returned in its original spelling, so fold
-	// both sides before comparing or a busy database slips past the preflight
-	// on a case mismatch.
+	// The operator's flags arrive in whatever case they were typed, and on
+	// MySQL a stored row written before storage folded its keys is still
+	// matched by the case-insensitive collation and returned in its original
+	// spelling, so fold both sides before comparing or a busy database slips
+	// past the preflight on a case mismatch. PostgreSQL compares bytes: the
+	// server filters by the folded environment, so such a row never reaches
+	// this client and only the one-time storage canonicalization brings it
+	// back into the preflight.
 	database = storage.CanonicalKey(database)
 	environment = storage.CanonicalKey(environment)
 	for _, apply := range result.Applies {
