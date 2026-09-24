@@ -751,6 +751,21 @@ func schemaFixturePath(ns, name string) string {
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
+	configs := map[string]string{}
+	if schemabotConfig != "" {
+		configs["schema/schemabot.yaml"] = schemabotConfig
+	}
+	return setupFakeGitHubForPlanWithConfigs(t, mux, schemaSQL, configs, ns, prFiles)
+}
+
+// setupFakeGitHubForPlanWithConfigs is setupFakeGitHubForPlanWithPRFiles with
+// the repository's schemabot.yaml files given by repository path rather than as
+// one config at the schema root, so a test can lay out a repository whose
+// directories are managed by different configs — and so a pull request can
+// touch more than one database.
+func setupFakeGitHubForPlanWithConfigs(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, configs map[string]string, ns string, prFiles []*gh.CommitFile) *planFlowResult {
+	t.Helper()
+
 	result := &planFlowResult{
 		comments:  make(chan string, 10),
 		reactions: make(chan string, 10),
@@ -825,16 +840,17 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	blobIndex := 0
 	blobContents := make(map[string]string) // sha -> content
 
-	// schemabot.yaml config
-	if schemabotConfig != "" {
-		configSHA := "configsha001"
-		blobContents[configSHA] = schemabotConfig
+	// schemabot.yaml configs, in path order so blob identifiers are stable
+	for configIndex, path := range slices.Sorted(maps.Keys(configs)) {
+		content := configs[path]
+		configSHA := fmt.Sprintf("configsha%03d", configIndex+1)
+		blobContents[configSHA] = content
 		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/schemabot.yaml"),
+			Path: new(path),
 			Mode: new("100644"),
 			Type: new("blob"),
 			SHA:  new(configSHA),
-			Size: new(len(schemabotConfig)),
+			Size: new(len(content)),
 		})
 	}
 
@@ -857,8 +873,12 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// branch tip then descends the directory levels a real repository has instead
 	// of stopping at an empty root, and still finds none of the PR's own files
 	// there — so every changed file remains the PR's own proposal.
-	if schemabotConfig != "" {
-		result.baseFiles.Store(&map[string]string{"schema/schemabot.yaml": "baseconfigsha001"})
+	if len(configs) > 0 {
+		held := make(map[string]string, len(configs))
+		for path := range configs {
+			held[path] = "baseconfigsha~" + path
+		}
+		result.baseFiles.Store(&held)
 	}
 
 	// The repository at both commits a plan flow reads. By default the default
@@ -892,13 +912,10 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// Contents API (used by FetchConfig -> FetchFileContent)
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/", func(w http.ResponseWriter, r *http.Request) {
 		filePath := r.URL.Path[len("/repos/octocat/hello-world/contents/"):]
-		if filePath == "schema/schemabot.yaml" && schemabotConfig != "" {
-			_ = json.NewEncoder(w).Encode(gh.RepositoryContent{
-				Name:     new("schemabot.yaml"),
-				Path:     new("schema/schemabot.yaml"),
-				Content:  new(base64.StdEncoding.EncodeToString([]byte(schemabotConfig))),
-				Encoding: new("base64"),
-			})
+		if content, ok := configs[filePath]; ok {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"name":"schemabot.yaml","path":%q,"content":%q,"encoding":"base64"}`,
+				filePath, base64.StdEncoding.EncodeToString([]byte(content)))
 			return
 		}
 		http.NotFound(w, r)
