@@ -111,12 +111,12 @@ func TestMySQLDialectInsertGuardedID(t *testing.T) {
 		assert.Zero(t, id)
 	})
 
-	t.Run("propagates last-insert-id error after a row is written", func(t *testing.T) {
+	t.Run("reports inserted but propagates last-insert-id error after a row is written", func(t *testing.T) {
 		wantErr := errors.New("id boom")
 		exec := &fakeExecer{result: fakeResult{rowsAffected: 1, lastInsertIDErr: wantErr}}
 		id, inserted, err := d.InsertGuardedID(t.Context(), exec, "INSERT ... SELECT ... WHERE lease = ?", "tok")
 		require.ErrorIs(t, err, wantErr)
-		assert.False(t, inserted)
+		assert.True(t, inserted, "a row was written; only id read-back failed")
 		assert.Zero(t, id)
 	})
 }

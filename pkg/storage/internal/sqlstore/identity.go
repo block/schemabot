@@ -29,7 +29,8 @@ type identityInserter interface {
 	// InsertGuardedID runs a guarded INSERT ... SELECT ... WHERE <guard> that
 	// inserts zero or one row. inserted reports whether a row was written; when
 	// it is false the caller interprets the guard (for example a lost lease).
-	// id is meaningful only when inserted is true.
+	// id is meaningful only when inserted is true and err is nil — a write can
+	// succeed (inserted true) while reading its id back fails (err non-nil).
 	InsertGuardedID(ctx context.Context, exec queryExecer, query string, args ...any) (id int64, inserted bool, err error)
 }
 
@@ -78,9 +79,11 @@ func (MySQLDialect) InsertGuardedID(ctx context.Context, exec queryExecer, query
 	if rows == 0 {
 		return 0, false, nil
 	}
+	// The row is written; report inserted=true even if reading its id back
+	// fails, so callers can't misclassify a successful write as a guard miss.
 	id, err := result.LastInsertId()
 	if err != nil {
-		return 0, false, err
+		return 0, true, err
 	}
 	return id, true, nil
 }
