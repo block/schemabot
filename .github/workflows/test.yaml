@@ -585,7 +585,9 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go | sed 's/func //' | sort)
+          # `|| true` so a no-match grep (exit 1) doesn't trip `set -e` before
+          # the explicit empty-test check below.
+          tests=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go | sed 's/func //' | sort || true)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no vitess e2e tests discovered"
