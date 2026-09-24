@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -140,10 +141,10 @@ func storageStateToProto(ts string) ternv1.State {
 // Unmapped actions use CHANGE_TYPE_OTHER because the proto has no richer value.
 func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
 	switch action {
-	case ddl.OpVSchemaUpdate:
+	case ternconv.OpVSchemaUpdate:
 		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
 	default:
-		return ddl.StatementTypeToChangeType(ddl.OpToStatementType(action))
+		return ternconv.StatementTypeToChangeType(ddl.OpToStatementType(action))
 	}
 }
 
@@ -154,9 +155,9 @@ func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
 // use "unknown" so callers can recover the action from the authoritative DDL.
 func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
 	if ct == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
-		return ddl.OpVSchemaUpdate
+		return ternconv.OpVSchemaUpdate
 	}
-	if st, ok := ddl.ChangeTypeToStatementType(ct); ok {
+	if st, ok := ternconv.ChangeTypeToStatementType(ct); ok {
 		return ddl.StatementTypeToOp(st)
 	}
 	return "unknown"

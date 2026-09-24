@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -427,9 +428,9 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 // Unmapped values use "other" because storage retains unsupported change types.
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 	if ct == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
-		return ddl.OpVSchemaUpdate
+		return ternconv.OpVSchemaUpdate
 	}
-	if st, ok := ddl.ChangeTypeToStatementType(ct); ok {
+	if st, ok := ternconv.ChangeTypeToStatementType(ct); ok {
 		return ddl.StatementTypeToOp(st)
 	}
 	return "other"
@@ -438,10 +439,10 @@ func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 // changeTypeToProto converts an operation to a proto change type. Operations
 // outside the proto vocabulary use CHANGE_TYPE_OTHER at this API boundary.
 func changeTypeToProto(op string) ternv1.ChangeType {
-	if strings.EqualFold(op, ddl.OpVSchemaUpdate) {
+	if strings.EqualFold(op, ternconv.OpVSchemaUpdate) {
 		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
 	}
-	return ddl.StatementTypeToChangeType(ddl.OpToStatementType(op))
+	return ternconv.StatementTypeToChangeType(ddl.OpToStatementType(op))
 }
 
 // protoToSchemaFiles converts proto SchemaFiles to the engine's schema.SchemaFiles,
