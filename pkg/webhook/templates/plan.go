@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -93,7 +94,19 @@ type AttributedChangeData struct {
 
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
-	Database     string
+	Database string
+
+	// ScopedDatabase is the database this comment's copy-paste commands name,
+	// so the follow-up an operator is being asked for is one they can paste in
+	// a repository that configures several databases rather than one rejected
+	// as ambiguous. It comes from the -d on the command that produced the
+	// comment, or, on a comment SchemaBot posts on its own, from the database
+	// that comment plans — an auto-plan posts one comment per database, so
+	// naming it is the comment's own identity rather than a guess at what an
+	// operator meant. Empty only on an unscoped command, which renders the
+	// commands bare.
+	ScopedDatabase string
+
 	SchemaName   string // Schema directory name (e.g. filepath.Base of schema dir)
 	Environment  string
 	Tenant       string
@@ -218,7 +231,11 @@ type DeploymentDriftData struct {
 // reviewed primary plan.
 type DeploymentDriftEntry struct {
 	Deployment string
-	Primary    bool
+	// Target is the member's target within its deployment. One deployment can
+	// address several targets, so the deployment name alone does not always name
+	// the member.
+	Target  string
+	Primary bool
 	// Class is "match", "planned", "diverged", or "errored".
 	Class string
 	// Blocked is the number of changes this member will refuse at apply.
@@ -226,6 +243,18 @@ type DeploymentDriftEntry struct {
 	// Detail is a short human explanation for a diverged or errored member;
 	// empty for a member that passed.
 	Detail string
+}
+
+// driftMemberNames renders each rollup entry the way an operator addresses it,
+// index-parallel to the entries. The naming rule is shared with every other
+// member-facing surface, so a deployment that addresses several targets is named
+// the same way in the plan comment, the check summary, and the progress comment.
+func driftMemberNames(entries []DeploymentDriftEntry) []string {
+	members := make([]routing.ExecutionTarget, len(entries))
+	for i, e := range entries {
+		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
+	}
+	return routing.DisplayNames(members)
 }
 
 // applyingWithoutConfirmation reports whether this comment announces an apply
@@ -274,8 +303,15 @@ type KeyspaceShardChange struct {
 	Satisfied bool
 }
 
-// RenderPlanComment renders the plan comment markdown.
+// RenderPlanComment renders the plan comment markdown. The DDL takes every
+// byte the rest of the comment leaves under GitHub's size limit.
 func RenderPlanComment(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderPlanComment(data, budget)
+	})
+}
+
+func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Header
@@ -322,7 +358,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	}
 
 	// Detailed changes
-	writeKeyspaceChanges(&sb, data)
+	writeKeyspaceChanges(&sb, data, budget)
 
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
@@ -401,7 +437,7 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	switch {
 	case data.IsLocked:
-		applyConfirmCmd := fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment)
+		applyConfirmCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
 			applyConfirmCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
@@ -423,14 +459,15 @@ func RenderPlanComment(data PlanCommentData) string {
 			sb.WriteString("**Confirmation required** — review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
-			sb.WriteString("```\nschemabot unlock\n```\n")
+			unlockCmd := appendTenantFlag(appendDatabaseFlag("schemabot unlock", data.ScopedDatabase), data.Tenant)
+			fmt.Fprintf(&sb, "```\n%s\n```\n", unlockCmd)
 		} else {
 			// Automatic apply is proceeding. No unlock hint — it's noise on the
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
 	default:
-		applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
+		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
@@ -894,7 +931,9 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 	return counts
 }
 
-func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
+// writeKeyspaceChanges renders each keyspace's DDL and VSchema changes, with
+// the DDL blocks drawing on the comment's shared budget.
+func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget) {
 	// The DDL blocks below format statements under the plan's own dialect so
 	// they are never reformatted under another family's grammar.
 	dialect := schema.DialectForDatabaseType(data.DatabaseType)
@@ -918,7 +957,6 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 		}
 	}
 	diffBudget := vschemaDiffBudget(diffCount)
-	ddlBudget := newDDLBlockBudget(countPlanDDLBlocks(data.Changes))
 
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
@@ -946,9 +984,9 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if hasDDLChanges {
 			if len(ks.Shards) > 0 {
-				writeShardedPlanDDL(sb, ks.Shards, dialect, ddlBudget)
+				writeShardedPlanDDL(sb, ks.Shards, dialect, budget)
 			} else {
-				writePlanDDLBlock(sb, ks.Statements, dialect, ddlBudget)
+				writePlanDDLBlock(sb, ks.Statements, dialect, budget)
 			}
 		}
 	}
@@ -1157,22 +1195,25 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
+	// One deployment can address several targets, so the deployment name alone
+	// does not always say which member a line belongs to. The shared naming rule
+	// adds the target only where it disambiguates.
+	//
+	// A member name is assembled from server config, so it reaches this comment
+	// as text SchemaBot did not choose. Rendering every one as a code span keeps
+	// a name carrying a backtick or a line break from closing the span it sits
+	// in and writing markdown of its own into a comment operators act on.
+	names := inlineCodeList(driftMemberNames(drift.Deployments))
 	switch {
 	case drift.Clean && drift.Independent:
 		// Independent members were deliberately never compared to each other, so
 		// the mirrored headline would assert agreement the rollup did not check.
 		// It says what was actually established: every target has a plan.
-		//
-		// The members are not named here the way the mirrored line names them.
-		// Mirrored members are distinct deployments, so their names identify
-		// them; independent members usually share one deployment and differ by
-		// target, which this entry does not carry, so the same list would name
-		// one deployment once per target and identify nothing.
-		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** — each target holds its own schema, so their plans are not expected to match.\n\n",
-			len(drift.Deployments))
+		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
+			len(drift.Deployments), strings.Join(names, ", "))
 	case drift.Clean:
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
-			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
+			len(drift.Deployments), strings.Join(names, ", "))
 	case drift.Independent:
 		// A member that could not be planned blocks under either contract, but
 		// only mirrored members can be out of agreement with each other. Calling
@@ -1188,8 +1229,8 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	if drift.Clean && !anyDeploymentBlocked(drift.Deployments) {
 		return
 	}
-	for _, d := range drift.Deployments {
-		name := "`" + d.Deployment + "`"
+	for i, d := range drift.Deployments {
+		name := names[i]
 		if d.Primary {
 			name += " (primary)"
 		}
@@ -1239,15 +1280,6 @@ func driftDetailSuffix(detail string) string {
 		return ""
 	}
 	return " — " + detail
-}
-
-// joinDeploymentNames lists deployment names for the uniform drift line.
-func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
-	names := make([]string, len(deployments))
-	for i, d := range deployments {
-		names[i] = d.Deployment
-	}
-	return strings.Join(names, ", ")
 }
 
 // writeBlockedChanges writes the section for statements the engine refuses,
@@ -1638,6 +1670,10 @@ type MultiEnvPlanCommentData struct {
 	RequestedBy  string
 	Tenant       string
 
+	// ScopedDatabase carries the operator's -d through to this comment's
+	// copy-paste commands, on the same terms as PlanCommentData.ScopedDatabase.
+	ScopedDatabase string
+
 	// AgentHint is the deployment's configured guidance for AI agents reading
 	// the plan. Empty on deployments that configure none, which render an
 	// unchanged comment.
@@ -1659,7 +1695,49 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	if plan, ok := singleEnvironmentPlan(data); ok {
 		return RenderPlanComment(plan)
 	}
+	return renderWithinCommentLimit(countMultiEnvPlanDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {
+		return renderMultiEnvPlanComment(data, budget)
+	})
+}
 
+// countEnvsWithChanges counts the environments whose plan carries a change.
+func countEnvsWithChanges(data MultiEnvPlanCommentData) int {
+	envsWithChanges := 0
+	for _, env := range data.Environments {
+		if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
+			envsWithChanges++
+		}
+	}
+	return envsWithChanges
+}
+
+// multiEnvPlansRenderOnce reports whether the environments' plans are
+// identical and so render as one section under a combined header.
+func multiEnvPlansRenderOnce(data MultiEnvPlanCommentData) bool {
+	return len(data.Errors) == 0 && countEnvsWithChanges(data) >= 2 && allPlansIdentical(data)
+}
+
+// countMultiEnvPlanDDLBlocks counts the DDL blocks a multi-environment plan
+// comment renders — the shared section's blocks when the plans are identical,
+// otherwise every rendered environment's own — so the comment's DDL budget is
+// shared across exactly those blocks.
+func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
+	if multiEnvPlansRenderOnce(data) {
+		return countPlanDDLBlocks(data.Plans[data.Environments[0]].Changes)
+	}
+	count := 0
+	for _, env := range data.Environments {
+		if _, hasErr := data.Errors[env]; hasErr {
+			continue
+		}
+		if plan, ok := data.Plans[env]; ok && plan != nil {
+			count += countPlanDDLBlocks(plan.Changes)
+		}
+	}
+	return count
+}
+
+func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Header
@@ -1673,13 +1751,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	})
 	sb.WriteString("\n")
 
-	// Check which environments have changes
-	envsWithChanges := 0
-	for _, env := range data.Environments {
-		if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
-			envsWithChanges++
-		}
-	}
+	envsWithChanges := countEnvsWithChanges(data)
 	hasErrors := len(data.Errors) > 0
 
 	// If no environments have changes and no errors, show simple message — unless
@@ -1698,11 +1770,10 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
-	// Check if all environments have identical plans (for deduplication)
-	if !hasErrors && envsWithChanges >= 2 && allPlansIdentical(data) {
+	if multiEnvPlansRenderOnce(data) {
 		// Identical plans: render once with combined header
 		fmt.Fprintf(&sb, "### %s\n\n", capitalizeEnvNames(data.Environments))
-		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]])
+		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]], budget)
 	} else {
 		// Separate sections per environment
 		for _, env := range data.Environments {
@@ -1720,7 +1791,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 				continue
 			}
 
-			writeEnvironmentPlanSection(&sb, plan)
+			writeEnvironmentPlanSection(&sb, plan, budget)
 		}
 	}
 
@@ -1809,7 +1880,7 @@ func titleDatabaseType(databaseType string) string {
 }
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
-func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
+func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's reviewed primary plan is a clean no-op.
@@ -1832,9 +1903,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	// than one is collapsed so the DDL doesn't dominate the comment while the
 	// unsafe/lint warnings and summary below stay visible at a glance.
 	if totalChanges == 1 {
-		writeKeyspaceChanges(sb, *plan)
+		writeKeyspaceChanges(sb, *plan, budget)
 	} else {
-		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements)
+		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements, budget)
 	}
 
 	// Blocked changes — statements the engine refuses; the apply will fail on
@@ -1891,13 +1962,13 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 // diffs for non-MySQL keyspaces — inside a collapsed <details> block. The
 // summary line carries the statement count so reviewers can gauge the size of
 // the change without expanding it.
-func writeCollapsibleKeyspaceChanges(sb *strings.Builder, plan PlanCommentData, totalStatements int) {
+func writeCollapsibleKeyspaceChanges(sb *strings.Builder, plan PlanCommentData, totalStatements int, budget *ddlBlockBudget) {
 	summary := "Show changes"
 	if totalStatements > 0 {
 		summary = fmt.Sprintf("Show SQL (%d %s)", totalStatements, pluralize("statement", totalStatements))
 	}
 	fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n\n", summary)
-	writeKeyspaceChanges(sb, plan)
+	writeKeyspaceChanges(sb, plan, budget)
 	sb.WriteString("</details>\n\n")
 }
 
@@ -1914,18 +1985,22 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	}
 
+	command := func(baseCommand, environment string) string {
+		return scopedCommand(baseCommand, environment, data.ScopedDatabase, data.Tenant)
+	}
+
 	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
 		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
-		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
+		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 		for i := 1; i < len(envsWithChanges); i++ {
 			fmt.Fprintf(sb, "\nAfter verifying %s, apply to %s:\n", envsWithChanges[i-1], envsWithChanges[i])
-			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[i], data.Tenant))
+			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[i]))
 		}
 	case len(envsWithChanges) == 1:
 		sb.WriteString("▶️ **To apply** these changes, comment:\n")
-		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
+		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 	case len(envsWithErrors) == 0:
 		sb.WriteString("No changes to apply.\n")
 	}
@@ -1935,13 +2010,23 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
 			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
-			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot plan", env, data.Tenant))
+			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}
 	}
 }
 
 func tenantCommand(baseCommand, environment, tenant string) string {
-	return appendTenantFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), tenant)
+	return scopedCommand(baseCommand, environment, "", tenant)
+}
+
+// scopedCommand renders a pasteable command for one environment, carrying the
+// database the operator named with -d and the deployment's tenant. Flags are
+// ordered as an operator would type them — the target first, then the
+// deployment qualifier — so a command lifted from one comment reads the same as
+// one lifted from another.
+func scopedCommand(baseCommand, environment, database, tenant string) string {
+	command := appendDatabaseFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), database)
+	return appendTenantFlag(command, tenant)
 }
 
 // appendTenantFlag appends the --tenant flag to a pasteable command hint when
@@ -1953,6 +2038,20 @@ func appendTenantFlag(command, tenant string) string {
 		return command
 	}
 	return fmt.Sprintf("%s --tenant %s", command, tenant)
+}
+
+// appendDatabaseFlag scopes a copy-paste command to the database the operator
+// named with -d, so the next command in a repository with several databases
+// does not have to name it again. Empty leaves the command unchanged: an
+// unscoped command is answered with an unscoped one, because the database this
+// comment resolved to is SchemaBot's answer to the ambiguity rather than a
+// choice the operator made, and a copy-paste line is not where to put words in
+// their mouth.
+func appendDatabaseFlag(command, database string) string {
+	if database == "" {
+		return command
+	}
+	return fmt.Sprintf("%s -d %s", command, database)
 }
 
 // allPlansIdentical returns true if all environments have identical changes.
@@ -2004,11 +2103,13 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 // them while the statements match. Comparing what the section says is the only
 // comparison that stays right as sections gain disclosures — a field-by-field
 // version silently drops each one added after it was written, and drops it from
-// the comment operators apply from.
+// the comment operators apply from. The sections are compared whole, never as
+// they would be cut to fit the comment: cut to the same length, two plans that
+// agree up to the cut and differ after it would read as one.
 func plansIdentical(a, b *PlanCommentData) bool {
 	var renderedA, renderedB strings.Builder
-	writeEnvironmentPlanSection(&renderedA, a)
-	writeEnvironmentPlanSection(&renderedB, b)
+	writeEnvironmentPlanSection(&renderedA, a, newUnboundedDDLBudget(countPlanDDLBlocks(a.Changes)))
+	writeEnvironmentPlanSection(&renderedB, b, newUnboundedDDLBudget(countPlanDDLBlocks(b.Changes)))
 	return renderedA.String() == renderedB.String()
 }
 

@@ -39,10 +39,16 @@ type MultiDeploymentApplyData struct {
 	StartedAt   string
 	CompletedAt string
 
-	// Details maps a deployment name to that deployment's single-deployment
-	// comment data (its tables, error, timing, database). Each deployment's
-	// <details> body is rendered from its entry via RenderApplyStatusComment.
-	Details map[string]ApplyStatusCommentData
+	// Details is each member's single-deployment comment data (its tables,
+	// error, timing, database), index-parallel to Model.Deployments. Each
+	// member's <details> body is rendered from its entry via
+	// RenderApplyStatusComment; a nil entry, or an index past the end, renders
+	// the no-detail placeholder instead. It is positional rather than keyed by
+	// deployment name because a deployment can own several operations —
+	// different targets of one deployment, or the several operations of a keyed
+	// apply — and a name-keyed lookup would render one member's tables under
+	// every one of them.
+	Details []*ApplyStatusCommentData
 
 	// Tenant is the deployment's tenant identity, appended as --tenant to every
 	// pasteable command hint so copied commands address this deployment in
@@ -66,8 +72,27 @@ type MultiDeploymentApplyData struct {
 // The single-deployment case is intentionally not handled here: callers render
 // it with RenderApplyStatusComment so the title and detail vocabulary stay shared.
 func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
-	var sb strings.Builder
 	renderedAt := currentTimestamp()
+	return renderWithinCommentLimit(countDeploymentTablesWithDDL(data), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderMultiDeploymentApplyComment(data, renderedAt, budget)
+	})
+}
+
+// countDeploymentTablesWithDDL counts the DDL blocks the per-deployment detail
+// sections render between them, so one comment's DDL budget is shared across
+// every deployment rather than granted to each.
+func countDeploymentTablesWithDDL(data MultiDeploymentApplyData) int {
+	count := 0
+	for i := range data.Model.Deployments {
+		if detail := memberDetail(data.Details, i); detail != nil {
+			count += countTablesWithDDL(detail.Tables)
+		}
+	}
+	return count
+}
+
+func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt string, budget *ddlBlockBudget) string {
+	var sb strings.Builder
 
 	// Aggregate header: the stable in-place status title, identical to the
 	// single-deployment comment so the headline vocabulary stays shared.
@@ -82,7 +107,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	writeDeploymentSummaryList(&sb, data.Model.Deployments)
 
 	// Expandable per-deployment detail, in resolved order.
-	writeDeploymentSections(&sb, data, renderedAt)
+	writeDeploymentSections(&sb, data, renderedAt, budget)
 	if !state.IsTerminalApplyState(data.Model.State) {
 		writeLastUpdatedFooter(&sb, renderedAt)
 	}
@@ -100,6 +125,12 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 // The single-deployment case is intentionally not handled here: callers render
 // it with RenderApplySummaryComment so the title and detail vocabulary stay shared.
 func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) string {
+	return renderWithinCommentLimit(countDeploymentTablesWithDDL(data), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderMultiDeploymentApplySummaryComment(data, budget)
+	})
+}
+
+func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
@@ -111,7 +142,7 @@ func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) str
 	writeDeploymentSummaryList(&sb, data.Model.Deployments)
 
 	// Expandable per-deployment terminal summary, in resolved order.
-	writeDeploymentSummarySections(&sb, data)
+	writeDeploymentSummarySections(&sb, data, budget)
 
 	return sb.String()
 }
@@ -161,7 +192,7 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 	if failure == nil {
 		return
 	}
-	name := html.EscapeString(failure.Deployment)
+	name := html.EscapeString(failure.Name)
 	msg := SanitizeInlineError(failure.Error)
 	if msg == "" {
 		fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code>\n", name)
@@ -181,7 +212,7 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	switch na.Kind {
 	case presentation.NextActionCutover:
 		writeFooterAction(sb,
-			fmt.Sprintf("To cut over `%s`:", na.Deployment),
+			fmt.Sprintf("To cut over %s:", inlineCode(na.Name)),
 			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
@@ -210,17 +241,19 @@ func writeDeploymentSummaryList(sb *strings.Builder, deps []presentation.Deploym
 
 // writeDeploymentSections writes the in-progress status detail per deployment,
 // reusing the single-deployment status renderer for each <details> body.
-func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData, renderedAt string) {
+func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData, renderedAt string, budget *ddlBlockBudget) {
 	writeDeploymentDetailSections(sb, data, func(detail ApplyStatusCommentData) string {
-		return renderApplyStatusComment(detail, false, renderedAt)
+		return renderApplyStatusCommentBody(detail, false, renderedAt, budget)
 	})
 }
 
 // writeDeploymentSummarySections writes the terminal summary detail per
 // deployment, reusing the single-deployment summary renderer for each <details>
 // body.
-func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApplyData) {
-	writeDeploymentDetailSections(sb, data, RenderApplySummaryComment)
+func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApplyData, budget *ddlBlockBudget) {
+	writeDeploymentDetailSections(sb, data, func(detail ApplyStatusCommentData) string {
+		return renderApplySummaryComment(detail, budget)
+	})
 }
 
 // writeDeploymentDetailSections writes a <details> block per deployment in
@@ -233,20 +266,31 @@ func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApp
 // already carries the title and the <summary> line names the deployment, so
 // repeating the headline inside every section is noise.
 func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentApplyData, renderDetail func(ApplyStatusCommentData) string) {
-	for _, d := range data.Model.Deployments {
+	for i, d := range data.Model.Deployments {
 		openAttr := ""
 		if d.Open {
 			openAttr = " open"
 		}
-		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), html.EscapeString(d.Label))
-		if detail, ok := data.Details[d.Deployment]; ok {
-			detail.DerivedStatus = siblingDerivedStatus(d)
-			sb.WriteString(stripLeadingHeading(renderDetail(detail)))
+		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTagHTML(d), html.EscapeString(d.Label))
+		if detail := memberDetail(data.Details, i); detail != nil {
+			body := *detail
+			body.DerivedStatus = siblingDerivedStatus(d)
+			sb.WriteString(stripLeadingHeading(renderDetail(body)))
 		} else {
 			sb.WriteString("_No details available yet._\n")
 		}
 		sb.WriteString("\n</details>\n")
 	}
+}
+
+// memberDetail returns member i's comment data, or nil when the caller supplied
+// no detail for it — either a nil entry or a details slice that stops short of
+// the member set, both of which mean the member has nothing to show yet.
+func memberDetail(details []*ApplyStatusCommentData, i int) *ApplyStatusCommentData {
+	if i >= len(details) {
+		return nil
+	}
+	return details[i]
 }
 
 // siblingDerivedStatus returns the <details> body status for a deployment whose
@@ -286,12 +330,30 @@ func stripLeadingHeading(body string) string {
 	return strings.TrimLeft(rest, "\n")
 }
 
-// deploymentTag renders the "<emoji> <deployment>" prefix, omitting the leading
-// space when a state has no glyph.
+// deploymentTag renders the "<emoji> <member>" prefix for a markdown line. The
+// member is named by the derivation's resolved name, so two targets of one
+// deployment are labelled distinctly.
+//
+// A member name is assembled from server config, so it reaches this comment as
+// text SchemaBot did not choose. Rendering it as a code span keeps a name
+// carrying a backtick or a line break from closing the span it sits in and
+// writing markdown of its own into a comment operators act on.
 func deploymentTag(d presentation.Deployment) string {
-	name := html.EscapeString(d.Deployment)
-	if d.Emoji == "" {
+	return glyphTag(d.Emoji, inlineCode(d.Name))
+}
+
+// deploymentTagHTML is deploymentTag for a <summary>, which GitHub reads as
+// HTML: the name is escaped rather than fenced, and flattened first so it
+// cannot carry a line break out of the tag it sits in.
+func deploymentTagHTML(d presentation.Deployment) string {
+	return glyphTag(d.Emoji, html.EscapeString(flattenIdentifier(d.Name)))
+}
+
+// glyphTag joins a state's glyph to an already-rendered name, omitting the
+// leading space when the state has no glyph.
+func glyphTag(emoji, name string) string {
+	if emoji == "" {
 		return name
 	}
-	return fmt.Sprintf("%s %s", d.Emoji, name)
+	return fmt.Sprintf("%s %s", emoji, name)
 }

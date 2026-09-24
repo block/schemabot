@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
@@ -1214,28 +1215,103 @@ func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 	}
 }
 
-// direct_execution on a non-MySQL database is a startup config error rather
-// than a silently ignored grant: config that looks like it permits direct
-// execution must either take effect or fail loudly.
-func TestServerConfig_ValidateRejectsDirectExecutionOnNonMySQL(t *testing.T) {
-	cfg := ServerConfig{
-		Databases: map[string]DatabaseConfig{
-			"mydb": {
-				Type: "vitess",
-				Environments: map[string]EnvironmentConfig{
-					"staging": {
-						DSN:             "root@tcp(localhost)/mydb",
-						DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+// direct_execution on a database whose engine does not route refused
+// statements is a startup config error rather than a silently ignored grant:
+// config that looks like it permits direct execution must either take effect
+// or fail loudly. Every database type SchemaBot recognizes is covered, so a
+// type whose engine adopts direct execution has to be moved deliberately
+// rather than inheriting the grant by resembling MySQL.
+func TestServerConfig_ValidateRejectsDirectExecutionOnEnginesThatDoNotRouteIt(t *testing.T) {
+	for _, dbType := range []string{
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+	} {
+		t.Run(dbType, func(t *testing.T) {
+			cfg := ServerConfig{
+				ExperimentalStrataEnabled: true,
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: dbType,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {
+								DSN:             "root@tcp(localhost)/mydb",
+								DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+							},
+						},
 					},
 				},
-			},
-		},
-	}
+			}
 
-	err := cfg.Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
-	assert.Contains(t, err.Error(), "only supported for mysql databases")
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
+			assert.Contains(t, err.Error(), "only supported for mysql databases")
+		})
+	}
+}
+
+// The server-wide policy states no database type, so it is what reaches a
+// database that reaches no per-database block. It reaches only the engines
+// that route refused statements — dropping the global default on the rest is
+// how one statement of the policy covers a mixed fleet without granting
+// native DDL to an engine that would never apply its bound.
+func TestServerConfig_ResolveDirectExecutionReachesOnlyEnginesThatRouteIt(t *testing.T) {
+	policy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000}
+	cfg := ServerConfig{DirectExecution: policy}
+
+	assert.Same(t, policy, cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL))
+	for _, dbType := range []string{
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+		"an-embedder-registered-engine",
+	} {
+		assert.Nil(t, cfg.ResolveDirectExecution(nil, dbType), "the server-wide policy must not reach %s", dbType)
+	}
+}
+
+// ResolveDirectExecution returns an environment's own block without passing
+// it through the engine filter, which is safe only because validation refuses
+// that block on every type the filter excludes. The two functions read the
+// same predicate, and this asserts the link directly: for each type a
+// database may be registered as, the filter's answer and validation's answer
+// agree. Relaxing either side alone would let a block validation accepted
+// resolve onto an engine that never applies its bound.
+func TestServerConfig_DirectExecutionEngineFilterAndValidationAgree(t *testing.T) {
+	// The types Validate() admits in databases:. Anything else is rejected
+	// before the direct execution rules are reached.
+	for _, dbType := range []string{
+		storage.DatabaseTypeMySQL,
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+	} {
+		t.Run(dbType, func(t *testing.T) {
+			block := &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000}
+			cfg := ServerConfig{
+				ExperimentalStrataEnabled: true,
+				Storage:                   StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: dbType,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: block},
+						},
+					},
+				},
+			}
+			err := cfg.Validate()
+
+			if directExecutionSupported(dbType) {
+				require.NoError(t, err)
+				assert.Same(t, block, cfg.ResolveDirectExecution(&EnvironmentConfig{DirectExecution: block}, dbType))
+				return
+			}
+			require.Error(t, err, "an environment block on %s must be refused, because ResolveDirectExecution will return it unfiltered", dbType)
+			assert.Contains(t, err.Error(), "only supported for mysql databases")
+		})
+	}
 }
 
 // A malformed direct_execution lock_acquisition_timeout is a startup config error —
@@ -1296,6 +1372,136 @@ func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 			require.NoError(t, cfg.Validate())
 		})
 	}
+}
+
+// The server-wide policy is held to the same shape rules as a per-database
+// block: enabling it without a row bound, or with a lock timeout that cannot
+// be applied with second granularity, fails startup.
+func TestServerConfig_ValidateRejectsMalformedServerDirectExecution(t *testing.T) {
+	for name, tc := range map[string]struct {
+		direct  *DirectExecutionConfig
+		wantErr string
+	}{
+		"enabled without bound":    {&DirectExecutionConfig{Enabled: true}, "a positive bound is required"},
+		"negative bound":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: -1}, "a positive bound is required"},
+		"sub-second lock timeout":  {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
+		"malformed while disabled": {&DirectExecutionConfig{LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				DirectExecution: tc.direct,
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Contains(t, err.Error(), "server config")
+		})
+	}
+}
+
+// A server-wide policy coexists with databases whose engine cannot honor it.
+// Unlike a per-database block — which is rejected on a non-MySQL database so
+// a deliberate grant is never silently ignored — the server-wide policy
+// states a fleet default and simply never reaches those engines.
+func TestServerConfig_ValidateAcceptsServerDirectExecutionAlongsideOtherEngines(t *testing.T) {
+	cfg := ServerConfig{
+		DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type:         "mysql",
+				Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+			},
+			"shardeddb": {
+				Type:         "vitess",
+				Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/shardeddb"}},
+			},
+		},
+	}
+
+	require.NoError(t, cfg.Validate())
+}
+
+// The server-wide policy reaches every MySQL database the server drives,
+// including one a data plane resolves per request with no registration of its
+// own, and reaches no engine that cannot honor it.
+func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
+	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}
+	cfg := ServerConfig{DirectExecution: serverPolicy}
+
+	t.Run("registered mysql database", func(t *testing.T) {
+		assert.Same(t, serverPolicy, cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("unregistered database resolved per request", func(t *testing.T) {
+		assert.Same(t, serverPolicy, cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		assert.Nil(t, cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeVitess))
+	})
+
+	t.Run("metadata carries the whole policy", func(t *testing.T) {
+		metadata, err := cfg.DirectExecutionMetadata(nil, storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			engine.MetadataDirectExecution:                              "true",
+			engine.MetadataDirectExecutionMaxTableRows:                  "10000",
+			engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds: "10",
+		}, metadata)
+	})
+}
+
+// A database environment's own block replaces the server-wide policy whole
+// rather than merging into it, so an override can neither inherit a row bound
+// it does not state nor be overruled when it opts out.
+func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *testing.T) {
+	cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}}
+
+	t.Run("override states its own bound", func(t *testing.T) {
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 50}}
+
+		metadata, err := cfg.DirectExecutionMetadata(envConfig, storage.DatabaseTypeMySQL)
+
+		require.NoError(t, err)
+		assert.Equal(t, "50", metadata[engine.MetadataDirectExecutionMaxTableRows])
+		assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
+			"the server policy's lock timeout must not leak into an override that states none")
+	})
+
+	// An opt-out states itself rather than rendering nothing. Rendering
+	// nothing would make a deliberate opt-out indistinguishable from an
+	// environment that never mentioned the policy, and every consumer that
+	// layers the server-wide grant over an unstated policy would then
+	// overlay it onto the opt-out too.
+	t.Run("override opts out", func(t *testing.T) {
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+
+		metadata, err := cfg.DirectExecutionMetadata(envConfig, storage.DatabaseTypeMySQL)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "false"}, metadata)
+		assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows,
+			"an opt-out carries no bound: there is nothing for a bound to permit")
+	})
+}
+
+// With no policy configured anywhere, refused statements stay blocked: the
+// engine metadata carries no direct execution keys at all.
+func TestServerConfig_ResolveDirectExecutionDefaultsToBlocked(t *testing.T) {
+	cfg := ServerConfig{}
+
+	metadata, err := cfg.DirectExecutionMetadata(&EnvironmentConfig{}, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.Empty(t, metadata)
 }
 
 // A well-formed revert_window_duration parses to the configured window.
@@ -4587,16 +4793,33 @@ func TestServerConfig_SpiritMetadata(t *testing.T) {
 		require.NoError(t, yaml.Unmarshal([]byte(`
 spirit:
   enable_experimental_autoscaling: false
+  enable_experimental_lockless_checksum: true
   checkpoint_max_age: 24h
   checksum_yield_timeout: 6h
 `), &cfg))
 		metadata, err := cfg.SpiritMetadata()
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
-			spirit.MetadataEnableExperimentalAutoscaling: "false",
-			spirit.MetadataCheckpointMaxAge:              "24h",
-			spirit.MetadataChecksumYieldTimeout:          "6h",
+			spirit.MetadataEnableExperimentalAutoscaling:      "false",
+			spirit.MetadataEnableExperimentalLocklessChecksum: "true",
+			spirit.MetadataCheckpointMaxAge:                   "24h",
+			spirit.MetadataChecksumYieldTimeout:               "6h",
 		}, metadata)
+	})
+
+	// The lockless checksum is off by default, so a block that spells that out
+	// carries no override: the key would restate the default, and a database
+	// that enabled the checker in its own metadata outranks the server value
+	// regardless.
+	t.Run("lockless checksum false carries no override", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte(`
+spirit:
+  enable_experimental_lockless_checksum: false
+`), &cfg))
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Empty(t, metadata)
 	})
 
 	t.Run("invalid duration errors", func(t *testing.T) {
@@ -5180,5 +5403,134 @@ func TestServerConfig_MemberPlanningFor(t *testing.T) {
 		_, err := cfg.MemberPlanningFor("payments", "missing")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "missing")
+	})
+}
+
+// A server-wide policy is expected to be partly inert on a mixed fleet, but a
+// policy that reaches no engine at all is one an operator believes is in force
+// and that will never route a statement.
+func TestServerConfig_ValidateRejectsAServerDirectExecutionNoEngineCanHonor(t *testing.T) {
+	policy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000}
+
+	t.Run("no registered database can honor it", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+			},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "which no registered database can honor")
+	})
+
+	t.Run("one database that can honor it is enough", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+				"payments": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/payments"},
+				}},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("a target resolver exempts the policy from the registry", func(t *testing.T) {
+		// A data plane resolves its targets per request and holds no
+		// registration for the databases behind them, so the loop over
+		// registered databases finds nothing to honor the policy. This is the
+		// deployment shape the server-wide policy exists for, and refusing to
+		// start on it would make the policy unusable exactly where it is
+		// needed.
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			TargetResolver: TargetResolverConfig{
+				Targets: map[string]inventory.StaticTarget{
+					"dsid-orders-prod": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(localhost:3306)/"},
+				},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("a disabled policy reaches nothing on purpose", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: &DirectExecutionConfig{Enabled: false},
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
+// A control plane resolves the policy by database and environment so it can
+// state it on the request. A database it does not register — every target a
+// server reaches through its target resolver — carries the server-wide policy,
+// which is the only policy such a target can have.
+func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
+	cfg := ServerConfig{
+		DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},
+		Databases: map[string]DatabaseConfig{
+			"overridden": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 50}},
+			}},
+			"opted-out": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {DirectExecution: &DirectExecutionConfig{Enabled: false}},
+			}},
+			"inherits": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {},
+			}},
+		},
+	}
+
+	t.Run("unregistered database carries the server-wide policy", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("resolved-at-request-time", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeoutSeconds: 10}, policy)
+	})
+
+	t.Run("registered database with no block inherits it", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("inherits", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeoutSeconds: 10}, policy)
+	})
+
+	t.Run("override replaces it whole", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("overridden", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 50}, policy,
+			"the override states its own bound and inherits no lock timeout")
+	})
+
+	t.Run("override that opts out travels as an opt-out", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("opted-out", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy,
+			"stating nothing would let a grant on the server that runs the statement decide instead of the opt-out")
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("inherits", "production", storage.DatabaseTypeVitess)
+		require.NoError(t, err)
+		assert.Nil(t, policy)
+	})
+
+	t.Run("no server-wide policy leaves refused statements blocked", func(t *testing.T) {
+		policy, err := (&ServerConfig{}).DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, policy)
 	})
 }

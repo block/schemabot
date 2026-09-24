@@ -245,3 +245,44 @@ func TestRollupReviewTimeDrift_MirroredMembersStoreNoMemberPlan(t *testing.T) {
 	assert.Empty(t, rollup.Entries[1].PlanIdentifier)
 	assert.Empty(t, plans.created, "mirrored members run the reviewed plan")
 }
+
+// A rollout member's plan row records the policy its own diff was judged
+// under, the same as the primary's. The apply dispatches each member against
+// its stored plan, so a member row without the policy would have its
+// statements resolved from configuration at apply while the primary's ran
+// under the reviewed one.
+func TestRollupReviewTimeDrift_MemberPlanRecordsTheDirectExecutionPolicy(t *testing.T) {
+	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	plans := &recordingPlanStore{}
+	svc := multiTargetService(t, &mockTernClient{
+		planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)"),
+	}, plans)
+	svc.config.DirectExecution = &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "5s"}
+
+	_, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewed, multiTargetMember("testapp-001"))
+	require.NoError(t, err)
+
+	require.Len(t, plans.created, 1)
+	assert.Equal(t, &storage.DirectExecutionPolicy{
+		Enabled:                       true,
+		MaxTableRows:                  10000,
+		LockAcquisitionTimeoutSeconds: 5,
+	}, plans.created[0].DirectExecution)
+}
+
+// A member planned on a server holding no grant records the opt-out, so its
+// row says what it was judged under rather than leaving the apply to resolve
+// one from a configuration that may have changed since.
+func TestRollupReviewTimeDrift_MemberPlanRecordsAnOptOutWhenNoGrantIsInForce(t *testing.T) {
+	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	plans := &recordingPlanStore{}
+	svc := multiTargetService(t, &mockTernClient{
+		planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)"),
+	}, plans)
+
+	_, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewed, multiTargetMember("testapp-001"))
+	require.NoError(t, err)
+
+	require.Len(t, plans.created, 1)
+	assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, plans.created[0].DirectExecution)
+}

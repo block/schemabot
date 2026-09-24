@@ -152,6 +152,12 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 // and --allow-unsafe was not specified. Shows the plan DDL plus a blocking message
 // instructing the user to re-run with --allow-unsafe.
 func RenderUnsafeChangesBlocked(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderUnsafeChangesBlocked(data, budget)
+	})
+}
+
+func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Render the full plan first (DDL, lint warnings, etc.) so the user can see
@@ -167,7 +173,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	totalChanges := totalStatements + keyspacesWithVSchema
 
 	if totalChanges > 0 {
-		writeKeyspaceChanges(&sb, data)
+		writeKeyspaceChanges(&sb, data, budget)
 	}
 
 	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
@@ -191,7 +197,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	}
 
 	sb.WriteString("**" + glyph.Escalation + " To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
-	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
+	applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
@@ -207,6 +213,12 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 // through, so the comment carries no retry instructions — the guidance is to
 // rewrite the change or contact the operators.
 func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderBlockedChangesApplyRejected(data, budget)
+	})
+}
+
+func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Render the full plan first (DDL, summary) so the user can see what was
@@ -219,7 +231,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	if totalStatements+keyspacesWithVSchema > 0 {
-		writeKeyspaceChanges(&sb, data)
+		writeKeyspaceChanges(&sb, data, budget)
 	}
 
 	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)

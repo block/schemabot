@@ -23,8 +23,19 @@ quick start uses `testapp`; it does not create the `shop` database shown here.
 
 `init` connects to your database, imports its schema, and stores a plan proving
 that the files match. It does not apply changes to the application database.
-Set `APP_DSN` and `STATE_DSN` in your shell first. The state connection must name
-a separate, existing database where SchemaBot can store its own metadata.
+Paste a connection string or enter connection details directly in the wizard. Existing
+`DATABASE_URL` and `SCHEMABOT_STORAGE_DSN` variables are detected when available.
+Choose Integrated to create a separate `schemabot` database on the same server, or
+connect an existing state database with Standalone. A standalone
+connection must name an existing database dedicated to SchemaBot’s own data. In a terminal,
+the wizard asks for everything else:
+
+```console
+$ schemabot init
+```
+
+[Initialize a database](init.md) walks through each step. Scripts and agents
+pass the same decisions as flags:
 
 ```console
 $ schemabot init -d shop -e staging --type mysql --dsn env:APP_DSN --storage-dsn env:STATE_DSN --namespace shop --schema-dir schema --json
@@ -224,7 +235,9 @@ CREATE TABLE `orders` (
 ```
 
 `pull` prints SQL by default. It reads the environment's primary deployment;
-it is not a comparison of every replica or shard. Use the
+it is not a comparison of every replica or shard. An environment that lists
+`targets` is the exception: its members each hold their own schema, so a pull
+reads every one of them and reports how they differ. Use the
 [schema intelligence guide](schema-intelligence.md#whats-in-this-database)
 for namespace and table filters, structured columns and indexes, and lint
 findings, each with output examples.

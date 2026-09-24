@@ -30,7 +30,7 @@ func TestRenderPlanComment_DriftCleanShowsUniformLine(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "Same plan on all 3 deployments")
-	assert.Contains(t, out, "eu, au, us")
+	assert.Contains(t, out, "`eu`, `au`, `us`")
 	assert.NotContains(t, out, "matches the reviewed plan")
 }
 
@@ -292,4 +292,91 @@ func TestAnyEnvHasDriftToShow(t *testing.T) {
 			assert.Equal(t, tc.want, AnyEnvHasDriftToShow(data))
 		})
 	}
+}
+
+// When one deployment addresses several targets, the deployment name alone
+// labels two different members identically. The plan comment names every member
+// of that deployment by its routing pair, while a sibling deployment that
+// addresses a single target keeps its plain name.
+func TestRenderPlanComment_DriftNamesMultiTargetMembers(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed:    true,
+			Clean:       false,
+			Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp-001", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp-002", Class: "errored", Detail: "diff failed; see server logs"},
+				{Deployment: "eu-west", Target: "orders-eu", Class: "planned"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "Some targets could not be planned")
+	assert.Contains(t, out, "`primary/testapp-001` (primary)")
+	assert.Contains(t, out, "`primary/testapp-002`")
+	assert.Contains(t, out, "`eu-west`")
+	// An independent target has no plan of its own to compare, so its failure
+	// is reported as unplanned rather than unverified.
+	assert.Contains(t, out, "could not plan")
+	assert.NotContains(t, out, "could not verify")
+}
+
+// The uniform clean line names members the same way the per-member breakdown
+// does, so a reviewer sees one vocabulary for the rollout across both renderings.
+func TestRenderPlanComment_DriftCleanNamesMultiTargetMembers(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed:    true,
+			Clean:       true,
+			Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp-001", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp-002", Class: "planned"},
+				{Deployment: "eu-west", Target: "orders-eu", Class: "planned"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "Planned separately for all 3 targets")
+	assert.Contains(t, out, "`primary/testapp-001`, `primary/testapp-002`, `eu-west`")
+	assert.True(t, strings.Contains(out, "each target holds its own schema"))
+}
+
+// A member name reaches the comment from server config, so the rollup renders
+// it as a code span it cannot break out of: a name carrying a backtick or a
+// line break stays one readable name on one line instead of closing its span
+// and writing markdown into a comment operators act on.
+func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    false,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "us`\n## Injected", Class: "diverged", Detail: "1 unexpected change(s) vs the reviewed plan"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.NotContains(t, out, "\n## Injected", "a name must not start a heading of its own")
+	assert.Contains(t, out, "`` us` ## Injected ``")
 }

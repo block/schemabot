@@ -94,9 +94,14 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 	tasksByOp := groupTasksByOperation(tasks)
 
 	model := deriveApplyPresentation(ops, released)
-	details := make(map[string]templates.ApplyStatusCommentData, len(ops))
+	// Derive returns one presentation per operation in input order, so the
+	// details are built in that same order and consumed positionally. A
+	// deployment can own several operations, which a name-keyed map could not
+	// tell apart.
+	details := make([]*templates.ApplyStatusCommentData, 0, len(ops))
 	for _, op := range ops {
-		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID], displayByOp[op.ID], shardsByTable, tenant)
+		detail := buildDeploymentDetail(apply, op, tasksByOp[op.ID], displayByOp[op.ID], shardsByTable, tenant)
+		details = append(details, &detail)
 	}
 
 	data := templates.MultiDeploymentApplyData{
@@ -140,6 +145,7 @@ func deriveApplyPresentation(ops []*storage.ApplyOperation, released bool) prese
 func applyOperationToPresentation(op *storage.ApplyOperation, released bool) presentation.Operation {
 	return presentation.Operation{
 		Deployment:        op.Deployment,
+		Target:            op.Target,
 		State:             op.State,
 		Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 		Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,

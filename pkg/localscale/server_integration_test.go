@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -374,6 +375,7 @@ func branchDatabaseExists(t *testing.T, branch, keyspace string) bool {
 const (
 	shortPollTimeout = 15 * time.Second // branch readiness, deploy diff
 	longPollTimeout  = 60 * time.Second // deploy state transitions (DDL execution)
+	cleanupTimeout   = 30 * time.Second // post-test cleanup, which outlives t.Context()
 )
 
 // waitForBranchReady polls until a branch is ready or the deadline is exceeded.
@@ -464,35 +466,113 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 	return result
 }
 
+// deferCleanupActiveDeployRequests clears any active deploy requests once the
+// test finishes.
+//
+// It builds its own context rather than taking the test's: t.Context() is
+// already cancelled by the time cleanups run, so a cleanup handed that context
+// fails its very first call and clears nothing at all.
+func deferCleanupActiveDeployRequests(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := testutil.CleanupContext(cleanupTimeout)
+		defer cancel()
+		cleanupActiveDeployRequests(t, ctx)
+	})
+}
+
 // cleanupActiveDeployRequests skips-revert or cancels any active deploy requests
 // so the next test isn't blocked by the gated deployment check.
+//
+// Both calls are asynchronous: the deploy request is still active when they
+// return and settles a moment later. Cleanup therefore has to wait for it to
+// clear and say so when it does not. Reporting a request as cleaned without
+// checking is what lets one wedged deploy fail every test that follows it,
+// each for a reason that names neither the wedged request nor this helper.
 func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 	t.Helper()
 	start := time.Now()
 	cleaned := 0
+	// One budget for all the waiting this cleanup does, not one per request:
+	// a shard that wedges several deploys must not spend a multiple of it
+	// between tests. Once it is gone, each remaining request is read once and
+	// reported at whatever state it is actually in.
+	waitDeadline := start.Add(shortPollTimeout)
 	// Scan all deploy requests and skip-revert or cancel any that are active
 	for i := uint64(1); i <= 100; i++ {
 		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
 			Organization: testOrg, Database: testDB, Number: i,
 		})
 		if err != nil {
-			break // no more deploy requests
+			// Only a missing request means the numbering has run out. Any
+			// other failure leaves the rest of the range unexamined, so say
+			// so rather than reporting the scan as complete.
+			var psErr *ps.Error
+			if !errors.As(err, &psErr) || psErr.Code != ps.ErrNotFound {
+				t.Logf("cleanupActiveDeployRequests: reading deploy request %d failed, "+
+					"stopping with requests %d and above unexamined: %v", i, i, err)
+			}
+			break
 		}
-		switch dr.DeploymentState {
-		case "complete_pending_revert":
-			_, _ = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+		var clearErr error
+		switch clearActionFor(dr.DeploymentState) {
+		case actionSkipRevert:
+			_, clearErr = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
-			cleaned++
-		case "queued", "in_progress", "pending_cutover", "in_progress_cutover", "submitting":
-			_, _ = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
+		case actionCancel:
+			_, clearErr = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
-			cleaned++
+		case actionWaitOut:
+			// Nothing to ask for; it only has to be waited out.
+		case actionNone:
+			continue
 		}
+		// Reported rather than asserted: a wedged request fails the next test
+		// that actually needs the deploy slot, with its own message, and that
+		// is the test worth reddening. Failing here as well would also redden
+		// the tests that never deploy, burying the one real failure.
+		if clearErr != nil {
+			t.Logf("cleanupActiveDeployRequests: clearing deploy request %d from %q failed: %v",
+				i, dr.DeploymentState, clearErr)
+			continue
+		}
+		if last, ok := waitForDeployCleared(ctx, i, waitDeadline); !ok {
+			t.Logf("cleanupActiveDeployRequests: deploy request %d did not clear, last state %q; "+
+				"it will block every deploy that follows", i, last)
+			continue
+		}
+		cleaned++
 	}
 	if cleaned > 0 {
 		t.Logf("cleanupActiveDeployRequests: cleaned %d DRs in %s", cleaned, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+// waitForDeployCleared waits, until the caller's shared deadline, for a deploy
+// request to stop occupying the active slot. It returns the last state it saw
+// and whether it cleared, reporting rather than failing so the caller can name
+// the request in one message. A deadline already passed still reads once, so
+// the state it reports is the current one either way.
+func waitForDeployCleared(ctx context.Context, number uint64, deadline time.Time) (string, bool) {
+	last := ""
+	for {
+		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: testOrg, Database: testDB, Number: number,
+		})
+		if err != nil {
+			// The request cannot be read, so it cannot be confirmed clear.
+			return fmt.Sprintf("unreadable: %v", err), false
+		}
+		last = dr.DeploymentState
+		if !blocksNewDeploy(last) {
+			return last, true
+		}
+		if time.Now().After(deadline) {
+			return last, false
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 

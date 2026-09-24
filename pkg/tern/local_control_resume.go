@@ -577,7 +577,13 @@ func (c *LocalClient) replanTargetSchema(ctx context.Context, apply *storage.App
 	// The re-plan withholds what the stored plan withheld: those tables were
 	// never captured in its original files, so a re-plan that saw them would
 	// report them as changes the apply still owes.
-	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{IgnoreTables: plan.IgnoreTables()}, apply.Database, plan.SchemaFiles)
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		IgnoreTables: plan.IgnoreTables(),
+		// Judged under the policy this apply was admitted with, so a
+		// statement it routed directly is not read back as still owed
+		// because a re-plan without the policy refused it.
+		DirectExecution: DirectExecutionPolicyProto(apply.GetOptions().DirectExecution),
+	}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("re-plan check failed: %w", err)
 	}
@@ -669,7 +675,10 @@ type replanResult struct {
 // Used by both Start() and ResumeApply() to handle tables that completed before
 // stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
-	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{IgnoreTables: plan.IgnoreTables()}, apply.Database, plan.SchemaFiles)
+	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		IgnoreTables:    plan.IgnoreTables(),
+		DirectExecution: DirectExecutionPolicyProto(apply.GetOptions().DirectExecution),
+	}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("re-plan failed: %w", err)
 	}
@@ -1562,7 +1571,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	// apply is handled inside the shared resume path: VSchema-only plans are
 	// re-driven so the VSchema is applied, and any other task-less shape (e.g. a
 	// sharded dispatch whose shard already matches) completes as a no-op.
-	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
+	return c.resumeApplyWithTasks(ctx, apply, nil, tasks, apply.GetOptions().Map(), false, false)
 }
 
 // ResumeApplyOperation starts or resumes a single apply_operation (one
@@ -1600,19 +1609,28 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
 			return c.driveGroupFinalizer(ctx, apply, op)
 		}
-		plan, planErr := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		// A plan is what makes a task-less work operation valid, so an operation
+		// that resolves to none is the same fail-closed signal as one whose plan
+		// carries no VSchema work: an invalid or stale claim, terminalized on this
+		// operation rather than failing the whole parent apply. The resolution
+		// failure rides along as context so the cause stays triageable.
+		planID, planErr := storage.PlanIDForOperation(apply, op)
+		if planErr != nil {
+			return fmt.Errorf("apply_operation %d (apply %s) resolves to no plan (%w): %w", applyOperationID, apply.ApplyIdentifier, planErr, ErrNoTasksForApplyOperation)
+		}
+		plan, planErr := c.storage.Plans().GetByID(ctx, planID)
 		if planErr != nil {
 			return fmt.Errorf("get plan for task-less apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, planErr)
 		}
 		// A missing plan row is its own cause, separate from a claim that resolved
 		// to the wrong operation, so name it rather than reporting a stale claim.
 		if plan == nil {
-			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
+			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", planID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 		}
 		if !op.IsTasklessVSchemaOnlyWork(plan) {
 			return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 		}
-		return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
+		return c.resumeApplyWithTasks(ctx, apply, op, tasks, apply.GetOptions().Map(), false, false)
 	}
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
@@ -1625,7 +1643,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	// unchanged.
 	releaseAtCutoverBarrier := shouldReleaseAtCutoverBarrier(apply, multiOperation, op)
 	options := effectiveCopyDriveOptions(apply, multiOperation, op).Map()
-	return c.resumeApplyWithTasks(ctx, apply, tasks, options, releaseAtCutoverBarrier, false)
+	return c.resumeApplyWithTasks(ctx, apply, op, tasks, options, releaseAtCutoverBarrier, false)
 }
 
 // ResumeApplyOperationCutover drives a single apply_operation parked at the
@@ -1681,7 +1699,7 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	// the parked engine checkpoint before driving.
 	opts := apply.GetOptions()
 	opts.DeferCutover = false
-	return c.resumeApplyWithTasks(ctx, apply, tasks, opts.Map(), false, true)
+	return c.resumeApplyWithTasks(ctx, apply, op, tasks, opts.Map(), false, true)
 }
 
 // finalizerOperationKeySuffix is the trailing segment of a namespace-scoped
@@ -1725,12 +1743,16 @@ func namespaceFromFinalizerKey(operationKey string) string {
 // terminal state), so the operator never advances the parent's aggregate as if
 // the VSchema applied when it did not.
 func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation) error {
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := storage.PlanIDForOperation(apply, op)
+	if err != nil {
+		return fmt.Errorf("resolve plan for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
 	if err != nil {
 		return fmt.Errorf("load plan for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
+		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
 	namespace := namespaceFromFinalizerKey(op.OperationKey)
 	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
@@ -1914,10 +1936,31 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 	}
 }
 
+// drivePlanID resolves the plan a drive runs. An operation-scoped drive runs the
+// plan its operation names, which for a member planned against its own live
+// schema is that member's plan rather than the apply's. A whole-apply drive has
+// no operation to name one and runs the apply's plan, erroring rather than
+// guessing when the apply names none.
+func (c *LocalClient) drivePlanID(apply *storage.Apply, op *storage.ApplyOperation) (int64, error) {
+	if op == nil {
+		if apply == nil || apply.PlanID == 0 {
+			return 0, fmt.Errorf("whole-apply drive: apply names no plan")
+		}
+		return apply.PlanID, nil
+	}
+	return storage.PlanIDForOperation(apply, op)
+}
+
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
-func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
+//
+// op is the operation being driven, or nil for a whole-apply drive. It names the
+// plan this drive runs: a rollout member planned against its own live schema
+// stores its plan on its operation row, and running the apply's plan there would
+// dispatch another target's DDL. A whole-apply drive has no operation to name
+// one, so it runs the apply's plan.
+func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
 	// Bind the apply's identity once so every line of this resume is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	// Mutable attrs (state, deployment) stay per-call so the bound logger
@@ -1960,7 +2003,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	// apply state — the engine-side work (a checkpointed copy or a live deploy
 	// request) is untouched. The recovery attempt exits with an error so the
 	// claim is released and a later attempt retries against intact storage.
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := c.drivePlanID(apply, op)
+	if err != nil {
+		return fmt.Errorf("resolve plan for drive of apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
 	if err != nil {
 		logger.Warn("failed to load plan during recovery; current apply owner will exit for operator retry",
 			append(apply.MutableLogAttrs(), "error", err)...)

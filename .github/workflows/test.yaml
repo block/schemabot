@@ -310,7 +310,10 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -h -o 'func Test[^(]*' pkg/localscale/*_test.go | sed 's/func //' | grep -v '/' | sort)
+          # Searched recursively: the shard runner tests every package under
+          # pkg/localscale that carries test files, so a test in a nested
+          # package that no shard filter names would be run by nobody.
+          tests=$(find pkg/localscale -name '*_test.go' -exec grep -h -o 'func Test[^(]*' {} + | sed 's/func //' | grep -v '/' | sort -u)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no localscale tests discovered"
@@ -374,8 +377,13 @@ jobs:
           docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
       - name: "Compile tests"
         run: go test -tags=integration -c -o /dev/null ./pkg/localscale/...
+      # The script streams per-test output and spends a time budget that keeps
+      # Go's own timeout below this job's timeout-minutes, so a shard that
+      # hangs panics with a dump naming the test it is stuck on instead of
+      # being killed with an empty log. Its budget is derived from the
+      # timeout-minutes above; see the script header before changing either.
       - name: "Test"
-        run: go test -tags=integration -timeout=8m -count=1 -v -run "${{ matrix.run_filter }}" ./pkg/localscale/... 2>&1 | tee /dev/stderr | tail -50
+        run: scripts/ci/run-localscale-shard.sh "${{ matrix.run_filter }}"
 
   e2e-mysql:
     name: "E2E MySQL Tests"

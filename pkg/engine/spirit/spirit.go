@@ -69,6 +69,7 @@ type Engine struct {
 	checkpointMaxAge     time.Duration
 	checksumYieldTimeout time.Duration
 	autoscaling          bool
+	locklessChecksum     bool
 
 	// onLog routes Spirit logs to the ApplyLogStore, with table context. It is
 	// swapped as drives hand the engine over and read from the log filter on
@@ -199,6 +200,7 @@ func New(cfg Config) *Engine {
 		checkpointMaxAge:     checkpointMaxAge,
 		checksumYieldTimeout: checksumYieldTimeout,
 		autoscaling:          autoscaling,
+		locklessChecksum:     cfg.Settings.EnableExperimentalLocklessChecksum,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -402,10 +404,8 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 				tp.Progress = 100
 				// A completed change copied everything, so the copied count is
 				// ground truth: reconcile the estimated total to it the way the
-				// live path does, and drop the detail line whose mid-copy
-				// percentage would contradict the completed bar.
+				// live path does.
 				tp.RowsTotal = tp.RowsCopied
-				tp.ProgressDetail = ""
 			}
 			tables = append(tables, tp)
 		}
@@ -1011,14 +1011,14 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 			tp.Progress = min(int(float64(st.RowsCopied)/float64(st.RowsTotal)*100), 100)
 			tp.ETASeconds = etaSeconds
 		}
-		if tp.RowsTotal > 0 {
-			tp.ProgressDetail = fmt.Sprintf("%d/%d %d%% copyRows",
-				tp.RowsCopied, tp.RowsTotal, tp.Progress)
-		}
 		// Spirit reports a single runner-wide checksum estimate (rows verified so
 		// far / total to verify), populated only during the verify phase and zero
 		// otherwise. Every table copy is complete by the time the verify phase
-		// runs, so the estimate is stamped on all tables unconditionally.
+		// runs, so the estimate is stamped on all tables unconditionally. The two
+		// checkers fill it differently: the snapshot one climbs through the
+		// table, while the lockless one has verified nothing conclusively until
+		// its first clean pass, so it reports zero for the phase and then the
+		// total.
 		tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
 		tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
 		// Spirit's throttle status is likewise runner-wide and already scoped to

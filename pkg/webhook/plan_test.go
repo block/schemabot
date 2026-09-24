@@ -566,6 +566,9 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		assert.Contains(t, rendered, "**Tenant**: `alpha`")
 		assert.Contains(t, rendered, "**Confirmation required**")
 		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
+		// The unlock hint is the other half of the same decision, and a tenant
+		// deployment ignores a command that does not name its tenant.
+		assert.Contains(t, rendered, "schemabot unlock --tenant alpha")
 	})
 
 	t.Run("preview shows tenant metadata without putting tenant in title", func(t *testing.T) {
@@ -1205,4 +1208,14 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
 	assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
+}
+
+// A plan comment's copy-paste commands name the database the comment is about.
+// For a command that is the -d the operator typed; for an auto-plan, which
+// posts one comment per database a pull request touches, it is the database
+// discovery resolved for that comment.
+func TestPlanCommentDatabaseFlag(t *testing.T) {
+	assert.Equal(t, "payments", planCommentDatabaseFlag("payments", "payments", false), "a command's -d is echoed back")
+	assert.Empty(t, planCommentDatabaseFlag("", "payments", false), "an unscoped command stays unscoped")
+	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true), "an auto-plan names the database its comment plans")
 }

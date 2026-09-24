@@ -1333,7 +1333,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (eu, au, us).
+✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 ```sql
 CREATE TABLE `users` (
@@ -1382,7 +1382,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (eu, au, us).
+✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 - `eu` (primary) ✅ matches the reviewed plan
 - `au` ✅ matches the reviewed plan · blocked: 1
@@ -1726,6 +1726,20 @@ To retry:
 ```
 schemabot apply -e staging
 ```
+
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
+</details>
+
+<details>
+<summary><a name="oversized-comment"></a><strong>Oversized Comment</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+⚠️ **This comment was too large to post.** SchemaBot rendered it at 84,801 bytes and GitHub accepts at most 65,536 in one comment, so this notice took its place. The schema change itself is unaffected; only this view of it is missing.
+
+**What to do next:** the desired schema is in this PR's schema files, and an apply's progress is available from the CLI with `schemabot status`. The server logs record the rendering with this PR's identifiers.
+<!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
@@ -7163,10 +7177,10 @@ To cut over `eu`:
 schemabot cutover apply-a1b2c3d4e5f6 -e production
 ```
 
-- 🟢 eu — ready for cutover — next in order
-- 🔄 us — running table copy
-- ⏳ au — waiting for us
-- ⏳ ca — waiting for us
+- 🟢 `eu` — ready for cutover — next in order
+- 🔄 `us` — running table copy
+- ⏳ `au` — waiting for us
+- ⏳ `ca` — waiting for us
 
 <details open>
 <summary>🟢 eu — ready for cutover — next in order</summary>
@@ -7289,10 +7303,10 @@ To retry:
 schemabot apply -e production
 ```
 
-- ✅ eu — completed
-- ❌ us — failed
-- ⏸️ au — halted — us failed
-- ⏸️ ca — halted — us failed
+- ✅ `eu` — completed
+- ❌ `us` — failed
+- ⏸️ `au` — halted — us failed
+- ⏸️ `ca` — halted — us failed
 
 <details>
 <summary>✅ eu — completed</summary>
@@ -7400,9 +7414,9 @@ _No details available yet._
 
 **Deployments**: 3 completed
 
-- ✅ eu — completed
-- ✅ us — completed
-- ✅ au — completed
+- ✅ `eu` — completed
+- ✅ `us` — completed
+- ✅ `au` — completed
 
 <details>
 <summary>✅ eu — completed</summary>
@@ -7520,9 +7534,9 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Deployments**: 3 completed
 
-- ✅ eu — completed
-- ✅ us — completed
-- ✅ au — completed
+- ✅ `eu` — completed
+- ✅ `us` — completed
+- ✅ `au` — completed
 
 <details>
 <summary>✅ eu — completed</summary>
@@ -7650,10 +7664,10 @@ To retry:
 schemabot apply -e production
 ```
 
-- ✅ eu — completed
-- ❌ us — failed
-- ⏸️ au — halted — us failed
-- ⏸️ ca — halted — us failed
+- ✅ `eu` — completed
+- ❌ `us` — failed
+- ⏸️ `au` — halted — us failed
+- ⏸️ `ca` — halted — us failed
 
 <details>
 <summary>✅ eu — completed</summary>

@@ -183,8 +183,17 @@ func hasVSchemaData(s sql.NullString) bool {
 
 // buildDDLStrategy constructs the Vitess online DDL strategy string.
 // If instantDDL is true, --prefer-instant-ddl is used; otherwise --postpone-completion.
+//
+// --analyze-table is deliberately absent. It runs ANALYZE TABLE on the shadow
+// table inside the cutover preparation, which replicates and briefly blocks
+// the table for writes, so the stream the cutover is about to wait on falls
+// behind. A stream that is behind at that moment reads the sentry table's DDL
+// after the cutover has locked the tables, reloads its schema, and blocks on
+// the locked table -- and the cutover is waiting on that same stream. The
+// statistics it produces are there for a replica promoted right after a
+// production cutover, which is not what this local backend is for.
 func buildDDLStrategy(instantDDL bool) string {
-	const baseFlags = " --in-order-completion --allow-zero-in-date --analyze-table" +
+	const baseFlags = " --in-order-completion --allow-zero-in-date" +
 		" --force-cut-over-after=1ms --cut-over-threshold=15s" +
 		" --singleton-context --allow-concurrent"
 
@@ -257,7 +266,15 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		return nil, nil, fmt.Errorf("invalid shard %s: %w", shard, err)
 	}
 
-	conn, err := backend.unscopedVtgateDB.Conn(ctx)
+	// Acquiring the connection and targeting the shard are both round trips to
+	// vtgate, so they carry their own deadline rather than the caller's lifetime:
+	// a vtgate that accepts a connection and then stops answering must not hold
+	// the caller indefinitely before it has a statement to time out. A shorter
+	// deadline already on ctx still wins.
+	setupCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+
+	conn, err := backend.unscopedVtgateDB.Conn(setupCtx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get vtgate connection: %w", err)
 	}
@@ -269,7 +286,7 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("invalid shard target %s: %w", target, err)
 	}
-	if _, err := conn.ExecContext(ctx, "USE "+quoteIdentifier(target)); err != nil {
+	if _, err := conn.ExecContext(setupCtx, "USE "+quoteIdentifier(target)); err != nil {
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("target shard %s: %w", target, err)
 	}

@@ -24,7 +24,9 @@ func TestStageExistingInitSchemaPreservesAndChecksScope(t *testing.T) {
 	_, err = stageExistingInitSchema(root, t.TempDir(), "app", "postgres", "development", []string{"other"})
 	require.ErrorContains(t, err, "do not match selected scope")
 	_, err = stageExistingInitSchema(root, t.TempDir(), "other", "postgres", "development", []string{"public"})
-	require.ErrorContains(t, err, "different database or engine")
+	require.ErrorContains(t, err, "configured for")
+	require.ErrorContains(t, err, `"app" (postgres)`)
+	require.ErrorContains(t, err, `"other" (postgres)`)
 }
 
 func TestStageExistingFlatSchemaUsesOriginalNamespace(t *testing.T) {

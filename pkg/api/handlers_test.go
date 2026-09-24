@@ -200,7 +200,26 @@ type staticPlanStore struct {
 	storage.PlanStore
 	plan      *storage.Plan
 	plansByID map[int64]*storage.Plan
-	err       error
+	// memberPlans are the plans stored for the members of a review round,
+	// listed by the round the apply was created from.
+	memberPlans []*storage.Plan
+	err         error
+}
+
+func (s *staticPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if opts.PrimaryPlanIdentifier == "" {
+		return s.memberPlans, nil
+	}
+	var matched []*storage.Plan
+	for _, plan := range s.memberPlans {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
 }
 
 func (s *staticPlanStore) Get(context.Context, string) (*storage.Plan, error) {
@@ -825,6 +844,7 @@ type mockTernClient struct {
 	pullSchemaErr  error
 	pullSchemaReq  *ternv1.PullSchemaRequest
 	pullSchemaReqs []*ternv1.PullSchemaRequest
+	pullSchemaMu   sync.Mutex
 	pullSchemaHook func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
 	applyResp      *ternv1.ApplyResponse
 	applyErr       error
@@ -874,8 +894,12 @@ type mockTernClient struct {
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	// A multi-target pull fans its members out concurrently, so several
+	// goroutines record through this one client.
+	m.pullSchemaMu.Lock()
 	m.pullSchemaReq = req
 	m.pullSchemaReqs = append(m.pullSchemaReqs, req)
+	m.pullSchemaMu.Unlock()
 	if m.pullSchemaHook != nil {
 		return m.pullSchemaHook(req)
 	}
@@ -4480,6 +4504,10 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 	require.Len(t, resp.Tables, 2)
 	assert.Equal(t, "deploy-a", resp.Tables[0].Deployment)
 	assert.Equal(t, "deploy-b", resp.Tables[1].Deployment)
+	// One deployment can address several targets, so the deployment alone does
+	// not say which target a table's copy is running against.
+	assert.Equal(t, "target-a", resp.Tables[0].Target)
+	assert.Equal(t, "target-b", resp.Tables[1].Target)
 }
 
 func newActiveProgressServiceWithOperations(client tern.Client, apply *storage.Apply, operations storage.ApplyOperationStore) *Service {

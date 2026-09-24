@@ -1670,6 +1670,21 @@ func (s applyTaskScope) tasklessOperationScope() bool {
 	return s.isOperationScoped() && s.tasklessOperation
 }
 
+// planID resolves the plan this drive runs. A rollout member planned against
+// its own live schema names its plan on its operation row, and dispatching the
+// apply's plan there would send another target's DDL and record another
+// target's plan identifier against this member's work. A whole-apply drive has
+// no operation to name one, so it runs the apply's plan.
+func (s applyTaskScope) planID(apply *storage.Apply) (int64, error) {
+	if s.operation == nil {
+		if apply == nil || apply.PlanID == 0 {
+			return 0, fmt.Errorf("resolve plan for whole-apply drive: apply names no plan")
+		}
+		return apply.PlanID, nil
+	}
+	return storage.PlanIDForOperation(apply, s.operation)
+}
+
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
 // Progress/Stop/Start/Cutover calls. Operation-owning drives read the claimed
 // operation's recorded remote apply id (which may be empty before dispatch);
@@ -2266,14 +2281,21 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		// modelled as a task row. Dispatch it as a VSchema-only apply, which the
 		// data plane applies via its own task-less VSchema-only path, mirroring
 		// LocalClient.ResumeApplyOperation.
-		plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		// A plan is what makes a task-less work operation valid, so an operation
+		// that resolves to none fails closed on the same signal as one whose plan
+		// carries no VSchema work, with the resolution failure as context.
+		planID, err := scope.planID(apply)
 		if err != nil {
-			return fmt.Errorf("load plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, err)
+			return fmt.Errorf("apply_operation %d (apply %s) resolves to no plan (%w): %w", applyOperationID, apply.ApplyIdentifier, err, ErrNoTasksForApplyOperation)
+		}
+		plan, err := c.storage.Plans().GetByID(ctx, planID)
+		if err != nil {
+			return fmt.Errorf("load plan %d for task-less apply_operation %d (apply %s): %w", planID, applyOperationID, apply.ApplyIdentifier, err)
 		}
 		// A missing plan row is its own cause, separate from a claim that resolved
 		// to the wrong operation, so name it rather than reporting a stale claim.
 		if plan == nil {
-			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
+			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", planID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 		}
 		// Fail closed before any dispatch or state mutation on every other
 		// task-less work shape: it is an invalid or stale claim. The shared resume
@@ -2310,12 +2332,16 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
 	}
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := scope.planID(apply)
 	if err != nil {
-		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, err)
+		return fmt.Errorf("resolve plan for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
+	if err != nil {
+		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
+		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
 	// Fail closed if the operation's scope carries no VSchema artifact,
 	// mirroring the local finalizer drive.
@@ -2351,7 +2377,8 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 	// the recorded remote apply id lets us poll the existing remote apply instead
 	// of starting a duplicate.
 	if scope.remoteApplyID(apply) == "" {
-		options := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation).Map()
+		driveOptions := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation)
+		options := driveOptions.Map()
 		target := options["target"]
 		if target == "" {
 			target = apply.Database
@@ -2389,6 +2416,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 			GenerationOperationKeys: scope.generationOperationKeys(),
 			IgnoreTables:            plan.IgnoreTables(),
+			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
 		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
@@ -3135,15 +3163,22 @@ func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope)
 }
 
 func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := scope.planID(apply)
 	if err != nil {
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", apply.PlanID, err), false, scope); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: %v", err), false, scope); markErr != nil {
+			return fmt.Errorf("mark queued gRPC apply %s failed after plan resolution error: %w", apply.ApplyIdentifier, markErr)
+		}
+		return fmt.Errorf("queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
+	if err != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", planID, err), false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after plan load error: %w", apply.ApplyIdentifier, markErr)
 		}
-		return fmt.Errorf("load plan %d for queued gRPC apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
+		return fmt.Errorf("load plan %d for queued gRPC apply %s: %w", planID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		errMsg := fmt.Sprintf("queued gRPC apply failed: plan %d not found", apply.PlanID)
+		errMsg := fmt.Sprintf("queued gRPC apply failed: plan %d not found", planID)
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing plan: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -3191,7 +3226,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	// and single-operation drives get the apply's stored options unchanged, so
 	// the deployment-ordered cutover claim (OC-3) can later drive each parked
 	// operation through its swap in turn.
-	options := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation).Map()
+	driveOptions := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation)
+	options := driveOptions.Map()
 	target := options["target"]
 	if target == "" {
 		target = apply.Database
@@ -3214,6 +3250,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
 		GenerationOperationKeys: scope.generationOperationKeys(),
 		IgnoreTables:            plan.IgnoreTables(),
+		// Restated as a field rather than left to ride in Options: the data
+		// plane admits the policy only from the field, so an option map that
+		// reached the control plane from anywhere else cannot grant one.
+		DirectExecution: DirectExecutionPolicyProto(driveOptions.DirectExecution),
 	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {

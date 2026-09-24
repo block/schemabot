@@ -308,6 +308,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// regular plan comment (no lock, no confirm footer).
 	if !planResp.HasChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData.ScopedDatabase = result.Database
 		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
 			h.logger.Error("failed to record no-changes check for apply command",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
@@ -324,6 +325,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData.ScopedDatabase = result.Database
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
@@ -344,6 +346,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData.ScopedDatabase = result.Database
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
@@ -388,6 +391,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// consent for every attributed table, where the re-plan choice the
 	// disclosure coaches is no longer open.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	commentData.ScopedDatabase = result.Database
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner

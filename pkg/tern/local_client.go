@@ -160,7 +160,8 @@ type LocalConfig struct {
 	// optional direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
-	// (enable_experimental_autoscaling, checkpoint_max_age,
+	// (enable_experimental_autoscaling,
+	// enable_experimental_lockless_checksum, checkpoint_max_age,
 	// checksum_yield_timeout).
 	Metadata map[string]string
 
@@ -602,9 +603,16 @@ func (c *LocalClient) remapsPostgresNamespaces() bool {
 }
 
 func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
 		return eng.Apply(ctx, req)
 	}
+	// Remapping rewrites the caller's request, so it is done on a copy: the
+	// caller keeps its logical namespaces, which is what it reports and stores.
+	// A shallow copy is enough because both rewritten fields are replaced
+	// outright rather than mutated in place — Changes through a cloned slice
+	// whose elements are values, SchemaFiles through a freshly built map — so
+	// nothing the copy shares with the original is written to.
 	requestCopy := *req
 	requestCopy.Changes = slices.Clone(req.Changes)
 	for i := range requestCopy.Changes {
@@ -1851,6 +1859,10 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 	if req.GroupedExecution != nil {
 		groupedExecution = req.GetGroupedExecution()
 	}
+	// The plan's execution-mode verdict has to be the one the apply will be
+	// judged by, so a refused statement is resolved against the caller's
+	// policy here exactly as the apply resolves it later.
+	creds = credentialsWithStatedDirectExecution(creds, req.GetDirectExecution())
 	return eng.Plan(ctx, &engine.PlanRequest{
 		Database:         database,
 		DatabaseType:     c.config.Type,
@@ -2704,6 +2716,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 
 	applyOpts := storage.ApplyOptionsFromMap(req.Options)
 	applyOpts.Target = plan.Target
+	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -2911,6 +2924,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// target string the request carried.
 	applyOpts := storage.ApplyOptionsFromMap(options)
 	applyOpts.Target = plan.Target
+	// The policy is taken from the request's own field and never from its
+	// option map, which is operator-supplied: a caller that could name its own
+	// direct execution policy in an option would be granting itself the thing
+	// the server's configuration exists to bound. A request that states none
+	// clears the field, so the executing server's configuration decides.
+	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -3089,6 +3108,14 @@ func (c *LocalClient) getEngine() engine.Engine {
 // configured actually reached it.
 func (c *LocalClient) Engine() engine.Engine {
 	return c.getEngine()
+}
+
+// Metadata returns the engine metadata this client runs under, exposed for
+// the same reason as Engine: a caller that assembles a LocalClient can verify
+// that the server policy it composed actually reached the client, rather than
+// only that the composition helper returns the right map.
+func (c *LocalClient) Metadata() map[string]string {
+	return maps.Clone(c.config.Metadata)
 }
 
 // Progress returns detailed progress for an active schema change.

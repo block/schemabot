@@ -711,6 +711,15 @@ func PreviewCommentSupportChannel() string {
 		RenderSupportChannelFooter(PreviewCommentApplyFailed(), previewSupportChannel())
 }
 
+// PreviewCommentOversized renders the notice posted in place of a comment
+// larger than GitHub accepts, with the support-channel footer it offers.
+func PreviewCommentOversized() string {
+	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
+		Title:         "## Schema Change Apply — Staging",
+		RenderedBytes: 84801,
+	}), previewSupportChannel())
+}
+
 // PreviewCommentErrorNoConfig renders the "no config found" error comment.
 func PreviewCommentErrorNoConfig() string {
 	return RenderNoConfig(SchemaErrorData{
@@ -2173,8 +2182,8 @@ func PreviewCommentApplyReverting() string {
 
 // sampleDeploymentDetail builds one deployment's single-deployment comment data
 // for the per-deployment <details> body, with its own database name.
-func sampleDeploymentDetail(database, applyState string, tables []TableProgressData) ApplyStatusCommentData {
-	return ApplyStatusCommentData{
+func sampleDeploymentDetail(database, applyState string, tables []TableProgressData) *ApplyStatusCommentData {
+	return &ApplyStatusCommentData{
 		Database:    database,
 		Environment: "production",
 		RequestedBy: "aparajon",
@@ -2216,9 +2225,9 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 		Environment: "production",
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-12 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
-			"us": sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
+			sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
 		},
 	})
 }
@@ -2255,9 +2264,9 @@ func PreviewCommentMultiDeploymentApplyFailed() string {
 		Environment: "production",
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
-			"us": usDetail,
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
+			usDetail,
 		},
 	})
 }
@@ -2286,10 +2295,10 @@ func PreviewCommentMultiDeploymentApplyCompleted() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
-			"us": sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
-			"au": sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
 		},
 	})
 }
@@ -2319,10 +2328,10 @@ func PreviewCommentMultiDeploymentApplySummaryCompleted() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
-			"us": sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
-			"au": sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
 		},
 	})
 }
@@ -2358,9 +2367,9 @@ func PreviewCommentMultiDeploymentApplySummaryFailed() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-1 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
-			"us": usDetail,
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
+			usDetail,
 		},
 	})
 }

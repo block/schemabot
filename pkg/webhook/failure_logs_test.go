@@ -149,7 +149,7 @@ func TestFailureLogsSectionSharesTheRoomWithTheEngineGroup(t *testing.T) {
 
 	assert.Contains(t, rendered, "Show recent logs (")
 	assert.Contains(t, rendered, "[orders] unsafe warning 1265: Data truncated")
-	assert.LessOrEqual(t, len(base)+len(rendered), templates.GitHubIssueCommentMaxChars-commentChromeHeadroom)
+	assert.LessOrEqual(t, len(base)+len(rendered), templates.GitHubIssueCommentMaxChars-templates.CommentChromeHeadroom)
 }
 
 // Only a failed apply carries logs. A completed, stopped, or cancelled
@@ -276,7 +276,7 @@ func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWhenTheFoldWouldNotFit(t
 	// A body that clears the room check by a margin narrower than the rewrite
 	// grows it: the unpointed body leaves exactly the minimum, the pointed one
 	// leaves less.
-	room := templates.GitHubIssueCommentMaxChars - commentChromeHeadroom - templates.MinFailureLogsSectionChars
+	room := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - templates.MinFailureLogsSectionChars
 	pad := strings.Repeat("x", room-len(apply.ErrorMessage))
 	renderBody := func(apply *storage.Apply) string {
 		return pad + apply.ErrorMessage

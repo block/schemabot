@@ -19,8 +19,12 @@ func (m WatchModel) multiDeploymentProgressView() string {
 	var b strings.Builder
 	m.writeMultiDeploymentHeader(&b, model)
 
-	for _, deployment := range model.Deployments {
-		m.writeDeploymentSection(&b, deployment)
+	// Derive returns one Deployment per input operation, in input order, so
+	// model.Deployments[i] projects m.operations[i]. Pairing by index lets each
+	// section render its own operation's identifiers; a deployment can own
+	// several operations, so a name-based lookup cannot tell them apart.
+	for i, deployment := range model.Deployments {
+		m.writeDeploymentSection(&b, deployment, m.operations[i])
 	}
 
 	b.WriteString(templates.FormatThrottleReference(m.tables))
@@ -37,6 +41,7 @@ func tuiOperationsForPresentation(ops []templates.ProgressOperation, released bo
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
 			Deployment:        op.Deployment,
+			Target:            op.Target,
 			State:             op.State,
 			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
@@ -61,9 +66,9 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 		if model.FirstFailure.Error != "" {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s — %s", model.FirstFailure.Deployment, model.FirstFailure.Error)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s — %s", model.FirstFailure.Name, model.FirstFailure.Error)))
 		} else {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Deployment)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Name)))
 		}
 	}
 	if m.applyID != "" {
@@ -83,16 +88,20 @@ func formatTUIDeploymentCounts(counts []presentation.StateCount) string {
 	return strings.Join(parts, " · ")
 }
 
-func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment) {
-	fmt.Fprintf(b, "%s %s — %s", deployment.Emoji, deployment.Deployment, deployment.Label)
-	if target := targetForTUIDeployment(m.operations, deployment.Deployment); target != "" {
-		fmt.Fprintf(b, " (%s)", target)
+func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment, op templates.ProgressOperation) {
+	fmt.Fprintf(b, "%s %s — %s", deployment.Emoji, deployment.Name, deployment.Label)
+	// A member whose name already carries its target does not repeat it in the
+	// trailing parenthetical.
+	if op.Target != "" && deployment.Name == deployment.Deployment {
+		fmt.Fprintf(b, " (%s)", op.Target)
 	}
 	b.WriteString("\n")
-	if externalOperationID := externalOperationIDForTUIDeployment(m.operations, deployment.Deployment); externalOperationID != "" {
-		fmt.Fprintf(b, "  External operation ID: %s\n", externalOperationID)
+	// The external operation ID identifies this operation's own data-plane row,
+	// so it never falls back to a sibling's value.
+	if op.ExternalOperationID != "" {
+		fmt.Fprintf(b, "  External operation ID: %s\n", op.ExternalOperationID)
 	}
-	if externalID := externalIDForTUIDeployment(m.operations, deployment.Deployment); externalID != "" {
+	if externalID := templates.SectionExternalID(op, m.operations); externalID != "" {
 		fmt.Fprintf(b, "  External apply ID: %s\n", externalID)
 	}
 
@@ -101,7 +110,10 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 		fmt.Fprintf(b, "  %s\n", errStyle.Render(deployment.Error))
 	}
 
-	tables := tablesForDeployment(m.tables, deployment.Deployment)
+	// The selector takes the member's recorded target, not the resolved one the
+	// header shows: a table row carries whatever its own operation carried, so
+	// matching an inherited value would look for a target the rows do not have.
+	tables := tablesForMember(m.tables, deployment.Deployment, deployment.Target)
 	if len(tables) > 0 && !state.IsSetupPhase(m.state) {
 		sortTablesByProgress(tables)
 		m.renderTables(b, tables)
@@ -109,41 +121,18 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 	b.WriteString("\n")
 }
 
-func targetForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment {
-			return op.Target
-		}
-	}
-	return ""
-}
-
-func externalOperationIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalOperationID != "" {
-			return op.ExternalOperationID
-		}
-	}
-	return ""
-}
-
-func externalIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalID != "" {
-			return op.ExternalID
-		}
-	}
-	return ""
-}
-
-func tablesForDeployment(tables []templates.TableProgress, deployment string) []templates.TableProgress {
-	deploymentTables := make([]templates.TableProgress, 0, len(tables))
+// tablesForMember selects the tables copied by one rollout member. Both halves
+// of the routing pair are matched: two targets of one deployment each copy the
+// same tables, and matching the deployment alone would list both members'
+// copies under each of them.
+func tablesForMember(tables []templates.TableProgress, deployment, target string) []templates.TableProgress {
+	memberTables := make([]templates.TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.TableName != "" {
-			deploymentTables = append(deploymentTables, table)
+		if table.Deployment == deployment && table.Target == target && table.TableName != "" {
+			memberTables = append(memberTables, table)
 		}
 	}
-	return deploymentTables
+	return memberTables
 }
 
 func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply) {

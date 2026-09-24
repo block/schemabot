@@ -667,7 +667,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
 	}
 	maps.Copy(metadata, spiritMetadata)
-	directMetadata, err := envConfig.DirectExecution.EngineMetadata()
+	directMetadata, err := s.config.DirectExecutionMetadata(&envConfig, dbType)
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct_execution metadata for %s: %w", key, err)
 	}

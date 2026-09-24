@@ -2276,15 +2276,18 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.Equal(t, DefaultCheckpointMaxAge, m.CheckpointMaxAge)
 	assert.Equal(t, DefaultChecksumYieldTimeout, m.ChecksumYieldTimeout)
 	assert.True(t, m.EnableExperimentalAutoscaling, "autoscaling defaults to enabled")
+	assert.False(t, m.EnableExperimentalLocklessChecksum,
+		"the copy is verified under the snapshot checksum until an operator opts in")
 	assert.True(t, m.InterpolateParams)
 	assert.Zero(t, m.WriteThreads, "write threads auto-size for the target")
 	assert.Equal(t, maxCommitLatency, m.MaxCommitLatency,
 		"commit-latency throttle must be set explicitly; Spirit disables the throttler on zero")
 
 	settings, err := SettingsFromMetadata(map[string]string{
-		MetadataEnableExperimentalAutoscaling: "false",
-		MetadataCheckpointMaxAge:              "24h",
-		MetadataChecksumYieldTimeout:          "6h",
+		MetadataEnableExperimentalAutoscaling:      "false",
+		MetadataEnableExperimentalLocklessChecksum: "true",
+		MetadataCheckpointMaxAge:                   "24h",
+		MetadataChecksumYieldTimeout:               "6h",
 	})
 	require.NoError(t, err, "SettingsFromMetadata")
 	eng = New(Config{Settings: settings})
@@ -2292,4 +2295,5 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, m.CheckpointMaxAge)
 	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
 	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
+	assert.True(t, m.EnableExperimentalLocklessChecksum, "the lockless checksum override enables it")
 }

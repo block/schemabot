@@ -25,6 +25,7 @@ CREATE TABLE `localscale_deploy_requests` (
   `instant_ddl_eligible` tinyint(1) NOT NULL DEFAULT '0',
   `instant_ddl` tinyint(1) NOT NULL DEFAULT '0',
   `revert_expires_at` timestamp NULL DEFAULT NULL,
+  `cancel_requested_at` timestamp NULL DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_database_number` (`org`,`database_name`,`number`)

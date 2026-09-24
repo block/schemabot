@@ -83,3 +83,11 @@ func TestUsesLocalRuntime_StorageSubcommands(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, usesLocalRuntime(ctx.Command(), &cli))
 }
+
+func TestInitWithoutFlagsReachesWizard(t *testing.T) {
+	var cli CLI
+	parser, err := kong.New(&cli, kong.Writers(io.Discard, io.Discard), kong.Vars{"cli_name": "schemabot"})
+	require.NoError(t, err)
+	_, err = parser.Parse([]string{"init"})
+	require.NoError(t, err)
+}
