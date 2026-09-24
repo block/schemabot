@@ -13,6 +13,9 @@
 # Environment:
 #   E2E_K8S_NAMESPACE  pin the namespace instead of deriving one per run
 #   KEEP_NAMESPACE=1   leave the stack up on exit (to read pod logs, or inspect)
+#   E2E_TEST_TIMEOUT   go test's own timeout (default 10m); CI sets it on the
+#                      job whose budget must exceed it plus setup, so the two
+#                      numbers are read and changed together
 
 set -euo pipefail
 
@@ -229,7 +232,7 @@ TEST_EXIT_CODE=0
 E2E_SCHEMABOT_URL="http://localhost:${CONTROL_PLANE_PORT}" \
 E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_CONTROL_PLANE_PORT})/schemabot?parseTime=true&multiStatements=true" \
 E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_DATA_PLANE_PORT})/testapp?parseTime=true&multiStatements=true" \
-    go test -count=1 -v -tags=e2e -timeout=10m -skip 'TestK8sEtre|TestK8sVitess' ./e2e/k8s/... || TEST_EXIT_CODE=$?
+    go test -count=1 -v -tags=e2e -timeout="${E2E_TEST_TIMEOUT:-10m}" -skip 'TestK8sEtre|TestK8sVitess' ./e2e/k8s/... || TEST_EXIT_CODE=$?
 
 # Teardown runs in the EXIT trap.
 exit "$TEST_EXIT_CODE"
