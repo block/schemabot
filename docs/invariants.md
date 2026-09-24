@@ -317,8 +317,10 @@ request body limit (`pkg/webhook/handler.go`).
 
 Every convergence of SchemaBot's own storage — at startup, or on an operator's command — is additive
 unless destroying storage state was explicitly permitted, and decides before it writes. Additivity
-is the whole rule: a statement that loses data and one that removes a schema object without losing
-any are both refusals, because the exposure is the fleet reading that storage, not the rows alone.
+is the whole rule: a statement that loses data and one that removes a schema object the fleet may
+still be reading through are both refusals, because the exposure is the fleet reading that storage,
+not the rows alone. A schema object the fleet has already stopped reading through is not that
+exposure, and removing it is not a refusal.
 Nothing about which surface asked changes that: an operator's command runs the bootstrap rather than
 a second implementation of it, and cannot narrow the permission a deployment already granted. Which
 schema a convergence runs is the operator's to name, so that the storage a release needs can be in
@@ -326,7 +328,11 @@ place before the first pod of it starts; naming one supplies the files the boots
 and nothing else, and every gate above applies to it unchanged. On MySQL such a statement is refused
 unless destructive storage changes are explicitly allowed, and the verdict is the one the plan
 already carries, read rather than re-derived, so the boot refuses exactly what the operator-facing
-plan flagged. The verdict is per statement and the differ emits one combined statement per table, so
+plan flagged. The plan flags an index drop only while the index is visible: an index already made
+invisible is one the optimizer has stopped planning around, so its drop is not flagged and the boot
+runs it without permission (see
+[What is never automatic](storage-schema.md#what-is-never-automatic)). The verdict is per statement
+and the differ emits one combined statement per table, so
 a flagged statement is reduced to the clauses that only add a schema object: those run and the rest
 does not. A clause that cannot run until a withheld clause has run waits with it, and a statement
 left with nothing to add is refused entire. Startup continues either way. On PostgreSQL the
