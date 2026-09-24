@@ -776,7 +776,7 @@ Two properties matter for display:
    - Each table's `State` is the raw Spirit phase string (`copyRows`, `applyChangeset`, ...).
    - Calculates `Progress` percent (clamped 0–100) and preserves raw `RowsCopied`
      so renderers can detect when the initial estimate was exceeded.
-   - Sets `ProgressDetail` = formatted summary like `"12345/50000 24% copyRows"`.
+   - Sets `ETASeconds` on tables still copying only when the runner reports a ready estimate.
    - When `IsComplete` is true, reconciles `RowsTotal = RowsCopied` (the estimate
      was never a count; the copied total is ground truth once the copy finishes)
      and sets `Progress` to 100. The table keeps the runner phase while the
@@ -797,6 +797,12 @@ Two properties matter for display:
    (`logEngineResumeOnce`).
 
 Key types: `engine.ProgressResult`, `engine.TableProgress` (`pkg/engine/engine.go`).
+
+`engine.TableProgress.ProgressDetail` is a free-text engine note, such as a
+summary before per-table progress is available or a marker for native DDL.
+It stops at the engine boundary: the drive persists structured fields, and
+neither the API nor CLI parses the note.
+
 
 When no runner exists (engine stopped, no active schema change), returns `StatePending` with
 message `"No active schema change"`.
@@ -944,19 +950,9 @@ adds apply-level fields: `apply_id`, `database`, `environment`.
 The TUI polls the API every **2 seconds** via `tick()`.
 
 `parseProgressResult()` delegates to `ParseProgressResponse()` in
-`pkg/cmd/internal/templates/progress_parse.go`. It normally uses the structured API fields; the
-stored-progress API leaves `ProgressDetail` empty. For older responses that supply a summary,
-`ParseSpiritProgress()` can extract its values:
-
-```
-"71436/221193 32.30% copyRows ETA 5m 30s"
- ↓       ↓      ↓       ↓          ↓
-RowsCopied RowsTotal Percent State    ETA
-```
-
-Summary parsing is a compatibility path for responses that supply `ProgressDetail`; ordinary
-progress reads use the stored numeric fields. The engine supplies a structured `ETASeconds`
-value when its row-copy estimate is ready.
+`pkg/cmd/internal/templates/progress_parse.go`. It reads the structured fields
+stored on each task: row counts, phase, checksum progress, throttle status, and
+ETA. No layer parses Spirit's human-readable summary to recover those values.
 
 For the operator-facing display examples and controls, see the
 [TUI rendering reference](mysql.md#tui-rendering-reference).
