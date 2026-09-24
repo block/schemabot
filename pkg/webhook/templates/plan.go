@@ -101,10 +101,11 @@ type PlanCommentData struct {
 	// a repository that configures several databases rather than one rejected
 	// as ambiguous. It comes from the -d on the command that produced the
 	// comment, or, on a comment SchemaBot posts on its own, from the database
-	// that comment plans — an auto-plan posts one comment per database, so
-	// naming it is the comment's own identity rather than a guess at what an
-	// operator meant. Empty only on an unscoped command, which renders the
-	// commands bare.
+	// that comment plans — the comment's own identity rather than a guess at
+	// what an operator meant. Empty renders the commands bare, which is what an
+	// unscoped command is answered with, and what a comment SchemaBot posts on
+	// its own carries when a bare command already reaches only the database the
+	// comment is about.
 	ScopedDatabase string
 
 	SchemaName   string // Schema directory name (e.g. filepath.Base of schema dir)

@@ -578,14 +578,45 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
 	}
+	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles)
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, postPlanComment, 0)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0)
 		})
 	}
 
 	return "auto-plan started", nil
+}
+
+// severalDatabases is the count that makes an auto-plan comment name its
+// database, used where discovery cannot answer how many a bare command reaches.
+const severalDatabases = 2
+
+// autoPlanCommandScopeDatabases counts the databases a bare command offered by
+// an auto-plan comment would reach, which is not the set this deployment plans.
+// The command path discovers over the PR's raw changed files, without the
+// proposed-against-default-branch narrowing applied above, and an unscoped
+// command reaches every deployment rather than this one's managed slice. Either
+// gap lets a deployment hold one database where the command finds two, and the
+// bare command it would then offer comes back rejected as ambiguous, or starts
+// a database its comment is not about.
+//
+// A discovery failure counts as several: naming the database always yields a
+// command that resolves, so an unanswerable question degrades to the scoped
+// rendering rather than to a command that may not work.
+func (h *Handler) autoPlanCommandScopeDatabases(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, changedFiles []ghclient.PRFile) int {
+	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, changedFiles)
+	if err != nil {
+		h.logger.Warn("failed to resolve which databases a bare command would reach; auto-plan comments will name their database",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		return severalDatabases
+	}
+	databases := make(map[string]struct{}, len(configs))
+	for _, cfg := range configs {
+		databases[cfg.Config.Database] = struct{}{}
+	}
+	return len(databases)
 }
 
 // autoPlanInputsMoved reports whether the PR changed underneath a plan that is
