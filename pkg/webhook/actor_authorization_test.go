@@ -1066,7 +1066,7 @@ func TestHandleMultiEnvPlanBlocksUnauthorizedActorAfterDiscovery(t *testing.T) {
 	})
 	h := actorAuthStorageTestHandler(cfg, &emptyStorage{}, installClient)
 
-	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, true, 0)
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, 0, true, 0)
 
 	body := requireComment(t, comments, "unauthorized plan comment")
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
