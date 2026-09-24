@@ -261,5 +261,5 @@ For command and response examples, see [schema intelligence](schema-intelligence
 If the change is throttled, start with the reported reason and the [throttle guide](throttle.md).
 
 For progress bar colors, phase labels, and keyboard controls, see the
-[CLI progress reference](cli-progress.md). For the implementation details, see
+[CLI progress reference](cli.md#progress-display-reference). For the implementation details, see
 [Spirit progress architecture](architecture.md#spirit-progress-architecture).
