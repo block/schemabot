@@ -513,6 +513,65 @@ func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
 	assert.Contains(t, out, "`` us` ## Injected ``")
 }
 
+// A rollout whose reviewed target is already at the desired schema, while other
+// targets are not, must not headline as a no-op. The reviewed plan is empty, so
+// the comment shows no DDL; a reviewer who reads "no schema changes detected"
+// merges believing an apply does nothing, when it would run the change on every
+// target that has not had it yet.
+func TestRenderPlanComment_ConvergedPrimaryDoesNotHeadlineAsNoOp(t *testing.T) {
+	alter := []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+	}}
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+				{Deployment: "primary", Target: "testapp_3", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1"}, Primary: true},
+				{Members: []string{"primary/testapp_2", "primary/testapp_3"}, Changes: alter},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.NotContains(t, out, "✅ **No schema changes detected**")
+	assert.Contains(t, out, "⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, so an apply would not be a no-op.")
+
+	// The same shape with a single other target agrees with itself on number.
+	data.DeploymentDrift.Deployments = data.DeploymentDrift.Deployments[:2]
+	data.DeploymentDrift.Plans[1].Members = []string{"primary/testapp_2"}
+	assert.Contains(t, RenderPlanComment(data), "⚠️ **No schema changes for the reviewed target** — 1 target still needs this change, so an apply would not be a no-op.")
+}
+
+// A rollout where every target is already at the desired schema is a no-op, and
+// still says so: the headline above is reserved for the targets that would run
+// work, not for every empty plan that has a rollup beside it.
+func TestRenderPlanComment_FullyConvergedRolloutIsStillANoOp(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "✅ **No schema changes detected**")
+	assert.Contains(t, out, "every target is already at this schema.")
+}
+
 // planGroupChanges builds a group plan running the given number of statements.
 // A group running none is already at the desired schema.
 func planGroupChanges(statements int) []KeyspaceChangeData {

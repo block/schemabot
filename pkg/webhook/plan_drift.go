@@ -146,6 +146,12 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup {
 	names := rollupMemberNames(rollup)
 	var groups []templates.DeploymentPlanGroup
+	// A member that could not be keyed carries an empty fingerprint, which means
+	// "do not group" and would collapse every such member into one plan here. Only
+	// a clean rollup reaches this function, and a clean rollup has no unkeyed
+	// member, so the empty key is never a key. The caller's gate is what
+	// establishes that, in a package of its own — a later caller that groups a
+	// rollup that did not pass has to key the members itself.
 	byPlan := make(map[string]int, len(rollup.Entries))
 	for i, e := range rollup.Entries {
 		at, ok := byPlan[e.PlanFingerprint]
@@ -175,17 +181,22 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 	return groups
 }
 
-// memberPlanChanges renders one member's plan in the shape the comment renders
-// the reviewed plan in, so a group's changes are described by the same code that
-// describes the plan a reviewer has already read.
+// memberPlanChanges renders one member's plan into the shape the comment renders
+// the reviewed plan in, so a group's changes can be shown the way a reviewer has
+// already read the primary's. It is a second builder of that shape, not the same
+// one: the reviewed plan is built from the plan response in buildPlanCommentData,
+// and the two have to be kept in step by hand.
 //
 // A sharded namespace carries its changes twice: once per shard, and once in a
 // collapsed namespace view that dedupes tables across shards. Both are kept, the
 // same way the reviewed plan keeps them, so the rendering can show what applies
 // where rather than a namespace-level view that hides a shard.
 //
-// A namespace that appears only on shard rows still gets an entry. Dropping it
-// would silently remove work from a plan the comment claims to describe in full.
+// A namespace that appears only on shard rows still gets an entry. The planner
+// opens a namespace's collapsed entry and its shard rows in the same step, so it
+// does not produce one — the entry exists because dropping a namespace would
+// silently remove work from a plan the comment claims to describe in full, and a
+// renderer should not be the thing that decides a shape is impossible.
 func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
 	shardsByNamespace := make(map[string][]templates.KeyspaceShardChange, len(cs.Shards))
 	var shardedNamespaces []string
@@ -203,6 +214,14 @@ func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
 		// A shard with nothing to run already matches the desired schema while
 		// its siblings change. It is carried as a satisfied group rather than
 		// dropped, so a partially-applied namespace shows its divergent state.
+		//
+		// A shard that reported changes and produced no DDL is a different thing:
+		// an incomplete plan, which the reviewed plan refuses to render rather
+		// than call satisfied. Calling it satisfied here would say the inverse —
+		// already at this schema — so it is worth naming why it cannot arrive.
+		// canonicalDDLForDrift rejects a blank statement, so a member carrying
+		// one fails its own comparison, classifies errored, and is excluded from
+		// the clean rollup this grouping runs on.
 		shard.Satisfied = len(shard.Statements) == 0
 		if _, seen := shardsByNamespace[sp.GetNamespace()]; !seen {
 			shardedNamespaces = append(shardedNamespaces, sp.GetNamespace())

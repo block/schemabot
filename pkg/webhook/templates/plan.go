@@ -246,9 +246,15 @@ type DeploymentPlanGroup struct {
 	// one group carries it, and it is the group operators read first: the
 	// reviewed plan is the one they have already seen.
 	Primary bool
-	// Changes is the plan every member of the group would run, in the same shape
-	// the comment renders the reviewed plan itself. Empty for a group whose
-	// members are already at the desired schema.
+	// Changes is one member's plan, in the same shape the comment renders the
+	// reviewed plan itself. Empty for a group whose members are already at the
+	// desired schema.
+	//
+	// The group's members run the same work, so any member's plan describes all
+	// of them — but they are grouped on canonicalized DDL, so two members can
+	// legitimately share a group while spelling the same statement differently.
+	// What renders is whichever member came first in rollout order, not a
+	// spelling every member would produce.
 	Changes []KeyspaceChangeData
 }
 
@@ -882,8 +888,45 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 	}
 }
 
+// noChangesHeadline states what an empty reviewed plan means for the rollout an
+// apply would run on.
+//
+// On its own an empty plan reads as a no-op, and that is only established for
+// the target that was reviewed. An independent rollout plans each target
+// against its own live schema, so a primary already at the desired schema says
+// nothing about the rest: the apply can still run DDL on every other target. A
+// reviewer who takes the green line at face value merges believing nothing will
+// happen, so where some target still needs the change the headline says so.
+func noChangesHeadline(drift *DeploymentDriftData) string {
+	changing := changingTargetCount(drift)
+	if changing == 0 {
+		return "✅ **No schema changes detected**"
+	}
+	return fmt.Sprintf("%s **No schema changes for the reviewed target** — %s this change, so an apply would not be a no-op.",
+		glyph.Attention, countedVerb(changing, "target still needs", "targets still need"))
+}
+
+// changingTargetCount counts the rollout's members whose own plan runs work.
+//
+// It answers only for a grouped rollup, which is a clean independent one: a
+// mirrored rollup that passed has already established that every member matches
+// the reviewed plan, so an empty reviewed plan is empty everywhere, and a rollup
+// that did not pass carries no per-member plans to count.
+func changingTargetCount(drift *DeploymentDriftData) int {
+	if drift == nil {
+		return 0
+	}
+	var changing int
+	for _, g := range drift.Plans {
+		if !g.Empty() {
+			changing += len(g.Members)
+		}
+	}
+	return changing
+}
+
 func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
-	sb.WriteString("✅ **No schema changes detected**\n")
+	sb.WriteString(noChangesHeadline(data.DeploymentDrift) + "\n")
 	if data.RecoveredApplyOwnedCheckState {
 		sb.WriteString("\n" + glyph.Info + " SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
 	}
@@ -1987,7 +2030,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// summary (writePlanSummary) or no-changes message, because entries can
 	// resolve differently per environment.
 	if totalChanges == 0 {
-		sb.WriteString("✅ **No schema changes detected**\n\n")
+		sb.WriteString(noChangesHeadline(plan.DeploymentDrift) + "\n\n")
 		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		writeExemptTables(sb, plan.ExemptTables)
 		return
