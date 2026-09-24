@@ -431,6 +431,12 @@ func stoppableContext(parent context.Context, stop <-chan struct{}) (context.Con
 // under the lock to confirm changes are still needed (another pod may have
 // applied them while we waited for the lock).
 //
+// The delta then converges one table at a time, each table its own engine run,
+// under the one lock and the one budget. That is what keeps an additive column
+// change metadata-only instead of a full copy of every table in the release;
+// see storageConvergenceRun for what the shape costs and why it is the right
+// trade on the path a pod starts on.
+//
 // Destructive statements in the diff — those the plan's linters report an error
 // against, which for the storage schema means losing data (DROP TABLE, or an
 // ALTER TABLE containing DROP COLUMN) or removing an index — are refused unless
@@ -582,7 +588,11 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 	}
 
 	tableChanges := flatTableChanges(changes)
-	logger.Info("applying storage schema changes", "ddl_count", len(tableChanges))
+	runs := storageConvergenceRuns(changes)
+	logger.Info("applying storage schema changes",
+		"ddl_count", len(tableChanges),
+		"run_count", len(runs),
+	)
 	for _, tc := range tableChanges {
 		logger.Info("schema change",
 			"table", tc.Table,
@@ -591,20 +601,193 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 		)
 	}
 
-	// Apply all DDL via Spirit (starts async schema change)
 	applyStart := time.Now()
-	_, err = eng.Apply(ctx, &engine.ApplyRequest{
-		Database:    storageSchemaNamespace,
-		Changes:     changes,
-		Credentials: &engine.Credentials{DSN: dsn},
-	})
-	if err != nil {
-		return fmt.Errorf("apply schema: %w", err)
+	for _, run := range runs {
+		if err := applyStorageConvergenceRun(ctx, eng, dsn, run, o, logger); err != nil {
+			return err
+		}
 	}
 
-	// Wait for schema change to complete by polling Progress.
-	// Spirit runs asynchronously, so we need to wait for completion.
-	ticker := time.NewTicker(100 * time.Millisecond)
+	logger.Info("storage schema applied successfully",
+		"ddl_count", len(tableChanges),
+		"run_count", len(runs),
+		"duration", time.Since(applyStart),
+	)
+	return nil
+}
+
+// storageConvergencePollInterval is how often a convergence asks the engine
+// where its current run has got to. It is short because the poll is an
+// in-process call and most storage-schema statements are metadata-only: a
+// longer interval would mostly add latency between one table finishing and the
+// next one starting.
+const storageConvergencePollInterval = 100 * time.Millisecond
+
+// storageConvergenceRun is one table's share of a convergence: the statements
+// the engine runs against that table, and where they sit in the whole pass.
+//
+// A convergence runs one of these per table rather than handing the engine the
+// whole outstanding delta at once, and that is what lets an additive column
+// change be metadata-only. The engine attempts native DDL — whichever
+// algorithm the server picks for the statement, INSTANT where the clause shape
+// and server version allow it — only for a change confined to a single table.
+// Given two tables it declines the attempt and copies all of them, cutting over
+// under a schema-scoped lock. On the startup path that copy is the whole cost:
+// it is synchronous, it runs under a budget a boot can afford (AV-11), and a
+// target that throttles it turns a release adding a nullable column into a
+// fleet that cannot start.
+//
+// Nothing here assumes the fast path is taken. Whether a statement can be
+// metadata-only is the server's decision, per statement, and the copy is still
+// what runs when it says no; the change is that the question gets asked.
+//
+// What per-table runs give up is the shared cutover a combined run performs.
+// A convergence that fails partway now leaves some tables converged and the
+// rest as they were. That is safe here, for reasons the bootstrap already
+// rests on. Every statement it runs is additive (AV-9), and the gate deciding
+// that runs over the whole delta before the first run starts, so a converged
+// table holds strictly more than it did and none is left in a shape between two
+// releases. The convergence records nothing about itself (AV-12), so the next
+// boot re-derives what is left from the live schema rather than from a marker
+// this one would have had to write. And an instance whose convergence returned
+// an error fails startup rather than serving against storage it did not finish
+// converging, so no pod queries a half-converged schema.
+//
+// Stopping partway was already reachable either way: a budget that expires or a
+// platform stopping the instance (AV-13) ends a combined run exactly as
+// readily. What changes is the cost of it. A combined run that stops discards
+// every copy it had going and the next boot starts from nothing, which is how a
+// convergence too slow for its budget becomes a boot loop that never converges;
+// per-table runs leave the tables that finished converged, so the next boot
+// starts from where this one stopped.
+type storageConvergenceRun struct {
+	// change is the whole plan for this run: one namespace, one table.
+	change engine.SchemaChange
+	// table is the table this run converges, for logs and for the observations
+	// reported while it runs.
+	table string
+	// phase is where this run sits in the convergence's phase order. A table
+	// whose statements span phases takes the earliest of them, so a run that
+	// creates anything runs in the create phase.
+	phase int
+	// position is this run's 1-based place among runCount runs, so a log line
+	// or an error says how far into the convergence it happened.
+	position int
+	runCount int
+	// doneDDL is how many statements finished before this run started, runDDL
+	// how many it carries, and totalDDL how many the convergence has. Together
+	// they restate the engine's per-run percentage over the whole pass.
+	doneDDL  int
+	runDDL   int
+	totalDDL int
+}
+
+// The phases a convergence runs its tables in, which is the order a single
+// engine run would have put them in: a table this convergence creates exists
+// before a later run drops another one.
+const (
+	storagePhaseCreate = iota
+	storagePhaseAlter
+	storagePhaseDrop
+)
+
+// storagePhaseOf places one statement in the convergence's phase order.
+// Anything that is neither a create nor a drop runs in the middle phase, the
+// same way the engine groups its own statements.
+func storagePhaseOf(op ddl.StatementType) int {
+	switch op {
+	case ddl.StatementCreateTable:
+		return storagePhaseCreate
+	case ddl.StatementDropTable:
+		return storagePhaseDrop
+	default:
+		return storagePhaseAlter
+	}
+}
+
+// storageConvergenceRuns splits a planned convergence into the runs that
+// execute it — one per table, in the order they run.
+//
+// The order is deliberate on both keys. Phase first, so the statements stay in
+// the order a single engine run would have executed them in. Then table name,
+// so a convergence that stops partway stops somewhere reproducible: the same
+// outstanding delta converges the same prefix of tables every time, rather
+// than whichever order the plan happened to come back in, which is what makes
+// a partial convergence something an operator can reason about instead of
+// something they have to go and read.
+func storageConvergenceRuns(changes []engine.SchemaChange) []storageConvergenceRun {
+	type tableKey struct{ namespace, table string }
+	grouped := map[tableKey]*storageConvergenceRun{}
+	var ordered []*storageConvergenceRun
+	totalDDL := 0
+	for _, sc := range changes {
+		for _, tc := range sc.TableChanges {
+			key := tableKey{namespace: sc.Namespace, table: tc.Table}
+			run, ok := grouped[key]
+			if !ok {
+				// The namespace and everything else the plan attached to this
+				// change carry over; only the table changes are narrowed.
+				narrowed := sc
+				narrowed.TableChanges = nil
+				run = &storageConvergenceRun{change: narrowed, table: tc.Table, phase: storagePhaseDrop}
+				grouped[key] = run
+				ordered = append(ordered, run)
+			}
+			run.change.TableChanges = append(run.change.TableChanges, tc)
+			run.phase = min(run.phase, storagePhaseOf(tc.Operation))
+			run.runDDL++
+			totalDDL++
+		}
+	}
+
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left, right := ordered[i], ordered[j]
+		if left.phase != right.phase {
+			return left.phase < right.phase
+		}
+		if left.change.Namespace != right.change.Namespace {
+			return left.change.Namespace < right.change.Namespace
+		}
+		return left.table < right.table
+	})
+
+	runs := make([]storageConvergenceRun, 0, len(ordered))
+	doneDDL := 0
+	for i, run := range ordered {
+		run.position = i + 1
+		run.runCount = len(ordered)
+		run.doneDDL = doneDDL
+		run.totalDDL = totalDDL
+		doneDDL += run.runDDL
+		runs = append(runs, *run)
+	}
+	return runs
+}
+
+// applyStorageConvergenceRun converges one table and waits for the engine to
+// finish with it, so the next run starts against a target the previous one has
+// let go of.
+func applyStorageConvergenceRun(ctx context.Context, eng engine.Engine, dsn string, run storageConvergenceRun, o ensureSchemaOptions, logger *slog.Logger) error {
+	logger.Info("converging storage table",
+		"database", storageSchemaNamespace,
+		"table", run.table,
+		"run", run.position,
+		"run_count", run.runCount,
+		"ddl_count", run.runDDL,
+	)
+
+	if _, err := eng.Apply(ctx, &engine.ApplyRequest{
+		Database:    storageSchemaNamespace,
+		Changes:     []engine.SchemaChange{run.change},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}); err != nil {
+		return fmt.Errorf("apply storage schema change to table %q (run %d of %d): %w",
+			run.table, run.position, run.runCount, err)
+	}
+
+	// Wait for this run to complete by polling Progress. The engine runs the
+	// statements asynchronously, so the run is only over once it says so.
+	ticker := time.NewTicker(storageConvergencePollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -617,30 +800,36 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 			// ("...context canceled"); name the timeout instead so the cause
 			// is clear from the message line alone.
 			if ctx.Err() != nil {
-				return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, len(tableChanges), logger)
+				return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, run.totalDDL, logger)
 			}
-			return fmt.Errorf("check progress: %w", err)
+			return fmt.Errorf("check progress of storage schema change to table %q (run %d of %d): %w",
+				run.table, run.position, run.runCount, err)
 		}
 
 		// Straight out of the poll the wait already runs — an operator watching
 		// sees what the engine sees, at the rate it is asked.
-		o.report(mysqlConvergenceProgress(progress, len(tableChanges)))
+		o.report(run.observe(progress))
 
 		if progress.State == engine.StateFailed {
 			// Surface the cause in an Error log here — callers typically wrap the
 			// returned error as a structured attribute, which is easy to miss in
-			// log search. Include the DDL count and the underlying message so a
-			// failed bootstrap is triageable from the message line alone.
+			// log search. Include the table, the run's place in the convergence,
+			// and the underlying message so a failed bootstrap is triageable from
+			// the message line alone, including how much of it had already run.
 			logger.Error("storage schema change failed; SchemaBot storage will not initialize",
 				"database", storageSchemaNamespace,
-				"ddl_count", len(tableChanges),
+				"table", run.table,
+				"run", run.position,
+				"run_count", run.runCount,
+				"ddl_count", run.totalDDL,
 				"error", progress.ErrorMessage,
 			)
-			return fmt.Errorf("storage schema change failed (%d change(s)): %s", len(tableChanges), progress.ErrorMessage)
+			return fmt.Errorf("storage schema change to table %q failed (run %d of %d, %d change(s) planned): %s",
+				run.table, run.position, run.runCount, run.totalDDL, progress.ErrorMessage)
 		}
 
 		if progress.State.IsTerminal() {
-			break
+			return nil
 		}
 
 		select {
@@ -655,39 +844,99 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 			// This is the branch a stop actually arrives on. The polls either
 			// side of it are in-process and return in microseconds, so the
 			// loop spends essentially all of its time blocked right here.
-			return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, len(tableChanges), logger)
+			return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, run.totalDDL, logger)
 		case <-ticker.C:
 		}
 	}
-
-	logger.Info("storage schema applied successfully",
-		"ddl_count", len(tableChanges),
-		"duration", time.Since(applyStart),
-	)
-	return nil
 }
 
-// mysqlConvergenceProgress narrows one engine poll to what an operator is
-// watching for. The engine's result also carries resume state, retry
-// classification, and its own metadata map, none of which describes how far
-// along the run is; passing them through would make the observation a second
-// name for the engine's response and tie every consumer to it.
-func mysqlConvergenceProgress(result *engine.ProgressResult, ddlCount int) StorageConvergenceProgress {
+// observe narrows one engine poll to what an operator is watching for. The
+// engine's result also carries resume state, retry classification, and its own
+// metadata map, none of which describes how far along the run is; passing them
+// through would make the observation a second name for the engine's response
+// and tie every consumer to it.
+//
+// The percentage is restated over the whole convergence, which is what the
+// field promises. The engine measures the run it is executing, so passing that
+// through would reach 100% once per table and tell a watching operator the
+// convergence had finished while most of it was still ahead.
+//
+// The state is the convergence's rather than the run's, for the same reason.
+// A run that finished is not the pass finishing, and an observation saying
+// otherwise is the one a watcher stops reading after.
+//
+// A run the engine has finished has finished every table in it, and that is
+// what those tables are reported as. Mid-run they carry the engine's own
+// per-table phase; on the last poll that phase is whatever the engine happened
+// to be doing as it wound the run down, which for a statement the server took
+// natively is a teardown phase and never a terminal one — the engine marks a
+// table done by finishing its copy, and a metadata-only statement never copies
+// anything. Left as it arrives, an operator watching a convergence of such
+// statements would see every table start and none of them finish. "completed"
+// is the engine's own word for a table that is done, so restating it here
+// keeps the per-table vocabulary the engine's.
+//
+// A finished run whose engine named no table is still reported under the table
+// it converged. That is a fact this run holds rather than one it invents — it
+// has exactly one table — and it is the only thing it can say about a table the
+// engine never named. Without it a convergence whose engine reports nothing
+// per table would leave a watcher reading the whole pass as one anonymous
+// subject.
+func (r storageConvergenceRun) observe(result *engine.ProgressResult) StorageConvergenceProgress {
+	done := result.State == engine.StateCompleted
 	p := StorageConvergenceProgress{
-		DDLCount: ddlCount,
-		State:    string(result.State),
-		Percent:  result.Progress,
+		DDLCount: r.totalDDL,
+		State:    string(r.convergenceState(result.State)),
 		Message:  result.Message,
 	}
+	if r.totalDDL > 0 {
+		p.Percent = (r.doneDDL*100 + r.runPercent(result)*r.runDDL) / r.totalDDL
+	}
 	for _, table := range result.Tables {
-		p.Tables = append(p.Tables, StorageConvergenceTableProgress{
+		tp := StorageConvergenceTableProgress{
 			Table:      table.Table,
 			State:      table.State,
 			Percent:    table.Progress,
 			RowsCopied: table.RowsCopied,
-		})
+		}
+		if done {
+			tp.State = string(engine.StateCompleted)
+			tp.Percent = 100
+		}
+		p.Tables = append(p.Tables, tp)
+	}
+	if len(p.Tables) == 0 && done {
+		p.Tables = []StorageConvergenceTableProgress{{
+			Table:   r.table,
+			State:   string(engine.StateCompleted),
+			Percent: 100,
+		}}
 	}
 	return p
+}
+
+// runPercent reports how much of this run is behind it. A run the engine has
+// finished is all of it: the engine stops measuring once a run is done and its
+// last poll reads zero, so taking that literally would leave the convergence
+// short of where it is at the moment each table lands — and short of 100% on
+// the observation that says it finished.
+func (r storageConvergenceRun) runPercent(result *engine.ProgressResult) int {
+	if result.State == engine.StateCompleted {
+		return 100
+	}
+	return result.Progress
+}
+
+// convergenceState reports what the whole convergence is doing, given what its
+// current run is. Only a completed run is restated: the convergence is over
+// when its last run completes and still running before that. Every other state
+// is the run's own, because a run that failed or was stopped ends the
+// convergence with it.
+func (r storageConvergenceRun) convergenceState(runState engine.State) engine.State {
+	if runState == engine.StateCompleted && r.position < r.runCount {
+		return engine.StateRunning
+	}
+	return runState
 }
 
 // stopConvergence ends a convergence whose context is gone: it releases what
