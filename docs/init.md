@@ -57,6 +57,20 @@ Connect your vtgate endpoint, choose your PlanetScale organization, and verify a
 reference. SchemaBot discovers keyspaces from the `main` branch and keeps its own data in a
 separate MySQL database.
 
+### Connect to your Vitess database
+
+The first connection uses a PlanetScale **branch password** for `main`. This provides a
+SQL username and password for the database connection, separate from your PlanetScale
+account login and the API service token.
+
+See the PlanetScale API's [Create a password](https://planetscale.com/docs/api/reference/create_password)
+endpoint. Its response includes `username`, `plain_text` (the password), and `access_host_url`
+(the connection host). Save the password when it is created; it cannot be retrieved later.
+Use these credentials and the endpoint's TLS settings in the wizard's database connection.
+
+The second connection is to the separate MySQL database where SchemaBot stores its plans
+and progress. It uses that MySQL server's credentials.
+
 ![Connect a Vitess database, verify its schema, and preview a change](../assets/init-vitess-demo.gif)
 
 ### Configure the PlanetScale service token
