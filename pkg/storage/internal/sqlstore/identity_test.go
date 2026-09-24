@@ -93,30 +93,30 @@ func TestMySQLDialectInsertGuardedID(t *testing.T) {
 		assert.Zero(t, id)
 	})
 
-	t.Run("propagates exec error", func(t *testing.T) {
+	t.Run("exec error leaves the write unproven", func(t *testing.T) {
 		wantErr := errors.New("exec boom")
 		exec := &fakeExecer{err: wantErr}
 		id, inserted, err := d.InsertGuardedID(t.Context(), exec, "INSERT ... SELECT ... WHERE lease = ?", "tok")
 		require.ErrorIs(t, err, wantErr)
-		assert.False(t, inserted)
+		assert.False(t, inserted, "nothing confirmed the write, so it is unproven, not rejected")
 		assert.Zero(t, id)
 	})
 
-	t.Run("propagates rows-affected error", func(t *testing.T) {
+	t.Run("rows-affected error leaves the write unproven", func(t *testing.T) {
 		wantErr := errors.New("rows boom")
 		exec := &fakeExecer{result: fakeResult{rowsAffectedErr: wantErr}}
 		id, inserted, err := d.InsertGuardedID(t.Context(), exec, "INSERT ... SELECT ... WHERE lease = ?", "tok")
 		require.ErrorIs(t, err, wantErr)
-		assert.False(t, inserted)
+		assert.False(t, inserted, "the statement ran but the row count is unreadable, so the write is unproven")
 		assert.Zero(t, id)
 	})
 
-	t.Run("reports inserted but propagates last-insert-id error after a row is written", func(t *testing.T) {
+	t.Run("last-insert-id error after a proven write still reports inserted", func(t *testing.T) {
 		wantErr := errors.New("id boom")
 		exec := &fakeExecer{result: fakeResult{rowsAffected: 1, lastInsertIDErr: wantErr}}
 		id, inserted, err := d.InsertGuardedID(t.Context(), exec, "INSERT ... SELECT ... WHERE lease = ?", "tok")
 		require.ErrorIs(t, err, wantErr)
-		assert.True(t, inserted, "a row was written; only id read-back failed")
+		assert.True(t, inserted, "RowsAffected proved the write; only the id read-back failed")
 		assert.Zero(t, id)
 	})
 }

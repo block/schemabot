@@ -27,16 +27,21 @@ type identityInserter interface {
 	// generated id. A statement that inserts no row is an error.
 	InsertID(ctx context.Context, exec queryExecer, query string, args ...any) (int64, error)
 	// InsertGuardedID runs a guarded INSERT ... SELECT ... WHERE <guard> that
-	// inserts zero or one row. inserted reports whether a row was written; when
-	// it is false and err is nil the caller interprets the guard (for example a
-	// lost lease). id is meaningful only when inserted is true and err is nil.
+	// inserts zero or one row. inserted has one meaning on every path: the
+	// dialect proved that a row was written. id is meaningful only when
+	// inserted is true and err is nil.
 	//
-	// Callers must check err before inserted. When err is non-nil, inserted
-	// reports only what the dialect can tell about the write: MySQL learns the
-	// row count before it reads the id back, so it reports inserted=true when
-	// the write landed and only the id read-back failed; PostgreSQL reads the
-	// id in the same statement (RETURNING), so a failed read-back is not
-	// separable from a failed write and it reports inserted=false.
+	// When err is nil, inserted=false is the guard's answer (for example a
+	// lost lease) and the caller interprets it. When err is non-nil,
+	// inserted=false means unproven, never rejected: an errored statement
+	// says nothing about the guard, so callers check err first and prove
+	// ownership with a read rather than concluding it from the failure. A
+	// dialect reports inserted=true with an error only when the write is
+	// already confirmed and a later step failed. MySQL learns the row count
+	// before it reads the id back, so it reports inserted=true when only the
+	// id read-back failed; a RowsAffected failure leaves the write unproven.
+	// PostgreSQL writes and reads the id in one statement (RETURNING), so any
+	// error leaves the write unproven.
 	InsertGuardedID(ctx context.Context, exec queryExecer, query string, args ...any) (id int64, inserted bool, err error)
 }
 
@@ -51,9 +56,9 @@ func (PostgresDialect) InsertID(ctx context.Context, exec queryExecer, query str
 
 // InsertGuardedID distinguishes a guarded INSERT that selected no row from a
 // successful insert by the absence of a RETURNING row. The write and the id
-// read-back are one statement, so any other error reports inserted=false: the
-// dialect cannot tell a write that failed from one that landed and then
-// failed to hand its id back.
+// read-back are one statement, so any other error leaves the write unproven
+// and reports inserted=false: the dialect cannot tell a write that failed
+// from one that landed and then failed to hand its id back.
 func (PostgresDialect) InsertGuardedID(ctx context.Context, exec queryExecer, query string, args ...any) (int64, bool, error) {
 	id, err := (PostgresDialect{}).InsertID(ctx, exec, query, args...)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -75,7 +80,9 @@ func (MySQLDialect) InsertID(ctx context.Context, exec queryExecer, query string
 }
 
 // InsertGuardedID executes the guarded INSERT and reports whether a row was
-// written via RowsAffected, returning its id only when one was.
+// written via RowsAffected, returning its id only when one was. Until
+// RowsAffected has answered, the write is unproven and every error reports
+// inserted=false.
 func (MySQLDialect) InsertGuardedID(ctx context.Context, exec queryExecer, query string, args ...any) (int64, bool, error) {
 	result, err := exec.ExecContext(ctx, query, args...)
 	if err != nil {
@@ -88,8 +95,8 @@ func (MySQLDialect) InsertGuardedID(ctx context.Context, exec queryExecer, query
 	if rows == 0 {
 		return 0, false, nil
 	}
-	// The row is written; report inserted=true even if reading its id back
-	// fails, so callers can't misclassify a successful write as a guard miss.
+	// RowsAffected proved the write; report inserted=true even if reading
+	// the id back fails, so the proven write is never reported as a miss.
 	id, err := result.LastInsertId()
 	if err != nil {
 		return 0, true, err
