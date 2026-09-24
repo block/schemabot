@@ -352,9 +352,10 @@ func TestStorageConvergenceRuns(t *testing.T) {
 		assert.Equal(t, []string{"applies", "plans", "tasks"}, runTables(runs),
 			"tables converge in name order within a phase")
 		for i, r := range runs {
-			require.Len(t, r.change.TableChanges, 1, "a run carries one table's statements")
-			assert.Equal(t, r.table, r.change.TableChanges[0].Table)
-			assert.Equal(t, "schemabot", r.change.Namespace, "the plan's namespace carries onto every run")
+			require.Len(t, r.changes, 1, "a per-table run carries one plan")
+			require.Len(t, r.changes[0].TableChanges, 1, "a run carries one table's statements")
+			assert.Equal(t, r.table, r.changes[0].TableChanges[0].Table)
+			assert.Equal(t, "schemabot", r.changes[0].Namespace, "the plan's namespace carries onto every run")
 			assert.Equal(t, i+1, r.position)
 			assert.Equal(t, 3, r.runCount)
 			assert.Equal(t, i, r.doneDDL, "each run knows how many statements finished before it")
@@ -387,7 +388,8 @@ func TestStorageConvergenceRuns(t *testing.T) {
 
 		require.Len(t, runs, 2)
 		require.Equal(t, "plans", runs[0].table)
-		assert.Len(t, runs[0].change.TableChanges, 2, "one table converges once, with all of its statements")
+		require.Len(t, runs[0].changes, 1)
+		assert.Len(t, runs[0].changes[0].TableChanges, 2, "one table converges once, with all of its statements")
 		assert.Equal(t, 2, runs[0].runDDL)
 		assert.Equal(t, 3, runs[0].totalDDL)
 		assert.Equal(t, 2, runs[1].doneDDL, "the second run starts after both of the first run's statements")
@@ -396,6 +398,46 @@ func TestStorageConvergenceRuns(t *testing.T) {
 	t.Run("an empty plan has no runs", func(t *testing.T) {
 		t.Parallel()
 		assert.Empty(t, storageConvergenceRuns(nil))
+	})
+
+	// Splitting a delta apart means a convergence that fails partway leaves
+	// some of it applied. That is harmless while every statement adds, and is
+	// not harmless once one of them removes something: a storage schema left
+	// missing an object the fleet still reads is not a state a later boot
+	// repairs, because the next diff reads the removal as already done. A
+	// delta holding any statement the engine called unsafe therefore converges
+	// in one run, the way every delta did before tables were split apart.
+	t.Run("a delta that removes something converges in one run", func(t *testing.T) {
+		t.Parallel()
+		removal := alter("applies")
+		removal.DDL = "ALTER TABLE `applies` DROP COLUMN `caller`"
+		removal.IsUnsafe = true
+		removal.UnsafeReason = "Unsafe operation detected: \"DROP COLUMN `caller`\""
+
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), removal, alter("tasks")},
+		}}
+		require.True(t, removesSchemaObjects(changes))
+
+		runs := storageConvergenceRuns(changes)
+		require.Len(t, runs, 1, "a delta that removes something must not be split across runs")
+		assert.Equal(t, changes, runs[0].changes, "the one run carries the whole delta")
+		assert.Empty(t, runs[0].table, "a run over the whole delta is about no single table")
+		assert.Equal(t, 1, runs[0].position)
+		assert.Equal(t, 1, runs[0].runCount)
+		assert.Equal(t, 3, runs[0].runDDL)
+		assert.Equal(t, 3, runs[0].totalDDL)
+	})
+
+	t.Run("a delta that only adds is split", func(t *testing.T) {
+		t.Parallel()
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), alter("applies")},
+		}}
+		assert.False(t, removesSchemaObjects(changes))
+		assert.Len(t, storageConvergenceRuns(changes), 2)
 	})
 }
 
@@ -502,4 +544,56 @@ func TestStorageConvergenceRunObserve(t *testing.T) {
 		assert.Equal(t, 12, o.Tables[0].Percent)
 		assert.Equal(t, int64(4096), o.Tables[0].RowsCopied)
 	})
+}
+
+// recordingApplyEngine counts the applies a convergence issues. Progress and
+// Cancel are the rest of the path a stop takes, so a run that does start
+// reports the count rather than panicking on an unimplemented method. Every
+// other method is the embedded nil interface.
+type recordingApplyEngine struct {
+	engine.Engine
+	applies int
+}
+
+func (e *recordingApplyEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applies++
+	return &engine.ApplyResult{}, nil
+}
+
+func (e *recordingApplyEngine) Progress(ctx context.Context, _ *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return nil, ctx.Err()
+}
+
+func (e *recordingApplyEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{}, nil
+}
+
+// A convergence stopped between two runs stops there. The engine executes a
+// run's statements on a context of its own, so a stop does not reach DDL that
+// has not been issued yet: a run started after the budget expired or the
+// instance was told to stop would go on changing the storage database after
+// the convergence ended (AV-13, AV-14).
+func TestApplyStorageConvergenceRunStartsNothingAfterAStop(t *testing.T) {
+	t.Parallel()
+
+	runs := storageConvergenceRuns([]engine.SchemaChange{{
+		Namespace: "schemabot",
+		TableChanges: []engine.TableChange{{
+			Table:     "applies",
+			Operation: ddl.StatementAlterTable,
+			DDL:       "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NULL",
+		}},
+	}})
+	require.Len(t, runs, 1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	eng := &recordingApplyEngine{}
+	err := applyStorageConvergenceRun(ctx, eng, closedPortDSN, runs[0],
+		ensureSchemaOptions{convergenceTimeout: time.Minute}, slog.New(slog.DiscardHandler))
+
+	require.Error(t, err, "a stopped convergence reports the stop rather than returning as if it converged")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, eng.applies, "no statement may be issued after the convergence was stopped")
 }
