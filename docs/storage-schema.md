@@ -200,7 +200,15 @@ who issued a command and can be pointed at a real deployment's storage. An index
 has a second path that needs no flag: make it invisible with `ALTER TABLE ...
 ALTER INDEX ... INVISIBLE`, and the next boot drops it. The same precondition
 applies — every running pod must be on a binary that no longer declares the
-index, because a binary that does would re-add it on its next boot.
+index. A binary that still declares it declares it visible, and its next boot
+makes the index visible again: a visibility change removes nothing, so it runs
+under the default policy with no refusal and no warning, and the boot after it
+on the newer binary is back to refusing the drop. Nothing in the logs says a
+peer undid the first half. Expect the drop itself to be quiet too: it is logged
+as the same info-level `schema change` line every converged statement gets,
+with no warning and no counter, so confirm it landed with
+[`storage plan`](#ask-what-storage-ddl-is-outstanding) rather than by watching
+for a refusal to stop.
 
 A booting pod skips a statement nothing has permitted and converges the safe
 remainder, rather than take a deployment down over a table nobody asked it to
@@ -213,9 +221,9 @@ gone — dropped under the flag, or hidden and then dropped by the next boot —
 that guarantee goes with it: rows that would have collided can now be written,
 and a rollback to a binary declaring the index re-adds it as `ADD UNIQUE INDEX`,
 which the duplicate rows cannot satisfy: the index is not re-added and that
-pod's startup fails with it. Before
-removing a unique index, be sure no release you might still roll back to
-declares it; if one does, keep the index and remove it in a later release.
+pod's startup fails with it. Before removing a unique index, be sure no release
+you might still roll back to declares it; if one does, keep the index and remove
+it in a later release.
 
 ## Ask what storage DDL is outstanding
 

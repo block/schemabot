@@ -579,6 +579,51 @@ func TestEnsureSchema_DropsAnInvisibleSurplusIndexByDefault(t *testing.T) {
 		"once the unique index is dropped, the colliding row must be accepted")
 }
 
+// Hiding an index is only the first half of removing it while every running
+// pod is on a binary that no longer declares it. A binary that still declares
+// the index declares it visible, and its differ treats the visibility as part
+// of the definition: its next boot makes the index visible again. That is a
+// metadata change that loses nothing and removes nothing, so it runs under the
+// default policy with no refusal and no warning, and the operator's first half
+// is undone before any pod reaches the second.
+func TestEnsureSchema_MakesAHiddenDeclaredIndexVisibleAgain(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// The embedded schema declares this index, so hiding it stands in for an
+	// operator starting a removal while a declaring binary is still running.
+	const declaredIndex = "idx_task_identifier"
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ALTER INDEX `%s` INVISIBLE", declaredIndex))
+	require.NoError(t, err)
+	require.Equal(t, "NO", indexVisibility(t, db, sdb.Name, "tasks", declaredIndex))
+
+	require.NoError(t, EnsureSchema(dsn, logger), "restoring an index's visibility must not fail startup")
+
+	assert.Equal(t, "YES", indexVisibility(t, db, sdb.Name, "tasks", declaredIndex),
+		"a declaring binary must make its hidden index visible again")
+	logs := logBuf.String()
+	assert.Contains(t, logs, "ALTER INDEX `"+declaredIndex+"` VISIBLE")
+	assert.NotContains(t, logs, "refusing destructive storage-schema change",
+		"a visibility change removes nothing and is not a destructive refusal")
+}
+
+// indexVisibility reports MySQL's IS_VISIBLE flag ("YES" or "NO") for one index.
+func indexVisibility(t *testing.T, db *sql.DB, schemaName, tableName, indexName string) string {
+	t.Helper()
+	var visible string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT IS_VISIBLE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1",
+		schemaName, tableName, indexName).Scan(&visible))
+	return visible
+}
+
 // Once a unique index is gone and a collision has been written, rolling back
 // to a binary whose embedded schema declares the index cannot succeed: its
 // diff re-adds the index as ADD UNIQUE INDEX, the duplicate rows cannot both
