@@ -92,8 +92,8 @@ func logRemoteControlResend(ctx context.Context, logger *slog.Logger, apply *sto
 	)
 	if pendingFor >= remoteControlStaleThreshold {
 		metrics.RecordRemoteControlRequestStale(ctx, string(controlReq.Operation), apply.Database, apply.Deployment, apply.Environment)
-		logger.Warn("remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
+		logger.WarnContext(ctx, "remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
 		return
 	}
-	logger.Info("re-sent pending remote control request to the data plane", attrs...)
+	logger.InfoContext(ctx, "re-sent pending remote control request to the data plane", attrs...)
 }
