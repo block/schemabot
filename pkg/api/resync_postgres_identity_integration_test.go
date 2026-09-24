@@ -119,12 +119,23 @@ func resyncLogger(t *testing.T) (*slog.Logger, *recordingLogHandler) {
 
 // A target without any SchemaBot storage tables is rejected before sequence
 // discovery, preventing an unrelated PostgreSQL database from appearing to
-// resync successfully.
+// resync successfully. The refusal names the database and schema it inspected,
+// both in the error and in the preamble logged before the check, so an
+// operator who pointed the command at the wrong DSN can see where it looked.
 func TestResyncPostgresIdentitySequences_RejectsTargetWithoutStorageTables(t *testing.T) {
 	_, db := startPostgresStorage(t)
-	err := ResyncPostgresIdentitySequences(t.Context(), db, slog.New(slog.DiscardHandler))
+	logger, logs := resyncLogger(t)
+
+	err := ResyncPostgresIdentitySequences(t.Context(), db, logger)
 	require.ErrorContains(t, err, "none of the")
+	require.ErrorContains(t, err, `database "schemabot" schema "public"`)
 	require.ErrorContains(t, err, "does not look like SchemaBot's storage database")
+
+	preambles := logs.recordsForMessage("resyncing identity sequences on storage tables")
+	require.Len(t, preambles, 1, "the target is named once before the refusal")
+	assert.Equal(t, "schemabot", preambles[0].attrs["database"])
+	assert.Equal(t, "public", preambles[0].attrs["schema"])
+	assert.Empty(t, logs.recordsForMessage("identity sequence resync complete"), "a refused run never reports completion")
 }
 
 // After an explicit-id bulk load, the identity sequences still point below
@@ -164,7 +175,7 @@ func TestResyncPostgresIdentitySequences_UnblocksDefaultInsertsAfterExplicitIDLo
 	preambles := logs.recordsForMessage("resyncing identity sequences on storage tables")
 	require.Len(t, preambles, 1, "the resync names its target once up front")
 	assert.Equal(t, slog.LevelInfo, preambles[0].level)
-	assert.NotEmpty(t, preambles[0].attrs["database"])
+	assert.Equal(t, "schemabot", preambles[0].attrs["database"])
 	assert.Equal(t, "public", preambles[0].attrs["schema"])
 
 	summaries := logs.recordsForMessage("identity sequence resync complete")

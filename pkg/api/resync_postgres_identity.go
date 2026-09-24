@@ -34,24 +34,19 @@ import (
 // (the advance-only guard suppresses the update) but can leave the sequence
 // where the concurrent draw put it rather than at the stored maximum.
 //
-// No SchemaBot code path invokes the resync yet: it is exported for the
-// operator tooling that performs such loads, and an Admin CLI entry point is
-// the intended first caller.
+// The server never runs the resync on its own: the Admin CLI's
+// `storage resync-identity-sequences` command is the caller, run by the
+// operator who performed the load. The function logs one summary line with
+// the outcome counts, so that caller reports nothing further on success.
 func ResyncPostgresIdentitySequences(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
 	tables, _, err := readEmbeddedPostgresSchemaFiles()
 	if err != nil {
 		return fmt.Errorf("read embedded PostgreSQL storage schema: %w", err)
 	}
-	missing, err := missingPostgresTables(ctx, db, tables)
-	if err != nil {
-		return fmt.Errorf("check target for storage tables: %w", err)
-	}
-	if len(missing) == len(tables) {
-		return fmt.Errorf("none of the %d storage tables exist in the target database; it does not look like SchemaBot's storage database", len(tables))
-	}
 
-	// Name the target up front so a resync pointed at the wrong database or
-	// schema is visible from the logs alone.
+	// Name the target before any check can refuse it, so a resync pointed at
+	// the wrong database or schema — the case the refusals below catch — is
+	// visible from the logs alone and named in the error.
 	var database string
 	var schemaName sql.NullString
 	if err := db.QueryRowContext(ctx, `SELECT current_database(), current_schema()`).Scan(&database, &schemaName); err != nil {
@@ -59,6 +54,15 @@ func ResyncPostgresIdentitySequences(ctx context.Context, db *sql.DB, logger *sl
 	}
 	logger.Info("resyncing identity sequences on storage tables",
 		"database", database, "schema", schemaName.String, "storage_tables", len(tables))
+
+	missing, err := missingPostgresTables(ctx, db, tables)
+	if err != nil {
+		return fmt.Errorf("check target for storage tables: %w", err)
+	}
+	if len(missing) == len(tables) {
+		return fmt.Errorf("none of the %d storage tables exist in database %q schema %q; it does not look like SchemaBot's storage database",
+			len(tables), database, schemaName.String)
+	}
 
 	columns, err := postgresIdentityColumns(ctx, db, tables)
 	if err != nil {
