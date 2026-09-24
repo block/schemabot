@@ -6415,14 +6415,17 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksMatchesDeploymentRenderingAndA
 	// table must each still find their own progress row, and once the
 	// canonical comparison has proven a row the same change, the stored task
 	// takes the deployment's spelling so the PR comment shows the statement as
-	// that deployment runs it. A row for a different change on the table is
-	// neither matched nor adopted.
+	// that deployment runs it. The adoption has to reach the row that is
+	// written: the next tick re-reads its tasks from storage, and a rendering
+	// that only lived on the in-memory task would be adopted — and logged —
+	// again on every tick for the life of the apply.
 	now := time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)
 	const (
 		reviewedCreate = `CREATE TABLE "app-region-a".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
 		reviewedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-a".recall USING btree (consumer_uuid)`
 		renderedCreate = `CREATE TABLE "app-region-b".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
 		renderedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall USING btree (consumer_uuid)`
+		adoptionLog    = "stored gRPC task takes the deployment's rendering of its statement"
 	)
 	storedApply := &storage.Apply{ID: 71, ApplyIdentifier: "apply-region-b", DatabaseType: "postgres", State: state.Apply.Running}
 	createTask := &storage.Task{
@@ -6433,11 +6436,20 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksMatchesDeploymentRenderingAndA
 		ID: 73, TaskIdentifier: "task-index-recall", ApplyID: storedApply.ID,
 		Namespace: "app", TableName: "recall", DDL: reviewedIndex, State: state.Task.Pending,
 	}
+	var records []capturedLog
+	tasks := &mockTaskStore{tasks: []*storage.Task{createTask, indexTask}}
 	client := &GRPCClient{
-		storage: &mockStorage{
-			tasks: &mockTaskStore{tasks: []*storage.Task{createTask, indexTask}},
-			logs:  &mockApplyLogStore{},
-		},
+		logger:  slog.New(captureHandler{records: &records}),
+		storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}},
+	}
+	adoptionLogs := func() int {
+		n := 0
+		for _, r := range records {
+			if r.msg == adoptionLog {
+				n++
+			}
+		}
+		return n
 	}
 
 	err := client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{createTask, indexTask}, []*ternv1.TableProgress{
@@ -6446,22 +6458,29 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksMatchesDeploymentRenderingAndA
 	}, now)
 	require.NoError(t, err)
 
-	assert.Equal(t, state.Task.Completed, createTask.State)
-	assert.Equal(t, 100, createTask.ProgressPercent)
-	assert.Equal(t, renderedCreate, createTask.DDL)
-	assert.Equal(t, state.Task.Running, indexTask.State)
-	assert.Equal(t, 40, indexTask.ProgressPercent)
-	assert.Equal(t, renderedIndex, indexTask.DDL)
+	// The rows handed to storage carry the adopted spelling alongside the
+	// mirrored progress; the in-memory tasks are not the evidence.
+	require.Len(t, tasks.updated, 2)
+	persistedCreate, persistedIndex := tasks.updated[0], tasks.updated[1]
+	assert.Equal(t, state.Task.Completed, persistedCreate.State)
+	assert.Equal(t, 100, persistedCreate.ProgressPercent)
+	assert.Equal(t, renderedCreate, persistedCreate.DDL)
+	assert.Equal(t, state.Task.Running, persistedIndex.State)
+	assert.Equal(t, 40, persistedIndex.ProgressPercent)
+	assert.Equal(t, renderedIndex, persistedIndex.DDL)
+	assert.Equal(t, 2, adoptionLogs(), "each statement is adopted once")
 
-	// A later tick reports the same rows; the adopted spelling now matches by
-	// text and nothing is rewritten.
-	err = client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{createTask, indexTask}, []*ternv1.TableProgress{
+	// A later tick re-reads the persisted rows and sees the same remote
+	// spelling; nothing is adopted or logged again.
+	err = client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{persistedCreate, persistedIndex}, []*ternv1.TableProgress{
 		{TaskId: "remote-1", Namespace: "app", TableName: "recall", Ddl: renderedCreate, Status: state.Task.Completed, PercentComplete: 100},
 		{TaskId: "remote-2", Namespace: "app", TableName: "recall", Ddl: renderedIndex, Status: state.Task.Completed, PercentComplete: 100},
 	}, now.Add(time.Second))
 	require.NoError(t, err)
-	assert.Equal(t, renderedIndex, indexTask.DDL)
-	assert.Equal(t, state.Task.Completed, indexTask.State)
+	require.Len(t, tasks.updated, 4)
+	assert.Equal(t, renderedIndex, tasks.updated[3].DDL)
+	assert.Equal(t, state.Task.Completed, tasks.updated[3].State)
+	assert.Equal(t, 2, adoptionLogs(), "a persisted rendering is not adopted again on the next tick")
 }
 
 func TestRemoteStatementRenderingKeepsReviewedTextUnlessProvenSameChange(t *testing.T) {

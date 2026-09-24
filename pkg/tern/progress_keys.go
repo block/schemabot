@@ -70,20 +70,32 @@ type StatementCanonicalizer func(ddl string) string
 // instead — the drift comparison has already refused such text before any
 // apply, so at this point it can only belong to work that never ran. An
 // unregistered database type is an error.
+//
+// Canonicalizing is a full parse and deparse, and one sync pass or progress
+// request asks for the same statement several times — once indexing it, once
+// looking it up, once comparing renderings — so the returned canonicalizer
+// remembers every answer for its lifetime. It is therefore scoped to a single
+// pass and not safe for concurrent use: build one per call site, never share
+// one across goroutines or keep one alive across passes.
 func StatementCanonicalizerForDatabaseType(databaseType string) (StatementCanonicalizer, error) {
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
 	if err != nil {
 		return nil, fmt.Errorf("statement canonicalizer for database type %q: %w", databaseType, err)
 	}
+	memo := map[string]string{}
 	return func(raw string) string {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			return ""
 		}
+		if canonical, ok := memo[raw]; ok {
+			return canonical
+		}
 		canonical, err := canonicalDDLForDrift(parser, raw)
 		if err != nil {
-			return raw
+			canonical = raw
 		}
+		memo[raw] = canonical
 		return canonical
 	}, nil
 }
