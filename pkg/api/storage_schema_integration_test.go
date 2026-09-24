@@ -1045,3 +1045,88 @@ func TestApplyStorageSchemaPostgres_ReportsProgressToAWatchingCaller(t *testing.
 	assert.True(t, engine.State(last.Tables[0].State).IsTerminal(),
 		"and so does the table it ended on: %q", last.Tables[0].State)
 }
+
+// A convergence spanning several tables runs each of them separately, so a
+// stop can land between two of them rather than inside one. What it leaves
+// behind is then a storage schema with some of the outstanding delta applied
+// and the rest not, which is the state the next instance to boot has to be
+// able to finish. It can: the convergence records nothing about itself
+// (AV-12), so the next pass re-derives what is left by reading the live schema
+// and converges exactly the tables the stopped one did not reach.
+//
+// The stop is taken from the convergence's own progress, at the moment it
+// reports its first table finished, so it lands in that window every run
+// rather than whenever a duration chosen in advance happens to expire.
+func TestApplyStorageSchemaMySQL_ResumesAConvergenceStoppedBetweenTables(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	logger := storageSchemaTestLogger()
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	var logBuf syncBuffer
+	stoppedLogger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Three tables, each missing one nullable column the embedded schema
+	// declares and no index covering it, so the outstanding delta is exactly
+	// one ADD COLUMN per table. Runs are ordered by table name within a phase,
+	// so `applies` converges first and the other two wait behind it.
+	const firstTable, firstColumn = "applies", "revert_skipped_at"
+	deferred := map[string]string{
+		"checks": "change_summary",
+		"plans":  "direct_execution",
+	}
+	drifted := maps.Clone(deferred)
+	drifted[firstTable] = firstColumn
+	for table, column := range drifted {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `%s` DROP COLUMN `%s`", table, column))
+		require.NoError(t, err, "drop %s.%s", table, column)
+		require.False(t, testutil.ColumnExists(t, db, sdb.Name, table, column))
+	}
+
+	// The observer runs inline on the convergence's own goroutine, so
+	// cancelling from it leaves the context cancelled before the convergence
+	// looks at it again, and no run after this one can start.
+	ctx, stop := context.WithCancel(t.Context())
+	var finished []string
+	_, _, err := ApplyStorageSchema(ctx, sdb.DSN, nil, stoppedLogger, WithConvergenceProgress(func(o StorageConvergenceProgress) {
+		for _, tp := range o.Tables {
+			if tp.State == string(engine.StateCompleted) {
+				finished = append(finished, tp.Table)
+				stop()
+			}
+		}
+	}))
+
+	require.Error(t, err, "a stopped convergence is not a successful one")
+	assert.Contains(t, err.Error(), "storage schema convergence stopped")
+	assert.NotContains(t, err.Error(), "did not complete within",
+		"an operator stopping a run must not be told a budget expired")
+	require.Len(t, finished, 1, "the stop must land after the first table and before the second, got %v", finished)
+	assert.Equal(t, firstTable, finished[0], "tables converge in name order, so this one went first")
+
+	// The run behind the stop is never started, rather than started and then
+	// cancelled. The engine executes a run's statements on a context of its
+	// own, so a stop does not reach DDL that has not been issued yet.
+	logs := logBuf.String()
+	assert.Equal(t, 1, strings.Count(logs, `msg="converging storage table"`),
+		"no run may be started after the convergence was stopped")
+	assert.Contains(t, logs, "the storage schema convergence was stopped before its next run started")
+
+	// The statement that finished stays finished (AV-13): a stop between runs
+	// does not undo the table already converged.
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, firstTable, firstColumn),
+		"%s.%s converged before the stop and must still be there", firstTable, firstColumn)
+	for table, column := range deferred {
+		assert.False(t, testutil.ColumnExists(t, db, sdb.Name, table, column),
+			"%s.%s was behind the stop and must not have run", table, column)
+	}
+
+	// A boot against the part converged schema finishes it. Nothing is left
+	// over from the stopped run for the new one to trip on, and the delta it
+	// reads is exactly the two tables that did not run.
+	require.NoError(t, EnsureSchema(sdb.DSN, logger),
+		"the next boot must converge what the stopped run did not reach")
+	for table, column := range drifted {
+		assert.True(t, testutil.ColumnExists(t, db, sdb.Name, table, column),
+			"%s.%s must converge on the boot after the stop", table, column)
+	}
+}
