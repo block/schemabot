@@ -868,9 +868,12 @@ Or resolve it from the server configuration:
 schemabot storage resync-identity-sequences --config /etc/schemabot/config.yaml
 ```
 
-The command refuses to run when none of SchemaBot's storage tables exist in
-the target database. Confirm the target and complete the resync before
-restarting the server or otherwise allowing default inserts.
+The command refuses to run when the connection's `search_path` resolves to no
+existing schema, when none of SchemaBot's storage tables exist in the target
+database, and when any storage table that does exist carries no identity
+column, so a database that merely shares table names with SchemaBot's storage
+cannot appear to resync successfully. Confirm the target and complete the
+resync before restarting the server or otherwise allowing default inserts.
 
 ## Storage Connection Pool
 
