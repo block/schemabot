@@ -17,6 +17,9 @@
 MySQL support. It copies and verifies a replacement table while your application keeps writing,
 then swaps it into place. SchemaBot supplies the reviewed plan, scheduling, and controls.
 
+For more background, watch Morgan Tocker's [Introducing Spirit](https://www.youtube.com/watch?v=-d-NOzKZxdI)
+talk at MySQL Belgian Days 2024.
+
 For engine setup and compatibility, see Spirit's [requirements](https://github.com/block/spirit#requirements)
 and [supported operations and limitations](https://github.com/block/spirit#unsupported-features).
 
@@ -131,9 +134,6 @@ Spirit's copy uses automatic write-thread scaling by default in SchemaBot, incre
 when capacity permits and backing off under pressure. It still needs room for the replacement
 table and a lock at cutover. For a long-running change, plan for the application's load as well
 as the copy; see [capacity and automatic scaling](throttle.md#capacity-and-automatic-scaling).
-
-For more background, watch Morgan Tocker's [Introducing Spirit](https://www.youtube.com/watch?v=-d-NOzKZxdI)
-talk at MySQL Belgian Days 2024.
 
 ## Checkpointing and resuming a change
 
