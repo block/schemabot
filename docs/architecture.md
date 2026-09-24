@@ -955,7 +955,7 @@ stored on each task: row counts, phase, checksum progress, throttle status, and
 ETA. No layer parses Spirit's human-readable summary to recover those values.
 
 For the operator-facing display examples and controls, see the
-[TUI rendering reference](mysql.md#tui-rendering-reference).
+[CLI progress reference](cli-progress.md).
 
 ##### Key behaviors
 

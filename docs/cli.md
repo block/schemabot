@@ -441,6 +441,9 @@ Press **Esc** to detach while copying; the apply keeps running. **s** requests
 a stop for this MySQL example. At deferred cutover, **Enter** requests the
 swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 
+For a reference to progress bar colors, phase labels, and keyboard controls, see
+the [CLI progress reference](cli-progress.md).
+
 ### Understand throttling
 
 When copying is throttled, the live view explains why. This MySQL example
