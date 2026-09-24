@@ -80,7 +80,10 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Contains(t, body, "**Tenant**: `alpha`")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
-		assert.Contains(t, body, fmt.Sprintf("schemabot apply -e staging -d %s --tenant alpha", dbName))
+		// One config is discovered, so the apply this comment offers resolves
+		// without being told which database it means.
+		assert.Contains(t, body, "schemabot apply -e staging --tenant alpha")
+		assert.NotContains(t, body, " -d ")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for auto-plan comment")
 	}
@@ -2061,5 +2064,66 @@ func TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead(t *testing.T) {
 	case body := <-result.comments:
 		t.Fatalf("expected no plan comment when the base branch could not be read, got: %s", body)
 	case <-time.After(3 * time.Second):
+	}
+}
+
+// A pull request touches two databases, but only one of its files is a change
+// the pull request proposes — the other is one its branch carries unchanged
+// from the default branch. Auto-plan narrows to what the pull request proposes
+// and plans that one database, while the command an operator would paste is
+// resolved over the pull request's raw changed-file list, across every
+// deployment, and reaches both. So the comment names the database it planned:
+// bare, the command it offers would resolve somewhere the comment never
+// mentioned, or come back rejected as ambiguous.
+func TestE2EAutoPlanScopesItsCommandWhenABareOneReachesMore(t *testing.T) {
+	dbName := "webhook_autoplan_scope"
+	peerDB := "webhook_autoplan_scope_peer"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Two schema directories, each managed by its own config, so the raw
+	// changed-file list resolves two databases.
+	configs := map[string]string{
+		"schema/" + dbName + "/schemabot.yaml": fmt.Sprintf("database: %s\ntype: mysql\n", dbName),
+		"schema/" + peerDB + "/schemabot.yaml": fmt.Sprintf("database: %s\ntype: mysql\n", peerDB),
+	}
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":    "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		peerDB + "/invoices.sql": "CREATE TABLE `invoices` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlanWithConfigs(t, mux, schemaFiles, configs, dbName, nil)
+	// The peer database's file is one the default branch already holds, so
+	// auto-plan drops it and plans this database alone. A pasted command still
+	// sees it.
+	result.baseHolds("schema/" + peerDB + "/invoices.sql")
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		require.Contains(t, body, "Schema Change Plan")
+		require.Contains(t, body, "`users`", "the comment plans this database alone")
+		require.NotContains(t, body, "`invoices`", "the inherited file is not this PR's change")
+		assert.Contains(t, body, "schemabot apply -e staging -d "+dbName,
+			"a bare command would reach the peer database too, so the comment names its own")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for auto-plan comment")
 	}
 }

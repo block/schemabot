@@ -1174,17 +1174,21 @@ On MySQL, destructive statements in the startup diff are refused and skipped by
 default, because a pod running an older binary does not declare a newer
 binary's tables, columns, and indexes, and would otherwise remove what the
 newer pods depend on. That covers statements that lose data — `DROP TABLE`, or an `ALTER
-TABLE` containing `DROP COLUMN` — and statements that remove an index, which
-destroy no rows and can still take the database down by regressing the plan of a
-query the rest of the fleet is running. Each refusal is logged at warn level with
+TABLE` containing `DROP COLUMN` — and statements that remove a visible index,
+which destroy no rows and can still take the database down by regressing the
+plan of a query the rest of the fleet is running. An index already made
+invisible regresses nothing and is dropped by the next boot without the opt-in;
+a unique index carries one more caveat, covered in
+[What is never automatic](storage-schema.md#what-is-never-automatic). Each
+refusal is logged at warn level with
 the exact DDL and counted in the
 `schemabot.storage_schema.destructive_refusals_total` metric. See
 [What is never automatic](storage-schema.md#what-is-never-automatic) for what a
 statement carrying both a removal and an addition does.
 
-To intentionally remove a storage table, column, or index, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then opt
-in:
+To intentionally remove a storage table, column, or visible index, first make
+sure every running pod is on a binary whose embedded schema no longer declares
+it, then opt in:
 
 ```yaml
 storage:
