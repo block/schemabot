@@ -8961,9 +8961,13 @@ Tables are being renamed atomically...
 
 Lint violations: Non-blocking warnings during plan/apply
 
-💡 Lint Warnings (2):
+💡 Lint Warnings (3):
   • orders: has_float: New column uses floating-point data type
   • users: no_default: Column added without DEFAULT value
+  • customers: Primary key column "id" has type "varchar"
+
+📖 Related guidance:
+  • Choosing a primary key: https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key
 
 
 ```

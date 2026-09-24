@@ -73,3 +73,11 @@ func TestRelatedGuidanceSkipsFindingsTheCommentWithholds(t *testing.T) {
 	writeRelatedGuidance(&shown, data.disclosesEverySeverity())
 	assert.Contains(t, shown.String(), primaryKeyDocURL, "a comment that shows every severity links both")
 }
+
+// Rename guidance applies to Vitess too, while the primary-key guide is MySQL-specific.
+func TestRelatedGuidanceVitessRename(t *testing.T) {
+	var out strings.Builder
+	writeRelatedGuidance(&out, guidanceScope{rules: []string{"rename_column", "primary_key"}})
+	assert.Contains(t, out.String(), "[Renaming a column or table]")
+	assert.NotContains(t, out.String(), primaryKeyDocURL)
+}

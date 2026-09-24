@@ -319,6 +319,15 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteLintViolations(lintViolations)
 	}
 
+	// Apply prints unsafe findings separately; link only findings shown here.
+	var guidanceRules []string
+	for _, finding := range result.LintResults {
+		if finding != nil && (!isApply || finding.Severity != "error") {
+			guidanceRules = append(guidanceRules, finding.Linter)
+		}
+	}
+	templates.WriteRelatedGuidance(guidanceRules, result.DatabaseType == "mysql")
+
 	// Write summary
 	switch {
 	case len(vschemaChanges) > 0:

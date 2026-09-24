@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [How a change runs](#how-a-change-runs)
+- [When a change needs direct execution](#when-a-change-needs-direct-execution)
 - [Why adding an index can copy the table](#why-adding-an-index-can-copy-the-table)
 - [Checkpointing and resuming a change](#checkpointing-and-resuming-a-change)
 - [Choosing a primary key](#choosing-a-primary-key)
@@ -39,6 +40,78 @@ and [direct execution](direct-execution.md) for statements routed outside the on
 Spirit documents the underlying [instant DDL path](https://github.com/block/spirit#attempt-instant-ddl),
 [dynamic chunking](https://github.com/block/spirit#dynamic-chunking), and
 [verification around deferred cutover](https://github.com/block/spirit/blob/main/docs/migrate.md#two-checksum-model).
+
+## When a change needs direct execution
+
+**Some changes need native MySQL DDL.** For example, reshaping a primary key can be
+outside what Spirit's online copy supports. Direct execution lets you make those
+changes through SchemaBot, with a reviewed plan and an audit trail, instead of
+running SQL by hand.
+
+This is a fallback inside the MySQL engine, not another engine to select. It only
+routes statements Spirit explicitly refuses. Enabling it does not make ordinary
+index additions skip the online copy, and an unexpected engine error is not
+permission to retry the statement directly.
+
+### Enable it with a table-size limit
+
+Direct execution is disabled by default. To allow it for small tables, add this
+at the top level of the **server configuration**:
+
+```yaml
+direct_execution:
+  enabled: true
+  max_table_rows: 1000
+  lock_acquisition_timeout: 10s
+```
+
+With this example, a refused statement can run directly on a table with at most
+1,000 rows. SchemaBot checks the table's estimated size, then confirms eligibility
+with a bounded exact count. A table above the limit, an unavailable count, or a
+failed check stays blocked. It checks again before execution, so growth after
+planning can still prevent the change from running.
+
+Choose the row limit for the amount of disruption you can accept. A small table
+can still have large rows or expensive DDL: this is a size limit, not a promise
+that a change finishes within a particular time.
+
+The policy covers MySQL databases on that server, including changes sent to a
+remote deployment over gRPC. An environment can replace it with its own policy
+or opt out with `enabled: false`; overrides replace the whole block rather than
+inheriting individual fields. See [configuration examples](configuration.md#direct-execution).
+
+### Know what changes operationally
+
+| Online table copy | Direct execution |
+|---|---|
+| Copies a replacement while the application uses the original | Runs the statement against the live table and can block writes |
+| Adapts throughput and backs off under pressure | Has no copy throttling |
+| Saves checkpoints for a compatible resume | Has no copy checkpoint to resume |
+| Can wait for a chosen cutover time | Has no separate cutover to schedule |
+| Reports copy and verification progress | Reports the statement's running or terminal state |
+
+The `10s` setting limits each metadata-lock wait, **not the DDL's runtime**.
+If the table is busy, the statement fails with a retryable lock error rather
+than waiting indefinitely. Once the lock is acquired, MySQL controls how long
+the statement takes. There is no Spirit revert window for a direct statement;
+undoing it requires another schema change.
+
+For a plan that mixes both paths, direct ALTER statements run before the
+Spirit-driven ALTER statements. Deferring cutover only delays the online
+copy's swap; it does not delay the direct statements. An all-direct plan cannot
+use deferred cutover.
+
+### Review the direct change before it runs
+
+The PR plan lists the direct statements and explains why Spirit cannot run them.
+The PR apply flow requires a separate confirmation against that disclosure,
+even when other changes would apply automatically. Unsafe-change consent is
+still required where applicable. See the [PR confirmation workflow](direct-execution.md#operator-consent-in-the-pr-workflow).
+
+The plan saves the policy used to make its decision. Applying that stored plan
+uses the saved policy, even if the server configuration changes during review.
+To use a new limit or withdraw permission for a pending change, generate and
+review a new plan. Live table-size checks still run before execution.
 
 ## Why adding an index can copy the table
 
@@ -157,10 +230,21 @@ one. See [lint and safety levels](lint-and-safety-levels.md).
 Spirit's [linter reference](https://github.com/block/spirit/blob/main/docs/lint.md#built-in-linters)
 covers the engine's rules; the SchemaBot guide explains how findings appear in a plan and affect approval.
 
+CLI plans link the same guidance beside the finding. For example, an advisory
+finding on an existing table includes:
+
+```text
+💡 Lint Warnings (1):
+  • customers: Primary key column "id" has type "varchar"
+
+📖 Related guidance:
+  • Choosing a primary key: https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key
+```
+
 The type rule is a design check, not a promise of fast copying: `BINARY` can pass lint while still
 using the general chunker. Conversely, a varchar finding does not mean Spirit cannot copy the
 table. Review the tradeoff rather than automatically rewriting a live primary key; changing an
-existing primary key may itself need a different execution path.
+existing primary key may itself need [direct execution](#when-a-change-needs-direct-execution).
 
 ## Reading progress
 

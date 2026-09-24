@@ -2,25 +2,12 @@ package templates
 
 import (
 	"fmt"
-	"slices"
 	"strings"
+
+	"github.com/block/schemabot/pkg/lintguidance"
 )
 
 const primaryKeyDocURL = "https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key"
-
-type lintGuide struct {
-	rules     []string
-	label     string
-	url       string
-	mysqlOnly bool
-}
-
-// Registry order is display order, independent of finding or environment order.
-// Multiple rules can point to a guide; its URL appears only once per comment.
-var lintGuides = []lintGuide{
-	{rules: []string{"primary_key"}, label: "Choosing a primary key", url: primaryKeyDocURL, mysqlOnly: true},
-	{rules: []string{"rename_column"}, label: "Renaming a column or table", url: "https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table", mysqlOnly: true},
-}
 
 // guidanceScope is the lint rules one comment discloses for one plan, with the
 // dialect that decides which guides apply. A comment links a guide only for a
@@ -56,21 +43,13 @@ func (d PlanCommentData) disclosesNonErrorsOnly() guidanceScope {
 // severities and environments, outside the optional findings fold. Unknown
 // rules have no link until registered above.
 func writeRelatedGuidance(sb *strings.Builder, scopes ...guidanceScope) {
-	seen := make(map[string]bool)
+	mapped := make([]lintguidance.Scope, 0, len(scopes))
+	for _, scope := range scopes {
+		mapped = append(mapped, lintguidance.Scope{Rules: scope.rules, IsMySQL: scope.isMySQL})
+	}
 	var links []string
-	for _, guide := range lintGuides {
-		for _, scope := range scopes {
-			if guide.mysqlOnly && !scope.isMySQL {
-				continue
-			}
-			matches := slices.ContainsFunc(scope.rules, func(rule string) bool {
-				return slices.Contains(guide.rules, rule)
-			})
-			if matches && !seen[guide.url] {
-				seen[guide.url] = true
-				links = append(links, fmt.Sprintf("[%s](%s)", guide.label, guide.url))
-			}
-		}
+	for _, guide := range lintguidance.Guides(mapped...) {
+		links = append(links, fmt.Sprintf("[%s](%s)", guide.Label, guide.URL))
 	}
 	if len(links) > 0 {
 		fmt.Fprintf(sb, "📖 **Related guidance:**\n\n- %s\n\n", strings.Join(links, "\n- "))

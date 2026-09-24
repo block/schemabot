@@ -710,8 +710,10 @@ documents the upstream contract. The fields below explain what SchemaBot consume
 | Field           | Type              | Notes |
 |-----------------|-------------------|-------|
 | `CurrentState`  | `status.State`    | Atomic int32 enum: `Initial`, `CopyRows`, `WaitingOnSentinelTable`, `Checksum`, `CutOver`, `Close`, ... |
-| `Summary`       | `string`          | `"71436/221193 32.30% copyRows ETA 5m 30s"` |
+| `Summary` | `string` | Human-readable progress for logs; display only, not a source for structured progress. |
 | `Tables[]`      | `[]TableProgress` | Per-table: `TableName`, `RowsCopied` (uint64), `RowsTotal` (uint64), `IsComplete` (bool) |
+| `Copy` | `status.CopyProgress` | Runner-wide copied and estimated total rows, summed from the same snapshot as `Tables[]`; SchemaBot renders the per-table counters. |
+| `Checksum` | `status.ChecksumProgress` | Rows checked and estimated total during verification; zero outside that phase. |
 | `ETA` | `status.ETA` | Remaining row-copy estimate and availability (`measuring`, `ready`, `due`, or no estimate). |
 | `Resume`        | `bool`            | True only after the runner successfully resumed from its durable checkpoint; a fresh start (or an abandoned resume attempt) reports false. |
 | `Throttle`      | `status.ThrottleStatus` | `Throttled` (bool), `Reason` (display-only string, `"<signal> <observed> <op> <threshold>"`), `Utilization` (float64, 0 means unknown — never render it as idle). |

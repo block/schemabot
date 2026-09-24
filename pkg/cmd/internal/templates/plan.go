@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/lintguidance"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -604,4 +605,17 @@ func unsafeChangeFindings(c UnsafeChange) []string {
 		return c.Reasons
 	}
 	return ui.LintReasons(c.Reason)
+}
+
+// WriteRelatedGuidance links only findings displayed by the calling surface.
+func WriteRelatedGuidance(rules []string, isMySQL bool) {
+	guides := lintguidance.Guides(lintguidance.Scope{Rules: rules, IsMySQL: isMySQL})
+	if len(guides) == 0 {
+		return
+	}
+	fmt.Println("📖 Related guidance:")
+	for _, guide := range guides {
+		fmt.Printf("  • %s: %s\n", guide.Label, guide.URL)
+	}
+	fmt.Println()
 }
