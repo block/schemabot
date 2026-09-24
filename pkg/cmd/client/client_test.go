@@ -183,23 +183,35 @@ func TestCheckActiveSchemaChangeRequestsActiveOnly(t *testing.T) {
 	assert.Equal(t, "staging", gotEnvironment)
 }
 
-// The preflight compares the operator's flags against stored keys, which the
-// server returns canonically, so a database or environment typed in a different
-// case must still find the busy apply rather than report the database idle.
+// The preflight compares the operator's flags against stored keys. Either side
+// can arrive in a different case — the flags as typed, a stored row in the
+// spelling it was written with before storage folded its keys — and the busy
+// apply must be found either way rather than the database reported idle.
 func TestCheckActiveSchemaChangeFoldsKeysBeforeComparing(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, err := w.Write([]byte(`{"active_count":1,"limit":1000,"applies":[` +
-			`{"apply_id":"apply-busy","database":"orders","environment":"staging","state":"running"}]}`))
-		assert.NoError(t, err)
-	}))
-	t.Cleanup(server.Close)
+	cases := map[string]struct {
+		stored                string
+		database, environment string
+	}{
+		"flags typed in another case":        {stored: `"database":"orders","environment":"staging"`, database: "Orders", environment: "Staging"},
+		"stored row spelled in another case": {stored: `"database":"Orders","environment":"Staging"`, database: "orders", environment: "staging"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, err := w.Write([]byte(`{"active_count":1,"limit":1000,"applies":[` +
+					`{"apply_id":"apply-busy",` + tc.stored + `,"state":"running"}]}`))
+				assert.NoError(t, err)
+			}))
+			t.Cleanup(server.Close)
 
-	active, err := CheckActiveSchemaChange(server.URL, "Orders", "Staging")
-	require.NoError(t, err)
-	require.NotNil(t, active)
-	assert.Equal(t, "apply-busy", active.ApplyID)
-	assert.Equal(t, "running", active.State)
+			active, err := CheckActiveSchemaChange(server.URL, tc.database, tc.environment)
+			require.NoError(t, err)
+			require.NotNil(t, active)
+			assert.Equal(t, "apply-busy", active.ApplyID)
+			assert.Equal(t, "running", active.State)
+		})
+	}
 }
 
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
