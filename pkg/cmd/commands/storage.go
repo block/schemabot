@@ -100,10 +100,11 @@ func (cmd *ResyncIdentitySequencesCmd) Run(ctx context.Context, g *Globals) erro
 		return fmt.Errorf("ping storage database: %w", err)
 	}
 
+	// The resync logs its own completion line with the outcome counts; a
+	// second one here would read as two completions per run.
 	if err := api.ResyncPostgresIdentitySequences(ctx, db, logger); err != nil {
 		return fmt.Errorf("resync identity sequences on storage tables: %w", err)
 	}
-	logger.Info("identity sequence resync complete")
 	return nil
 }
 
