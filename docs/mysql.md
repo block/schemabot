@@ -64,12 +64,12 @@ at the top level of the **server configuration**:
 ```yaml
 direct_execution:
   enabled: true
-  max_table_rows: 1000
+  max_table_rows: 10000
   lock_acquisition_timeout: 10s
 ```
 
 With this example, a refused statement can run directly on a table with at most
-1,000 rows. SchemaBot checks the table's estimated size, then confirms eligibility
+10,000 rows. SchemaBot checks the table's estimated size, then confirms eligibility
 with a bounded exact count. A table above the limit, an unavailable count, or a
 failed check stays blocked. It checks again before execution, so growth after
 planning can still prevent the change from running.
