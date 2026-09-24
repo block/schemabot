@@ -189,14 +189,18 @@ While any such release is still running, treat a long gap between pre-creating
 an index and rolling the release that declares it as a gap the index may not
 have survived, and re-check before you roll.
 
-To intentionally remove a storage table, column, or index, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then opt
-in with
+To intentionally remove a storage table, column, or visible index, first make
+sure every running pod is on a binary whose embedded schema no longer declares
+it, then opt in with
 [`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes),
 and revert the flag once the removal converges. `--allow-unsafe` opts in for one
 CLI invocation, widening the deployment's standing policy and never narrowing
 it. A locally hosted server refuses it instead, since local hosting cannot say
-who issued a command and can be pointed at a real deployment's storage.
+who issued a command and can be pointed at a real deployment's storage. An index
+has a second path that needs no flag: make it invisible with `ALTER TABLE ...
+ALTER INDEX ... INVISIBLE`, and the next boot drops it. The same precondition
+applies — every running pod must be on a binary that no longer declares the
+index, because a binary that does would re-add it on its next boot.
 
 A booting pod skips a statement nothing has permitted and converges the safe
 remainder, rather than take a deployment down over a table nobody asked it to
@@ -208,7 +212,8 @@ to a binary that declares it finds it in place and changes nothing. Once it is
 gone — dropped under the flag, or hidden and then dropped by the next boot —
 that guarantee goes with it: rows that would have collided can now be written,
 and a rollback to a binary declaring the index re-adds it as `ADD UNIQUE INDEX`,
-which fails on the first duplicate and fails that pod's startup with it. Before
+which the duplicate rows cannot satisfy: the index is not re-added and that
+pod's startup fails with it. Before
 removing a unique index, be sure no release you might still roll back to
 declares it; if one does, keep the index and remove it in a later release.
 

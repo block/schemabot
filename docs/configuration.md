@@ -1056,9 +1056,9 @@ the exact DDL and counted in the
 [What is never automatic](storage-schema.md#what-is-never-automatic) for what a
 statement carrying both a removal and an addition does.
 
-To intentionally remove a storage table, column, or index, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then opt
-in:
+To intentionally remove a storage table, column, or visible index, first make
+sure every running pod is on a binary whose embedded schema no longer declares
+it, then opt in:
 
 ```yaml
 storage:

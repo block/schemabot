@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/block/mysql"
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -485,14 +485,40 @@ func TestEnsureSchema_RefusesIndexDropByDefault(t *testing.T) {
 	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
 }
 
+// insertTask writes the smallest `tasks` row MySQL accepts, with the two
+// columns the unique-index tests collide on set explicitly. Everything else
+// takes a placeholder or the column default.
+func insertTask(ctx context.Context, db *sql.DB, taskIdentifier string, planID int64, databaseName string) error {
+	_, err := db.ExecContext(ctx,
+		"INSERT INTO `tasks` (`task_identifier`, `apply_id`, `plan_id`, `database_name`, `database_type`, `engine`, `repository`, `pull_request`, `environment`, `state`)"+
+			" VALUES (?, 1, ?, ?, 'mysql', 'spirit', 'example/repo', 1, 'production', 'pending')",
+		taskIdentifier, planID, databaseName)
+	return err
+}
+
+// requireDuplicateEntry asserts MySQL rejected a write for colliding with a
+// unique index (error 1062), rather than for any other reason.
+func requireDuplicateEntry(t *testing.T, err error, msgAndArgs ...any) {
+	t.Helper()
+	require.Error(t, err, msgAndArgs...)
+	var mysqlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &mysqlErr, msgAndArgs...)
+	require.EqualValues(t, 1062, mysqlErr.Number, msgAndArgs...)
+}
+
 // The refusal protects a visible index because the fleet's queries may plan
 // around it. An operator who has already made a surplus index invisible has
 // taken it out of planning, so its drop regresses nothing and is not
 // destructive: the next boot removes it under the default policy, with no
 // opt-in. This is the second half of the two-step removal the refusal's own
-// reason describes, and it holds for a unique index too — the index stops
-// enforcing uniqueness the moment it is gone, which is what the operator docs
-// tell operators to weigh before hiding one.
+// reason describes.
+//
+// For a unique index the two halves differ in what they guarantee. Refused or
+// hidden, the index still rejects a colliding row; MySQL enforces an invisible
+// unique index as strictly as a visible one. Dropped, it enforces nothing, and
+// the collision it would have rejected is written. That is the check the docs
+// tell operators to make before hiding one, so the test pins both sides of the
+// drop with a real collision on columns no other key covers.
 func TestEnsureSchema_DropsAnInvisibleSurplusIndexByDefault(t *testing.T) {
 	ctx := t.Context()
 	var logBuf syncBuffer
@@ -503,23 +529,36 @@ func TestEnsureSchema_DropsAnInvisibleSurplusIndexByDefault(t *testing.T) {
 
 	require.NoError(t, EnsureSchema(dsn, logger))
 
+	// (plan_id, database_name) is covered by no key the embedded schema
+	// declares, so only the surplus index can make the pair unique.
 	const surplusUniqueIndex = "uq_newer_binary"
 	_, err := db.ExecContext(ctx,
-		fmt.Sprintf("ALTER TABLE `tasks` ADD UNIQUE INDEX `%s` (`id`, `environment`)", surplusUniqueIndex))
+		fmt.Sprintf("ALTER TABLE `tasks` ADD UNIQUE INDEX `%s` (`plan_id`, `database_name`)", surplusUniqueIndex))
 	require.NoError(t, err)
 
-	// Visible, the unique surplus is refused like any other index.
+	require.NoError(t, insertTask(ctx, db, "task-1", 7, "shard_a"))
+	requireDuplicateEntry(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"the visible surplus unique index must reject a colliding row")
+
+	// Visible, the unique surplus is refused like any other index, and keeps
+	// enforcing while it stands refused.
 	require.NoError(t, EnsureSchema(dsn, logger))
 	require.True(t, testutil.IndexExists(t, db, sdb.Name, "tasks", surplusUniqueIndex),
 		"a visible surplus unique index must be refused, not dropped")
 	assert.Contains(t, logBuf.String(), "refusing destructive storage-schema change")
 	assert.Contains(t, logBuf.String(), surplusUniqueIndex)
+	requireDuplicateEntry(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"a refused unique index must still reject a colliding row")
 
-	// Hidden, it is no longer a plan the fleet depends on, and the boot drops it.
+	// Hidden, it is no longer a plan the fleet depends on, but it is still a
+	// constraint: MySQL enforces an invisible unique index.
 	_, err = db.ExecContext(ctx,
 		fmt.Sprintf("ALTER TABLE `tasks` ALTER INDEX `%s` INVISIBLE", surplusUniqueIndex))
 	require.NoError(t, err)
+	requireDuplicateEntry(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"an invisible unique index must still reject a colliding row")
 
+	// The next default-policy boot drops it.
 	var dropBuf syncBuffer
 	dropLogger := slog.New(slog.NewTextHandler(&dropBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	require.NoError(t, EnsureSchema(dsn, dropLogger))
@@ -531,6 +570,55 @@ func TestEnsureSchema_DropsAnInvisibleSurplusIndexByDefault(t *testing.T) {
 		"dropping an invisible index is not a destructive refusal")
 	assert.Contains(t, logs, "DROP INDEX")
 	assert.Contains(t, logs, surplusUniqueIndex)
+
+	// Gone, the index guarantees nothing: the row it rejected three times is
+	// now written. This is the state a rollback to a binary declaring the index
+	// would meet, and TestEnsureSchema_RollbackFailsWhenADroppedUniqueIndexHasDuplicates
+	// shows what that rollback does with it.
+	require.NoError(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"once the unique index is dropped, the colliding row must be accepted")
+}
+
+// Once a unique index is gone and a collision has been written, rolling back
+// to a binary whose embedded schema declares the index cannot succeed: its
+// diff re-adds the index as ADD UNIQUE INDEX, the duplicate rows cannot both
+// satisfy it, and EnsureSchema fails the boot with the index still missing.
+// The embedded schema declares `idx_task_identifier` UNIQUE on `tasks`, so a
+// live table missing it stands in for the deployment that removed a unique
+// index, and the booting binary stands in for the release being rolled back
+// to.
+func TestEnsureSchema_RollbackFailsWhenADroppedUniqueIndexHasDuplicates(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// The deployment removed the unique index, then wrote rows that collide
+	// on it. Nothing stops the second write once the index is gone.
+	const droppedUniqueIndex = "idx_task_identifier"
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP INDEX `%s`", droppedUniqueIndex))
+	require.NoError(t, err)
+	require.NoError(t, insertTask(ctx, db, "same-identifier", 1, "shard_a"))
+	require.NoError(t, insertTask(ctx, db, "same-identifier", 2, "shard_b"),
+		"with the unique index gone, the colliding row must be accepted")
+
+	// The rolled-back binary declares the index, so its boot tries to re-add it
+	// and cannot: the duplicate it would have prevented is already there.
+	err = EnsureSchema(dsn, logger)
+	require.ErrorContains(t, err, "storage schema change failed",
+		"re-adding a unique index over duplicate rows must fail the boot, not be skipped")
+	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "tasks", droppedUniqueIndex),
+		"the unique index cannot be re-added while the duplicate rows remain")
+	logs := logBuf.String()
+	assert.Contains(t, logs, "ADD UNIQUE INDEX `"+droppedUniqueIndex+"`",
+		"the boot must have attempted the re-add the rolled-back schema declares")
+	assert.Contains(t, logs, "storage schema change failed; SchemaBot storage will not initialize")
+	assert.NotContains(t, logs, "refusing destructive storage-schema change",
+		"an ADD UNIQUE INDEX is additive: it is attempted, not refused")
 }
 
 // Spirit's diff emits one combined ALTER per table, so an index drop reaches
