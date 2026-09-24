@@ -74,10 +74,6 @@ const (
 	// yet expires before the claimant's own next tick, so a replica that dies
 	// mid-pass costs the repository at most one interval of coverage.
 	defaultWebhookReconcileScanClaim = defaultWebhookReconcileInterval / 2
-
-	// webhookReconcileScanCursorKeyPrefix namespaces the per-repository
-	// settings row that persists the missing-delivery scan's resume point.
-	webhookReconcileScanCursorKeyPrefix = "webhook_reconcile_scan_cursor:"
 )
 
 // webhookReconcileScanCursor is the persisted resume point for one
@@ -127,7 +123,7 @@ type webhookReconcileScanCursor struct {
 }
 
 func webhookReconcileScanCursorKey(repo string) string {
-	return webhookReconcileScanCursorKeyPrefix + repo
+	return storage.WebhookReconcileScanCursorSettingKeyPrefix + repo
 }
 
 func (h *Handler) settingsStore() storage.SettingsStore {
@@ -277,7 +273,7 @@ func (h *Handler) deleteOrphanedWebhookReconcileScanCursors(ctx context.Context,
 		return
 	}
 	for _, setting := range settings {
-		repo, isCursor := strings.CutPrefix(setting.Key, webhookReconcileScanCursorKeyPrefix)
+		repo, isCursor := strings.CutPrefix(setting.Key, storage.WebhookReconcileScanCursorSettingKeyPrefix)
 		if !isCursor {
 			continue
 		}
