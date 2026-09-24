@@ -23,24 +23,32 @@
 //
 // The missing-delivery scan pages each repository's updated-descending open
 // PR listing under a per-pass page budget, in two phases. A fresh-window walk
-// from the newest page examines every head updated since the previous pass,
-// so new activity is always covered promptly. A resumed scan then continues
-// from a persisted per-repository cursor toward the lookback cutoff, with a
-// reserved share of the budget so sustained fresh traffic cannot starve it.
-// When the budget runs out before the cutoff, the cursor records where to
-// resume, guaranteeing the full lookback window is examined across a bounded
-// number of passes instead of restarting from the newest PRs every pass.
+// from the newest page examines every head updated since the last fresh walk
+// that reached its floor, so new activity is always covered promptly. A
+// resumed scan then continues from a persisted per-repository cursor toward
+// the lookback cutoff, with a reserved share of the budget so sustained fresh
+// traffic cannot starve it. When the budget runs out before the cutoff, the
+// cursor records where to resume — the next page, and a watermark naming the
+// oldest head examined so heads that shifted onto that page since are not
+// examined twice — guaranteeing the full lookback window is examined across
+// a bounded number of passes instead of restarting from the newest PRs every
+// pass. Each pass claims a repository's cursor before walking, with a
+// compare-and-set, so replicas ticking together take turns rather than
+// overwriting each other's progress.
 package webhook
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -61,6 +69,12 @@ const (
 	defaultWebhookReconcileMaxPages = 5
 	webhookReconcilePageSize        = 100
 
+	// defaultWebhookReconcileScanClaim is how long one pass's claim on a
+	// repository's scan excludes other replicas. It outlasts any single pass
+	// yet expires before the claimant's own next tick, so a replica that dies
+	// mid-pass costs the repository at most one interval of coverage.
+	defaultWebhookReconcileScanClaim = defaultWebhookReconcileInterval / 2
+
 	// webhookReconcileScanCursorKeyPrefix namespaces the per-repository
 	// settings row that persists the missing-delivery scan's resume point.
 	webhookReconcileScanCursorKeyPrefix = "webhook_reconcile_scan_cursor:"
@@ -68,23 +82,48 @@ const (
 
 // webhookReconcileScanCursor is the persisted resume point for one
 // repository's missing-delivery scan. When a pass exhausts its page budget
-// before reaching the lookback cutoff, the cursor records the next listing
-// page so the following pass continues the walk instead of restarting from
-// the newest PRs — a restart would let sustained PR traffic starve older
-// heads forever. Page numbers shift as the listing reorders (an updated PR
-// moves to the front, where the fresh-window walk catches it; a closed PR
-// pulls later entries shallower, deferring them to the next cycle), so the
-// cursor is an approximate resume point: the invariant is eventual coverage
-// of the full lookback window across a bounded number of passes, not exact
-// per-pass coverage.
+// before reaching the lookback cutoff, the cursor records where the following
+// pass continues the walk instead of restarting from the newest PRs — a
+// restart would let sustained PR traffic starve older heads forever.
+//
+// Page numbers shift as the listing reorders: an updated PR moves to the
+// front and pushes everything behind it one slot deeper, a closed PR pulls
+// later entries shallower. Page is therefore only where the resumed walk
+// starts fetching; Watermark decides what on those pages still needs
+// examining. A head updated more recently than the watermark sits above the
+// resume point because it moved there since the walk passed, and the fresh
+// walk owns it; only heads at or below the watermark count as the deep walk's
+// progress. Entries pulled shallower by a closed PR can slip above the resume
+// point unexamined, which the next cycle's restart from the newest page
+// recovers. Page fetches, not examinations, are the budget, so the resumed
+// scan advances each pass by its page share less the pages of new activity
+// that entered the listing since: it converges while the reserved share
+// outpaces front insertion, and the truncation warning's examined count shows
+// when it does not. The invariant is eventual coverage of the full lookback
+// window across a bounded number of passes, not exact per-pass coverage.
 type webhookReconcileScanCursor struct {
-	// Page is the next 1-based listing page the resumed scan examines.
+	// Page is the next 1-based listing page the resumed scan fetches.
 	Page int `json:"page"`
+	// Watermark is the update time of the oldest head the current cycle's
+	// resumed scan has examined; zero until it examines its first head.
+	Watermark time.Time `json:"watermark,omitzero"`
+	// FreshCoveredAt is the instant from which every later head update is
+	// known to have been examined by a fresh-window walk. The next fresh walk
+	// descends to it (widened by the grace window) and advances it only when
+	// it gets there, so a fresh walk cut short by the page budget widens the
+	// next one instead of leaving a gap.
+	FreshCoveredAt time.Time `json:"fresh_covered_at,omitzero"`
 	// CycleStartedAt is when the current scan cycle began at the newest page.
 	CycleStartedAt time.Time `json:"cycle_started_at"`
 	// CyclePasses counts the reconcile passes the current cycle has spent
 	// without reaching the lookback cutoff.
 	CyclePasses int `json:"cycle_passes"`
+	// ClaimedUntil serializes the repository's scan across replicas: a pass
+	// that finds a live claim skips the repository, and a pass that takes the
+	// claim does so with a compare-and-set on the stored cursor, so two
+	// replicas ticking together cannot both walk the listing and overwrite
+	// each other's progress.
+	ClaimedUntil time.Time `json:"claimed_until,omitzero"`
 }
 
 func webhookReconcileScanCursorKey(repo string) string {
@@ -98,29 +137,55 @@ func (h *Handler) settingsStore() storage.SettingsStore {
 	return h.service.Storage().Settings()
 }
 
+// loadedScanCursor is a repository's scan cursor together with what a pass
+// needs to write it back: the stored setting it was decoded from, and whether
+// writing back is possible at all.
+type loadedScanCursor struct {
+	cursor webhookReconcileScanCursor
+	// stored is the settings row the cursor was decoded from, nil when the
+	// repository has none yet. Every write compares against it.
+	stored *storage.Setting
+	// persistable is false when settings storage is unavailable or the read
+	// failed. The pass then scans from a fresh cursor and writes nothing back,
+	// so a stored cursor survives a transient read failure intact instead of
+	// being overwritten by a pass that never saw it.
+	persistable bool
+}
+
+// freshWebhookReconcileScanCursor starts a cycle at the newest page. Its fresh
+// window reaches back one interval, the span the previous pass would have
+// covered had it run.
+func (h *Handler) freshWebhookReconcileScanCursor(now time.Time) webhookReconcileScanCursor {
+	return webhookReconcileScanCursor{
+		Page:           1,
+		CycleStartedAt: now,
+		FreshCoveredAt: now.Add(-h.webhookReconcileInterval),
+	}
+}
+
 // loadWebhookReconcileScanCursor returns the repository's persisted scan
-// cursor, or a fresh newest-page cursor when none is stored or storage is
-// unavailable — the scan then degrades to restart-from-newest rather than
-// skipping the pass.
-func (h *Handler) loadWebhookReconcileScanCursor(ctx context.Context, repo string) webhookReconcileScanCursor {
-	fresh := webhookReconcileScanCursor{Page: 1, CycleStartedAt: time.Now()}
+// cursor, or a fresh newest-page cursor when none is stored, it cannot be
+// decoded, or storage is unavailable — the scan then degrades to
+// restart-from-newest rather than skipping the pass.
+func (h *Handler) loadWebhookReconcileScanCursor(ctx context.Context, repo string, now time.Time) loadedScanCursor {
+	fresh := h.freshWebhookReconcileScanCursor(now)
 	store := h.settingsStore()
 	if store == nil {
-		h.logger.Debug("webhook reconciler scan cursor unavailable because settings storage is unavailable; scanning from the newest page", "repo", repo)
-		return fresh
+		h.logger.Debug("webhook reconciler scan cursor unavailable because settings storage is unavailable; scanning from the newest page without persisting progress", "repo", repo)
+		return loadedScanCursor{cursor: fresh}
 	}
 	setting, err := store.Get(ctx, webhookReconcileScanCursorKey(repo))
 	if err != nil {
-		h.logger.Warn("webhook reconciler failed to load scan cursor; scanning from the newest page", "repo", repo, "error", err)
-		return fresh
+		h.logger.Warn("webhook reconciler failed to load scan cursor; scanning from the newest page without persisting progress so the stored cursor survives", "repo", repo, "error", err)
+		return loadedScanCursor{cursor: fresh}
 	}
 	if setting == nil {
-		return fresh
+		return loadedScanCursor{cursor: fresh, persistable: true}
 	}
 	var cursor webhookReconcileScanCursor
 	if err := json.Unmarshal([]byte(setting.Value), &cursor); err != nil {
-		h.logger.Warn("webhook reconciler could not decode scan cursor; scanning from the newest page", "repo", repo, "error", err)
-		return fresh
+		h.logger.Warn("webhook reconciler could not decode scan cursor; scanning from the newest page and replacing it", "repo", repo, "error", err)
+		return loadedScanCursor{cursor: fresh, stored: setting, persistable: true}
 	}
 	if cursor.Page < 1 {
 		cursor.Page = 1
@@ -128,17 +193,58 @@ func (h *Handler) loadWebhookReconcileScanCursor(ctx context.Context, repo strin
 	if cursor.CycleStartedAt.IsZero() {
 		cursor.CycleStartedAt = fresh.CycleStartedAt
 	}
-	return cursor
+	if cursor.FreshCoveredAt.IsZero() {
+		cursor.FreshCoveredAt = fresh.FreshCoveredAt
+	}
+	return loadedScanCursor{cursor: cursor, stored: setting, persistable: true}
 }
 
-// saveWebhookReconcileScanCursor persists the repository's scan cursor.
-// Persistence failures are logged and tolerated: the next pass resumes from
-// the previously stored cursor and re-examines already-covered heads, which
-// is idempotent.
-func (h *Handler) saveWebhookReconcileScanCursor(ctx context.Context, repo string, cursor webhookReconcileScanCursor) {
-	store := h.settingsStore()
-	if store == nil {
-		h.logger.Debug("webhook reconciler scan cursor not persisted because settings storage is unavailable", "repo", repo)
+// claimWebhookReconcileScan takes this pass's claim on the repository's scan,
+// reporting whether the pass may proceed. A live claim held by another pass
+// skips the repository until it expires. The claim is written with a
+// compare-and-set against the loaded cursor, so of two replicas that load the
+// same cursor only one proceeds. When the cursor cannot be persisted at all
+// the pass proceeds unserialized, as it would without a settings store.
+func (h *Handler) claimWebhookReconcileScan(ctx context.Context, repo string, loaded *loadedScanCursor, now time.Time) bool {
+	if !loaded.persistable {
+		return true
+	}
+	if loaded.cursor.ClaimedUntil.After(now) {
+		h.logger.Debug("webhook reconciler skipped repository because another pass holds its scan claim",
+			"repo", repo, "claimed_until", loaded.cursor.ClaimedUntil)
+		return false
+	}
+	claimed := loaded.cursor
+	claimed.ClaimedUntil = now.Add(h.webhookReconcileScanClaim)
+	encoded, err := json.Marshal(claimed)
+	if err != nil {
+		h.logger.Warn("webhook reconciler failed to encode scan cursor claim; scanning without persisting progress", "repo", repo, "error", err)
+		loaded.persistable = false
+		return true
+	}
+	swapped, err := h.settingsStore().CompareAndSet(ctx, webhookReconcileScanCursorKey(repo), loaded.stored, string(encoded))
+	if err != nil {
+		h.logger.Warn("webhook reconciler failed to claim scan cursor; scanning without persisting progress", "repo", repo, "error", err)
+		loaded.persistable = false
+		return true
+	}
+	if !swapped {
+		h.logger.Debug("webhook reconciler skipped repository because another pass claimed its scan first", "repo", repo)
+		return false
+	}
+	loaded.cursor = claimed
+	loaded.stored = &storage.Setting{Key: webhookReconcileScanCursorKey(repo), Value: string(encoded)}
+	return true
+}
+
+// saveWebhookReconcileScanCursor persists the repository's scan cursor with a
+// compare-and-set against the value this pass claimed, so a pass whose claim
+// was superseded cannot overwrite the newer progress. Persistence failures are
+// logged and tolerated: the next pass resumes from the previously stored
+// cursor and re-examines already-covered heads, which is idempotent.
+func (h *Handler) saveWebhookReconcileScanCursor(ctx context.Context, repo string, loaded loadedScanCursor, cursor webhookReconcileScanCursor) {
+	if !loaded.persistable {
+		h.logger.Debug("webhook reconciler scan cursor not persisted because this pass could not load or claim it", "repo", repo)
 		return
 	}
 	encoded, err := json.Marshal(cursor)
@@ -146,8 +252,47 @@ func (h *Handler) saveWebhookReconcileScanCursor(ctx context.Context, repo strin
 		h.logger.Warn("webhook reconciler failed to encode scan cursor", "repo", repo, "error", err)
 		return
 	}
-	if err := store.Set(ctx, webhookReconcileScanCursorKey(repo), string(encoded)); err != nil {
+	swapped, err := h.settingsStore().CompareAndSet(ctx, webhookReconcileScanCursorKey(repo), loaded.stored, string(encoded))
+	if err != nil {
 		h.logger.Warn("webhook reconciler failed to persist scan cursor; the next pass resumes from the previously stored cursor", "repo", repo, "error", err)
+		return
+	}
+	if !swapped {
+		h.logger.Warn("webhook reconciler discarded this pass's scan progress because another pass advanced the repository's cursor concurrently", "repo", repo)
+	}
+}
+
+// deleteOrphanedWebhookReconcileScanCursors removes the scan cursors of
+// repositories no longer in the registry, so a deregistered repository does
+// not leave a settings row behind forever.
+func (h *Handler) deleteOrphanedWebhookReconcileScanCursors(ctx context.Context, registered map[string]api.RepoConfig) {
+	store := h.settingsStore()
+	if store == nil {
+		h.logger.Debug("webhook reconciler orphaned scan cursor cleanup skipped because settings storage is unavailable")
+		return
+	}
+	settings, err := store.List(ctx)
+	if err != nil {
+		h.logger.Warn("webhook reconciler failed to list settings for orphaned scan cursor cleanup", "error", err)
+		return
+	}
+	for _, setting := range settings {
+		repo, isCursor := strings.CutPrefix(setting.Key, webhookReconcileScanCursorKeyPrefix)
+		if !isCursor {
+			continue
+		}
+		if _, ok := registered[repo]; ok {
+			continue
+		}
+		if err := store.Delete(ctx, setting.Key); err != nil {
+			if errors.Is(err, storage.ErrSettingNotFound) {
+				h.logger.Debug("webhook reconciler orphaned scan cursor was already deleted", "repo", repo)
+				continue
+			}
+			h.logger.Warn("webhook reconciler failed to delete orphaned scan cursor", "repo", repo, "error", err)
+			continue
+		}
+		h.logger.Info("webhook reconciler deleted the scan cursor of a repository that is no longer registered", "repo", repo)
 	}
 }
 
@@ -224,6 +369,7 @@ func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 		repos = append(repos, repo)
 	}
 	sort.Strings(repos)
+	h.deleteOrphanedWebhookReconcileScanCursors(ctx, cfg.Repos)
 
 	start := time.Now()
 	var scanned, missing, synthesized int
@@ -290,16 +436,22 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 	now := time.Now()
 	cutoff := now.Add(-h.webhookReconcileLookback)
 	grace := now.Add(-h.webhookReconcileGrace)
-	// freshCutoff bounds the fresh-window walk: every head updated since the
-	// previous pass — widened by the grace window so a head skipped as
+
+	loaded := h.loadWebhookReconcileScanCursor(ctx, repo, now)
+	if !h.claimWebhookReconcileScan(ctx, repo, &loaded, now) {
+		return 0, 0, 0
+	}
+	cursor := loaded.cursor
+
+	// freshFloor bounds the fresh-window walk: every head updated since the
+	// fresh coverage point — widened by the grace window so a head skipped as
 	// too-fresh last pass cannot age past the boundary between passes — is
 	// examined every pass, wherever the resumed scan's cursor is.
-	freshCutoff := now.Add(-(h.webhookReconcileInterval + h.webhookReconcileGrace))
-	if freshCutoff.Before(cutoff) {
-		freshCutoff = cutoff
+	freshFloor := cursor.FreshCoveredAt.Add(-h.webhookReconcileGrace)
+	if freshFloor.Before(cutoff) {
+		freshFloor = cutoff
 	}
 
-	cursor := h.loadWebhookReconcileScanCursor(ctx, repo)
 	budget := h.webhookReconcileMaxPages
 	// The resumed scan keeps a reserved share of the page budget so sustained
 	// fresh PR traffic cannot starve it: without the reserve, a repository
@@ -310,7 +462,7 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 
 	freshWalk := h.walkOpenPRPages(ctx, store, client, repo, installationID, webhookReconcileWalkBounds{
 		startPage: 1,
-		floor:     freshCutoff,
+		floor:     freshFloor,
 		cutoff:    cutoff,
 		grace:     grace,
 		budget:    &budget,
@@ -321,6 +473,15 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 	synthesized += freshWalk.synthesized
 	if freshWalk.listFailed {
 		return scanned, missing, synthesized
+	}
+	if freshWalk.reachedFloor() {
+		// Every head updated between the previous coverage point and the
+		// start of this pass has now been examined; anything updated during
+		// the pass falls inside the next pass's window.
+		cursor.FreshCoveredAt = now
+	} else {
+		h.logger.Debug("webhook reconciler fresh-window walk stopped at the page reserve before reaching its floor; the next pass widens its fresh window to cover the remainder",
+			"repo", repo, "last_page", freshWalk.lastPage, "fresh_floor", freshFloor)
 	}
 
 	cycleComplete := freshWalk.crossedCutoff || freshWalk.listingEnded
@@ -334,6 +495,7 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 			cutoff:    cutoff,
 			grace:     grace,
 			budget:    &budget,
+			watermark: cursor.Watermark,
 		})
 		scanned += scanWalk.scanned
 		missing += scanWalk.missing
@@ -344,12 +506,16 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 		cycleComplete = scanWalk.crossedCutoff || scanWalk.listingEnded
 		if !cycleComplete {
 			cursor.Page = scanWalk.nextPage
+			if !scanWalk.watermark.IsZero() {
+				cursor.Watermark = scanWalk.watermark
+			}
 			cursor.CyclePasses++
-			h.saveWebhookReconcileScanCursor(ctx, repo, cursor)
+			h.saveWebhookReconcileScanCursor(ctx, repo, loaded, cursor)
 			metrics.RecordWebhookReconcileScanTruncated(ctx, repo)
 			h.logger.Warn("webhook reconciler exhausted its page budget before reaching the lookback cutoff; the resumed scan continues from the cursor next pass",
 				"repo", repo, "max_pages", h.webhookReconcileMaxPages, "page_size", webhookReconcilePageSize,
-				"resume_page", cursor.Page, "cycle_passes", cursor.CyclePasses)
+				"resume_page", cursor.Page, "watermark", cursor.Watermark, "examined", scanWalk.examined,
+				"cycle_passes", cursor.CyclePasses)
 			return scanned, missing, synthesized
 		}
 	}
@@ -360,7 +526,18 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 		h.logger.Info("webhook reconciler missing-delivery scan cycle reached the lookback cutoff",
 			"repo", repo, "cycle_passes", passes, "cycle_age", now.Sub(cursor.CycleStartedAt))
 	}
-	h.saveWebhookReconcileScanCursor(ctx, repo, webhookReconcileScanCursor{Page: 1, CycleStartedAt: now})
+	// A completed cycle has examined every head that was in the window when
+	// it started, so the fresh coverage point need never sit before then.
+	freshCoveredAt := cursor.FreshCoveredAt
+	if cycleCovered := cursor.CycleStartedAt.Add(-h.webhookReconcileGrace); cycleCovered.After(freshCoveredAt) {
+		freshCoveredAt = cycleCovered
+	}
+	h.saveWebhookReconcileScanCursor(ctx, repo, loaded, webhookReconcileScanCursor{
+		Page:           1,
+		CycleStartedAt: now,
+		FreshCoveredAt: freshCoveredAt,
+		ClaimedUntil:   cursor.ClaimedUntil,
+	})
 	return scanned, missing, synthesized
 }
 
@@ -368,7 +545,10 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 // PR listing. The walk starts at startPage and stops paging once a listed PR
 // is older than floor, the listing ends, or fetching another page would drop
 // the shared budget below reserve. Every fetched page is examined in full
-// down to cutoff, so a later walk may safely resume at lastPage+1.
+// down to cutoff, so a later walk may safely resume at lastPage+1. A non-zero
+// watermark confines examination to heads updated at or before it: heads
+// newer than the watermark on a resumed page moved there since the walk
+// passed, and belong to the fresh walk.
 type webhookReconcileWalkBounds struct {
 	startPage int
 	floor     time.Time
@@ -376,16 +556,26 @@ type webhookReconcileWalkBounds struct {
 	grace     time.Time
 	budget    *int
 	reserve   int
+	watermark time.Time
 }
 
 // webhookReconcileWalkResult reports how one listing walk ended alongside its
 // examination counts.
 type webhookReconcileWalkResult struct {
 	scanned, missing, synthesized int
+	// examined counts the listed heads the walk examined, excluding heads
+	// passed over as newer than the watermark.
+	examined int
 	// lastPage is the last page fetched (0 when the budget allowed none).
 	lastPage int
 	// nextPage is GitHub's next page after lastPage (0 when the listing ended).
 	nextPage int
+	// watermark is the update time of the oldest head examined (zero when the
+	// walk examined none).
+	watermark time.Time
+	// crossedFloor means a listed PR was older than the walk's floor, so the
+	// walk fetched everything it was bounded to.
+	crossedFloor bool
 	// crossedCutoff means a listed PR was older than the lookback cutoff:
 	// everything deeper is out of the coverage window.
 	crossedCutoff bool
@@ -395,6 +585,12 @@ type webhookReconcileWalkResult struct {
 	listFailed bool
 }
 
+// reachedFloor reports whether the walk covered every head down to its floor
+// rather than being cut short by the page budget.
+func (r webhookReconcileWalkResult) reachedFloor() bool {
+	return r.crossedFloor || r.crossedCutoff || r.listingEnded
+}
+
 // walkOpenPRPages pages through the repository's open PR listing within
 // bounds, examining every listed head for inbox coverage.
 func (h *Handler) walkOpenPRPages(ctx context.Context, store storage.WebhookEventStore, client *github.InstallationClient, repo string, installationID int64, bounds webhookReconcileWalkBounds) webhookReconcileWalkResult {
@@ -402,6 +598,8 @@ func (h *Handler) walkOpenPRPages(ctx context.Context, store storage.WebhookEven
 	page := bounds.startPage
 	for {
 		if *bounds.budget <= bounds.reserve {
+			h.logger.Debug("webhook reconciler listing walk stopped before fetching the next page because the remaining page budget is reserved",
+				"repo", repo, "next_page", page, "remaining_budget", *bounds.budget, "reserve", bounds.reserve)
 			return result
 		}
 		prs, nextPage, _, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookReconcilePageSize)
@@ -413,7 +611,7 @@ func (h *Handler) walkOpenPRPages(ctx context.Context, store storage.WebhookEven
 		*bounds.budget--
 		result.lastPage = page
 		result.nextPage = nextPage
-		crossedFloor := false
+		examinedOnPage := 0
 		for _, pr := range prs {
 			if pr.UpdatedAt.Before(bounds.cutoff) {
 				// The listing is newest-updated first; everything after this is
@@ -425,18 +623,33 @@ func (h *Handler) walkOpenPRPages(ctx context.Context, store storage.WebhookEven
 				// Past the walk's floor; the page is already fetched, so keep
 				// examining it in full — that lets a later walk resume at the
 				// next page without a coverage gap — but stop paging after it.
-				crossedFloor = true
+				result.crossedFloor = true
+			}
+			if !bounds.watermark.IsZero() && pr.UpdatedAt.After(bounds.watermark) {
+				// Newer than anything this walk has examined so far: the head
+				// moved above the resume point since the walk passed, and the
+				// fresh walk covers it.
+				continue
 			}
 			s, m, syn := h.examineOpenPRHead(ctx, store, repo, pr, bounds.grace, installationID)
 			result.scanned += s
 			result.missing += m
 			result.synthesized += syn
+			result.examined++
+			examinedOnPage++
+			if result.watermark.IsZero() || pr.UpdatedAt.Before(result.watermark) {
+				result.watermark = pr.UpdatedAt
+			}
+		}
+		if !bounds.watermark.IsZero() && examinedOnPage == 0 && len(prs) > 0 && !result.crossedCutoff {
+			h.logger.Debug("webhook reconciler passed over a resumed listing page because every head on it was updated after the scan watermark",
+				"repo", repo, "page", page, "watermark", bounds.watermark)
 		}
 		if result.nextPage == 0 {
 			result.listingEnded = true
 			return result
 		}
-		if result.crossedCutoff || crossedFloor {
+		if result.crossedCutoff || result.crossedFloor {
 			return result
 		}
 		page = result.nextPage

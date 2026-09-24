@@ -89,6 +89,25 @@ func recordHistogram(ctx context.Context, name string, value float64, descriptio
 	hist.Record(ctx, value, otelmetric.WithAttributes(attrs...))
 }
 
+// recordCountHistogram records a small integer count into a named
+// Int64Histogram with the given unit and explicit bucket boundaries, logging
+// and skipping if the instrument cannot be created. Counts need their own
+// boundaries: the default duration buckets lump every healthy small count
+// together with the first few degraded ones.
+func recordCountHistogram(ctx context.Context, name string, value int64, description, unit string, boundaries []float64, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	hist, err := meter.Int64Histogram(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+		otelmetric.WithExplicitBucketBoundaries(boundaries...),
+	)
+	if err != nil {
+		slog.Warn("failed to create count histogram", "metric", name, "error", err)
+		return
+	}
+	hist.Record(ctx, value, otelmetric.WithAttributes(attrs...))
+}
+
 // recordGauge records value into a named Int64Gauge with the given attributes,
 // logging and skipping if the instrument cannot be created.
 func recordGauge(ctx context.Context, name string, value int64, description, unit string, attrs ...attribute.KeyValue) {
@@ -2139,7 +2158,8 @@ func RecordWebhookCheckSuiteRecovery(ctx context.Context, repo string, outcome s
 // pass, so occasional truncation on a busy repository is expected and heals;
 // a sustained rate combined with high reconcile_scan_cycle_passes means the
 // page budget is too small for the repository's open-PR volume — raise the
-// budget or shorten the lookback so the backstop covers its window promptly.
+// budget with WEBHOOK_RECONCILE_MAX_PAGES or shorten the lookback with
+// WEBHOOK_RECONCILE_LOOKBACK so the backstop covers its window promptly.
 func RecordWebhookReconcileScanTruncated(ctx context.Context, repo string) {
 	addCounter(ctx, "schemabot.webhook.reconcile_scan_truncated_total",
 		"Total number of reconcile passes whose missing-delivery scan was truncated by the page budget", "{pass}",
@@ -2147,15 +2167,22 @@ func RecordWebhookReconcileScanTruncated(ctx context.Context, repo string) {
 		attribute.String("repository", repo))
 }
 
+// webhookReconcileScanCyclePassBoundaries buckets the pass count of a scan
+// cycle so the healthy single-pass cycle, a cycle that needed a few passes,
+// and a chronically truncated cycle land in different buckets.
+var webhookReconcileScanCyclePassBoundaries = []float64{1, 2, 3, 5, 8, 13, 21}
+
 // RecordWebhookReconcileScanCycleCompleted records how many reconcile passes
 // one full missing-delivery scan cycle took to reach the lookback cutoff for
 // a repository. One pass is the healthy case; a growing pass count means the
 // scan is chronically truncated and recovery of lost deliveries deep in the
 // listing is delayed by roughly passes × reconcile interval — the bound to
-// alert on when delivery-gap healing must complete within a target time.
+// alert on when delivery-gap healing must complete within a target time. The
+// remedies are the same as for reconcile_scan_truncated_total.
 func RecordWebhookReconcileScanCycleCompleted(ctx context.Context, repo string, passes int64) {
-	recordHistogram(ctx, "schemabot.webhook.reconcile_scan_cycle_passes", float64(passes),
-		"Reconcile passes needed for one full missing-delivery scan cycle to reach the lookback cutoff",
+	recordCountHistogram(ctx, "schemabot.webhook.reconcile_scan_cycle_passes", passes,
+		"Reconcile passes needed for one full missing-delivery scan cycle to reach the lookback cutoff", "{pass}",
+		webhookReconcileScanCyclePassBoundaries,
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo))
 }

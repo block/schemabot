@@ -294,6 +294,14 @@ type SettingsStore interface {
 	// Set saves a setting. Creates if not exists, updates if exists.
 	Set(ctx context.Context, key string, value string) error
 
+	// CompareAndSet writes value under key only while the stored setting still
+	// matches previous: a nil previous means no setting may exist yet, and a
+	// non-nil previous means the stored value must equal previous.Value. It
+	// reports whether the write happened. A writer that reads a setting,
+	// derives the next value from it, and writes it back uses this so a
+	// slower writer cannot overwrite a value a faster one already advanced.
+	CompareAndSet(ctx context.Context, key string, previous *Setting, value string) (bool, error)
+
 	// List returns all settings, ordered by key ascending.
 	List(ctx context.Context) ([]*Setting, error)
 

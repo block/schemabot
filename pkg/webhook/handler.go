@@ -180,6 +180,7 @@ type Handler struct {
 	webhookReconcileLookback  time.Duration
 	webhookReconcileGrace     time.Duration
 	webhookReconcileMaxPages  int
+	webhookReconcileScanClaim time.Duration
 
 	checkSuiteRecovery      bool
 	checkSuiteRecoveryGrace time.Duration
@@ -240,6 +241,23 @@ func WithWebhookReconcileSynthesis() HandlerOption {
 	}
 }
 
+// WithWebhookReconcileScanBounds sizes the reconciler's missing-delivery scan:
+// maxPages is the per-repository page budget of one reconcile pass and
+// lookback is how far back in update time the scan covers. Raising the budget
+// or shortening the lookback is the remedy when the scan is chronically
+// truncated (see the reconcile_scan_truncated_total metric). A non-positive
+// value leaves the corresponding default in place.
+func WithWebhookReconcileScanBounds(maxPages int, lookback time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if maxPages > 0 {
+			h.webhookReconcileMaxPages = maxPages
+		}
+		if lookback > 0 {
+			h.webhookReconcileLookback = lookback
+		}
+	}
+}
+
 // WithCheckSuiteRecovery feeds check_suite.requested deliveries into the
 // durable inbox as a redundant convergence signal: each is enqueued with a
 // not-before time (the recovery grace) and, once claimable, synthesizes a
@@ -295,6 +313,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		webhookReconcileLookback:    defaultWebhookReconcileLookback,
 		webhookReconcileGrace:       defaultWebhookReconcileGrace,
 		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
+		webhookReconcileScanClaim:   defaultWebhookReconcileScanClaim,
 		checkSuiteRecoveryGrace:     defaultCheckSuiteRecoveryGrace,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
