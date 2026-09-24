@@ -20,8 +20,9 @@ then swaps it into place. SchemaBot supplies the reviewed plan, scheduling, and 
 For more background, watch Morgan Tocker's [Introducing Spirit](https://www.youtube.com/watch?v=-d-NOzKZxdI)
 talk at MySQL Belgian Days 2024.
 
-For engine setup and compatibility, see Spirit's [requirements](https://github.com/block/spirit#requirements)
-and [supported operations and limitations](https://github.com/block/spirit#unsupported-features).
+See Spirit's [requirements](https://github.com/block/spirit#requirements) and
+[supported operations and limitations](https://github.com/block/spirit#unsupported-features)
+for setup and compatibility details.
 
 ## How a change runs
 
