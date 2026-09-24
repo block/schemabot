@@ -1210,12 +1210,15 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
 }
 
-// A plan comment's copy-paste commands name the database the comment is about.
-// For a command that is the -d the operator typed; for an auto-plan, which
-// posts one comment per database a pull request touches, it is the database
-// discovery resolved for that comment.
+// A plan comment's copy-paste commands name a database only where a bare
+// command would not resolve. For a command that is the -d the operator typed.
+// An auto-plan names the database its own comment plans when the pull request
+// touches several, because each comment's command would otherwise be the same
+// ambiguous line, and leaves it off when the pull request touches one, because
+// discovery resolves that command on its own.
 func TestPlanCommentDatabaseFlag(t *testing.T) {
-	assert.Equal(t, "payments", planCommentDatabaseFlag("payments", "payments", false), "a command's -d is echoed back")
-	assert.Empty(t, planCommentDatabaseFlag("", "payments", false), "an unscoped command stays unscoped")
-	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true), "an auto-plan names the database its comment plans")
+	assert.Equal(t, "payments", planCommentDatabaseFlag("payments", "payments", false, 0), "a command's -d is echoed back")
+	assert.Empty(t, planCommentDatabaseFlag("", "payments", false, 0), "an unscoped command stays unscoped")
+	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true, 2), "an auto-plan on a PR touching several databases names the one its comment plans")
+	assert.Empty(t, planCommentDatabaseFlag("", "payments", true, 1), "an auto-plan on a PR touching one database has nothing to disambiguate")
 }

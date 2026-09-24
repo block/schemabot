@@ -80,7 +80,10 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Contains(t, body, "**Tenant**: `alpha`")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
-		assert.Contains(t, body, fmt.Sprintf("schemabot apply -e staging -d %s --tenant alpha", dbName))
+		// One config is discovered, so the apply this comment offers resolves
+		// without being told which database it means.
+		assert.Contains(t, body, "schemabot apply -e staging --tenant alpha")
+		assert.NotContains(t, body, " -d ")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for auto-plan comment")
 	}
