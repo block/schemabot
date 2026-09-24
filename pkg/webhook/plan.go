@@ -230,10 +230,10 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
 // commentID is the command comment to acknowledge once discovery commits this
 // deployment to acting; auto-plans pass zero (no comment to acknowledge).
-// discoveredDatabases is how many databases the PR's changed files resolve to,
-// which decides whether this comment's commands have to name theirs; only an
-// auto-plan reads it.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, discoveredDatabases int, postPlanComment bool, commentID int64) {
+// commandScopeDatabases is how many databases a bare command offered by this
+// comment would reach, which decides whether its commands have to name theirs;
+// only an auto-plan reads it.
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -374,7 +374,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:    requestedBy,
 		Tenant:         tenant,
-		ScopedDatabase: planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, discoveredDatabases),
+		ScopedDatabase: planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases),
 		AgentHint:      h.agentHint(),
 		Environments:   environments,
 		Plans:          make(map[string]*templates.PlanCommentData),
@@ -468,7 +468,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
-		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, discoveredDatabases)
+		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
@@ -899,18 +899,18 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 //
 // An operator who scoped their command with -d is answered with the same scope,
 // and an unscoped one with an unscoped command. An auto-plan has no operator to
-// answer, so it names a database only where a bare command would be ambiguous:
-// discovery resolves a command against the databases the pull request's own
-// changed files touch, so one of them is unambiguous however many the
-// repository configures, and several make every comment's one actionable line
-// the same bare command that discovery then rejects. Scoping the unambiguous
-// case too would put a flag in front of every operator on every pull request to
-// serve the few that need it.
-func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoPlan bool, discoveredDatabases int) string {
+// answer, so it names a database only where a bare command would not resolve to
+// the one its comment is about: commandScopeDatabases counts what the pasted
+// command itself would reach, which is a wider set than the comment planned,
+// and above one the comment has to name its database or offer a command that
+// comes back ambiguous, or that acts on a database the comment never mentioned.
+// Scoping the single-database case too would put a flag in front of every
+// operator on every pull request to serve the few that need it.
+func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoPlan bool, commandScopeDatabases int) string {
 	if !isAutoPlan {
 		return requestedDatabase
 	}
-	if discoveredDatabases > 1 {
+	if commandScopeDatabases > 1 {
 		return resolvedDatabase
 	}
 	return ""
