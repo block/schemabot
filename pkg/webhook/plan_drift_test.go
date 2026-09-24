@@ -494,6 +494,31 @@ func TestMemberPlanChanges_CarriesVSchemaChange(t *testing.T) {
 	assert.False(t, templates.DeploymentPlanGroup{Changes: changes}.Empty())
 }
 
+// A rendered VSchema diff marks the namespace as carrying work on its own. The
+// two metadata keys annotate the same thing, so a renderer that recognized only
+// the flag would call a member with work "already at this schema" — and, since
+// the grouping key reads the other annotation too, group it with members that
+// genuinely have nothing to run.
+func TestMemberPlanChanges_DiffAloneIsVSchemaWork(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		Metadata:  map[string]string{apitypes.VSchemaDiffMetadataKey: "+ table users"},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.True(t, changes[0].VSchemaChanged)
+	assert.False(t, templates.DeploymentPlanGroup{Changes: changes}.Empty())
+
+	// The grouping key agrees, so this member is not folded in with one that has
+	// nothing to run.
+	withDiff, err := tern.ChangeSetFingerprint(schema.DialectMySQL, cs)
+	require.NoError(t, err)
+	empty, err := tern.ChangeSetFingerprint(schema.DialectMySQL, tern.ChangeSet{})
+	require.NoError(t, err)
+	assert.NotEqual(t, empty, withDiff)
+}
+
 // A member already at the desired schema produces no changes at all, which is
 // the group the comment names as having nothing to apply.
 func TestMemberPlanChanges_EmptyPlanHasNoChanges(t *testing.T) {

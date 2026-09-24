@@ -602,6 +602,67 @@ func PreviewCommentPlanDriftDetected() string {
 	})
 }
 
+// previewRolloutMembers is the three independent targets the rollout previews
+// below are rendered for, in rollout order with the reviewed primary first.
+func previewRolloutMembers() []DeploymentDriftEntry {
+	return []DeploymentDriftEntry{
+		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+		{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+		{Deployment: "primary", Target: "testapp_3", Class: "planned"},
+	}
+}
+
+// PreviewCommentPlanRolloutConverging renders a plan comment for a rollout of
+// independent targets partway through converging: the reviewed target and one
+// other still need the change, and the third already holds it.
+func PreviewCommentPlanRolloutConverging() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: samplePlanChanges()},
+				{Members: []string{"primary/testapp_3"}},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
+// whose reviewed target already holds the desired schema while other targets do
+// not. The reviewed plan is empty, so the comment renders no DDL — and says that
+// an apply is still not a no-op rather than reading as one.
+func PreviewCommentPlanRolloutConvergedPrimary() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1"}, Primary: true},
+				{Members: []string{"primary/testapp_2", "primary/testapp_3"}, Changes: samplePlanChanges()},
+			},
+		},
+	})
+}
+
 // PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
 // drift rollup could not be computed, so the plan check fails closed.
 func PreviewCommentPlanDriftUnverified() string {

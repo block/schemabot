@@ -154,9 +154,21 @@ func (sc *SchemaChangeResponse) VSchemaUnsafeChanges() []UnsafeChange {
 	return result
 }
 
+// HasVSchemaWork reports whether a plan change's metadata records VSchema work.
+//
+// Either key alone means work, because they are two annotations of the same
+// thing: an engine records a rendered diff when it has one and the flag when the
+// work is known without one. Every caller that has to decide whether a namespace
+// changes its VSchema reads it here rather than testing one key, so a surface
+// that renders the work, a comparison that judges it, and a grouping key derived
+// from that comparison cannot come to different answers about the same change.
+func HasVSchemaWork(metadata map[string]string) bool {
+	return metadata[VSchemaDiffMetadataKey] != "" || metadata[VSchemaChangedMetadataKey] == "true"
+}
+
 // HasVSchemaChange reports whether this namespace's change carries VSchema work.
 func (sc *SchemaChangeResponse) HasVSchemaChange() bool {
-	return sc.Metadata[VSchemaDiffMetadataKey] != "" || sc.Metadata[VSchemaChangedMetadataKey] == "true"
+	return HasVSchemaWork(sc.Metadata)
 }
 
 // VSchemaChange is one keyspace's VSchema application state for display. Each

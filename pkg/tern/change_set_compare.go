@@ -154,7 +154,7 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			return nil, nil, fmt.Errorf("nil schema change")
 		}
 		ns := sc.Namespace
-		if sc.Metadata["vschema_changed"] == "true" {
+		if apitypes.HasVSchemaWork(sc.Metadata) {
 			vschema[ns] = true
 		}
 		hasTableChanges := false

@@ -246,7 +246,7 @@ func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
 			}
 			ks.Statements = append(ks.Statements, tc.GetDdl())
 		}
-		if sc.GetMetadata()[apitypes.VSchemaChangedMetadataKey] == "true" {
+		if apitypes.HasVSchemaWork(sc.GetMetadata()) {
 			ks.VSchemaChanged = true
 			ks.VSchemaDiff = sc.GetMetadata()[apitypes.VSchemaDiffMetadataKey]
 		}
