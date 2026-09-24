@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 )
 
@@ -121,4 +122,44 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+// ExecutionVerdicts resolves the policy up front, so a malformed policy or
+// missing credentials fail before any statement is judged, naming the
+// database the policy was meant for. The target is never contacted to find
+// this out.
+func TestNewExecutionVerdicts_RejectsBadInput(t *testing.T) {
+	eng := New(Config{})
+	const unreachable = "root:nopass@tcp(127.0.0.1:1)/orders_db"
+
+	_, err := eng.NewExecutionVerdicts(nil)
+	require.ErrorContains(t, err, "DSN credentials required")
+	_, err = eng.NewExecutionVerdicts(&engine.Credentials{})
+	require.ErrorContains(t, err, "DSN credentials required")
+
+	_, err = eng.NewExecutionVerdicts(&engine.Credentials{DSN: unreachable, Metadata: map[string]string{"direct_execution": "true"}})
+	require.ErrorContains(t, err, `execution verdicts for database "orders_db"`)
+	require.ErrorContains(t, err, "direct_execution_max_table_rows is not set")
+}
+
+// Only an ALTER can be refused, so any other statement is left on the default
+// path without reading the target. The DSN here points nowhere, so recording
+// a verdict for a CREATE or DROP succeeds only because no connection is made.
+func TestExecutionVerdicts_NonAlterNeedsNoTarget(t *testing.T) {
+	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{
+		DSN:      "root:nopass@tcp(127.0.0.1:1)/orders_db",
+		Metadata: map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000"},
+	})
+	require.NoError(t, err)
+	defer verdicts.Close()
+
+	for _, change := range []engine.TableChange{
+		{Table: "orders", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+		{Table: "orders", Operation: ddl.StatementDropTable, DDL: "DROP TABLE `orders`"},
+	} {
+		require.NoError(t, verdicts.Record(t.Context(), &change), change.DDL)
+		assert.Empty(t, change.ExecutionMode, change.DDL)
+		assert.Empty(t, change.ModeReason, change.DDL)
+	}
+	assert.Nil(t, verdicts.target.db, "no statement needed the target")
 }
