@@ -38,7 +38,7 @@ func durableClosedEvent() *storage.WebhookEvent {
 		"installation": {"id": 12345}
 	}`)
 	return &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-closed-1",
 		Event:       "pull_request",
 		Action:      "closed",
@@ -70,7 +70,7 @@ func TestDurablePRClosedWebhookQueuesAndAcks(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.JSONEq(t, `{"message":"PR close cleanup queued"}`, rr.Body.String())
 
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-closed-1")
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-closed-1")
 	require.NoError(t, err)
 	require.NotNil(t, event)
 	require.Equal(t, "pull_request", event.Event)
