@@ -54,6 +54,14 @@ func ResyncPostgresIdentitySequences(ctx context.Context, db *sql.DB, logger *sl
 	}
 	logger.Info("resyncing identity sequences on storage tables",
 		"database", database, "schema", schemaName.String, "storage_tables", len(tables))
+	// current_schema() is NULL when the session's search_path names no
+	// existing schema. Every target check below filters on current_schema(),
+	// so a NULL would match nothing and misreport a fully bootstrapped
+	// storage database as unrecognizable; name the actual cause instead.
+	if !schemaName.Valid {
+		return fmt.Errorf("the connection's search_path resolves to no existing schema in database %q (current_schema() is NULL); fix the search_path on the DSN or role before resyncing",
+			database)
+	}
 
 	missing, err := missingPostgresTables(ctx, db, tables)
 	if err != nil {
@@ -68,13 +76,16 @@ func ResyncPostgresIdentitySequences(ctx context.Context, db *sql.DB, logger *sl
 	if err != nil {
 		return fmt.Errorf("find identity columns on storage tables: %w", err)
 	}
-	// Every storage table carries an identity primary key, so a target where
-	// none of them yields an identity column is not a bootstrapped SchemaBot
-	// storage schema — succeeding silently would report a load as unblocked
-	// while every sequence on the real target is still behind.
-	if len(columns) == 0 {
-		return fmt.Errorf("no identity columns found on any of the %d storage tables in database %q schema %q; the connection does not point at a bootstrapped SchemaBot storage schema",
-			len(tables), database, schemaName.String)
+	// Every storage table carries an identity primary key, so a present
+	// storage table without an identity column means the target is not a
+	// bootstrapped SchemaBot storage schema, only one that shares table names
+	// with it — succeeding silently would report a load as unblocked while
+	// every sequence on the real target is still behind. Tables the target
+	// lacks entirely are not held to this: a newer binary embeds tables an
+	// older database has not converged yet.
+	if lacking := presentTablesWithoutIdentity(tables, missing, columns); len(lacking) > 0 {
+		return fmt.Errorf("storage tables %v in database %q schema %q have no identity column (%d of %d storage tables present); the connection does not point at a bootstrapped SchemaBot storage schema",
+			lacking, database, schemaName.String, len(tables)-len(missing), len(tables))
 	}
 
 	outcomeCounts := make(map[sequenceResyncOutcome]int)
@@ -127,6 +138,27 @@ const (
 	sequenceSkippedAlreadyAhead
 	sequenceSkippedDescending
 )
+
+// presentTablesWithoutIdentity returns, in the embedded order, the storage
+// tables that exist in the target but yielded no identity column. Tables in
+// missing are absent from the target and are not reported.
+func presentTablesWithoutIdentity(tables, missing []string, columns []postgresIdentityColumn) []string {
+	absent := make(map[string]bool, len(missing))
+	for _, table := range missing {
+		absent[table] = true
+	}
+	hasIdentity := make(map[string]bool, len(columns))
+	for _, col := range columns {
+		hasIdentity[col.table] = true
+	}
+	var lacking []string
+	for _, table := range tables {
+		if !absent[table] && !hasIdentity[table] {
+			lacking = append(lacking, table)
+		}
+	}
+	return lacking
+}
 
 // postgresIdentityColumns lists every identity column on the given tables in
 // the connection's current schema, in a stable order.
