@@ -25,6 +25,7 @@ import (
 // InitCmd accepts explicit inputs or collects missing decisions in a terminal.
 // Both routes use the same initialization workflow.
 type InitCmd struct {
+	Sample         bool         `help:"Start a disposable local MySQL or PostgreSQL database with sample tables (requires Docker)"`
 	NonInteractive bool         `name:"non-interactive" help:"Never prompt; report missing inputs instead"`
 	interactive    bool         `kong:"-"`
 	progress       func(string) `kong:"-"`
@@ -52,6 +53,12 @@ type initResult struct {
 }
 
 func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
+	if err := cmd.prepareSample(ctx, g); err != nil {
+		if cmd.JSON && !errors.Is(err, ErrSilent) {
+			return client.ExitWithJSON("initialization_error", err.Error())
+		}
+		return err
+	}
 	if err := cmd.collectInputs(ctx, g); err != nil {
 		if cmd.JSON && !errors.Is(err, ErrSilent) {
 			return client.ExitWithJSON("initialization_error", err.Error())

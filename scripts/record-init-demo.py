@@ -6,6 +6,7 @@ The target must contain users(id, email varchar(255)): public.users for Postgres
 shop.users for MySQL. Postgres also needs an empty analytics namespace. No apply is issued.
 """
 import argparse
+import codecs
 import difflib
 import errno
 import fcntl
@@ -22,6 +23,7 @@ import tempfile
 import time
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--sample', action='store_true')
 parser.add_argument('--binary', required=True)
 parser.add_argument('--output', required=True)
 parser.add_argument('--paste-connection', action='store_true')
@@ -40,7 +42,8 @@ master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
 screen = pyte.Screen(88, 24)
 stream = pyte.Stream(screen)
-process = subprocess.Popen(['./schemabot', 'init'], cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
+command = ['./schemabot', 'init'] + (['--profile', 'demo'] if args.sample else [])
+process = subprocess.Popen(command, cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
 os.close(slave)
 # Send individual keystrokes while continuing to read the terminal, so the
 # recording captures typing, cursor movement, and checkbox changes as they happen.
@@ -58,9 +61,15 @@ else:
 if args.engine == 'postgres':
     steps.append(('space select', [(0.8, ' '), (0.8, '\x1b[B'), (0.8, ' '), (1.0, '\r')]))
 steps.append(('Review your setup', [(2.0, '\r')]))
+if args.sample:
+    arrows = [(0.9, '\x1b[B')] * (2 if args.engine == 'postgres' else 1)
+    steps = [('What would you like to try?', arrows + [(1.5, '\r')])]
+else:
+    steps.insert(0, ('What would you like to try?', [(1.0, '\r')]))
 pending = []
 frames = []
 text = ''
+decoder = codecs.getincrementaldecoder('utf-8')('replace')
 seen = 0
 start = time.monotonic()
 try:
@@ -78,7 +87,7 @@ try:
                 raise
             if not data:
                 break
-            chunk = data.decode('utf-8', errors='replace')
+            chunk = decoder.decode(data)
             text += chunk
             if '\x1b]11;' in chunk:
                 os.write(master, b'\x1b]11;rgb:ffff/ffff/ffff\x1b\\')
@@ -115,14 +124,17 @@ try:
     if process.returncode:
         raise RuntimeError(text)
     schema_file = 'schema/public/users.sql' if args.engine == 'postgres' else 'schema/shop/users.sql'
+    if args.sample:
+        schema_file = schema_file.replace('users.sql', 'customers.sql')
     schema = work / schema_file
     before = schema.read_text()
     after = before.replace('varchar(255)', 'varchar(320)').replace('character varying(255)', 'character varying(320)')
     if before == after:
         raise RuntimeError('demo table does not have the expected email column')
     schema.write_text(after)
-    plan = subprocess.run([binary, 'plan', '-s', 'schema', '-e', 'development'], cwd=work, env=env, text=True, capture_output=True, check=True)
-    output = {'engine': args.engine, 'schema_file': schema_file, 'wizard': '\n'.join(screen.display).strip(), 'wizard_frames': [f for f in frames if any('SchemaBot' in ''.join(s['text'] for s in r) for r in f['rows']) or f['time'] > 1], 'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=schema_file, tofile=schema_file)), 'plan': plan.stdout, 'plan_stderr': plan.stderr}
+    plan_args = ['plan', '-s', 'schema', '-e', 'development'] + (['--profile', 'demo'] if args.sample else [])
+    plan = subprocess.run([binary, *plan_args], cwd=work, env=env, text=True, capture_output=True, check=True)
+    output = {'init_command': 'schemabot init --profile demo' if args.sample else 'schemabot init', 'plan_command': 'schemabot ' + ' '.join(plan_args), 'engine': args.engine, 'schema_file': schema_file, 'wizard': '\n'.join(screen.display).strip(), 'wizard_frames': [f for f in frames if any('SchemaBot' in ''.join(s['text'] for s in r) for r in f['rows']) or f['time'] > 1], 'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=schema_file, tofile=schema_file)), 'plan': plan.stdout, 'plan_stderr': plan.stderr}
     # One generated frame per line keeps updates reviewable without expanding
     # every terminal cell into thousands of lines of JSON.
     fields = []
@@ -141,7 +153,13 @@ finally:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
-    subprocess.run([binary, 'local', 'stop', 'local'], cwd=work, env=env, capture_output=True, timeout=35)
+    if args.sample:
+        runtimes = list((work / 'home' / '.schemabot' / 'runtimes').glob('schemabot-sample-*'))
+        for runtime in runtimes:
+            subprocess.run([binary, 'local', 'stop', runtime.name], cwd=work, env=env, capture_output=True, timeout=35)
+            subprocess.run(['docker', 'rm', '-fv', runtime.name], capture_output=True, timeout=35)
+    else:
+        subprocess.run([binary, 'local', 'stop', 'local'], cwd=work, env=env, capture_output=True, timeout=35)
     # Leave the private work directory for troubleshooting; no credentials are
     # copied to the committed recording (only environment-variable references).
     print('Private demo workspace:', work)
