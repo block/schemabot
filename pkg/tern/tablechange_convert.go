@@ -47,7 +47,7 @@ func protoTableChangeFromEngine(tc engine.TableChange, namespace string) *ternv1
 		Namespace:     namespace,
 		TableName:     tc.Table,
 		Ddl:           tc.DDL,
-		ChangeType:    changeTypeToProto(tc.Operation),
+		ChangeType:    ddl.StatementTypeToChangeType(tc.Operation),
 		IsUnsafe:      tc.IsUnsafe,
 		UnsafeReason:  tc.UnsafeReason,
 		ExecutionMode: tc.ExecutionMode,

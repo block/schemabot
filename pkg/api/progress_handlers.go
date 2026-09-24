@@ -27,30 +27,16 @@ const (
 	maxStatusLimit     = 1000
 )
 
-// changeTypeToString converts a proto ChangeType enum to a lowercase string.
+// changeTypeToString converts a proto change type for progress responses.
+// Unmapped values stay empty because progress omits unavailable change types.
 func changeTypeToString(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(ddl.StatementDropTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
-		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
-	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
-		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
-		return ddl.StatementTypeToOp(ddl.StatementCreateView)
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	default:
-		return ""
+	if ct == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+		return ddl.OpVSchemaUpdate
 	}
+	if st, ok := ddl.ChangeTypeToStatementType(ct); ok {
+		return ddl.StatementTypeToOp(st)
+	}
+	return ""
 }
 
 // deriveErrorCode returns an error code based on apply state

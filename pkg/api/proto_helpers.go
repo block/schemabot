@@ -423,57 +423,25 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 	return out, nil
 }
 
-// protoChangeTypeToOperation converts a proto ChangeType enum to a storage operation string.
+// protoChangeTypeToOperation converts a proto change type to a storage operation.
+// Unmapped values use "other" because storage retains unsupported change types.
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(ddl.StatementDropTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
-		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
-	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
-		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
-		return ddl.StatementTypeToOp(ddl.StatementCreateView)
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	default:
-		return "other"
+	if ct == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+		return ddl.OpVSchemaUpdate
 	}
+	if st, ok := ddl.ChangeTypeToStatementType(ct); ok {
+		return ddl.StatementTypeToOp(st)
+	}
+	return "other"
 }
 
-// changeTypeToProto converts operation string to proto ChangeType enum.
+// changeTypeToProto converts an operation to a proto change type. Operations
+// outside the proto vocabulary use CHANGE_TYPE_OTHER at this API boundary.
 func changeTypeToProto(op string) ternv1.ChangeType {
-	if strings.EqualFold(op, "vschema_update") {
+	if strings.EqualFold(op, ddl.OpVSchemaUpdate) {
 		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
 	}
-	switch ddl.OpToStatementType(op) {
-	case ddl.StatementCreateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case ddl.StatementAlterTable:
-		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case ddl.StatementDropTable:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP
-	case ddl.StatementCreateIndex:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
-	case ddl.StatementDropIndex:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
-	case ddl.StatementRenameTable:
-		return ternv1.ChangeType_CHANGE_TYPE_RENAME
-	case ddl.StatementTruncateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_TRUNCATE
-	case ddl.StatementCreateView:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW
-	default:
-		return ternv1.ChangeType_CHANGE_TYPE_OTHER
-	}
+	return ddl.StatementTypeToChangeType(ddl.OpToStatementType(op))
 }
 
 // protoToSchemaFiles converts proto SchemaFiles to the engine's schema.SchemaFiles,
