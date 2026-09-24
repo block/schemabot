@@ -20,6 +20,16 @@
 //     is report-only. A dead-lettered head (failed_permanent) is not a miss —
 //     HasEventForHead reports it covered — so synthesis cannot resurrect a
 //     delivery the driver proved can never succeed for that head.
+//
+// The missing-delivery scan pages each repository's updated-descending open
+// PR listing under a per-pass page budget, in two phases. A fresh-window walk
+// from the newest page examines every head updated since the previous pass,
+// so new activity is always covered promptly. A resumed scan then continues
+// from a persisted per-repository cursor toward the lookback cutoff, with a
+// reserved share of the budget so sustained fresh traffic cannot starve it.
+// When the budget runs out before the cutoff, the cursor records where to
+// resume, guaranteeing the full lookback window is examined across a bounded
+// number of passes instead of restarting from the newest PRs every pass.
 package webhook
 
 import (
@@ -31,6 +41,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -49,7 +60,96 @@ const (
 
 	defaultWebhookReconcileMaxPages = 5
 	webhookReconcilePageSize        = 100
+
+	// webhookReconcileScanCursorKeyPrefix namespaces the per-repository
+	// settings row that persists the missing-delivery scan's resume point.
+	webhookReconcileScanCursorKeyPrefix = "webhook_reconcile_scan_cursor:"
 )
+
+// webhookReconcileScanCursor is the persisted resume point for one
+// repository's missing-delivery scan. When a pass exhausts its page budget
+// before reaching the lookback cutoff, the cursor records the next listing
+// page so the following pass continues the walk instead of restarting from
+// the newest PRs — a restart would let sustained PR traffic starve older
+// heads forever. Page numbers shift as the listing reorders (an updated PR
+// moves to the front, where the fresh-window walk catches it; a closed PR
+// pulls later entries shallower, deferring them to the next cycle), so the
+// cursor is an approximate resume point: the invariant is eventual coverage
+// of the full lookback window across a bounded number of passes, not exact
+// per-pass coverage.
+type webhookReconcileScanCursor struct {
+	// Page is the next 1-based listing page the resumed scan examines.
+	Page int `json:"page"`
+	// CycleStartedAt is when the current scan cycle began at the newest page.
+	CycleStartedAt time.Time `json:"cycle_started_at"`
+	// CyclePasses counts the reconcile passes the current cycle has spent
+	// without reaching the lookback cutoff.
+	CyclePasses int `json:"cycle_passes"`
+}
+
+func webhookReconcileScanCursorKey(repo string) string {
+	return webhookReconcileScanCursorKeyPrefix + repo
+}
+
+func (h *Handler) settingsStore() storage.SettingsStore {
+	if h.service == nil || h.service.Storage() == nil {
+		return nil
+	}
+	return h.service.Storage().Settings()
+}
+
+// loadWebhookReconcileScanCursor returns the repository's persisted scan
+// cursor, or a fresh newest-page cursor when none is stored or storage is
+// unavailable — the scan then degrades to restart-from-newest rather than
+// skipping the pass.
+func (h *Handler) loadWebhookReconcileScanCursor(ctx context.Context, repo string) webhookReconcileScanCursor {
+	fresh := webhookReconcileScanCursor{Page: 1, CycleStartedAt: time.Now()}
+	store := h.settingsStore()
+	if store == nil {
+		h.logger.Debug("webhook reconciler scan cursor unavailable because settings storage is unavailable; scanning from the newest page", "repo", repo)
+		return fresh
+	}
+	setting, err := store.Get(ctx, webhookReconcileScanCursorKey(repo))
+	if err != nil {
+		h.logger.Warn("webhook reconciler failed to load scan cursor; scanning from the newest page", "repo", repo, "error", err)
+		return fresh
+	}
+	if setting == nil {
+		return fresh
+	}
+	var cursor webhookReconcileScanCursor
+	if err := json.Unmarshal([]byte(setting.Value), &cursor); err != nil {
+		h.logger.Warn("webhook reconciler could not decode scan cursor; scanning from the newest page", "repo", repo, "error", err)
+		return fresh
+	}
+	if cursor.Page < 1 {
+		cursor.Page = 1
+	}
+	if cursor.CycleStartedAt.IsZero() {
+		cursor.CycleStartedAt = fresh.CycleStartedAt
+	}
+	return cursor
+}
+
+// saveWebhookReconcileScanCursor persists the repository's scan cursor.
+// Persistence failures are logged and tolerated: the next pass resumes from
+// the previously stored cursor and re-examines already-covered heads, which
+// is idempotent.
+func (h *Handler) saveWebhookReconcileScanCursor(ctx context.Context, repo string, cursor webhookReconcileScanCursor) {
+	store := h.settingsStore()
+	if store == nil {
+		h.logger.Debug("webhook reconciler scan cursor not persisted because settings storage is unavailable", "repo", repo)
+		return
+	}
+	encoded, err := json.Marshal(cursor)
+	if err != nil {
+		h.logger.Warn("webhook reconciler failed to encode scan cursor", "repo", repo, "error", err)
+		return
+	}
+	if err := store.Set(ctx, webhookReconcileScanCursorKey(repo), string(encoded)); err != nil {
+		h.logger.Warn("webhook reconciler failed to persist scan cursor; the next pass resumes from the previously stored cursor", "repo", repo, "error", err)
+	}
+}
 
 // startWebhookReconciler launches the reconcile loop on the durable-dispatch
 // lifecycle: it shares the dispatch stop channel, context, and wait group, so
@@ -190,93 +290,218 @@ func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.W
 	now := time.Now()
 	cutoff := now.Add(-h.webhookReconcileLookback)
 	grace := now.Add(-h.webhookReconcileGrace)
-	page := 1
-	coverageComplete := false
-pages:
-	for range h.webhookReconcileMaxPages {
+	// freshCutoff bounds the fresh-window walk: every head updated since the
+	// previous pass — widened by the grace window so a head skipped as
+	// too-fresh last pass cannot age past the boundary between passes — is
+	// examined every pass, wherever the resumed scan's cursor is.
+	freshCutoff := now.Add(-(h.webhookReconcileInterval + h.webhookReconcileGrace))
+	if freshCutoff.Before(cutoff) {
+		freshCutoff = cutoff
+	}
+
+	cursor := h.loadWebhookReconcileScanCursor(ctx, repo)
+	budget := h.webhookReconcileMaxPages
+	// The resumed scan keeps a reserved share of the page budget so sustained
+	// fresh PR traffic cannot starve it: without the reserve, a repository
+	// with more fresh updates per pass than the budget covers would never
+	// advance the cursor, and heads deeper in the listing would never be
+	// examined.
+	scanReserve := max(1, h.webhookReconcileMaxPages/2)
+
+	freshWalk := h.walkOpenPRPages(ctx, store, client, repo, installationID, webhookReconcileWalkBounds{
+		startPage: 1,
+		floor:     freshCutoff,
+		cutoff:    cutoff,
+		grace:     grace,
+		budget:    &budget,
+		reserve:   scanReserve,
+	})
+	scanned += freshWalk.scanned
+	missing += freshWalk.missing
+	synthesized += freshWalk.synthesized
+	if freshWalk.listFailed {
+		return scanned, missing, synthesized
+	}
+
+	cycleComplete := freshWalk.crossedCutoff || freshWalk.listingEnded
+	if !cycleComplete {
+		// Resume the deep scan past both the pages the fresh walk just
+		// examined and the pages earlier passes of this cycle covered.
+		resume := max(cursor.Page, freshWalk.lastPage+1)
+		scanWalk := h.walkOpenPRPages(ctx, store, client, repo, installationID, webhookReconcileWalkBounds{
+			startPage: resume,
+			floor:     cutoff,
+			cutoff:    cutoff,
+			grace:     grace,
+			budget:    &budget,
+		})
+		scanned += scanWalk.scanned
+		missing += scanWalk.missing
+		synthesized += scanWalk.synthesized
+		if scanWalk.listFailed {
+			return scanned, missing, synthesized
+		}
+		cycleComplete = scanWalk.crossedCutoff || scanWalk.listingEnded
+		if !cycleComplete {
+			cursor.Page = scanWalk.nextPage
+			cursor.CyclePasses++
+			h.saveWebhookReconcileScanCursor(ctx, repo, cursor)
+			metrics.RecordWebhookReconcileScanTruncated(ctx, repo)
+			h.logger.Warn("webhook reconciler exhausted its page budget before reaching the lookback cutoff; the resumed scan continues from the cursor next pass",
+				"repo", repo, "max_pages", h.webhookReconcileMaxPages, "page_size", webhookReconcilePageSize,
+				"resume_page", cursor.Page, "cycle_passes", cursor.CyclePasses)
+			return scanned, missing, synthesized
+		}
+	}
+
+	passes := cursor.CyclePasses + 1
+	metrics.RecordWebhookReconcileScanCycleCompleted(ctx, repo, int64(passes))
+	if passes > 1 {
+		h.logger.Info("webhook reconciler missing-delivery scan cycle reached the lookback cutoff",
+			"repo", repo, "cycle_passes", passes, "cycle_age", now.Sub(cursor.CycleStartedAt))
+	}
+	h.saveWebhookReconcileScanCursor(ctx, repo, webhookReconcileScanCursor{Page: 1, CycleStartedAt: now})
+	return scanned, missing, synthesized
+}
+
+// webhookReconcileWalkBounds bounds one walk over the updated-descending open
+// PR listing. The walk starts at startPage and stops paging once a listed PR
+// is older than floor, the listing ends, or fetching another page would drop
+// the shared budget below reserve. Every fetched page is examined in full
+// down to cutoff, so a later walk may safely resume at lastPage+1.
+type webhookReconcileWalkBounds struct {
+	startPage int
+	floor     time.Time
+	cutoff    time.Time
+	grace     time.Time
+	budget    *int
+	reserve   int
+}
+
+// webhookReconcileWalkResult reports how one listing walk ended alongside its
+// examination counts.
+type webhookReconcileWalkResult struct {
+	scanned, missing, synthesized int
+	// lastPage is the last page fetched (0 when the budget allowed none).
+	lastPage int
+	// nextPage is GitHub's next page after lastPage (0 when the listing ended).
+	nextPage int
+	// crossedCutoff means a listed PR was older than the lookback cutoff:
+	// everything deeper is out of the coverage window.
+	crossedCutoff bool
+	// listingEnded means the walk consumed the final page of the listing.
+	listingEnded bool
+	// listFailed means a list call failed and the walk stopped early.
+	listFailed bool
+}
+
+// walkOpenPRPages pages through the repository's open PR listing within
+// bounds, examining every listed head for inbox coverage.
+func (h *Handler) walkOpenPRPages(ctx context.Context, store storage.WebhookEventStore, client *github.InstallationClient, repo string, installationID int64, bounds webhookReconcileWalkBounds) webhookReconcileWalkResult {
+	var result webhookReconcileWalkResult
+	page := bounds.startPage
+	for {
+		if *bounds.budget <= bounds.reserve {
+			return result
+		}
 		prs, nextPage, _, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookReconcilePageSize)
 		if err != nil {
 			h.logger.Warn("webhook reconciler failed to list open pull requests", "repo", repo, "page", page, "error", err)
-			return scanned, missing, synthesized
+			result.listFailed = true
+			return result
 		}
+		*bounds.budget--
+		result.lastPage = page
+		result.nextPage = nextPage
+		crossedFloor := false
 		for _, pr := range prs {
-			if pr.UpdatedAt.Before(cutoff) {
+			if pr.UpdatedAt.Before(bounds.cutoff) {
 				// The listing is newest-updated first; everything after this is
 				// older than the lookback window.
-				coverageComplete = true
-				break pages
+				result.crossedCutoff = true
+				break
 			}
-			if pr.HeadSHA == "" {
-				// A PR listing without a head SHA can't be matched to an inbox
-				// delivery; skip rather than emit a spurious missing-row report.
-				h.logger.Debug("webhook reconciler skipped open PR with no head SHA",
-					"repo", repo, "pr", pr.Number)
-				continue
+			if pr.UpdatedAt.Before(bounds.floor) {
+				// Past the walk's floor; the page is already fetched, so keep
+				// examining it in full — that lets a later walk resume at the
+				// next page without a coverage gap — but stop paging after it.
+				crossedFloor = true
 			}
-			if pr.UpdatedAt.After(grace) {
-				// Updated within the grace window; its webhook delivery may still
-				// be in flight to the inbox, so a missing row here is expected.
-				h.logger.Debug("webhook reconciler skipped recently updated open PR within grace window",
-					"repo", repo, "pr", pr.Number, "updated_at", pr.UpdatedAt)
-				continue
-			}
-			scanned++
-			found, err := store.HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr.Number, pr.HeadSHA)
-			if err != nil {
-				h.logger.Warn("webhook reconciler failed to query inbox for PR head",
-					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)
-				continue
-			}
-			if found {
-				continue
-			}
-			missing++
-			metrics.RecordWebhookReconcileMissingEvent(ctx, repo)
-			if !h.webhookReconcileSynthesis {
-				// Report-only mode re-reports the same missing head on every
-				// pass until synthesis is enabled or an organic delivery
-				// arrives, so the per-head line is info; the metric and the
-				// per-pass summary carry the operator signal.
-				h.logger.Info("webhook reconciler found open PR head with no inbox delivery (report-only; synthesis disabled)",
-					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
-				continue
-			}
-			h.logger.Warn("webhook reconciler found open PR head with no inbox delivery; synthesizing recovery delivery",
-				"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
-			inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(ctx, repo, pr.Number, pr.HeadSHA, installationID)
-			if err != nil {
-				// Each head recovers independently; the next pass retries this one.
-				h.logger.Warn("webhook reconciler failed to synthesize recovery delivery for open PR head",
-					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)
-				continue
-			}
-			if !inserted {
-				// Another pod's reconciler won the enqueue race on the same
-				// synthesized GUID and its row is still live; the head is
-				// covered. (An organic delivery can never collide here — its
-				// GUID is GitHub's, not the synthesized form — it is caught by
-				// the HasEventForHead check upstream instead.)
-				h.logger.Debug("webhook reconciler skipped synthesizing recovery delivery because one is already queued",
-					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA)
-				continue
-			}
-			synthesized++
-			metrics.RecordWebhookReconcileSynthesizedEvent(ctx, repo, resynthesized)
+			s, m, syn := h.examineOpenPRHead(ctx, store, repo, pr, bounds.grace, installationID)
+			result.scanned += s
+			result.missing += m
+			result.synthesized += syn
 		}
-		if nextPage == 0 {
-			coverageComplete = true
-			break
+		if result.nextPage == 0 {
+			result.listingEnded = true
+			return result
 		}
-		page = nextPage
+		if result.crossedCutoff || crossedFloor {
+			return result
+		}
+		page = result.nextPage
 	}
-	if !coverageComplete {
-		// The page budget ran out before the walk reached the lookback cutoff,
-		// so open PR heads older than the last page scanned went unchecked this
-		// pass. Surface the truncated coverage rather than silently capping it.
-		h.logger.Warn("webhook reconciler exhausted its page budget before reaching the lookback cutoff; open PR coverage is truncated this pass",
-			"repo", repo, "max_pages", h.webhookReconcileMaxPages, "page_size", webhookReconcilePageSize)
+}
+
+// examineOpenPRHead checks one listed open PR head for inbox coverage,
+// reporting a miss and — when synthesis is enabled — enqueueing a recovery
+// delivery for it. The returned counts are 0-or-1 increments for the pass
+// totals.
+func (h *Handler) examineOpenPRHead(ctx context.Context, store storage.WebhookEventStore, repo string, pr github.OpenPullRequest, grace time.Time, installationID int64) (scanned, missing, synthesized int) {
+	if pr.HeadSHA == "" {
+		// A PR listing without a head SHA can't be matched to an inbox
+		// delivery; skip rather than emit a spurious missing-row report.
+		h.logger.Debug("webhook reconciler skipped open PR with no head SHA",
+			"repo", repo, "pr", pr.Number)
+		return 0, 0, 0
 	}
-	return scanned, missing, synthesized
+	if pr.UpdatedAt.After(grace) {
+		// Updated within the grace window; its webhook delivery may still
+		// be in flight to the inbox, so a missing row here is expected.
+		h.logger.Debug("webhook reconciler skipped recently updated open PR within grace window",
+			"repo", repo, "pr", pr.Number, "updated_at", pr.UpdatedAt)
+		return 0, 0, 0
+	}
+	found, err := store.HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr.Number, pr.HeadSHA)
+	if err != nil {
+		h.logger.Warn("webhook reconciler failed to query inbox for PR head",
+			"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)
+		return 1, 0, 0
+	}
+	if found {
+		return 1, 0, 0
+	}
+	metrics.RecordWebhookReconcileMissingEvent(ctx, repo)
+	if !h.webhookReconcileSynthesis {
+		// Report-only mode re-reports the same missing head on every
+		// pass until synthesis is enabled or an organic delivery
+		// arrives, so the per-head line is info; the metric and the
+		// per-pass summary carry the operator signal.
+		h.logger.Info("webhook reconciler found open PR head with no inbox delivery (report-only; synthesis disabled)",
+			"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
+		return 1, 1, 0
+	}
+	h.logger.Warn("webhook reconciler found open PR head with no inbox delivery; synthesizing recovery delivery",
+		"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
+	inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(ctx, repo, pr.Number, pr.HeadSHA, installationID)
+	if err != nil {
+		// Each head recovers independently; the next pass retries this one.
+		h.logger.Warn("webhook reconciler failed to synthesize recovery delivery for open PR head",
+			"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)
+		return 1, 1, 0
+	}
+	if !inserted {
+		// Another pod's reconciler won the enqueue race on the same
+		// synthesized GUID and its row is still live; the head is
+		// covered. (An organic delivery can never collide here — its
+		// GUID is GitHub's, not the synthesized form — it is caught by
+		// the HasEventForHead check upstream instead.)
+		h.logger.Debug("webhook reconciler skipped synthesizing recovery delivery because one is already queued",
+			"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA)
+		return 1, 1, 0
+	}
+	metrics.RecordWebhookReconcileSynthesizedEvent(ctx, repo, resynthesized)
+	return 1, 1, 1
 }
 
 // webhookReconcileSynthesizedAction is the pull_request action stamped on

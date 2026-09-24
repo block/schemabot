@@ -9,7 +9,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,19 +27,143 @@ import (
 // mux. Extra options are appended so tests can enable synthesis.
 func newReconcileTestHandler(t *testing.T, store storage.WebhookEventStore, repos map[string]api.RepoConfig, opts ...HandlerOption) (*Handler, *http.ServeMux) {
 	t.Helper()
+	h, mux := newReconcileTestHandlerWithSettings(t, store, newMemorySettingsStore(), repos, opts...)
+	return h, mux
+}
+
+// newReconcileTestHandlerWithSettings builds a reconciler-enabled handler
+// backed by the given settings store, so tests can inspect the persisted scan
+// cursor or share it across handler instances to model a process restart.
+func newReconcileTestHandlerWithSettings(t *testing.T, store storage.WebhookEventStore, settings storage.SettingsStore, repos map[string]api.RepoConfig, opts ...HandlerOption) (*Handler, *http.ServeMux) {
+	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newReconcileTestHandlerWithLogger(t, logger, store, repos, opts...)
+	return newReconcileTestHandlerWithLoggerAndSettings(t, logger, store, settings, repos, opts...)
 }
 
 // newReconcileTestHandlerWithLogger is newReconcileTestHandler with a
 // caller-supplied logger, for tests that assert on emitted log records.
 func newReconcileTestHandlerWithLogger(t *testing.T, logger *slog.Logger, store storage.WebhookEventStore, repos map[string]api.RepoConfig, opts ...HandlerOption) (*Handler, *http.ServeMux) {
 	t.Helper()
+	return newReconcileTestHandlerWithLoggerAndSettings(t, logger, store, newMemorySettingsStore(), repos, opts...)
+}
+
+func newReconcileTestHandlerWithLoggerAndSettings(t *testing.T, logger *slog.Logger, store storage.WebhookEventStore, settings storage.SettingsStore, repos map[string]api.RepoConfig, opts ...HandlerOption) (*Handler, *http.ServeMux) {
+	t.Helper()
 	ghc, mux := setupGitHubServer(t)
-	service := api.New(&durableWebhookTestStorage{webhookEvents: store}, &api.ServerConfig{Repos: repos}, nil, logger)
+	service := api.New(&durableWebhookTestStorage{webhookEvents: store, settings: settings}, &api.ServerConfig{Repos: repos}, nil, logger)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
 	h := NewHandler(service, factory, nil, logger, append([]HandlerOption{WithDurableWebhookDispatch(), WithWebhookReconciler()}, opts...)...)
 	return h, mux
+}
+
+// memorySettingsStore is an in-memory storage.SettingsStore for reconciler
+// tests that exercise the persisted scan cursor.
+type memorySettingsStore struct {
+	mu       sync.Mutex
+	settings map[string]string
+}
+
+func newMemorySettingsStore() *memorySettingsStore {
+	return &memorySettingsStore{settings: make(map[string]string)}
+}
+
+func (s *memorySettingsStore) Get(_ context.Context, key string) (*storage.Setting, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.settings[key]
+	if !ok {
+		return nil, nil
+	}
+	return &storage.Setting{Key: key, Value: value}, nil
+}
+
+func (s *memorySettingsStore) Set(_ context.Context, key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settings[key] = value
+	return nil
+}
+
+func (s *memorySettingsStore) List(_ context.Context) ([]*storage.Setting, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	settings := make([]*storage.Setting, 0, len(s.settings))
+	for key, value := range s.settings {
+		settings = append(settings, &storage.Setting{Key: key, Value: value})
+	}
+	return settings, nil
+}
+
+func (s *memorySettingsStore) Delete(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.settings[key]; !ok {
+		return storage.ErrSettingNotFound
+	}
+	delete(s.settings, key)
+	return nil
+}
+
+// pageFetchLog records which listing pages the reconciler fetched, in order,
+// so tests can assert exactly how a pass spent its page budget.
+type pageFetchLog struct {
+	mu    sync.Mutex
+	pages []int
+}
+
+func (l *pageFetchLog) record(page int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pages = append(l.pages, page)
+}
+
+// take returns the pages fetched since the last call and clears the log, so a
+// test can assert per-pass fetch patterns.
+func (l *pageFetchLog) take() []int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	pages := l.pages
+	l.pages = nil
+	return pages
+}
+
+// registerPagedOpenPRs serves a multi-page open-PR listing on the fake GitHub
+// server, emulating the Link-header pagination ListOpenPullRequestsPage
+// consumes: every page but the last advertises rel="next". Returns a log of
+// the pages fetched.
+func registerPagedOpenPRs(t *testing.T, mux *http.ServeMux, repo string, pages ...[]map[string]any) *pageFetchLog {
+	t.Helper()
+	log := &pageFetchLog{}
+	mux.HandleFunc("/repos/"+repo+"/pulls", func(w http.ResponseWriter, r *http.Request) {
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if err != nil || page < 1 {
+			page = 1
+		}
+		log.record(page)
+		if page > len(pages) {
+			writeOpenPRs(t, w)
+			return
+		}
+		if page < len(pages) {
+			w.Header().Set("Link", fmt.Sprintf(
+				`<https://api.github.test/repos/%s/pulls?page=%d>; rel="next", <https://api.github.test/repos/%s/pulls?page=%d>; rel="last"`,
+				repo, page+1, repo, len(pages)))
+		}
+		writeOpenPRs(t, w, pages[page-1]...)
+	})
+	return log
+}
+
+// storedScanCursor reads the repository's persisted scan cursor back from the
+// settings store, failing the test when none is stored.
+func storedScanCursor(t *testing.T, settings storage.SettingsStore, repo string) webhookReconcileScanCursor {
+	t.Helper()
+	setting, err := settings.Get(t.Context(), webhookReconcileScanCursorKey(repo))
+	require.NoError(t, err)
+	require.NotNil(t, setting, "expected a persisted scan cursor for %s", repo)
+	var cursor webhookReconcileScanCursor
+	require.NoError(t, json.Unmarshal([]byte(setting.Value), &cursor))
+	return cursor
 }
 
 func openPR(number int, headSHA string, updatedAt time.Time) map[string]any {
@@ -526,4 +652,186 @@ func TestWebhookReconcilerCompletedRowStillCoversHead(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 0, missing)
 	require.Equal(t, 0, synthesized)
+}
+
+// TestWebhookReconcilerScanCursorResumesAcrossPasses exercises the persisted
+// scan cursor under a page budget too small to reach the lookback cutoff in
+// one pass: the first pass covers the fresh window plus the start of the deep
+// scan and records where it stopped; the next pass resumes there instead of
+// restarting from the newest PRs, so every head in the lookback window is
+// examined within a bounded number of passes. Once the listing end is
+// reached, the cursor resets and a new cycle begins at the newest page.
+func TestWebhookReconcilerScanCursorResumesAcrossPasses(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	settings := newMemorySettingsStore()
+	h, mux := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	// Budget of 2: the fresh-window walk may spend 1 page, the resumed deep
+	// scan the other.
+	h.webhookReconcileMaxPages = 2
+	// Three pages of PRs all updated before the fresh window but inside the
+	// lookback window, so covering them requires the deep scan.
+	fetches := registerPagedOpenPRs(t, mux, "octocat/hello-world",
+		[]map[string]any{openPR(1, "sha-1", time.Now().Add(-2*time.Hour))},
+		[]map[string]any{openPR(2, "sha-2", time.Now().Add(-3*time.Hour))},
+		[]map[string]any{openPR(3, "sha-3", time.Now().Add(-4*time.Hour))},
+	)
+
+	scanned, missing, _ := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, []int{1, 2}, fetches.take(), "first pass: fresh walk page 1, deep scan page 2")
+	require.Equal(t, 2, scanned)
+	require.Equal(t, 2, missing)
+	cursor := storedScanCursor(t, settings, "octocat/hello-world")
+	require.Equal(t, 3, cursor.Page, "budget exhausted before page 3; cursor records the resume point")
+	require.Equal(t, 1, cursor.CyclePasses)
+
+	scanned, missing, _ = h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, []int{1, 3}, fetches.take(), "second pass: fresh walk page 1, deep scan resumes at page 3")
+	require.Equal(t, 2, scanned)
+	require.Equal(t, 2, missing)
+	cursor = storedScanCursor(t, settings, "octocat/hello-world")
+	require.Equal(t, 1, cursor.Page, "listing end reached; the cursor resets for a new cycle")
+	require.Equal(t, 0, cursor.CyclePasses)
+}
+
+// TestWebhookReconcilerFreshTrafficCannotStarveDeepScan pins the page-budget
+// reserve: a repository whose fresh PR traffic alone exceeds the fresh walk's
+// budget share every pass must still advance the deep-scan cursor, so heads
+// deeper in the listing are examined within a bounded number of passes
+// instead of being starved forever by new activity.
+func TestWebhookReconcilerFreshTrafficCannotStarveDeepScan(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	settings := newMemorySettingsStore()
+	h, mux := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h.webhookReconcileMaxPages = 2
+	// Pages 1-2 hold PRs updated inside the fresh window (past the grace
+	// window, so they are examined) on every pass; pages 3-5 hold older heads
+	// only the deep scan can reach.
+	fresh := time.Now().Add(-20 * time.Minute)
+	fetches := registerPagedOpenPRs(t, mux, "octocat/hello-world",
+		[]map[string]any{openPR(1, "sha-1", fresh)},
+		[]map[string]any{openPR(2, "sha-2", fresh)},
+		[]map[string]any{openPR(3, "sha-3", time.Now().Add(-3*time.Hour))},
+		[]map[string]any{openPR(4, "sha-4", time.Now().Add(-4*time.Hour))},
+		[]map[string]any{openPR(5, "sha-5", time.Now().Add(-5*time.Hour))},
+	)
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+	require.Equal(t, []int{1, 2}, fetches.take())
+	require.Equal(t, 3, storedScanCursor(t, settings, "octocat/hello-world").Page)
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+	require.Equal(t, []int{1, 3}, fetches.take(), "deep scan resumes past the fresh pages")
+	require.Equal(t, 4, storedScanCursor(t, settings, "octocat/hello-world").Page)
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+	require.Equal(t, []int{1, 4}, fetches.take())
+	require.Equal(t, 5, storedScanCursor(t, settings, "octocat/hello-world").Page)
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+	require.Equal(t, []int{1, 5}, fetches.take(), "deep scan reaches the listing end despite constant fresh traffic")
+	cursor := storedScanCursor(t, settings, "octocat/hello-world")
+	require.Equal(t, 1, cursor.Page, "cycle complete; cursor resets")
+	require.Equal(t, 0, cursor.CyclePasses)
+}
+
+// TestWebhookReconcilerScanCursorPersistsAcrossRestart pins that the scan
+// cursor lives in settings storage, not handler memory: a new handler (a
+// restarted process) resumes the deep scan where the previous one stopped.
+func TestWebhookReconcilerScanCursorPersistsAcrossRestart(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	settings := newMemorySettingsStore()
+	pages := [][]map[string]any{
+		{openPR(1, "sha-1", time.Now().Add(-2*time.Hour))},
+		{openPR(2, "sha-2", time.Now().Add(-3*time.Hour))},
+		{openPR(3, "sha-3", time.Now().Add(-4*time.Hour))},
+	}
+
+	h1, mux1 := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h1.webhookReconcileMaxPages = 2
+	registerPagedOpenPRs(t, mux1, "octocat/hello-world", pages...)
+	h1.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+	require.Equal(t, 3, storedScanCursor(t, settings, "octocat/hello-world").Page)
+
+	h2, mux2 := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h2.webhookReconcileMaxPages = 2
+	fetches := registerPagedOpenPRs(t, mux2, "octocat/hello-world", pages...)
+	h2.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, []int{1, 3}, fetches.take(), "restarted handler resumes the deep scan from the persisted cursor")
+}
+
+// TestWebhookReconcilerScanCursorResetsOnCutoffCrossing pins cycle completion
+// via the lookback cutoff: when the deep scan reaches a PR older than the
+// lookback window, everything deeper is outside coverage, so the cycle is
+// complete and the cursor resets even though the listing has more pages.
+func TestWebhookReconcilerScanCursorResetsOnCutoffCrossing(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	settings := newMemorySettingsStore()
+	h, mux := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h.webhookReconcileMaxPages = 2
+	fetches := registerPagedOpenPRs(t, mux, "octocat/hello-world",
+		[]map[string]any{openPR(1, "sha-1", time.Now().Add(-2*time.Hour))},
+		[]map[string]any{openPR(2, "sha-2", time.Now().Add(-72*time.Hour))},
+		[]map[string]any{openPR(3, "sha-3", time.Now().Add(-73*time.Hour))},
+	)
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, []int{1, 2}, fetches.take(), "page 3 is beyond the cutoff and never fetched")
+	cursor := storedScanCursor(t, settings, "octocat/hello-world")
+	require.Equal(t, 1, cursor.Page, "cutoff crossed; cycle complete and cursor reset")
+	require.Equal(t, 0, cursor.CyclePasses)
+}
+
+// failingSettingsStore errors on every operation, modeling unavailable
+// settings storage.
+type failingSettingsStore struct{}
+
+func (failingSettingsStore) Get(context.Context, string) (*storage.Setting, error) {
+	return nil, errors.New("settings storage unavailable")
+}
+
+func (failingSettingsStore) Set(context.Context, string, string) error {
+	return errors.New("settings storage unavailable")
+}
+
+func (failingSettingsStore) List(context.Context) ([]*storage.Setting, error) {
+	return nil, errors.New("settings storage unavailable")
+}
+
+func (failingSettingsStore) Delete(context.Context, string) error {
+	return errors.New("settings storage unavailable")
+}
+
+// TestWebhookReconcilerScanDegradesWithoutSettingsStorage pins the fallback
+// when the cursor cannot be loaded or persisted (nil or failing settings
+// storage): each pass degrades to the pre-cursor behavior — scan from the
+// newest page under the budget — rather than skipping the repository.
+func TestWebhookReconcilerScanDegradesWithoutSettingsStorage(t *testing.T) {
+	for name, settings := range map[string]storage.SettingsStore{
+		"nil":     nil,
+		"failing": failingSettingsStore{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newRecordingWebhookEventStore()
+			h, mux := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+			h.webhookReconcileMaxPages = 2
+			fetches := registerPagedOpenPRs(t, mux, "octocat/hello-world",
+				[]map[string]any{openPR(1, "sha-1", time.Now().Add(-2*time.Hour))},
+				[]map[string]any{openPR(2, "sha-2", time.Now().Add(-3*time.Hour))},
+				[]map[string]any{openPR(3, "sha-3", time.Now().Add(-4*time.Hour))},
+			)
+
+			scanned, missing, _ := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+			require.Equal(t, []int{1, 2}, fetches.take())
+			require.Equal(t, 2, scanned)
+			require.Equal(t, 2, missing)
+
+			scanned, _, _ = h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+			require.Equal(t, []int{1, 2}, fetches.take(), "without a persisted cursor every pass restarts from the newest page")
+			require.Equal(t, 2, scanned)
+		})
+	}
 }

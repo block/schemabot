@@ -2133,6 +2133,33 @@ func RecordWebhookCheckSuiteRecovery(ctx context.Context, repo string, outcome s
 		attribute.String("outcome", outcome))
 }
 
+// RecordWebhookReconcileScanTruncated counts reconcile passes whose
+// missing-delivery scan ran out of page budget before reaching the lookback
+// cutoff for a repository. The scan resumes from its persisted cursor next
+// pass, so occasional truncation on a busy repository is expected and heals;
+// a sustained rate combined with high reconcile_scan_cycle_passes means the
+// page budget is too small for the repository's open-PR volume — raise the
+// budget or shorten the lookback so the backstop covers its window promptly.
+func RecordWebhookReconcileScanTruncated(ctx context.Context, repo string) {
+	addCounter(ctx, "schemabot.webhook.reconcile_scan_truncated_total",
+		"Total number of reconcile passes whose missing-delivery scan was truncated by the page budget", "{pass}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
+// RecordWebhookReconcileScanCycleCompleted records how many reconcile passes
+// one full missing-delivery scan cycle took to reach the lookback cutoff for
+// a repository. One pass is the healthy case; a growing pass count means the
+// scan is chronically truncated and recovery of lost deliveries deep in the
+// listing is delayed by roughly passes × reconcile interval — the bound to
+// alert on when delivery-gap healing must complete within a target time.
+func RecordWebhookReconcileScanCycleCompleted(ctx context.Context, repo string, passes int64) {
+	recordHistogram(ctx, "schemabot.webhook.reconcile_scan_cycle_passes", float64(passes),
+		"Reconcile passes needed for one full missing-delivery scan cycle to reach the lookback cutoff",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
 // RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
 // reconciler terminated because they were parked in processing with an expired
 // lease at the attempt cap — a driver hard-killed on its final attempt. A
