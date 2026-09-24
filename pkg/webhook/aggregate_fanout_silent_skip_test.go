@@ -203,7 +203,7 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 // command and a non-aggregate repo still surface the error.
 func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 	barePlan := func(h *Handler, databaseName, tenant string) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, true, 0)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0)
 	}
 
 	t.Run("bare plan on aggregate repo stays silent", func(t *testing.T) {
@@ -264,7 +264,7 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 // the leader may publish Database Not Found as the fleet-authoritative answer.
 func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
 	barePlan := func(h *Handler) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, true, 0)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0)
 	}
 
 	t.Run("participant stays silent", func(t *testing.T) {
@@ -838,7 +838,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		serveSchemaConfigForDatabase(t, mux, "orders")
 		reactions := registerReactionRecorder(t, mux)
 
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, true, 42)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42)
 
 		select {
 		case <-reactions:

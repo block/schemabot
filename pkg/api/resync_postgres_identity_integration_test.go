@@ -5,11 +5,13 @@ package api
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -68,6 +70,19 @@ func (h *recordingLogHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *recordingLogHandler) WithGroup(string) slog.Handler      { return h }
 
+// recordsForMessage returns the captured records with the given message.
+func (h *recordingLogHandler) recordsForMessage(message string) []capturedLogRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []capturedLogRecord
+	for _, r := range h.records {
+		if r.message == message {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // recordsForTable returns the captured records whose "table" attr matches.
 func (h *recordingLogHandler) recordsForTable(table string) []capturedLogRecord {
 	h.mu.Lock()
@@ -104,12 +119,23 @@ func resyncLogger(t *testing.T) (*slog.Logger, *recordingLogHandler) {
 
 // A target without any SchemaBot storage tables is rejected before sequence
 // discovery, preventing an unrelated PostgreSQL database from appearing to
-// resync successfully.
+// resync successfully. The refusal names the database and schema it inspected,
+// both in the error and in the preamble logged before the check, so an
+// operator who pointed the command at the wrong DSN can see where it looked.
 func TestResyncPostgresIdentitySequences_RejectsTargetWithoutStorageTables(t *testing.T) {
 	_, db := startPostgresStorage(t)
-	err := ResyncPostgresIdentitySequences(t.Context(), db, slog.New(slog.DiscardHandler))
+	logger, logs := resyncLogger(t)
+
+	err := ResyncPostgresIdentitySequences(t.Context(), db, logger)
 	require.ErrorContains(t, err, "none of the")
+	require.ErrorContains(t, err, `database "schemabot" schema "public"`)
 	require.ErrorContains(t, err, "does not look like SchemaBot's storage database")
+
+	preambles := logs.recordsForMessage("resyncing identity sequences on storage tables")
+	require.Len(t, preambles, 1, "the target is named once before the refusal")
+	assert.Equal(t, "schemabot", preambles[0].attrs["database"])
+	assert.Equal(t, "public", preambles[0].attrs["schema"])
+	assert.Empty(t, logs.recordsForMessage("identity sequence resync complete"), "a refused run never reports completion")
 }
 
 // After an explicit-id bulk load, the identity sequences still point below
@@ -145,6 +171,17 @@ func TestResyncPostgresIdentitySequences_UnblocksDefaultInsertsAfterExplicitIDLo
 
 	tables := logs.tablesInOrder()
 	assert.True(t, sort.StringsAreSorted(tables), "outcomes are logged in a stable table order: %v", tables)
+
+	preambles := logs.recordsForMessage("resyncing identity sequences on storage tables")
+	require.Len(t, preambles, 1, "the resync names its target once up front")
+	assert.Equal(t, slog.LevelInfo, preambles[0].level)
+	assert.Equal(t, "schemabot", preambles[0].attrs["database"])
+	assert.Equal(t, "public", preambles[0].attrs["schema"])
+
+	summaries := logs.recordsForMessage("identity sequence resync complete")
+	require.Len(t, summaries, 1, "the resync summarizes its outcomes once at the end")
+	assert.Equal(t, slog.LevelInfo, summaries[0].level)
+	assert.Equal(t, int64(1), summaries[0].attrs["advanced"], "only the loaded table's sequence advanced")
 }
 
 // A sequence that has never handed out a value still resyncs: a fresh
@@ -267,7 +304,7 @@ func TestAdvancePostgresIdentitySequence_MixedCaseTable(t *testing.T) {
 	require.NoError(t, err)
 
 	newValue, outcome, err := advancePostgresIdentitySequence(t.Context(), db,
-		postgresIdentityColumn{table: "zAudit", column: "id"})
+		postgresIdentityColumn{schema: "public", table: "zAudit", column: "id"})
 	require.NoError(t, err)
 	assert.Equal(t, sequenceAdvanced, outcome)
 	assert.Equal(t, int64(3), newValue)
@@ -292,7 +329,7 @@ func TestAdvancePostgresIdentitySequence_SkipsDescendingSequence(t *testing.T) {
 	require.NoError(t, err)
 
 	newValue, outcome, err := advancePostgresIdentitySequence(t.Context(), db,
-		postgresIdentityColumn{table: "countdown", column: "id"})
+		postgresIdentityColumn{schema: "public", table: "countdown", column: "id"})
 	require.NoError(t, err)
 	assert.Equal(t, sequenceSkippedDescending, outcome)
 	assert.Zero(t, newValue)
@@ -302,4 +339,182 @@ func TestAdvancePostgresIdentitySequence_SkipsDescendingSequence(t *testing.T) {
 		`INSERT INTO countdown (note) VALUES ('') RETURNING id`).Scan(&id)
 	require.Error(t, err, "the descending sequence is untouched, so its next draw still collides")
 	require.Contains(t, err.Error(), "duplicate key")
+}
+
+// A target that carries the storage tables by name but none of their
+// identity columns — a hand-built or partially loaded copy of the schema —
+// errors instead of succeeding silently: every storage table carries an
+// identity primary key, so finding none means the connection does not
+// target a bootstrapped SchemaBot storage schema, and reporting success
+// would leave the operator believing the real target's sequences were
+// advanced. The error names the tables that lack one, the database and
+// schema the resync looked in, and how many storage tables were present.
+func TestResyncPostgresIdentitySequences_ErrorsWhenStorageTablesLackIdentityColumns(t *testing.T) {
+	_, db := startPostgresStorage(t)
+	tables, _, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	require.NotEmpty(t, tables)
+	// Plain integer keys: same names as the storage tables, no identity column.
+	for _, table := range tables {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id integer PRIMARY KEY)", pgx.Identifier{table}.Sanitize()))
+		require.NoError(t, err)
+	}
+	logger, _ := resyncLogger(t)
+
+	err = ResyncPostgresIdentitySequences(t.Context(), db, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("storage tables %v", tables))
+	assert.Contains(t, err.Error(), "have no identity column")
+	assert.Contains(t, err.Error(), fmt.Sprintf("(%d of %d storage tables present)", len(tables), len(tables)))
+	assert.Contains(t, err.Error(), `database "schemabot" schema "public"`)
+}
+
+// A copy that shares every storage table name and carries an identity column
+// on just one of them is still not a bootstrapped storage schema: the
+// refusal holds every present table to the identity-key premise, not only
+// the target as a whole, and names exactly the tables that fall short.
+func TestResyncPostgresIdentitySequences_ErrorsWhenOnePresentTableLacksIdentityColumn(t *testing.T) {
+	_, db := startPostgresStorage(t)
+	tables, _, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	require.Greater(t, len(tables), 1)
+	withIdentity := tables[0]
+	for _, table := range tables {
+		keyDDL := "id integer PRIMARY KEY"
+		if table == withIdentity {
+			keyDDL = "id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"
+		}
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (%s)", pgx.Identifier{table}.Sanitize(), keyDDL))
+		require.NoError(t, err)
+	}
+	logger, logs := resyncLogger(t)
+
+	err = ResyncPostgresIdentitySequences(t.Context(), db, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("storage tables %v", tables[1:]))
+	assert.NotContains(t, err.Error(), fmt.Sprintf("[%s", withIdentity), "the table carrying an identity column is not reported")
+	assert.Empty(t, logs.recordsForMessage("identity sequence resync complete"), "a refused run never reports completion")
+}
+
+// Storage tables the target does not have at all are not held to the
+// identity-key premise — a newer binary embeds tables an older database has
+// not converged yet — so a partial but otherwise well-formed schema resyncs,
+// and a refusal on a partial schema counts the tables that are present.
+func TestResyncPostgresIdentitySequences_HoldsOnlyPresentTablesToIdentityPremise(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	tables, _, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	require.Greater(t, len(tables), 2)
+	// Keep two bootstrapped tables; drop the rest so they read as missing.
+	present := tables[:2]
+	for _, table := range tables[2:] {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s", pgx.Identifier{table}.Sanitize()))
+		require.NoError(t, err)
+	}
+	logger, _ := resyncLogger(t)
+
+	require.NoError(t, ResyncPostgresIdentitySequences(t.Context(), db, logger),
+		"present tables carry identity columns; absent tables are not required")
+
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s", pgx.Identifier{present[1]}.Sanitize()))
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id integer PRIMARY KEY)", pgx.Identifier{present[1]}.Sanitize()))
+	require.NoError(t, err)
+
+	err = ResyncPostgresIdentitySequences(t.Context(), db, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("storage tables [%s]", present[1]))
+	assert.Contains(t, err.Error(), fmt.Sprintf("(2 of %d storage tables present)", len(tables)))
+}
+
+// A session whose search_path names no existing schema makes current_schema()
+// NULL, and every target check filters on current_schema(). A fully
+// bootstrapped storage database would then look like it has no storage
+// tables; the resync names the search_path as the cause instead.
+func TestResyncPostgresIdentitySequences_NamesUnresolvedSearchPath(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	logger, logs := resyncLogger(t)
+
+	// SET is session-local; a single-connection pool makes it hold for every
+	// query the resync runs.
+	db.SetMaxOpenConns(1)
+	_, err := db.ExecContext(t.Context(), `SET search_path TO schemabot_typo`)
+	require.NoError(t, err)
+
+	err = ResyncPostgresIdentitySequences(t.Context(), db, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "search_path resolves to no existing schema")
+	assert.Contains(t, err.Error(), `database "schemabot"`)
+	assert.Contains(t, err.Error(), "current_schema() is NULL")
+	assert.NotContains(t, err.Error(), "does not look like SchemaBot's storage database")
+
+	preambles := logs.recordsForMessage("resyncing identity sequences on storage tables")
+	require.Len(t, preambles, 1)
+	assert.Equal(t, "", preambles[0].attrs["schema"])
+}
+
+// A sequence parked exactly on the stored maximum without having drawn it —
+// setval(seq, max, false) or RESTART WITH max — hands out the maximum itself
+// next, colliding with the stored row. The resync must advance it: the
+// undrawn parked position is not "already ahead", it is exactly one draw
+// behind.
+func TestResyncPostgresIdentitySequences_AdvancesSequenceParkedOnMaximum(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	logger, logs := resyncLogger(t)
+
+	insertSettingWithID(t, db, 1, "loaded-1")
+	insertSettingWithID(t, db, 2, "loaded-2")
+	insertSettingWithID(t, db, 3, "loaded-3")
+
+	_, err := db.ExecContext(t.Context(), `ALTER TABLE settings ALTER COLUMN id RESTART WITH 3`)
+	require.NoError(t, err)
+
+	require.NoError(t, ResyncPostgresIdentitySequences(t.Context(), db, logger))
+
+	id, err := insertSettingDefaultID(t, db, "after-resync")
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), id, "the parked-on-maximum sequence advanced past the stored maximum")
+
+	records := logs.recordsForTable("settings")
+	require.Len(t, records, 1)
+	assert.Equal(t, "advanced identity sequence past stored maximum", records[0].message)
+	assert.Equal(t, int64(3), records[0].attrs["sequence_value"])
+}
+
+// A temporary table with the storage table's name cannot hijack the resync:
+// pg_temp is searched before every other schema, so the acting queries pin
+// the schema the table was listed in rather than resolving the bare name
+// through the search path. The shadowed storage table still gets its
+// sequence advanced.
+func TestResyncPostgresIdentitySequences_PinsSchemaAgainstTempTableShadowing(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	logger, logs := resyncLogger(t)
+
+	insertSettingWithID(t, db, 1, "loaded-1")
+	insertSettingWithID(t, db, 2, "loaded-2")
+	insertSettingWithID(t, db, 3, "loaded-3")
+
+	// Temp tables are connection-local; a single-connection pool makes the
+	// shadow visible to every query the resync runs.
+	db.SetMaxOpenConns(1)
+	_, err := db.ExecContext(t.Context(),
+		`CREATE TEMP TABLE settings (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, setting_key text NOT NULL, setting_value text NOT NULL)`)
+	require.NoError(t, err)
+
+	require.NoError(t, ResyncPostgresIdentitySequences(t.Context(), db, logger))
+
+	var id int64
+	err = db.QueryRowContext(t.Context(),
+		`INSERT INTO public.settings (setting_key, setting_value) VALUES ('after-resync', '') RETURNING id`).Scan(&id)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), id, "the storage table's sequence advanced despite the pg_temp shadow")
+
+	records := logs.recordsForTable("settings")
+	require.Len(t, records, 1)
+	assert.Equal(t, "advanced identity sequence past stored maximum", records[0].message)
+	assert.Equal(t, int64(3), records[0].attrs["sequence_value"], "the advance used the storage table's stored maximum, not the empty shadow's")
 }
