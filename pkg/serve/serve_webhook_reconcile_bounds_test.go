@@ -11,9 +11,9 @@ import (
 
 // TestParseWebhookReconcileScanBounds pins the tuning contract for the
 // reconciler's missing-delivery scan: an unset variable yields zero (keep the
-// default), each variable can be set on its own, and a malformed or
-// non-positive value is rejected to zero rather than shrinking or disabling
-// the scan.
+// default), each variable can be set on its own, and a malformed value, a
+// non-positive lookback, or a page budget below the floor the pass needs is
+// rejected to zero rather than shrinking or disabling the scan.
 func TestParseWebhookReconcileScanBounds(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -30,6 +30,8 @@ func TestParseWebhookReconcileScanBounds(t *testing.T) {
 		{"lookback alone", "", "36h", 0, 36 * time.Hour},
 		{"non-numeric max pages rejected", "many", "24h", 0, 24 * time.Hour},
 		{"zero max pages rejected", "0", "", 0, 0},
+		{"one max page rejected", "1", "", 0, 0},
+		{"smallest usable max pages accepted", "2", "", 2, 0},
 		{"negative max pages rejected", "-3", "", 0, 0},
 		{"malformed lookback rejected", "8", "2 days", 8, 0},
 		{"negative lookback rejected", "", "-1h", 0, 0},

@@ -69,6 +69,13 @@ const (
 	defaultWebhookReconcileMaxPages = 5
 	webhookReconcilePageSize        = 100
 
+	// MinWebhookReconcileMaxPages is the smallest page budget a pass can be
+	// given. The budget is shared between the fresh-window walk and the
+	// resumed scan's reserve, and each needs a page of its own: with one page
+	// the reserve takes it and the newest page, where new activity lands,
+	// would go unexamined until the cycle completes.
+	MinWebhookReconcileMaxPages = 2
+
 	// defaultWebhookReconcileScanClaim is how long one pass's claim on a
 	// repository's scan excludes other replicas. It outlasts any single pass
 	// yet expires before the claimant's own next tick, so a replica that dies

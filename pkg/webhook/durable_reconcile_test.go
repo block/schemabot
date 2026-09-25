@@ -1065,6 +1065,35 @@ func TestWebhookReconcilerFreshWindowWidensWhenCutShort(t *testing.T) {
 		"the fresh walk was cut short, so coverage advances only to the completed cycle's start")
 }
 
+// TestWebhookReconcilerFreshWalkStopsAtItsFloor pins that the fresh-window
+// walk stops paging on the page where it crosses its floor and records the
+// fresh window as covered, so the rest of the budget goes to the deep scan
+// and the next pass's fresh window does not widen.
+func TestWebhookReconcilerFreshWalkStopsAtItsFloor(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	settings := newMemorySettingsStore()
+	h, mux := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h.webhookReconcileMaxPages = 4
+	// Page 1 holds one head inside the fresh window and one below its floor,
+	// so the fresh walk must stop after page 1 and leave pages 2 and 3 to the
+	// deep scan.
+	fetches := registerPagedOpenPRs(t, mux, "octocat/hello-world",
+		[]map[string]any{
+			openPR(1, "sha-1", time.Now().Add(-20*time.Minute)),
+			openPR(2, "sha-2", time.Now().Add(-2*time.Hour)),
+		},
+		[]map[string]any{openPR(3, "sha-3", time.Now().Add(-3*time.Hour))},
+		[]map[string]any{openPR(4, "sha-4", time.Now().Add(-4*time.Hour))},
+	)
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, []int{1, 2, 3}, fetches.take(), "the fresh walk fetched page 1 only; the deep scan took the remaining pages")
+	cursor := storedScanCursor(t, settings, "octocat/hello-world")
+	require.WithinDuration(t, time.Now(), cursor.FreshCoveredAt, time.Minute,
+		"the fresh walk crossed its floor on page 1, so the fresh window is covered through this pass")
+}
+
 // TestWebhookReconcilerDeletesOrphanedScanCursors pins that a repository
 // removed from the registry does not leave its scan cursor behind: the next
 // pass deletes it, while cursors of registered repositories are kept.
@@ -1104,4 +1133,10 @@ func TestWithWebhookReconcileScanBounds(t *testing.T) {
 	WithWebhookReconcileScanBounds(0, 0)(h)
 	require.Equal(t, 12, h.webhookReconcileMaxPages, "a non-positive budget leaves the current value in place")
 	require.Equal(t, 6*time.Hour, h.webhookReconcileLookback, "a non-positive lookback leaves the current value in place")
+
+	WithWebhookReconcileScanBounds(MinWebhookReconcileMaxPages-1, 0)(h)
+	require.Equal(t, 12, h.webhookReconcileMaxPages, "a budget the pass cannot split between its two walks leaves the current value in place")
+
+	WithWebhookReconcileScanBounds(MinWebhookReconcileMaxPages, 0)(h)
+	require.Equal(t, MinWebhookReconcileMaxPages, h.webhookReconcileMaxPages)
 }
