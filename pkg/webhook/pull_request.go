@@ -474,11 +474,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// an aggregate blocking reason, so a stored block can now be released.
 	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
 
-	// Collect database names from discovered configs
-	affectedDatabases := make(map[string]bool)
-	for _, cfg := range configs {
-		affectedDatabases[cfg.Config.Database] = true
-	}
+	affectedDatabases := checkDatabaseKeysForConfigs(configs)
 
 	// Clean up stale checks from databases no longer in the PR.
 	// Pass the new HEAD SHA so cleanup can create new check runs on the correct commit.
@@ -967,7 +963,43 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 	return errors.Join(releaseErrs...)
 }
 
-// cleanupStaleChecks updates checks for databases no longer in the PR.
+// checkDatabaseKey identifies the database a per-database stored check row
+// gates: its name and its type, the two database components of the stored
+// check state key. A database whose type changes while a PR is open (for
+// example a MySQL database converted to Strata) is planned under the new type,
+// so its row under the old type no longer belongs to anything the PR plans.
+type checkDatabaseKey struct {
+	databaseName string
+	databaseType string
+}
+
+// newCheckDatabaseKey folds both components the way stored check state folds
+// them, so a row and the config that planned it always produce the same key.
+func newCheckDatabaseKey(databaseName, databaseType string) checkDatabaseKey {
+	return checkDatabaseKey{
+		databaseName: storage.CanonicalKey(databaseName),
+		databaseType: storage.CanonicalKey(databaseType),
+	}
+}
+
+// checkDatabaseKeyForCheck returns the database a stored check row gates.
+func checkDatabaseKeyForCheck(check *storage.Check) checkDatabaseKey {
+	return newCheckDatabaseKey(check.DatabaseName, check.DatabaseType)
+}
+
+// checkDatabaseKeysForConfigs returns the databases the PR's discovered configs
+// plan, keyed by name and type.
+func checkDatabaseKeysForConfigs(configs []ghclient.DiscoveredConfig) map[checkDatabaseKey]bool {
+	keys := make(map[checkDatabaseKey]bool, len(configs))
+	for _, cfg := range configs {
+		keys[newCheckDatabaseKey(cfg.Config.Database, string(cfg.Config.GetType()))] = true
+	}
+	return keys
+}
+
+// cleanupStaleChecks updates checks for databases no longer in the PR. A row is
+// still affected only when the PR plans a database with the same name and type;
+// a row whose database type no longer matches the discovered config is stale.
 // Plan-only checks can be marked "success" because the current PR no longer asks
 // SchemaBot to apply anything. Checks that represent a started apply remain
 // blocking because the live database may already have changed or may still change.
@@ -975,7 +1007,7 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 // On synchronize events, headSHA is the new commit SHA. Stale checks must be created
 // as new check runs on this SHA (not updated on the old SHA) so GitHub shows them
 // on the current commit.
-func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[string]bool) {
+func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[checkDatabaseKey]bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -1033,7 +1065,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			continue
 		}
 
-		if affectedDatabases[check.DatabaseName] {
+		if affectedDatabases[checkDatabaseKeyForCheck(check)] {
 			h.logger.Debug("skipping check during stale cleanup because database is still affected",
 				"repo", repo, "pr", pr, "head_sha", headSHA,
 				"database", check.DatabaseName, "database_type", check.DatabaseType,
@@ -1041,7 +1073,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			continue
 		}
 
-		// This check's database is no longer in the PR.
+		// The PR no longer plans this check's database under this type.
 		h.logger.Info("cleaning up stale check",
 			"repo", repo, "pr", pr,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
