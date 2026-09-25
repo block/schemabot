@@ -20,6 +20,7 @@ package tern
 import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -47,7 +48,7 @@ func protoTableChangeFromEngine(tc engine.TableChange, namespace string) *ternv1
 		Namespace:     namespace,
 		TableName:     tc.Table,
 		Ddl:           tc.DDL,
-		ChangeType:    changeTypeToProto(tc.Operation),
+		ChangeType:    ternconv.StatementTypeToChangeType(tc.Operation),
 		IsUnsafe:      tc.IsUnsafe,
 		UnsafeReason:  tc.UnsafeReason,
 		ExecutionMode: tc.ExecutionMode,

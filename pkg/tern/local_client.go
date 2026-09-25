@@ -114,6 +114,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -3275,7 +3276,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			Status:       t.State,
 			TaskId:       t.TaskIdentifier,
 			IsInstant:    t.IsInstant || vitessApplyIsInstant,
-			ChangeType:   ddlActionToProtoChangeType(t.DDLAction),
+			ChangeType:   ternconv.OpToChangeType(t.DDLAction),
 			ErrorMessage: t.ErrorMessage,
 		}
 
