@@ -121,6 +121,41 @@ func TestDDLBlockBudgetIsSharedAcrossBlocks(t *testing.T) {
 	})
 }
 
+// A section's blocks share the section's one budget share: they render whole
+// and in order while it holds them, the first that does not fit is cut to the
+// room left and marked once, and the blocks after it are left out, so the
+// section shows exactly as much DDL as it would have as one block.
+func TestWriteSQLFencedBlocksShareOneSectionBudget(t *testing.T) {
+	first := "ALTER TABLE a ADD COLUMN x int;"
+	second := "ALTER TABLE b ADD COLUMN y int;"
+	third := "ALTER TABLE c ADD COLUMN z int;"
+	whole := func(content string) string { return "```sql\n" + content + "\n```\n" }
+
+	t.Run("blocks that fit render whole with a blank line between them", func(t *testing.T) {
+		budget := &ddlBlockBudget{remaining: commentBodyLimit, blocksLeft: 1}
+		var out strings.Builder
+		writeSQLFencedBlocks(&out, []string{first, second, third}, budget)
+
+		assert.Equal(t, whole(first)+"\n"+whole(second)+"\n"+whole(third), out.String())
+		assert.Equal(t, commentBodyLimit-len(out.String()), budget.remaining, "every byte written is charged, separators included")
+	})
+
+	t.Run("the first block past the share is cut and the rest are left out", func(t *testing.T) {
+		share := len(whole(first)) + len("\n") + len(whole(second)) - 4
+		budget := &ddlBlockBudget{remaining: share, blocksLeft: 1}
+		var out strings.Builder
+		writeSQLFencedBlocks(&out, []string{first, second, third}, budget)
+		rendered := out.String()
+
+		assert.True(t, strings.HasPrefix(rendered, whole(first)+"\n```sql\n"+second[:len(second)-4]), "the second block is cut where the share ends")
+		assert.Equal(t, 1, strings.Count(rendered, ddlTruncatedMarker), "one marker for the section")
+		assert.True(t, strings.HasSuffix(rendered, ddlTruncatedMarker), "nothing renders after the cut block")
+		assert.NotContains(t, rendered, "ALTER TABLE c")
+		assert.Equal(t, share, len(rendered)-len(ddlTruncatedMarker), "the section fills its share exactly")
+		assert.Equal(t, 0, budget.remaining)
+	})
+}
+
 func TestWriteVSchemaDiffFenceSizesFenceToContent(t *testing.T) {
 	var out strings.Builder
 	writeVSchemaDiffFence(&out, "-a\n+```\n+# injected", maxCommentVSchemaDiffLen)
@@ -211,7 +246,7 @@ func TestDDLBlocksContainHostileIdentifier(t *testing.T) {
 
 	t.Run("plan", func(t *testing.T) {
 		var out strings.Builder
-		writePlanDDLBlock(&out, []string{hostileDDL}, schema.DialectPostgres, newDDLBlockBudget(1, commentBodyLimit))
+		writePlanDDLBlocks(&out, []string{hostileDDL}, schema.DialectPostgres, newDDLBlockBudget(1, commentBodyLimit))
 
 		assert.Equal(t, expectedBlock+"\n", out.String())
 	})
