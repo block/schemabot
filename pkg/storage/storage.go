@@ -921,7 +921,14 @@ type TaskStore interface {
 	// Get returns a task by task_identifier (external identifier), or nil if not found.
 	Get(ctx context.Context, taskIdentifier string) (*Task, error)
 
-	// Update updates an existing task.
+	// Update writes an existing task's mutable columns: its state, progress,
+	// execution mode, engine identifiers, timestamps, and statement text. The
+	// statement is written because a task may adopt the deployment's own
+	// rendering of its reviewed statement; every operator surface re-reads
+	// it from the row, and so does the next dispatch of the task, which
+	// sends the stored statement to that deployment. Identity columns
+	// (apply, operation, namespace, table, shard) never change through
+	// Update.
 	// Returns ErrTaskNotFound if the task does not exist.
 	Update(ctx context.Context, task *Task) error
 
@@ -932,8 +939,9 @@ type TaskStore interface {
 	// the context: the single lease-holding operator is the only writer of an
 	// operation's per-shard rows, so the lookup-then-write is serialized by that
 	// lease and needs no unique constraint. A displaced operator (lost lease)
-	// fails closed with ErrApplyLeaseLost. On conflict only the progress fields
-	// change; identity and DDL are preserved.
+	// fails closed with ErrApplyLeaseLost. On conflict the row is rewritten
+	// through Update: identity is preserved, and the statement text follows
+	// the caller's task like every other mutable column.
 	UpsertShardProgress(ctx context.Context, task *Task) error
 
 	// GetByApplyID returns all tasks for an apply, in creation order — the
