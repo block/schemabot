@@ -118,7 +118,7 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
-		task.IsInstant, nullString(task.EngineMigrationID),
+		task.IsInstant, nullString(task.EngineMigrationID), task.DDL,
 		task.StartedAt, task.CompletedAt,
 		task.ID,
 	}
@@ -153,7 +153,7 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		UPDATE tasks SET
 			state = ?, error_message = ?, options = ?, attempt = ?,
 			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?, checksum_rows_checked = ?, checksum_rows_total = ?, throttled = ?, throttle_reason = ?, execution_mode = ?, mode_reason = ?, cutover_attempts = ?,
-			is_instant = ?, engine_migration_id = ?,
+			is_instant = ?, engine_migration_id = ?, ddl = ?,
 			started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?`+leasePredicate+`
 	`, args...)

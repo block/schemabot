@@ -6369,6 +6369,71 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksMirrorsPerTableError(t *testin
 	}
 }
 
+func TestGRPCClient_SyncStoredTasksFromRemoteTasksAdoptsTheDeploymentsOwnStatement(t *testing.T) {
+	// The stored task row is built from the primary's reviewed text, while a
+	// remote TableProgress row carries the statement as the data plane spelled
+	// it for its own target — its own schema qualifier. The control plane
+	// adopts that text so the apply comment for a non-primary deployment shows
+	// the statement that deployment runs. An empty remote statement keeps the
+	// stored one: an older data plane omits the field.
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	const primaryDDL = `ALTER TABLE "primary_schema"."users" ADD COLUMN "email" text`
+	const replicaDDL = `ALTER TABLE "replica_schema"."users" ADD COLUMN "email" text`
+	testCases := []struct {
+		name      string
+		remoteDDL string
+		wantDDL   string
+	}{
+		{
+			name:      "remote statement replaces the primary's text on the stored task",
+			remoteDDL: replicaDDL,
+			wantDDL:   replicaDDL,
+		},
+		{
+			name:      "empty remote statement keeps the stored text",
+			remoteDDL: "",
+			wantDDL:   primaryDDL,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			storedApply := &storage.Apply{
+				ID:              29,
+				ApplyIdentifier: "apply-statement-adopt",
+				State:           state.Apply.Running,
+			}
+			storedTask := &storage.Task{
+				ID:             31,
+				TaskIdentifier: "task-statement-adopt",
+				ApplyID:        storedApply.ID,
+				TableName:      "users",
+				DDL:            primaryDDL,
+				State:          state.Task.Pending,
+			}
+			taskStore := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+			client := &GRPCClient{
+				storage: &mockStorage{
+					tasks: taskStore,
+					logs:  &mockApplyLogStore{},
+				},
+			}
+
+			err := client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{storedTask}, []*ternv1.TableProgress{{
+				TableName: "users",
+				Status:    state.Task.Running,
+				Ddl:       tc.remoteDDL,
+			}}, now)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantDDL, storedTask.DDL)
+			assert.Equal(t, state.Task.Running, storedTask.State)
+			require.Len(t, taskStore.updated, 1)
+			assert.Equal(t, tc.wantDDL, taskStore.updated[0].DDL)
+		})
+	}
+}
+
 func TestGRPCClient_SyncStoredTasksFromRemoteTasksAttributesEachStatementToItsOwnTask(t *testing.T) {
 	// A remote apply that runs two statements against one table reports one
 	// TableProgress row per statement. Each stored task mirrors the row for

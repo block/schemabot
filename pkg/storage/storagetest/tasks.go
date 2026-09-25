@@ -114,6 +114,7 @@ func TestTasks(t *testing.T, h Harness) {
 		got.CutoverAttempts = 3
 		got.IsInstant = true
 		got.EngineMigrationID = "engine-task-1"
+		got.DDL = "ALTER TABLE `tenant`.`users` ADD COLUMN `email` varchar(255)"
 		got.StartedAt = &started
 		got.CompletedAt = &completed
 		require.NoError(t, store.Tasks().Update(ctx, got))
@@ -133,6 +134,7 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, "replica lag", updated.ThrottleReason)
 		assert.Equal(t, 3, updated.CutoverAttempts)
 		assert.True(t, updated.IsInstant)
+		assert.Equal(t, "ALTER TABLE `tenant`.`users` ADD COLUMN `email` varchar(255)", updated.DDL)
 		assert.Equal(t, "engine-task-1", updated.EngineMigrationID)
 		require.NotNil(t, updated.StartedAt)
 		assert.WithinDuration(t, started, *updated.StartedAt, time.Second)

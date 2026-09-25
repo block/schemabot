@@ -4106,6 +4106,22 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 		if remoteTask.ErrorMessage != "" {
 			storedTask.ErrorMessage = remoteTask.ErrorMessage
 		}
+		// The stored task row was built from the primary's reviewed text; the
+		// data plane reports the statement as its own engine spelled it for its
+		// own target (its schema qualifier, quoting, whitespace), the text the
+		// drift check admitted as the same change and the text it actually
+		// runs. Adopt it so the operator surfaces this control plane renders
+		// from its task rows show each deployment's own statement rather than
+		// the primary's. An empty remote statement keeps the stored one: a
+		// data plane running an older proto omits the field.
+		if remoteDDL := strings.TrimSpace(remoteTask.Ddl); remoteDDL != "" && remoteDDL != strings.TrimSpace(storedTask.DDL) {
+			logger.DebugContext(ctx, "adopting the deployment's own statement text onto the stored gRPC task",
+				"external_id", storedApply.ExternalID,
+				"task_id", storedTask.TaskIdentifier,
+				"namespace", storedTask.Namespace,
+				"table", storedTask.TableName)
+			storedTask.DDL = remoteTask.Ddl
+		}
 		if state.IsState(storedTask.State, state.Task.Completed) && storedTask.ProgressPercent != 100 {
 			storedTask.ProgressPercent = 100
 		}
