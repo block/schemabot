@@ -33,17 +33,8 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		"elapsed_ms", time.Since(seqStart).Milliseconds(),
 	)
 
-	now := time.Now()
-	apply.State = state.Apply.Running
-	apply.StartedAt = &now
-	apply.UpdatedAt = now
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		if applyWriteEndsDrive(err) {
-			logger.Warn("apply is no longer this driver's to run; sequential drive will stand down before starting any table",
-				append(apply.MutableLogAttrs(), "error", err)...)
-			return
-		}
-		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
+	if !c.recordDriveStarted(ctx, apply, logger) {
+		return
 	}
 
 	var failedTask *storage.Task

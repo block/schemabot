@@ -225,9 +225,14 @@ func reopenGuardPredicate(column, newState string) (predicate string, args []any
 // the row may not exist, or the guard may have refused a finished row. The
 // row's current state tells the three apart, so each surfaces as its own cause.
 func ensureReopenGuardHeld(ctx context.Context, db queryRower, apply *storage.Apply) error {
-	// FOR UPDATE reads the latest committed row rather than the transaction's
-	// snapshot: a finishing write committed by another writer is exactly what
-	// the guard refused.
+	// The two dialects reach the finished row by different routes. On MySQL,
+	// InnoDB's locking read returns the latest committed row whatever the
+	// transaction's snapshot, so a finishing write another writer committed
+	// mid-update is exactly what the guard refused. On PostgreSQL under
+	// REPEATABLE READ, a row another writer changed after this transaction's
+	// snapshot raises a serialization failure instead, from the guarded UPDATE
+	// or from this read. Update retries the whole attempt through
+	// withLockRetry, and the retry's fresh snapshot sees the finished row.
 	var currentState string
 	err := db.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState)
 	if errors.Is(err, sql.ErrNoRows) {

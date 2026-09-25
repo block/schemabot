@@ -346,6 +346,50 @@ func TestApplies(t *testing.T, h Harness) {
 		}
 	})
 
+	// A stopped apply goes active again only through the start claim. A caller
+	// that writes running over it without one is refused and the apply stays
+	// stopped. Once an operator's start request is claimed, the claim moves the
+	// apply to resuming and the driver's running write lands.
+	t.Run("Update_ResumesStoppedApplyOnlyThroughStartClaim", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stopped_resume_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithTask(t, store, lock, "apply_stopped_resume", 9004)
+		apply.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, apply))
+
+		apply.State = state.Apply.Running
+		require.ErrorIs(t, store.Applies().Update(ctx, apply), storage.ErrApplyReopenRefused,
+			"running over a stopped apply without the start claim reopens it")
+		stillStopped, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stillStopped)
+		assert.Equal(t, state.Apply.Stopped, stillStopped.State)
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   apply.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a stopped apply with a pending start request is claimable")
+		resuming, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, resuming)
+		assert.Equal(t, state.Apply.Resuming, resuming.State, "the start claim moves the apply out of stopped")
+
+		claimed.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(storage.WithApplyLease(ctx, claimed.Lease()), claimed))
+		resumed, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, resumed)
+		assert.Equal(t, state.Apply.Running, resumed.State)
+	})
+
 	// Stopping is not a reopen: stop lands on a running apply, and a stopped
 	// apply can be rewritten as stopped, for example to record an error.
 	t.Run("Update_StopsActiveApplyAndRefreshesStopped", func(t *testing.T) {

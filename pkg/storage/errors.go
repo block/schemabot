@@ -45,9 +45,9 @@ var (
 
 	// ErrApplyReopenRefused is returned when a general apply update would
 	// reopen a finished apply: an active state written over a terminal row, or
-	// stopped written over a settled one. A finished apply re-enters the active
-	// lifecycle only through the claim of a stopped apply, never through an
-	// update written from a caller's in-memory copy.
+	// stopped written over a settled one. The guard covers Update alone: the
+	// claim transitions and the rollout projection (UpdateDerivedState) move
+	// the state through their own conditional writes and never return it.
 	ErrApplyReopenRefused = errors.New("refused to reopen a finished apply")
 
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer

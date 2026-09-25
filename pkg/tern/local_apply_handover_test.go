@@ -158,11 +158,13 @@ func (e *countingEngine) Progress(context.Context, *engine.ProgressRequest) (*en
 // write fails because the apply is no longer this driver's, whether another
 // writer already finished it or another driver took the lease, the drive stands
 // down without starting a table: work it started could never be recorded
-// against the apply.
+// against the apply. The same holds when another apply went active on the
+// target, since the work would run alongside that apply's schema change.
 func TestExecuteApply_StandsDownWhenStartWriteEndsTheDrive(t *testing.T) {
 	refusals := map[string]error{
 		"reopen refused": fmt.Errorf("apply apply-1 is completed; update to running would reopen it: %w", storage.ErrApplyReopenRefused),
 		"lease lost":     fmt.Errorf("apply apply-1 lease taken by another driver: %w", storage.ErrApplyLeaseLost),
+		"target busy":    fmt.Errorf("apply apply-2 is active on orders/staging: %w", storage.ErrActiveApplyExists),
 	}
 	drives := map[string]func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task){
 		"sequential": func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {

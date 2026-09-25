@@ -649,7 +649,9 @@ to an active state. Not a retry, not an API write, not a crashed driver replayin
 The general apply update holds this for every caller, whatever copy of the apply it writes from:
 it is evaluated against the stored row and refuses an active state over a terminal apply, and
 `stopped` over a settled one, since a stopped apply can be claimed to resume. Every other terminal
-write lands, including cancelling a stopped apply.
+write lands, including cancelling a stopped apply. The guard covers that update alone. The claim
+transitions and the rollout projection write the state through their own conditional updates, so
+a new caller that moves an apply to an active state through either of them is not caught by it.
 
 `stopped` is the one terminal state that is still addressable, because a stopped apply is holding
 a database rather than done with it. It can be claimed to resume via `start`, and it can be
