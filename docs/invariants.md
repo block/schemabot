@@ -644,8 +644,9 @@ Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and
 ### ST-1: A finished apply stays finished
 
 No path moves a terminal apply (`completed`, `failed`, `cancelled`, `reverted`, `stopped`) back
-to an active state, other than correcting a rollout verdict that was recorded too early (below).
-Not a retry, not an API write, not a crashed driver replaying stale progress.
+to an active state, other than the two routes named below: claiming a stopped apply to resume it
+or deliver its cancel, and correcting a rollout verdict that was recorded too early. Not a retry,
+not an API write, not a crashed driver replaying stale progress.
 
 This is upheld by the routes into an active state rather than by a single predicate on the apply
 update: the claim query names the states it will claim, and the control handlers refuse a
@@ -678,8 +679,8 @@ That refusal holds at every surface that could begin the work again: the API rej
 request and points at the successor, a claim to resume refuses and fails the pending start request
 with the reason, and the claim predicate excludes a stamped `failed_retryable` apply from automatic
 retry. No other claim path can reach a stamped apply, since work must have run before a successor
-can take it over, and an active apply cannot gain one at all. *Enforced:* the terminal guard in the
-storage apply update path, the named state arms of the single claim query, and the write-once
+can take it over, and an active apply cannot gain one at all. *Enforced:* the named state arms of
+the single claim query, the terminal-state refusals in the control handlers, and the write-once
 supersession marker consulted by the start, resume, and retry paths
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`); the lease-scoped
 reopen policy on the rollout projection (`reopensHeldFailedRollout` in
