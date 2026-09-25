@@ -77,6 +77,26 @@ func TestPlanSummarySurfacesShareIndexCounts(t *testing.T) {
 	assert.Equal(t, "1 alter, 1 index create, 1 index drop", webhooktemplates.SummarizeChanges(commentData))
 }
 
+// A CREATE INDEX planned as its own step on a table the same plan creates is
+// one table to create and one index to create on both surfaces: the index is
+// its own apply task, and the table is never also counted as a table to alter.
+func TestPlanSummarySurfacesCountIndexOnNewTableAsIndexWork(t *testing.T) {
+	cliChanges := []DDLChange{
+		{ChangeType: "CHANGE_TYPE_CREATE", TableName: "widgets"},
+		{ChangeType: "CHANGE_TYPE_CREATE_INDEX", TableName: "widgets"},
+	}
+	commentData := webhooktemplates.PlanCommentData{
+		DatabaseType: "postgres",
+		Changes: []webhooktemplates.KeyspaceChangeData{{Keyspace: "app", Statements: []string{
+			"CREATE TABLE widgets (id bigint PRIMARY KEY, sku text)",
+			"CREATE INDEX CONCURRENTLY widgets_sku_idx ON widgets (sku)",
+		}}},
+	}
+
+	assert.Equal(t, []string{"1 table to create", "1 index to create"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 create, 1 index create", webhooktemplates.SummarizeChanges(commentData))
+}
+
 // The CLI plan summary counts every statement the plan will run, matching the
 // PR comment: index work is named in its own clauses, statements outside every
 // bucket are named in a mixed plan, and a plan made only of them reports its
