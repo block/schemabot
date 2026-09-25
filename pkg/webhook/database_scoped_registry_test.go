@@ -39,7 +39,7 @@ func TestDatabaseScopedCommandOnUnconfiguredDatabaseAnswersFromRegistry(t *testi
 		run  func(*Handler, string)
 	}{
 		{"plan", func(h *Handler, tenant string) {
-			h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", tenant, 12345, "hubot", false, true, 0)
+			h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", tenant, 12345, "hubot", false, 0, true, 0)
 		}},
 		{"apply", func(h *Handler, tenant string) {
 			h.handleApplyCommand("octocat/hello-world", 1, "staging", "payments", 12345, "hubot",
@@ -106,7 +106,7 @@ func TestAggregateLeaderDatabaseScopedCommandKeepsSearchingTheRepository(t *test
 		run  func(*Handler)
 	}{
 		{"plan", func(h *Handler) {
-			h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", "", 12345, "hubot", false, true, 0)
+			h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", "", 12345, "hubot", false, 0, true, 0)
 		}},
 		{"apply", func(h *Handler) {
 			h.handleApplyCommand("octocat/hello-world", 1, "staging", "payments", 12345, "hubot",
@@ -156,7 +156,7 @@ func TestDatabaseScopedCommandOnDatabaseRejectingTheRepositoryReportsPolicy(t *t
 	h, mux, comments := newFanOutSkipHandler(t, cfg)
 	serveTruncatedRepoWithChangedSchemaFile(t, mux)
 
-	h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", "", 12345, "hubot", false, true, 0)
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", "", 12345, "hubot", false, 0, true, 0)
 
 	body := requireComment(t, comments, "policy answer for a database that rejects the repository")
 	assert.Contains(t, body, "Database Not Available to This Repository")
@@ -178,7 +178,7 @@ func TestTargetResolverDeploymentKeepsDiscoveringDatabaseScopedCommands(t *testi
 	serveSchemaConfigForDatabase(t, mux, "inventory")
 	serveCompleteRootConfigTree(t, mux)
 
-	h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", "", 12345, "hubot", false, true, 0)
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", "", 12345, "hubot", false, 0, true, 0)
 
 	body := requireComment(t, comments, "database-not-found plan error on a target-resolver deployment")
 	assert.Contains(t, body, "Database Not Found")

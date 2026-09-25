@@ -33,56 +33,97 @@ import (
 // sequence behind again; a concurrent default insert cannot cause a rewind
 // (the advance-only guard suppresses the update) but can leave the sequence
 // where the concurrent draw put it rather than at the stored maximum.
+//
+// The server never runs the resync on its own: the Admin CLI's
+// `storage resync-identity-sequences` command is the caller, run by the
+// operator who performed the load. The function logs one summary line with
+// the outcome counts, so that caller reports nothing further on success.
 func ResyncPostgresIdentitySequences(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
 	tables, _, err := readEmbeddedPostgresSchemaFiles()
 	if err != nil {
 		return fmt.Errorf("read embedded PostgreSQL storage schema: %w", err)
 	}
+
+	// Name the target before any check can refuse it, so a resync pointed at
+	// the wrong database or schema — the case the refusals below catch — is
+	// visible from the logs alone and named in the error.
+	var database string
+	var schemaName sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT current_database(), current_schema()`).Scan(&database, &schemaName); err != nil {
+		return fmt.Errorf("read resync target database and schema: %w", err)
+	}
+	logger.Info("resyncing identity sequences on storage tables",
+		"database", database, "schema", schemaName.String, "storage_tables", len(tables))
+	// current_schema() is NULL when the session's search_path names no
+	// existing schema. Every target check below filters on current_schema(),
+	// so a NULL would match nothing and misreport a fully bootstrapped
+	// storage database as unrecognizable; name the actual cause instead.
+	if !schemaName.Valid {
+		return fmt.Errorf("the connection's search_path resolves to no existing schema in database %q (current_schema() is NULL); fix the search_path on the DSN or role before resyncing",
+			database)
+	}
+
 	missing, err := missingPostgresTables(ctx, db, tables)
 	if err != nil {
 		return fmt.Errorf("check target for storage tables: %w", err)
 	}
 	if len(missing) == len(tables) {
-		return fmt.Errorf("none of the %d storage tables exist in the target database; it does not look like SchemaBot's storage database", len(tables))
+		return fmt.Errorf("none of the %d storage tables exist in database %q schema %q; it does not look like SchemaBot's storage database",
+			len(tables), database, schemaName.String)
 	}
+
 	columns, err := postgresIdentityColumns(ctx, db, tables)
 	if err != nil {
 		return fmt.Errorf("find identity columns on storage tables: %w", err)
 	}
+	// Every storage table carries an identity primary key, so a present
+	// storage table without an identity column means the target is not a
+	// bootstrapped SchemaBot storage schema, only one that shares table names
+	// with it — succeeding silently would report a load as unblocked while
+	// every sequence on the real target is still behind. Tables the target
+	// lacks entirely are not held to this: a newer binary embeds tables an
+	// older database has not converged yet.
+	if lacking := presentTablesWithoutIdentity(tables, missing, columns); len(lacking) > 0 {
+		return fmt.Errorf("storage tables %v in database %q schema %q have no identity column (%d of %d storage tables present); the connection does not point at a bootstrapped SchemaBot storage schema",
+			lacking, database, schemaName.String, len(tables)-len(missing), len(tables))
+	}
 
-	advanced := 0
-	skipped := 0
+	outcomeCounts := make(map[sequenceResyncOutcome]int)
 	for _, col := range columns {
 		newValue, outcome, err := advancePostgresIdentitySequence(ctx, db, col)
 		if err != nil {
 			return fmt.Errorf("resync identity column %s.%s: %w", col.table, col.column, err)
 		}
+		outcomeCounts[outcome]++
 		switch outcome {
 		case sequenceAdvanced:
-			advanced++
 			logger.Info("advanced identity sequence past stored maximum",
 				"table", col.table, "column", col.column, "sequence_value", newValue)
 		case sequenceSkippedEmptyTable:
-			skipped++
 			logger.Debug("identity column has no stored rows; sequence left untouched",
 				"table", col.table, "column", col.column)
 		case sequenceSkippedAlreadyAhead:
-			skipped++
 			logger.Debug("identity sequence already at or past stored maximum; left untouched",
 				"table", col.table, "column", col.column)
 		case sequenceSkippedDescending:
-			skipped++
 			logger.Warn("identity sequence is descending; resync skipped it — a stored-maximum resync only applies to ascending sequences",
 				"table", col.table, "column", col.column)
 		}
 	}
-	logger.Info("identity sequence resync summary",
-		"tables", len(tables), "examined", len(columns), "advanced", advanced, "skipped", skipped)
+	logger.Info("identity sequence resync complete",
+		"database", database, "schema", schemaName.String,
+		"advanced", outcomeCounts[sequenceAdvanced],
+		"skipped_empty", outcomeCounts[sequenceSkippedEmptyTable],
+		"skipped_already_ahead", outcomeCounts[sequenceSkippedAlreadyAhead],
+		"skipped_descending", outcomeCounts[sequenceSkippedDescending])
 	return nil
 }
 
-// postgresIdentityColumn names one identity column on a storage table.
+// postgresIdentityColumn names one identity column on a storage table,
+// carrying the schema the table was listed in so the acting queries can pin
+// it instead of resolving the bare table name through the search path.
 type postgresIdentityColumn struct {
+	schema string
 	table  string
 	column string
 }
@@ -98,11 +139,32 @@ const (
 	sequenceSkippedDescending
 )
 
+// presentTablesWithoutIdentity returns, in the embedded order, the storage
+// tables that exist in the target but yielded no identity column. Tables in
+// missing are absent from the target and are not reported.
+func presentTablesWithoutIdentity(tables, missing []string, columns []postgresIdentityColumn) []string {
+	absent := make(map[string]bool, len(missing))
+	for _, table := range missing {
+		absent[table] = true
+	}
+	hasIdentity := make(map[string]bool, len(columns))
+	for _, col := range columns {
+		hasIdentity[col.table] = true
+	}
+	var lacking []string
+	for _, table := range tables {
+		if !absent[table] && !hasIdentity[table] {
+			lacking = append(lacking, table)
+		}
+	}
+	return lacking
+}
+
 // postgresIdentityColumns lists every identity column on the given tables in
 // the connection's current schema, in a stable order.
 func postgresIdentityColumns(ctx context.Context, db *sql.DB, tables []string) ([]postgresIdentityColumn, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT table_name, column_name
+		SELECT table_schema, table_name, column_name
 		FROM information_schema.columns
 		WHERE table_schema = current_schema() AND is_identity = 'YES'
 		  AND table_name = ANY($1)
@@ -115,7 +177,7 @@ func postgresIdentityColumns(ctx context.Context, db *sql.DB, tables []string) (
 	var columns []postgresIdentityColumn
 	for rows.Next() {
 		var col postgresIdentityColumn
-		if err := rows.Scan(&col.table, &col.column); err != nil {
+		if err := rows.Scan(&col.schema, &col.table, &col.column); err != nil {
 			return nil, fmt.Errorf("scan identity column row: %w", err)
 		}
 		columns = append(columns, col)
@@ -133,12 +195,15 @@ func postgresIdentityColumns(ctx context.Context, db *sql.DB, tables []string) (
 // maximum, an empty table, and a descending sequence are left untouched.
 func advancePostgresIdentitySequence(ctx context.Context, db *sql.DB, col postgresIdentityColumn) (int64, sequenceResyncOutcome, error) {
 	// pg_get_serial_sequence parses its table argument as an SQL name — an
-	// unquoted mixed-case name is downcased — so the table is quoted. The
+	// unquoted mixed-case name is downcased — so the table is quoted, and it
+	// is schema-qualified so a same-named table earlier on the search path
+	// (pg_temp is always searched first) cannot shadow the storage table. The
 	// column argument is matched verbatim against attribute names and must
 	// stay unquoted.
+	qualifiedTable := quotePostgresIdentifier(col.schema) + "." + quotePostgresIdentifier(col.table)
 	var sequence sql.NullString
 	if err := db.QueryRowContext(ctx,
-		`SELECT pg_get_serial_sequence($1, $2)`, quotePostgresIdentifier(col.table), col.column,
+		`SELECT pg_get_serial_sequence($1, $2)`, qualifiedTable, col.column,
 	).Scan(&sequence); err != nil {
 		return 0, 0, fmt.Errorf("resolve backing sequence for identity column %s.%s: %w", col.table, col.column, err)
 	}
@@ -153,13 +218,15 @@ func advancePostgresIdentitySequence(ctx context.Context, db *sql.DB, col postgr
 		return 0, 0, fmt.Errorf("read increment of sequence %s for identity column %s.%s: %w",
 			sequence.String, col.table, col.column, err)
 	}
+	// The embedded storage schema only declares ascending identities; the
+	// guard covers a sequence altered by hand after bootstrap.
 	if increment < 0 {
 		return 0, sequenceSkippedDescending, nil
 	}
 
 	var storedMax sql.NullInt64
 	maxQuery := fmt.Sprintf(`SELECT MAX(%s) FROM %s`,
-		quotePostgresIdentifier(col.column), quotePostgresIdentifier(col.table))
+		quotePostgresIdentifier(col.column), qualifiedTable)
 	if err := db.QueryRowContext(ctx, maxQuery).Scan(&storedMax); err != nil {
 		return 0, 0, fmt.Errorf("read stored maximum of identity column %s.%s: %w", col.table, col.column, err)
 	}

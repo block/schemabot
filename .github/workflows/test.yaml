@@ -390,7 +390,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (checkout, Go, cache restore, image pulls and compose
+    # startup — measured between three and a half and four and a half minutes)
+    # plus the E2E_TEST_TIMEOUT passed to make on the Test step lands inside
+    # the job budget with room for the goroutine dump and the log-capture step:
+    # a hung test panics with its dump instead of the runner cancelling the job
+    # first.
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -416,7 +422,7 @@ jobs:
             --dockerfile deploy/local/Dockerfile.dev \
             --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
-        run: make test-e2e-mysql
+        run: make test-e2e-mysql E2E_TEST_TIMEOUT=10m
       - name: "Capture container logs on failure"
         if: failure()
         run: |
@@ -443,7 +449,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (including the server image build and compose startup)
+    # plus the E2E_TEST_TIMEOUT passed to make on the Test step lands inside
+    # the job budget: a hung test panics with its goroutine dump instead of
+    # the runner cancelling the job first.
+    timeout-minutes: 14
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -468,7 +478,7 @@ jobs:
             mysql:8.0 \
             --dockerfile deploy/local/Dockerfile.dev
       - name: "Test"
-        run: make test-e2e-grpc
+        run: make test-e2e-grpc E2E_TEST_TIMEOUT=10m
       - name: "Capture container logs on failure"
         if: failure()
         run: |
@@ -502,6 +512,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # Sized so setup (about two and a half minutes including the server image
+    # build and compose startup) plus the E2E_TEST_TIMEOUT passed to make on
+    # the Test step lands inside the job budget: a hung test panics with its
+    # goroutine dump instead of the runner cancelling the job first.
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -510,7 +524,7 @@ jobs:
           - shard: ordered
             run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability|BarrierReleaseBounded)$$
           - shard: failure-policy
-            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue)$$
+            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue|OnFailurePauseRelease)$$
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -535,7 +549,7 @@ jobs:
             mysql:8.0 \
             --dockerfile deploy/local/Dockerfile.dev
       - name: "Test"
-        run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}'
+        run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}' E2E_TEST_TIMEOUT=10m
       - name: "Show captured container logs on failure"
         if: failure()
         run: |
@@ -615,7 +629,13 @@ jobs:
     needs: [changes, e2e-vitess-matrix]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (about three and a half minutes including the image
+    # builds and compose startup) plus the E2E_TEST_TIMEOUT passed to make on
+    # the Test step (8m for these shards, not the 10m the other e2e jobs use)
+    # lands inside the job budget with room for the goroutine dump and the
+    # log-capture step: a hung test panics with its dump instead of the runner
+    # cancelling the job first.
+    timeout-minutes: 14
     strategy:
       fail-fast: false
       matrix:
@@ -669,13 +689,14 @@ jobs:
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
     # Sized so setup (checkout, Go, cache restore, minikube start, plus the
-    # script's own image build and deploy — about five minutes) plus go
-    # test's per-binary timeout inside the script can land inside the job
-    # budget: a hung test panics with its goroutine dump instead of the
-    # runner cancelling the job first — or, on a slow run, cancelling it
-    # during the script's exit-trap cleanup after the suite already passed.
-    # Matches the sibling e2e-k8s-etre job's budget.
-    timeout-minutes: 15
+    # script's own image build and deploy — measured at about four minutes)
+    # plus the E2E_TEST_TIMEOUT set on the Deploy and test step lands inside
+    # the job budget with room left for the goroutine dump, the script's exit
+    # trap, and the pod-log capture step: a hung test panics with its dump
+    # instead of the runner cancelling the job first. The dump is guaranteed
+    # only where the binary's own deadline lands inside the job's — an
+    # unusually slow setup can still push it out.
+    timeout-minutes: 17
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -709,6 +730,9 @@ jobs:
         env:
           E2E_K8S_NAMESPACE: schemabot-e2e
           KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-test.sh
       - name: "Pod logs on failure"
         if: failure()
@@ -729,7 +753,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Sized so setup (checkout, Go, cache restore, minikube start, plus the
+    # script's own build of both images and the deploy — typically a little
+    # over five minutes, but measured as high as six and a half) plus the
+    # E2E_TEST_TIMEOUT set on the Deploy and test step lands inside the job
+    # budget with room left for the goroutine dump, the script's exit trap,
+    # and the pod-log capture step: a hung test panics with its dump instead
+    # of the runner cancelling the job first. The budget is sized from the
+    # slowest setup seen, not the typical one, because the run that needs its
+    # pod logs is the one that must not lose them. The dump is guaranteed only
+    # where the binary's own deadline lands inside the job's — an unusually
+    # slow setup can still push it out.
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -761,6 +796,9 @@ jobs:
         # logs; the runner is ephemeral, so there is nothing to clean up after.
         env:
           KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-etre-test.sh
       - name: "Pod logs on failure"
         if: failure()
@@ -829,6 +867,9 @@ jobs:
         # logs; the runner is ephemeral, so there is nothing to clean up after.
         env:
           KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-vitess-test.sh
       - name: "Pod logs on failure"
         if: failure()
