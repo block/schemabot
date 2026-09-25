@@ -168,14 +168,15 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		HeadSHA:      schemaResult.HeadSHA,
 	}, templates.RenderPlanComment(commentData))
 
-	// When drift blocked the check but its record could not be persisted, the
-	// aggregate must not be recomputed from stale (possibly passing) stored rows.
-	// Post a failing aggregate carrying the drift block from the in-memory result
-	// so the gate still blocks closed. This is best-effort visibility: with the
-	// per-database row unstored, a later recompute has no durable drift row to
-	// read, so the store error is logged above and not treated as a safe update.
-	if drift.blocks() && checkErr != nil {
-		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{environment: drift.summary}, reviewTimeDeploymentDriftBlock)
+	// When drift blocked the check, or a rollout member still has work, but the
+	// record could not be persisted, the aggregate must not be recomputed from
+	// stale (possibly passing) stored rows. Post a failing aggregate from the
+	// in-memory result so the gate still blocks closed. This is best-effort
+	// visibility: with the per-database row unstored, a later recompute has no
+	// durable row to read, so the store error is logged above and not treated as
+	// a safe update.
+	if checkErr != nil && rolloutStillPending(drift) {
+		h.failClosedOnUnstoredRollout(ctx, client, repo, pr, schemaResult.HeadSHA, environment, drift)
 	} else if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
@@ -371,6 +372,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// so a failing aggregate can be posted from the in-memory drift result rather
 	// than letting the post-loop aggregate recompute from stale stored rows.
 	driftBlockUnstored := map[string]string{}
+	// Environments whose check record could not be persisted while a rollout
+	// member still has work (MG-12), kept for the same reason.
+	pendingWorkUnstored := map[string]string{}
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:    requestedBy,
 		Tenant:         tenant,
@@ -461,6 +465,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
 			if drift.blocks() {
 				driftBlockUnstored[env] = drift.summary
+			} else if drift.work.pending > 0 {
+				pendingWorkUnstored[env] = drift.work.summary()
 			}
 		}
 		if sha != "" {
@@ -514,6 +520,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"repo", repo,
 			"pr", pr,
 			"environments", len(driftBlockUnstored))
+	}
+	if len(pendingWorkUnstored) > 0 && multiEnvData.HeadSHA != "" {
+		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, pendingWorkUnstored)
+	} else if len(pendingWorkUnstored) > 0 {
+		h.logger.Warn("a rollout target still needs the change in one or more environments but no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
+			"repo", repo,
+			"pr", pr,
+			"environments", len(pendingWorkUnstored))
 	}
 
 	// Auto-plan: skip the comment only when there is genuinely nothing to show —

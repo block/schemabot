@@ -647,7 +647,9 @@ be planned is unknown work, never none. *Breaks if violated:* a PR merges green 
 lacks its schema change. *Enforced:* member work counted into the stored check state
 (`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
 in `pkg/api`); the rollout round the apply command and apply-confirm run before answering an empty
-primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`).
+primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); the failing
+aggregate published from that round when the stored check state cannot be written
+(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
 
 ## Apply state machine (ST)
 

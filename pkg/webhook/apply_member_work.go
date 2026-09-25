@@ -36,14 +36,35 @@ func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.Ins
 		"environment", environment, "action", actionName, "plan_id", planResp.PlanID,
 		"drift_blocked", outcome.blocks(), "targets_pending", outcome.work.pending, "targets", outcome.work.members,
 		"pending_targets", outcome.work.names)
-	if headSHA, err := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, outcome); err != nil {
-		h.logger.Error("failed to record the pending rollout on the check; the stored check state is left as it was",
-			"repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type,
+	headSHA, err := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, outcome)
+	switch {
+	case err != nil:
+		h.logger.Error("failed to record the pending rollout on the check; publishing a failing aggregate from the rollout round instead",
+			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"environment", environment, "error", err)
-	} else if headSHA != "" {
+		h.failClosedOnUnstoredRollout(ctx, client, repo, pr, schemaResult.HeadSHA, environment, outcome)
+	case headSHA != "":
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, pendingRolloutMessage(outcome))
+}
+
+// failClosedOnUnstoredRollout publishes a failing aggregate for an environment
+// whose plan check record could not be stored after the rollout round proved
+// its check must not pass. Refreshing the aggregate instead would recompute it
+// from the stored row, which can still be a pass recorded before the pending
+// work was found (MG-1, MG-12).
+func (h *Handler) failClosedOnUnstoredRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, environment string, outcome reviewDriftOutcome) {
+	if headSHA == "" {
+		h.logger.Warn("the pending rollout was not stored and no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
+			"repo", repo, "pr", pr, "environment", environment)
+		return
+	}
+	if outcome.blocks() {
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, map[string]string{environment: outcome.summary}, reviewTimeDeploymentDriftBlock)
+		return
+	}
+	h.postFailingAggregates(ctx, client, repo, pr, headSHA, map[string]string{environment: outcome.work.summary()})
 }
 
 // pendingRolloutMessage explains a refused apply to the operator. The drift

@@ -106,6 +106,14 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 // members hold schemas of their own.
 func setupE2ERolloutService(t *testing.T, dbName string, specs []deploymentSpec, planning api.MemberPlanning) *api.Service {
 	t.Helper()
+	return setupE2ERolloutServiceWithStorage(t, dbName, specs, planning, nil)
+}
+
+// setupE2ERolloutServiceWithStorage is setupE2ERolloutService with the
+// service's storage passed through wrapStorage, so a test can fault a store the
+// handler writes through. A nil wrapStorage uses the storage unchanged.
+func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []deploymentSpec, planning api.MemberPlanning, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
+	t.Helper()
 	ctx := t.Context()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -205,7 +213,11 @@ func setupE2ERolloutService(t *testing.T, dbName string, specs []deploymentSpec,
 		},
 	}
 
-	svc := api.New(st, serverConfig, ternClients, logger)
+	var svcStorage storage.Storage = st
+	if wrapStorage != nil {
+		svcStorage = wrapStorage(st)
+	}
+	svc := api.New(svcStorage, serverConfig, ternClients, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc
 }
