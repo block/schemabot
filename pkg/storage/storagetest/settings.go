@@ -47,6 +47,63 @@ func TestSettings(t *testing.T, h Harness) {
 		require.Equal(t, "updated_value", setting.Value)
 	})
 
+	t.Run("CompareAndSet", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A nil previous claims the key only while it is absent.
+		swapped, err := store.Settings().CompareAndSet(ctx, "cas_key", nil, "v1")
+		require.NoError(t, err)
+		require.True(t, swapped)
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", nil, "lost-race")
+		require.NoError(t, err)
+		require.False(t, swapped, "the key exists, so an insert-only write must lose")
+
+		// A matching previous advances the value; a stale previous does not.
+		current, err := store.Settings().Get(ctx, "cas_key")
+		require.NoError(t, err)
+		require.NotNil(t, current)
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", current, "v2")
+		require.NoError(t, err)
+		require.True(t, swapped)
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", current, "v3")
+		require.NoError(t, err)
+		require.False(t, swapped, "previous still names v1, which v2 replaced")
+		setting, err := store.Settings().Get(ctx, "cas_key")
+		require.NoError(t, err)
+		require.NotNil(t, setting)
+		require.Equal(t, "v2", setting.Value)
+
+		// Values are compared exactly: a case-only difference is a mismatch.
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", &storage.Setting{Key: "cas_key", Value: "V2"}, "v4")
+		require.NoError(t, err)
+		require.False(t, swapped)
+
+		// Writing the value the row already holds is a successful no-op.
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", setting, "v2")
+		require.NoError(t, err)
+		require.True(t, swapped)
+
+		// A stale previous loses even when the value it would write is the
+		// one already stored: the write did not happen, so it must not be
+		// reported as one.
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", &storage.Setting{Key: "cas_key", Value: "v1"}, "v2")
+		require.NoError(t, err)
+		require.False(t, swapped, "previous names v1, which the row no longer holds")
+
+		// A previous for a key that has since been deleted matches nothing.
+		require.NoError(t, store.Settings().Delete(ctx, "cas_key"))
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", setting, "v5")
+		require.NoError(t, err)
+		require.False(t, swapped)
+	})
+
+	t.Run("CompareAndSet_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Settings().CompareAndSet(t.Context(), "key", nil, "value")
+		require.Error(t, err)
+	})
+
 	t.Run("List", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
