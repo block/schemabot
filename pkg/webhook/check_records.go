@@ -88,6 +88,17 @@ func (w memberWork) summary() string {
 	return fmt.Sprintf("%d of %d targets need this change", w.pending, w.members)
 }
 
+// unstoredSummary is the failing aggregate's summary when the check record for
+// this work could not be stored. The work counts the primary, so a plan for a
+// single target with changes of its own lands here too, and names no count.
+func (w memberWork) unstoredSummary() string {
+	const unstored = "SchemaBot could not record this plan's result; re-run plan"
+	if w.members > 1 {
+		return unstored + " (" + w.summary() + ")"
+	}
+	return unstored
+}
+
 // blocks reports whether this outcome must fail the plan check closed.
 func (o reviewDriftOutcome) blocks() bool { return o.state == driftBlocked }
 

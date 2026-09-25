@@ -51,9 +51,10 @@ func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.Ins
 
 // failClosedOnUnstoredRollout publishes a failing aggregate for an environment
 // whose plan check record could not be stored after the rollout round proved
-// its check must not pass. Refreshing the aggregate instead would recompute it
-// from the stored row, which can still be a pass recorded before the pending
-// work was found (MG-1, MG-12).
+// its check must not pass: drift blocks, or some member has work, the primary
+// included. Refreshing the aggregate instead would recompute it from the stored
+// row, which can still be a pass recorded before the pending work was found
+// (MG-1, MG-12).
 func (h *Handler) failClosedOnUnstoredRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, environment string, outcome reviewDriftOutcome) {
 	if headSHA == "" {
 		h.logger.Warn("the pending rollout was not stored and no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
@@ -64,7 +65,7 @@ func (h *Handler) failClosedOnUnstoredRollout(ctx context.Context, client *ghcli
 		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, map[string]string{environment: outcome.summary}, reviewTimeDeploymentDriftBlock)
 		return
 	}
-	h.postFailingAggregates(ctx, client, repo, pr, headSHA, map[string]string{environment: outcome.work.summary()})
+	h.postFailingAggregates(ctx, client, repo, pr, headSHA, map[string]string{environment: outcome.work.unstoredSummary()})
 }
 
 // pendingRolloutMessage explains a refused apply to the operator. The drift

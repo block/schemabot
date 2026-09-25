@@ -34,6 +34,13 @@ import (
 // and returns the capture of what SchemaBot posts in response.
 func runRolloutCommand(t *testing.T, svc *api.Service, dbName, command string) *planFlowResult {
 	t.Helper()
+	return runRolloutWebhook(t, svc, dbName, buildWebhookRequest(t, webhookPayloadOpts{comment: command, isPR: true}, nil))
+}
+
+// runRolloutWebhook delivers one webhook to the rollout fixture and returns the
+// capture of what SchemaBot posts in response.
+func runRolloutWebhook(t *testing.T, svc *api.Service, dbName string, req *http.Request) *planFlowResult {
+	t.Helper()
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -51,7 +58,7 @@ func runRolloutCommand(t *testing.T, svc *api.Service, dbName, command string) *
 	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger)
 
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: command, isPR: true}, nil))
+	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 	return result
 }
@@ -133,6 +140,25 @@ func TestE2EConvergedPrimaryWithPendingTargetBlocksCheckAndApply(t *testing.T) {
 	check = rolloutCheck(t, svc, dbName)
 	assert.Equal(t, "action_required", check.Conclusion, "the refused apply leaves the check pending")
 	assert.True(t, check.HasChanges)
+}
+
+// The same rollout, planned automatically when the PR opens. The primary's own
+// plan is empty, but the check is pending on us, so auto-plan must post its
+// comment rather than skip it as a no-op: a check that is not passing always
+// has a comment on the PR explaining it.
+func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
+	dbName := "webhook_rollout_autoplan"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+
+	result := runRolloutWebhook(t, svc, dbName, buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action: "opened", headSHA: "abc123", headRef: "feature-branch",
+	}, nil))
+
+	awaitCommentContaining(t, result, "Planned separately for all 2 targets")
+	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }
 
 // Two targets expected to mirror each other, where the reviewed primary (eu)
@@ -256,20 +282,27 @@ func (s *planResultFailingCheckStore) UpsertPlanResult(context.Context, *storage
 // scoped to one environment, a plan across every environment, and a refused
 // apply each store the record on a path of their own, so all three are covered.
 func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
+	rollout := []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}
+	pending := "(1 of 2 targets need this change)"
 	for _, tc := range []struct {
 		name    string
 		dbName  string
 		command string
+		specs   []deploymentSpec
+		summary string
 	}{
-		{name: "plan one environment", dbName: "webhook_rollout_unstored_plan", command: "schemabot plan -e " + driftEnv},
-		{name: "plan every environment", dbName: "webhook_rollout_unstored_plan_all", command: "schemabot plan"},
-		{name: "apply", dbName: "webhook_rollout_unstored_apply", command: "schemabot apply -e " + driftEnv},
+		{name: "plan one environment", dbName: "webhook_rollout_unstored_plan", command: "schemabot plan -e " + driftEnv, specs: rollout, summary: pending},
+		{name: "plan every environment", dbName: "webhook_rollout_unstored_plan_all", command: "schemabot plan", specs: rollout, summary: pending},
+		{name: "apply", dbName: "webhook_rollout_unstored_apply", command: "schemabot apply -e " + driftEnv, specs: rollout, summary: pending},
+		// A single target with work of its own fails closed the same way, and
+		// the summary names no target count.
+		{name: "plan one target", dbName: "webhook_rollout_unstored_single", command: "schemabot plan -e " + driftEnv, specs: rollout[1:], summary: "could not record this plan's result; re-run plan"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := setupE2ERolloutServiceWithStorage(t, tc.dbName, []deploymentSpec{
-				{name: "eu", liveSchema: usersWithEmailSchema},
-				{name: "us", liveSchema: usersBaseSchema},
-			}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+			svc := setupE2ERolloutServiceWithStorage(t, tc.dbName, tc.specs, api.PlanIndependent, func(st storage.Storage) storage.Storage {
 				return &planResultFailingStorage{Storage: st}
 			})
 			require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
@@ -283,7 +316,7 @@ func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 				return run.Conclusion == checkConclusionFailure
 			})
 			require.NotNil(t, run.Output)
-			assert.Contains(t, run.Output.Summary, "1 of 2 targets need this change")
+			assert.Contains(t, run.Output.Summary, tc.summary)
 			requireNoApplies(t, svc, tc.dbName)
 		})
 	}
