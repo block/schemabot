@@ -636,6 +636,19 @@ gating commit saying so. *Enforced:* one uncached head read shared by the publis
 currency check on the terminal check refresh (`pkg/webhook/handler.go`,
 `pkg/webhook/check_publisher.go`).
 
+### MG-12: A check passes only when no rollout member has work
+
+A plan check passes only when every rollout member of the database's environment is known to have
+nothing to apply. The reviewed primary's plan speaks for the primary alone: a member planned against
+a schema of its own can still need the change, and a member expected to mirror the primary can have
+drifted from it. A primary already at the desired schema is therefore not a converged rollout, and
+every path that records a check from a plan plans the other members first. A member that could not
+be planned is unknown work, never none. *Breaks if violated:* a PR merges green while a target still
+lacks its schema change. *Enforced:* member work counted into the stored check state
+(`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
+in `pkg/api`); the rollout round the apply command and apply-confirm run before answering an empty
+primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`).
+
 ## Apply state machine (ST)
 
 Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and

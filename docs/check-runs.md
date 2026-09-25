@@ -902,8 +902,10 @@ then plans the requested environment. `schemabot plan` without an environment
 does the same reconciliation, then plans all configured environments. The plan
 result writes per-database records and updates the aggregate.
 
-If the plan finds no changes, that environment's record becomes `success`. If it
-finds changes, the record becomes `action_required`. If planning fails, SchemaBot
+If the plan finds no changes on any rollout member, that environment's record
+becomes `success`. If it finds changes on any member, the record becomes
+`action_required`, including when the reviewed primary is already at the desired
+schema and only another target still needs the change (MG-12). If planning fails, SchemaBot
 posts a failure comment; when every environment in a multi-environment plan
 fails, it also publishes a failing aggregate check.
 
@@ -913,9 +915,14 @@ fails, it also publishes a failing aggregate check.
 exist and pass safety checks, SchemaBot acquires a lock, posts a confirmation
 comment, stores `action_required`, and updates the aggregate.
 
-If the apply command finds no changes, SchemaBot posts a no-change plan comment
-and does not acquire a lock. A later plan on the current head records the passing
-state if the stored check still needs to be updated.
+If the apply command finds no changes, SchemaBot plans the environment's other
+rollout members before answering. When none of them has work either, it posts a
+no-change plan comment and does not acquire a lock. When the reviewed primary is
+already at the desired schema but another target still needs the change, or a
+target could not be confirmed, the apply is refused: nothing runs, and the
+record stays `action_required` (or `failure` for drift) until every target has
+the change. A PR apply cannot yet run a change on targets other than the
+reviewed one. Apply-confirm answers an empty re-plan the same way.
 
 ### Apply confirmed
 

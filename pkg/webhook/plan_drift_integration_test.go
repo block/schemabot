@@ -97,6 +97,15 @@ func driftDSN(t *testing.T, dbName string) string {
 // 0). Returns the service; physical databases are dropped on cleanup.
 func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentSpec) *api.Service {
 	t.Helper()
+	return setupE2ERolloutService(t, dbName, specs, api.PlanMirrored)
+}
+
+// setupE2ERolloutService is setupE2EReviewDriftService with the environment's
+// member planning under test control. Independent planning spells each
+// deployment's routing as a targets list, the shape that tells SchemaBot the
+// members hold schemas of their own.
+func setupE2ERolloutService(t *testing.T, dbName string, specs []deploymentSpec, planning api.MemberPlanning) *api.Service {
+	t.Helper()
 	ctx := t.Context()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -169,7 +178,12 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = client.Close() })
 
-		deployments[spec.name] = api.DeploymentTarget{Target: dbName + "-" + spec.name + "-target"}
+		target := dbName + "-" + spec.name + "-target"
+		if planning == api.PlanIndependent {
+			deployments[spec.name] = api.DeploymentTarget{Targets: []string{target}}
+		} else {
+			deployments[spec.name] = api.DeploymentTarget{Target: target}
+		}
 		order = append(order, spec.name)
 		ternClients[spec.name+"/"+driftEnv] = client
 	}
