@@ -80,6 +80,22 @@ func TestApplyChangeCountsSummary(t *testing.T) {
 	assert.Equal(t, "Changes: 2 created, 1 altered, 2 dropped, 2 VSchema updates.", countTableProgressChanges(tables).summary())
 }
 
+// Index builds and drops are counted in their own clauses whether the change
+// type arrives in the REST form or the proto form, so an apply that only ran
+// index work does not complete with an empty summary and a table that also
+// gained an index is not counted as altered twice.
+func TestApplyChangeCountsSummaryNamesIndexWork(t *testing.T) {
+	tables := []templates.TableProgress{
+		{TableName: "orders", ChangeType: "alter"},
+		{TableName: "orders", ChangeType: "create_index"},
+		{TableName: "events", ChangeType: "CHANGE_TYPE_CREATE_INDEX"},
+		{TableName: "orders", ChangeType: "drop_index"},
+	}
+
+	assert.Equal(t, "Changes: 1 altered, 2 indexes created, 1 index dropped.", countTableProgressChanges(tables).summary())
+	assert.Equal(t, "Changes: 1 index created.", countTableProgressChanges(tables[2:3]).summary())
+}
+
 func TestApplyChangeCountsSummaryVSchemaOnly(t *testing.T) {
 	tables := []templates.TableProgress{{ChangeType: "vschema_update"}}
 
