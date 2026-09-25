@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -134,4 +135,75 @@ func TestExecuteApplySequential_CancelledDriveLeavesApplyActive(t *testing.T) {
 	assert.True(t, state.IsState(stored.State, state.Apply.Running),
 		"the apply stays running so a peer driver reclaims it; stored state was %q", stored.State)
 	assert.Nil(t, stored.CompletedAt, "the apply is not finished, so it is not stamped completed")
+}
+
+// countingEngine records whether a drive reached the engine.
+type countingEngine struct {
+	engine.Engine
+	applyCalls int
+}
+
+func (e *countingEngine) Name() string { return "counting" }
+
+func (e *countingEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applyCalls++
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func (e *countingEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{State: engine.StateCompleted}, nil
+}
+
+// A drive records running before it hands any work to the engine. When that
+// write fails because the apply is no longer this driver's, whether another
+// writer already finished it or another driver took the lease, the drive stands
+// down without starting a table: work it started could never be recorded
+// against the apply.
+func TestExecuteApply_StandsDownWhenStartWriteEndsTheDrive(t *testing.T) {
+	refusals := map[string]error{
+		"reopen refused": fmt.Errorf("apply apply-1 is completed; update to running would reopen it: %w", storage.ErrApplyReopenRefused),
+		"lease lost":     fmt.Errorf("apply apply-1 lease taken by another driver: %w", storage.ErrApplyLeaseLost),
+	}
+	drives := map[string]func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task){
+		"sequential": func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+			c.executeApplySequential(ctx, apply, tasks, &storage.Plan{}, nil)
+		},
+		"grouped": func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+			plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"orders": {}}}
+			c.executeGroupedApply(ctx, apply, tasks, plan, nil, false)
+		},
+	}
+	for driveName, drive := range drives {
+		for refusalName, refusal := range refusals {
+			t.Run(driveName+"/"+refusalName, func(t *testing.T) {
+				task := &storage.Task{
+					ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+					Database: "orders", Namespace: "orders", TableName: "line_items", State: state.Task.Pending,
+					DDL: "ALTER TABLE line_items ADD COLUMN sku VARCHAR(64)",
+				}
+				apply := &storage.Apply{
+					ID: 1, ApplyIdentifier: "apply-1", Database: "orders",
+					Environment: "staging", State: state.Apply.Pending,
+				}
+				eng := &countingEngine{}
+				client := &LocalClient{
+					config:            LocalConfig{Database: "orders"},
+					customEngine:      eng,
+					heartbeatInterval: time.Hour,
+					storage: &exactProgressStorage{
+						applies:         &snapshotApplyStore{stored: *apply, err: refusal},
+						tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+						controlRequests: &testControlRequestStore{},
+						logs:            &mockApplyLogStore{},
+					},
+					logger: slog.Default(),
+				}
+
+				drive(client, t.Context(), apply, []*storage.Task{task})
+
+				assert.Zero(t, eng.applyCalls, "no engine work starts once the apply is no longer this driver's")
+				assert.Equal(t, state.Task.Pending, task.State, "the task is left for whoever owns the apply")
+			})
+		}
+	}
 }

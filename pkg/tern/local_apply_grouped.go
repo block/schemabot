@@ -76,6 +76,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	apply.StartedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		if applyWriteEndsDrive(err) {
+			logger.Warn("apply is no longer this driver's to run; grouped drive will stand down before calling the engine",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return
+		}
 		logger.Error("failed to set started_at", append(apply.MutableLogAttrs(), "error", err)...)
 	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {

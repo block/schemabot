@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -1088,6 +1089,18 @@ func deriveOverallState(tasks []*storage.Task) string {
 // Returns empty string if the event is informational (no state transition).
 func deriveApplyPhase(event engine.ApplyEvent) string {
 	return event.NewState
+}
+
+// applyWriteEndsDrive reports whether a failed apply write means this driver no
+// longer owns the apply's outcome: another driver took the lease, or storage
+// refused to reopen an apply another writer already finished. The causes
+// differ, but either way engine work started after the write would run on
+// behalf of an apply this driver can no longer record.
+func applyWriteEndsDrive(err error) bool {
+	if errors.Is(err, storage.ErrApplyLeaseLost) {
+		return true
+	}
+	return errors.Is(err, storage.ErrApplyReopenRefused)
 }
 
 // applyEventStateTransition updates an apply's state based on an engine event.

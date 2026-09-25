@@ -1076,6 +1076,18 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	if err != nil {
 		return err
 	}
+	// The whole write retries on a transient conflict. On PostgreSQL a writer
+	// that finishes the apply after this transaction's snapshot surfaces as a
+	// serialization failure rather than as a row the guard refused; the retry
+	// takes a fresh snapshot, sees the finished row, and refuses it as such.
+	return withLockRetry(ctx, s.classifier, fmt.Sprintf("update apply %d", apply.ID), func() error {
+		return s.updateOnce(ctx, apply, lease, hasLease)
+	})
+}
+
+// updateOnce runs one attempt of Update in its own transaction.
+func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease storage.ApplyLease, hasLease bool) error {
+	var err error
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
 	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
