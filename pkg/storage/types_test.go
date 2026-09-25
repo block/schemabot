@@ -584,3 +584,17 @@ func TestDirectExecutionPolicyEngineMetadata(t *testing.T) {
 	}, (&DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000}).EngineMetadata(),
 		"an unset lock bound leaves the engine's own default in effect")
 }
+
+// Component state is recognised by its key namespace alone, so a repository
+// name that happens to contain the prefix text is not mistaken for it and an
+// operator key that merely resembles the prefix is not hidden.
+func TestIsComponentStateSettingKey(t *testing.T) {
+	assert.True(t, IsComponentStateSettingKey(WebhookReconcileScanCursorSettingKeyPrefix+"octo/payments"))
+	assert.True(t, IsComponentStateSettingKey(WebhookReconcileScanCursorSettingKeyPrefix),
+		"a cursor row with an empty repository is still the reconciler's row, not an operator's")
+	assert.False(t, IsComponentStateSettingKey("webhook_reconcile_scan_cursor"),
+		"without the separator the key is an operator's, whatever it is named")
+	assert.False(t, IsComponentStateSettingKey("spirit_debug_logs"))
+	assert.False(t, IsComponentStateSettingKey("octo/"+WebhookReconcileScanCursorSettingKeyPrefix+"repo"),
+		"the namespace is a prefix, not a substring")
+}
