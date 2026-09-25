@@ -4028,6 +4028,69 @@ func TestProgressByApplyIDDisplaysStoredStateNotLiveProto(t *testing.T) {
 		"displayed state must come from the stored apply state, not the live engine proto")
 }
 
+func TestProgressByApplyIDOverlaysTaskTimestampsByCanonicalStatement(t *testing.T) {
+	// A deployment's progress projection spells each statement as its own
+	// engine emitted it, qualified with its own physical schema, while the
+	// stored task rows carry the reviewed text. The per-table timestamps live
+	// only on the task rows, so each projected statement must find its task by
+	// canonical form: two statements on one table each get their own
+	// timestamps, and a projected statement that is a different change on
+	// that table gets none rather than a sibling's.
+	started := time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)
+	completed := started.Add(2 * time.Minute)
+	indexStarted := started.Add(3 * time.Minute)
+	const (
+		reviewedCreate = `CREATE TABLE "app-region-a".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		reviewedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-a".recall USING btree (consumer_uuid)`
+		renderedCreate = `CREATE TABLE "app-region-b".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		renderedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall USING btree (consumer_uuid)`
+		renderedOther  = `CREATE INDEX idx_recall_agency ON "app-region-b".recall USING btree (agency_id)`
+	)
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-canon",
+			State:   ternv1.State_STATE_RUNNING,
+			Tables: []*ternv1.TableProgress{
+				{Namespace: "app", TableName: "recall", Ddl: renderedCreate, Status: state.Task.Completed, PercentComplete: 100},
+				{Namespace: "app", TableName: "recall", Ddl: renderedIndex, Status: state.Task.Running, PercentComplete: 40},
+				{Namespace: "app", TableName: "recall", Ddl: renderedOther, Status: state.Task.Pending},
+			},
+		},
+	}
+	apply := activeTestApply("apply-canon-overlay")
+	apply.ExternalID = "remote-apply-canon"
+	apply.DatabaseType = storage.DatabaseTypePostgres
+	tasks := []*storage.Task{
+		{ID: 1, TaskIdentifier: "task-create", ApplyID: apply.ID, Namespace: "app", TableName: "recall", DDL: reviewedCreate, State: state.Task.Completed, StartedAt: &started, CompletedAt: &completed},
+		{ID: 2, TaskIdentifier: "task-index", ApplyID: apply.ID, Namespace: "app", TableName: "recall", DDL: reviewedIndex, State: state.Task.Running, StartedAt: &indexStarted},
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, tasks)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-canon-overlay", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Tables, 3)
+
+	assert.Equal(t, renderedCreate, resp.Tables[0].DDL, "the projection keeps the deployment's own spelling")
+	assert.Equal(t, started.Format(time.RFC3339), resp.Tables[0].StartedAt)
+	assert.Equal(t, completed.Format(time.RFC3339), resp.Tables[0].CompletedAt)
+
+	assert.Equal(t, renderedIndex, resp.Tables[1].DDL)
+	assert.Equal(t, indexStarted.Format(time.RFC3339), resp.Tables[1].StartedAt)
+	assert.Empty(t, resp.Tables[1].CompletedAt)
+
+	assert.Equal(t, renderedOther, resp.Tables[2].DDL)
+	assert.Empty(t, resp.Tables[2].StartedAt, "a different change on the table must not borrow a sibling's timestamps")
+	assert.Empty(t, resp.Tables[2].CompletedAt)
+}
+
 func TestProgressByApplyIDOnlySendsApplyIDAndEnvironment(t *testing.T) {
 	// Remote progress lookups use the apply ID as the stable routing key. The
 	// data plane should not need database routing hints to interpret that ID.

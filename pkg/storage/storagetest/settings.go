@@ -84,6 +84,13 @@ func TestSettings(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.True(t, swapped)
 
+		// A stale previous loses even when the value it would write is the
+		// one already stored: the write did not happen, so it must not be
+		// reported as one.
+		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", &storage.Setting{Key: "cas_key", Value: "v1"}, "v2")
+		require.NoError(t, err)
+		require.False(t, swapped, "previous names v1, which the row no longer holds")
+
 		// A previous for a key that has since been deleted matches nothing.
 		require.NoError(t, store.Settings().Delete(ctx, "cas_key"))
 		swapped, err = store.Settings().CompareAndSet(ctx, "cas_key", setting, "v5")

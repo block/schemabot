@@ -245,11 +245,12 @@ func WithWebhookReconcileSynthesis() HandlerOption {
 // maxPages is the per-repository page budget of one reconcile pass and
 // lookback is how far back in update time the scan covers. Raising the budget
 // or shortening the lookback is the remedy when the scan is chronically
-// truncated (see the reconcile_scan_truncated_total metric). A non-positive
-// value leaves the corresponding default in place.
+// truncated (see the reconcile_scan_truncated_total metric). A budget below
+// MinWebhookReconcileMaxPages or a non-positive lookback leaves the
+// corresponding default in place.
 func WithWebhookReconcileScanBounds(maxPages int, lookback time.Duration) HandlerOption {
 	return func(h *Handler) {
-		if maxPages > 0 {
+		if maxPages >= MinWebhookReconcileMaxPages {
 			h.webhookReconcileMaxPages = maxPages
 		}
 		if lookback > 0 {

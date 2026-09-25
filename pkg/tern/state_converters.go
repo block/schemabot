@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -136,68 +136,16 @@ func storageStateToProto(ts string) ternv1.State {
 	}
 }
 
-// changeTypeToProto converts a ddl.StatementType to the proto ChangeType enum.
-func changeTypeToProto(op ddl.StatementType) ternv1.ChangeType {
-	switch op {
-	case ddl.StatementCreateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case ddl.StatementCreateIndex:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
-	case ddl.StatementAlterTable:
-		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case ddl.StatementDropTable:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP
-	case ddl.StatementDropIndex:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
-	case ddl.StatementRenameTable:
-		return ternv1.ChangeType_CHANGE_TYPE_RENAME
-	case ddl.StatementTruncateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_TRUNCATE
-	case ddl.StatementCreateView:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW
-	default:
-		return ternv1.ChangeType_CHANGE_TYPE_OTHER
-	}
-}
-
-// ddlActionToProtoChangeType converts a task's DDLAction string to a proto ChangeType.
-// Handles vschema_update which doesn't come from Spirit's statement parser.
-func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
-	switch action {
-	case "vschema_update":
-		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
-	default:
-		return changeTypeToProto(ddl.OpToStatementType(action))
-	}
-}
-
 // protoChangeTypeToDDLAction converts a proto ChangeType back to the lowercase
 // DDLAction string used in storage. It is the inverse of
-// ddlActionToProtoChangeType and is used to rebuild a plan's table changes from
-// a dispatch request on a deployment that did not plan locally.
+// ternconv.OpToChangeType and is used to rebuild a plan's table changes from
+// a dispatch request on a deployment that did not plan locally. Unmapped values
+// use "unknown" so callers can recover the action from the authoritative DDL.
 func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(ddl.StatementDropTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
-		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
-	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
-		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
-		return ddl.StatementTypeToOp(ddl.StatementCreateView)
-	default:
-		return "unknown"
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
+	return "unknown"
 }
 
 // filterTasksByApply returns only tasks belonging to the specified apply, sorted by ID (execution order).

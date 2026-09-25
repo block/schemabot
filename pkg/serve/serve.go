@@ -1484,8 +1484,9 @@ func webhookReconcileSynthesisOptions(logger *slog.Logger) []webhook.HandlerOpti
 }
 
 // webhookReconcileScanBoundsOptions returns the handler option sizing the
-// reconciler's missing-delivery scan from WEBHOOK_RECONCILE_MAX_PAGES (a
-// positive integer page budget per repository per pass) and
+// reconciler's missing-delivery scan from WEBHOOK_RECONCILE_MAX_PAGES (an
+// integer page budget per repository per pass, at least
+// webhook.MinWebhookReconcileMaxPages) and
 // WEBHOOK_RECONCILE_LOOKBACK (a positive Go duration such as 24h). Either may
 // be set alone; an unset variable keeps the package default. Unlike the kill
 // switches above, a malformed value here has no safe direction to fail in —
@@ -1509,9 +1510,9 @@ func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookbac
 		case err != nil:
 			logger.Error("invalid WEBHOOK_RECONCILE_MAX_PAGES value; the default reconcile page budget stays in force",
 				"value", value, "error", err)
-		case parsed <= 0:
-			logger.Error("WEBHOOK_RECONCILE_MAX_PAGES must be a positive page count; the default reconcile page budget stays in force",
-				"value", value)
+		case parsed < webhook.MinWebhookReconcileMaxPages:
+			logger.Error("WEBHOOK_RECONCILE_MAX_PAGES is below the smallest page budget a pass can split between its fresh walk and resumed scan; the default reconcile page budget stays in force",
+				"value", value, "min_pages", webhook.MinWebhookReconcileMaxPages)
 		default:
 			maxPages = parsed
 		}

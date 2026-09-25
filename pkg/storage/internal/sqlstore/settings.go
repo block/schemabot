@@ -96,8 +96,14 @@ func (s *settingsStore) CompareAndSet(ctx context.Context, key string, previous 
 	}
 	// RowsAffected==0 is ambiguous: under MySQL's default changed-rows
 	// semantics a matched row reports zero affected rows when the stored value
-	// already equals the new one. Re-read to tell "already at value" from
-	// "another writer moved it".
+	// already equals the new one. That reading is only possible when the
+	// caller is rewriting the value it matched on; a write that would have
+	// changed the row affects it under either semantics, so zero rows there
+	// means the predicate did not match. Re-read to tell "already at value"
+	// from "another writer moved it".
+	if previous.Value != value {
+		return false, nil
+	}
 	current, err := s.Get(ctx, key)
 	if err != nil {
 		return false, fmt.Errorf("re-read setting %s after compare-and-set matched no row: %w", key, err)
