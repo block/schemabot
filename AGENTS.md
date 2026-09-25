@@ -354,11 +354,14 @@ When the upstream fix is right but cannot wait for a release, land the smallest 
 
 ### Vitess Dependency
 
-- This project uses a fork of Vitess at [`github.com/block/vitess`](https://github.com/block/vitess), branch `release-23.0`, with per-shard sidecar database support for vtcombo and a MySQL topology server for Strata support.
-- The fork is referenced via a `replace` directive in `go.mod`. When updating, point to the latest commit on `release-23.0` (not `main`).
-- The fork adds two features on top of upstream Vitess v23.0.3:
-  - `--per-shard-sidecar` flag for vtcombo/vttestserver, which gives each shard its own `_vt_{keyspace}_{shard}` sidecar database — required for online DDL and VReplication to work correctly in multi-shard test environments.
+- This project uses a fork of Vitess at [`github.com/block/vitess`](https://github.com/block/vitess), branch `release-24.0`, with per-shard sidecar database support for vtcombo and a MySQL topology server for Strata support.
+- The fork is referenced via a `replace` directive in `go.mod`. When updating, point to the latest commit on `release-24.0` (not `main`).
+- `e2e/consumermodule/go.mod` carries its own copy of that replace — replaces do not propagate across module boundaries — so bump both together. `TestReplaceDirectivesMirrorParent` fails if they drift.
+- The fork adds four changes on top of upstream Vitess release-24.0. Only the first is one schemabot links (via `go/vt/vttest`); the rest ship in the fork regardless, so they are still part of what a bump brings in:
+  - vtcombo VReplication/OnlineDDL support, including the `--per-shard-sidecar` flag for vtcombo/vttestserver, which gives each shard its own `_vt_{keyspace}_{shard}` sidecar database — required for online DDL and VReplication to work correctly in multi-shard test environments.
   - A MySQL-backed topology server implementation for Strata support.
+  - The `ALLOW_CROSS_SHARD` vtgate query directive, which changes vtgate planning behaviour.
+  - GHCR image publishing and arm64 vttestserver builds — this is where the `ghcr.io/block/vitess/vttestserver` image `pkg/localscale` pulls comes from.
 
 ### Storage Schema (Self-Bootstrapping)
 
