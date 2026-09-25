@@ -705,7 +705,8 @@ func TestExecutionVerdicts_RecordMatchesPlan(t *testing.T) {
 }
 
 // A statement the engine runs on its default path gets no verdict: an ALTER
-// the engine accepts is recorded with an empty mode.
+// the engine accepts is recorded with an empty mode, even when the change
+// still carries the verdict an earlier target recorded for it.
 func TestExecutionVerdicts_AcceptedAlterHasNoVerdict(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	dropTablesOnCleanup(t, db, "direct_accepted")
@@ -719,6 +720,9 @@ func TestExecutionVerdicts_AcceptedAlterHasNoVerdict(t *testing.T) {
 		Table:     "direct_accepted",
 		Operation: ddl.StatementAlterTable,
 		DDL:       "ALTER TABLE `direct_accepted` ADD COLUMN `note` varchar(64)",
+		// The verdict another shard primary recorded for the same change.
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    "refused on another target",
 	}
 	require.NoError(t, verdicts.Record(t.Context(), &change))
 	assert.Empty(t, change.ExecutionMode)
@@ -738,10 +742,14 @@ func TestExecutionVerdicts_UnreadableTableFails(t *testing.T) {
 		Table:     "direct_absent",
 		Operation: ddl.StatementAlterTable,
 		DDL:       "ALTER TABLE `direct_absent` DROP PRIMARY KEY",
+		// The verdict another shard primary recorded for the same change.
+		ExecutionMode: engine.ExecutionModeDirect,
+		ModeReason:    "within bound on another target",
 	}
 	err = verdicts.Record(t.Context(), &change)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `execution verdict for table "direct_absent"`)
 	assert.Contains(t, err.Error(), "read current definition")
 	assert.Empty(t, change.ExecutionMode)
+	assert.Empty(t, change.ModeReason)
 }

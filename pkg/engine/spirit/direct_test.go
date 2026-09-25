@@ -145,6 +145,8 @@ func TestNewExecutionVerdicts_RejectsBadInput(t *testing.T) {
 // Only an ALTER can be refused, so any other statement is left on the default
 // path without reading the target. The DSN here points nowhere, so recording
 // a verdict for a CREATE or DROP succeeds only because no connection is made.
+// Each change starts out carrying a verdict an earlier target recorded, which
+// the call must clear.
 func TestExecutionVerdicts_NonAlterNeedsNoTarget(t *testing.T) {
 	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{
 		DSN:      "root:nopass@tcp(127.0.0.1:1)/orders_db",
@@ -154,8 +156,8 @@ func TestExecutionVerdicts_NonAlterNeedsNoTarget(t *testing.T) {
 	defer verdicts.Close()
 
 	for _, change := range []engine.TableChange{
-		{Table: "orders", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
-		{Table: "orders", Operation: ddl.StatementDropTable, DDL: "DROP TABLE `orders`"},
+		{Table: "orders", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "refused on another target"},
+		{Table: "orders", Operation: ddl.StatementDropTable, DDL: "DROP TABLE `orders`", ExecutionMode: engine.ExecutionModeDirect, ModeReason: "within bound on another target"},
 	} {
 		require.NoError(t, verdicts.Record(t.Context(), &change), change.DDL)
 		assert.Empty(t, change.ExecutionMode, change.DDL)

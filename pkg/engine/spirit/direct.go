@@ -306,7 +306,14 @@ func (e *Engine) NewExecutionVerdicts(creds *engine.Credentials) (*ExecutionVerd
 // the apply's routing reads it. A change the engine runs on its default path
 // is left with an empty verdict, and so is every statement other than an
 // ALTER, since only an ALTER can be refused.
+//
+// Every call replaces the whole verdict change carries. A verdict belongs to
+// one target, so a change judged against several in turn, such as one shard
+// primary after another, must not keep a mode an earlier target set when a
+// later one accepts the statement or cannot be judged.
 func (v *ExecutionVerdicts) Record(ctx context.Context, change *engine.TableChange) error {
+	change.ExecutionMode = ""
+	change.ModeReason = ""
 	if !verdictApplies(change) {
 		return nil
 	}
