@@ -1299,6 +1299,79 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "staging", progressReq.Environment)
 }
 
+// A stored task's statement is the input to its next dispatch, not only what
+// the operator surfaces render. A task on a non-primary deployment that took
+// that deployment's own spelling of its reviewed statement during a progress
+// tick, then paused in a retryable failure, is re-dispatched to the same
+// deployment carrying the adopted spelling rather than the primary's reviewed
+// text — the spelling is that deployment's own and has been proven the same
+// change (RV-1).
+func TestGRPCClient_ResumeApplyRedispatchesAdoptedStatementRendering(t *testing.T) {
+	const adopted = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall USING btree (consumer_uuid)`
+	server := &capturingTernServer{
+		remoteApplyID: "remote-redispatched-recall",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "app",
+			TableName:       "recall",
+			Ddl:             adopted,
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              81,
+		ApplyIdentifier: "apply-region-b-retry",
+		PlanID:          99,
+		Database:        "app",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "region-b",
+		State:           state.Apply.Pending,
+	}
+	task := &storage.Task{
+		ID:             82,
+		TaskIdentifier: "task-index-recall",
+		ApplyID:        apply.ID,
+		Namespace:      "app",
+		TableName:      "recall",
+		DDL:            adopted,
+		DDLAction:      "create",
+		State:          state.Task.FailedRetryable,
+		ErrorMessage:   "connection reset",
+	}
+	tasks := &mockTaskStore{tasks: []*storage.Task{task}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   tasks,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-region-b",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApply(ctx, apply))
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the retryable task to be re-dispatched to remote Tern")
+	assert.Equal(t, "app", req.Database)
+	assert.Equal(t, "app", req.Target)
+	assert.Equal(t, "region-b", req.Environment)
+	require.Len(t, req.DdlChanges, 1)
+	assert.Equal(t, adopted, req.DdlChanges[0].Ddl)
+	assert.Equal(t, "recall", req.DdlChanges[0].TableName)
+
+	require.NotEmpty(t, tasks.updated, "expected the retryable task to be reset before dispatch")
+	reset := tasks.updated[0]
+	assert.Equal(t, state.Task.Pending, reset.State)
+	assert.Equal(t, 1, reset.Attempt)
+	assert.Empty(t, reset.ErrorMessage)
+	assert.Equal(t, adopted, reset.DDL)
+}
+
 // A member deployment re-plans the schema files it is handed, against its own
 // catalog, before it applies them. The reviewed `ignore_tables` has to travel
 // with the dispatch for that re-plan to reach the same verdict: a table the
@@ -6484,7 +6557,7 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksMatchesDeploymentRenderingAndA
 }
 
 func TestRemoteStatementRenderingKeepsReviewedTextUnlessProvenSameChange(t *testing.T) {
-	canon, err := StatementCanonicalizerForDatabaseType("postgres")
+	canon, err := StatementCanonicalizerForDatabaseType("postgres", slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 	stored := &storage.Task{Namespace: "app", TableName: "recall", DDL: `CREATE INDEX idx_recall_consumer_uuid ON "app-region-a".recall (consumer_uuid)`}
 

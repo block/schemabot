@@ -4031,7 +4031,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	now time.Time,
 ) error {
 	logger := c.applyLogger(storedApply)
-	canon, err := StatementCanonicalizerForDatabaseType(storedApply.DatabaseType)
+	canon, err := StatementCanonicalizerForDatabaseType(storedApply.DatabaseType, logger)
 	if err != nil {
 		// Without a dialect the two planes' spellings can only meet on equal
 		// text; a deployment that renders a statement differently from the
@@ -4152,6 +4152,16 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 // spelling is adopted only once the canonical comparison proves it the same
 // change (RV-1): a remote entry that omits its DDL, or that reports a table's
 // statements as one combined text, leaves the stored statement as reviewed.
+//
+// The stored statement is not display-only. tasksToProtoTableChanges builds
+// the ApplyRequest from the same column, so a task that pauses in a retryable
+// failure after adopting is re-dispatched carrying the adopted spelling. That
+// stays within RV-1 because the spelling goes back to the deployment it came
+// from — dispatchPendingApply targets the apply's own database and
+// environment — it is proven the same change as the reviewed text, and the
+// data plane derives its drift keys from the statement it receives. Adopting
+// from any other source, or re-dispatching to any other target, would need
+// this gate to be re-argued.
 func remoteStatementRendering(storedTask *storage.Task, remoteTask *ternv1.TableProgress, canon StatementCanonicalizer) (string, bool) {
 	rendering := strings.TrimSpace(remoteTask.Ddl)
 	if canon == nil || rendering == "" || rendering == strings.TrimSpace(storedTask.DDL) {

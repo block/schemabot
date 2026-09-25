@@ -916,9 +916,11 @@ type TaskStore interface {
 	// Update writes an existing task's mutable columns: its state, progress,
 	// execution mode, engine identifiers, timestamps, and statement text. The
 	// statement is written because a task may adopt the deployment's own
-	// rendering of its reviewed statement, and every operator surface
-	// re-reads it from the row. Identity columns (apply, operation,
-	// namespace, table, shard) never change through Update.
+	// rendering of its reviewed statement; every operator surface re-reads
+	// it from the row, and so does the next dispatch of the task, which
+	// sends the stored statement to that deployment. Identity columns
+	// (apply, operation, namespace, table, shard) never change through
+	// Update.
 	// Returns ErrTaskNotFound if the task does not exist.
 	Update(ctx context.Context, task *Task) error
 

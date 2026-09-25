@@ -2,6 +2,7 @@ package tern
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -66,18 +67,26 @@ type StatementCanonicalizer func(ddl string) string
 // database type's dialect: the drift comparison's canonical form, which
 // strips the physical schema qualifier and normalizes spelling, so a
 // deployment's rendering of a reviewed statement keys the same as the
-// reviewed text. Text the dialect's parser rejects keys by its trimmed form
-// instead — the drift comparison has already refused such text before any
-// apply, so at this point it can only belong to work that never ran. An
-// unregistered database type is an error.
+// reviewed text. An unregistered database type is an error.
+//
+// Text the dialect's parser rejects keys by its trimmed form instead, and the
+// rejection is logged with the statement. On the stored side such text can
+// only belong to work that never ran, because the drift comparison refused it
+// before any apply. On the remote side it is the version-skew case: the
+// deployment's own parser accepted a rendering that this control plane's
+// parser does not, so the two spellings can meet only on equal text and the
+// task reads as omitted from the deployment's progress. The drift comparison
+// itself fails closed on the same error; keying by text here is a deliberate
+// re-opening for matching only, which is why it has to be visible.
 //
 // Canonicalizing is a full parse and deparse, and one sync pass or progress
 // request asks for the same statement several times — once indexing it, once
 // looking it up, once comparing renderings — so the returned canonicalizer
-// remembers every answer for its lifetime. It is therefore scoped to a single
-// pass and not safe for concurrent use: build one per call site, never share
-// one across goroutines or keep one alive across passes.
-func StatementCanonicalizerForDatabaseType(databaseType string) (StatementCanonicalizer, error) {
+// remembers every answer for its lifetime, and logs each rejection once. It
+// is therefore scoped to a single pass and not safe for concurrent use: build
+// one per call site, never share one across goroutines or keep one alive
+// across passes.
+func StatementCanonicalizerForDatabaseType(databaseType string, logger *slog.Logger) (StatementCanonicalizer, error) {
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
 	if err != nil {
 		return nil, fmt.Errorf("statement canonicalizer for database type %q: %w", databaseType, err)
@@ -93,6 +102,8 @@ func StatementCanonicalizerForDatabaseType(databaseType string) (StatementCanoni
 		}
 		canonical, err := canonicalDDLForDrift(parser, raw)
 		if err != nil {
+			logger.Warn("statement is matched by its text because the dialect parser rejected it",
+				"database_type", databaseType, "ddl", raw, "error", err)
 			canonical = raw
 		}
 		memo[raw] = canonical
