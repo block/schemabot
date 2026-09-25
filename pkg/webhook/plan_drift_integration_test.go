@@ -12,21 +12,15 @@ package webhook
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
 	"testing"
 
 	mysql "github.com/block/mysql"
-	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
-	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -226,33 +220,7 @@ func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []depl
 // drift fixtures and returns the service so the caller can assert stored state.
 func runDriftPlan(t *testing.T, svc *api.Service, dbName string) {
 	t.Helper()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	client := gh.NewClient(nil)
-	baseURL, err := url.Parse(server.URL + "/")
-	require.NoError(t, err)
-	client.BaseURL = baseURL
-
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	schemaFiles := map[string]string{"users.sql": usersWithEmailSchema}
-	setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
-	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
-
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot plan -e " + driftEnv,
-		isPR:    true,
-	}, nil)
-
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
+	runRolloutCommand(t, svc, dbName, "schemabot plan -e "+driftEnv)
 }
 
 // A non-primary deployment whose live schema already carries the reviewed change

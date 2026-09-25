@@ -242,22 +242,6 @@ func (s *planResultFailingCheckStore) UpsertPlanResult(context.Context, *storage
 	return false, errors.New("store plan result: injected failure")
 }
 
-// seedPassingRolloutCheck stores the passing check a PR carries from before
-// the pending rollout was found.
-func seedPassingRolloutCheck(t *testing.T, svc *api.Service, dbName string) {
-	t.Helper()
-	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		HeadSHA:      "abc123",
-		Environment:  driftEnv,
-		DatabaseType: "mysql",
-		DatabaseName: dbName,
-		Status:       checkStatusCompleted,
-		Conclusion:   "success",
-	}))
-}
-
 // awaitFailingCheckRun returns the first failing Check Run the command
 // publishes, failing the test if none arrives before the deadline. Passing runs
 // published before it are skipped.
@@ -280,19 +264,20 @@ func awaitFailingCheckRun(t *testing.T, result *planFlowResult) checkRunCapture 
 }
 
 // The reviewed primary (eu) already has the column and us does not, and the PR
-// carries a passing check from before. When storing the plan's check record
-// fails, the plan command must not leave that stale pass as the PR's check: it
-// publishes a failing check from the rollout round that says us still needs
-// the change. A plan scoped to one environment and a plan across every
-// environment store the record on separate paths, so both are covered.
-func TestE2EUnstoredPendingRolloutPlanFailsCheckClosed(t *testing.T) {
+// carries a passing check from before. When storing the check record fails, a
+// command that finds us still needs the change must not leave that stale pass
+// as the PR's check: it publishes a failing check from the rollout round. A plan
+// scoped to one environment, a plan across every environment, and a refused
+// apply each store the record on a path of their own, so all three are covered.
+func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		dbName  string
 		command string
 	}{
-		{name: "one environment", dbName: "webhook_rollout_unstored_plan", command: "schemabot plan -e " + driftEnv},
-		{name: "every environment", dbName: "webhook_rollout_unstored_plan_all", command: "schemabot plan"},
+		{name: "plan one environment", dbName: "webhook_rollout_unstored_plan", command: "schemabot plan -e " + driftEnv},
+		{name: "plan every environment", dbName: "webhook_rollout_unstored_plan_all", command: "schemabot plan"},
+		{name: "apply", dbName: "webhook_rollout_unstored_apply", command: "schemabot apply -e " + driftEnv},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := setupE2ERolloutServiceWithStorage(t, tc.dbName, []deploymentSpec{
@@ -301,35 +286,17 @@ func TestE2EUnstoredPendingRolloutPlanFailsCheckClosed(t *testing.T) {
 			}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
 				return &planResultFailingStorage{Storage: st}
 			})
-			seedPassingRolloutCheck(t, svc, tc.dbName)
+			require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+				Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "abc123", Environment: driftEnv,
+				DatabaseType: "mysql", DatabaseName: tc.dbName, Status: checkStatusCompleted, Conclusion: "success",
+			}))
 
-			plan := runRolloutCommand(t, svc, tc.dbName, tc.command)
+			result := runRolloutCommand(t, svc, tc.dbName, tc.command)
 
-			run := awaitFailingCheckRun(t, plan)
+			run := awaitFailingCheckRun(t, result)
 			require.NotNil(t, run.Output)
 			assert.Contains(t, run.Output.Summary, "1 of 2 targets need this change")
+			requireNoApplies(t, svc, tc.dbName)
 		})
 	}
-}
-
-// The same stale pass and failing store, answered by the apply command: the
-// apply refuses, and the check it leaves behind is a failing one from the
-// rollout round rather than the stored pass.
-func TestE2EUnstoredPendingRolloutApplyFailsCheckClosed(t *testing.T) {
-	dbName := "webhook_rollout_unstored_apply"
-	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
-		{name: "eu", liveSchema: usersWithEmailSchema},
-		{name: "us", liveSchema: usersBaseSchema},
-	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
-		return &planResultFailingStorage{Storage: st}
-	})
-	seedPassingRolloutCheck(t, svc, dbName)
-
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "nothing was applied")
-
-	requireNoApplies(t, svc, dbName)
-	run := awaitFailingCheckRun(t, apply)
-	require.NotNil(t, run.Output)
-	assert.Contains(t, run.Output.Summary, "1 of 2 targets need this change")
 }
