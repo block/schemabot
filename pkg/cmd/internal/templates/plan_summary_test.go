@@ -50,14 +50,14 @@ func TestPlanSummarySurfacesShareCounts(t *testing.T) {
 		}}},
 	}
 
-	assert.Equal(t, []string{"1 table to create", "2 tables to alter"}, ddlSummaryParts(cliChanges))
-	assert.Equal(t, "1 create, 2 alters", webhooktemplates.SummarizeChanges(commentData))
+	assert.Equal(t, []string{"1 table to create", "2 tables to alter", "1 index to create"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 create, 2 alters, 1 index create", webhooktemplates.SummarizeChanges(commentData))
 }
 
-// A CREATE INDEX on a table no other statement touches is one table to alter
-// on both surfaces, and a PostgreSQL DROP INDEX — which names no table — is
-// an other statement on both, even though the CLI's change record carries the
-// table the engine resolved for it.
+// A CREATE INDEX on a table no other statement touches is one index to
+// create on both surfaces, not a table to alter, and a PostgreSQL DROP INDEX
+// is one index to drop on both even though only the CLI's change record
+// carries the table the engine resolved for it.
 func TestPlanSummarySurfacesShareIndexCounts(t *testing.T) {
 	cliChanges := []DDLChange{
 		{ChangeType: "CHANGE_TYPE_ALTER", TableName: "orders"},
@@ -73,14 +73,14 @@ func TestPlanSummarySurfacesShareIndexCounts(t *testing.T) {
 		}}},
 	}
 
-	assert.Equal(t, []string{"2 tables to alter", "1 other DDL statement"}, ddlSummaryParts(cliChanges))
-	assert.Equal(t, "2 alters, 1 other DDL statement", webhooktemplates.SummarizeChanges(commentData))
+	assert.Equal(t, []string{"1 table to alter", "1 index to create", "1 index to drop"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 alter, 1 index create, 1 index drop", webhooktemplates.SummarizeChanges(commentData))
 }
 
 // The CLI plan summary counts every statement the plan will run, matching the
-// PR comment: statements outside the create/alter/drop buckets are named in a
-// mixed plan and a plan made only of them reports its raw total, so an
-// index-only or type-only plan never prints a blank summary.
+// PR comment: index work is named in its own clauses, statements outside every
+// bucket are named in a mixed plan, and a plan made only of them reports its
+// raw total, so a type-only plan never prints a blank summary.
 func TestWritePlanSummary_CountsEveryStatement(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -105,12 +105,19 @@ func TestWritePlanSummary_CountsEveryStatement(t *testing.T) {
 				{ChangeType: "create_index", TableName: "events"},
 				{ChangeType: "other", TableName: "order_state"},
 			},
-			want: "📋 Plan: 2 tables to alter, 1 other DDL statement\n\n",
+			want: "📋 Plan: 1 table to alter, 2 indexes to create, 1 other DDL statement\n\n",
+		},
+		{
+			name: "index work only is named as index work",
+			changes: []DDLChange{
+				{ChangeType: "drop_index", TableName: "orders"},
+			},
+			want: "📋 Plan: 1 index to drop\n\n",
 		},
 		{
 			name: "only unbucketed statements report the raw total",
 			changes: []DDLChange{
-				{ChangeType: "drop_index", TableName: "orders"},
+				{ChangeType: "other", TableName: "order_state"},
 			},
 			want: "📋 Plan: 1 DDL statement\n\n",
 		},
@@ -136,5 +143,5 @@ func TestWritePlanSummaryWithVSchema_CountsEveryStatement(t *testing.T) {
 			[]VSchemaChange{{Keyspace: "orders"}},
 		)
 	})
-	assert.Equal(t, "📋 **Plan**: 1 DDL statement, 1 VSchema change\n\n", out)
+	assert.Equal(t, "📋 **Plan**: 1 index to drop, 1 VSchema change\n\n", out)
 }

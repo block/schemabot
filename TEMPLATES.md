@@ -941,7 +941,7 @@ ALTER TABLE users
 CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
 ```
 
-📋 **Plan**: **1** table to create, **2** tables to alter
+📋 **Plan**: **1** table to create, **1** table to alter, **1** index to create
 
 
 ---
@@ -2150,7 +2150,7 @@ Options: ⏸️ Defer Cutover
      ~ orders
        CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
 
-📋 Plan: 1 table to create, 2 tables to alter
+📋 Plan: 1 table to create, 1 table to alter, 1 index to create
 
 
 ```

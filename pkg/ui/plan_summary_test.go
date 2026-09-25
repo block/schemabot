@@ -23,12 +23,12 @@ func TestPlanCountsCountsATableOncePerOperation(t *testing.T) {
 	assert.Equal(t, []string{"1 table to create", "2 tables to alter", "2 other DDL statements"}, PlanSummaryParts(counts, 6, false))
 }
 
-// An index build changes its table's schema, so it shares the table's alter
-// bucket: an ALTER and a CREATE INDEX on one table are one table to alter, and
-// an index on a table nothing else touches is a table to alter on its own. An
-// index drop names no table in every dialect that emits one, so it stays an
-// other statement.
-func TestPlanCountsCountsAnIndexBuildAsAnAlterOfItsTable(t *testing.T) {
+// Index builds and drops on existing tables are named in their own clauses,
+// one per statement: an ALTER and a CREATE INDEX on one table are one table
+// to alter and one index to create, an index on a table nothing else touches
+// does not make that table a table to alter, and an index drop is counted
+// whether or not its dialect names the table.
+func TestPlanCountsNamesIndexBuildsAndDropsInTheirOwnBuckets(t *testing.T) {
 	var counts PlanCounts
 	counts.AddTable("app", "create", "invoices")
 	counts.AddTable("app", "alter", "orders")
@@ -38,10 +38,22 @@ func TestPlanCountsCountsAnIndexBuildAsAnAlterOfItsTable(t *testing.T) {
 	counts.AddTable("app", "drop_index", "")
 
 	assert.Equal(t, 1, counts.Created)
-	assert.Equal(t, 3, counts.Altered)
+	assert.Equal(t, 2, counts.Altered)
 	assert.Zero(t, counts.Dropped)
-	assert.Equal(t, 1, counts.Other)
-	assert.Equal(t, []string{"1 table to create", "3 tables to alter", "1 other DDL statement"}, PlanSummaryParts(counts, 6, false))
+	assert.Equal(t, 2, counts.IndexesCreated)
+	assert.Equal(t, 1, counts.IndexesDropped)
+	assert.Zero(t, counts.Other)
+	assert.Equal(t, []string{"1 table to create", "2 tables to alter", "2 indexes to create", "1 index to drop"}, PlanSummaryParts(counts, 6, false))
+	assert.Equal(t, []string{"**1** table to create", "**2** tables to alter", "**2** indexes to create", "**1** index to drop"}, PlanSummaryParts(counts, 6, true))
+}
+
+// A plan made only of index work names it rather than falling back to the raw
+// statement total.
+func TestPlanSummaryPartsNamesAnIndexOnlyPlan(t *testing.T) {
+	var counts PlanCounts
+	counts.AddTable("app", "create_index", "events")
+
+	assert.Equal(t, []string{"1 index to create"}, PlanSummaryParts(counts, 1, false))
 }
 
 func TestPlanCountsKeepsEqualNamesInDifferentNamespacesApart(t *testing.T) {

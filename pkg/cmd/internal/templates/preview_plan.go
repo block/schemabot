@@ -64,7 +64,7 @@ func previewVitessPlanOutput() {
 }
 
 // previewPostgresPlanOutput renders a PostgreSQL plan whose standalone index
-// build on an existing table counts as an alter of that table in the summary.
+// build on an existing table is named as an index to create in the summary.
 func previewPostgresPlanOutput() {
 	WritePlanHeader(PlanHeaderData{
 		Engine:      "postgres",

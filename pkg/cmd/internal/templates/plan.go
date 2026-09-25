@@ -363,11 +363,11 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 	}
 }
 
-// ddlSummaryParts builds the create/alter/drop clauses of the plan summary.
-// An index build counts as an alter of its table. Statements outside those
-// buckets (types, extensions, comments, index drops) still run, so a mixed
-// plan names them alongside the table counts, and a plan made only of them
-// reports its raw statement total so it never reads as "no changes".
+// ddlSummaryParts builds the table and index clauses of the plan summary.
+// Index builds and drops on existing tables are named in their own clauses.
+// Statements outside every bucket (types, extensions, comments) still run, so
+// a mixed plan names them alongside the counted clauses, and a plan made only
+// of them reports its raw statement total so it never reads as "no changes".
 func ddlSummaryParts(changes []DDLChange) []string {
 	var counts ui.PlanCounts
 	for _, c := range changes {
