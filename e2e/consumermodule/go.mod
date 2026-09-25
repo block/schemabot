@@ -8,7 +8,7 @@
 // version imported by pkg/api/telemetry.go; the test guards this precondition.
 module github.com/block/schemabot/e2e/consumermodule
 
-go 1.26.6
+go 1.26.8
 
 require (
 	github.com/block/schemabot v0.0.0
@@ -125,4 +125,4 @@ replace github.com/block/schemabot => ../..
 
 // Mirror the parent module's replace directives; replaces do not propagate
 // across module boundaries.
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260925015115-736e47fe71a6
