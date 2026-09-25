@@ -644,7 +644,8 @@ Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and
 ### ST-1: A finished apply stays finished
 
 No path moves a terminal apply (`completed`, `failed`, `cancelled`, `reverted`, `stopped`) back
-to an active state. Not a retry, not an API write, not a crashed driver replaying stale progress.
+to an active state, other than correcting a rollout verdict that was recorded too early (below).
+Not a retry, not an API write, not a crashed driver replaying stale progress.
 
 This is upheld by the routes into an active state rather than by a single predicate on the apply
 update: the claim query names the states it will claim, and the control handlers refuse a
@@ -652,11 +653,18 @@ transition out of a terminal state before writing. There is no blanket storage-l
 that would catch a new caller writing an active state directly, which is worth knowing before
 adding one.
 
+One write moves a terminal apply back to an active state, and it corrects a verdict recorded too
+early rather than reviving the apply. A rollout's state is derived from its operations, and a
+sibling's failure can record `failed` on the parent while another deployment's driver is still
+working. Re-deriving then returns the parent to `running_degraded` until that work settles (ST-10).
+It runs only from `failed`, only while the operations themselves still derive `failed`, and only
+for a caller that holds the lease. The write lands only if the parent still holds the state it
+read. It writes the parent row alone, so no failed operation runs again.
+
 `stopped` is the one terminal state that is still addressable, because a stopped apply is holding
 a database rather than done with it. It can be claimed to resume via `start`, and it can be
 claimed to deliver a pending `cancel`, which settles it to `cancelled`. Both are explicit arms of
-the claim query rather than general re-entry: no other terminal state is claimable, and nothing
-reaches an active state by any other route.
+the claim query rather than general re-entry: no other terminal state is claimable.
 
 One marker overrides even that. When a later apply takes over a stopped apply's unfinished work,
 adopting or discarding the copy it left behind, the stopped apply is stamped with its successor's
@@ -673,13 +681,18 @@ retry. No other claim path can reach a stamped apply, since work must have run b
 can take it over, and an active apply cannot gain one at all. *Enforced:* the terminal guard in the
 storage apply update path, the named state arms of the single claim query, and the write-once
 supersession marker consulted by the start, resume, and retry paths
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`).
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`); the lease-scoped
+reopen policy on the rollout projection (`reopensHeldFailedRollout` in
+`updateApplyStateFromOperations`, `pkg/api/operator.go`).
 
 ### ST-2: Recovery from permanent failure is a fresh plan and apply
 
 There is no revival path from `failed`. Plans are diffs, so a fresh plan and apply never re-runs
 already-landed work, whereas a revival path would re-run stored DDL against a database that may
-have drifted since. *Enforced:* absence. Storage exposes no failed-to-active transition (ST-1).
+have drifted since. A rollout whose `failed` verdict is corrected back to `running_degraded` (ST-1)
+is not revived: its failed operation stays failed and is never run again. *Enforced:* absence. No
+write re-runs a failed operation, and the rollout projection is the only write that moves a failed
+apply to an active state (ST-1).
 
 ### ST-3: Apply state flows upward, never downward
 
