@@ -14,7 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
-	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
@@ -27,30 +27,13 @@ const (
 	maxStatusLimit     = 1000
 )
 
-// changeTypeToString converts a proto ChangeType enum to a lowercase string.
+// changeTypeToString converts a proto change type for progress responses.
+// Unmapped values stay empty because progress omits unavailable change types.
 func changeTypeToString(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(ddl.StatementDropTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
-		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
-	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
-		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
-		return ddl.StatementTypeToOp(ddl.StatementCreateView)
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	default:
-		return ""
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
+	return ""
 }
 
 // deriveErrorCode returns an error code based on apply state
@@ -468,7 +451,15 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
-		taskIndex := tern.NewStatementIndex[storage.Task](len(tasks))
+		// The routed projection reports each statement as its deployment
+		// spells it, so a stored task is matched by canonical form rather than
+		// by the reviewed text it carries.
+		canon, canonErr := tern.StatementCanonicalizerForDatabaseType(apply.DatabaseType, s.logger)
+		if canonErr != nil {
+			s.logger.Warn("progress response matches task timestamps by statement text only",
+				append(apply.LogAttrs(), "error", canonErr)...)
+		}
+		taskIndex := tern.NewCanonicalStatementIndex[storage.Task](len(tasks), canon)
 		for _, t := range tasks {
 			taskIndex.Add(t.Namespace, t.TableName, t.DDL, t)
 		}

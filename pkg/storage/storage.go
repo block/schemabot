@@ -294,6 +294,14 @@ type SettingsStore interface {
 	// Set saves a setting. Creates if not exists, updates if exists.
 	Set(ctx context.Context, key string, value string) error
 
+	// CompareAndSet writes value under key only while the stored setting still
+	// matches previous: a nil previous means no setting may exist yet, and a
+	// non-nil previous means the stored value must equal previous.Value. It
+	// reports whether the write happened. A writer that reads a setting,
+	// derives the next value from it, and writes it back uses this so a
+	// slower writer cannot overwrite a value a faster one already advanced.
+	CompareAndSet(ctx context.Context, key string, previous *Setting, value string) (bool, error)
+
 	// List returns all settings, ordered by key ascending.
 	List(ctx context.Context) ([]*Setting, error)
 
@@ -913,7 +921,14 @@ type TaskStore interface {
 	// Get returns a task by task_identifier (external identifier), or nil if not found.
 	Get(ctx context.Context, taskIdentifier string) (*Task, error)
 
-	// Update updates an existing task.
+	// Update writes an existing task's mutable columns: its state, progress,
+	// execution mode, engine identifiers, timestamps, and statement text. The
+	// statement is written because a task may adopt the deployment's own
+	// rendering of its reviewed statement; every operator surface re-reads
+	// it from the row, and so does the next dispatch of the task, which
+	// sends the stored statement to that deployment. Identity columns
+	// (apply, operation, namespace, table, shard) never change through
+	// Update.
 	// Returns ErrTaskNotFound if the task does not exist.
 	Update(ctx context.Context, task *Task) error
 
@@ -924,8 +939,9 @@ type TaskStore interface {
 	// the context: the single lease-holding operator is the only writer of an
 	// operation's per-shard rows, so the lookup-then-write is serialized by that
 	// lease and needs no unique constraint. A displaced operator (lost lease)
-	// fails closed with ErrApplyLeaseLost. On conflict only the progress fields
-	// change; identity and DDL are preserved.
+	// fails closed with ErrApplyLeaseLost. On conflict the row is rewritten
+	// through Update: identity is preserved, and the statement text follows
+	// the caller's task like every other mutable column.
 	UpsertShardProgress(ctx context.Context, task *Task) error
 
 	// GetByApplyID returns all tasks for an apply, in creation order — the
