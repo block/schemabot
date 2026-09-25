@@ -12,8 +12,10 @@ import (
 )
 
 // An operator who types the database and type flags in a different case than
-// the stored lock still gets the alternate-type hint, spelled with the lock's
-// canonical identity, on both the owned and the forced release paths.
+// the stored lock still gets the alternate-type hint on both the owned and the
+// forced release paths. The hint spells the lock's canonical identity even when
+// the listed lock keeps the spelling it was written with before the server
+// folded lock keys.
 func TestUnlockCmdCanonicalizesKeysForAlternateTypeHint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -27,7 +29,7 @@ func TestUnlockCmdCanonicalizesKeysForAlternateTypeHint(t *testing.T) {
 			_, err := w.Write([]byte(`{"error":"lock not found"}`))
 			assert.NoError(t, err)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/locks":
-			_, err := w.Write([]byte(`{"locks":[{"database":"games","database_type":"vitess","owner":"org/repo#2"}]}`))
+			_, err := w.Write([]byte(`{"locks":[{"database":"Games","database_type":"VITESS","owner":"org/repo#2"}]}`))
 			assert.NoError(t, err)
 		default:
 			http.NotFound(w, r)

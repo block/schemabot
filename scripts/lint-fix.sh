@@ -36,6 +36,24 @@ if [ -z "$LINT_CMD" ]; then
     LINT_CMD="docker run --rm -v $(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint"
 fi
 
+# golangci-lint allows one run at a time per machine, through a lock file in
+# the temp dir. --allow-serial-runners makes each run below wait for that lock
+# instead of failing, but the wait is silent and has no time limit. Say which
+# process holds the lock, so a commit that looks hung shows what it is waiting
+# on, and a stuck run can be found and stopped. A Docker run has its own temp
+# dir, so it never waits on the host's lock.
+note_lint_lock_holder() {
+    if [[ "$LINT_CMD" == docker* ]] || ! command -v lsof >/dev/null 2>&1; then
+        return 0
+    fi
+    local lock_dir="${TMPDIR:-/tmp}"
+    local holders
+    holders=$(lsof -t "${lock_dir%/}/golangci-lint.lock" 2>/dev/null | tr '\n' ' ' || true)
+    if [ -n "$holders" ]; then
+        echo "Waiting for another golangci-lint run to finish (pid ${holders% })..."
+    fi
+}
+
 # Separate files by build tag requirements:
 # - e2e/consumermodule/ files belong to a nested Go module; root package
 #   patterns (./e2e/...) never descend into it, so it lints from its own
@@ -78,7 +96,8 @@ lint_and_fix() {
     fi
 
     echo "Running golangci-lint --fix${build_tags:+ ($build_tags)}..."
-    $LINT_CMD run --fix --timeout=5m $tag_flag "${packages[@]}" || true
+    note_lint_lock_holder
+    $LINT_CMD run --fix --allow-serial-runners --timeout=5m $tag_flag "${packages[@]}" || true
 
     # Re-stage any files that were fixed
     for file in $STAGED_GO_FILES; do
@@ -89,7 +108,8 @@ lint_and_fix() {
     done
 
     # Verify no remaining issues
-    if ! $LINT_CMD run --timeout=5m $tag_flag $new_flag "${packages[@]}"; then
+    note_lint_lock_holder
+    if ! $LINT_CMD run --allow-serial-runners --timeout=5m $tag_flag $new_flag "${packages[@]}"; then
         echo ""
         echo "golangci-lint found issues that cannot be auto-fixed."
         echo "Please fix them manually before committing."
@@ -127,7 +147,8 @@ if [ "$HAS_CONSUMER_MODULE" -gt 0 ]; then
     fi
 
     echo "Running golangci-lint --fix (consumer module)..."
-    (cd "$CM_DIR" && $CM_LINT_CMD run --fix --timeout=5m ./...) || true
+    note_lint_lock_holder
+    (cd "$CM_DIR" && $CM_LINT_CMD run --fix --allow-serial-runners --timeout=5m ./...) || true
 
     # Re-stage any files that were fixed
     for file in $STAGED_GO_FILES; do
@@ -141,7 +162,8 @@ if [ "$HAS_CONSUMER_MODULE" -gt 0 ]; then
     if [ -n "$NEW_FROM_REV" ]; then
         CM_NEW_FLAG="--new-from-rev=$NEW_FROM_REV"
     fi
-    if ! (cd "$CM_DIR" && $CM_LINT_CMD run --timeout=5m $CM_NEW_FLAG ./...); then
+    note_lint_lock_holder
+    if ! (cd "$CM_DIR" && $CM_LINT_CMD run --allow-serial-runners --timeout=5m $CM_NEW_FLAG ./...); then
         echo ""
         echo "golangci-lint found issues in $CM_DIR that cannot be auto-fixed."
         echo "Please fix them manually before committing."

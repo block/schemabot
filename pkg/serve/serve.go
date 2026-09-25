@@ -1352,6 +1352,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
+	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
@@ -1429,6 +1430,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
+	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
 	handler := webhook.NewHandlerWithDispatch(
 		svc,
 		ghclient.NewClientSet(clients),
@@ -1479,6 +1481,55 @@ func webhookReconcileSynthesisOptions(logger *slog.Logger) []webhook.HandlerOpti
 		}
 	}
 	return []webhook.HandlerOption{webhook.WithWebhookReconcileSynthesis()}
+}
+
+// webhookReconcileScanBoundsOptions returns the handler option sizing the
+// reconciler's missing-delivery scan from WEBHOOK_RECONCILE_MAX_PAGES (an
+// integer page budget per repository per pass, at least
+// webhook.MinWebhookReconcileMaxPages) and
+// WEBHOOK_RECONCILE_LOOKBACK (a positive Go duration such as 24h). Either may
+// be set alone; an unset variable keeps the package default. Unlike the kill
+// switches above, a malformed value here has no safe direction to fail in —
+// the operator is tuning, not disabling — so it is logged and ignored, and the
+// default stays in force.
+func webhookReconcileScanBoundsOptions(logger *slog.Logger) []webhook.HandlerOption {
+	maxPages, lookback := parseWebhookReconcileScanBounds(logger)
+	if maxPages == 0 && lookback == 0 {
+		return nil
+	}
+	logger.Info("webhook reconcile scan bounds configured from environment",
+		"max_pages", maxPages, "lookback", lookback)
+	return []webhook.HandlerOption{webhook.WithWebhookReconcileScanBounds(maxPages, lookback)}
+}
+
+// parseWebhookReconcileScanBounds reads the scan-bound environment variables,
+// returning zero for each that is unset or rejected.
+func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookback time.Duration) {
+	if value := os.Getenv("WEBHOOK_RECONCILE_MAX_PAGES"); value != "" {
+		switch parsed, err := strconv.Atoi(value); {
+		case err != nil:
+			logger.Error("invalid WEBHOOK_RECONCILE_MAX_PAGES value; the default reconcile page budget stays in force",
+				"value", value, "error", err)
+		case parsed < webhook.MinWebhookReconcileMaxPages:
+			logger.Error("WEBHOOK_RECONCILE_MAX_PAGES is below the smallest page budget a pass can split between its fresh walk and resumed scan; the default reconcile page budget stays in force",
+				"value", value, "min_pages", webhook.MinWebhookReconcileMaxPages)
+		default:
+			maxPages = parsed
+		}
+	}
+	if value := os.Getenv("WEBHOOK_RECONCILE_LOOKBACK"); value != "" {
+		switch parsed, err := time.ParseDuration(value); {
+		case err != nil:
+			logger.Error("invalid WEBHOOK_RECONCILE_LOOKBACK value; the default reconcile lookback stays in force",
+				"value", value, "error", err)
+		case parsed <= 0:
+			logger.Error("WEBHOOK_RECONCILE_LOOKBACK must be a positive duration; the default reconcile lookback stays in force",
+				"value", value)
+		default:
+			lookback = parsed
+		}
+	}
+	return maxPages, lookback
 }
 
 // checkSuiteRecoveryOptions returns the handler option enabling durable
