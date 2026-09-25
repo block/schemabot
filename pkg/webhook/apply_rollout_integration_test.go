@@ -56,25 +56,32 @@ func runRolloutCommand(t *testing.T, svc *api.Service, dbName, command string) *
 	return result
 }
 
-// awaitCommentContaining returns the first posted comment containing want,
-// failing the test if none arrives before the deadline. Comments posted before
-// it are skipped: a command can post an acknowledgment first.
-func awaitCommentContaining(t *testing.T, result *planFlowResult, want string) string {
+// awaitCapture returns the first value the command publishes on ch that
+// matches, failing the test if none arrives before the deadline. Values
+// published before it are skipped: a command can post an acknowledgment, or
+// republish a stale check, first.
+func awaitCapture[T any](t *testing.T, ch <-chan T, what string, match func(T) bool) T {
 	t.Helper()
 	deadline := time.After(webhookIntegrationPollDeadline)
-	var seen []string
+	var seen []T
 	for {
 		select {
-		case body := <-result.comments:
-			if strings.Contains(body, want) {
-				return body
+		case v := <-ch:
+			if match(v) {
+				return v
 			}
-			seen = append(seen, body)
+			seen = append(seen, v)
 		case <-deadline:
-			require.FailNowf(t, "timed out waiting for comment", "want a comment containing %q; saw %d: %q", want, len(seen), seen)
-			return ""
+			require.FailNowf(t, "timed out waiting for "+what, "saw %d: %+v", len(seen), seen)
+			var zero T
+			return zero
 		}
 	}
+}
+
+func awaitCommentContaining(t *testing.T, result *planFlowResult, want string) string {
+	t.Helper()
+	return awaitCapture(t, result.comments, "a comment containing "+want, func(body string) bool { return strings.Contains(body, want) })
 }
 
 func rolloutCheck(t *testing.T, svc *api.Service, dbName string) *storage.Check {
@@ -242,27 +249,6 @@ func (s *planResultFailingCheckStore) UpsertPlanResult(context.Context, *storage
 	return false, errors.New("store plan result: injected failure")
 }
 
-// awaitFailingCheckRun returns the first failing Check Run the command
-// publishes, failing the test if none arrives before the deadline. Passing runs
-// published before it are skipped.
-func awaitFailingCheckRun(t *testing.T, result *planFlowResult) checkRunCapture {
-	t.Helper()
-	deadline := time.After(webhookIntegrationPollDeadline)
-	var seen []string
-	for {
-		select {
-		case run := <-result.checkRuns:
-			if run.Conclusion == checkConclusionFailure {
-				return run
-			}
-			seen = append(seen, run.Conclusion)
-		case <-deadline:
-			require.FailNowf(t, "timed out waiting for a failing Check Run", "a pending target must not leave the stale pass standing; saw conclusions %q", seen)
-			return checkRunCapture{}
-		}
-	}
-}
-
 // The reviewed primary (eu) already has the column and us does not, and the PR
 // carries a passing check from before. When storing the check record fails, a
 // command that finds us still needs the change must not leave that stale pass
@@ -293,7 +279,9 @@ func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 
 			result := runRolloutCommand(t, svc, tc.dbName, tc.command)
 
-			run := awaitFailingCheckRun(t, result)
+			run := awaitCapture(t, result.checkRuns, "a failing Check Run", func(run checkRunCapture) bool {
+				return run.Conclusion == checkConclusionFailure
+			})
 			require.NotNil(t, run.Output)
 			assert.Contains(t, run.Output.Summary, "1 of 2 targets need this change")
 			requireNoApplies(t, svc, tc.dbName)
