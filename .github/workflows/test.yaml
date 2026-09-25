@@ -317,7 +317,12 @@ jobs:
           # unusable. Under `set -e` either would abort here with a bare exit
           # status, so both are absorbed and reported apart: a missing or
           # unreadable tree says so rather than being described as an empty
-          # test set. A Go identifier cannot contain `/`, so a match carrying
+          # test set. The status check below is the fail-closed gate, not
+          # just the label: with `set +e` in force, grep still prints the
+          # matches from every file it could read, so without the check one
+          # unreadable test file's tests would drop out of every shard filter
+          # and the job would pass with nobody running them.
+          # A Go identifier cannot contain `/`, so a match carrying
           # one came from prose that mentions `func Test`, not from a
           # declaration, and is dropped after discovery.
           set +e
