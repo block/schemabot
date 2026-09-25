@@ -1068,30 +1068,75 @@ func TestWebhookReconcilerFreshWindowWidensWhenCutShort(t *testing.T) {
 // TestWebhookReconcilerFreshWalkStopsAtItsFloor pins that the fresh-window
 // walk stops paging on the page where it crosses its floor and records the
 // fresh window as covered, so the rest of the budget goes to the deep scan
-// and the next pass's fresh window does not widen.
+// and the next pass's fresh window does not widen. It runs at the default
+// budget, where the floor rather than the page reserve is what stops the
+// fresh walk: without it the fresh walk would spend its full share on pages
+// the deep scan already covered, every pass.
 func TestWebhookReconcilerFreshWalkStopsAtItsFloor(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	settings := newMemorySettingsStore()
 	h, mux := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
-	h.webhookReconcileMaxPages = 4
-	// Page 1 holds one head inside the fresh window and one below its floor,
-	// so the fresh walk must stop after page 1 and leave pages 2 and 3 to the
-	// deep scan.
-	fetches := registerPagedOpenPRs(t, mux, "octocat/hello-world",
-		[]map[string]any{
-			openPR(1, "sha-1", time.Now().Add(-20*time.Minute)),
-			openPR(2, "sha-2", time.Now().Add(-2*time.Hour)),
-		},
-		[]map[string]any{openPR(3, "sha-3", time.Now().Add(-3*time.Hour))},
-		[]map[string]any{openPR(4, "sha-4", time.Now().Add(-4*time.Hour))},
-	)
+	h.webhookReconcileMaxPages = defaultWebhookReconcileMaxPages
+	// Page 1 holds one head inside the fresh window and one below its floor;
+	// the five pages after it are older still, one more than the budget
+	// covers in a single pass.
+	pages := [][]map[string]any{{
+		openPR(1, "sha-1", time.Now().Add(-20*time.Minute)),
+		openPR(2, "sha-2", time.Now().Add(-2*time.Hour)),
+	}}
+	for page := 2; page <= 6; page++ {
+		pages = append(pages, []map[string]any{openPR(page+1, fmt.Sprintf("sha-%d", page+1), time.Now().Add(-time.Duration(page+1)*time.Hour))})
+	}
+	fetches := registerPagedOpenPRs(t, mux, "octocat/hello-world", pages...)
 
 	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
 
-	require.Equal(t, []int{1, 2, 3}, fetches.take(), "the fresh walk fetched page 1 only; the deep scan took the remaining pages")
+	require.Equal(t, []int{1, 2, 3, 4, 5}, fetches.take(), "the fresh walk fetched page 1 only; the deep scan took the rest of the budget")
 	cursor := storedScanCursor(t, settings, "octocat/hello-world")
+	require.Equal(t, 6, cursor.Page, "the deep scan resumes past the pages this pass examined")
 	require.WithinDuration(t, time.Now(), cursor.FreshCoveredAt, time.Minute,
 		"the fresh walk crossed its floor on page 1, so the fresh window is covered through this pass")
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, []int{1, 6}, fetches.take(), "the fresh walk stops at its floor on page 1 again and the deep scan finishes the cycle")
+	require.Equal(t, 1, storedScanCursor(t, settings, "octocat/hello-world").Page, "the listing ended, so the cycle is complete")
+}
+
+// TestWebhookReconcilerFailedFreshWalkRecordsNoScanProgress pins that a pass
+// whose fresh-window walk could not list the repository writes no deep-scan
+// progress: the cursor keeps the page and pass count it had, so the next
+// pass resumes where the last complete one stopped rather than treating
+// pages the failed pass never examined as covered.
+func TestWebhookReconcilerFailedFreshWalkRecordsNoScanProgress(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	settings := newMemorySettingsStore()
+	h, mux := newReconcileTestHandlerWithSettings(t, store, settings, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	seeded := webhookReconcileScanCursor{Page: 3, CycleStartedAt: time.Now().Add(-time.Hour), CyclePasses: 1}
+	encoded, err := json.Marshal(seeded)
+	require.NoError(t, err)
+	require.NoError(t, settings.Set(t.Context(), webhookReconcileScanCursorKey("octocat/hello-world"), string(encoded)))
+	// Page 1, the fresh walk's start, is unavailable; the deeper pages the
+	// cursor points at would list fine if the pass went on to fetch them.
+	fetches := &pageFetchLog{}
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, r *http.Request) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		fetches.record(page)
+		if page <= 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writeOpenPRs(t, w, openPR(page, fmt.Sprintf("sha-%d", page), time.Now().Add(-time.Duration(page)*time.Hour)))
+	})
+
+	h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	for _, page := range fetches.take() {
+		require.Equal(t, 1, page, "the pass stopped at the failed fresh walk without fetching deeper pages")
+	}
+	cursor := storedScanCursor(t, settings, "octocat/hello-world")
+	require.Equal(t, seeded.Page, cursor.Page, "the resume page is unchanged")
+	require.Equal(t, seeded.CyclePasses, cursor.CyclePasses, "the failed pass does not count toward the cycle")
 }
 
 // TestWebhookReconcilerDeletesOrphanedScanCursors pins that a repository
