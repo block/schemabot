@@ -260,6 +260,39 @@ func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifi
 func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 	return s.apply, s.err
 }
+
+// finishedAfterReadApplyStore hands a lookup a copy of the apply in readState
+// while the stored row is already finished: the view a handler holds when a
+// driver finishes the apply after the handler read it. Update refuses stopped
+// over a settled row the way the storage reopen guard does, and Get returns
+// the stored row.
+type finishedAfterReadApplyStore struct {
+	storage.ApplyStore
+	stored         *storage.Apply
+	readState      string
+	refusedUpdates int
+}
+
+func (s *finishedAfterReadApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
+	read := *s.stored
+	read.State = s.readState
+	read.CompletedAt = nil
+	return &read, nil
+}
+
+func (s *finishedAfterReadApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	stored := *s.stored
+	return &stored, nil
+}
+
+func (s *finishedAfterReadApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	if state.IsState(apply.State, state.Apply.Stopped) && state.IsState(s.stored.State, state.SettledApplyStates...) {
+		s.refusedUpdates++
+		return fmt.Errorf("apply %s is %s: %w", s.stored.ApplyIdentifier, s.stored.State, storage.ErrApplyReopenRefused)
+	}
+	*s.stored = *apply
+	return nil
+}
 func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
 	return nil
 }
@@ -6647,6 +6680,69 @@ func TestStartHandler(t *testing.T) {
 		require.NoError(t, err, "failed to decode response")
 		assert.True(t, resp.Accepted, "expected accepted=true")
 		assert.Equal(t, int64(1), resp.StartedCount)
+	})
+
+	// The handler reads a running apply with a pending stop, and the data plane
+	// reports it stopped; before the handler records that, a driver finishes
+	// the apply. Storage refuses to write stopped over the completed row, so
+	// the start is refused for the verdict that won, nothing is queued, and the
+	// stop request stays pending for whoever finished the apply.
+	t.Run("refuses start when the apply finished during the remote stop check", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_STOPPED,
+				Tables: []*ternv1.TableProgress{{
+					TableName: "users",
+					Status:    state.Task.Stopped,
+				}},
+			},
+		}
+		completedAt := time.Now().Add(-time.Second)
+		stored := activeTestApply("apply-remote-stop-finished")
+		stored.ExternalID = "remote-apply-stop-finished"
+		stored.State = state.Apply.Completed
+		stored.CompletedAt = &completedAt
+		applies := &finishedAfterReadApplyStore{stored: stored, readState: state.Apply.Running}
+		controls := &memoryControlRequestStore{}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithApplyStores{
+			applies:  applies,
+			tasks:    &capturingTaskStore{},
+			controls: controls,
+		}, testServerConfig(), map[string]tern.Client{
+			"default/staging": mock,
+		}, logger)
+		_, alreadyPending, err := controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID:     stored.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-stop-finished", "caller": "cli:starter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), state.Apply.Completed, "the refusal names the stored verdict")
+		require.NotNil(t, mock.progressReq)
+		assert.Nil(t, mock.startReq)
+		assert.Equal(t, state.Apply.Completed, stored.State, "the finished apply keeps its verdict")
+		assert.Equal(t, 1, applies.refusedUpdates, "the handler tried to record stopped exactly once")
+		pendingStop, err := controls.GetPending(t.Context(), stored.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, pendingStop, "the stop request stays with whoever finished the apply")
+		assert.Equal(t, "cli:stopper", pendingStop.RequestedBy)
+		pendingStart, err := controls.GetPending(t.Context(), stored.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		assert.Nil(t, pendingStart, "no start is queued against a finished apply")
 	})
 
 	t.Run("returns already requested for remote duplicate after operator claim", func(t *testing.T) {
