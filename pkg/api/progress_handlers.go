@@ -14,7 +14,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -31,11 +30,8 @@ const (
 // changeTypeToString converts a proto change type for progress responses.
 // Unmapped values stay empty because progress omits unavailable change types.
 func changeTypeToString(ct ternv1.ChangeType) string {
-	if ct == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
-		return ternconv.OpVSchemaUpdate
-	}
-	if st, ok := ternconv.ChangeTypeToStatementType(ct); ok {
-		return ddl.StatementTypeToOp(st)
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
 	return ""
 }

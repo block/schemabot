@@ -118,6 +118,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -3442,7 +3443,7 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 		changes = append(changes, &ternv1.TableChange{
 			TableName:  task.TableName,
 			Ddl:        task.DDL,
-			ChangeType: ddlActionToProtoChangeType(task.DDLAction),
+			ChangeType: ternconv.OpToChangeType(task.DDLAction),
 			Namespace:  task.Namespace,
 		})
 	}

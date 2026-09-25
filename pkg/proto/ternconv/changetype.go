@@ -7,14 +7,42 @@
 package ternconv
 
 import (
+	"strings"
+
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 )
 
 // OpVSchemaUpdate is the operation string for Vitess vschema updates, which
 // have no SQL statement type and therefore sit outside the StatementType
-// vocabulary; conversions special-case it alongside the shared mapping.
+// vocabulary. OpToChangeType and ChangeTypeToOp carry it alongside the shared
+// mapping so no boundary has to special-case it.
 const OpVSchemaUpdate = "vschema_update"
+
+// OpToChangeType maps a lowercase operation string, as stored in task actions
+// and table changes, to its proto change type. Matching ignores case, as
+// ddl.OpToStatementType does, so every boundary applies one case rule.
+// Operations outside the proto vocabulary are reported as other.
+func OpToChangeType(op string) ternv1.ChangeType {
+	if strings.EqualFold(op, OpVSchemaUpdate) {
+		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
+	}
+	return StatementTypeToChangeType(ddl.OpToStatementType(op))
+}
+
+// ChangeTypeToOp maps a proto change type to its lowercase operation string.
+// Change types with no operation (other and undeclared values) are left to
+// callers, which each have their own fallback.
+func ChangeTypeToOp(ct ternv1.ChangeType) (string, bool) {
+	if ct == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+		return OpVSchemaUpdate, true
+	}
+	st, ok := ChangeTypeToStatementType(ct)
+	if !ok {
+		return "", false
+	}
+	return ddl.StatementTypeToOp(st), true
+}
 
 // ChangeTypeToStatementType maps proto change types represented by the shared
 // DDL vocabulary. Change types outside that vocabulary are left to callers.

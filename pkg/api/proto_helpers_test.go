@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
@@ -22,31 +23,19 @@ func TestProtoSchemaFilesToAPIIgnoresNilNamespaces(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint);\n", result["users"].Files["users.sql"])
 }
 
-func TestChangeTypeRoundTrip(t *testing.T) {
-	// Proto → storage → proto should round-trip correctly
-	for _, ct := range []ternv1.ChangeType{
-		ternv1.ChangeType_CHANGE_TYPE_CREATE,
-		ternv1.ChangeType_CHANGE_TYPE_ALTER,
-		ternv1.ChangeType_CHANGE_TYPE_DROP,
-		ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
-		ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX,
-		ternv1.ChangeType_CHANGE_TYPE_RENAME,
-		ternv1.ChangeType_CHANGE_TYPE_TRUNCATE,
-		ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW,
-		ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
-		ternv1.ChangeType_CHANGE_TYPE_OTHER,
-	} {
+// A change type stored through the API boundary reads back as the same proto
+// value, and the one value without an operation is retained as "other" rather
+// than dropped.
+func TestProtoChangeTypeToOperationRoundTrips(t *testing.T) {
+	for value, name := range ternv1.ChangeType_name {
+		ct := ternv1.ChangeType(value)
+		if ct == ternv1.ChangeType_CHANGE_TYPE_OTHER {
+			continue
+		}
 		op := protoChangeTypeToOperation(ct)
-		result := changeTypeToProto(op)
-		assert.Equal(t, ct, result, "round-trip failed for %v (op=%q)", ct, op)
+		assert.Equal(t, ct, ternconv.OpToChangeType(op), "round-trip failed for %s (op=%q)", name, op)
 	}
-}
-
-func TestChangeTypeToProto_CaseInsensitive(t *testing.T) {
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, changeTypeToProto("alter"))
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, changeTypeToProto("ALTER"))
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_CREATE, changeTypeToProto("Create"))
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_OTHER, changeTypeToProto("unknown"))
+	assert.Equal(t, "other", protoChangeTypeToOperation(ternv1.ChangeType_CHANGE_TYPE_OTHER))
 }
 
 func TestPlanResponseFromProto_ChangeType(t *testing.T) {

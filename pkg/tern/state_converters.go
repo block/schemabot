@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -137,28 +136,14 @@ func storageStateToProto(ts string) ternv1.State {
 	}
 }
 
-// ddlActionToProtoChangeType converts a task action to a proto change type.
-// Unmapped actions use CHANGE_TYPE_OTHER because the proto has no richer value.
-func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
-	switch action {
-	case ternconv.OpVSchemaUpdate:
-		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
-	default:
-		return ternconv.StatementTypeToChangeType(ddl.OpToStatementType(action))
-	}
-}
-
 // protoChangeTypeToDDLAction converts a proto ChangeType back to the lowercase
 // DDLAction string used in storage. It is the inverse of
-// ddlActionToProtoChangeType and is used to rebuild a plan's table changes from
+// ternconv.OpToChangeType and is used to rebuild a plan's table changes from
 // a dispatch request on a deployment that did not plan locally. Unmapped values
 // use "unknown" so callers can recover the action from the authoritative DDL.
 func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
-	if ct == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
-		return ternconv.OpVSchemaUpdate
-	}
-	if st, ok := ternconv.ChangeTypeToStatementType(ct); ok {
-		return ddl.StatementTypeToOp(st)
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
 	return "unknown"
 }
