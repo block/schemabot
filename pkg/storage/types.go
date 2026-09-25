@@ -310,7 +310,9 @@ const WebhookReconcileScanCursorSettingKeyPrefix = "webhook_reconcile_scan_curso
 // IsComponentStateSettingKey reports whether key names a row a component
 // keeps for its own state rather than an operator setting. The settings
 // listing leaves such rows out so it shows only what an operator can act on;
-// fetching one by its exact key still works, for inspection.
+// fetching one by key still works, for inspection. Component-state keys carry
+// a repository name, so they contain a slash and travel percent-encoded on
+// the settings path.
 func IsComponentStateSettingKey(key string) bool {
 	return strings.HasPrefix(key, WebhookReconcileScanCursorSettingKeyPrefix)
 }

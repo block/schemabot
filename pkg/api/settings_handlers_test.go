@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -101,4 +102,24 @@ func TestSettingsGetReturnsComponentStateRowByKey(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
 	assert.Equal(t, key, response.Key)
 	assert.Equal(t, `{"page":3}`, response.Value)
+}
+
+// The CLI reaches a cursor row the same way an operator types it: with the
+// repository's slash intact. The route matches one path segment, so the client
+// percent-encodes the key and the server decodes it back before the lookup;
+// an unescaped slash would leave the route unmatched and the CLI reporting the
+// setting as unset.
+func TestCLIGetSettingReadsComponentStateKeyWithSlash(t *testing.T) {
+	key := storage.WebhookReconcileScanCursorSettingKeyPrefix + "octo/payments"
+	service := New(&mockStorageWithSettings{settings: &staticSettingsStore{settings: []*storage.Setting{
+		{Key: key, Value: `{"page":3}`},
+	}}}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mux := http.NewServeMux()
+	service.ConfigureRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	value, err := client.GetSetting(srv.URL, key)
+	require.NoError(t, err)
+	assert.Equal(t, `{"page":3}`, value)
 }
