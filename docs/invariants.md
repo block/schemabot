@@ -659,8 +659,10 @@ early rather than reviving the apply. A rollout's state is derived from its oper
 sibling's failure can record `failed` on the parent while another deployment's driver is still
 working. Re-deriving then returns the parent to `running_degraded` until that work settles (ST-10).
 It runs only from `failed`, only while the operations themselves still derive `failed`, and only
-for a caller that holds the lease. The write lands only if the parent still holds the state it
-read. It writes the parent row alone, so no failed operation runs again.
+for a caller that opts in; every caller that does holds the lease. Storage does not require the
+lease for this write, so the lease requirement is the callers' policy. The write lands only if the
+parent still holds the state it read. It writes the parent row alone, so no failed operation runs
+again, and it does not re-run the target check of OW-5.
 
 `stopped` is the one terminal state that is still addressable, because a stopped apply is holding
 a database rather than done with it. It can be claimed to resume via `start`, and it can be
@@ -682,9 +684,10 @@ retry. No other claim path can reach a stamped apply, since work must have run b
 can take it over, and an active apply cannot gain one at all. *Enforced:* the named state arms of
 the single claim query, the terminal-state refusals in the control handlers, and the write-once
 supersession marker consulted by the start, resume, and retry paths
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`); the lease-scoped
-reopen policy on the rollout projection (`reopensHeldFailedRollout` in
-`updateApplyStateFromOperations`, `pkg/api/operator.go`).
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`); the reopen policy
+each caller passes to the rollout projection, with the lease-scoped drive paths opting in and the
+unscoped reconciler opting out (`reopensHeldFailedRollout` in `updateApplyStateFromOperations`,
+`pkg/api/operator.go`).
 
 ### ST-2: Recovery from permanent failure is a fresh plan and apply
 
@@ -867,7 +870,10 @@ rather than the operation is the unit of reconciliation.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. That lock excludes only while the connection holding it keeps one
+transaction that decides. The rollout verdict correction in ST-1 is the one exception: it writes
+the parent row without re-running the check. The check reads the parent's state, so a parent whose
+`failed` verdict was recorded too early reserves none of its deployments until that verdict is
+corrected, even while one of its operations is still running there. That lock excludes only while the connection holding it keeps one
 server session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct API
 callers and `--no-lock` flows are equally bound. *Enforced:* the exclusivity check in the storage
 apply create and activate paths, under the apply target lock
