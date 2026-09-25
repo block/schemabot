@@ -110,16 +110,40 @@ func TestSummarizeChanges(t *testing.T) {
 		assert.Zero(t, counts.Other)
 	})
 
-	t.Run("does not count a MySQL create index as a table change", func(t *testing.T) {
+	t.Run("counts a MySQL create index as an alter of its table", func(t *testing.T) {
 		changes := []KeyspaceChangeData{{
 			Keyspace:   "orders",
 			Statements: []string{"CREATE INDEX `i` ON `t` (`v`)"},
 		}}
 		counts := countStatementTypes(changes, "mysql")
 		assert.Zero(t, counts.Created)
-		assert.Zero(t, counts.Altered)
+		assert.Equal(t, 1, counts.Altered)
 		assert.Zero(t, counts.Dropped)
-		assert.Equal(t, 1, counts.Other)
+		assert.Zero(t, counts.Other)
+	})
+
+	t.Run("counts a PostgreSQL index on an existing table beside a create set", func(t *testing.T) {
+		// A greenfield create set is one table to create however many indexes
+		// it carries; a concurrent index build on a table the plan does not
+		// otherwise touch is that table to alter, and an ALTER plus an index
+		// on one table is still one table to alter.
+		data := PlanCommentData{
+			DatabaseType: "postgres",
+			Changes: []KeyspaceChangeData{{
+				Keyspace: "orders",
+				Statements: []string{
+					`ALTER TABLE "app"."settings" ADD COLUMN file_prefix text`,
+					`ALTER TABLE "app"."payments" ALTER COLUMN amount TYPE numeric`,
+					`CREATE TABLE "app"."recalls" (id bigint PRIMARY KEY, payment_id bigint); CREATE INDEX recalls_payment_idx ON "app"."recalls" (payment_id)`,
+					`CREATE INDEX CONCURRENTLY payments_settled_idx ON "app"."payments" (settled_at)`,
+					`CREATE INDEX CONCURRENTLY referrals_referred_idx ON "app"."referrals" (referred_at)`,
+				},
+			}},
+		}
+		assert.Equal(t, "1 create, 3 alters", SummarizeChanges(data))
+		var summary strings.Builder
+		writePlanSummary(&summary, data, 5, 0)
+		assert.Equal(t, "📋 **Plan**: **1** table to create, **3** tables to alter\n\n", summary.String())
 	})
 
 	tests := []struct {
@@ -212,9 +236,10 @@ func TestSummarizeChanges(t *testing.T) {
 
 	t.Run("a statement confined to one shard is counted", func(t *testing.T) {
 		// The collapsed namespace-level Statements carry only the change every
-		// shard shares; the CREATE INDEX exists on one drifted shard alone. The
-		// comment renders the per-shard DDL, so the summary counts from it and
-		// names the index statement instead of reporting the collapsed view.
+		// shard shares; the CREATE INDEX on a second table exists on one drifted
+		// shard alone. The comment renders the per-shard DDL, so the summary
+		// counts from it and names that table instead of reporting the
+		// collapsed view.
 		data := PlanCommentData{
 			IsMySQL:      false,
 			DatabaseType: "vitess",
@@ -222,12 +247,12 @@ func TestSummarizeChanges(t *testing.T) {
 				Keyspace:   "orders",
 				Statements: []string{"ALTER TABLE a ADD COLUMN b INT"},
 				Shards: []KeyspaceShardChange{
-					{Shard: "-80", Statements: []string{"ALTER TABLE a ADD COLUMN b INT", "CREATE INDEX `i` ON `a` (`b`)"}},
+					{Shard: "-80", Statements: []string{"ALTER TABLE a ADD COLUMN b INT", "CREATE INDEX `i` ON `c` (`d`)"}},
 					{Shard: "80-", Statements: []string{"ALTER TABLE a ADD COLUMN b INT"}},
 				},
 			}},
 		}
-		assert.Equal(t, "1 alter, 1 other DDL statement", SummarizeChanges(data))
+		assert.Equal(t, "2 alters", SummarizeChanges(data))
 		totalStatements, _ := countChanges(data.Changes)
 		assert.Equal(t, 2, totalStatements)
 	})

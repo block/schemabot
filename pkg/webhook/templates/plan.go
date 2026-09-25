@@ -892,10 +892,13 @@ func SummarizeChanges(data PlanCommentData) string {
 // (keyspaceStatements), so a sharded keyspace is counted from its per-shard
 // changes. The create/alter/drop counts are per table: when shards diverge,
 // one table can render two different ALTER statements, and it is still one
-// table to alter. A statement the parser rejects or a recognized statement
-// outside the table buckets contributes to other so the summary stays
-// complete. A database type with no registered parser yields no counts at
-// all, and the callers' raw-total fallback carries the statement count.
+// table to alter, and a CREATE INDEX on an existing table is an alter of that
+// table. A statement the parser rejects or a recognized statement outside the
+// table buckets contributes to other so the summary stays complete; the
+// shared counter decides which bucket each classified statement lands in, so
+// the CLI and the comment cannot disagree on it. A database type with no
+// registered parser yields no counts at all, and the callers' raw-total
+// fallback carries the statement count.
 func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.PlanCounts {
 	var counts ui.PlanCounts
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
@@ -919,12 +922,6 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 					continue
 				}
 				stmtType, table = createSet.Type, createSet.Table
-			}
-			switch stmtType {
-			case ddl.StatementCreateTable, ddl.StatementAlterTable, ddl.StatementDropTable:
-			default:
-				counts.AddOther()
-				continue
 			}
 			counts.AddTable(ks.Keyspace, ddl.StatementTypeToOp(stmtType), table)
 		}

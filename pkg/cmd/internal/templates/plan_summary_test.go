@@ -50,8 +50,31 @@ func TestPlanSummarySurfacesShareCounts(t *testing.T) {
 		}}},
 	}
 
-	assert.Equal(t, []string{"1 table to create", "2 tables to alter", "1 other DDL statement"}, ddlSummaryParts(cliChanges))
-	assert.Equal(t, "1 create, 2 alters, 1 other DDL statement", webhooktemplates.SummarizeChanges(commentData))
+	assert.Equal(t, []string{"1 table to create", "2 tables to alter"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 create, 2 alters", webhooktemplates.SummarizeChanges(commentData))
+}
+
+// A CREATE INDEX on a table no other statement touches is one table to alter
+// on both surfaces, and a PostgreSQL DROP INDEX — which names no table — is
+// an other statement on both, even though the CLI's change record carries the
+// table the engine resolved for it.
+func TestPlanSummarySurfacesShareIndexCounts(t *testing.T) {
+	cliChanges := []DDLChange{
+		{ChangeType: "CHANGE_TYPE_ALTER", TableName: "orders"},
+		{ChangeType: "CHANGE_TYPE_CREATE_INDEX", TableName: "events"},
+		{ChangeType: "CHANGE_TYPE_DROP_INDEX", TableName: "orders"},
+	}
+	commentData := webhooktemplates.PlanCommentData{
+		DatabaseType: "postgres",
+		Changes: []webhooktemplates.KeyspaceChangeData{{Keyspace: "app", Statements: []string{
+			"ALTER TABLE orders ADD COLUMN state text",
+			"CREATE INDEX CONCURRENTLY events_at_idx ON events (occurred_at)",
+			"DROP INDEX CONCURRENTLY orders_legacy_idx",
+		}}},
+	}
+
+	assert.Equal(t, []string{"2 tables to alter", "1 other DDL statement"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "2 alters, 1 other DDL statement", webhooktemplates.SummarizeChanges(commentData))
 }
 
 // The CLI plan summary counts every statement the plan will run, matching the
@@ -79,14 +102,15 @@ func TestWritePlanSummary_CountsEveryStatement(t *testing.T) {
 			changes: []DDLChange{
 				{ChangeType: "alter", TableName: "orders"},
 				{ChangeType: "create_index", TableName: "orders"},
+				{ChangeType: "create_index", TableName: "events"},
 				{ChangeType: "other", TableName: "order_state"},
 			},
-			want: "📋 Plan: 1 table to alter, 2 other DDL statements\n\n",
+			want: "📋 Plan: 2 tables to alter, 1 other DDL statement\n\n",
 		},
 		{
 			name: "only unbucketed statements report the raw total",
 			changes: []DDLChange{
-				{ChangeType: "create_index", TableName: "orders"},
+				{ChangeType: "drop_index", TableName: "orders"},
 			},
 			want: "📋 Plan: 1 DDL statement\n\n",
 		},
@@ -104,11 +128,11 @@ func TestWritePlanSummary_CountsEveryStatement(t *testing.T) {
 }
 
 // The vschema variant shares the DDL clauses with WritePlanSummary and appends
-// the vschema count, so a per-shard index plus a vschema update names both.
+// the vschema count, so a per-shard index drop plus a vschema update names both.
 func TestWritePlanSummaryWithVSchema_CountsEveryStatement(t *testing.T) {
 	out := captureStdout(t, func() {
 		WritePlanSummaryWithVSchema(
-			[]DDLChange{{ChangeType: "create_index", TableName: "orders"}},
+			[]DDLChange{{ChangeType: "drop_index", TableName: "orders"}},
 			[]VSchemaChange{{Keyspace: "orders"}},
 		)
 	})

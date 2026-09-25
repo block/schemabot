@@ -8,9 +8,12 @@ import "fmt"
 // disagree on it.
 //
 // A table is counted once per operation however many statements target it:
-// three ALTER statements on one table are one table to alter. Statements
-// outside the create/alter/drop buckets (types, extensions, comments,
-// indexes) are counted as other so a mixed plan still names them.
+// three ALTER statements on one table are one table to alter. A CREATE INDEX
+// on an existing table alters that table's schema and counts as one alter of
+// it, so an ALTER and an index build on one table are still one table to
+// alter. Statements outside the create/alter/drop buckets (types, extensions,
+// comments, index drops) are counted as other so a mixed plan still names
+// them.
 type PlanCounts struct {
 	Created int
 	Altered int
@@ -30,8 +33,13 @@ type planTableKey struct {
 }
 
 // AddTable counts a table-level statement. op is the lowercase operation
-// ("create", "alter", "drop"); a table is counted once per (namespace, op,
-// table). Any other op is counted as an other statement.
+// ("create", "alter", "drop", "create_index"); a table is counted once per
+// (namespace, bucket, table), and an index build shares its table's alter
+// bucket. Any other op is counted as an other statement.
+//
+// An index drop stays in the other bucket on every surface: a PostgreSQL
+// DROP INDEX names only the index, so a surface that counts from statement
+// text cannot attribute it to a table, and the surfaces must agree.
 //
 // A statement with no table name cannot be judged a duplicate of anything,
 // so it is counted rather than keyed: merging every nameless change into one
@@ -39,6 +47,8 @@ type planTableKey struct {
 func (c *PlanCounts) AddTable(namespace, op, table string) {
 	switch op {
 	case "create", "alter", "drop":
+	case "create_index":
+		op = "alter"
 	default:
 		c.AddOther()
 		return
