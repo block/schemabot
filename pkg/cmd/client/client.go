@@ -913,7 +913,7 @@ func GetSetting(endpoint, key string) (string, error) {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	}
-	err := doGetInto(endpoint, fmt.Sprintf("/api/settings/%s", key), &result)
+	err := doGetInto(endpoint, "/api/settings/"+url.PathEscape(key), &result)
 	if IsNotFound(err) {
 		return "", nil // Setting not found, return empty
 	}
