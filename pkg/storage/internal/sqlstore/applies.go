@@ -485,6 +485,9 @@ func operationDeploymentsForApply(ctx context.Context, tx *rebindTx, applyID int
 // is matched against both the parent applies.deployment (the primary) and the
 // apply_operations.deployment rows, so single-operation applies (where the two
 // are equal) behave exactly as before.
+//
+// A started operation also reserves its own deployment, whatever its parent's
+// state (checkNoStartedOperationForTargets).
 func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
 	deployments = dedupeDeployments(deployments)
 	if len(deployments) == 0 {
@@ -520,13 +523,63 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 
 	var exists int
 	err := tx.QueryRowContext(ctx, query, args...).Scan(&exists)
+	if err == nil {
+		return fmt.Errorf("active apply exists for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, storage.ErrActiveApplyExists)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+	}
+	return checkNoStartedOperationForTargets(ctx, tx, database, dbType, environment, deployments, excludeApplyID)
+}
+
+// startedOperationStatePredicate matches an operation that a driver has started
+// and that has not reached a terminal state. A pending operation is excluded:
+// under an active parent the parent already reserves it, and under a terminal
+// parent the claim refuses to start it, so it holds no deployment on its own.
+func startedOperationStatePredicate(column string) (string, []any) {
+	notStarted := terminalApplyStates()
+	notStarted = append(notStarted, state.ApplyOperation.Pending)
+	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(notStarted))), stringArgs(notStarted)
+}
+
+// checkNoStartedOperationForTargets reserves a deployment for as long as an
+// operation is working there, whatever its parent apply's state says. The
+// parent check above releases a deployment once the parent is terminal, and a
+// rollout's parent can record a terminal verdict while one of its operations is
+// still running: a sibling's failure can terminalize the parent before the
+// projection re-derives it. Matching the operation rows directly keeps a second
+// apply off that deployment until the running operation settles.
+func checkNoStartedOperationForTargets(ctx context.Context, tx *rebindTx, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
+	statePredicate, stateArgs := startedOperationStatePredicate("o.state")
+	query := fmt.Sprintf(`
+		SELECT a.apply_identifier, a.state, o.deployment, o.state
+		FROM apply_operations o
+		JOIN applies a ON a.id = o.apply_id
+		WHERE o.deployment IN (%s)
+		AND %s
+		AND a.database_name = ?
+		AND a.database_type = ?
+		AND a.environment = ?
+	`, placeholders(len(deployments)), statePredicate)
+	args := stringArgs(deployments)
+	args = append(args, stateArgs...)
+	args = append(args, database, dbType, environment)
+	if excludeApplyID > 0 {
+		query += " AND a.id != ?"
+		args = append(args, excludeApplyID)
+	}
+	query += " LIMIT 1"
+
+	var holderIdentifier, holderState, holderDeployment, operationState string
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&holderIdentifier, &holderState, &holderDeployment, &operationState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+		return fmt.Errorf("check started operations for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	return fmt.Errorf("active apply exists for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, storage.ErrActiveApplyExists)
+	return fmt.Errorf("apply %s (state %s) has a %s operation on deployment %s for %s/%s/%s: %w",
+		holderIdentifier, holderState, operationState, holderDeployment, database, dbType, environment, storage.ErrActiveApplyExists)
 }
 
 func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {
