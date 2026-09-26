@@ -1452,12 +1452,21 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 
 	now := time.Now()
 	oldState := apply.State
-	apply.State = state.Apply.Stopped
-	apply.CompletedAt = &now
-	apply.UpdatedAt = now
-	if err := s.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+	synced := *apply
+	synced.State = state.Apply.Stopped
+	synced.CompletedAt = &now
+	synced.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, &synced); err != nil {
+		if !errors.Is(err, storage.ErrApplyReopenRefused) {
+			return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+		}
+		// The remote check takes real time, and the apply finished in storage
+		// while it ran. Writing stopped over that verdict would make a finished
+		// apply startable again, so the start proceeds from the stored row and
+		// the pending stop stays with whoever finished it.
+		return s.reloadApplyAfterRefusedStopSync(ctx, apply, oldState, stopCaller, caller)
 	}
+	*apply = synced
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 	}
@@ -1466,6 +1475,28 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 			"requested_by", stopCaller, "start_requested_by", caller, "old_state", oldState, "new_state", apply.State)...)
 	s.logControlOperationForApply(ctx, apply, stopCaller, storage.LogEventStopRequested,
 		"Pending remote stop request completed before start")
+	return nil
+}
+
+// reloadApplyAfterRefusedStopSync replaces the handler's copy of the apply with
+// the stored row after storage refused to write stopped over a finished apply,
+// then validates the start against that row, so the operator is refused for
+// the verdict that won rather than for the stop request it left pending.
+func (s *Service) reloadApplyAfterRefusedStopSync(ctx context.Context, apply *storage.Apply, readState, stopCaller, caller string) error {
+	fresh, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("reload apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("reload apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	*apply = *fresh
+	s.logger.Info("apply finished while the remote stop check ran; stop request left pending and start revalidated against the stored state",
+		append(apply.LogAttrs(),
+			"requested_by", stopCaller, "start_requested_by", caller, "read_state", readState)...)
+	if err := validateStartRequestState(apply); err != nil {
+		return fmt.Errorf("start apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, err)
+	}
 	return nil
 }
 

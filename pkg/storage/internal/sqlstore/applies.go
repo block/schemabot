@@ -185,6 +185,68 @@ func nonTerminalApplyStatePredicate(column string) (string, []any) {
 	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(terminalStates))), stringArgs(terminalStates)
 }
 
+func unsettledApplyStatePredicate(column string) (string, []any) {
+	settled := settledApplyStates()
+	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(settled))), stringArgs(settled)
+}
+
+// wouldReopenFinishedApply reports whether writing newState over a row in
+// currentState would hand a finished apply back to a path that can drive it.
+// An active state reopens any terminal row. Stopped reopens a settled row,
+// because a stopped apply can be claimed to resume. Every other terminal write
+// leaves a finished apply finished, so cancelling a stopped apply is allowed.
+func wouldReopenFinishedApply(currentState, newState string) bool {
+	if isActiveApplyState(newState) {
+		return state.IsTerminalApplyState(currentState)
+	}
+	if state.IsState(newState, state.Apply.Stopped) {
+		return state.IsState(currentState, settledApplyStates()...)
+	}
+	return false
+}
+
+// reopenGuardPredicate is the SQL form of wouldReopenFinishedApply: the WHERE
+// predicate that lets a general update land only on a row it cannot reopen.
+// ok is false when newState cannot reopen any row, so the write is unguarded.
+func reopenGuardPredicate(column, newState string) (predicate string, args []any, ok bool) {
+	if isActiveApplyState(newState) {
+		predicate, args = nonTerminalApplyStatePredicate(column)
+		return predicate, args, true
+	}
+	if state.IsState(newState, state.Apply.Stopped) {
+		predicate, args = unsettledApplyStatePredicate(column)
+		return predicate, args, true
+	}
+	return "", nil, false
+}
+
+// ensureReopenGuardHeld resolves a zero-rows result from an update that carried
+// the reopen guard. Zero rows is ambiguous: the write may have changed nothing,
+// the row may not exist, or the guard may have refused a finished row. The
+// row's current state tells the three apart, so each surfaces as its own cause.
+func ensureReopenGuardHeld(ctx context.Context, db queryRower, apply *storage.Apply) error {
+	// The two dialects reach the finished row by different routes. On MySQL,
+	// InnoDB's locking read returns the latest committed row whatever the
+	// transaction's snapshot, so a finishing write another writer committed
+	// mid-update is exactly what the guard refused. On PostgreSQL under
+	// REPEATABLE READ, a row another writer changed after this transaction's
+	// snapshot raises a serialization failure instead, from the guarded UPDATE
+	// or from this read. Update retries the whole attempt through
+	// withLockRetry, and the retry's fresh snapshot sees the finished row.
+	var currentState string
+	err := db.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("apply %s does not exist for update to state %s: %w", apply.ApplyIdentifier, apply.State, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("re-read apply %s after guarded update to state %s: %w", apply.ApplyIdentifier, apply.State, err)
+	}
+	if wouldReopenFinishedApply(currentState, apply.State) {
+		return fmt.Errorf("apply %s is %s; update to %s would reopen it: %w", apply.ApplyIdentifier, currentState, apply.State, storage.ErrApplyReopenRefused)
+	}
+	return nil
+}
+
 func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation string) (*applyWriteTx, error) {
 	tx, err := beginner.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
@@ -1019,6 +1081,18 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	if err != nil {
 		return err
 	}
+	// The whole write retries on a transient conflict. On PostgreSQL a writer
+	// that finishes the apply after this transaction's snapshot surfaces as a
+	// serialization failure rather than as a row the guard refused; the retry
+	// takes a fresh snapshot, sees the finished row, and refuses it as such.
+	return withLockRetry(ctx, s.classifier, fmt.Sprintf("update apply %d", apply.ID), func() error {
+		return s.updateOnce(ctx, apply, lease, hasLease)
+	})
+}
+
+// updateOnce runs one attempt of Update in its own transaction.
+func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease storage.ApplyLease, hasLease bool) error {
+	var err error
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
 	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
@@ -1069,6 +1143,15 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		leasePredicate = " AND lease_token = ?"
 		args = append(args, lease.Token)
 	}
+	// A finished apply stays finished whoever writes it. The guard is evaluated
+	// against the stored row, so a caller holding an in-memory copy from before
+	// another writer finished the apply cannot hand it back to a driver.
+	reopenPredicate := ""
+	guardPredicate, guardArgs, reopenGuarded := reopenGuardPredicate("state", apply.State)
+	if reopenGuarded {
+		reopenPredicate = " AND " + guardPredicate
+		args = append(args, guardArgs...)
+	}
 
 	// The recovery budget (attempt) is deliberately not written here. It is
 	// owned by the insert at create time and by the claim transition's atomic
@@ -1079,19 +1162,28 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		UPDATE applies
 		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?%s
-	`, optionsUpdate, leasePredicate), args...)
+		WHERE id = ?%s%s
+	`, optionsUpdate, leasePredicate, reopenPredicate), args...)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
 	}
-	if hasLease {
+	if hasLease || reopenGuarded {
 		rows, err := result.RowsAffected()
 		if err != nil {
 			return fmt.Errorf("read apply update rows affected for apply %d: %w", apply.ID, err)
 		}
 		if rows == 0 {
-			if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
-				return err
+			// A lost lease outranks a refused reopen: the caller no longer owns
+			// the apply at all, which is the cause it needs to act on.
+			if hasLease {
+				if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
+					return err
+				}
+			}
+			if reopenGuarded {
+				if err := ensureReopenGuardHeld(ctx, writeTx.tx, apply); err != nil {
+					return err
+				}
 			}
 		}
 	}

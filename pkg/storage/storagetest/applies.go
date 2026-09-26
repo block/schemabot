@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -266,6 +267,165 @@ func TestApplies(t *testing.T, h Harness) {
 		third, err := store.Applies().ClaimApplyByID(ctx, first.ID, "driver-c")
 		require.NoError(t, err)
 		assert.Nil(t, third, "a mismatched release leaves the current lease fresh")
+	})
+
+	// Every write a general update can make over a finished apply, across the
+	// whole state registry: the write is refused exactly when it would reopen
+	// the apply, and every other write lands. An active state reopens any
+	// terminal row; stopped reopens a settled one, because a stopped apply can
+	// be claimed to resume. Cancelling a stopped apply is not a reopen.
+	t.Run("Update_NeverReopensFinishedApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_reopen_matrix_db", storage.DatabaseTypeMySQL)
+
+		reopens := func(current, next string) bool {
+			if !state.IsTerminalApplyState(next) {
+				return true
+			}
+			return state.IsState(next, state.Apply.Stopped) && state.IsState(current, state.SettledApplyStates...)
+		}
+
+		planID := int64(9100)
+		for _, current := range registeredApplyStates(t) {
+			if !state.IsTerminalApplyState(current) {
+				continue
+			}
+			for _, next := range registeredApplyStates(t) {
+				t.Run(current+"_to_"+next, func(t *testing.T) {
+					planID++
+					apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_reopen_"+current+"_"+next, planID, current, "staging")
+
+					apply.State = next
+					err := store.Applies().Update(ctx, apply)
+
+					persisted, getErr := store.Applies().Get(ctx, apply.ID)
+					require.NoError(t, getErr)
+					require.NotNil(t, persisted)
+					if reopens(current, next) {
+						require.ErrorIsf(t, err, storage.ErrApplyReopenRefused, "writing %s over a %s apply reopens it", next, current)
+						assert.Equal(t, current, persisted.State, "a refused write leaves the stored verdict in place")
+						return
+					}
+					require.NoErrorf(t, err, "writing %s over a %s apply leaves it finished", next, current)
+					assert.Equal(t, next, persisted.State)
+				})
+			}
+		}
+	})
+
+	// A caller copies an apply while it runs; another writer finishes it; the
+	// caller then writes its copy back. Whether the copy says running or
+	// stopped, the finished verdict stands: a running copy would hand the apply
+	// to a driver, and a stopped copy would make it startable.
+	t.Run("Update_RefusesStaleCopyOfFinishedApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_copy_db", storage.DatabaseTypeMySQL)
+
+		for _, staleState := range []string{state.Apply.Running, state.Apply.Stopped} {
+			t.Run(staleState, func(t *testing.T) {
+				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stale_copy_"+staleState, 9001, state.Apply.Running, "staging")
+				staleCopy := *apply
+
+				finishedAt := time.Now()
+				apply.State = state.Apply.Completed
+				apply.CompletedAt = &finishedAt
+				require.NoError(t, store.Applies().Update(ctx, apply))
+
+				staleCopy.State = staleState
+				staleCopy.CompletedAt = nil
+				require.ErrorIs(t, store.Applies().Update(ctx, &staleCopy), storage.ErrApplyReopenRefused)
+
+				persisted, err := store.Applies().Get(ctx, apply.ID)
+				require.NoError(t, err)
+				require.NotNil(t, persisted)
+				assert.Equal(t, state.Apply.Completed, persisted.State)
+				assert.NotNil(t, persisted.CompletedAt, "the finished apply keeps its completion time")
+			})
+		}
+	})
+
+	// A stopped apply goes active again only through the start claim. A caller
+	// that writes running over it without one is refused and the apply stays
+	// stopped. Once an operator's start request is claimed, the claim moves the
+	// apply to resuming and the driver's running write lands.
+	t.Run("Update_ResumesStoppedApplyOnlyThroughStartClaim", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stopped_resume_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithTask(t, store, lock, "apply_stopped_resume", 9004)
+		apply.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, apply))
+
+		apply.State = state.Apply.Running
+		require.ErrorIs(t, store.Applies().Update(ctx, apply), storage.ErrApplyReopenRefused,
+			"running over a stopped apply without the start claim reopens it")
+		stillStopped, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stillStopped)
+		assert.Equal(t, state.Apply.Stopped, stillStopped.State)
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   apply.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a stopped apply with a pending start request is claimable")
+		resuming, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, resuming)
+		assert.Equal(t, state.Apply.Resuming, resuming.State, "the start claim moves the apply out of stopped")
+
+		claimed.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(storage.WithApplyLease(ctx, claimed.Lease()), claimed))
+		resumed, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, resumed)
+		assert.Equal(t, state.Apply.Running, resumed.State)
+	})
+
+	// Stopping is not a reopen: stop lands on a running apply, and a stopped
+	// apply can be rewritten as stopped, for example to record an error.
+	t.Run("Update_StopsActiveApplyAndRefreshesStopped", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stop_write_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stop_write", 9002, state.Apply.Running, "staging")
+
+		apply.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, apply))
+		apply.ErrorMessage = "stopped by operator"
+		require.NoError(t, store.Applies().Update(ctx, apply))
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Stopped, persisted.State)
+		assert.Equal(t, "stopped by operator", persisted.ErrorMessage)
+	})
+
+	// A driver that lost its lease and writes over a finished apply is told it
+	// lost the lease, the cause it has to act on, not that the write would
+	// have reopened an apply it no longer owns.
+	t.Run("Update_LostLeaseOutranksReopenRefusal", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_lease_reopen_db", storage.DatabaseTypeMySQL)
+		claimed := CreateClaimedApply(t, store, lock, "apply_lease_reopen", 9003, "driver-a")
+
+		ownedCtx := storage.WithApplyLease(ctx, claimed.Lease())
+		claimed.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ownedCtx, claimed))
+
+		staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: claimed.ID, Owner: "old-driver", Token: "stale-token"})
+		claimed.State = state.Apply.Running
+		require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost)
 	})
 
 	t.Run("LeaseGuardsWrites", func(t *testing.T) {
@@ -596,4 +756,18 @@ func TestApplies(t *testing.T, h Harness) {
 			require.Error(t, test(t, h.NewUnreachableStorage(t).Applies()))
 		})
 	}
+}
+
+// registeredApplyStates returns every state in the apply state registry, so a
+// test that sweeps it covers a state the moment it is added.
+func registeredApplyStates(t *testing.T) []string {
+	t.Helper()
+	v := reflect.ValueOf(state.Apply)
+	states := make([]string, 0, v.NumField())
+	for i := 0; i < v.NumField(); i++ {
+		value := v.Field(i).String()
+		require.NotEmptyf(t, value, "state.Apply.%s is empty", v.Type().Field(i).Name)
+		states = append(states, value)
+	}
+	return states
 }
