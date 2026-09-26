@@ -264,7 +264,7 @@ func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 // finishedAfterReadApplyStore hands a lookup a copy of the apply in readState
 // while the stored row is already finished: the view a handler holds when a
 // driver finishes the apply after the handler read it. Update refuses stopped
-// over a settled row the way the storage reopen guard does, and Get returns
+// over a settled row the way the storage finished-apply guard does, and Get returns
 // the stored row.
 type finishedAfterReadApplyStore struct {
 	storage.ApplyStore

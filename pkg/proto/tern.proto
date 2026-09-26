@@ -979,6 +979,11 @@ message CancelRequest {
 // CancelResponse indicates whether the cancel was accepted.
 message CancelResponse {
   bool accepted = 1;
+  // error_message explains a refusal when accepted is false. When accepted is
+  // true it may still be set, to say what actually happened: a cancel that
+  // arrived after the schema change settled is accepted with
+  // "Schema change already <state>". Branch on accepted, not on whether
+  // error_message is empty.
   string error_message = 2;
   // Number of tasks that were cancelled.
   int64 cancelled_count = 3;
