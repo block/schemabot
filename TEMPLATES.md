@@ -969,7 +969,9 @@ CREATE TABLE sessions (
 ALTER TABLE users
     ADD COLUMN last_seen_at timestamptz,
     ADD COLUMN preferences jsonb;
+```
 
+```sql
 CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
 ```
 
