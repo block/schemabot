@@ -404,7 +404,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
 		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
-			sb.WriteString("\n")
+			if !targetPlans {
+				sb.WriteString("\n")
+			}
 			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
 			writeExemptTables(&sb, data.ExemptTables)
 		}
@@ -912,29 +914,8 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 	}
 }
 
-// noChangesHeadline states what an empty reviewed plan means for the rest of the
-// rollout.
-//
-// On its own an empty plan reads as a no-op, and that is only established for
-// the target that was reviewed. An independent rollout plans each target against
-// its own live schema, so a primary already at the desired schema says nothing
-// about the rest: other targets can still be missing the change. A reviewer who
-// takes the green line at face value merges believing the fleet holds this
-// schema, so where some target does not the headline says so.
-//
-// It says what is true of the targets, not what an apply would do about them.
-// An apply is gated on the reviewed target's own re-plan, so an empty reviewed
-// plan ends the command before any member runs — the unconverged targets named
-// here are not reconciled by applying this plan, and the headline must not read
-// as though they would be.
-func noChangesHeadline(drift *DeploymentDriftData) string {
-	changing := changingTargetCount(drift)
-	if changing == 0 {
-		return "✅ **No schema changes detected**"
-	}
-	return fmt.Sprintf("%s **No schema changes for the reviewed target** — %s this change, and applying this plan will not run it for them.",
-		glyph.Attention, countedVerb(changing, "target still needs", "targets still need"))
-}
+// noChangesDetected is the line that closes a comment with nothing to apply.
+const noChangesDetected = "✅ **No schema changes detected**"
 
 // changingTargetCount counts the rollout's members whose own plan runs work.
 //
@@ -955,8 +936,17 @@ func changingTargetCount(drift *DeploymentDriftData) int {
 	return changing
 }
 
+// writeNoChangesDetected closes a comment whose reviewed plan is empty.
+//
+// An empty reviewed plan is a no-op only for the reviewed target. An independent
+// rollout plans each target against its own live schema, so other targets can
+// still be missing the change. When they are, their plans have already rendered
+// above, each under the targets that run it, beside the targets already at this
+// schema, so the comment adds no line claiming the whole rollout is done.
 func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
-	sb.WriteString(noChangesHeadline(data.DeploymentDrift) + "\n")
+	if !rendersTargetPlans(data.DeploymentDrift) {
+		sb.WriteString(noChangesDetected + "\n")
+	}
 	if data.RecoveredApplyOwnedCheckState {
 		sb.WriteString("\n" + glyph.Info + " SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
 	}
@@ -2163,7 +2153,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// summary (writePlanSummary) or no-changes message, because entries can
 	// resolve differently per environment.
 	if totalChanges == 0 {
-		sb.WriteString(noChangesHeadline(plan.DeploymentDrift) + "\n\n")
+		if !targetPlans {
+			sb.WriteString(noChangesDetected + "\n\n")
+		}
 		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		writeExemptTables(sb, plan.ExemptTables)
 		return

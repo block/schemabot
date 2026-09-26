@@ -368,9 +368,11 @@ func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) 
 
 	out := RenderMultiEnvPlanComment(data)
 	assert.NotContains(t, out, "**No schema changes detected** for any environment.")
-	assert.Contains(t, out, "⚠️ **No schema changes for the reviewed target** — 1 target still needs this change, and applying this plan will not run it for them.")
-	// Staging is genuinely converged, so its own section keeps the green line.
-	assert.Contains(t, out, "✅ **No schema changes detected**")
+	assert.Contains(t, out, "📋 **Plan** for `primary/testapp_2`: ")
+	assert.Contains(t, out, "ADD COLUMN `email`")
+	// Staging is genuinely converged, so its own section keeps the green line,
+	// and production, which still has work, does not.
+	assert.Equal(t, 1, strings.Count(out, "✅ **No schema changes detected**"))
 
 	// With every environment's rollout converged, the all-clear is correct and
 	// still renders.
@@ -606,11 +608,11 @@ func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
 }
 
 // A rollout whose reviewed target is already at the desired schema, while other
-// targets are not, must not headline as a no-op. The reviewed plan is empty, so
-// the comment shows no DDL; a reviewer who reads "no schema changes detected"
-// merges believing the fleet holds this schema, when targets are still missing
-// it and applying this plan does not give it to them.
-func TestRenderPlanComment_ConvergedPrimaryDoesNotHeadlineAsNoOp(t *testing.T) {
+// targets are not, must not read as a no-op. The reviewed plan is empty, but a
+// reviewer who reads "no schema changes detected" merges believing the fleet
+// holds this schema, so the comment shows the plan the other targets still run
+// and names the reviewed target as the one already there.
+func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 	alter := []KeyspaceChangeData{{
 		Keyspace:   "testapp",
 		Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
@@ -633,12 +635,9 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotHeadlineAsNoOp(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.NotContains(t, out, "✅ **No schema changes detected**")
-	assert.Contains(t, out, "⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, and applying this plan will not run it for them.")
-
-	// The same shape with a single other target agrees with itself on number.
-	data.DeploymentDrift.Deployments = data.DeploymentDrift.Deployments[:2]
-	data.DeploymentDrift.Plans[1].Members = []string{"primary/testapp_2"}
-	assert.Contains(t, RenderPlanComment(data), "⚠️ **No schema changes for the reviewed target** — 1 target still needs this change, and applying this plan will not run it for them.")
+	assert.Contains(t, out, "📋 **Plan** for `primary/testapp_2`, `primary/testapp_3`: ")
+	assert.Contains(t, out, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "✅ `primary/testapp_1` is already at this schema.")
 }
 
 // A rollout where every target is already at the desired schema is a no-op, and
@@ -787,8 +786,8 @@ func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 }
 
 // A reviewed target already at the schema has no plan of its own to show, but
-// the targets still missing the change do, so their plans render above the
-// headline that says an apply of this plan will not run them.
+// the targets still missing the change do, so their plans render and the
+// reviewed target is listed with the rest of the targets already there.
 func TestRenderPlanComment_ConvergedReviewedTargetShowsTheOtherTargetsPlans(t *testing.T) {
 	drift := targetPlanRollout(nil)
 	out := RenderPlanComment(PlanCommentData{
@@ -799,7 +798,7 @@ func TestRenderPlanComment_ConvergedReviewedTargetShowsTheOtherTargetsPlans(t *t
 	assert.Contains(t, out, "📋 **Plan** for `primary/testapp_4`: ")
 	assert.Contains(t, out, "ADD INDEX `idx_email`")
 	assert.Contains(t, out, "✅ `primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3` are already at this schema.")
-	assert.Greater(t, strings.Index(out, "⚠️ **No schema changes for the reviewed target** — 1 target still needs this change"), strings.Index(out, "ADD INDEX `idx_email`"))
+	assert.NotContains(t, out, "✅ **No schema changes detected**")
 }
 
 // Each environment's section renders its rollout's plans the same way, folding

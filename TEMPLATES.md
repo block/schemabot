@@ -1693,7 +1693,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ✅ `primary/testapp_1` is already at this schema.
 
-⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, and applying this plan will not run it for them.
 
 </details>
 

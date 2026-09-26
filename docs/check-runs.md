@@ -756,8 +756,8 @@ changes, because the reviewer needs to be told why the check is not passing. A
 deployment that diverged or could not be verified fails the check closed, and
 the comment explains the failure. A rollout of independent targets whose
 reviewed target is already at the desired schema, while another target is not,
-keeps the check pending (MG-12), and the comment is the only place that says
-how many targets still need the change.
+keeps the check pending (MG-12), and the comment is the only place that shows
+the plans those targets still need.
 
 ### PR touches no managed schema files
 

@@ -641,8 +641,8 @@ func PreviewCommentPlanRolloutConverging() string {
 // PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
 // whose reviewed target already holds the desired schema while other targets do
 // not. The reviewed target has no plan to show, so the comment renders the plan
-// of the targets still missing the change, names the reviewed target as already
-// there, and says an apply of this plan will not run the others.
+// of the targets still missing the change and names the reviewed target as
+// already there.
 func PreviewCommentPlanRolloutConvergedPrimary() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
