@@ -123,8 +123,10 @@ func TestDDLBlockBudgetIsSharedAcrossBlocks(t *testing.T) {
 
 // A section's blocks share the section's one budget share: they render whole
 // and in order while it holds them, the first that does not fit is cut to the
-// room left and marked once, and the blocks after it are left out, so the
-// section shows exactly as much DDL as it would have as one block.
+// room left and marked once, and the blocks after it are left out. Each
+// block's fences and separator are charged to the share, so the section never
+// renders past it, and when the share runs out at a block boundary the marker
+// follows the last whole block rather than an empty fence.
 func TestWriteSQLFencedBlocksShareOneSectionBudget(t *testing.T) {
 	first := "ALTER TABLE a ADD COLUMN x int;"
 	second := "ALTER TABLE b ADD COLUMN y int;"
@@ -152,6 +154,32 @@ func TestWriteSQLFencedBlocksShareOneSectionBudget(t *testing.T) {
 		assert.True(t, strings.HasSuffix(rendered, ddlTruncatedMarker), "nothing renders after the cut block")
 		assert.NotContains(t, rendered, "ALTER TABLE c")
 		assert.Equal(t, share, len(rendered)-len(ddlTruncatedMarker), "the section fills its share exactly")
+		assert.Equal(t, 0, budget.remaining)
+	})
+
+	t.Run("a share that ends at a block boundary is marked without an empty fence", func(t *testing.T) {
+		// A one-byte block needs the separator, both fences, the info string,
+		// and two newlines around its byte; any share short of that past the
+		// first block has room for nothing the reader could see.
+		oneByteBlock := len("\n") + len("```sql\nA\n```\n")
+		for extra := range oneByteBlock {
+			share := len(whole(first)) + extra
+			budget := &ddlBlockBudget{remaining: share, blocksLeft: 1}
+			var out strings.Builder
+			writeSQLFencedBlocks(&out, []string{first, second, third}, budget)
+
+			assert.Equal(t, whole(first)+ddlTruncatedMarker, out.String(), "share %d: the marker follows the whole block directly", share)
+			assert.Equal(t, extra, budget.remaining, "share %d: only the block written is charged", share)
+		}
+	})
+
+	t.Run("a share with room for one byte of the next block shows it", func(t *testing.T) {
+		share := len(whole(first)) + len("\n") + len("```sql\nA\n```\n")
+		budget := &ddlBlockBudget{remaining: share, blocksLeft: 1}
+		var out strings.Builder
+		writeSQLFencedBlocks(&out, []string{first, second, third}, budget)
+
+		assert.Equal(t, whole(first)+"\n"+whole(second[:1])+ddlTruncatedMarker, out.String())
 		assert.Equal(t, 0, budget.remaining)
 	})
 }

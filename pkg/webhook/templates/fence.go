@@ -128,21 +128,32 @@ func writeSQLFencedBlock(sb *strings.Builder, content string, budget *ddlBlockBu
 const sqlBlockSeparator = "\n"
 
 // writeSQLFencedBlocks writes each content as its own sql code block, the
-// blocks together drawing one share of the budget so that splitting a
-// section's DDL into blocks does not change how much of it the comment shows.
-// Blocks render whole, in order, while the share holds them; the first block
-// the share cannot hold is cut to the room left and followed by the
-// truncation marker, and the blocks after it are left out — the marker says
-// where the rest lives.
+// blocks together drawing one share of the budget: the section is charged for
+// its fences and separators like any other DDL it renders, so a section split
+// into blocks shows a little less DDL than it would as one block and never
+// more than its share. Blocks render whole, in order, while the share holds
+// them; the first block the share cannot hold is cut to the room left and
+// followed by the truncation marker, and the blocks after it are left out —
+// the marker says where the rest lives. When the share runs out at a block
+// boundary, so that not one byte of the next block would show, the marker
+// follows the last whole block directly rather than an empty fence.
 func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlockBudget) {
 	share := budget.take()
 	spent := 0
 	for i, content := range contents {
+		room := share - spent
 		if i > 0 {
+			room -= len(sqlBlockSeparator)
+		}
+		content, truncated := fitSQLBlock(content, room)
+		if i > 0 {
+			if truncated && content == "" {
+				sb.WriteString(ddlTruncatedMarker)
+				break
+			}
 			sb.WriteString(sqlBlockSeparator)
 			spent += len(sqlBlockSeparator)
 		}
-		content, truncated := fitSQLBlock(content, share-spent)
 		spent += sqlBlockSize(content)
 		writeFencedBlock(sb, "sql", content)
 		if truncated {
