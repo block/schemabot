@@ -235,8 +235,9 @@ func (cs ChangeSet) AuthoritativeTableChanges() []*ternv1.TableChange {
 
 // HasWork reports whether applying the change set would change anything: a
 // table change in any representation, or a namespace whose VSchema changes. It
-// reads either VSchema signal a plan can carry, so a change set that says it
-// changes a VSchema in only one of the two ways still counts as work.
+// reads VSchema work through the same predicate the comparison and the comment
+// do, so the check cannot count a namespace as changing that the comment shows
+// as already at this schema, or the reverse.
 func (cs ChangeSet) HasWork() bool {
 	if len(cs.AuthoritativeTableChanges()) > 0 {
 		return true
@@ -245,7 +246,7 @@ func (cs ChangeSet) HasWork() bool {
 		if sc == nil {
 			continue
 		}
-		if sc.Metadata[apitypes.VSchemaChangedMetadataKey] == "true" || sc.Metadata[apitypes.VSchemaDiffMetadataKey] != "" {
+		if apitypes.HasVSchemaWork(sc.Metadata) {
 			return true
 		}
 	}
