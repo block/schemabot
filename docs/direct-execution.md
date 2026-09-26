@@ -198,9 +198,13 @@ Engine notes:
   a sharded planner that emits no refusal verdict, and the per-shard delegate
   it drives to execute a change is handed a target rather than the caller's
   policy. Adopting it means a refusal detector in the sharded planner and
-  carrying the policy through to each shard, at which point `max_table_rows`
-  becomes a per-shard bound — one over-bound or unknown-size shard blocking
-  the whole apply through the normal any-shard-blocked aggregation, and a
+  carrying the policy through to each shard. The detector is not written
+  again: the Spirit engine's `ExecutionVerdicts` records, for a change planned
+  against one shard primary, the verdict the Spirit engine's own plan would
+  record there, from the same refusal check, policy, and size gate. Once both
+  pieces are in place, `max_table_rows` becomes a per-shard bound — one
+  over-bound or unknown-size shard blocking the whole apply through the normal
+  any-shard-blocked aggregation, and a
   direct statement that does run executing per shard rather than atomically
   across shards, the same property every sharded change has.
 - **PlanetScale/Vitess: excluded by design.** Raw DDL against vtgate would
