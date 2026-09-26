@@ -663,8 +663,10 @@ to an active state. Not a retry, not an API write, not a crashed driver replayin
 
 The general apply update holds this for every caller, whatever copy of the apply it writes from:
 it is evaluated against the stored row and refuses an active state over a terminal apply, and
-`stopped` over a settled one, since a stopped apply can be claimed to resume. Every other terminal
-write lands, including cancelling a stopped apply. The guard covers that update alone. The claim
+`stopped` over a settled one, since a stopped apply can be claimed to resume. It also refuses to
+replace a settled outcome with a different one, so a write from a stale copy, such as a cancel
+that arrives after the apply completed, cannot rewrite what happened. Every other terminal write
+lands, including cancelling a stopped apply. The guard covers that update alone. The claim
 transitions and the rollout projection write the state through their own conditional updates, so
 a new caller that moves an apply to an active state through either of them is not caught by it.
 
@@ -686,9 +688,9 @@ That refusal holds at every surface that could begin the work again: the API rej
 request and points at the successor, a claim to resume refuses and fails the pending start request
 with the reason, and the claim predicate excludes a stamped `failed_retryable` apply from automatic
 retry. No other claim path can reach a stamped apply, since work must have run before a successor
-can take it over, and an active apply cannot gain one at all. *Enforced:* the reopen guard on the
-storage apply update (`reopenGuardPredicate`), the named state arms of the single claim query,
-and the write-once supersession marker consulted by the start, resume, and retry paths
+can take it over, and an active apply cannot gain one at all. *Enforced:* the finished-apply guard
+on the storage apply update (`finishedApplyGuardPredicate`), the named state arms of the single
+claim query, and the write-once supersession marker consulted by the start, resume, and retry paths
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`).
 
 ### ST-2: Recovery from permanent failure is a fresh plan and apply

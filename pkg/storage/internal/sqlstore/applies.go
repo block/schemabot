@@ -205,10 +205,23 @@ func wouldReopenFinishedApply(currentState, newState string) bool {
 	return false
 }
 
-// reopenGuardPredicate is the SQL form of wouldReopenFinishedApply: the WHERE
-// predicate that lets a general update land only on a row it cannot reopen.
-// ok is false when newState cannot reopen any row, so the write is unguarded.
-func reopenGuardPredicate(column, newState string) (predicate string, args []any, ok bool) {
+// wouldRewriteSettledOutcome reports whether writing newState over a row in
+// currentState would replace one settled outcome with a different one, such
+// as a late cancel recording a completed apply as cancelled. The settled row is
+// what happened on the database; rewriting the same outcome, for example to
+// refresh a failure message, changes nothing about it.
+func wouldRewriteSettledOutcome(currentState, newState string) bool {
+	if !state.IsState(newState, settledApplyStates()...) {
+		return false
+	}
+	return state.IsState(currentState, settledApplyStates()...) && !state.IsState(currentState, newState)
+}
+
+// finishedApplyGuardPredicate is the SQL form of wouldReopenFinishedApply and
+// wouldRewriteSettledOutcome: the WHERE predicate that lets a general update
+// land only on a row it neither reopens nor gives a different outcome. ok is
+// false when newState can do neither to any row, so the write is unguarded.
+func finishedApplyGuardPredicate(column, newState string) (predicate string, args []any, ok bool) {
 	if isActiveApplyState(newState) {
 		predicate, args = nonTerminalApplyStatePredicate(column)
 		return predicate, args, true
@@ -217,14 +230,20 @@ func reopenGuardPredicate(column, newState string) (predicate string, args []any
 		predicate, args = unsettledApplyStatePredicate(column)
 		return predicate, args, true
 	}
+	if state.IsState(newState, settledApplyStates()...) {
+		unsettled, unsettledArgs := unsettledApplyStatePredicate(column)
+		predicate = fmt.Sprintf("(%s OR %s = ?)", unsettled, column)
+		return predicate, append(unsettledArgs, state.NormalizeState(newState)), true
+	}
 	return "", nil, false
 }
 
-// ensureReopenGuardHeld resolves a zero-rows result from an update that carried
-// the reopen guard. Zero rows is ambiguous: the write may have changed nothing,
-// the row may not exist, or the guard may have refused a finished row. The
-// row's current state tells the three apart, so each surfaces as its own cause.
-func ensureReopenGuardHeld(ctx context.Context, db queryRower, apply *storage.Apply) error {
+// ensureFinishedApplyGuardHeld resolves a zero-rows result from an update that
+// carried the finished-apply guard. Zero rows is ambiguous: the write may have
+// changed nothing, the row may not exist, or the guard may have refused a
+// finished row. The row's current state tells these apart, so each surfaces as
+// its own cause.
+func ensureFinishedApplyGuardHeld(ctx context.Context, db queryRower, apply *storage.Apply) error {
 	// The two dialects reach the finished row by different routes. On MySQL,
 	// InnoDB's locking read returns the latest committed row whatever the
 	// transaction's snapshot, so a finishing write another writer committed
@@ -243,6 +262,9 @@ func ensureReopenGuardHeld(ctx context.Context, db queryRower, apply *storage.Ap
 	}
 	if wouldReopenFinishedApply(currentState, apply.State) {
 		return fmt.Errorf("apply %s is %s; update to %s would reopen it: %w", apply.ApplyIdentifier, currentState, apply.State, storage.ErrApplyReopenRefused)
+	}
+	if wouldRewriteSettledOutcome(currentState, apply.State) {
+		return fmt.Errorf("apply %s already settled as %s; update to %s would rewrite its outcome: %w", apply.ApplyIdentifier, currentState, apply.State, storage.ErrApplyOutcomeSettled)
 	}
 	return nil
 }
@@ -1143,13 +1165,15 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 		leasePredicate = " AND lease_token = ?"
 		args = append(args, lease.Token)
 	}
-	// A finished apply stays finished whoever writes it. The guard is evaluated
-	// against the stored row, so a caller holding an in-memory copy from before
-	// another writer finished the apply cannot hand it back to a driver.
-	reopenPredicate := ""
-	guardPredicate, guardArgs, reopenGuarded := reopenGuardPredicate("state", apply.State)
-	if reopenGuarded {
-		reopenPredicate = " AND " + guardPredicate
+	// A finished apply stays finished whoever writes it, and a settled outcome
+	// keeps the outcome it recorded. The guard is evaluated against the stored
+	// row, so a caller holding an in-memory copy from before another writer
+	// finished the apply can neither hand it back to a driver nor overwrite
+	// what it recorded.
+	finishedPredicate := ""
+	guardPredicate, guardArgs, finishedGuarded := finishedApplyGuardPredicate("state", apply.State)
+	if finishedGuarded {
+		finishedPredicate = " AND " + guardPredicate
 		args = append(args, guardArgs...)
 	}
 
@@ -1163,25 +1187,26 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?%s%s
-	`, optionsUpdate, leasePredicate, reopenPredicate), args...)
+	`, optionsUpdate, leasePredicate, finishedPredicate), args...)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
 	}
-	if hasLease || reopenGuarded {
+	if hasLease || finishedGuarded {
 		rows, err := result.RowsAffected()
 		if err != nil {
 			return fmt.Errorf("read apply update rows affected for apply %d: %w", apply.ID, err)
 		}
 		if rows == 0 {
-			// A lost lease outranks a refused reopen: the caller no longer owns
-			// the apply at all, which is the cause it needs to act on.
+			// A lost lease outranks a refusal from the finished-apply guard:
+			// the caller no longer owns the apply at all, which is the cause it
+			// needs to act on.
 			if hasLease {
 				if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
 					return err
 				}
 			}
-			if reopenGuarded {
-				if err := ensureReopenGuardHeld(ctx, writeTx.tx, apply); err != nil {
+			if finishedGuarded {
+				if err := ensureFinishedApplyGuardHeld(ctx, writeTx.tx, apply); err != nil {
 					return err
 				}
 			}
