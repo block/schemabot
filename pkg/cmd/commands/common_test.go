@@ -3,6 +3,7 @@
 package commands
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/e2eutil"
 )
 
@@ -89,11 +91,44 @@ func TestApplyChangeCountsSummaryNamesIndexWork(t *testing.T) {
 		{TableName: "orders", ChangeType: "alter"},
 		{TableName: "orders", ChangeType: "create_index"},
 		{TableName: "events", ChangeType: "CHANGE_TYPE_CREATE_INDEX"},
-		{TableName: "orders", ChangeType: "drop_index"},
+		{TableName: "orders", ChangeType: "CHANGE_TYPE_DROP_INDEX"},
 	}
 
 	assert.Equal(t, "Changes: 1 altered, 2 indexes created, 1 index dropped.", countTableProgressChanges(tables).summary())
 	assert.Equal(t, "Changes: 1 index created.", countTableProgressChanges(tables[2:3]).summary())
+}
+
+// A change type outside the named buckets — a DDL kind the counter does not
+// name, or an empty one the producer could not map — is reported as other DDL
+// rather than dropped, and the clause sits between the typed counts and the
+// VSchema clause so the typed counts never read as the whole apply.
+func TestApplyChangeCountsSummaryNamesOtherDDL(t *testing.T) {
+	tables := []templates.TableProgress{
+		{TableName: "orders", ChangeType: "alter"},
+		{TableName: "orders", ChangeType: "rename"},
+		{TableName: "events", ChangeType: ""},
+		{ChangeType: "vschema_update"},
+	}
+
+	assert.Equal(t, "Changes: 1 altered, 2 other DDL statements, 1 VSchema update.", countTableProgressChanges(tables).summary())
+	assert.Equal(t, "Changes: 1 other DDL statement.", countTableProgressChanges(tables[1:2]).summary())
+}
+
+// TestApplyChangeCountsSummaryNamesEveryDDLKind walks the DDL statement
+// vocabulary and pins that a task of every kind appears in the completion
+// summary, so a kind without a named bucket is still reported instead of
+// leaving an apply that ran it with an empty or short Changes clause.
+func TestApplyChangeCountsSummaryNamesEveryDDLKind(t *testing.T) {
+	for st := range ddl.StatementType(64) {
+		if !st.IsDDL() {
+			continue
+		}
+		op := ddl.StatementTypeToOp(st)
+		t.Run(fmt.Sprintf("%d_%s", int(st), op), func(t *testing.T) {
+			tables := []templates.TableProgress{{TableName: "orders", ChangeType: op}}
+			assert.NotEmpty(t, countTableProgressChanges(tables).summary(), "a %q task is missing from the completion summary", op)
+		})
+	}
 }
 
 func TestApplyChangeCountsSummaryVSchemaOnly(t *testing.T) {
