@@ -486,8 +486,8 @@ func operationDeploymentsForApply(ctx context.Context, tx *rebindTx, applyID int
 // apply_operations.deployment rows, so single-operation applies (where the two
 // are equal) behave exactly as before.
 //
-// A started operation also reserves its own deployment, whatever its parent's
-// state (checkNoStartedOperationForTargets).
+// An operation a driver has started also reserves its own deployment, whatever
+// its parent's state (checkNoStartedOperationForTargets).
 func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
 	deployments = dedupeDeployments(deployments)
 	if len(deployments) == 0 {
@@ -529,17 +529,37 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	return checkNoStartedOperationForTargets(ctx, tx, database, dbType, environment, deployments, excludeApplyID)
+	return checkNoStartedOperationForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
 }
 
-// startedOperationStatePredicate matches an operation that a driver has started
-// and that has not reached a terminal state. A pending operation is excluded:
-// under an active parent the parent already reserves it, and under a terminal
-// parent the claim refuses to start it, so it holds no deployment on its own.
-func startedOperationStatePredicate(column string) (string, []any) {
-	notStarted := terminalApplyStates()
-	notStarted = append(notStarted, state.ApplyOperation.Pending)
-	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(notStarted))), stringArgs(notStarted)
+// operationHoldsDeploymentPredicate matches an operation row o that holds its
+// own deployment: one a driver has started and that has not reached a terminal
+// state.
+//
+// Two non-terminal states hold nothing on their own, because no driver works
+// them while their parent's verdict stands:
+//   - pending: the claim refuses to start an operation whose parent is
+//     terminal, and the stranded reaper later settles the row.
+//   - failed_retryable: the retry claim resumes an operation only while its
+//     parent is retryable or active. A driver re-driving one leaves the state
+//     alone for the whole drive and clears its lease when the drive ends, so
+//     a fresh lease is what tells a retry in progress from an idle row.
+//
+// Under an active parent the parent check already reserves both. An ST-1
+// verdict correction that reopens the parent makes them claimable again
+// without re-running this check; OW-5 records that exception.
+func operationHoldsDeploymentPredicate(dialect Dialect) (string, []any) {
+	notHolding := terminalApplyStates()
+	notHolding = append(notHolding, state.ApplyOperation.Pending, state.ApplyOperation.FailedRetryable)
+	freshLeaseAfter := dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	clause := fmt.Sprintf(`(
+			o.state NOT IN (%s)
+			OR (o.state = ? AND o.lease_owner <> '' AND o.updated_at >= %s)
+		)`, placeholders(len(notHolding)), freshLeaseAfter)
+	args := stringArgs(notHolding)
+	args = append(args, state.ApplyOperation.FailedRetryable)
+	return clause, args
 }
 
 // checkNoStartedOperationForTargets reserves a deployment for as long as an
@@ -548,9 +568,15 @@ func startedOperationStatePredicate(column string) (string, []any) {
 // rollout's parent can record a terminal verdict while one of its operations is
 // still running: a sibling's failure can terminalize the parent before the
 // projection re-derives it. Matching the operation rows directly keeps a second
-// apply off that deployment until the running operation settles.
-func checkNoStartedOperationForTargets(ctx context.Context, tx *rebindTx, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
-	statePredicate, stateArgs := startedOperationStatePredicate("o.state")
+// apply off that deployment until the operation reaches a terminal state.
+//
+// A running operation holds its deployment by state alone, not by lease. When
+// its driver dies, the stale-active claim re-leases it whatever the parent's
+// state, and the drive settles it from the terminal parent, which is what
+// frees the deployment. Gating on a fresh lease instead would free the
+// deployment while a live driver's heartbeat lags.
+func checkNoStartedOperationForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
+	statePredicate, stateArgs := operationHoldsDeploymentPredicate(dialect)
 	query := fmt.Sprintf(`
 		SELECT a.apply_identifier, a.state, o.deployment, o.state
 		FROM apply_operations o
