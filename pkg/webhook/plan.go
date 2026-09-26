@@ -168,14 +168,15 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		HeadSHA:      schemaResult.HeadSHA,
 	}, templates.RenderPlanComment(commentData))
 
-	// When drift blocked the check but its record could not be persisted, the
-	// aggregate must not be recomputed from stale (possibly passing) stored rows.
-	// Post a failing aggregate carrying the drift block from the in-memory result
-	// so the gate still blocks closed. This is best-effort visibility: with the
-	// per-database row unstored, a later recompute has no durable drift row to
-	// read, so the store error is logged above and not treated as a safe update.
-	if drift.blocks() && checkErr != nil {
-		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{environment: drift.summary}, reviewTimeDeploymentDriftBlock)
+	// When drift blocked the check, or any rollout member has work (the primary
+	// included), but the record could not be persisted, the aggregate must not be recomputed from
+	// stale (possibly passing) stored rows. Post a failing aggregate from the
+	// in-memory result so the gate still blocks closed. This is best-effort
+	// visibility: with the per-database row unstored, a later recompute has no
+	// durable row to read, so the store error is logged above and not treated as
+	// a safe update.
+	if checkErr != nil && rolloutStillPending(drift) {
+		h.failClosedOnUnstoredRollout(ctx, client, repo, pr, schemaResult.HeadSHA, environment, drift)
 	} else if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
@@ -371,6 +372,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// so a failing aggregate can be posted from the in-memory drift result rather
 	// than letting the post-loop aggregate recompute from stale stored rows.
 	driftBlockUnstored := map[string]string{}
+	// Environments whose check record could not be persisted while some rollout
+	// member, the primary included, has work (MG-12), kept for the same reason.
+	pendingWorkUnstored := map[string]string{}
+	// Whether any environment's rollout round found a member with work. The
+	// primary's plan alone cannot say, so auto-plan reads this before skipping
+	// its comment.
+	rolloutHasWork := false
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:    requestedBy,
 		Tenant:         tenant,
@@ -461,7 +469,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
 			if drift.blocks() {
 				driftBlockUnstored[env] = drift.summary
+			} else if drift.work.pending > 0 {
+				pendingWorkUnstored[env] = drift.work.unstoredSummary()
 			}
+		}
+		if drift.work.pending > 0 {
+			rolloutHasWork = true
 		}
 		if sha != "" {
 			headSHA = sha
@@ -515,12 +528,21 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"pr", pr,
 			"environments", len(driftBlockUnstored))
 	}
+	if len(pendingWorkUnstored) > 0 && multiEnvData.HeadSHA != "" {
+		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, pendingWorkUnstored)
+	} else if len(pendingWorkUnstored) > 0 {
+		h.logger.Warn("a rollout target still needs the change in one or more environments but no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
+			"repo", repo,
+			"pr", pr,
+			"environments", len(pendingWorkUnstored))
+	}
 
 	// Auto-plan: skip the comment only when there is genuinely nothing to show —
-	// no changes, no errors, and no deployment drift. A drifted or unverifiable
-	// deployment fails the check closed even when every primary plan is a clean
-	// no-op, so the comment must still post to explain why the check is red;
-	// skipping it would leave a red check with no visible reason on the PR.
+	// no changes on any rollout member, no errors, and no deployment drift. A
+	// member with work keeps the check pending, and a drifted or unverifiable
+	// deployment fails it closed, even when every primary plan is a clean no-op,
+	// so the comment must still post to explain the check; skipping it would
+	// leave a check that is not passing with no visible reason on the PR.
 	if isAutoPlan {
 		hasErrors := len(multiEnvData.Errors) > 0
 		anyChanges := false
@@ -530,7 +552,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				break
 			}
 		}
-		if !anyChanges && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) {
+		if !anyChanges && !rolloutHasWork && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) {
 			// The no-changes outcome supersedes older plan comments just as a
 			// new plan comment would: a prior head's comment still advertises
 			// pending DDL and an apply prompt that no longer match the branch.
