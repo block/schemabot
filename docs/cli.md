@@ -441,6 +441,9 @@ Press **Esc** to detach while copying; the apply keeps running. **s** requests
 a stop for this MySQL example. At deferred cutover, **Enter** requests the
 swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 
+For progress bar colors, phase labels, and keyboard controls, see the
+[progress display reference](#progress-display-reference).
+
 ### Understand throttling
 
 When copying is throttled, the live view explains why. This MySQL example
@@ -819,6 +822,141 @@ The stored rows are read only for runs old enough to reach the report, since
 a fleet sweep would otherwise pay a storage read per pull request for runs
 that started minutes ago and never get printed. `--stuck-after` sets that
 threshold, and a run whose start time cannot be read is always explained.
+
+### Progress display reference
+
+<details>
+<summary>MySQL progress bars, phase labels, and keyboard controls</summary>
+
+The TUI and CLI use emoji progress bars to convey state at a glance. Each color maps to a
+specific state. The bar is 20 squares wide; filled squares represent percent complete.
+
+#### Progress bar colors
+
+| Color | Emoji | Meaning | Used when |
+|-------|-------|---------|-----------|
+| Blue  | `🟦`  | In progress | Engine actively working: copying rows, cutting over, recovering state |
+| Yellow | `🟨` | Not final | Waiting for cutover, revert window open, reverting, skipping revert, or retrying after a recoverable failure |
+| Green | `🟩`  | Complete | Table finished successfully |
+| Orange | `🟧` | Stopped | Stopped mid-progress (partially complete) |
+| Red   | `🟥`  | Failed | Table failed |
+| White | `⬜`  | Empty | Remaining (unfilled portion of any bar) |
+
+#### Per-table display by state
+
+**Copying rows** — blue bar with percent, row counts, and ETA while the estimate still holds:
+```
+  orders: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32% (71,436/221,193 rows) ETA 5m 30s
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Copying rows after estimate exceeded** — full-width activity indicator with no percentage:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 145,000 so far
+       • ℹ️ More rows than initially estimated, copying is still active and will continue
+```
+
+**Catching up** — blue bar at 100% with the first-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Catching up on accumulated changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Checksumming** — blue bar tracking verify progress once Spirit reports a total
+(indeterminate "Checksumming to verify data..." before that):
+```
+  orders: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21%)
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows verified: 321,450 / 1,466,232
+```
+
+**Post-checksum** — blue bar at 100% with the second-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Queued** (pending, not yet started) — empty bar:
+```
+  products: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ queued
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+**Starting** (running but no row data yet):
+```
+  users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ starting...
+         ALTER TABLE `users` ADD COLUMN `phone` varchar(20)
+```
+
+**Waiting for cutover** — yellow bar at 100%:
+```
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cutting over** — blue bar at 100% with spinner (the engine is working again, so the
+bar returns to blue):
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Complete** — green bar at 100%:
+```
+  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Stopped** — orange bar at the progress when stop occurred:
+```
+  orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Failed** — red bar at the progress when failure occurred:
+```
+  orders: 🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cancelled** (sequential mode — earlier table failed, this one never ran):
+```
+  products: ⊘ Cancelled (not started)
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+#### Status line (above tables)
+
+The TUI shows a single status line above the table list. It varies by overall state:
+
+| State | Status line |
+|-------|-------------|
+| Starting | `⠋ Loading...` |
+| Pending | `⠋ Starting...` |
+| Running | `⠋ 🔄 Copying rows... ETA 5m 30s` |
+| Stopping | `⠋ Stopping...` |
+| Waiting for cutover | *(cutover prompt shown in footer instead)* |
+| Cutting over | `⠋ Cutting over...` |
+| Completed | *(no status line — completion message shown after tables)* |
+| Stopped | *(no status line — stopped message shown after tables)* |
+
+The `⠋` is a Braille spinner (animated in the TUI, static here).
+
+#### Footer
+
+| State | Footer |
+|-------|--------|
+| Running | `ESC detach • s stop` |
+| Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
+| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
+| Cutting over | `Cutover in progress - please wait...` |
+| Stopped | `Use 'schemabot start -e <env> <id>' to resume.` |
+
+</details>
 
 ## Use the CLI from scripts and agents
 

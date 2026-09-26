@@ -42,10 +42,12 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// Unsafe warning — rollback typically produces DROP operations
 	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")
 
-	// Lint violations
+	// Lint violations. The comment has no unsafe section, so error-severity
+	// findings go unshown here and their guides stay unlinked.
 	if len(data.LintViolations) > 0 {
 		writeLintViolations(&sb, data.LintViolations)
 	}
+	writeRelatedGuidance(&sb, data.disclosesNonErrorsOnly())
 
 	// Errors
 	if len(data.Errors) > 0 {

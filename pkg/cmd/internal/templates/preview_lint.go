@@ -14,8 +14,10 @@ func previewLintViolationsOutput() {
 	warnings := []apitypes.LintViolationResponse{
 		{Message: "has_float: New column uses floating-point data type", Table: "orders", Linter: "has_float"},
 		{Message: "no_default: Column added without DEFAULT value", Table: "users", Linter: "no_default"},
+		{Message: `Primary key column "id" has type "varchar"`, Table: "customers", Linter: "primary_key"},
 	}
 	WriteLintViolations(warnings)
+	WriteRelatedGuidance([]string{"has_float", "no_default", "primary_key"}, true)
 }
 
 func previewUnsafeBlockedOutput() {

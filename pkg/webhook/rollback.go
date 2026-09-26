@@ -320,6 +320,17 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		AgentHint:    h.agentHint(),
 	}
 
+	commentData = buildRollbackPlanCommentData(commentData, planResp)
+
+	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
+	return false, nil
+}
+
+// buildRollbackPlanCommentData keeps advisory findings in the warning list.
+// Error-severity findings are left out: the rollback comment has no unsafe
+// section to show them in, and a guide linked for a finding the comment never
+// shows is advice about nothing.
+func buildRollbackPlanCommentData(commentData templates.PlanCommentData, planResp *apitypes.PlanResponse) templates.PlanCommentData {
 	for _, sc := range planResp.Changes {
 		nsData := templates.KeyspaceChangeData{
 			Keyspace: sc.Namespace,
@@ -336,14 +347,14 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 
 	for _, w := range planResp.LintNonErrors() {
 		commentData.LintViolations = append(commentData.LintViolations, templates.LintViolationData{
-			Message: w.Message,
-			Table:   w.Table,
+			Message:    w.Message,
+			Table:      w.Table,
+			LinterName: w.Linter,
 		})
 	}
 	commentData.Errors = planResp.Errors
 
-	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
-	return false, nil
+	return commentData
 }
 
 // handleRollbackSourceError posts the user-facing answer for a source-apply

@@ -1,0 +1,69 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Why primary key choice matters</title>
+<style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace}</style>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An illustration of primary key storage and Spirit chunk boundary selection"></svg>
+<script>
+const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5',purple:'#8250df'};
+const clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x)};
+const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8)=>`<rect x="${x}" y="${y}" width="${Math.max(0,w)}" height="${h}" rx="${r}" fill="${fill}" stroke="${stroke}"/>`;
+const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}">${esc(s)}</text>`;
+const line=(x,y,x2,y2,color=C.line,width=1)=>`<path d="M${x} ${y} L${x2} ${y2}" fill="none" stroke="${color}" stroke-width="${width}"/>`;
+const group=(a,s)=>`<g opacity="${clamp(a)}">${s}</g>`;
+function header(scene,t){return rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(828,37,scene===1?'01  /  INDEX STORAGE':'02  /  COPYING A TABLE',13,C.muted,650)+rect(36,54,508,3,scene===1?C.blue:C.line)+rect(556,54,508,3,scene===2?C.blue:C.line);}
+function panel(x,title,sub){return rect(x,178,502,376,'#fff',C.line,12)+txt(x+24,212,title,21,C.ink,650)+txt(x+24,240,sub,14,C.muted);}
+function storage(t){
+ let s=header(1,t)+txt(36,105,'A wide key gets copied everywhere.',34,C.ink,650)+txt(36,140,'InnoDB carries the primary key in every secondary index entry.',19,C.muted);
+ const key='customer_us_east_7f3a91c2';
+ for(let lane=0;lane<2;lane++){
+  let x=36+lane*526, wide=lane===1, color=wide?C.purple:C.blue, bg=wide?'#fbefff':C.blueBg;
+  s+=panel(x,wide?'A wider string key':'A compact integer key',wide?'VARCHAR  ·  example value: 25 ASCII bytes':'BIGINT  ·  8 bytes');
+  s+=txt(x+24,278,'PRIMARY KEY',11,C.muted,650)+rect(x+150,254,wide?320:84,36,bg)+txt(x+164,278,wide?key:'1042',15,color,600,'mono');
+  s+=line(x+38,298,x+38,497,C.line,2);
+  const labels=['INDEX(status)','INDEX(created_at)','INDEX(region)'];
+  const vals=['active','2026-09-09','us-east'];
+  for(let j=0;j<3;j++){
+   let y=316+j*73,p=ease((t-1.6-j*.55)/1.25),arrival=clamp((t-2.55-j*.55)/.3);
+   s+=line(x+38,y+40,x+60,y+40,C.line,2)+rect(x+60,y,418,60,C.soft,'none',7)+txt(x+72,y+18,labels[j],11,C.muted,550,'mono');
+   s+=txt(x+72,y+43,vals[j],14,C.ink,400,'mono');
+   s+=group(arrival,rect(x+177,y+26,wide?286:73,26,bg)+txt(x+188,y+44,wide?key:'1042',wide?12.5:14,color,550,'mono'));
+   if(p>0&&p<1){let sx=x+(wide?310:192),sy=274,ex=x+(wide?320:208),ey=y+39,yy=sy+(ey-sy)*p,xx=sx+(ex-sx)*p;
+    s+=rect(xx-22,yy-12,44,24,color,'none',5)+txt(xx-12,yy+5,'PK',12,'#fff',650);
+   }
+  }
+ }
+ s+=group(ease((t-5)/.6),rect(36,576,1028,57,C.soft)+txt(58,612,'More key bytes in each entry → more bytes to store, cache, and write.',21,C.ink,550));
+ s+=txt(36,662,'Illustrative values; payload bytes exclude record overhead.',12,C.muted)+txt(706,662,'Key width matters—not just the VARCHAR label.',12,C.muted);
+ return s;
+}
+function copying(t){
+ let s=header(2,t)+txt(36,105,'More work before each chunk.',34,C.ink,650)+txt(36,140,'For table-copy schema changes, Spirit has to choose where each chunk ends.',19,C.muted);
+ const started=t>1.3, scan=clamp((t-2.8)/3.5),ready=t>6.7,copy=clamp((t-8.1)/2.4);
+ for(let lane=0;lane<2;lane++){
+  let x=36+lane*526,right=lane===1;
+  s+=panel(x,right?'VARCHAR or composite primary key':'Single AUTO_INCREMENT primary key',right?'Find a boundary in the primary-key index':'Calculate the next numeric boundary');
+  s+=rect(x+24,260,454,67,C.soft);
+  s+=txt(x+39,285,right?'SELECT id FROM customers': '100 + chunk size 6',right?14:20,C.ink,500,'mono');
+  s+=txt(x+39,309,right?'ORDER BY id LIMIT 1 OFFSET 6':'Next boundary: 106',right?14:15,right?C.muted:C.blue,500,'mono');
+  const rowY=346;
+  for(let j=0;j<7;j++){
+   let y=rowY+j*23, active=right&&scan>j/7&&scan<(j+1)/7, boundary=j===6;
+   let found=right?ready:started;
+   if(active)s+=rect(x+24,y-15,454,22,C.amberBg,'none',3);
+   if(copy>0&&j<6)s+=rect(x+24,y-15,454*clamp(copy*6-j),22,C.greenBg,'none',3);
+   if(boundary&&found)s+=rect(x+24,y-15,454,22,C.blueBg,'none',3);
+   s+=txt(x+39,y,right?'customer_'+String.fromCharCode(97+j):String(100+j),14,C.ink,400,'mono');
+   if(active)s+=txt(x+360,y,'read key',12,C.amber,550);
+   if(boundary&&found)s+=txt(x+334,y,'boundary',12,C.blue,650);
+  }
+  let label=right?(ready?'Boundary found':scan>0?'Read ahead to find the boundary':'One boundary-finding query'):(started?'Boundary calculated in memory':'Arithmetic on the key');
+  if(copy>0)label=copy===1?'Illustrated chunk copied':'Copy rows in the selected range';
+  s+=txt(x+24,531,label,14,copy>0?C.green:right&&scan>0&&!ready?C.amber:C.blue,600);
+ }
+ let caption=t>11?'VARCHAR is supported. Wider keys and boundary lookups add work.':'The string-key path reads the index to discover each chunk boundary.';
+ s+=rect(36,576,1028,57,C.soft)+txt(58,612,caption,20,C.ink,550);
+ s+=txt(36,659,'Conceptual sequence, not a benchmark; real work can overlap.',12,C.muted)+txt(36,678,'Dense numeric example; sparse integer keys can also use lookups.',12,C.muted)+txt(752,678,'Instant changes do not copy the table.',12,C.muted);
+ return s;
+}
+window.renderFrame=t=>{t=Math.max(0,t);let a=clamp((t-10.4)/.35);document.getElementById('art').innerHTML=t<10.4?storage(t):t<10.75?group(1-a,storage(10.4))+group(a,copying(0)):copying(Math.min(t-10.75,14));return {scene:t<10.75?1:2,time:t}};
+window.renderFrame(0);
+</script></html>
