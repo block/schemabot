@@ -71,12 +71,8 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// Mark the apply as started before calling the engine. The engine may run
 	// for a long time (branch creation, DDL application, deploy request) and
 	// started_at should reflect when work actually began, not when it finished.
-	now := time.Now()
-	apply.State = state.Apply.Running
-	apply.StartedAt = &now
-	apply.UpdatedAt = now
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		logger.Error("failed to set started_at", append(apply.MutableLogAttrs(), "error", err)...)
+	if !c.recordDriveStarted(ctx, apply, logger) {
+		return
 	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",

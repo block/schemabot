@@ -648,11 +648,12 @@ to an active state, other than the two routes named below: claiming a stopped ap
 or deliver its cancel, and correcting a rollout verdict that was recorded too early. Not a retry,
 not an API write, not a crashed driver replaying stale progress.
 
-This is upheld by the routes into an active state rather than by a single predicate on the apply
-update: the claim query names the states it will claim, and the control handlers refuse a
-transition out of a terminal state before writing. There is no blanket storage-level assertion
-that would catch a new caller writing an active state directly, which is worth knowing before
-adding one.
+The general apply update holds this for every caller, whatever copy of the apply it writes from:
+it is evaluated against the stored row and refuses an active state over a terminal apply, and
+`stopped` over a settled one, since a stopped apply can be claimed to resume. Every other terminal
+write lands, including cancelling a stopped apply. The guard covers that update alone. The claim
+transitions and the rollout projection write the state through their own conditional updates, so
+a new caller that moves an apply to an active state through either of them is not caught by it.
 
 One write moves a terminal apply back to an active state, and it corrects a verdict recorded too
 early rather than reviving the apply. A rollout's state is derived from its operations, and a
@@ -681,13 +682,13 @@ That refusal holds at every surface that could begin the work again: the API rej
 request and points at the successor, a claim to resume refuses and fails the pending start request
 with the reason, and the claim predicate excludes a stamped `failed_retryable` apply from automatic
 retry. No other claim path can reach a stamped apply, since work must have run before a successor
-can take it over, and an active apply cannot gain one at all. *Enforced:* the named state arms of
-the single claim query, the terminal-state refusals in the control handlers, and the write-once
-supersession marker consulted by the start, resume, and retry paths
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`); the reopen policy
-each caller passes to the rollout projection, with the lease-scoped drive paths opting in and the
-unscoped reconciler opting out (`reopensHeldFailedRollout` in `updateApplyStateFromOperations`,
-`pkg/api/operator.go`).
+can take it over, and an active apply cannot gain one at all. *Enforced:* the reopen guard on the
+storage apply update (`reopenGuardPredicate`), the named state arms of the single claim query, the
+terminal-state refusals in the control handlers, and the write-once supersession marker consulted
+by the start, resume, and retry paths (`pkg/storage/internal/sqlstore/applies.go`,
+`pkg/api/control_handlers.go`); the reopen policy each caller passes to the rollout projection,
+with the lease-scoped drive paths opting in and the unscoped reconciler opting out
+(`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`).
 
 ### ST-2: Recovery from permanent failure is a fresh plan and apply
 

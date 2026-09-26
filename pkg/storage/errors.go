@@ -43,6 +43,13 @@ var (
 	// an apply no drive will pick up again.
 	ErrApplyNotActive = errors.New("apply is not active")
 
+	// ErrApplyReopenRefused is returned when a general apply update would
+	// reopen a finished apply: an active state written over a terminal row, or
+	// stopped written over a settled one. The guard covers Update alone: the
+	// claim transitions and the rollout projection (UpdateDerivedState) move
+	// the state through their own conditional writes and never return it.
+	ErrApplyReopenRefused = errors.New("refused to reopen a finished apply")
+
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")

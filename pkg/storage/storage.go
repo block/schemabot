@@ -627,6 +627,12 @@ type ApplyStore interface {
 	// Returns ErrActiveApplyExists when moving an apply into an active state
 	// would overlap another active apply for the same database, database type,
 	// and environment.
+	// Returns ErrApplyReopenRefused when the write would reopen a finished
+	// apply: an active state over a terminal row, or stopped over a settled
+	// one, since a stopped apply can be claimed to resume. Every other terminal
+	// write is allowed, including cancelling a stopped apply and same-state
+	// refreshes. Returns ErrApplyNotFound when a guarded write matches no row
+	// because the apply does not exist.
 	Update(ctx context.Context, apply *Apply) error
 
 	// UpdateDerivedState compare-and-swaps the rollout-projected applies.state.

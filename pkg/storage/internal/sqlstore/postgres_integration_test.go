@@ -60,6 +60,74 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
 	t.Run("ApplyCommentProgressAuthorityStaleTakeover", func(t *testing.T) { testPostgresApplyCommentProgressAuthorityStaleTakeover(t, h) })
+	t.Run("ApplyUpdateRefusesReopenAcrossSnapshotRace", func(t *testing.T) { testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t, h) })
+}
+
+// reopenRaceDeadline bounds each wait in the snapshot race: the update reaching
+// the row lock, and the update returning once the finisher commits.
+const reopenRaceDeadline = 30 * time.Second
+
+// testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace pins the reopen guard
+// against a finisher that commits while a stale update waits on the row. The
+// finisher holds the row as completed but has not committed; the stale update
+// takes its snapshot and blocks on the row lock; the finisher commits. Under
+// REPEATABLE READ PostgreSQL rejects the waiting update as a serialization
+// failure rather than matching zero rows, and the caller must still be told the
+// write would have reopened a finished apply, not handed a driver error.
+func testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t *testing.T, h postgresHarness) {
+	for _, staleState := range []string{state.Apply.Running, state.Apply.Stopped} {
+		t.Run(staleState, func(t *testing.T) {
+			ctx := t.Context()
+			store := h.NewStorage(t)
+			lock := storagetest.CreateLock(t, store, "reopen_race_db", storage.DatabaseTypeMySQL)
+			apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_reopen_race", 9101, state.Apply.Running, "staging")
+			staleCopy := *apply
+			staleCopy.State = staleState
+
+			finisher, err := h.db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = finisher.Rollback() })
+			_, err = finisher.ExecContext(ctx, `UPDATE applies SET state = $1, completed_at = NOW() WHERE id = $2`, state.Apply.Completed, apply.ID)
+			require.NoError(t, err)
+
+			updateErr := make(chan error, 1)
+			go func() { updateErr <- store.Applies().Update(ctx, &staleCopy) }()
+
+			waitForPostgresApplyRowLockWaiter(t, h.db)
+			require.NoError(t, finisher.Commit())
+
+			select {
+			case err := <-updateErr:
+				require.ErrorIs(t, err, storage.ErrApplyReopenRefused)
+			case <-time.After(reopenRaceDeadline):
+				require.FailNow(t, "stale update did not return after the finisher committed")
+			}
+			persisted, err := store.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			assert.Equal(t, state.Apply.Completed, persisted.State)
+		})
+	}
+}
+
+// waitForPostgresApplyRowLockWaiter blocks until a backend is waiting on a row
+// lock to update applies, so the test commits the finisher only after the stale
+// update has taken its snapshot.
+func waitForPostgresApplyRowLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(reopenRaceDeadline)
+	for {
+		var waiters int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query ILIKE '%UPDATE applies%'
+		`).Scan(&waiters))
+		if waiters > 0 {
+			return
+		}
+		require.True(t, time.Now().Before(deadline), "stale update never waited on the finisher's row lock")
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // backdatePostgresProgressObserverHeartbeat pushes an apply's progress-comment
