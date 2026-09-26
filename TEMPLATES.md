@@ -1615,7 +1615,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1626,7 +1628,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
