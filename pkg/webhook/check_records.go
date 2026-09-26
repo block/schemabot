@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -40,6 +42,61 @@ const (
 type reviewDriftOutcome struct {
 	state   reviewDriftState
 	summary string
+	// work is how many rollout members still need the change, read from the
+	// same rollup. The reviewed primary plan speaks only for the primary, so a
+	// primary already at the desired schema says nothing about members planned
+	// against schemas of their own.
+	work memberWork
+}
+
+// memberWork counts the rollout members, primary included, whose own plan
+// would change something, out of the members a rollup planned.
+type memberWork struct {
+	pending int
+	members int
+	// names are the members with work, the way an operator addresses them, in
+	// rollout order.
+	names []string
+}
+
+// memberWorkOf counts the work in a rollup. A nil rollup is one that was not
+// run, which leaves the primary plan to speak for the work on its own.
+func memberWorkOf(rollup *api.PlanRollup) memberWork {
+	if rollup == nil {
+		return memberWork{}
+	}
+	withWork := map[string]bool{}
+	for _, member := range rollup.MembersWithWork() {
+		withWork[member.MemberID()] = true
+	}
+	// Names are rendered over the whole rollout so a target is qualified exactly
+	// where the rest of the comment qualifies it.
+	names := rollupMemberNames(*rollup)
+	work := memberWork{members: len(rollup.Entries)}
+	for i, entry := range rollup.Entries {
+		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
+			work.names = append(work.names, names[i])
+		}
+	}
+	work.pending = len(work.names)
+	return work
+}
+
+// summary says how many targets still need the change, for a check whose
+// reviewed primary plan has nothing of its own to summarize.
+func (w memberWork) summary() string {
+	return fmt.Sprintf("%d of %d targets need this change", w.pending, w.members)
+}
+
+// unstoredSummary is the failing aggregate's summary when the check record for
+// this work could not be stored. The work counts the primary, so a plan for a
+// single target with changes of its own lands here too, and names no count.
+func (w memberWork) unstoredSummary() string {
+	const unstored = "SchemaBot could not record this plan's result; re-run plan"
+	if w.members > 1 {
+		return unstored + " (" + w.summary() + ")"
+	}
+	return unstored
 }
 
 // blocks reports whether this outcome must fail the plan check closed.
@@ -201,16 +258,21 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
 	}
 
-	hasChanges := planResp.HasChanges()
+	// A check passes only when no rollout member has work (MG-12), so work on a
+	// member counts even when the reviewed primary plan is empty.
+	hasChanges := planResp.HasChanges() || drift.work.pending > 0
 	driftBlocked := drift.blocks()
 
 	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, planRefusalFailsCheck(schema.Type, planResp), driftBlocked)
 
 	// Review-time drift is a first-class blocking reason, not an overload of the
-	// plan facts: HasChanges stays "the reviewed primary plan has changes", and
-	// the block rides on BlockingReason + Conclusion so a stored drift block is
+	// plan facts: HasChanges stays "some rollout member has changes", and the
+	// block rides on BlockingReason + Conclusion so a stored drift block is
 	// legible and durable across write paths.
 	changeSummary := summarizePlanChanges(schema, planResp, environment)
+	if changeSummary == "" && drift.work.pending > 0 {
+		changeSummary = drift.work.summary()
+	}
 	blockingReason := ""
 	if driftBlocked {
 		changeSummary = drift.summary

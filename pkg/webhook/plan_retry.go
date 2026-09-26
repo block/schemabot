@@ -46,7 +46,7 @@ func (h *Handler) planRetryDelay() time.Duration {
 	return defaultTransientPlanRetryDelay
 }
 
-// executePlanWithTransientRetry runs ExecutePlan and retries when the
+// executePlanProtoWithTransientRetry runs ExecutePlanProto and retries when the
 // failure is transient remote unavailability. Plan requests are safe to
 // re-send: each attempt produces an independent plan record and only the
 // returned plan ID is used. Every other failure class (policy, validation,
@@ -57,16 +57,10 @@ func (h *Handler) planRetryDelay() time.Duration {
 // confirming again. A bounded delayed retry loop absorbs blips that outlast
 // the gRPC client's retry budget while still surfacing sustained outages
 // within seconds.
-func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api.PlanRequest, repo string, pr int) (*apitypes.PlanResponse, error) {
-	_, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
-	return planResp, err
-}
-
-// executePlanProtoWithTransientRetry runs ExecutePlanProto with the same
-// transient-retry behavior as executePlanWithTransientRetry, additionally
-// returning the reviewed primary plan proto so callers can feed it to the
-// review-time drift rollup without re-planning or reconstructing it from
-// storage.
+//
+// It returns the reviewed primary plan proto alongside the API response so
+// callers can feed it to the review-time drift rollup without re-planning or
+// reconstructing it from storage.
 func (h *Handler) executePlanProtoWithTransientRetry(ctx context.Context, planReq api.PlanRequest, repo string, pr int) (*ternv1.PlanResponse, *apitypes.PlanResponse, error) {
 	planProto, planResp, err := h.service.ExecutePlanProto(ctx, planReq)
 	if err == nil || !isTransientRemotePlanError(err) {

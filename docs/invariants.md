@@ -636,6 +636,21 @@ gating commit saying so. *Enforced:* one uncached head read shared by the publis
 currency check on the terminal check refresh (`pkg/webhook/handler.go`,
 `pkg/webhook/check_publisher.go`).
 
+### MG-12: A check passes only when no rollout member has work
+
+A plan check passes only when every rollout member of the database's environment is known to have
+nothing to apply. The reviewed primary's plan speaks for the primary alone: a member planned against
+a schema of its own can still need the change, and a member expected to mirror the primary can have
+drifted from it. A primary already at the desired schema is therefore not a converged rollout, and
+every path that records a check from a plan plans the other members first. A member that could not
+be planned is unknown work, never none. *Breaks if violated:* a PR merges green while a target still
+lacks its schema change. *Enforced:* member work counted into the stored check state
+(`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
+in `pkg/api`); the rollout round the apply command and apply-confirm run before answering an empty
+primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); the failing
+aggregate published from that round when the stored check state cannot be written
+(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
+
 ## Apply state machine (ST)
 
 Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and
@@ -644,19 +659,33 @@ Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and
 ### ST-1: A finished apply stays finished
 
 No path moves a terminal apply (`completed`, `failed`, `cancelled`, `reverted`, `stopped`) back
-to an active state. Not a retry, not an API write, not a crashed driver replaying stale progress.
+to an active state, other than the two routes named below: claiming a stopped apply to resume it
+or deliver its cancel, and correcting a rollout verdict that was recorded too early. Not a retry,
+not an API write, not a crashed driver replaying stale progress.
 
-This is upheld by the routes into an active state rather than by a single predicate on the apply
-update: the claim query names the states it will claim, and the control handlers refuse a
-transition out of a terminal state before writing. There is no blanket storage-level assertion
-that would catch a new caller writing an active state directly, which is worth knowing before
-adding one.
+The general apply update holds this for every caller, whatever copy of the apply it writes from:
+it is evaluated against the stored row and refuses an active state over a terminal apply, and
+`stopped` over a settled one, since a stopped apply can be claimed to resume. Every other terminal
+write lands, including cancelling a stopped apply. The guard covers that update alone. The claim
+transitions and the rollout projection write the state through their own conditional updates, so
+a new caller that moves an apply to an active state through either of them is not caught by it.
+
+One write moves a terminal apply back to an active state. It goes through the rollout projection's
+update (`UpdateDerivedState`) rather than the general apply update, so the guard above does not
+apply to it, and it corrects a verdict recorded too early rather than reviving the apply. A
+rollout's state is derived from its operations, and a sibling's failure can record `failed` on the
+parent while another deployment's driver is still working. Re-deriving then returns the parent to
+`running_degraded` until that work settles (ST-10).
+It runs only from `failed`, only while the operations themselves still derive `failed`, and only
+for a caller that opts in; every caller that does holds the lease. Storage does not require the
+lease for this write, so the lease requirement is the callers' policy. The write lands only if the
+parent still holds the state it read. It writes the parent row alone, so no failed operation runs
+again, and it does not re-run the target check of OW-5.
 
 `stopped` is the one terminal state that is still addressable, because a stopped apply is holding
 a database rather than done with it. It can be claimed to resume via `start`, and it can be
 claimed to deliver a pending `cancel`, which settles it to `cancelled`. Both are explicit arms of
-the claim query rather than general re-entry: no other terminal state is claimable, and nothing
-reaches an active state by any other route.
+the claim query rather than general re-entry: no other terminal state is claimable.
 
 One marker overrides even that. When a later apply takes over a stopped apply's unfinished work,
 adopting or discarding the copy it left behind, the stopped apply is stamped with its successor's
@@ -670,16 +699,22 @@ That refusal holds at every surface that could begin the work again: the API rej
 request and points at the successor, a claim to resume refuses and fails the pending start request
 with the reason, and the claim predicate excludes a stamped `failed_retryable` apply from automatic
 retry. No other claim path can reach a stamped apply, since work must have run before a successor
-can take it over, and an active apply cannot gain one at all. *Enforced:* the terminal guard in the
-storage apply update path, the named state arms of the single claim query, and the write-once
-supersession marker consulted by the start, resume, and retry paths
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`).
+can take it over, and an active apply cannot gain one at all. *Enforced:* the reopen guard on the
+storage apply update (`reopenGuardPredicate`), the named state arms of the single claim query, the
+terminal-state refusals in the control handlers, and the write-once supersession marker consulted
+by the start, resume, and retry paths (`pkg/storage/internal/sqlstore/applies.go`,
+`pkg/api/control_handlers.go`); the reopen policy each caller passes to the rollout projection,
+with the lease-scoped drive paths opting in and the unscoped reconciler opting out
+(`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`).
 
 ### ST-2: Recovery from permanent failure is a fresh plan and apply
 
 There is no revival path from `failed`. Plans are diffs, so a fresh plan and apply never re-runs
 already-landed work, whereas a revival path would re-run stored DDL against a database that may
-have drifted since. *Enforced:* absence. Storage exposes no failed-to-active transition (ST-1).
+have drifted since. A rollout whose `failed` verdict is corrected back to `running_degraded` (ST-1)
+is not revived: its failed operation stays failed and is never run again. *Enforced:* absence. No
+write re-runs a failed operation, and the rollout projection is the only write that moves a failed
+apply to an active state (ST-1).
 
 ### ST-3: Apply state flows upward, never downward
 
@@ -853,9 +888,18 @@ rather than the operation is the unit of reconciliation.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. That lock excludes only while the connection holding it keeps one
-server session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct API
-callers and `--no-lock` flows are equally bound. *Enforced:* the exclusivity check in the storage
+transaction that decides. That lock excludes only while the connection holding it keeps one server
+session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct
+API callers and `--no-lock` flows are equally bound.
+
+The rollout verdict correction in ST-1 is the one exception: it writes the parent row without
+re-running the check. The check reads the parent's state, not its operations', so a parent whose
+`failed` verdict was recorded too early reserves none of its deployments while one of its
+operations is still running there. Nothing else excludes a second apply in that window: the
+operation lease guards only the operation's own row, and the advisory lock is held only for the
+deciding transaction. The window closes when a drive holding a lease re-derives the parent. No
+periodic pass does that for a terminal parent, so the window can last for the rest of that
+operation's run. *Enforced:* the exclusivity check in the storage
 apply create and activate paths, under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
 

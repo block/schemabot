@@ -29,7 +29,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -40,7 +42,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -80,7 +84,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -91,7 +97,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -167,7 +175,9 @@ schemabot apply -e staging
 
 ```sql
 ALTER TABLE `orders` DROP INDEX `idx_legacy_status`;
+```
 
+```sql
 ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 ```
 
@@ -212,9 +222,13 @@ schemabot apply -e staging
 ALTER TABLE `users`
     DROP PRIMARY KEY,
     ADD PRIMARY KEY(`id`, `tenant_id`);
+```
 
+```sql
 ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`);
+```
 
+```sql
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
@@ -248,7 +262,9 @@ schemabot apply -e staging
 
 ```sql
 ALTER TABLE users ALTER COLUMN email TYPE bigint;
+```
 
+```sql
 ALTER TABLE orders ADD COLUMN notes text;
 ```
 
@@ -286,7 +302,9 @@ schemabot apply -e staging
 ALTER TABLE `users`
     DROP PRIMARY KEY,
     ADD PRIMARY KEY(`id`, `tenant_id`);
+```
 
+```sql
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
@@ -324,7 +342,9 @@ schemabot unlock
 
 ```sql
 ALTER TABLE `orders` DROP COLUMN `notes`;
+```
 
+```sql
 DROP TABLE `reconcile_state`;
 ```
 
@@ -501,7 +521,9 @@ schemabot unlock
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
+```sql
 ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
 ```
 
@@ -534,7 +556,9 @@ schemabot apply -e staging
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
+```sql
 ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
 ```
 
@@ -567,7 +591,9 @@ schemabot apply -e staging
 
 ```sql
 ALTER TABLE users ALTER COLUMN email TYPE bigint;
+```
 
+```sql
 ALTER TABLE orders ADD COLUMN notes text;
 ```
 
@@ -603,7 +629,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -614,7 +642,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -933,7 +963,9 @@ CREATE TABLE sessions (
     payload jsonb,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+```
 
+```sql
 ALTER TABLE users
     ADD COLUMN last_seen_at timestamptz,
     ADD COLUMN preferences jsonb;
@@ -1055,7 +1087,9 @@ CREATE TABLE `addresses` (
 #### Schema Name: `app_primary`
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
+```sql
 ALTER TABLE `sessions` ADD COLUMN `device` varchar(100) DEFAULT '';
 ```
 
@@ -1110,7 +1144,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1121,7 +1157,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1172,7 +1210,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1183,7 +1223,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1225,7 +1267,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1236,7 +1280,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1288,7 +1334,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1299,7 +1347,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1347,7 +1397,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1358,7 +1410,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1400,7 +1454,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1411,7 +1467,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1453,7 +1511,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1464,7 +1524,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1502,7 +1564,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1513,7 +1577,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -1607,7 +1673,9 @@ schemabot apply -e staging --allow-unsafe
 
 ```sql
 ALTER TABLE `orders` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT;
+```
 
+```sql
 ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 ```
 
@@ -1766,7 +1834,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -1777,7 +1847,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -2616,7 +2688,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -2627,7 +2701,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -2662,7 +2738,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -2673,7 +2751,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
@@ -2710,7 +2790,9 @@ CREATE TABLE `users` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 CREATE TABLE `orders` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
     `user_id` bigint NOT NULL,
@@ -2721,7 +2803,9 @@ CREATE TABLE `orders` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+```
 
+```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 

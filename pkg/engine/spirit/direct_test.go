@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 )
 
@@ -121,4 +122,48 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+// ExecutionVerdicts resolves the policy up front, so a malformed policy or
+// missing credentials fail before any statement is judged, naming the
+// database the policy was meant for. The target is never contacted to find
+// this out.
+func TestNewExecutionVerdicts_RejectsBadInput(t *testing.T) {
+	eng := New(Config{})
+	const unreachable = "root:nopass@tcp(127.0.0.1:1)/orders_db"
+
+	_, err := eng.NewExecutionVerdicts(nil)
+	require.ErrorContains(t, err, "DSN credentials required")
+	_, err = eng.NewExecutionVerdicts(&engine.Credentials{})
+	require.ErrorContains(t, err, "DSN credentials required")
+
+	_, err = eng.NewExecutionVerdicts(&engine.Credentials{DSN: unreachable, Metadata: map[string]string{"direct_execution": "true"}})
+	require.ErrorContains(t, err, `execution verdicts for database "orders_db"`)
+	require.ErrorContains(t, err, "direct_execution_max_table_rows is not set")
+}
+
+// The engine never refuses a CREATE TABLE or DROP TABLE, so either is left on
+// the default path without reading the target. The DSN here points nowhere,
+// so recording a verdict for one succeeds only because no connection is made.
+// The statement is classified from its DDL, so a change whose Operation claims
+// an ALTER is still treated as the CREATE it runs. Record sets the whole
+// verdict, so a mode a change already carries is cleared.
+func TestExecutionVerdicts_NonAlterNeedsNoTarget(t *testing.T) {
+	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{
+		DSN:      "root:nopass@tcp(127.0.0.1:1)/orders_db",
+		Metadata: map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000"},
+	})
+	require.NoError(t, err)
+	defer verdicts.Close()
+
+	for _, change := range []engine.TableChange{
+		{Table: "orders", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "stale"},
+		{Table: "orders", Operation: ddl.StatementDropTable, DDL: "DROP TABLE `orders`", ExecutionMode: engine.ExecutionModeDirect, ModeReason: "stale"},
+		{Table: "orders", Operation: ddl.StatementAlterTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+	} {
+		require.NoError(t, verdicts.Record(t.Context(), &change), change.DDL)
+		assert.Empty(t, change.ExecutionMode, change.DDL)
+		assert.Empty(t, change.ModeReason, change.DDL)
+	}
+	assert.Nil(t, verdicts.target.db, "no statement needed the target")
 }

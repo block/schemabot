@@ -21,6 +21,7 @@ import (
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
@@ -254,6 +255,126 @@ const (
 	directStateFailed    = "failed"
 	directStateStopped   = "stopped"
 )
+
+// ExecutionVerdicts records execution-mode verdicts, which say how a planned
+// statement will run at apply time, for the table changes planned against one
+// target database. It uses this engine's refusal check, direct execution
+// policy, and size gate, so a verdict it records is the one this engine's own
+// Plan records for the same statement. Both judge the statement against the
+// table's SHOW CREATE TABLE output: Record reads it from the target as the
+// apply's routing does, and Plan reads it into the schema snapshot it diffs.
+// An engine that plans a schema change itself but drives this engine against
+// each target, such as one that fans a sharded schema change out to its shard
+// primaries, uses it to disclose the verdict at plan time without
+// reimplementing the rule.
+//
+// It connects to the target only when a statement needs it, and it is not safe
+// for concurrent use. Close releases the connection.
+type ExecutionVerdicts struct {
+	engine   *Engine
+	policy   directPolicy
+	target   *lazyTargetDB
+	schema   *targetSchema
+	database string
+}
+
+// NewExecutionVerdicts resolves the direct execution policy in creds.Metadata
+// for the target database creds.DSN names. A malformed policy is an error, as
+// it is for Plan: treating it as disabled would record blocked verdicts that
+// the apply's routing might not agree with.
+func (e *Engine) NewExecutionVerdicts(creds *engine.Credentials) (*ExecutionVerdicts, error) {
+	if creds == nil || creds.DSN == "" {
+		return nil, errors.New("execution verdicts: DSN credentials required for Spirit engine")
+	}
+	_, _, _, database, err := parseDSN(creds.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("execution verdicts: parse DSN: %w", err)
+	}
+	policy, err := directPolicyFromMetadata(creds.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("execution verdicts for database %q: resolve direct execution policy: %w", database, err)
+	}
+	target := &lazyTargetDB{dsn: creds.DSN}
+	return &ExecutionVerdicts{
+		engine:   e,
+		policy:   policy,
+		target:   target,
+		schema:   &targetSchema{target: target},
+		database: database,
+	}, nil
+}
+
+// Record sets change's ExecutionMode and ModeReason to the verdict for its DDL
+// on the target. The statement is classified from change.DDL, the text the
+// apply runs, rather than from change.Operation. The table's current
+// definition is read from the target, as the apply's routing reads it. A
+// statement the engine runs on its default path is left with an empty verdict,
+// and so are CREATE TABLE and DROP TABLE, which the engine never refuses. A
+// table the target cannot describe is an error rather than a verdict, as it is
+// for the apply's routing, which fails the apply on it.
+//
+// A verdict is one target's, so change must be judged against exactly one
+// target. A caller planning the same statement for several targets, such as
+// one shard primary after another, records each target's verdict on its own
+// change: judging one change against each in turn would let a target that
+// accepts the statement erase the blocked verdict another target recorded,
+// and the plan would admit an apply that target then refuses. Record sets the
+// whole verdict, clearing any mode change already carries.
+func (v *ExecutionVerdicts) Record(ctx context.Context, change *engine.TableChange) error {
+	change.ExecutionMode = ""
+	change.ModeReason = ""
+	stmtType, _, err := ddl.ClassifyStatement(change.DDL)
+	if err != nil {
+		return fmt.Errorf("execution verdict for table %q in database %q: classify statement: %w", change.Table, v.database, err)
+	}
+	if !verdictApplies(stmtType) {
+		return nil
+	}
+	currentCreateTable, err := v.schema.createTable(ctx, change.Table)
+	if err != nil {
+		return fmt.Errorf("execution verdict for table %q in database %q: read current definition: %w", change.Table, v.database, err)
+	}
+	return v.record(ctx, change, currentCreateTable)
+}
+
+// Close releases the target connection, if a verdict opened one.
+func (v *ExecutionVerdicts) Close() {
+	v.target.close()
+}
+
+// verdictApplies reports whether a statement of stmtType can carry an
+// execution-mode verdict. The apply runs every statement other than CREATE
+// TABLE and DROP TABLE in its ALTER phase (see classifyDDLPhases), where each
+// one passes the engine's refusal check, so each of those can be refused.
+func verdictApplies(stmtType ddl.StatementType) bool {
+	return stmtType != ddl.StatementCreateTable && stmtType != ddl.StatementDropTable
+}
+
+// record sets change's verdict, judged against currentCreateTable. The
+// engine's refusal checks compare a redeclared column against its current
+// type, which is why the statement is classified alongside the table's
+// definition.
+func (v *ExecutionVerdicts) record(ctx context.Context, change *engine.TableChange, currentCreateTable string) error {
+	logger := v.engine.logger
+	reason, refused, err := check.StatementRefusal(ctx, change.DDL, currentCreateTable, logger)
+	if err != nil {
+		return fmt.Errorf("execution verdict for table %q in database %q: %w", change.Table, v.database, err)
+	}
+	if !refused {
+		return nil
+	}
+	decision := v.engine.resolveRefusedMode(ctx, v.target, v.policy, v.database, change.Table, reason)
+	change.ExecutionMode = decision.mode
+	change.ModeReason = decision.modeReason
+	if decision.mode == engine.ExecutionModeDirect {
+		logger.Info("plan routes a statement the engine refuses to direct execution",
+			"database", v.database, "table", change.Table, "reason", reason, "estimated_rows", decision.rows)
+	} else {
+		logger.Info("plan contains a statement the engine will refuse at apply time",
+			"database", v.database, "table", change.Table, "reason", decision.modeReason)
+	}
+	return nil
+}
 
 // defaultDirectLockAcquisitionTimeoutSeconds bounds how long a direct statement
 // waits to acquire its locks when the policy does not configure a bound.

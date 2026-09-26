@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -1088,6 +1089,53 @@ func deriveOverallState(tasks []*storage.Task) string {
 // Returns empty string if the event is informational (no state transition).
 func deriveApplyPhase(event engine.ApplyEvent) string {
 	return event.NewState
+}
+
+// recordDriveStarted marks the apply running and started before the drive hands
+// any work to the engine, and reports whether the drive may go on. A drive of a
+// multi-operation apply holds only its operation lease: the parent's running
+// state is the operator's projection to write, so the drive keeps the mark in
+// memory and leaves the stored row alone. When storage refuses the write
+// because the apply is no longer this driver's to run, the drive stands down
+// before starting any work. Any other write failure is logged and the drive
+// goes on, since only an outcome storage has confirmed ends a drive.
+func (c *LocalClient) recordDriveStarted(ctx context.Context, apply *storage.Apply, logger *slog.Logger) bool {
+	now := time.Now()
+	apply.State = state.Apply.Running
+	apply.StartedAt = &now
+	apply.UpdatedAt = now
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("drive holds only its operation lease; parent running state is the operator's projection",
+			apply.MutableLogAttrs()...)
+		return true
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		if applyWriteEndsDrive(err) {
+			logger.Warn("apply is no longer this driver's to run; drive will stand down before calling the engine",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return false
+		}
+		logger.Error("failed to record apply started; drive will continue",
+			append(apply.MutableLogAttrs(), "error", err)...)
+	}
+	return true
+}
+
+// applyWriteEndsDrive reports whether a failed apply write means this driver
+// must not start engine work: another driver took the lease, storage refused to
+// reopen an apply another writer already finished, or another apply went active
+// on the same target. The causes differ, but in each one work started after the
+// write would run on behalf of an apply this driver can no longer record, or
+// alongside another apply's schema change on the same target.
+func applyWriteEndsDrive(err error) bool {
+	switch {
+	case errors.Is(err, storage.ErrApplyLeaseLost):
+		return true
+	case errors.Is(err, storage.ErrApplyReopenRefused):
+		return true
+	default:
+		return errors.Is(err, storage.ErrActiveApplyExists)
+	}
 }
 
 // applyEventStateTransition updates an apply's state based on an engine event.

@@ -989,16 +989,17 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			if len(ks.Shards) > 0 {
 				writeShardedPlanDDL(sb, ks.Shards, dialect, budget)
 			} else {
-				writePlanDDLBlock(sb, ks.Statements, dialect, budget)
+				writePlanDDLBlocks(sb, ks.Statements, dialect, budget)
 			}
 		}
 	}
 }
 
-// countPlanDDLBlocks counts the DDL blocks writeKeyspaceChanges renders for
+// countPlanDDLBlocks counts the DDL sections writeKeyspaceChanges renders for
 // changes — one per unsharded keyspace with statements and one per group of
 // shards that share a change — so the comment's DDL budget is shared across
-// exactly those blocks.
+// exactly those sections. A section renders its statements as separate
+// blocks, but they draw on the section's share together.
 func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 	count := 0
 	for _, ks := range changes {
@@ -1017,14 +1018,18 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 	return count
 }
 
-// writePlanDDLBlock writes a single fenced SQL block of statements, formatted
-// under the plan's own dialect and drawing on the comment's shared DDL budget.
-// A greenfield create set is split so each of its statements is formatted on
-// its own line; rendering is best-effort, so a statement that is neither a
-// single statement nor a valid create set is still rendered as written, and
-// the reason is logged for triage.
-func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
-	formattedStatements := make([]string, 0, len(statements))
+// writePlanDDLBlocks writes one fenced SQL block per statement, in plan
+// order, so a reviewer reads each table's change on its own instead of
+// picking it out of one run of every statement in the plan. Each statement is
+// one unit of work the apply runs, so the blocks also mirror how the change
+// will be applied. Blocks are formatted under the plan's own dialect and
+// together draw one share of the comment's DDL budget. A greenfield create
+// set stays one block — the table and the indexes it ships with — with each
+// of its statements formatted on its own line. Rendering is best-effort, so a
+// statement that is neither a single statement nor a valid create set is
+// still rendered as written, and the reason is logged for triage.
+func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
+	blocks := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
 		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
@@ -1047,14 +1052,14 @@ func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.
 		for _, statementToFormat := range statementsToFormat {
 			formattedCreateSet = append(formattedCreateSet, ddl.FormatDDLForDialect(dialect, statementToFormat))
 		}
-		formattedStatements = append(formattedStatements, strings.Join(formattedCreateSet, "\n"))
+		blocks = append(blocks, strings.Join(formattedCreateSet, "\n"))
 	}
-	writeSQLFencedBlock(sb, strings.Join(formattedStatements, "\n\n"), budget)
+	writeSQLFencedBlocks(sb, blocks, budget)
 	sb.WriteString("\n")
 }
 
 // writeShardedPlanDDL renders a sharded keyspace's DDL grouped by change: shards
-// that need the same statements share one block, so a uniform keyspace shows the
+// that need the same statements share one section, so a uniform keyspace shows the
 // DDL once and a divergent one shows "what applies where" — each distinct change
 // set with the shards it applies to.
 func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dialect schema.Dialect, budget *ddlBlockBudget) {
@@ -1067,7 +1072,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dial
 		// an empty code block.
 		if len(groups) == 1 && !groups[0].Satisfied {
 			writeShardGroupHeading(sb, groups[0].Shards, len(shards))
-			writePlanDDLBlock(sb, groups[0].Statements, dialect, budget)
+			writePlanDDLBlocks(sb, groups[0].Statements, dialect, budget)
 		}
 		return
 	}
@@ -1080,7 +1085,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dial
 			sb.WriteString("_Already applied — no change._\n\n")
 			continue
 		}
-		writePlanDDLBlock(sb, g.Statements, dialect, budget)
+		writePlanDDLBlocks(sb, g.Statements, dialect, budget)
 	}
 }
 
