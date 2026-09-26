@@ -900,11 +900,10 @@ func SummarizeChanges(data PlanCommentData) string {
 // table to alter. An index build or drop on an existing table is counted in
 // its own bucket, one per statement. A statement the parser rejects or a
 // recognized statement outside every bucket contributes to other so the
-// summary stays complete; the
-// shared counter decides which bucket each classified statement lands in, so
-// the CLI and the comment cannot disagree on it. A database type with no
-// registered parser yields no counts at all, and the callers' raw-total
-// fallback carries the statement count.
+// summary stays complete; the shared counter decides which bucket each
+// classified statement lands in, so the CLI and the comment cannot disagree
+// on it. A database type with no registered parser yields no counts at all,
+// and the callers' raw-total fallback carries the statement count.
 func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.PlanCounts {
 	var counts ui.PlanCounts
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))

@@ -1423,8 +1423,8 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 
 // PreviewCommentPostgresPlan renders a sample PostgreSQL plan comment whose
 // statements are classified and formatted under the PostgreSQL grammar. The
-// standalone index build on an existing table counts as an alter of that
-// table in the plan summary.
+// standalone index build on an existing table is named as an index to create
+// in the plan summary.
 func PreviewCommentPostgresPlan() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
