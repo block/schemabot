@@ -486,8 +486,8 @@ func operationDeploymentsForApply(ctx context.Context, tx *rebindTx, applyID int
 // apply_operations.deployment rows, so single-operation applies (where the two
 // are equal) behave exactly as before.
 //
-// An operation a driver has started also reserves its own deployment, whatever
-// its parent's state (checkNoStartedOperationForTargets).
+// A terminal parent keeps its whole target set reserved while any of its
+// operations is still in progress (checkNoInProgressRolloutForTargets).
 func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
 	deployments = dedupeDeployments(deployments)
 	if len(deployments) == 0 {
@@ -529,15 +529,15 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	return checkNoStartedOperationForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
+	return checkNoInProgressRolloutForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
 }
 
-// operationHoldsDeploymentPredicate matches an operation row o that holds its
-// own deployment: one a driver has started and that has not reached a terminal
-// state.
+// operationInProgressPredicate matches an operation row, under the given
+// alias, that is still in progress: one a driver has started and that has not
+// reached a terminal state.
 //
-// Two non-terminal states hold nothing on their own, because no driver works
-// them while their parent's verdict stands:
+// Two non-terminal states are not in progress, because no driver works them
+// while their parent's verdict stands:
 //   - pending: the claim refuses to start an operation whose parent is
 //     terminal, and the stranded reaper later settles the row.
 //   - failed_retryable: the retry claim resumes an operation only while its
@@ -545,67 +545,76 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 //     alone for the whole drive and clears its lease when the drive ends, so
 //     a fresh lease is what tells a retry in progress from an idle row.
 //
-// Under an active parent the parent check already reserves both. An ST-1
-// verdict correction that reopens the parent makes them claimable again
-// without re-running this check; OW-5 records that exception.
-func operationHoldsDeploymentPredicate(dialect Dialect) (string, []any) {
-	notHolding := terminalApplyStates()
-	notHolding = append(notHolding, state.ApplyOperation.Pending, state.ApplyOperation.FailedRetryable)
+// A running operation is in progress by state alone, not by lease. When its
+// driver dies, the stale-active claim re-leases it whatever the parent's state
+// and the drive settles it from the terminal parent, which is what ends it.
+// Gating on a fresh lease instead would end the reservation while a live
+// driver's heartbeat lags.
+func operationInProgressPredicate(dialect Dialect, alias string) (string, []any) {
+	notInProgress := terminalApplyStates()
+	notInProgress = append(notInProgress, state.ApplyOperation.Pending, state.ApplyOperation.FailedRetryable)
 	freshLeaseAfter := dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	clause := fmt.Sprintf(`(
-			o.state NOT IN (%s)
-			OR (o.state = ? AND o.lease_owner <> '' AND o.updated_at >= %s)
-		)`, placeholders(len(notHolding)), freshLeaseAfter)
-	args := stringArgs(notHolding)
+			%[1]s.state NOT IN (%[2]s)
+			OR (%[1]s.state = ? AND %[1]s.lease_owner <> '' AND %[1]s.updated_at >= %[3]s)
+		)`, alias, placeholders(len(notInProgress)), freshLeaseAfter)
+	args := stringArgs(notInProgress)
 	args = append(args, state.ApplyOperation.FailedRetryable)
 	return clause, args
 }
 
-// checkNoStartedOperationForTargets reserves a deployment for as long as an
-// operation is working there, whatever its parent apply's state says. The
-// parent check above releases a deployment once the parent is terminal, and a
-// rollout's parent can record a terminal verdict while one of its operations is
-// still running: a sibling's failure can terminalize the parent before the
-// projection re-derives it. Matching the operation rows directly keeps a second
-// apply off that deployment until the operation reaches a terminal state.
-//
-// A running operation holds its deployment by state alone, not by lease. When
-// its driver dies, the stale-active claim re-leases it whatever the parent's
-// state, and the drive settles it from the terminal parent, which is what
-// frees the deployment. Gating on a fresh lease instead would free the
-// deployment while a live driver's heartbeat lags.
-func checkNoStartedOperationForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
-	statePredicate, stateArgs := operationHoldsDeploymentPredicate(dialect)
+// checkNoInProgressRolloutForTargets keeps a terminal parent's whole target set
+// reserved while any of its operations is in progress. A rollout's parent can
+// record a terminal verdict while an operation is still in progress: a
+// sibling's failure can terminalize the parent before the projection
+// re-derives it. Until that operation reaches a terminal state the rollout is
+// still live. Its drive can reopen the parent (ST-1), and the reopened rollout
+// can then start its pending operations, so its targets stay reserved exactly
+// as an active parent's would. The parent check above covers active parents.
+func checkNoInProgressRolloutForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
+	parentStates := terminalApplyStates()
+	inProgress, inProgressArgs := operationInProgressPredicate(dialect, "busy")
+	deploymentPlaceholders := placeholders(len(deployments))
 	query := fmt.Sprintf(`
-		SELECT a.apply_identifier, a.state, o.deployment, o.state
-		FROM apply_operations o
-		JOIN applies a ON a.id = o.apply_id
-		WHERE o.deployment IN (%s)
-		AND %s
-		AND a.database_name = ?
+		SELECT a.apply_identifier, a.state, busy.deployment, busy.state
+		FROM applies a%s
+		JOIN apply_operations busy ON busy.apply_id = a.id
+		WHERE a.database_name = ?
 		AND a.database_type = ?
 		AND a.environment = ?
-	`, placeholders(len(deployments)), statePredicate)
-	args := stringArgs(deployments)
-	args = append(args, stateArgs...)
-	args = append(args, database, dbType, environment)
+		AND a.state IN (%s)
+		AND %s
+		AND (
+			a.deployment IN (%s)
+			OR EXISTS (
+				SELECT 1 FROM apply_operations o
+				WHERE o.apply_id = a.id
+				AND o.deployment IN (%s)
+			)
+		)
+	`, dialect.IndexHint("idx_database_env_deployment"), placeholders(len(parentStates)), inProgress, deploymentPlaceholders, deploymentPlaceholders)
+	args := []any{database, dbType, environment}
+	args = append(args, stringArgs(parentStates)...)
+	args = append(args, inProgressArgs...)
+	args = append(args, stringArgs(deployments)...)
+	args = append(args, stringArgs(deployments)...)
 	if excludeApplyID > 0 {
 		query += " AND a.id != ?"
 		args = append(args, excludeApplyID)
 	}
 	query += " LIMIT 1"
 
-	var holderIdentifier, holderState, holderDeployment, operationState string
-	err := tx.QueryRowContext(ctx, query, args...).Scan(&holderIdentifier, &holderState, &holderDeployment, &operationState)
+	var holderIdentifier, holderState, busyDeployment, busyState string
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&holderIdentifier, &holderState, &busyDeployment, &busyState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("check started operations for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+		return fmt.Errorf("check in-progress rollouts for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	return fmt.Errorf("apply %s (state %s) has a %s operation on deployment %s for %s/%s/%s: %w",
-		holderIdentifier, holderState, operationState, holderDeployment, database, dbType, environment, storage.ErrActiveApplyExists)
+	return fmt.Errorf("apply %s (state %s) still has a %s operation on deployment %s and holds its targets among %v for %s/%s/%s: %w",
+		holderIdentifier, holderState, busyState, busyDeployment, deployments, database, dbType, environment, storage.ErrActiveApplyExists)
 }
 
 func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {

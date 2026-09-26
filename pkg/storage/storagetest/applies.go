@@ -656,10 +656,11 @@ func TestApplies(t *testing.T, h Harness) {
 	// settles, because a driver is still changing that deployment. region-a and
 	// region-c are free at once: nothing is running on either.
 	// A rollout's parent can record failed while one of its operations is still
-	// running. The running operation keeps its deployment reserved, with or
-	// without a lease on it, while the deployments the rollout left idle (an
-	// operation that failed or never started) are free for a new apply.
-	t.Run("Create_RefusesDeploymentWithStartedOperationUnderFinishedParent", func(t *testing.T) {
+	// running. Until that operation reaches a terminal state the rollout is still
+	// live: its drive can reopen the parent and start the never-started
+	// operation. So the whole target set stays reserved, with or without a lease
+	// on the running operation, and frees once nothing is in progress.
+	t.Run("Create_RefusesRolloutTargetsWhileAnOperationIsInProgress", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_started_operation_db", storage.DatabaseTypeMySQL)
@@ -678,14 +679,19 @@ func TestApplies(t *testing.T, h Harness) {
 
 		err := createApplyOnDeployment(t, store, lock, "apply_region_b_while_running", 9301, "region-b")
 		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "a running operation holds its deployment even with no lease on it")
-		assert.Contains(t, err.Error(), "apply_rollout_failed_early", "the refusal names the apply still working on the deployment")
-		assert.Contains(t, err.Error(), "region-b")
-
-		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_a_after_failure", 9302, "region-a"), "a failed operation holds no deployment")
-		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_c_never_started", 9303, "region-c"), "an operation the finished rollout never started holds no deployment")
+		assert.Contains(t, err.Error(), "apply_rollout_failed_early", "the refusal names the apply still in progress")
+		assert.Contains(t, err.Error(), "running operation on deployment region-b", "the refusal names the operation keeping it live")
+		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_a_while_running", 9302, "region-a"), storage.ErrActiveApplyExists,
+			"a deployment whose operation failed stays reserved while the rollout is live")
+		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_c_while_running", 9303, "region-c"), storage.ErrActiveApplyExists,
+			"a never-started operation stays reserved while a reopen could still start it")
+		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_d_outside_rollout", 9304, "region-d"), "a deployment outside the rollout is free")
 
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, operationIDs["region-b"]))
-		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_b_after_settle", 9304, "region-b"), "the deployment frees once its operation settles")
+		for i, deployment := range []string{"region-a", "region-b", "region-c"} {
+			require.NoErrorf(t, createApplyOnDeployment(t, store, lock, "apply_"+deployment+"_after_settle", int64(9305+i), deployment),
+				"%s frees once no operation of the rollout is in progress", deployment)
+		}
 	})
 
 	// A driver claims a rollout's operation and then loses it, so the operation
@@ -758,9 +764,9 @@ func TestApplies(t *testing.T, h Harness) {
 
 	// Moving an existing apply back into an active state runs the same check as
 	// creating one, so neither the general update nor the resume claim of a
-	// stopped apply can activate an apply on a deployment where another apply's
-	// operation is still running under a failed parent.
-	t.Run("Activate_RefusesDeploymentWithStartedOperationUnderFinishedParent", func(t *testing.T) {
+	// stopped apply can activate an apply on a target of a rollout whose parent
+	// recorded failed while one of its operations is still running.
+	t.Run("Activate_RefusesTargetsOfRolloutWithAnOperationInProgress", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_activate_started_operation_db", storage.DatabaseTypeMySQL)
