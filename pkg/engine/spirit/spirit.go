@@ -616,11 +616,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		// Execution-mode verdict: surface statements Spirit deterministically
 		// refuses so the operator learns at plan time how the apply will
 		// behave — routed to direct execution when the policy permits, or
-		// guaranteed to fail when it doesn't. Only ALTERs can be refused, and
-		// gating here keeps the verdict — an informational field — from ever
-		// failing the plan on a statement type the engine's own parser
-		// doesn't accept.
-		if verdictApplies(&change) {
+		// guaranteed to fail when it doesn't. The diff emits only CREATE,
+		// ALTER, and DROP, so every statement that can be refused here is an
+		// ALTER.
+		if verdictApplies(stmtType) {
 			currentCreateTable, ok := currentByTable[pc.TableName]
 			if !ok {
 				return nil, fmt.Errorf("plan produced an ALTER for table %q, which has no current definition in database %q", pc.TableName, database)

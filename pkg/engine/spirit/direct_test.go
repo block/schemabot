@@ -142,11 +142,12 @@ func TestNewExecutionVerdicts_RejectsBadInput(t *testing.T) {
 	require.ErrorContains(t, err, "direct_execution_max_table_rows is not set")
 }
 
-// Only an ALTER can be refused, so any other statement is left on the default
-// path without reading the target. The DSN here points nowhere, so recording
-// a verdict for a CREATE or DROP succeeds only because no connection is made.
-// Each change starts out carrying a verdict an earlier target recorded, which
-// the call must clear.
+// The engine never refuses a CREATE TABLE or DROP TABLE, so either is left on
+// the default path without reading the target. The DSN here points nowhere,
+// so recording a verdict for one succeeds only because no connection is made.
+// The statement is classified from its DDL, so a change whose Operation claims
+// an ALTER is still treated as the CREATE it runs. Record sets the whole
+// verdict, so a mode a change already carries is cleared.
 func TestExecutionVerdicts_NonAlterNeedsNoTarget(t *testing.T) {
 	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{
 		DSN:      "root:nopass@tcp(127.0.0.1:1)/orders_db",
@@ -156,8 +157,9 @@ func TestExecutionVerdicts_NonAlterNeedsNoTarget(t *testing.T) {
 	defer verdicts.Close()
 
 	for _, change := range []engine.TableChange{
-		{Table: "orders", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "refused on another target"},
-		{Table: "orders", Operation: ddl.StatementDropTable, DDL: "DROP TABLE `orders`", ExecutionMode: engine.ExecutionModeDirect, ModeReason: "within bound on another target"},
+		{Table: "orders", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "stale"},
+		{Table: "orders", Operation: ddl.StatementDropTable, DDL: "DROP TABLE `orders`", ExecutionMode: engine.ExecutionModeDirect, ModeReason: "stale"},
+		{Table: "orders", Operation: ddl.StatementAlterTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
 	} {
 		require.NoError(t, verdicts.Record(t.Context(), &change), change.DDL)
 		assert.Empty(t, change.ExecutionMode, change.DDL)

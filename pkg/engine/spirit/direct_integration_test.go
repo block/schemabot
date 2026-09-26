@@ -705,8 +705,8 @@ func TestExecutionVerdicts_RecordMatchesPlan(t *testing.T) {
 }
 
 // A statement the engine runs on its default path gets no verdict: an ALTER
-// the engine accepts is recorded with an empty mode, even when the change
-// still carries the verdict an earlier target recorded for it.
+// the engine accepts is recorded with an empty mode. Record sets the whole
+// verdict, so a mode the change already carried does not survive it.
 func TestExecutionVerdicts_AcceptedAlterHasNoVerdict(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	dropTablesOnCleanup(t, db, "direct_accepted")
@@ -717,16 +717,38 @@ func TestExecutionVerdicts_AcceptedAlterHasNoVerdict(t *testing.T) {
 	require.NoError(t, err)
 	defer verdicts.Close()
 	change := engine.TableChange{
-		Table:     "direct_accepted",
-		Operation: ddl.StatementAlterTable,
-		DDL:       "ALTER TABLE `direct_accepted` ADD COLUMN `note` varchar(64)",
-		// The verdict another shard primary recorded for the same change.
+		Table:         "direct_accepted",
+		Operation:     ddl.StatementAlterTable,
+		DDL:           "ALTER TABLE `direct_accepted` ADD COLUMN `note` varchar(64)",
 		ExecutionMode: engine.ExecutionModeBlocked,
-		ModeReason:    "refused on another target",
+		ModeReason:    "stale",
 	}
 	require.NoError(t, verdicts.Record(t.Context(), &change))
 	assert.Empty(t, change.ExecutionMode)
 	assert.Empty(t, change.ModeReason)
+}
+
+// The verdict follows the statement the apply will run, not the Operation the
+// caller labelled it with. A caller that plans the statement itself and leaves
+// Operation unset still learns that the engine refuses it, so the plan does not
+// admit an apply the engine then refuses.
+func TestExecutionVerdicts_JudgesTheStatementNotItsOperation(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_unlabelled")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE direct_unlabelled (id INT NOT NULL, tenant_id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err, "create direct_unlabelled table")
+
+	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{DSN: dsn})
+	require.NoError(t, err)
+	defer verdicts.Close()
+	change := engine.TableChange{
+		Table: "direct_unlabelled",
+		DDL:   "ALTER TABLE `direct_unlabelled` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+	}
+	require.Equal(t, ddl.StatementUnknown, change.Operation)
+	require.NoError(t, verdicts.Record(t.Context(), &change))
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, "dropping primary key is not supported")
 }
 
 // An ALTER for a table the target cannot describe fails rather than recording
@@ -739,12 +761,11 @@ func TestExecutionVerdicts_UnreadableTableFails(t *testing.T) {
 	require.NoError(t, err)
 	defer verdicts.Close()
 	change := engine.TableChange{
-		Table:     "direct_absent",
-		Operation: ddl.StatementAlterTable,
-		DDL:       "ALTER TABLE `direct_absent` DROP PRIMARY KEY",
-		// The verdict another shard primary recorded for the same change.
+		Table:         "direct_absent",
+		Operation:     ddl.StatementAlterTable,
+		DDL:           "ALTER TABLE `direct_absent` DROP PRIMARY KEY",
 		ExecutionMode: engine.ExecutionModeDirect,
-		ModeReason:    "within bound on another target",
+		ModeReason:    "stale",
 	}
 	err = verdicts.Record(t.Context(), &change)
 	require.Error(t, err)

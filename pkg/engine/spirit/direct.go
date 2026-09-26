@@ -260,10 +260,13 @@ const (
 // statement will run at apply time, for the table changes planned against one
 // target database. It uses this engine's refusal check, direct execution
 // policy, and size gate, so a verdict it records is the one this engine's own
-// Plan records for the same statement. An engine that plans a schema change
-// itself but drives this engine against each target, such as one that fans a
-// sharded schema change out to its shard primaries, uses it to disclose the
-// verdict at plan time without reimplementing the rule.
+// Plan records for the same statement. Both judge the statement against the
+// table's SHOW CREATE TABLE output: Record reads it from the target as the
+// apply's routing does, and Plan reads it into the schema snapshot it diffs.
+// An engine that plans a schema change itself but drives this engine against
+// each target, such as one that fans a sharded schema change out to its shard
+// primaries, uses it to disclose the verdict at plan time without
+// reimplementing the rule.
 //
 // It connects to the target only when a statement needs it, and it is not safe
 // for concurrent use. Close releases the connection.
@@ -302,19 +305,29 @@ func (e *Engine) NewExecutionVerdicts(creds *engine.Credentials) (*ExecutionVerd
 }
 
 // Record sets change's ExecutionMode and ModeReason to the verdict for its DDL
-// on the target. The table's current definition is read from the target, as
-// the apply's routing reads it. A change the engine runs on its default path
-// is left with an empty verdict, and so is every statement other than an
-// ALTER, since only an ALTER can be refused.
+// on the target. The statement is classified from change.DDL, the text the
+// apply runs, rather than from change.Operation. The table's current
+// definition is read from the target, as the apply's routing reads it. A
+// statement the engine runs on its default path is left with an empty verdict,
+// and so are CREATE TABLE and DROP TABLE, which the engine never refuses. A
+// table the target cannot describe is an error rather than a verdict, as it is
+// for the apply's routing, which fails the apply on it.
 //
-// Every call replaces the whole verdict change carries. A verdict belongs to
-// one target, so a change judged against several in turn, such as one shard
-// primary after another, must not keep a mode an earlier target set when a
-// later one accepts the statement or cannot be judged.
+// A verdict is one target's, so change must be judged against exactly one
+// target. A caller planning the same statement for several targets, such as
+// one shard primary after another, records each target's verdict on its own
+// change: judging one change against each in turn would let a target that
+// accepts the statement erase the blocked verdict another target recorded,
+// and the plan would admit an apply that target then refuses. Record sets the
+// whole verdict, clearing any mode change already carries.
 func (v *ExecutionVerdicts) Record(ctx context.Context, change *engine.TableChange) error {
 	change.ExecutionMode = ""
 	change.ModeReason = ""
-	if !verdictApplies(change) {
+	stmtType, _, err := ddl.ClassifyStatement(change.DDL)
+	if err != nil {
+		return fmt.Errorf("execution verdict for table %q in database %q: classify statement: %w", change.Table, v.database, err)
+	}
+	if !verdictApplies(stmtType) {
 		return nil
 	}
 	currentCreateTable, err := v.schema.createTable(ctx, change.Table)
@@ -329,12 +342,12 @@ func (v *ExecutionVerdicts) Close() {
 	v.target.close()
 }
 
-// verdictApplies reports whether change can carry an execution-mode verdict.
-// Only an ALTER can be refused, and gating on it keeps the verdict, an
-// informational field, from ever failing a plan on a statement type the
-// engine's own parser does not accept.
-func verdictApplies(change *engine.TableChange) bool {
-	return change.Operation == ddl.StatementAlterTable
+// verdictApplies reports whether a statement of stmtType can carry an
+// execution-mode verdict. The apply runs every statement other than CREATE
+// TABLE and DROP TABLE in its ALTER phase (see classifyDDLPhases), where each
+// one passes the engine's refusal check, so each of those can be refused.
+func verdictApplies(stmtType ddl.StatementType) bool {
+	return stmtType != ddl.StatementCreateTable && stmtType != ddl.StatementDropTable
 }
 
 // record sets change's verdict, judged against currentCreateTable. The
