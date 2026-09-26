@@ -271,9 +271,11 @@ func TestApplies(t *testing.T, h Harness) {
 
 	// Every write a general update can make over a finished apply, across the
 	// whole state registry: the write is refused exactly when it would reopen
-	// the apply, and every other write lands. An active state reopens any
-	// terminal row; stopped reopens a settled one, because a stopped apply can
-	// be claimed to resume. Cancelling a stopped apply is not a reopen.
+	// the apply or rewrite its settled outcome, and every other write lands. An
+	// active state reopens any terminal row; stopped reopens a settled one,
+	// because a stopped apply can be claimed to resume. A settled outcome keeps
+	// its state, so only a same-state refresh lands over it. Cancelling a
+	// stopped apply is neither.
 	t.Run("Update_NeverReopensFinishedApply", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -284,6 +286,11 @@ func TestApplies(t *testing.T, h Harness) {
 				return true
 			}
 			return state.IsState(next, state.Apply.Stopped) && state.IsState(current, state.SettledApplyStates...)
+		}
+		rewritesOutcome := func(current, next string) bool {
+			return state.IsState(current, state.SettledApplyStates...) &&
+				state.IsState(next, state.SettledApplyStates...) &&
+				!state.IsState(current, next)
 		}
 
 		planID := int64(9100)
@@ -302,30 +309,43 @@ func TestApplies(t *testing.T, h Harness) {
 					persisted, getErr := store.Applies().Get(ctx, apply.ID)
 					require.NoError(t, getErr)
 					require.NotNil(t, persisted)
-					if reopens(current, next) {
+					switch {
+					case reopens(current, next):
 						require.ErrorIsf(t, err, storage.ErrApplyReopenRefused, "writing %s over a %s apply reopens it", next, current)
 						assert.Equal(t, current, persisted.State, "a refused write leaves the stored verdict in place")
-						return
+					case rewritesOutcome(current, next):
+						require.ErrorIsf(t, err, storage.ErrApplyOutcomeSettled, "writing %s over a %s apply rewrites its outcome", next, current)
+						assert.Equal(t, current, persisted.State, "a refused write leaves the stored verdict in place")
+					default:
+						require.NoErrorf(t, err, "writing %s over a %s apply leaves it finished", next, current)
+						assert.Equal(t, next, persisted.State)
 					}
-					require.NoErrorf(t, err, "writing %s over a %s apply leaves it finished", next, current)
-					assert.Equal(t, next, persisted.State)
 				})
 			}
 		}
 	})
 
-	// A caller copies an apply while it runs; another writer finishes it; the
-	// caller then writes its copy back. Whether the copy says running or
-	// stopped, the finished verdict stands: a running copy would hand the apply
-	// to a driver, and a stopped copy would make it startable.
+	// A caller copies an apply while it runs; another writer completes it; the
+	// caller then writes its copy back. Whatever the copy says, the completed
+	// verdict stands: a running copy would hand the apply to a driver, a
+	// stopped copy would make it startable, and a cancelled or failed copy
+	// would record an outcome the database never had.
 	t.Run("Update_RefusesStaleCopyOfFinishedApply", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_stale_copy_db", storage.DatabaseTypeMySQL)
 
-		for _, staleState := range []string{state.Apply.Running, state.Apply.Stopped} {
-			t.Run(staleState, func(t *testing.T) {
-				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stale_copy_"+staleState, 9001, state.Apply.Running, "staging")
+		for _, tc := range []struct {
+			staleState string
+			wantErr    error
+		}{
+			{staleState: state.Apply.Running, wantErr: storage.ErrApplyReopenRefused},
+			{staleState: state.Apply.Stopped, wantErr: storage.ErrApplyReopenRefused},
+			{staleState: state.Apply.Cancelled, wantErr: storage.ErrApplyOutcomeSettled},
+			{staleState: state.Apply.Failed, wantErr: storage.ErrApplyOutcomeSettled},
+		} {
+			t.Run(tc.staleState, func(t *testing.T) {
+				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stale_copy_"+tc.staleState, 9001, state.Apply.Running, "staging")
 				staleCopy := *apply
 
 				finishedAt := time.Now()
@@ -333,17 +353,55 @@ func TestApplies(t *testing.T, h Harness) {
 				apply.CompletedAt = &finishedAt
 				require.NoError(t, store.Applies().Update(ctx, apply))
 
-				staleCopy.State = staleState
+				staleCopy.State = tc.staleState
 				staleCopy.CompletedAt = nil
-				require.ErrorIs(t, store.Applies().Update(ctx, &staleCopy), storage.ErrApplyReopenRefused)
+				staleCopy.ErrorMessage = "stale writer"
+				require.ErrorIs(t, store.Applies().Update(ctx, &staleCopy), tc.wantErr)
 
 				persisted, err := store.Applies().Get(ctx, apply.ID)
 				require.NoError(t, err)
 				require.NotNil(t, persisted)
 				assert.Equal(t, state.Apply.Completed, persisted.State)
 				assert.NotNil(t, persisted.CompletedAt, "the finished apply keeps its completion time")
+				assert.Empty(t, persisted.ErrorMessage, "a refused write lands none of its fields")
 			})
 		}
+	})
+
+	// A caller that writes a state in non-canonical form still gets it stored
+	// canonically, so the finished-apply guard, which compares the stored
+	// column against the canonical states, holds on every dialect. A completed
+	// apply written as COMPLETED must still refuse a later cancelled write.
+	t.Run("Update_StoresCanonicalStateSoTheGuardHolds", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_canonical_state_db", storage.DatabaseTypeMySQL)
+
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_canonical_state", 9002, "RUNNING", "staging")
+		created, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		assert.Equal(t, state.Apply.Running, created.State, "create stores the canonical state")
+		staleCopy := *created
+
+		finishedAt := time.Now()
+		created.State = "COMPLETED"
+		created.CompletedAt = &finishedAt
+		require.NoError(t, store.Applies().Update(ctx, created))
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Completed, persisted.State, "update stores the canonical state")
+
+		staleCopy.State = state.Apply.Cancelled
+		staleCopy.ErrorMessage = "late cancel"
+		require.ErrorIs(t, store.Applies().Update(ctx, &staleCopy), storage.ErrApplyOutcomeSettled)
+
+		persisted, err = store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Completed, persisted.State, "the completed outcome stands")
 	})
 
 	// A stopped apply goes active again only through the start claim. A caller
@@ -426,6 +484,9 @@ func TestApplies(t *testing.T, h Harness) {
 		staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: claimed.ID, Owner: "old-driver", Token: "stale-token"})
 		claimed.State = state.Apply.Running
 		require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost)
+		claimed.State = state.Apply.Cancelled
+		require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost,
+			"a lost lease also outranks the refusal to rewrite a settled outcome")
 	})
 
 	t.Run("LeaseGuardsWrites", func(t *testing.T) {

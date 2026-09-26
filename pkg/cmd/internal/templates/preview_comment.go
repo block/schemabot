@@ -390,6 +390,7 @@ func previewCLIPlanAllOutput() {
 		fn   func()
 	}{
 		{"PLAN (MYSQL)", previewPlanOutput},
+		{"PLAN (POSTGRES)", previewPostgresPlanOutput},
 		{"PLAN (NO CHANGES)", previewPlanNoChangesOutput},
 		{"PLAN (VITESS)", previewVitessPlanOutput},
 		{"MULTI-ENV PLAN (IDENTICAL)", previewMultiEnvPlanOutput},

@@ -1422,7 +1422,9 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 }
 
 // PreviewCommentPostgresPlan renders a sample PostgreSQL plan comment whose
-// statements are classified and formatted under the PostgreSQL grammar.
+// statements are classified and formatted under the PostgreSQL grammar. The
+// standalone index build on an existing table is named as an index to create
+// in the plan summary.
 func PreviewCommentPostgresPlan() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -1438,6 +1440,7 @@ func PreviewCommentPostgresPlan() string {
 				Statements: []string{
 					"CREATE TABLE sessions (id uuid PRIMARY KEY, user_id bigint NOT NULL, payload jsonb, created_at timestamptz NOT NULL DEFAULT now())",
 					"ALTER TABLE users ADD COLUMN last_seen_at timestamptz, ADD COLUMN preferences jsonb",
+					"CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)",
 				},
 			},
 		},

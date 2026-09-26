@@ -67,7 +67,7 @@ func TestPostgresStorageParity(t *testing.T) {
 // the row lock, and the update returning once the finisher commits.
 const reopenRaceDeadline = 30 * time.Second
 
-// testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace pins the reopen guard
+// testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace pins the finished-apply guard
 // against a finisher that commits while a stale update waits on the row. The
 // finisher holds the row as completed but has not committed; the stale update
 // takes its snapshot and blocks on the row lock; the finisher commits. Under
