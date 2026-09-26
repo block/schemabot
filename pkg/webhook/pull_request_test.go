@@ -82,26 +82,3 @@ func TestCheckDatabaseKeysMatchNameAndType(t *testing.T) {
 		})
 	}
 }
-
-// TestPlannedDatabasesWithoutCheckState pins which databases the PR plans but
-// has no stored check row for yet. Stale cleanup leaves the aggregate to their
-// plans rather than folding it from the rows it cleaned alone.
-func TestPlannedDatabasesWithoutCheckState(t *testing.T) {
-	planned := checkDatabaseKeysForConfigs([]ghclient.DiscoveredConfig{
-		{Config: &ghclient.SchemabotConfig{Database: "orders", Type: ghclient.DatabaseTypeStrata}},
-		{Config: &ghclient.SchemabotConfig{Database: "payments", Type: ghclient.DatabaseTypeMySQL}},
-		{Config: &ghclient.SchemabotConfig{Database: "ledger", Type: ghclient.DatabaseTypeMySQL}},
-	})
-	checks := []*storage.Check{
-		{DatabaseName: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"},
-		{DatabaseName: "Payments", DatabaseType: "MYSQL", Environment: "staging"},
-		{DatabaseName: aggregateSentinel, DatabaseType: aggregateSentinel, Environment: "staging"},
-	}
-
-	assert.Equal(t, []checkDatabaseKey{
-		{databaseName: "ledger", databaseType: storage.DatabaseTypeMySQL},
-		{databaseName: "orders", databaseType: storage.DatabaseTypeStrata},
-	}, plannedDatabasesWithoutCheckState(checks, planned),
-		"a row under a database's previous type does not stand in for the type the PR plans")
-	assert.Empty(t, plannedDatabasesWithoutCheckState(checks, nil))
-}

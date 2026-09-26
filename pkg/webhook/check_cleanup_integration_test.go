@@ -214,13 +214,14 @@ func strataConfigsFor(dbName string) []ghclient.DiscoveredConfig {
 }
 
 // A database is converted from MySQL to Strata while a PR is open. The PR's
-// earlier commit left a plan-only stored check row for (database, mysql); the
-// re-plan on the new commit stores its result under (database, strata). Stale
-// cleanup treats the MySQL row as no longer in the PR, since the PR plans the
-// database only under its new type, and moves it to plan-only success on the
-// new commit. The Strata row the PR does plan is left untouched, so the
-// aggregate reflects the Strata plan's pending changes rather than waiting
-// forever on a row no future plan will ever refresh.
+// earlier commit left a plan-only stored check row for (database, mysql), and
+// the new commit plans the database under (database, strata). Stale cleanup
+// treats the MySQL row as no longer in the PR and moves it to plan-only
+// success on the new commit, but it does not publish the aggregate: until the
+// Strata plan stores its result, that row is the commit's only result, and
+// folding it alone would pass the gate. The Strata plan's fold then reflects
+// its pending changes instead of waiting forever on a row no future plan
+// refreshes.
 func TestE2EStaleCheckCleanupDatabaseTypeChanged(t *testing.T) {
 	dbName := "webhook_stale_type_changed"
 	svc := setupE2EService(t, dbName)
@@ -234,18 +235,6 @@ func TestE2EStaleCheckCleanupDatabaseTypeChanged(t *testing.T) {
 		DatabaseType: storage.DatabaseTypeMySQL,
 		DatabaseName: dbName,
 		CheckRunID:   100,
-		HasChanges:   true,
-		Status:       checkStatusCompleted,
-		Conclusion:   checkConclusionActionRequired,
-	}))
-	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		HeadSHA:      "newsha222",
-		Environment:  "staging",
-		DatabaseType: storage.DatabaseTypeStrata,
-		DatabaseName: dbName,
-		CheckRunID:   101,
 		HasChanges:   true,
 		Status:       checkStatusCompleted,
 		Conclusion:   checkConclusionActionRequired,
@@ -269,71 +258,6 @@ func TestE2EStaleCheckCleanupDatabaseTypeChanged(t *testing.T) {
 	assert.Equal(t, checkConclusionSuccess, mysqlCheck.Conclusion)
 	assert.False(t, mysqlCheck.HasChanges)
 	assert.Empty(t, mysqlCheck.BlockingReason)
-
-	strataCheck, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", storage.DatabaseTypeStrata, dbName)
-	require.NoError(t, err)
-	require.NotNil(t, strataCheck)
-	assert.Equal(t, "newsha222", strataCheck.HeadSHA)
-	assert.Equal(t, int64(101), strataCheck.CheckRunID)
-	assert.Equal(t, checkStatusCompleted, strataCheck.Status)
-	assert.Equal(t, checkConclusionActionRequired, strataCheck.Conclusion, "the row the PR still plans keeps its own result")
-	assert.True(t, strataCheck.HasChanges)
-
-	select {
-	case cr := <-checkRuns:
-		assert.Equal(t, aggregateCheckName, cr.Name)
-		assert.Equal(t, "newsha222", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
-		require.NotNil(t, cr.Output)
-		assert.NotEqual(t, awaitingCurrentCommitTitle, cr.Output.Title)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for the aggregate check run stale cleanup publishes")
-	}
-	stored := waitForStoredAggregate(t, svc, "octocat/hello-world", 1, checkStatusCompleted, checkConclusionActionRequired)
-	assert.Equal(t, "newsha222", stored.HeadSHA)
-}
-
-// A database is converted from MySQL to Strata, and stale cleanup for the new
-// commit runs before the re-plan has stored anything under (database, strata).
-// Cleanup moves the plan-only MySQL row to success on the new commit, but it
-// does not publish the aggregate: that row is then the commit's only stored
-// result, and folding it alone would pass the gate before the Strata plan
-// exists. When the Strata plan stores its result and folds, the aggregate
-// reflects that plan's pending changes.
-func TestE2EStaleCheckCleanupDatabaseTypeChangedBeforeReplanLeavesAggregateToPlan(t *testing.T) {
-	dbName := "webhook_stale_type_changed_unplanned"
-	svc := setupE2EService(t, dbName)
-	ctx := t.Context()
-
-	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		HeadSHA:      "oldsha111",
-		Environment:  "staging",
-		DatabaseType: storage.DatabaseTypeMySQL,
-		DatabaseName: dbName,
-		CheckRunID:   100,
-		HasChanges:   true,
-		Status:       checkStatusCompleted,
-		Conclusion:   checkConclusionActionRequired,
-	}))
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-	client := gh.NewClient(nil)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
-	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "newsha222")
-
-	h := newE2EHandler(t, svc, client)
-	h.cleanupStaleChecks("octocat/hello-world", 1, "newsha222", 0, checkDatabaseKeysForConfigs(strataConfigsFor(dbName)))
-
-	mysqlCheck, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", storage.DatabaseTypeMySQL, dbName)
-	require.NoError(t, err)
-	require.NotNil(t, mysqlCheck)
-	assert.Equal(t, "newsha222", mysqlCheck.HeadSHA)
-	assert.Equal(t, checkConclusionSuccess, mysqlCheck.Conclusion)
 
 	select {
 	case cr := <-checkRuns:
@@ -368,8 +292,55 @@ func TestE2EStaleCheckCleanupDatabaseTypeChangedBeforeReplanLeavesAggregateToPla
 		assert.Equal(t, "newsha222", cr.HeadSHA)
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion, "the aggregate folds the Strata plan's pending changes")
+		require.NotNil(t, cr.Output)
+		assert.NotEqual(t, awaitingCurrentCommitTitle, cr.Output.Title)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
 		t.Fatal("timed out waiting for the aggregate check run the Strata plan's fold publishes")
+	}
+	stored := waitForStoredAggregate(t, svc, "octocat/hello-world", 1, checkStatusCompleted, checkConclusionActionRequired)
+	assert.Equal(t, "newsha222", stored.HeadSHA)
+}
+
+// A PR's later commit drops its only schema change, so the PR plans no
+// database. No plan runs to fold the aggregate, so stale cleanup publishes it
+// itself once it settles the plan-only row: the commit's aggregate passes
+// instead of waiting on a row that no longer belongs to the PR.
+func TestE2EStaleCheckCleanupWithNothingPlannedPublishesAggregate(t *testing.T) {
+	dbName := "webhook_stale_nothing_planned"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "newsha222")
+
+	h := newE2EHandler(t, svc, client)
+	h.cleanupStaleChecks("octocat/hello-world", 1, "newsha222", 0, checkDatabaseKeysForConfigs(nil))
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "newsha222", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for the aggregate check run stale cleanup publishes")
 	}
 }
 
