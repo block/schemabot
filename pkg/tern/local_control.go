@@ -719,12 +719,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return c.settleCancelForTasklessApply(ctx, targetApply, caller)
 	}
 	if cancelledCount == 0 && skippedCount > 0 && applyID > 0 {
-		if targetApply != nil && state.IsState(targetApply.State, state.Apply.Cancelled) {
-			return &ternv1.CancelResponse{Accepted: true, CancelledCount: 0, SkippedCount: skippedCount}, nil
-		}
-		if err := c.markApplyCancelled(ctx, applyID); err != nil {
-			return nil, err
-		}
+		return c.settleCancelAllTasksTerminal(ctx, applyID, skippedCount, caller)
 	}
 	return &ternv1.CancelResponse{
 		Accepted:       true,
@@ -781,10 +776,13 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		c.logger.Info("cancel found task-less apply already terminal; accepting without a state change",
 			append(apply.LogAttrs(), "requested_by", caller)...)
-		return &ternv1.CancelResponse{Accepted: true}, nil
+		return cancelAlreadySettledResponse(apply.State, 0), nil
 	}
 	previousState := apply.State
 	if err := c.markApplyCancelled(ctx, apply.ID); err != nil {
+		if errors.Is(err, storage.ErrApplyOutcomeSettled) {
+			return c.acceptCancelOverSettledApply(ctx, apply, 0, caller, err)
+		}
 		if !errors.Is(err, storage.ErrApplyLeaseLost) {
 			return nil, err
 		}
@@ -1872,6 +1870,99 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		StoppedCount: 0,
 		SkippedCount: skippedCount,
 	}, nil
+}
+
+// settleCancelAllTasksTerminal handles a cancel that found every targeted task
+// already terminal. The cancel stopped no work, so the apply records what its
+// tasks did rather than cancelled: a driver that finished its tasks but had not
+// yet written the apply row must not lose a completed outcome to a cancel that
+// arrived in between, since the settled cancelled row would then refuse the
+// driver's own completed write. An apply that already settled keeps its
+// outcome. Fails closed when the apply still owns unfinished tasks this client
+// could not see, because settling the apply over them would abandon live work.
+func (c *LocalClient) settleCancelAllTasksTerminal(ctx context.Context, applyID int64, skippedCount int64, caller string) (*ternv1.CancelResponse, error) {
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("load apply %d after cancel found all tasks terminal: %w", applyID, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("load apply %d after cancel found all tasks terminal: %w", applyID, storage.ErrApplyNotFound)
+	}
+	if state.IsState(apply.State, state.SettledApplyStates...) {
+		c.logger.Info("cancel found all tasks terminal and the apply already settled; keeping its outcome",
+			append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller)...)
+		return cancelAlreadySettledResponse(apply.State, skippedCount), nil
+	}
+
+	// A multi-operation drive owns only its operation. Its tasks already carry
+	// the outcome, and the operator derives the operation row from them and
+	// projects the parent, so the parent write is the operator's to make. A
+	// direct write here fails closed under the operation-only lease and would
+	// turn an accepted cancel into a drive error the claim loop re-runs forever.
+	// The durable request stays pending until the projection resolves the
+	// stored apply.
+	if suppressParentApplyWrites(ctx) {
+		c.logger.Info("cancel found all tasks terminal; operation drive leaves the apply outcome to the operator's projection",
+			append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller)...)
+		return &ternv1.CancelResponse{Accepted: true, SkippedCount: skippedCount}, nil
+	}
+
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("load tasks for apply %s to derive its outcome after cancel: %w", apply.ApplyIdentifier, err)
+	}
+	derivedState := state.DeriveApplyState(taskStates(tasks))
+	if !state.IsState(derivedState, state.SettledApplyStates...) {
+		c.logger.Warn("cancel found every targeted task terminal, but the apply's tasks do not settle it; failing closed rather than settling over unfinished task work",
+			append(apply.LogAttrs(), "derived_state", derivedState, "task_count", len(tasks), "client_database", c.config.Database)...)
+		return nil, fmt.Errorf("cancel cannot settle apply %s: its tasks derive %s, not a finished outcome", apply.ApplyIdentifier, derivedState)
+	}
+
+	oldState := apply.State
+	now := time.Now()
+	apply.State = derivedState
+	if state.IsState(derivedState, state.Apply.Failed) && apply.ErrorMessage == "" {
+		apply.ErrorMessage = firstFailedTaskError(tasks)
+	}
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		if !errors.Is(err, storage.ErrApplyOutcomeSettled) {
+			return nil, fmt.Errorf("update apply %s to derived state %s after cancel: %w", apply.ApplyIdentifier, derivedState, err)
+		}
+		return c.acceptCancelOverSettledApply(ctx, apply, skippedCount, caller, err)
+	}
+
+	c.logger.Info("cancel found all tasks terminal; apply state derived from tasks",
+		append(apply.LogAttrs(), "old_state", oldState, "skipped_count", skippedCount, "requested_by", caller)...)
+	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		fmt.Sprintf("All tasks terminal before cancel took effect; apply state derived from tasks: %s", derivedState), oldState, derivedState)
+	return cancelAlreadySettledResponse(derivedState, skippedCount), nil
+}
+
+// acceptCancelOverSettledApply answers a cancel whose apply write was refused
+// because another writer settled the apply first. The recorded outcome stands
+// and the cancel is accepted, so its durable request completes instead of
+// retrying against an outcome that can no longer change.
+func (c *LocalClient) acceptCancelOverSettledApply(ctx context.Context, apply *storage.Apply, skippedCount int64, caller string, refusal error) (*ternv1.CancelResponse, error) {
+	current, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("reload apply %s after cancel lost the race to settle it: %w", apply.ApplyIdentifier, err)
+	}
+	if current == nil {
+		return nil, fmt.Errorf("reload apply %s after cancel lost the race to settle it: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	c.logger.Info("cancel arrived after the apply settled; keeping the recorded outcome",
+		append(current.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller, "refusal", refusal)...)
+	return cancelAlreadySettledResponse(current.State, skippedCount), nil
+}
+
+func cancelAlreadySettledResponse(settledState string, skippedCount int64) *ternv1.CancelResponse {
+	return &ternv1.CancelResponse{
+		Accepted:     true,
+		ErrorMessage: fmt.Sprintf("Schema change already %s", settledState),
+		SkippedCount: skippedCount,
+	}
 }
 
 func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error {

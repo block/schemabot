@@ -50,6 +50,13 @@ var (
 	// the state through their own conditional writes and never return it.
 	ErrApplyReopenRefused = errors.New("refused to reopen a finished apply")
 
+	// ErrApplyOutcomeSettled is returned when a general apply update would
+	// replace a settled outcome (completed, failed, cancelled, reverted) with a
+	// different one. The settled row records what happened on the database, so
+	// a later writer, such as a cancel that arrives after the apply completed,
+	// learns the outcome already landed instead of overwriting it.
+	ErrApplyOutcomeSettled = errors.New("apply outcome already settled")
+
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
