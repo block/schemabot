@@ -971,7 +971,11 @@ ALTER TABLE users
     ADD COLUMN preferences jsonb;
 ```
 
-📋 **Plan**: **1** table to create, **1** table to alter
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
+```
+
+📋 **Plan**: **1** table to create, **1** table to alter, **1** index to create
 
 
 ---
@@ -2187,6 +2191,41 @@ That command wasn't recognized. Available commands:
 📋 Plan: 2 tables to create, 1 table to alter
 
 Options: ⏸️ Defer Cutover
+
+```
+</details>
+
+<details>
+<summary><a name="plan-postgres"></a><strong>Plan (Postgres)</strong></summary>
+
+```
+
+╭─────────────────────────────────────────────╮
+│  PostgreSQL Schema Change Plan              │
+│                                             │
+│  Database: testapp                          │
+│  Environment: staging                       │
+│  Schema name: testapp                       │
+╰─────────────────────────────────────────────╯
+
+     + sessions
+       CREATE TABLE sessions (
+           id uuid PRIMARY KEY,
+           user_id bigint NOT NULL,
+           payload jsonb,
+           created_at timestamptz NOT NULL DEFAULT now()
+       );
+
+     ~ users
+       ALTER TABLE users
+           ADD COLUMN last_seen_at timestamptz,
+           ADD COLUMN preferences jsonb;
+
+     ~ orders
+       CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
+
+📋 Plan: 1 table to create, 1 table to alter, 1 index to create
+
 
 ```
 </details>

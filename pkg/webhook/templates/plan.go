@@ -866,7 +866,12 @@ func SummarizeChanges(data PlanCommentData) string {
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
 	parts := ui.AssemblePlanSummary(counts, totalStatements,
-		func(count int, op string) string { return fmt.Sprintf("%d %s", count, pluralize(op, count)) },
+		func(count int, noun, op string) string {
+			if noun == "index" {
+				return fmt.Sprintf("%d index %s", count, pluralize(op, count))
+			}
+			return fmt.Sprintf("%d %s", count, pluralize(op, count))
+		},
 		func(count int, other bool) string {
 			prefix := ""
 			if other {
@@ -892,10 +897,13 @@ func SummarizeChanges(data PlanCommentData) string {
 // (keyspaceStatements), so a sharded keyspace is counted from its per-shard
 // changes. The create/alter/drop counts are per table: when shards diverge,
 // one table can render two different ALTER statements, and it is still one
-// table to alter. A statement the parser rejects or a recognized statement
-// outside the table buckets contributes to other so the summary stays
-// complete. A database type with no registered parser yields no counts at
-// all, and the callers' raw-total fallback carries the statement count.
+// table to alter. An index build or drop on an existing table is counted in
+// its own bucket, one per statement. A statement the parser rejects or a
+// recognized statement outside every bucket contributes to other so the
+// summary stays complete; the shared counter decides which bucket each
+// classified statement lands in, so the CLI and the comment cannot disagree
+// on it. A database type with no registered parser yields no counts at all,
+// and the callers' raw-total fallback carries the statement count.
 func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.PlanCounts {
 	var counts ui.PlanCounts
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
@@ -919,12 +927,6 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 					continue
 				}
 				stmtType, table = createSet.Type, createSet.Table
-			}
-			switch stmtType {
-			case ddl.StatementCreateTable, ddl.StatementAlterTable, ddl.StatementDropTable:
-			default:
-				counts.AddOther()
-				continue
 			}
 			counts.AddTable(ks.Keyspace, ddl.StatementTypeToOp(stmtType), table)
 		}
