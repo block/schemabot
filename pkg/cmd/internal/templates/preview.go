@@ -143,6 +143,7 @@ const (
 	PreviewCommentMultiEnvLint                 PreviewType = "comment_multi_env_lint"                  // Multi-env plan with lint violations
 	PreviewCommentVitessPlan                   PreviewType = "comment_vitess_plan"                     // Vitess plan with keyspaces + VSchema
 	PreviewCommentVitessPlanVSchemaRemoval     PreviewType = "comment_vitess_plan_vschema_removal"     // Vitess plan with unsafe VSchema removals
+	PreviewCommentStrataPlanVSchemaRefresh     PreviewType = "comment_strata_plan_vschema_refresh"     // Strata plan whose VSchema work only refreshes DDL-derived entries
 	PreviewCommentVitessApplyPlan              PreviewType = "comment_vitess_apply_plan"               // Locked Vitess apply-plan with options
 	PreviewCommentMySQLMultiSchema             PreviewType = "comment_mysql_multi_schema"              // MySQL plan with multiple schema names
 	PreviewCommentHelp                         PreviewType = "comment_help"                            // Help command reference comment

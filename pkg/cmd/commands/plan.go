@@ -231,8 +231,9 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	for _, sc := range result.Changes {
 		if sc.HasVSchemaChange() {
 			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
-				Keyspace: sc.Namespace,
-				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
+				Keyspace:    sc.Namespace,
+				Diff:        sc.Metadata[apitypes.VSchemaDiffMetadataKey],
+				DerivedOnly: sc.VSchemaDerivedOnly(),
 			})
 		}
 	}
@@ -274,9 +275,9 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 
 	// Build VSchema diff map by keyspace for merging into namespace changes
-	vsDiffByKS := make(map[string]string)
+	vsByKS := make(map[string]templates.VSchemaChange)
 	for _, vc := range vschemaChanges {
-		vsDiffByKS[vc.Keyspace] = vc.Diff
+		vsByKS[vc.Keyspace] = vc
 	}
 
 	// Render DDL + VSchema changes grouped by namespace/keyspace
@@ -297,9 +298,10 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 				Namespace: ns,
 				Changes:   namespaceMap[ns],
 			}
-			if diff, ok := vsDiffByKS[ns]; ok {
+			if vc, ok := vsByKS[ns]; ok {
 				nc.VSchemaChanged = true
-				nc.VSchemaDiff = diff
+				nc.VSchemaDiff = vc.Diff
+				nc.VSchemaDerivedOnly = vc.DerivedOnly
 			}
 			nsChanges = append(nsChanges, nc)
 		}

@@ -87,12 +87,12 @@ type shardWorkGroup struct {
 // `-40` failed") reference shards. Finalizer (VSchema) operations are not
 // shard work: each one becomes a VSchema change — its keyspace from the
 // operation key, its display status from the operation state, and its diff
-// from the stored plan's per-namespace diffs (vschemaDiffs, see
-// resolveShardedVSchemaDiffs) — rendered in the comment's VSchema section. A
+// and derived-only flag from the stored plan (vschemaPlans, see
+// resolveShardedVSchemaPlans) — rendered in the comment's VSchema section. A
 // failed finalizer's error also stands in for the apply-level failure cause
 // when the apply row carries none, since a finalizer failure is
 // operation-scoped and leaves no failed shard row to name it.
-func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, vschemaDiffs map[string]string, tenant string) templates.ShardedApplyData {
+func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, vschemaPlans map[string]apitypes.VSchemaChange, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 	// Sort each operation's tasks by id so the joined DDL (and the change
 	// signature derived from it) is deterministic without depending on the
@@ -123,9 +123,10 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 				continue
 			}
 			vschemaChanges = append(vschemaChanges, apitypes.VSchemaChange{
-				Namespace: finalizerNS,
-				Status:    vschemaStatusForOperationState(apply.State, op.State),
-				Diff:      vschemaDiffs[finalizerNS],
+				Namespace:   finalizerNS,
+				Status:      vschemaStatusForOperationState(apply.State, op.State),
+				Diff:        vschemaPlans[finalizerNS].Diff,
+				DerivedOnly: vschemaPlans[finalizerNS].DerivedOnly,
 			})
 			if finalizerError == "" && isFinalizerFailureState(op.State) && op.ErrorMessage != "" {
 				finalizerError = op.ErrorMessage
@@ -198,18 +199,20 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	return data
 }
 
-// resolveShardedVSchemaDiffs loads the stored plan's per-namespace rendered
-// VSchema diffs for a sharded apply's comment: the diff the engine annotated
-// at plan time and plan persistence kept (PlanMetadataVSchemaDiff), so the
-// comment shows the change the operator approved rather than a re-diff
-// against live state. Returns nil without touching storage unless the apply
+// resolveShardedVSchemaPlans loads the stored plan's per-namespace VSchema
+// display data for a sharded apply's comment: the rendered diff the engine
+// annotated at plan time and plan persistence kept (PlanMetadataVSchemaDiff),
+// so the comment shows the change the operator approved rather than a re-diff
+// against live state, and whether the work only refreshes entries derived
+// from the table DDL (PlanMetadataVSchemaDerivedOnly), so the comment says so
+// instead of showing no diff. Returns nil without touching storage unless the apply
 // renders the sharded layout and carries a finalizer operation — only the
 // sharded layout consumes these diffs, and only finalizer rows render VSchema
 // entries, so any other shape would pay a stored-plan read on every comment
 // edit just to discard the result. Best-effort: a plan load failure, a
-// missing plan row, or a stored plan without diffs (recorded before diffs
-// were persisted) contributes nothing rather than blocking the comment.
-func resolveShardedVSchemaDiffs(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+// missing plan row, or a stored plan without this data (recorded before it
+// was persisted) contributes nothing rather than blocking the comment.
+func resolveShardedVSchemaPlans(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[string]apitypes.VSchemaChange {
 	if !isShardedApply(ops) {
 		return nil
 	}
@@ -236,19 +239,22 @@ func resolveShardedVSchemaDiffs(ctx context.Context, stor storage.Storage, apply
 		return nil
 	}
 
-	var diffs map[string]string
+	var plans map[string]apitypes.VSchemaChange
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
 			continue
 		}
-		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
-			if diffs == nil {
-				diffs = make(map[string]string)
-			}
-			diffs[namespace] = d
+		diff := nsData.Metadata[storage.PlanMetadataVSchemaDiff]
+		derivedOnly := diff == "" && nsData.Metadata[storage.PlanMetadataVSchemaDerivedOnly] == "true"
+		if diff == "" && !derivedOnly {
+			continue
 		}
+		if plans == nil {
+			plans = make(map[string]apitypes.VSchemaChange)
+		}
+		plans[namespace] = apitypes.VSchemaChange{Namespace: namespace, Diff: diff, DerivedOnly: derivedOnly}
 	}
-	return diffs
+	return plans
 }
 
 // vschemaStatusForOperationState projects a finalizer operation's state onto

@@ -23,6 +23,16 @@ const (
 	VSchemaChangedMetadataKey = "vschema_changed"
 )
 
+// VSchemaDerivedOnlyMetadataKey is the plan change-metadata key an engine sets
+// to "true" when a namespace's VSchema work changes nothing the operator
+// authored: the engine still rewrites the VSchema, but only to refresh entries
+// it derives from the table DDL (such as registering a new table or
+// refreshing a table's column list). The namespace still carries VSchema
+// work, so apply behavior is unchanged; surfaces use the key to say the
+// VSchema is refreshed from the DDL rather than show an empty VSchema change.
+// Display-only: no safety gate reads it.
+const VSchemaDerivedOnlyMetadataKey = "vschema_derived_only"
+
 // VSchemaDeletionsMetadataKey is the plan change-metadata key under which
 // engines record structural removals in a namespace's VSchema change as a
 // JSON-encoded []VSchemaDeletion. A removal changes Vitess query routing the
@@ -159,6 +169,16 @@ func (sc *SchemaChangeResponse) HasVSchemaChange() bool {
 	return sc.Metadata[VSchemaDiffMetadataKey] != "" || sc.Metadata[VSchemaChangedMetadataKey] == "true"
 }
 
+// VSchemaDerivedOnly reports whether this namespace's VSchema work only
+// refreshes entries the engine derives from the table DDL, with no authored
+// VSchema change (see VSchemaDerivedOnlyMetadataKey). A change that carries a
+// rendered diff is never derived-only: the diff is the authored change.
+func (sc *SchemaChangeResponse) VSchemaDerivedOnly() bool {
+	return sc.HasVSchemaChange() &&
+		sc.Metadata[VSchemaDiffMetadataKey] == "" &&
+		sc.Metadata[VSchemaDerivedOnlyMetadataKey] == "true"
+}
+
 // VSchemaChange is one keyspace's VSchema application state for display. Each
 // keyspace that changes its VSchema carries its own status and diff so a
 // multi-keyspace deploy renders each keyspace independently.
@@ -166,6 +186,10 @@ type VSchemaChange struct {
 	Namespace string `json:"namespace"`
 	Status    string `json:"status"` // "applying", "applied", "failed", "cancelled", "stopped", or "" (pending)
 	Diff      string `json:"diff"`   // VSchema diff (not SQL); empty when unavailable
+	// DerivedOnly marks VSchema work that only refreshes entries derived from
+	// the table DDL (see VSchemaDerivedOnlyMetadataKey), so there is no diff
+	// to show by design rather than because it is unavailable.
+	DerivedOnly bool `json:"derived_only,omitempty"`
 }
 
 // EncodeVSchemaChanges marshals VSchema changes for the progress display

@@ -112,6 +112,10 @@ type NamespaceChange struct {
 	Changes        []DDLChange
 	VSchemaChanged bool
 	VSchemaDiff    string
+	// VSchemaDerivedOnly marks VSchema work that only refreshes entries the
+	// engine derives from the table DDL, with no authored VSchema change: the
+	// namespace prints a note instead of a VSchema diff.
+	VSchemaDerivedOnly bool
 }
 
 // WriteNamespaceChanges writes per-namespace DDL and VSchema sections.
@@ -171,7 +175,7 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 				if !singleNamespace {
 					fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 				}
-				if ns.VSchemaChanged && !isMySQL {
+				if ns.VSchemaChanged && !ns.VSchemaDerivedOnly && !isMySQL {
 					fmt.Println(indentTable + "~ VSchema:")
 					if ns.VSchemaDiff != "" {
 						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, indentContent))
@@ -180,6 +184,10 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 				}
 				if len(ns.Changes) > 0 {
 					WriteSQLChanges(ns.Changes, dialect)
+				}
+				if ns.VSchemaChanged && ns.VSchemaDerivedOnly && !isMySQL {
+					fmt.Printf("%s%sNo vschema.json changes. The apply refreshes this keyspace's VSchema entries from its table DDL.%s\n\n",
+						indentTable, ANSIDim, ANSIReset)
 				}
 			}
 		}
@@ -344,17 +352,29 @@ func WritePlanSummary(changes []DDLChange) {
 type VSchemaChange struct {
 	Keyspace string
 	Diff     string
+	// DerivedOnly marks VSchema work that only refreshes entries derived from
+	// the table DDL; it is not counted as a VSchema change in the summary.
+	DerivedOnly bool
 }
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
 func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
 	parts := ddlSummaryParts(ddlChanges)
-	if len(vschemaChanges) > 0 {
+	authored := 0
+	for _, vc := range vschemaChanges {
+		if !vc.DerivedOnly {
+			authored++
+		}
+	}
+	if authored > 0 {
 		word := "VSchema change"
-		if len(vschemaChanges) > 1 {
+		if authored > 1 {
 			word = "VSchema changes"
 		}
-		parts = append(parts, fmt.Sprintf("%d %s", len(vschemaChanges), word))
+		parts = append(parts, fmt.Sprintf("%d %s", authored, word))
+	}
+	if len(parts) == 0 && len(vschemaChanges) > 0 {
+		parts = append(parts, "VSchema refresh from table DDL")
 	}
 
 	if len(parts) > 0 {

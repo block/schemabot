@@ -36,6 +36,17 @@ func TestVSchemaPlanMetadata(t *testing.T) {
 			PlanMetadataVSchemaDiff:      "--- current\n+++ new\n+ vindex hash",
 		}, got)
 	})
+
+	t.Run("derived-only flag persists for apply-time display", func(t *testing.T) {
+		got := VSchemaPlanMetadata(map[string]string{
+			PlanMetadataVSchemaChanged:     "true",
+			PlanMetadataVSchemaDerivedOnly: "true",
+		})
+		assert.Equal(t, map[string]string{
+			PlanMetadataVSchemaChanged:     "true",
+			PlanMetadataVSchemaDerivedOnly: "true",
+		}, got)
+	})
 }
 
 // TestPlanUnsafeVSchemaChanges verifies the stored-plan unsafe-change view of

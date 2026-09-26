@@ -300,3 +300,49 @@ func TestSummarizeChanges(t *testing.T) {
 		assert.Empty(t, SummarizeChanges(PlanCommentData{IsMySQL: true}))
 	})
 }
+
+// A derived-only VSchema refresh is not an authored VSchema change, so the
+// check summary leaves it out of the vschema clause; a plan whose only work
+// is the refresh still names it instead of reading as a no-op.
+func TestSummarizeChanges_DerivedOnlyVSchema(t *testing.T) {
+	withDDL := PlanCommentData{
+		DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:           "orders",
+			Statements:         []string{"CREATE TABLE a (id INT)"},
+			VSchemaChanged:     true,
+			VSchemaDerivedOnly: true,
+		}},
+	}
+	assert.Equal(t, "1 create", SummarizeChanges(withDDL))
+
+	refreshOnly := PlanCommentData{
+		DatabaseType: "strata",
+		Changes:      []KeyspaceChangeData{{Keyspace: "orders", VSchemaChanged: true, VSchemaDerivedOnly: true}},
+	}
+	assert.Equal(t, "VSchema refresh from table DDL", SummarizeChanges(refreshOnly))
+
+	mixed := PlanCommentData{
+		DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{
+			{Keyspace: "orders", VSchemaChanged: true, VSchemaDerivedOnly: true},
+			{Keyspace: "users", VSchemaChanged: true, VSchemaDiff: "+ x"},
+		},
+	}
+	assert.Equal(t, "1 vschema update", SummarizeChanges(mixed))
+}
+
+// A plan whose only work is a derived-only VSchema refresh still runs the
+// finalizer, so the plan comment must not read as "No schema changes
+// detected": it shows the note and a refresh summary.
+func TestRenderPlanComment_DerivedOnlyVSchemaRefreshIsNotANoOp(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "orders", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{Keyspace: "orders_001", VSchemaChanged: true, VSchemaDerivedOnly: true}},
+	})
+
+	assert.NotContains(t, out, "No schema changes detected")
+	assert.Contains(t, out, "📋 **Plan**: VSchema refresh from table DDL\n")
+	assert.Contains(t, out, "_No `vschema.json` changes. The apply refreshes this keyspace's VSchema entries from its table DDL._")
+	assert.NotContains(t, out, "#### VSchema")
+}

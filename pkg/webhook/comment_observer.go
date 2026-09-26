@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
@@ -682,7 +683,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaPlans(apply, ops), o.tenant)
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
@@ -707,14 +708,14 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 	return releasedForApply(ctx, o.stor, apply, ops, o.logger)
 }
 
-// resolveVSchemaDiffs loads the stored plan's per-namespace VSchema diffs for
+// resolveVSchemaPlans loads the stored plan's per-namespace VSchema display data for
 // a sharded apply's comment rendering. It uses a short, independent deadline
 // so a slow storage read degrades to a comment without diffs rather than
 // blocking the update.
-func (o *CommentObserver) resolveVSchemaDiffs(apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+func (o *CommentObserver) resolveVSchemaPlans(apply *storage.Apply, ops []*storage.ApplyOperation) map[string]apitypes.VSchemaChange {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveShardedVSchemaDiffs(ctx, o.stor, apply, ops)
+	return resolveShardedVSchemaPlans(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -750,11 +751,11 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 	// the body actually posted.
 	var released bool
 	var display map[int64]operationDisplay
-	var vschemaDiffs map[string]string
+	var vschemaPlans map[string]apitypes.VSchemaChange
 	if opsErr == nil {
 		released = o.resolveReleased(apply, ops)
 		display = o.resolveDisplay(apply, ops)
-		vschemaDiffs = o.resolveVSchemaDiffs(apply, ops)
+		vschemaPlans = o.resolveVSchemaPlans(apply, ops)
 	}
 	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
 	renderBody := func(apply *storage.Apply) string {
@@ -762,7 +763,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 		if opsErr != nil {
 			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 		} else {
-			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, vschemaDiffs, o.tenant)
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, vschemaPlans, o.tenant)
 		}
 		return body + renderControlRejections(rejections, o.logger, apply, body)
 	}

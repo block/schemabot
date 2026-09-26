@@ -1522,6 +1522,35 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
 	})
 }
 
+// PreviewCommentStrataPlanVSchemaRefresh renders a sample Strata plan comment
+// where the PR adds one table and alters another without touching
+// vschema.json: the apply still refreshes the keyspace's VSchema entries from
+// the DDL, so the keyspace carries a note instead of a VSchema section and the
+// summary counts only the DDL.
+func PreviewCommentStrataPlanVSchemaRefresh() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "reviews",
+		SchemaName:   "reviews",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "reviews_001",
+				Statements: []string{
+					"CREATE TABLE `review_assignments` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `review_id` bigint unsigned NOT NULL,\n  `assignee` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_review_id` (`review_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+					"ALTER TABLE `review_versions` ADD COLUMN `notified_at` datetime NULL;",
+				},
+				VSchemaChanged:     true,
+				VSchemaDerivedOnly: true,
+			},
+		},
+	})
+}
+
 // PreviewCommentVitessApplyPlan renders a sample locked Vitess apply-plan with options.
 func PreviewCommentVitessApplyPlan() string {
 	return RenderPlanComment(PlanCommentData{

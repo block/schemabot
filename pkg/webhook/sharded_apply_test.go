@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -209,7 +210,7 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 		mk(3, "ks/group_finalizer", state.ApplyOperation.Running),
 	}
 
-	data := buildShardedApplyData(apply, ops, false, nil, map[string]string{"ks": "+ vindex hash"}, "")
+	data := buildShardedApplyData(apply, ops, false, nil, map[string]apitypes.VSchemaChange{"ks": {Namespace: "ks", Diff: "+ vindex hash"}}, "")
 
 	require.Len(t, data.VSchemaChanges, 1)
 	assert.Equal(t, "ks", data.VSchemaChanges[0].Namespace)
@@ -221,6 +222,13 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 	data = buildShardedApplyData(apply, ops, false, nil, nil, "")
 	require.Len(t, data.VSchemaChanges, 1)
 	assert.Empty(t, data.VSchemaChanges[0].Diff, "a stored plan without diffs renders the status-only entry")
+	assert.False(t, data.VSchemaChanges[0].DerivedOnly)
+
+	data = buildShardedApplyData(apply, ops, false, nil, map[string]apitypes.VSchemaChange{"ks": {Namespace: "ks", DerivedOnly: true}}, "")
+	require.Len(t, data.VSchemaChanges, 1)
+	assert.Equal(t, "applying", data.VSchemaChanges[0].Status)
+	assert.Empty(t, data.VSchemaChanges[0].Diff)
+	assert.True(t, data.VSchemaChanges[0].DerivedOnly, "the stored plan's derived-only flag rides on the keyspace's entry")
 }
 
 // A finalizer whose rollout ended without running it must not read as
@@ -272,36 +280,43 @@ func (s *stubPlanStore) GetByID(_ context.Context, _ int64) (*storage.Plan, erro
 	return s.plan, s.err
 }
 
-// The sharded comment's VSchema diffs come from the stored plan: the resolver
-// reads each namespace's persisted diff so the comment shows the change the
-// operator approved at plan time. Degraded storage (a load error or a missing
-// plan row) and older stored plans without diffs must render the comment
-// without diffs rather than blocking it, and an apply with no finalizer
-// operation must not read storage at all.
-func TestResolveShardedVSchemaDiffs(t *testing.T) {
+// The sharded comment's VSchema entries come from the stored plan: the
+// resolver reads each namespace's persisted diff so the comment shows the
+// change the operator approved at plan time, and its derived-only flag so a
+// refresh of DDL-derived entries says so instead of showing no diff. Degraded
+// storage (a load error or a missing plan row) and older stored plans without
+// this metadata must render the comment without it rather than blocking it,
+// and an apply with no finalizer operation must not read storage at all.
+func TestResolveShardedVSchemaPlans(t *testing.T) {
 	shardOp := &storage.ApplyOperation{OperationKey: "ks/-40/mutes"}
 	finalizerOp := &storage.ApplyOperation{OperationKey: "ks/group_finalizer"}
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: 7}
 	ops := []*storage.ApplyOperation{shardOp, finalizerOp}
 
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
-		"ks":    {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDiff: "+ vindex hash"}},
-		"other": {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true"}},
+		"ks":      {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDiff: "+ vindex hash"}},
+		"other":   {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true"}},
+		"derived": {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDerivedOnly: "true"}},
+		// A diff is the authored change, so it outranks a stray derived-only flag.
+		"both": {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDiff: "+ table t", storage.PlanMetadataVSchemaDerivedOnly: "true"}},
 	}}
-	diffs := resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
-	assert.Equal(t, map[string]string{"ks": "+ vindex hash"}, diffs,
-		"only namespaces with a persisted diff contribute")
+	plans := resolveShardedVSchemaPlans(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+	assert.Equal(t, map[string]apitypes.VSchemaChange{
+		"ks":      {Namespace: "ks", Diff: "+ vindex hash"},
+		"derived": {Namespace: "derived", DerivedOnly: true},
+		"both":    {Namespace: "both", Diff: "+ table t"},
+	}, plans, "only namespaces with a persisted diff or derived-only flag contribute")
 
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{err: errors.New("storage down")}, apply, ops),
+	assert.Nil(t, resolveShardedVSchemaPlans(t.Context(), &stubPlanStorage{err: errors.New("storage down")}, apply, ops),
 		"a plan load failure degrades to no diffs")
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{}, apply, ops),
+	assert.Nil(t, resolveShardedVSchemaPlans(t.Context(), &stubPlanStorage{}, apply, ops),
 		"a missing plan row degrades to no diffs")
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{plan: &storage.Plan{}}, apply, ops),
+	assert.Nil(t, resolveShardedVSchemaPlans(t.Context(), &stubPlanStorage{plan: &storage.Plan{}}, apply, ops),
 		"a stored plan without diff metadata degrades to no diffs")
 
 	// No finalizer operation → nothing to attach a diff to; the nil Storage
 	// would panic on any read, proving the resolver does not touch storage.
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), nil, apply, []*storage.ApplyOperation{shardOp}))
+	assert.Nil(t, resolveShardedVSchemaPlans(t.Context(), nil, apply, []*storage.ApplyOperation{shardOp}))
 
 	// A shape that is not the sharded layout — here a two-deployment apply —
 	// discards the diffs downstream, so the resolver must not pay the
@@ -310,7 +325,7 @@ func TestResolveShardedVSchemaDiffs(t *testing.T) {
 		{OperationKey: "ks/-40/mutes", Deployment: "cake"},
 		{OperationKey: "ks/group_finalizer", Deployment: "ski"},
 	}
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), nil, apply, multiDeployment))
+	assert.Nil(t, resolveShardedVSchemaPlans(t.Context(), nil, apply, multiDeployment))
 }
 
 // The stored-plan diff must reach a real PR comment through the production
@@ -328,11 +343,35 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	}}
 
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveVSchemaDiffs(apply, ops), "")
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveVSchemaPlans(apply, ops), "")
 
 	assert.Contains(t, body, "### VSchema")
 	assert.Contains(t, body, "```diff\n+ vindex hash\n```",
 		"the stored plan's diff renders in the observer-built comment body")
+}
+
+// A Strata keyspace that adds a table without touching vschema.json still
+// runs its finalizer, which registers the new table in the VSchema. The
+// stored plan marks that work derived-only, so the observer-built comment
+// shows the finalizer's status with a note that the entries are refreshed
+// from the DDL, rather than a VSchema entry with nothing under it.
+func TestCommentObserverDerivedOnlyVSchemaReachesShardedComment(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running, PlanID: 7}
+	mk := func(id int64, key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{mk(1, "ks/-/review_assignments"), mk(2, "ks/group_finalizer")}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+		"ks": {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDerivedOnly: "true"}},
+	}}
+
+	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveVSchemaPlans(apply, ops), "")
+
+	assert.Contains(t, body, "### VSchema")
+	assert.Contains(t, body, "**`ks`**: ")
+	assert.Contains(t, body, "_No `vschema.json` changes. The apply refreshes this keyspace's VSchema entries from its table DDL._")
+	assert.NotContains(t, body, "```diff", "a derived-only refresh has no authored diff to render")
 }
 
 // A finalizer failure is operation-scoped: it does not write the parent

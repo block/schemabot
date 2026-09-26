@@ -330,6 +330,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		if sc.HasVSchemaChange() {
 			nsData.VSchemaChanged = true
 			nsData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
+			nsData.VSchemaDerivedOnly = sc.VSchemaDerivedOnly()
 		}
 		commentData.Changes = append(commentData.Changes, nsData)
 	}

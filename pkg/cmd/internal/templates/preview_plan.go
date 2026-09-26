@@ -63,6 +63,32 @@ func previewVitessPlanOutput() {
 	WritePlanSummary(allChanges)
 }
 
+// previewStrataPlanVSchemaRefreshOutput renders a Strata plan that adds a
+// table without touching vschema.json: the keyspace prints its DDL and a note
+// that its VSchema entries are refreshed from it, and the summary counts only
+// the DDL.
+func previewStrataPlanVSchemaRefreshOutput() {
+	WritePlanHeader(PlanHeaderData{
+		EngineLabel: "Strata",
+		Database:    "reviews",
+		SchemaName:  "reviews",
+		Environment: "staging",
+		IsMySQL:     false,
+	})
+
+	changes := []DDLChange{
+		{TableName: "review_assignments", ChangeType: "create", DDL: "CREATE TABLE `review_assignments` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `review_id` bigint unsigned NOT NULL,\n  `assignee` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_review_id` (`review_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
+		{TableName: "review_versions", ChangeType: "alter", DDL: "ALTER TABLE `review_versions` ADD COLUMN `notified_at` datetime NULL"},
+	}
+	WriteNamespaceChanges([]NamespaceChange{{
+		Namespace:          "reviews_001",
+		Changes:            changes,
+		VSchemaChanged:     true,
+		VSchemaDerivedOnly: true,
+	}}, false, "reviews", schema.DialectMySQL)
+	WritePlanSummaryWithVSchema(changes, []VSchemaChange{{Keyspace: "reviews_001", DerivedOnly: true}})
+}
+
 // previewPostgresPlanOutput renders a PostgreSQL plan whose standalone index
 // build on an existing table is named as an index to create in the summary.
 func previewPostgresPlanOutput() {

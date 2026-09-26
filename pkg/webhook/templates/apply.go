@@ -686,8 +686,11 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 	budget := vschemaDiffBudget(diffCount)
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(c.Namespace), ui.VSchemaStatusLabel(c.Status))
-		if c.Diff != "" {
+		switch {
+		case c.Diff != "":
 			writeVSchemaDiffFence(sb, c.Diff, budget)
+		case c.DerivedOnly:
+			sb.WriteString(vschemaDerivedOnlyNote + "\n\n")
 		}
 	}
 }

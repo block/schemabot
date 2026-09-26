@@ -161,3 +161,25 @@ func TestEncodeVSchemaMutations_EmptyOmitsKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, meta)
 }
+
+// VSchemaDerivedOnly holds only for VSchema work flagged derived-only with no
+// rendered diff: a diff is the authored change, and the flag alone without
+// VSchema work is not a refresh.
+func TestSchemaChangeResponse_VSchemaDerivedOnly(t *testing.T) {
+	derived := &SchemaChangeResponse{Metadata: map[string]string{
+		VSchemaChangedMetadataKey: "true", VSchemaDerivedOnlyMetadataKey: "true",
+	}}
+	assert.True(t, derived.VSchemaDerivedOnly())
+	assert.True(t, derived.HasVSchemaChange(), "derived-only work is still VSchema work")
+
+	withDiff := &SchemaChangeResponse{Metadata: map[string]string{
+		VSchemaChangedMetadataKey: "true", VSchemaDiffMetadataKey: "+ x", VSchemaDerivedOnlyMetadataKey: "true",
+	}}
+	assert.False(t, withDiff.VSchemaDerivedOnly())
+
+	flagOnly := &SchemaChangeResponse{Metadata: map[string]string{VSchemaDerivedOnlyMetadataKey: "true"}}
+	assert.False(t, flagOnly.VSchemaDerivedOnly())
+
+	authored := &SchemaChangeResponse{Metadata: map[string]string{VSchemaChangedMetadataKey: "true"}}
+	assert.False(t, authored.VSchemaDerivedOnly())
+}

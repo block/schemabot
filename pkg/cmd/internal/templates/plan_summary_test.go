@@ -1,8 +1,10 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/schema"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -164,4 +166,36 @@ func TestWritePlanSummaryWithVSchema_CountsEveryStatement(t *testing.T) {
 		)
 	})
 	assert.Equal(t, "📋 **Plan**: 1 index to drop, 1 VSchema change\n\n", out)
+}
+
+// A derived-only VSchema refresh is not counted as a VSchema change; a plan
+// whose only work is the refresh still names it rather than printing nothing.
+func TestWritePlanSummaryWithVSchema_DerivedOnly(t *testing.T) {
+	out := captureStdout(t, func() {
+		WritePlanSummaryWithVSchema(
+			[]DDLChange{{ChangeType: "create", TableName: "orders"}},
+			[]VSchemaChange{{Keyspace: "orders", DerivedOnly: true}},
+		)
+	})
+	assert.Equal(t, "📋 **Plan**: 1 table to create\n\n", out)
+
+	out = captureStdout(t, func() {
+		WritePlanSummaryWithVSchema(nil, []VSchemaChange{{Keyspace: "orders", DerivedOnly: true}})
+	})
+	assert.Equal(t, "📋 **Plan**: VSchema refresh from table DDL\n\n", out)
+}
+
+// A derived-only keyspace prints its DDL and a note, not a "~ VSchema:" block.
+func TestWriteNamespaceChanges_DerivedOnlyVSchemaPrintsNote(t *testing.T) {
+	out := captureStdout(t, func() {
+		WriteNamespaceChanges([]NamespaceChange{{
+			Namespace:          "orders_001",
+			Changes:            []DDLChange{{ChangeType: "create", TableName: "orders", DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+			VSchemaChanged:     true,
+			VSchemaDerivedOnly: true,
+		}}, false, "orders", schema.DialectMySQL)
+	})
+	assert.NotContains(t, out, "~ VSchema:")
+	assert.Contains(t, out, "No vschema.json changes. The apply refreshes this keyspace's VSchema entries from its table DDL.")
+	assert.Less(t, strings.Index(out, "CREATE TABLE"), strings.Index(out, "No vschema.json changes"), "the note follows the DDL it is derived from")
 }

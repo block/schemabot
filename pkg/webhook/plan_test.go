@@ -1224,3 +1224,66 @@ func TestPlanCommentDatabaseFlag(t *testing.T) {
 	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true, 2), "an auto-plan on a PR touching several databases names the one its comment plans")
 	assert.Empty(t, planCommentDatabaseFlag("", "payments", true, 1), "an auto-plan on a PR touching one database has nothing to disambiguate")
 }
+
+// A Strata keyspace whose vschema.json lists its tables bare, and a PR that
+// adds one table and alters another without touching vschema.json: the engine
+// still marks VSchema work, because the finalizer registers the new table, but
+// flags it derived-only. The plan comment shows the DDL, a note that the
+// VSchema entries are refreshed from it, and a summary that counts only the
+// DDL — no VSchema section and no "vschema update".
+func TestPlanComment_DerivedOnlyVSchemaRendersNoteNotUpdate(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "reviews", Type: "strata"}
+	planResp := &apitypes.PlanResponse{
+		Database: "reviews",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "reviews_001",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "review_assignments", DDL: "CREATE TABLE `review_assignments` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", ChangeType: "create"},
+				{TableName: "review_versions", DDL: "ALTER TABLE `review_versions` ADD COLUMN `notified_at` datetime", ChangeType: "alter"},
+			},
+			Metadata: map[string]string{
+				apitypes.VSchemaChangedMetadataKey:     "true",
+				apitypes.VSchemaDerivedOnlyMetadataKey: "true",
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	require.Len(t, data.Changes, 1)
+	assert.True(t, data.Changes[0].VSchemaChanged, "the keyspace still carries VSchema work for the finalizer")
+	assert.True(t, data.Changes[0].VSchemaDerivedOnly)
+
+	comment := templates.RenderPlanComment(data)
+	assert.Contains(t, comment, "📋 **Plan**: **1** table to create, **1** table to alter\n")
+	assert.Contains(t, comment, "_No `vschema.json` changes. The apply refreshes this keyspace's VSchema entries from its table DDL._")
+	assert.NotContains(t, comment, "#### VSchema")
+	assert.NotContains(t, comment, "diff not available")
+	assert.NotContains(t, comment, "vschema update")
+	assert.Equal(t, "1 create, 1 alter", templates.SummarizeChanges(data))
+}
+
+// A rendered diff is the authored VSchema change, so a stray derived-only
+// flag beside it never hides the diff or drops the update from the count.
+func TestPlanComment_VSchemaDiffOutranksDerivedOnlyFlag(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "reviews", Type: "strata"}
+	planResp := &apitypes.PlanResponse{
+		Database: "reviews",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "reviews_001",
+			Metadata: map[string]string{
+				apitypes.VSchemaChangedMetadataKey:     "true",
+				apitypes.VSchemaDiffMetadataKey:        "+ \"review_assignments\": {}",
+				apitypes.VSchemaDerivedOnlyMetadataKey: "true",
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	require.Len(t, data.Changes, 1)
+	assert.False(t, data.Changes[0].VSchemaDerivedOnly)
+
+	comment := templates.RenderPlanComment(data)
+	assert.Contains(t, comment, "#### VSchema")
+	assert.Contains(t, comment, "**1** vschema update")
+	assert.NotContains(t, comment, "No `vschema.json` changes")
+}

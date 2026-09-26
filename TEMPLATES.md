@@ -947,6 +947,47 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="strata-plan-vschema-refreshed-from-ddl"></a><strong>Strata Plan: VSchema Refreshed From DDL</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `reviews` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `reviews_001`
+```sql
+CREATE TABLE `review_assignments` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `review_id` bigint unsigned NOT NULL,
+    `assignee` varchar(255) NOT NULL,
+    PRIMARY KEY(`id`),
+    INDEX `idx_review_id`(`review_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `review_versions` ADD COLUMN `notified_at` datetime NULL;
+```
+
+_No `vschema.json` changes. The apply refreshes this keyspace's VSchema entries from its table DDL._
+
+📋 **Plan**: **1** table to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="postgres-plan"></a><strong>Postgres Plan</strong></summary>
 
 
@@ -2297,6 +2338,44 @@ Options: ⏸️ Defer Cutover
          COLLATE utf8mb4_0900_ai_ci;
 
 📋 Plan: 1 table to create, 1 table to alter
+
+
+```
+</details>
+
+<details>
+<summary><a name="plan-strata-vschema-refreshed-from-ddl"></a><strong>Plan (Strata, VSchema Refreshed From DDL)</strong></summary>
+
+```
+
+╭─────────────────────────────────────────────╮
+│  Strata Schema Change Plan                  │
+│                                             │
+│  Database: reviews                          │
+│  Environment: staging                       │
+│  Schema name: reviews                       │
+╰─────────────────────────────────────────────╯
+
+
+  ── reviews_001 ──
+
+     + review_assignments
+       CREATE TABLE `review_assignments` (
+           `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+           `review_id` bigint unsigned NOT NULL,
+           `assignee` varchar(255) NOT NULL,
+           PRIMARY KEY(`id`),
+           INDEX `idx_review_id`(`review_id`)
+       ) ENGINE InnoDB,
+         CHARSET utf8mb4,
+         COLLATE utf8mb4_0900_ai_ci;
+
+     ~ review_versions
+       ALTER TABLE `review_versions` ADD COLUMN `notified_at` datetime NULL;
+
+     No vschema.json changes. The apply refreshes this keyspace's VSchema entries from its table DDL.
+
+📋 **Plan**: 1 table to create, 1 table to alter
 
 
 ```

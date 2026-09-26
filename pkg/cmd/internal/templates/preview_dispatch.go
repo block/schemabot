@@ -184,6 +184,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlan())
 	case PreviewCommentVitessPlanVSchemaRemoval:
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval())
+	case PreviewCommentStrataPlanVSchemaRefresh:
+		fmt.Print(webhooktemplates.PreviewCommentStrataPlanVSchemaRefresh())
 	case PreviewCommentVitessApplyPlan:
 		fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan())
 	case PreviewCommentMySQLMultiSchema:

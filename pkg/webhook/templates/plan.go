@@ -285,6 +285,11 @@ type KeyspaceChangeData struct {
 	Statements     []string
 	VSchemaChanged bool
 	VSchemaDiff    string
+	// VSchemaDerivedOnly marks VSchema work that only refreshes entries the
+	// engine derives from the table DDL, with no authored VSchema change. The
+	// keyspace renders a note instead of a VSchema section and is left out of
+	// the VSchema update count.
+	VSchemaDerivedOnly bool
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
@@ -599,6 +604,24 @@ func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithV
 	return
 }
 
+// countAuthoredVSchemaUpdates counts the keyspaces whose VSchema work carries
+// an authored change, leaving out derived-only refreshes. The summary line
+// names only VSchema changes the PR made; countChanges still counts a refresh
+// as work, so a plan whose only work is a refresh never reads as a no-op.
+func countAuthoredVSchemaUpdates(changes []KeyspaceChangeData) int {
+	n := 0
+	for _, ks := range changes {
+		if ks.VSchemaChanged && !ks.VSchemaDerivedOnly {
+			n++
+		}
+	}
+	return n
+}
+
+// vschemaRefreshSummary is the plan summary for a plan whose only work is
+// refreshing VSchema entries derived from the table DDL.
+const vschemaRefreshSummary = "VSchema refresh from table DDL"
+
 // keyspaceStatementCount counts a keyspace's DDL statements for the summary and
 // the no-changes short-circuit.
 func keyspaceStatementCount(ks KeyspaceChangeData) int {
@@ -640,13 +663,16 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	parts := ui.PlanSummaryParts(countStatementTypes(data.Changes, data.DatabaseType), totalStatements, true)
-	if keyspacesWithVSchema > 0 && !data.IsMySQL {
-		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
+	if authored := countAuthoredVSchemaUpdates(data.Changes); authored > 0 && !data.IsMySQL {
+		parts = append(parts, fmt.Sprintf("**%d** vschema %s", authored, pluralize("update", authored)))
 	}
 
-	if len(parts) > 0 {
+	switch {
+	case len(parts) > 0:
 		fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", strings.Join(parts, ", "))
-	} else {
+	case totalStatements == 0 && keyspacesWithVSchema > 0 && !data.IsMySQL:
+		fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", vschemaRefreshSummary)
+	default:
 		// Fallback for unrecognized statement types
 		fmt.Fprintf(sb, "📋 **Plan**: %d DDL %s\n\n", totalStatements, pluralize("statement", totalStatements))
 	}
@@ -881,12 +907,15 @@ func SummarizeChanges(data PlanCommentData) string {
 		})
 	ddlSummary := strings.Join(parts, ", ")
 
-	if keyspacesWithVSchema > 0 && !data.IsMySQL {
-		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))
+	if authored := countAuthoredVSchemaUpdates(data.Changes); authored > 0 && !data.IsMySQL {
+		vschemaSummary := fmt.Sprintf("%d vschema %s", authored, pluralize("update", authored))
 		if ddlSummary == "" {
 			return vschemaSummary
 		}
 		return ddlSummary + " · " + vschemaSummary
+	}
+	if ddlSummary == "" && keyspacesWithVSchema > 0 && !data.IsMySQL {
+		return vschemaRefreshSummary
 	}
 	return ddlSummary
 }
@@ -955,7 +984,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	// stays bounded.
 	diffCount := 0
 	for _, ks := range data.Changes {
-		if ks.VSchemaChanged && !data.IsMySQL && ks.VSchemaDiff != "" {
+		if ks.VSchemaChanged && !ks.VSchemaDerivedOnly && !data.IsMySQL && ks.VSchemaDiff != "" {
 			diffCount++
 		}
 	}
@@ -976,7 +1005,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			fmt.Fprintf(sb, "#### %s: %s\n", label, inlineCode(ks.Keyspace))
 		}
 
-		if hasVSchemaChanges {
+		if hasVSchemaChanges && !ks.VSchemaDerivedOnly {
 			sb.WriteString("#### VSchema\n")
 			if ks.VSchemaDiff != "" {
 				writeVSchemaDiffFence(sb, ks.VSchemaDiff, diffBudget)
@@ -992,8 +1021,17 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 				writePlanDDLBlocks(sb, ks.Statements, dialect, budget)
 			}
 		}
+
+		if hasVSchemaChanges && ks.VSchemaDerivedOnly {
+			sb.WriteString(vschemaDerivedOnlyNote + "\n\n")
+		}
 	}
 }
+
+// vschemaDerivedOnlyNote stands in for a keyspace's VSchema section when its
+// VSchema work only refreshes entries derived from the table DDL: there is no
+// authored VSchema change to show, but the apply still rewrites the VSchema.
+const vschemaDerivedOnlyNote = "_No `vschema.json` changes. The apply refreshes this keyspace's VSchema entries from its table DDL._"
 
 // countPlanDDLBlocks counts the DDL sections writeKeyspaceChanges renders for
 // changes — one per unsharded keyspace with statements and one per group of

@@ -93,6 +93,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentMultiEnv, templates.PreviewCommentMultiEnvDiff,
 		templates.PreviewCommentMultiEnvLint,
 		templates.PreviewCommentVitessPlan, templates.PreviewCommentVitessApplyPlan,
+		templates.PreviewCommentStrataPlanVSchemaRefresh,
 		templates.PreviewCommentMySQLMultiSchema,
 		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel, templates.PreviewCommentOversized,
 		templates.PreviewCommentErrors, templates.PreviewCommentUnsafeBlocked,
