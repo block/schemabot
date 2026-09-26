@@ -157,7 +157,9 @@ func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
 		action: "opened", headSHA: "abc123", headRef: "feature-branch",
 	}, nil))
 
-	awaitCommentContaining(t, result, "Planned separately for all 2 targets")
+	body := awaitCommentContaining(t, result, "Targets diverge — what applies where:")
+	assert.Contains(t, body, "**target `eu`**\n\n_Already applied — no change._")
+	assert.Contains(t, body, "**target `us`**\n\n```sql\n")
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }
 
@@ -195,8 +197,7 @@ func TestE2EConvergedRolloutApplyReportsNoChanges(t *testing.T) {
 	}, api.PlanIndependent)
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "No schema changes detected")
-	assert.Contains(t, body, "Planned separately for all 2 targets")
+	awaitCommentContaining(t, apply, "No schema changes detected")
 
 	requireNoApplies(t, svc, dbName)
 	check := rolloutCheck(t, svc, dbName)

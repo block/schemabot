@@ -1603,9 +1603,9 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-**Planned separately for all 3 targets** — 2 need this change, 1 is already at this schema.
+Targets diverge — what applies where:
 
-📋 **Plan** for `primary/testapp_1`, `primary/testapp_2`: **2** tables to create, **1** table to alter
+**targets `primary/testapp_1`, `primary/testapp_2`**
 
 ```sql
 CREATE TABLE `users` (
@@ -1636,7 +1636,11 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-✅ `primary/testapp_3` is already at this schema.
+**target `primary/testapp_3`**
+
+_Already applied — no change._
+
+📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
@@ -1658,9 +1662,13 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-**Planned separately for all 3 targets** — 2 need this change, 1 is already at this schema.
+Targets diverge — what applies where:
 
-📋 **Plan** for `primary/testapp_2`, `primary/testapp_3`: **2** tables to create, **1** table to alter
+**target `primary/testapp_1`**
+
+_Already applied — no change._
+
+**targets `primary/testapp_2`, `primary/testapp_3`**
 
 ```sql
 CREATE TABLE `users` (
@@ -1691,7 +1699,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-✅ `primary/testapp_1` is already at this schema.
+📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 </details>
@@ -1706,15 +1714,15 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-**Planned separately for all 3 targets** — 2 distinct plans. Each target applies its own.
+Targets diverge — what applies where:
 
-📋 **Plan** for `primary/testapp_1`, `primary/testapp_2`: **1** table to alter
+**targets `primary/testapp_1`, `primary/testapp_2`**
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ```
 
-📋 **Plan** for `primary/testapp_3`: **1** table to alter
+**target `primary/testapp_3`**
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -1723,6 +1731,8 @@ ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
+
+📋 **Plan**: **1** table to alter
 
 
 ---

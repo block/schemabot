@@ -368,7 +368,7 @@ func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) 
 
 	out := RenderMultiEnvPlanComment(data)
 	assert.NotContains(t, out, "**No schema changes detected** for any environment.")
-	assert.Contains(t, out, "📋 **Plan** for `primary/testapp_2`: ")
+	assert.Contains(t, out, "**target `primary/testapp_2`**")
 	assert.Contains(t, out, "ADD COLUMN `email`")
 	// Staging is genuinely converged, so its own section keeps the green line,
 	// and production, which still has work, does not.
@@ -414,11 +414,12 @@ func TestRenderPlanComment_DriftNamesMultiTargetMembers(t *testing.T) {
 	assert.NotContains(t, out, "could not verify")
 }
 
-// The uniform clean line names members the same way the per-member breakdown
-// does, so a reviewer sees one vocabulary for the rollout across both renderings.
-func TestRenderPlanComment_DriftCleanNamesMultiTargetMembers(t *testing.T) {
+// A rollout whose targets all need the same change names every target on the
+// one group heading, the way a uniform sharded keyspace names its shards, and
+// in the same vocabulary the per-member breakdown uses.
+func TestRenderPlanComment_OneTargetPlanNamesEveryTarget(t *testing.T) {
 	data := PlanCommentData{
-		Database: "testapp", Environment: "production", IsMySQL: true,
+		Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "testapp",
 			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
@@ -441,28 +442,26 @@ func TestRenderPlanComment_DriftCleanNamesMultiTargetMembers(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "Planned separately for all 3 targets")
-	assert.Contains(t, out, "`primary/testapp-001`, `primary/testapp-002`, `eu-west`")
-	assert.True(t, strings.Contains(out, "every target needs the same change"))
+	assert.Contains(t, out, "\n**targets `primary/testapp-001`, `primary/testapp-002`, `eu-west`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.NotContains(t, out, "Targets diverge", "one plan is not divergence")
+	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 }
 
-// Targets are free to hold different schemas, so what an operator needs to know
-// is how much they agree this round. The comment says how many distinct plans
-// the apply would run and how many targets are already there, which the contract
-// alone cannot tell them.
-func TestRenderPlanComment_PlanGroupsDescribeThisRound(t *testing.T) {
-	render := func(plans []DeploymentPlanGroup) string {
-		members := make([]DeploymentDriftEntry, 0, 5)
+// Targets whose plans differ render the way shards whose plans differ do: the
+// divergence is introduced once, each group is headed by the targets it covers,
+// and a group already at the desired schema says so in place of DDL.
+func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T) {
+	render := func(plans ...DeploymentPlanGroup) string {
+		var members []DeploymentDriftEntry
 		for _, g := range plans {
 			for range g.Members {
 				members = append(members, DeploymentDriftEntry{Deployment: "primary", Class: "planned"})
 			}
 		}
 		members[0].Primary = true
-		// The primary's group is the reviewed plan, so the comment's own plan is
-		// the first group's.
+		plans[0].Primary = true
 		return RenderPlanComment(PlanCommentData{
-			Database: "testapp", Environment: "production", IsMySQL: true,
+			Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
 			Changes: plans[0].Changes,
 			DeploymentDrift: &DeploymentDriftData{
 				Computed: true, Clean: true, Independent: true,
@@ -475,63 +474,29 @@ func TestRenderPlanComment_PlanGroupsDescribeThisRound(t *testing.T) {
 		return DeploymentPlanGroup{Members: members, Changes: planGroupChanges(statements)}
 	}
 
-	cases := []struct {
-		name   string
-		plans  []DeploymentPlanGroup
-		expect string
-		mark   string
-	}{
-		{
-			name:   "every target needs the same change",
-			plans:  []DeploymentPlanGroup{group(1, "a", "b", "c")},
-			expect: "every target needs the same change.",
-			mark:   "",
-		},
-		{
-			name:   "some targets are already there",
-			plans:  []DeploymentPlanGroup{group(1, "a", "c", "d"), group(0, "b", "e")},
-			expect: "3 need this change, 2 are already at this schema.",
-			mark:   "",
-		},
-		{
-			name:   "a single target still needs it",
-			plans:  []DeploymentPlanGroup{group(1, "a"), group(0, "b")},
-			expect: "1 needs this change, 1 is already at this schema.",
-			mark:   "",
-		},
-		{
-			name:   "targets need different changes",
-			plans:  []DeploymentPlanGroup{group(1, "a", "b", "c"), group(2, "d", "e")},
-			expect: "2 distinct plans. Each target applies its own.",
-			mark:   "",
-		},
-		{
-			name:   "different changes with some already there",
-			plans:  []DeploymentPlanGroup{group(1, "a", "b"), group(2, "c"), group(0, "d", "e")},
-			expect: "2 distinct plans across the 3 targets that change; 2 are already at this schema.",
-			mark:   "",
-		},
-		{
-			name:   "the whole fleet is already there",
-			plans:  []DeploymentPlanGroup{group(0, "a", "b", "c")},
-			expect: "every target is already at this schema.",
-			mark:   "✅ ",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			out := render(tc.plans)
-			assert.Contains(t, out, tc.expect)
-			assert.Contains(t, out, "\n"+tc.mark+"**Planned separately for all",
-				"the checkmark is reserved for a round with nothing left to apply")
-		})
-	}
+	t.Run("some targets are already there", func(t *testing.T) {
+		out := render(group(1, "a", "c"), group(0, "b"))
+		assert.Contains(t, out, "Targets diverge — what applies where:\n\n**targets `a`, `c`**\n\n```sql\n")
+		assert.Contains(t, out, "**target `b`**\n\n_Already applied — no change._")
+		assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
+	})
+	t.Run("targets need different changes", func(t *testing.T) {
+		out := render(group(1, "a"), group(2, "b", "c"))
+		assert.Contains(t, out, "Targets diverge — what applies where:\n\n**target `a`**\n\n```sql\n")
+		assert.Contains(t, out, "**targets `b`, `c`**\n\n```sql\n")
+		assert.NotContains(t, out, "_Already applied")
+		assert.Equal(t, 1, strings.Count(out, "📋 **Plan**: "), "the plans are summarized once, together")
+	})
+	t.Run("a wide group collapses its names", func(t *testing.T) {
+		out := render(group(1, "a", "b", "c", "d", "e", "f", "g", "h", "i"), group(0, "j"))
+		assert.Contains(t, out, "<details>\n<summary><b>9 of 10 targets</b></summary>\n\n`a`, `b`, `c`, `d`, `e`, `f`, `g`, `h`, `i`\n\n</details>")
+		assert.Contains(t, out, "**target `j`**\n\n_Already applied — no change._")
+	})
 }
 
 // A plan that only rewrites the vschema runs no DDL, and is still work. It is
-// described as a change the targets need rather than as a schema they already
-// hold, which would tell an operator the apply does nothing.
+// shown as the targets' plan and counted in the summary rather than as a schema
+// they already hold, which would tell an operator the apply does nothing.
 func TestRenderPlanComment_VSchemaOnlyPlanIsNotAlreadyApplied(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "production",
@@ -554,7 +519,9 @@ func TestRenderPlanComment_VSchemaOnlyPlanIsNotAlreadyApplied(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "1 needs this change, 1 is already at this schema.")
+	assert.Equal(t, 1, strings.Count(out, "_Already applied — no change._"), "only the target with nothing to run is already applied")
+	assert.Contains(t, out, "**target `primary/testapp_2`**\n\n_Already applied — no change._")
+	assert.Contains(t, out, "📋 **Plan**: **1** vschema update")
 }
 
 // A rollup that reaches the comment ungrouped states the contract and nothing
@@ -611,14 +578,15 @@ func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
 // targets are not, must not read as a no-op. The reviewed plan is empty, but a
 // reviewer who reads "no schema changes detected" merges believing the fleet
 // holds this schema, so the comment shows the plan the other targets still run
-// and names the reviewed target as the one already there.
+// and the reviewed target as already applied. It offers no apply command: a PR
+// apply runs from the reviewed plan, and an empty one does not run the others.
 func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 	alter := []KeyspaceChangeData{{
 		Keyspace:   "testapp",
 		Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
 	}}
 	data := PlanCommentData{
-		Database: "testapp", Environment: "production", IsMySQL: true,
+		Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
 		DeploymentDrift: &DeploymentDriftData{
 			Computed: true, Clean: true, Independent: true,
 			Deployments: []DeploymentDriftEntry{
@@ -635,14 +603,15 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.NotContains(t, out, "✅ **No schema changes detected**")
-	assert.Contains(t, out, "📋 **Plan** for `primary/testapp_2`, `primary/testapp_3`: ")
-	assert.Contains(t, out, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	assert.Contains(t, out, "✅ `primary/testapp_1` is already at this schema.")
+	assert.Contains(t, out, "**target `primary/testapp_1`**\n\n_Already applied — no change._")
+	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
+	assert.NotContains(t, out, "schemabot apply", "an empty reviewed plan cannot apply the other targets' plans")
 }
 
 // A rollout where every target is already at the desired schema is a no-op, and
-// still says so: the headline above is reserved for the targets that would run
-// work, not for every empty plan that has a rollup beside it.
+// says so once: the comment's no-changes line speaks for every target, so no
+// rollout line repeats it.
 func TestRenderPlanComment_FullyConvergedRolloutIsStillANoOp(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "production", IsMySQL: true,
@@ -660,16 +629,14 @@ func TestRenderPlanComment_FullyConvergedRolloutIsStillANoOp(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "✅ **No schema changes detected**")
-	assert.Contains(t, out, "every target is already at this schema.")
+	assert.Equal(t, 1, strings.Count(out, "✅"), "the no-op is said once")
 }
 
-// planGroupChanges builds a group plan running the given number of statements.
-// A group running none is already at the desired schema.
-// A clean rollout's line carries the checkmark only when nothing is left to
-// apply, the meaning it has on the rest of the comment. A shared plan with work,
-// a converging rollout whose reviewed target is already done, and independent
-// targets whose own plans were not grouped all lead with the plan mark instead.
-func TestRenderPlanComment_CleanRolloutMarksOnlyNothingToApplyAsDone(t *testing.T) {
+// A clean rollout's line is a statement about the rollout, not a verdict, so it
+// carries no mark. When nothing is left to apply on any member, the comment's
+// no-changes line already says so for all of them, and the rollout line is left
+// out rather than repeating it.
+func TestRenderPlanComment_NothingToApplyIsSaidOnce(t *testing.T) {
 	email := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}}}
 	mirrored := []DeploymentDriftEntry{
 		{Deployment: "eu", Primary: true, Class: "match"},
@@ -679,50 +646,27 @@ func TestRenderPlanComment_CleanRolloutMarksOnlyNothingToApplyAsDone(t *testing.
 		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
 		{Deployment: "primary", Target: "testapp_2", Class: "planned"},
 	}
-	cases := []struct {
-		name     string
-		reviewed []KeyspaceChangeData
-		drift    DeploymentDriftData
-		want     string
-	}{
-		{
-			name:     "mirrored deployments share a plan with work",
-			reviewed: email,
-			drift:    DeploymentDriftData{Computed: true, Clean: true, Deployments: mirrored},
-			want:     "\n**Same plan on all 2 deployments**",
-		},
-		{
-			name:  "mirrored deployments are all at the schema",
-			drift: DeploymentDriftData{Computed: true, Clean: true, Deployments: mirrored},
-			want:  "✅ **Same plan on all 2 deployments**",
-		},
-		{
-			name: "the reviewed target is done and another is not",
-			drift: DeploymentDriftData{
-				Computed: true, Clean: true, Independent: true, Deployments: independent,
-				Plans: []DeploymentPlanGroup{
-					{Members: []string{"primary/testapp_1"}, Primary: true},
-					{Members: []string{"primary/testapp_2"}, Changes: email},
-				},
-			},
-			want: "\n**Planned separately for all 2 targets**",
-		},
-		{
-			name:  "independent targets whose plans were not grouped",
-			drift: DeploymentDriftData{Computed: true, Clean: true, Independent: true, Deployments: independent},
-			want:  "\n**Planned separately for all 2 targets**",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			out := RenderPlanComment(PlanCommentData{
-				Database: "testapp", Environment: "production", IsMySQL: true,
-				Changes:         tc.reviewed,
-				DeploymentDrift: &tc.drift,
-			})
-			assert.Contains(t, out, tc.want)
+	render := func(reviewed []KeyspaceChangeData, drift DeploymentDriftData) string {
+		return RenderPlanComment(PlanCommentData{
+			Database: "testapp", Environment: "production", IsMySQL: true,
+			Changes:         reviewed,
+			DeploymentDrift: &drift,
 		})
 	}
+
+	t.Run("mirrored deployments share a plan with work", func(t *testing.T) {
+		out := render(email, DeploymentDriftData{Computed: true, Clean: true, Deployments: mirrored})
+		assert.Contains(t, out, "\n**Same plan on all 2 deployments** (`eu`, `au`).")
+	})
+	t.Run("mirrored deployments are all at the schema", func(t *testing.T) {
+		out := render(nil, DeploymentDriftData{Computed: true, Clean: true, Deployments: mirrored})
+		assert.Contains(t, out, "✅ **No schema changes detected**")
+		assert.Equal(t, 1, strings.Count(out, "✅"), "the no-op is said once")
+	})
+	t.Run("independent targets whose plans were not grouped", func(t *testing.T) {
+		out := render(email, DeploymentDriftData{Computed: true, Clean: true, Independent: true, Deployments: independent})
+		assert.Contains(t, out, "\n**Planned separately for all 2 targets**")
+	})
 }
 
 const (
@@ -753,11 +697,9 @@ func targetPlanRollout(reviewed []KeyspaceChangeData) *DeploymentDriftData {
 }
 
 // Independent targets each apply their own plan, so the comment shows every
-// plan the apply would run, each under the targets that run it, the way a
-// single-target comment shows its one plan. The reviewed target's group shows
-// the reviewed plan itself, targets with nothing to apply are named on one
-// checkmarked line, and no unattributed plan summary follows, since each plan
-// carries its own.
+// plan the apply would run, each under the targets that run it. The reviewed
+// target's group shows the reviewed plan itself, and the plans are summarized
+// once below them, counting each table once however many targets change it.
 func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 	standIn := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `stand_in` ADD COLUMN `x` int"}}}
 	out := RenderPlanComment(PlanCommentData{
@@ -766,39 +708,27 @@ func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 		DeploymentDrift: targetPlanRollout(standIn),
 	})
 
-	reviewedHeader := strings.Index(out, "📋 **Plan** for `primary/testapp_1`, `primary/testapp_2`: ")
-	reviewedDDL := strings.Index(out, "ADD COLUMN `email`")
-	otherHeader := strings.Index(out, "📋 **Plan** for `primary/testapp_4`: ")
-	otherDDL := strings.Index(out, "ADD INDEX `idx_email`")
-	converged := strings.Index(out, "✅ `primary/testapp_3` is already at this schema.")
-	for name, at := range map[string]int{"reviewed header": reviewedHeader, "reviewed DDL": reviewedDDL, "other header": otherHeader, "other DDL": otherDDL, "converged line": converged} {
-		assert.GreaterOrEqual(t, at, 0, "%s missing from:\n%s", name, out)
+	positions := map[string]int{}
+	for _, want := range []string{
+		"Targets diverge — what applies where:",
+		"**targets `primary/testapp_1`, `primary/testapp_2`**",
+		"ADD COLUMN `email`",
+		"**target `primary/testapp_4`**",
+		"ADD INDEX `idx_email`",
+		"**target `primary/testapp_3`**\n\n_Already applied — no change._",
+		"📋 **Plan**: **1** table to alter",
+	} {
+		positions[want] = strings.Index(out, want)
+		require.GreaterOrEqual(t, positions[want], 0, "%q missing from:\n%s", want, out)
 	}
-	assert.Less(t, reviewedHeader, reviewedDDL)
-	assert.Less(t, reviewedDDL, otherHeader, "each plan's DDL sits under its own targets")
-	assert.Less(t, otherHeader, otherDDL)
-	assert.Less(t, otherDDL, converged)
+	assert.Less(t, positions["**targets `primary/testapp_1`, `primary/testapp_2`**"], positions["ADD COLUMN `email`"])
+	assert.Less(t, positions["ADD COLUMN `email`"], positions["**target `primary/testapp_4`**"], "each plan's DDL sits under its own targets")
+	assert.Less(t, positions["**target `primary/testapp_4`**"], positions["ADD INDEX `idx_email`"])
+	assert.Less(t, positions["ADD INDEX `idx_email`"], positions["📋 **Plan**: **1** table to alter"])
 
 	assert.NotContains(t, out, "stand_in", "the reviewed target's group renders the reviewed plan")
 	assert.Equal(t, 2, strings.Count(out, "ADD COLUMN `email`"), "the reviewed plan renders once, under its targets, and not again below them")
-	assert.NotContains(t, out, "📋 **Plan**: ", "each plan carries its own summary")
-	assert.Contains(t, out, "**Planned separately for all 4 targets** — 2 distinct plans across the 3 targets that change; 1 is already at this schema.")
-}
-
-// A reviewed target already at the schema has no plan of its own to show, but
-// the targets still missing the change do, so their plans render and the
-// reviewed target is listed with the rest of the targets already there.
-func TestRenderPlanComment_ConvergedReviewedTargetShowsTheOtherTargetsPlans(t *testing.T) {
-	drift := targetPlanRollout(nil)
-	out := RenderPlanComment(PlanCommentData{
-		Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
-		DeploymentDrift: drift,
-	})
-
-	assert.Contains(t, out, "📋 **Plan** for `primary/testapp_4`: ")
-	assert.Contains(t, out, "ADD INDEX `idx_email`")
-	assert.Contains(t, out, "✅ `primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3` are already at this schema.")
-	assert.NotContains(t, out, "✅ **No schema changes detected**")
+	assert.Equal(t, 1, strings.Count(out, "📋 **Plan**: "), "the plans are summarized once, together")
 }
 
 // Each environment's section renders its rollout's plans the same way, folding
@@ -817,13 +747,14 @@ func TestRenderMultiEnvPlanComment_EachTargetPlanRendersUnderItsTargets(t *testi
 
 	_, production, found := strings.Cut(out, "Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "📋 **Plan** for `primary/testapp_1`, `primary/testapp_2`: ")
-	otherHeader := strings.Index(production, "📋 **Plan** for `primary/testapp_4`: ")
+	assert.Contains(t, production, "Targets diverge — what applies where:\n\n**targets `primary/testapp_1`, `primary/testapp_2`**")
+	otherHeader := strings.Index(production, "**target `primary/testapp_4`**")
 	details := strings.Index(production, "<details>\n<summary>Show SQL (2 statements)</summary>")
 	assert.GreaterOrEqual(t, otherHeader, 0)
 	assert.Greater(t, details, otherHeader, "the two-statement plan folds under its own targets")
 	assert.Less(t, details, strings.Index(production, "ADD INDEX `idx_email`"))
-	assert.Contains(t, production, "✅ `primary/testapp_3` is already at this schema.")
+	assert.Contains(t, production, "**target `primary/testapp_3`**\n\n_Already applied — no change._")
+	assert.Equal(t, 1, strings.Count(production, "📋 **Plan**: "), "the plans are summarized once, together")
 }
 
 // The comment's DDL budget is shared across every block it renders, so a
@@ -837,6 +768,8 @@ func TestCountCommentDDLBlocks_CountsEveryTargetPlan(t *testing.T) {
 	assert.Equal(t, 1, countCommentDDLBlocks(data))
 }
 
+// planGroupChanges builds a group plan running the given number of statements.
+// A group running none is already at the desired schema.
 func planGroupChanges(statements int) []KeyspaceChangeData {
 	if statements == 0 {
 		return nil
