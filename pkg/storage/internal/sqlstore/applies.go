@@ -168,6 +168,19 @@ func canonicalizeApplyIdentity(apply *storage.Apply) {
 	apply.Environment = storage.CanonicalKey(apply.Environment)
 }
 
+// canonicalizeApplyState stores the state in its canonical form. The state
+// guards compare the stored column against the canonical constants, and
+// PostgreSQL compares strings case-sensitively, so a non-canonical value such
+// as COMPLETED would read as unsettled there and take a settled write
+// unguarded. An empty state is left as it is rather than normalized to the
+// no-active-change sentinel, which is not an apply state.
+func canonicalizeApplyState(apply *storage.Apply) {
+	if apply.State == "" {
+		return
+	}
+	apply.State = state.NormalizeState(apply.State)
+}
+
 func placeholders(count int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
@@ -607,6 +620,7 @@ func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.App
 // Create stores a new apply and returns its ID.
 func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, error) {
 	canonicalizeApplyIdentity(apply)
+	canonicalizeApplyState(apply)
 
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
@@ -785,6 +799,7 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 
 func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, newDeployments []string, writeRows applyCreateWriter) (int64, error) {
 	canonicalizeApplyIdentity(apply)
+	canonicalizeApplyState(apply)
 
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
@@ -1086,6 +1101,7 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 // Update updates apply state and fields.
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	canonicalizeApplyIdentity(apply)
+	canonicalizeApplyState(apply)
 
 	// A drive that holds only an operation lease must never write the parent
 	// applies row directly: under fan-out the parent state is owned solely by

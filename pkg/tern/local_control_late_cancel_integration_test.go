@@ -3,6 +3,9 @@
 package tern
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,6 +131,203 @@ func TestLocalClient_CancelAfterTasksFinishedRecordsTheirOutcome(t *testing.T) {
 	driverCopy.State = state.Apply.Completed
 	driverCopy.CompletedAt = &finishedAt
 	require.NoError(t, stor.Applies().Update(ctx, &driverCopy), "the driver's completed write agrees with the recorded outcome")
+}
+
+// A driver records its only task failed and exits before it writes the apply
+// row, and an operator's cancel arrives. The cancel stopped no work, so the
+// apply records the failure its task reached, carrying the task's error so the
+// operator can triage from the apply record, rather than a cancelled outcome
+// that would hide the failure.
+func TestLocalClient_CancelAfterTaskFailedRecordsTheFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, _ := newTasklessControlClient(t, dsn, stor)
+
+	apply, task := dispatchApplyWithCompletedTask(t, stor, client, "failed_cancel_note")
+	task.State = state.Task.Failed
+	task.ErrorMessage = "Duplicate column name 'failed_cancel_note'"
+	require.NoError(t, stor.Tasks().Update(ctx, task))
+	apply.State = state.Apply.Running
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+
+	resp, err := client.cancelOwnedApply(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	}, "operator")
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(0), resp.CancelledCount)
+	assert.Equal(t, int64(1), resp.SkippedCount)
+	assert.Equal(t, "Schema change already failed", resp.ErrorMessage)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Failed, settled.State, "the apply records the failure its task reached")
+	assert.Equal(t, "table users failed: Duplicate column name 'failed_cancel_note'", settled.ErrorMessage,
+		"the apply carries its failed task's error")
+	assert.NotNil(t, settled.CompletedAt)
+}
+
+// An operator cancels an apply whose tasks on this database have all finished,
+// while the same apply still has a task running on another database that this
+// client cannot see. Settling the apply from the finished tasks alone would
+// record an outcome over live work, so the cancel fails closed: the apply stays
+// running and the running task is left alone.
+func TestLocalClient_CancelFailsClosedWhenTheApplyStillHasUnfinishedTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newTasklessControlClient(t, dsn, stor)
+
+	apply, task := dispatchApplyWithCompletedTask(t, stor, client, "unfinished_cancel_note")
+	elsewhere := *task
+	elsewhere.ID = 0
+	elsewhere.TaskIdentifier = task.TaskIdentifier + "-elsewhere"
+	elsewhere.Database = "otherdb"
+	elsewhere.State = state.Task.Running
+	elsewhere.CompletedAt = nil
+	_, err := stor.Tasks().Create(ctx, &elsewhere)
+	require.NoError(t, err)
+	apply.State = state.Apply.Running
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+
+	resp, err := client.cancelOwnedApply(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	}, "operator")
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "cancel cannot settle apply "+apply.ApplyIdentifier)
+	assert.Contains(t, err.Error(), "its tasks derive running")
+
+	current, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	assert.Equal(t, state.Apply.Running, current.State, "the apply must not settle over a task still running elsewhere")
+	assert.Nil(t, current.CompletedAt)
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	for _, got := range tasks {
+		if got.Database == "otherdb" {
+			assert.Equal(t, state.Task.Running, got.State, "the cancel must not touch a task it cannot see")
+		}
+	}
+	assert.NotContains(t, eng.recorded(), "Cancel", "the finished task has no engine work to cancel")
+}
+
+// settleBeforeDeriveTaskStore settles the apply through the underlying store the
+// first time the apply's tasks are loaded after it is armed, standing in for
+// another writer that records the outcome between the cancel's read of the
+// apply and its write.
+type settleBeforeDeriveTaskStore struct {
+	storage.TaskStore
+	mu     sync.Mutex
+	settle func(ctx context.Context, applyID int64) error
+}
+
+func (s *settleBeforeDeriveTaskStore) arm(settle func(ctx context.Context, applyID int64) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settle = settle
+}
+
+func (s *settleBeforeDeriveTaskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage.Task, error) {
+	s.mu.Lock()
+	settle := s.settle
+	s.settle = nil
+	s.mu.Unlock()
+	if settle != nil {
+		if err := settle(ctx, applyID); err != nil {
+			return nil, fmt.Errorf("settle apply %d before its tasks are read: %w", applyID, err)
+		}
+	}
+	return s.TaskStore.GetByApplyID(ctx, applyID)
+}
+
+type settleBeforeDeriveStorage struct {
+	storage.Storage
+	tasks *settleBeforeDeriveTaskStore
+}
+
+func (s *settleBeforeDeriveStorage) Tasks() storage.TaskStore { return s.tasks }
+
+// An operator's cancel finds the apply's only task completed and derives a
+// completed outcome, but another writer settles the apply as failed between the
+// cancel's read of the apply and its write. The storage guard refuses the
+// cancel's different outcome, and the cancel is accepted and reports the
+// failure that was recorded, so its durable request completes instead of
+// retrying against an outcome that can no longer change.
+func TestLocalClient_CancelThatLosesTheSettleRaceReportsTheRecordedOutcome(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	inner := createStorage(t, dsn)
+	defer utils.CloseAndLog(inner)
+	stor := &settleBeforeDeriveStorage{Storage: inner, tasks: &settleBeforeDeriveTaskStore{TaskStore: inner.Tasks()}}
+	client, _ := newTasklessControlClient(t, dsn, stor)
+
+	apply, _ := dispatchApplyWithCompletedTask(t, stor, client, "race_cancel_note")
+	apply.State = state.Apply.Running
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+
+	stor.tasks.arm(func(ctx context.Context, applyID int64) error {
+		other, err := inner.Applies().Get(ctx, applyID)
+		if err != nil {
+			return fmt.Errorf("load apply %d: %w", applyID, err)
+		}
+		if other == nil {
+			return fmt.Errorf("load apply %d: %w", applyID, storage.ErrApplyNotFound)
+		}
+		settledAt := time.Now()
+		other.State = state.Apply.Failed
+		other.ErrorMessage = "rollout failed on another target"
+		other.CompletedAt = &settledAt
+		return inner.Applies().Update(ctx, other)
+	})
+
+	resp, err := client.cancelOwnedApply(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	}, "operator")
+	require.NoError(t, err, "a cancel that loses the race to settle the apply resolves instead of retrying")
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(0), resp.CancelledCount)
+	assert.Equal(t, int64(1), resp.SkippedCount)
+	assert.Equal(t, "Schema change already failed", resp.ErrorMessage, "the cancel reports the outcome that was recorded")
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Failed, settled.State, "the first recorded outcome stands")
+	assert.Equal(t, "rollout failed on another target", settled.ErrorMessage)
 }
 
 // An operator cancels a task-less apply that already completed. The cancel is

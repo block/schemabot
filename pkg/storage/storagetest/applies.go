@@ -368,6 +368,42 @@ func TestApplies(t *testing.T, h Harness) {
 		}
 	})
 
+	// A caller that writes a state in non-canonical form still gets it stored
+	// canonically, so the finished-apply guard, which compares the stored
+	// column against the canonical states, holds on every dialect. A completed
+	// apply written as COMPLETED must still refuse a later cancelled write.
+	t.Run("Update_StoresCanonicalStateSoTheGuardHolds", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_canonical_state_db", storage.DatabaseTypeMySQL)
+
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_canonical_state", 9002, "RUNNING", "staging")
+		created, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		assert.Equal(t, state.Apply.Running, created.State, "create stores the canonical state")
+		staleCopy := *created
+
+		finishedAt := time.Now()
+		created.State = "COMPLETED"
+		created.CompletedAt = &finishedAt
+		require.NoError(t, store.Applies().Update(ctx, created))
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Completed, persisted.State, "update stores the canonical state")
+
+		staleCopy.State = state.Apply.Cancelled
+		staleCopy.ErrorMessage = "late cancel"
+		require.ErrorIs(t, store.Applies().Update(ctx, &staleCopy), storage.ErrApplyOutcomeSettled)
+
+		persisted, err = store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Completed, persisted.State, "the completed outcome stands")
+	})
+
 	// A stopped apply goes active again only through the start claim. A caller
 	// that writes running over it without one is refused and the apply stays
 	// stopped. Once an operator's start request is claimed, the claim moves the
