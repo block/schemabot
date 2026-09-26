@@ -1,0 +1,20 @@
+CREATE TABLE `pending_drops` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `target` varchar(255) NOT NULL,
+  `environment` varchar(50) NOT NULL,
+  `database_name` varchar(255) NOT NULL DEFAULT '',
+  `original_table` varchar(64) NOT NULL DEFAULT '',
+  `quarantined_name` varchar(64) NOT NULL,
+  `quarantined_at` datetime(6) NOT NULL,
+  `run_id` varchar(255) NOT NULL DEFAULT '',
+  `engine` varchar(50) NOT NULL,
+  `state` varchar(20) NOT NULL,
+  `arrival_target` varchar(255) NOT NULL DEFAULT '',
+  `metadata` json NOT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_pending_drops_quarantined_name` (`target`,`environment`,`quarantined_name`),
+  KEY `idx_pending_drops_expiry` (`state`,`quarantined_at`),
+  KEY `idx_pending_drops_origin` (`target`,`environment`,`database_name`,`original_table`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
