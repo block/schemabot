@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/state"
@@ -197,7 +196,7 @@ func (s *Service) StopOperator() {
 	if cancel != nil {
 		cancel()
 	}
-	drivesReturned := drain.Wait(&s.recoveryWg, driverDrainTimeout)
+	drivesReturned := s.shutdownWait(&s.recoveryWg, driverDrainTimeout)
 	if !drivesReturned {
 		s.logAbandonedDrives()
 	}
@@ -505,7 +504,14 @@ func (o engineHaltOutcome) haltedCleanly(deployment string) bool {
 func (s *Service) haltEnginesForShutdown() engineHaltOutcome {
 	// The drive contexts are already cancelled by this point, so the halt runs
 	// on a fresh bounded context rather than one that is guaranteed expired.
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+	//
+	// A budget with nothing left leaves this with the moment it takes to find
+	// an engine that is already down, and every engine that is not fails its
+	// halt. That is the safe direction: a failed halt is what stops the claim
+	// below it from being handed to a peer, so the work goes stale and is
+	// reclaimed on staleness rather than offered to a peer while this process
+	// still holds the target.
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownAllot(shutdownHaltTimeout))
 	defer cancel()
 
 	s.ternMu.Lock()

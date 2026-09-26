@@ -99,9 +99,19 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 // late, against the cost of a process that cannot exit.
 const durableWebhookDrainTimeout = 10 * time.Second
 
+// SetShutdownBudget gives this pool's drain the same deadline the rest of the
+// process's shutdown is spending, so the drain costs whatever is left of it
+// rather than its own bound on top of every stage before it. Call it before
+// StopDurableWebhookDispatch; a handler that is never given one drains on its
+// own bound in full.
+func (h *Handler) SetShutdownBudget(budget *drain.Budget) {
+	h.shutdownBudget.Store(budget)
+}
+
 // StopDurableWebhookDispatch stops the durable webhook driver pool and waits up
-// to durableWebhookDrainTimeout for in-flight claimed deliveries to finish
-// their current drive.
+// to durableWebhookDrainTimeout — or whatever is left of the shutdown budget,
+// when that is less — for in-flight claimed deliveries to finish their current
+// drive.
 func (h *Handler) StopDurableWebhookDispatch() {
 	h.durableWebhookMu.Lock()
 	if h.durableWebhookStop == nil {
@@ -120,10 +130,12 @@ func (h *Handler) StopDurableWebhookDispatch() {
 	if cancel != nil {
 		cancel()
 	}
-	if !drain.Wait(&h.durableWebhookWg, durableWebhookDrainTimeout) {
+	budget := h.shutdownBudget.Load()
+	if !budget.Wait(&h.durableWebhookWg, durableWebhookDrainTimeout) {
 		abandoned := h.durableWebhookClaimsSnapshot()
 		h.logger.Error("durable webhook deliveries did not return within the shutdown drain; their inbox rows stay claimed until the claim goes stale and the next process to run the pool redelivers them",
 			"drain_timeout", durableWebhookDrainTimeout,
+			"budget_spent", budget.Spent(),
 			"abandoned_deliveries", len(abandoned))
 		for _, attrs := range abandoned {
 			h.logger.Error("abandoned a claimed webhook delivery whose driver did not return", attrs...)

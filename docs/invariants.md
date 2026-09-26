@@ -456,8 +456,9 @@ something other than that cancellation.
 Stopping is bounded from the moment the instance is told to, and startup is inside that: the
 signal that ends a running instance also ends one that is still bringing storage up, rather than
 waiting out a boot budget measured in minutes for a database the instance will never use. On the
-way down, every wait on background work carries a bound of its own, so shutdown ends when those
-bounds are spent rather than when the slowest goroutine decides to return. An instance that cannot
+way down, every wait on background work carries a bound of its own, and every one of those bounds
+is measured against a single deadline set when stopping begins, so stopping costs that deadline
+however many of the waits expire rather than the sum of their bounds. An instance that cannot
 finish starting exits non-zero rather than lingering, so the platform restarts it instead of
 routing to it.
 
@@ -471,9 +472,11 @@ rerun by the next instance to start, and storage that was not converged is conve
 instance boots next. Waiting past the bound buys none of that back; it only delays the exit the
 recovery is waiting on.
 
-*Breaks if violated:* a single goroutine that never returns holds the instance open indefinitely, so
-a routine restart becomes an interrupted schema change with no bound on how long the target stays
-locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`,
+*Breaks if violated:* an instance takes longer to stop than the grace period it is given and is
+killed part-way through stopping, skipping the stages that hand its work back, so a routine restart
+becomes an interrupted schema change with no bound on how long the target stays
+locked. *Enforced:* the shared deadline and the bounded waits measured against it on the close path
+(`pkg/drain`, used by `pkg/api/operator.go`,
 `pkg/api/shutdown.go`, `pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
 in-flight storage convergence as the deliberate stop AV-13 permits.

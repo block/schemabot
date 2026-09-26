@@ -29,10 +29,36 @@ func Wait(wg *sync.WaitGroup, timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
+	return waitUntil(done, timer.C)
+}
+
+// WaitFor waits for done to close, reporting whether it closed within timeout.
+//
+// It is Wait for work that signals its own completion on a channel rather than
+// through a group, and it makes the same trade: a caller past the timeout
+// carries on without the work, and says what it left.
+func WaitFor(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	return waitUntil(done, timer.C)
+}
+
+// waitUntil reports whether done closed before deadline elapsed.
+//
+// The two can be ready together, and Go picks between two ready cases at
+// random. A group that finished is finished whichever one it picked, so the
+// deadline branch asks again before reporting work abandoned that is not.
+func waitUntil(done <-chan struct{}, deadline <-chan time.Time) bool {
 	select {
 	case <-done:
 		return true
-	case <-timer.C:
-		return false
+	case <-deadline:
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
 	}
 }

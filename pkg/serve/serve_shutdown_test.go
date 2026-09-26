@@ -14,7 +14,83 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/drain"
 )
+
+// A server that is never told what budget to keep keeps the default, and one
+// that asks for none runs unbudgeted. The two are different answers to
+// different questions, and both leave options.shutdownBudget at zero, which is
+// why the option records that it was set at all.
+func TestShutdownBudgetFor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		opts []Option
+		want time.Duration
+	}{
+		{name: "unset", want: shutdownBudgetTotal},
+		{name: "set", opts: []Option{WithShutdownBudget(90 * time.Second)}, want: 90 * time.Second},
+		{name: "set to zero runs unbudgeted", opts: []Option{WithShutdownBudget(0)}, want: 0},
+		{name: "negative runs unbudgeted", opts: []Option{WithShutdownBudget(-time.Second)}, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var o options
+			for _, opt := range tt.opts {
+				opt(&o)
+			}
+
+			assert.Equal(t, tt.want, shutdownBudgetFor(o))
+		})
+	}
+}
+
+// Shutdown begins wherever it is first noticed, and only once. Run reaches it
+// at the top of its own shutdown and Close reaches it for an embedder that
+// never ran the server, so both call it — and the second call must measure
+// itself against the first call's deadline rather than starting a fresh one,
+// which would restore the summing the budget exists to stop.
+func TestBeginShutdownArmsOneBudgetForEveryStage(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handlerBudgets := make(chan *drain.Budget, 4)
+	srv := &Server{
+		logger:              logger,
+		svc:                 api.New(nil, &api.ServerConfig{}, nil, logger),
+		webhook:             webhookRuntime{setShutdownBudget: func(b *drain.Budget) { handlerBudgets <- b }},
+		shutdownBudgetTotal: time.Minute,
+	}
+
+	first := srv.beginShutdown()
+	require.NotNil(t, first)
+	time.Sleep(50 * time.Millisecond)
+	assert.Same(t, first, srv.beginShutdown(), "the second stage shares the first stage's deadline")
+
+	assert.Less(t, srv.shutdownAllot(time.Minute), time.Minute,
+		"a stage asking for the whole budget gets only what the elapsed time left")
+
+	require.Len(t, handlerBudgets, 1, "the webhook pool is told once")
+	assert.Same(t, first, <-handlerBudgets)
+}
+
+// An unbudgeted server hands every stage its own bound in full, and says so,
+// because an operator reading a shutdown that overran needs to know whether
+// there was a budget at all.
+func TestBeginShutdownLeavesAnUnbudgetedServerUnbounded(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	srv := &Server{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+
+	assert.Nil(t, srv.beginShutdown())
+	assert.Equal(t, time.Minute, srv.shutdownAllot(time.Minute))
+	assert.Contains(t, logs.String(), "shutdown is unbudgeted")
+}
 
 // buildCancelDeadline bounds a Build that is expected to return on its
 // cancelled context. It is far below the storage boot budget, so a Build that
@@ -150,7 +226,7 @@ func TestReconcilePassStopIsBounded(t *testing.T) {
 			require.NotNil(t, pass)
 
 			start := time.Now()
-			pass.stop(logger)
+			pass.stop(logger, nil)
 			elapsed := time.Since(start)
 
 			assert.GreaterOrEqual(t, elapsed, missingSummaryReconcileDrainTimeout,
@@ -168,6 +244,43 @@ func TestReconcilePassStopIsBounded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A shutdown whose earlier stages already spent the budget does not then wait
+// the reconciliation pass's own seven seconds on top. The stage still runs, and
+// still says what it gave up; it just gets what is left rather than a fresh
+// bound of its own, which is what keeps a shutdown where several stages hang
+// inside the deployment's termination grace period instead of the sum of every
+// bound.
+func TestReconciliationStopSpendsOnlyWhatIsLeftOfTheShutdownBudget(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	var mu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: &logs}, nil))
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	runtime := webhookRuntime{reconcileMissingSummaryComments: func(context.Context) { <-release }}
+
+	pass := runtime.StartMissingSummaryReconciliation(t.Context(), logger)
+	require.NotNil(t, pass)
+
+	budget := drain.NewBudget(time.Nanosecond)
+	require.True(t, budget.Spent())
+
+	start := time.Now()
+	pass.stop(logger, budget)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, missingSummaryReconcileDrainTimeout,
+		"a spent budget leaves the stage less than its own bound")
+
+	mu.Lock()
+	output := logs.String()
+	mu.Unlock()
+	assert.Contains(t, output, "did not finish within the shutdown drain")
+	assert.Contains(t, output, "budget_spent=true")
 }
 
 // lockedWriter serializes writes from the reconciliation goroutine and the test
