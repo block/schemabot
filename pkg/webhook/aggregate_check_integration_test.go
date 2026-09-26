@@ -133,6 +133,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 
 	// Set up fake GitHub server that returns NO changed files (simulating revert commit)
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -545,6 +546,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -711,6 +713,7 @@ func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -833,6 +836,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -1190,6 +1194,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 

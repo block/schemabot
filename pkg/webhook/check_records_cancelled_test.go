@@ -241,7 +241,7 @@ func TestE2EPlanCancelledApplyWithEarlierFailedApplyCompletedTaskStaysBlocked(t 
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Schema Change Reconciliation Required")
-		assert.NotContains(t, body, "refreshed as passing")
+		assert.NotContains(t, body, "requested a check refresh")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for reconciliation comment")
 	}
@@ -361,7 +361,7 @@ func TestE2EPlanCancelledApplyWithNoManagedFilesConvergesPassing(t *testing.T) {
 	require.NoError(t, err)
 	client.BaseURL = baseURL
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{}, "", database)
-	installClient := ghclient.NewInstallationClient(client, testLogger())
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, testLogger())
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil)
@@ -373,7 +373,7 @@ func TestE2EPlanCancelledApplyWithNoManagedFilesConvergesPassing(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "No Schema Files Changed")
-		assert.Contains(t, body, "refreshed as passing")
+		assert.Contains(t, body, "requested a check refresh")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for passing convergence comment")
 	}

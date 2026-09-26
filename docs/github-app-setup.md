@@ -186,6 +186,27 @@ type: mysql
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 | `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
+| `legacy_baseline` | No | Opts into legacy verification for recorded paths still present on the current base branch. Records the full base commit and exact repository-relative legacy schema paths whose supported DDL effects are represented by the declarative files. `schemabot onboard` writes it when both `--legacy-base-commit` and repeatable `--legacy-path` flags are supplied. |
+
+The existing SchemaBot aggregate Check Runs verify every `legacy_baseline` in
+the configs at the pinned PR head before publishing success. They do not require
+or compare configs on the base branch. Omit that optional metadata when legacy
+verification is not needed; existing databases need no metadata backfill.
+The aggregate fails if the metadata is malformed, the anchor is no longer an
+ancestor of the base, or any recorded path does not exist at the anchor.
+For each path still present on the current base branch, normally `main`, no
+later base commit may have touched it. Paths absent from that base are retired
+individually, so deleting files in the PR cannot disable verification. After the
+deletion merges, the metadata may remain. A rename also retires the old path;
+update recorded paths when moving legacy files. An inconclusive path lookup
+blocks and triggers a bounded retry. The base branch tip is checked again before
+success; a changed or unreadable tip also blocks and triggers a bounded retry.
+The production plan must also be empty before merge.
+
+Keep the existing required aggregate checks; no separate onboarding check is
+needed. Rerun an aggregate to retry verification. Require branches to be up to
+date before merging so a later base change cannot reuse an earlier passing
+result. Merge-group checks do not verify onboarding against queued changes.
 
 Environment availability and promotion order are configured on the SchemaBot server.
 

@@ -70,7 +70,7 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 		})
 
 		assert.Contains(t, rendered, "## ℹ️ No Schema Files Changed")
-		assert.Contains(t, rendered, "refreshed as passing on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
+		assert.Contains(t, rendered, "requested a check refresh on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
 		assert.Contains(t, rendered, "<summary>Expected a plan?</summary>")
 		assert.Contains(t, rendered, "This PR changes none, so no database was compared against its schema directory.")
 		assert.Contains(t, rendered, "- **A new database.** Its schema directory merged before the database was configured")

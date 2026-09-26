@@ -160,6 +160,13 @@ var noAllowedConfiguredEnvironmentsBlock = checkBlockReason{
 	message:        "SchemaBot found schema changes, but no configured environment for this database is allowed for this SchemaBot deployment. Align server environment configuration with allowed_environments, then retry the check.",
 }
 
+// onboardingVerificationBlock is re-evaluated before an aggregate can pass,
+// including apply completion and no-schema publication paths.
+var onboardingVerificationBlock = checkBlockReason{
+	blockingReason: checkstate.BlockOnboardingVerification,
+	message:        "Onboarding could not be verified against the current base branch. Review the legacy baseline and retry this check.",
+}
+
 // allCheckBlockReasons is every blocking reason a check row can carry: the
 // durable ones SchemaBot writes to storage, plus the marker a synthesized
 // participant row carries in memory. A reader reaches both and has to know
@@ -174,6 +181,7 @@ var allCheckBlockReasons = []checkBlockReason{
 	applyCancelledAfterTaskCompletedBlock,
 	githubConfigDiscoveryUnavailableBlock,
 	configDiscoveryFailedBlock,
+	onboardingVerificationBlock,
 	planPublishVerificationFailedBlock,
 	prFileCapExceededBlock,
 	managedDirMissingConfigBlock,

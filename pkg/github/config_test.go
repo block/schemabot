@@ -19,6 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	"github.com/block/schemabot/pkg/repoconfig"
 )
 
 func TestSchemabotConfigRejectsEnvironments(t *testing.T) {
@@ -1409,6 +1411,61 @@ func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "invalid schemabot.yaml")
 			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestFetchConfigParsesLegacyBaselineWithoutActivatingIt(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", `database: orders
+type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
+`)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	config, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "head")
+
+	require.NoError(t, err)
+	require.NotNil(t, config.LegacyBaseline)
+	assert.Equal(t, 1, config.LegacyBaseline.Version)
+	assert.Equal(t, "0123456789abcdef0123456789abcdef01234567", config.LegacyBaseline.BaseCommit)
+	assert.Equal(t, []string{"service/db/changes"}, config.LegacyBaseline.LegacyPaths)
+}
+
+func TestLegacyBaselineConfigsSelectsOptedInDatabases(t *testing.T) {
+	baseline := &repoconfig.LegacyBaseline{Version: 1}
+	orders := DiscoveredConfig{Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL, LegacyBaseline: baseline}, Path: "moved/schemabot.yaml"}
+	billing := DiscoveredConfig{Config: &SchemabotConfig{Database: "billing", Type: DatabaseTypeMySQL, LegacyBaseline: baseline}, Path: "billing/schemabot.yaml"}
+	head := &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{
+		orders,
+		{Config: &SchemabotConfig{Database: "payments", Type: DatabaseTypeMySQL}, Path: "payments/schemabot.yaml"},
+		billing,
+	}}
+	configured, err := LegacyBaselineConfigs(head)
+	require.NoError(t, err)
+	assert.Equal(t, []DiscoveredConfig{billing, orders}, configured)
+}
+
+func TestLegacyBaselineConfigsFailsClosedOnUncertainDiscovery(t *testing.T) {
+	valid := DiscoveredConfig{Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL}, Path: "schema/schemabot.yaml"}
+	for _, tc := range []struct {
+		name string
+		head *FindAllConfigsResult
+		want string
+	}{
+		{name: "missing discovery", want: "head config discovery result is required"},
+		{name: "invalid config", head: &FindAllConfigsResult{InvalidConfigs: []InvalidConfigInfo{{Path: "bad/schemabot.yaml", Error: "database is required"}}}, want: "head contains invalid"},
+		{name: "missing parsed config", head: &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{{Path: "schema/schemabot.yaml"}}}, want: "no parsed configuration"},
+		{name: "duplicate identity", head: &FindAllConfigsResult{ValidConfigs: []DiscoveredConfig{valid, {Config: &SchemabotConfig{Database: "orders", Type: DatabaseTypeMySQL}, Path: "other/schemabot.yaml"}}}, want: "ambiguous database identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configured, err := LegacyBaselineConfigs(tc.head)
+			require.ErrorContains(t, err, tc.want)
+			assert.Nil(t, configured)
 		})
 	}
 }

@@ -174,6 +174,8 @@ CREATE TABLE `+quoteIdentifier("onboard_users")+` (
 		"-d", dbName,
 		"-e", "staging",
 		"-s", schemaDir,
+		"--legacy-base-commit", "0123456789abcdef0123456789abcdef01234567",
+		"--legacy-path", "legacy/db/changes",
 		"--endpoint", endpoint,
 	)
 	assertContains(t, out, "Onboarding complete")
@@ -181,7 +183,14 @@ CREATE TABLE `+quoteIdentifier("onboard_users")+` (
 
 	config, err := os.ReadFile(filepath.Join(schemaDir, "schemabot.yaml"))
 	require.NoError(t, err, "read generated schemabot.yaml")
-	assert.Equal(t, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), string(config))
+	assert.Equal(t, fmt.Sprintf(`database: %s
+type: mysql
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - legacy/db/changes
+`, dbName), string(config))
 
 	tableFile := filepath.Join(schemaDir, dbName, "onboard_users.sql")
 	ddl, err := os.ReadFile(tableFile)

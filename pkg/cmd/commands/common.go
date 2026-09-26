@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/repoconfig"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -84,8 +85,9 @@ type CLIConfig struct {
 	// IgnoreTables lists live tables SchemaBot must not reconcile. Without the
 	// exclusion a live table no schema file declares is planned as DROP TABLE,
 	// which blocks the merge.
-	IgnoreTables []string `yaml:"ignore_tables"`
-	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	IgnoreTables   []string                   `yaml:"ignore_tables"`
+	LegacyBaseline *repoconfig.LegacyBaseline `yaml:"legacy_baseline"`
+	SchemaDir      string                     `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
 
 // PlanExclusions returns the config's declared exclusions in the form the plan
