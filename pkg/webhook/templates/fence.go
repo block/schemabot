@@ -120,12 +120,48 @@ func (b *ddlBlockBudget) spend(size int) {
 // Content that would render past the block's share of budget is cut and the
 // block is followed by a visible marker.
 func writeSQLFencedBlock(sb *strings.Builder, content string, budget *ddlBlockBudget) {
-	content, truncated := fitSQLBlock(content, budget.take())
-	budget.spend(sqlBlockSize(content))
-	writeFencedBlock(sb, "sql", content)
-	if truncated {
-		sb.WriteString(ddlTruncatedMarker)
+	writeSQLFencedBlocks(sb, []string{content}, budget)
+}
+
+// sqlBlockSeparator is the blank line between consecutive sql code blocks that
+// share one section, so each block renders as its own fence.
+const sqlBlockSeparator = "\n"
+
+// writeSQLFencedBlocks writes each content as its own sql code block, the
+// blocks together drawing one share of the budget: the section is charged for
+// its fences and separators like any other DDL it renders, so a section split
+// into blocks shows a little less DDL than it would as one block and never
+// more than its share. Blocks render whole, in order, while the share holds
+// them; the first block the share cannot hold is cut to the room left and
+// followed by the truncation marker, and the blocks after it are left out —
+// the marker says where the rest lives. When the share runs out at a block
+// boundary, so that not one byte of the next block would show, the marker
+// follows the last whole block directly rather than an empty fence.
+func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlockBudget) {
+	share := budget.take()
+	spent := 0
+	for i, content := range contents {
+		room := share - spent
+		if i > 0 {
+			room -= len(sqlBlockSeparator)
+		}
+		content, truncated := fitSQLBlock(content, room)
+		if i > 0 {
+			if truncated && content == "" {
+				sb.WriteString(ddlTruncatedMarker)
+				break
+			}
+			sb.WriteString(sqlBlockSeparator)
+			spent += len(sqlBlockSeparator)
+		}
+		spent += sqlBlockSize(content)
+		writeFencedBlock(sb, "sql", content)
+		if truncated {
+			sb.WriteString(ddlTruncatedMarker)
+			break
+		}
 	}
+	budget.spend(spent)
 }
 
 // writeFencedBlock writes content inside a code fence carrying info as its
