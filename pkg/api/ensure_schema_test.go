@@ -303,3 +303,297 @@ func TestReleaseStoppedConvergence_AcceptsAChangeThatAlreadyFinished(t *testing.
 	assert.NotContains(t, logs.String(), "level=WARN",
 		"a change that finished on its own leaves nothing behind to warn about")
 }
+
+// A convergence hands the engine one table at a time. The engine attempts
+// native DDL only for a change confined to a single table, so a delta spanning
+// several tables that arrived as one run would copy every one of them on the
+// path a pod starts on. The runs are ordered by phase and then by table name,
+// so a convergence that stops partway converges the same prefix every time.
+func TestStorageConvergenceRuns(t *testing.T) {
+	t.Parallel()
+
+	alter := func(table string) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementAlterTable,
+			DDL:       "ALTER TABLE `" + table + "` ADD COLUMN `caller` VARCHAR(64) NULL",
+		}
+	}
+	create := func(table string) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementCreateTable,
+			DDL:       "CREATE TABLE `" + table + "` (`id` BIGINT UNSIGNED NOT NULL PRIMARY KEY)",
+		}
+	}
+	drop := func(table string) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementDropTable,
+			DDL:       "DROP TABLE `" + table + "`",
+		}
+	}
+	runTables := func(runs []storageConvergenceRun) []string {
+		tables := make([]string, 0, len(runs))
+		for _, r := range runs {
+			tables = append(tables, r.table)
+		}
+		return tables
+	}
+
+	t.Run("each table is its own run", func(t *testing.T) {
+		t.Parallel()
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), alter("applies"), alter("tasks")},
+		}})
+
+		require.Len(t, runs, 3, "three tables must converge as three engine runs, not one")
+		assert.Equal(t, []string{"applies", "plans", "tasks"}, runTables(runs),
+			"tables converge in name order within a phase")
+		for i, r := range runs {
+			require.Len(t, r.changes, 1, "a per-table run carries one plan")
+			require.Len(t, r.changes[0].TableChanges, 1, "a run carries one table's statements")
+			assert.Equal(t, r.table, r.changes[0].TableChanges[0].Table)
+			assert.Equal(t, "schemabot", r.changes[0].Namespace, "the plan's namespace carries onto every run")
+			assert.Equal(t, i+1, r.position)
+			assert.Equal(t, 3, r.runCount)
+			assert.Equal(t, i, r.doneDDL, "each run knows how many statements finished before it")
+			assert.Equal(t, 1, r.runDDL)
+			assert.Equal(t, 3, r.totalDDL)
+		}
+	})
+
+	t.Run("creates run before alters and alters before drops", func(t *testing.T) {
+		t.Parallel()
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace: "schemabot",
+			TableChanges: []engine.TableChange{
+				drop("zeta"), alter("plans"), create("nu"), drop("alpha"), create("beta"),
+			},
+		}})
+
+		assert.Equal(t, []string{"beta", "nu", "plans", "alpha", "zeta"}, runTables(runs),
+			"a table created by this convergence exists before a later run drops another one")
+	})
+
+	t.Run("a table's statements stay in one run", func(t *testing.T) {
+		t.Parallel()
+		second := alter("plans")
+		second.DDL = "ALTER TABLE `plans` ADD INDEX `idx_caller` (`caller`)"
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), alter("tasks"), second},
+		}})
+
+		require.Len(t, runs, 2)
+		require.Equal(t, "plans", runs[0].table)
+		require.Len(t, runs[0].changes, 1)
+		assert.Len(t, runs[0].changes[0].TableChanges, 2, "one table converges once, with all of its statements")
+		assert.Equal(t, 2, runs[0].runDDL)
+		assert.Equal(t, 3, runs[0].totalDDL)
+		assert.Equal(t, 2, runs[1].doneDDL, "the second run starts after both of the first run's statements")
+	})
+
+	t.Run("an empty plan has no runs", func(t *testing.T) {
+		t.Parallel()
+		assert.Empty(t, storageConvergenceRuns(nil))
+	})
+
+	// Splitting a delta apart means a convergence that fails partway leaves
+	// some of it applied. That is harmless while every statement adds, and is
+	// not harmless once one of them removes something: a storage schema left
+	// missing an object the fleet still reads is not a state a later boot
+	// repairs, because the next diff reads the removal as already done. A
+	// delta holding any statement the engine called unsafe therefore converges
+	// in one run, the way every delta did before tables were split apart.
+	t.Run("a delta that removes something converges in one run", func(t *testing.T) {
+		t.Parallel()
+		removal := alter("applies")
+		removal.DDL = "ALTER TABLE `applies` DROP COLUMN `caller`"
+		removal.IsUnsafe = true
+		removal.UnsafeReason = "Unsafe operation detected: \"DROP COLUMN `caller`\""
+
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), removal, alter("tasks")},
+		}}
+		require.True(t, removesSchemaObjects(changes))
+
+		runs := storageConvergenceRuns(changes)
+		require.Len(t, runs, 1, "a delta that removes something must not be split across runs")
+		assert.Equal(t, changes, runs[0].changes, "the one run carries the whole delta")
+		assert.Empty(t, runs[0].table, "a run over the whole delta is about no single table")
+		assert.Equal(t, 1, runs[0].position)
+		assert.Equal(t, 1, runs[0].runCount)
+		assert.Equal(t, 3, runs[0].runDDL)
+		assert.Equal(t, 3, runs[0].totalDDL)
+	})
+
+	t.Run("a delta that only adds is split", func(t *testing.T) {
+		t.Parallel()
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), alter("applies")},
+		}}
+		assert.False(t, removesSchemaObjects(changes))
+		assert.Len(t, storageConvergenceRuns(changes), 2)
+	})
+}
+
+// A watcher is told how far along the whole convergence is, not how far along
+// the run in front of it. Reporting the engine's own percentage would reach
+// 100% once per table and say the convergence had finished while most of it
+// was still ahead.
+func TestStorageConvergenceRunObserve(t *testing.T) {
+	t.Parallel()
+
+	runs := storageConvergenceRuns([]engine.SchemaChange{{
+		Namespace: "schemabot",
+		TableChanges: []engine.TableChange{
+			{Table: "applies", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NULL"},
+			{Table: "plans", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `plans` ADD COLUMN `caller` VARCHAR(64) NULL"},
+			{Table: "tasks", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `tasks` ADD COLUMN `caller` VARCHAR(64) NULL"},
+		},
+	}})
+	require.Len(t, runs, 3)
+
+	t.Run("the percentage spans the convergence", func(t *testing.T) {
+		t.Parallel()
+		first := runs[0].observe(&engine.ProgressResult{State: engine.StateRunning, Progress: 60})
+		assert.Equal(t, 20, first.Percent, "60% of the first of three runs is 20% of the convergence")
+		assert.Equal(t, 3, first.DDLCount)
+
+		done := runs[0].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, 33, done.Percent, "the first run finishing is not the convergence finishing")
+
+		last := runs[2].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, 100, last.Percent, "the convergence is done when its last run is")
+
+		// The engine stops measuring a run it has finished, so its last poll
+		// reads zero. A finished run is all of its own share regardless.
+		silent := runs[2].observe(&engine.ProgressResult{State: engine.StateCompleted})
+		assert.Equal(t, 100, silent.Percent,
+			"a convergence must not report itself short of done on the observation that says it finished")
+	})
+
+	t.Run("the state is the convergence's, not the run's", func(t *testing.T) {
+		t.Parallel()
+		done := runs[0].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, string(engine.StateRunning), done.State,
+			"a watcher told the convergence completed at its first table stops reading")
+
+		last := runs[2].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, string(engine.StateCompleted), last.State,
+			"the last run completing is the convergence completing")
+
+		// A run that failed ends the convergence with it, so its state is the
+		// convergence's however early it happened.
+		failed := runs[0].observe(&engine.ProgressResult{State: engine.StateFailed, ErrorMessage: "boom"})
+		assert.Equal(t, string(engine.StateFailed), failed.State)
+	})
+
+	t.Run("a finished run naming no table is reported under its own", func(t *testing.T) {
+		t.Parallel()
+		// A metadata-only statement can finish before the engine ever reports a
+		// table for it. That the run is over is still something to say about
+		// the table it converged, and a watcher keyed on table names needs it.
+		o := runs[1].observe(&engine.ProgressResult{State: engine.StateCompleted})
+		require.Len(t, o.Tables, 1)
+		assert.Equal(t, "plans", o.Tables[0].Table)
+		assert.Equal(t, string(engine.StateCompleted), o.Tables[0].State)
+
+		// Mid-run there is nothing honest to say: how far in the statement got
+		// is a measurement nobody took, and the per-table phases are the
+		// engine's vocabulary, not this package's.
+		assert.Empty(t, runs[1].observe(&engine.ProgressResult{State: engine.StateRunning}).Tables)
+	})
+
+	t.Run("a finished run's tables are reported finished", func(t *testing.T) {
+		t.Parallel()
+		// A statement the server takes natively copies nothing, so the engine
+		// never marks its table done and the last poll catches whatever phase
+		// the run was winding down through. Passing that through would show an
+		// operator every table starting and none of them finishing.
+		o := runs[0].observe(&engine.ProgressResult{
+			State: engine.StateCompleted,
+			Tables: []engine.TableProgress{
+				{Table: "applies", State: "close"},
+			},
+		})
+		require.Len(t, o.Tables, 1)
+		assert.Equal(t, "applies", o.Tables[0].Table)
+		assert.Equal(t, string(engine.StateCompleted), o.Tables[0].State)
+		assert.Equal(t, 100, o.Tables[0].Percent)
+	})
+
+	t.Run("the engine's own table progress is passed through", func(t *testing.T) {
+		t.Parallel()
+		o := runs[0].observe(&engine.ProgressResult{
+			State:    engine.StateRunning,
+			Message:  "12.5% copyRows ETA 1h30m",
+			Progress: 12,
+			Tables: []engine.TableProgress{
+				{Table: "applies", State: "copyRows", Progress: 12, RowsCopied: 4096},
+			},
+		})
+		assert.Equal(t, "12.5% copyRows ETA 1h30m", o.Message)
+		require.Len(t, o.Tables, 1)
+		assert.Equal(t, "applies", o.Tables[0].Table)
+		assert.Equal(t, "copyRows", o.Tables[0].State)
+		assert.Equal(t, 12, o.Tables[0].Percent)
+		assert.Equal(t, int64(4096), o.Tables[0].RowsCopied)
+	})
+}
+
+// recordingApplyEngine counts the applies a convergence issues. Progress and
+// Cancel are the rest of the path a stop takes, so a run that does start
+// reports the count rather than panicking on an unimplemented method. Every
+// other method is the embedded nil interface.
+type recordingApplyEngine struct {
+	engine.Engine
+	applies int
+}
+
+func (e *recordingApplyEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applies++
+	return &engine.ApplyResult{}, nil
+}
+
+func (e *recordingApplyEngine) Progress(ctx context.Context, _ *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return nil, ctx.Err()
+}
+
+func (e *recordingApplyEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{}, nil
+}
+
+// A convergence stopped between two runs stops there. The engine executes a
+// run's statements on a context of its own, so a stop does not reach DDL that
+// has not been issued yet: a run started after the budget expired or the
+// instance was told to stop would go on changing the storage database after
+// the convergence ended (AV-13, AV-14).
+func TestApplyStorageConvergenceRunStartsNothingAfterAStop(t *testing.T) {
+	t.Parallel()
+
+	runs := storageConvergenceRuns([]engine.SchemaChange{{
+		Namespace: "schemabot",
+		TableChanges: []engine.TableChange{{
+			Table:     "applies",
+			Operation: ddl.StatementAlterTable,
+			DDL:       "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NULL",
+		}},
+	}})
+	require.Len(t, runs, 1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	eng := &recordingApplyEngine{}
+	err := applyStorageConvergenceRun(ctx, eng, closedPortDSN, runs[0],
+		ensureSchemaOptions{convergenceTimeout: time.Minute}, slog.New(slog.DiscardHandler))
+
+	require.Error(t, err, "a stopped convergence reports the stop rather than returning as if it converged")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, eng.applies, "no statement may be issued after the convergence was stopped")
+}
