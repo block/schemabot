@@ -655,10 +655,12 @@ write lands, including cancelling a stopped apply. The guard covers that update 
 transitions and the rollout projection write the state through their own conditional updates, so
 a new caller that moves an apply to an active state through either of them is not caught by it.
 
-One write moves a terminal apply back to an active state, and it corrects a verdict recorded too
-early rather than reviving the apply. A rollout's state is derived from its operations, and a
-sibling's failure can record `failed` on the parent while another deployment's driver is still
-working. Re-deriving then returns the parent to `running_degraded` until that work settles (ST-10).
+One write moves a terminal apply back to an active state. It goes through the rollout projection's
+update (`UpdateDerivedState`) rather than the general apply update, so the guard above does not
+apply to it, and it corrects a verdict recorded too early rather than reviving the apply. A
+rollout's state is derived from its operations, and a sibling's failure can record `failed` on the
+parent while another deployment's driver is still working. Re-deriving then returns the parent to
+`running_degraded` until that work settles (ST-10).
 It runs only from `failed`, only while the operations themselves still derive `failed`, and only
 for a caller that opts in; every caller that does holds the lease. Storage does not require the
 lease for this write, so the lease requirement is the callers' policy. The write lands only if the
@@ -871,12 +873,18 @@ rather than the operation is the unit of reconciliation.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. The rollout verdict correction in ST-1 is the one exception: it writes
-the parent row without re-running the check. The check reads the parent's state, so a parent whose
-`failed` verdict was recorded too early reserves none of its deployments until that verdict is
-corrected, even while one of its operations is still running there. That lock excludes only while the connection holding it keeps one
-server session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct API
-callers and `--no-lock` flows are equally bound. *Enforced:* the exclusivity check in the storage
+transaction that decides. That lock excludes only while the connection holding it keeps one server
+session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct
+API callers and `--no-lock` flows are equally bound.
+
+The rollout verdict correction in ST-1 is the one exception: it writes the parent row without
+re-running the check. The check reads the parent's state, not its operations', so a parent whose
+`failed` verdict was recorded too early reserves none of its deployments while one of its
+operations is still running there. Nothing else excludes a second apply in that window: the
+operation lease guards only the operation's own row, and the advisory lock is held only for the
+deciding transaction. The window closes when a drive holding a lease re-derives the parent. No
+periodic pass does that for a terminal parent, so the window can last for the rest of that
+operation's run. *Enforced:* the exclusivity check in the storage
 apply create and activate paths, under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
 
