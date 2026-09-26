@@ -3,9 +3,11 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
@@ -109,12 +111,154 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 		}
 		entries[i] = entry
 	}
-	return &templates.DeploymentDriftData{
+	independent := rollup.Planning == api.PlanIndependent
+	data := &templates.DeploymentDriftData{
 		Deployments: entries,
 		Clean:       rollup.Clean,
 		Computed:    true,
-		Independent: rollup.Planning == api.PlanIndependent,
+		Independent: independent,
 	}
+	// Grouping describes the targets that were planned, so it is only meaningful
+	// once every one of them was. A blocked rollup lists each member on its own
+	// instead: the operator's next step is the member that could not be planned,
+	// not the plans of an apply that cannot run.
+	//
+	// Mirrored members are left ungrouped because a clean mirrored rollup has
+	// already proved they are one group. Saying so a second time, in the
+	// vocabulary of a fleet that may diverge, would suggest the agreement was an
+	// outcome rather than the requirement that let the check pass.
+	if rollup.Clean && independent {
+		data.Plans = deploymentPlanGroups(rollup)
+	}
+	return data
+}
+
+// deploymentPlanGroups groups the rollout's members by the plan each would run,
+// one entry per distinct plan.
+//
+// Members are grouped on the plan fingerprint, which two members share exactly
+// when their plans are the same work — so a group can be described once and
+// attributed to all of its members without comparing every pair. Groups come out
+// in the rollout order of their first member, with the primary's group first:
+// the reviewed plan is the one an operator has already seen, and a fixed order
+// keeps a comment that is re-rendered on a later push from reshuffling under a
+// reader who is looking for what changed.
+func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup {
+	names := rollupMemberNames(rollup)
+	var groups []templates.DeploymentPlanGroup
+	// A member that could not be keyed carries an empty fingerprint, which means
+	// "do not group" and would collapse every such member into one plan here. Only
+	// a clean rollup reaches this function, and a clean rollup has no unkeyed
+	// member, so the empty key is never a key. The caller's gate is what
+	// establishes that, in a package of its own — a later caller that groups a
+	// rollup that did not pass has to key the members itself.
+	byPlan := make(map[string]int, len(rollup.Entries))
+	for i, e := range rollup.Entries {
+		at, ok := byPlan[e.PlanFingerprint]
+		if !ok {
+			groups = append(groups, templates.DeploymentPlanGroup{
+				Primary: i == 0,
+				Changes: memberPlanChanges(e.ChangeSet),
+			})
+			at = len(groups) - 1
+			byPlan[e.PlanFingerprint] = at
+		}
+		groups[at].Members = append(groups[at].Members, names[i])
+	}
+	// The primary is the first member, so its group is already first. Ordering is
+	// stated as a property of the result rather than left to that coincidence,
+	// which a later change to rollout order would silently break.
+	slices.SortStableFunc(groups, func(a, b templates.DeploymentPlanGroup) int {
+		switch {
+		case a.Primary == b.Primary:
+			return 0
+		case a.Primary:
+			return -1
+		default:
+			return 1
+		}
+	})
+	return groups
+}
+
+// memberPlanChanges renders one member's plan into the shape the comment renders
+// the reviewed plan in, so a group's changes can be shown the way a reviewer has
+// already read the primary's. It is a second builder of that shape, not the same
+// one: the reviewed plan is built from the plan response in buildPlanCommentData,
+// and the two have to be kept in step by hand.
+//
+// A sharded namespace carries its changes twice: once per shard, and once in a
+// collapsed namespace view that dedupes tables across shards. Both are kept, the
+// same way the reviewed plan keeps them, so the rendering can show what applies
+// where rather than a namespace-level view that hides a shard.
+//
+// A namespace that appears only on shard rows still gets an entry. The planner
+// opens a namespace's collapsed entry and its shard rows in the same step, so it
+// does not produce one — the entry exists because dropping a namespace would
+// silently remove work from a plan the comment claims to describe in full, and a
+// renderer should not be the thing that decides a shape is impossible.
+func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
+	shardsByNamespace := make(map[string][]templates.KeyspaceShardChange, len(cs.Shards))
+	var shardedNamespaces []string
+	for _, sp := range cs.Shards {
+		if sp == nil {
+			continue
+		}
+		shard := templates.KeyspaceShardChange{Shard: sp.GetShard()}
+		for _, tc := range sp.GetChanges() {
+			if tc.GetDdl() == "" {
+				continue
+			}
+			shard.Statements = append(shard.Statements, tc.GetDdl())
+		}
+		// A shard with nothing to run already matches the desired schema while
+		// its siblings change. It is carried as a satisfied group rather than
+		// dropped, so a partially-applied namespace shows its divergent state.
+		//
+		// A shard that reported changes and produced no DDL is a different thing:
+		// an incomplete plan, which the reviewed plan refuses to render rather
+		// than call satisfied. Calling it satisfied here would say the inverse —
+		// already at this schema — so it is worth naming why it cannot arrive.
+		// canonicalDDLForDrift rejects a blank statement, so a member carrying
+		// one fails its own comparison, classifies errored, and is excluded from
+		// the clean rollup this grouping runs on.
+		shard.Satisfied = len(shard.Statements) == 0
+		if _, seen := shardsByNamespace[sp.GetNamespace()]; !seen {
+			shardedNamespaces = append(shardedNamespaces, sp.GetNamespace())
+		}
+		shardsByNamespace[sp.GetNamespace()] = append(shardsByNamespace[sp.GetNamespace()], shard)
+	}
+
+	changes := make([]templates.KeyspaceChangeData, 0, len(cs.Changes))
+	named := make(map[string]bool, len(cs.Changes))
+	for _, sc := range cs.Changes {
+		if sc == nil {
+			continue
+		}
+		named[sc.GetNamespace()] = true
+		ks := templates.KeyspaceChangeData{
+			Keyspace: sc.GetNamespace(),
+			Shards:   shardsByNamespace[sc.GetNamespace()],
+		}
+		for _, tc := range sc.GetTableChanges() {
+			if tc.GetDdl() == "" {
+				continue
+			}
+			ks.Statements = append(ks.Statements, tc.GetDdl())
+		}
+		if apitypes.HasVSchemaWork(sc.GetMetadata()) {
+			ks.VSchemaChanged = true
+			ks.VSchemaDiff = sc.GetMetadata()[apitypes.VSchemaDiffMetadataKey]
+		}
+		changes = append(changes, ks)
+	}
+	for _, ns := range shardedNamespaces {
+		if named[ns] {
+			continue
+		}
+		changes = append(changes, templates.KeyspaceChangeData{Keyspace: ns, Shards: shardsByNamespace[ns]})
+	}
+	return changes
 }
 
 // describeDriftDiff renders a short, count-based summary of how a diverged

@@ -86,7 +86,11 @@ func TestReviewDriftComment_IndependentCleanDoesNotClaimAgreement(t *testing.T) 
 		assert.Equal(t, api.DeploymentPlanned, e.Class, "target %q", e.Target)
 	}
 
-	assert.Contains(t, out, "Planned separately for all 3 targets")
+	assert.Contains(t, out, "Targets diverge — what applies where:")
+	for _, target := range []string{"orders-001", "orders-002", "orders-003"} {
+		assert.Contains(t, out, "**target `commerce/"+target+"`**\n\n```sql\n",
+			"each target's plan renders under it alone, not as one shared plan")
+	}
 	assert.NotContains(t, out, "Same plan on all",
 		"members that were never compared must not be described as agreeing")
 
@@ -112,7 +116,7 @@ func TestReviewDriftComment_IndependentSurfacesBlockedMember(t *testing.T) {
 	assert.Equal(t, 0, rollup.Entries[0].Blocked)
 	assert.Equal(t, 1, rollup.Entries[1].Blocked, "the blocked change must be counted on the member that carries it")
 
-	assert.Contains(t, out, "Planned separately for all 2 targets")
+	assert.Contains(t, out, "**Some targets carry changes blocked at apply:**\n\n")
 	// Both members are addressed by one deployment, so the deployment name alone
 	// would render them as two identical lines and leave the reviewer unable to
 	// tell which target holds the refused change.

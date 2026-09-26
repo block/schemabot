@@ -226,6 +226,55 @@ type DeploymentDriftData struct {
 	// rollup means every target was planned rather than that they agree — which
 	// is the opposite of what the mirrored wording says.
 	Independent bool
+	// Plans is the members grouped by the plan they would run, one entry per
+	// distinct plan, the primary's first. It says how much the members actually
+	// agree this round, which the contract alone cannot: members that are free
+	// to differ usually do not. Set only for a clean rollup of independent
+	// members — members expected to match each other say nothing by matching,
+	// and a blocked rollup describes each member on its own instead.
+	Plans []DeploymentPlanGroup
+}
+
+// DeploymentPlanGroup is the members of a rollout that would run the same plan.
+// Members share a group exactly when their plans are identical work, so a group
+// is what the comment can describe once and attribute to all of them.
+//
+// Identical work is what an apply would do to each member, not what each
+// member's plan looks like written down. Members are keyed on canonicalized
+// table DDL and on which namespaces change their VSchema, because a VSchema is
+// applied as the file the PR holds rather than as a computed delta: two members
+// given the same file are doing the same work even where their recorded diffs
+// differ, since a diff differs by where the member started.
+type DeploymentPlanGroup struct {
+	// Members names the group's members the way an operator addresses them, in
+	// rollout order.
+	Members []string
+	// Primary marks the group the reviewed primary member belongs to. Exactly
+	// one group carries it, and it is the group operators read first: the
+	// reviewed plan is the one they have already seen.
+	Primary bool
+	// Changes is one member's plan, in the same shape the comment renders the
+	// reviewed plan itself. Empty for a group whose members are already at the
+	// desired schema.
+	//
+	// The group's members run the same work, so any member's plan describes all
+	// of them — but they are grouped on canonicalized DDL, so two members can
+	// legitimately share a group while spelling the same statement differently.
+	// What renders is whichever member came first in rollout order, not a
+	// spelling every member would produce.
+	Changes []KeyspaceChangeData
+}
+
+// Empty reports that the group's members are already at the desired schema and
+// would apply nothing. That is a plan in its own right, not a missing one, and
+// naming it is the difference between a fleet that is converging and one the
+// comment has quietly left out.
+// A vschema rewrite carries no DDL and is still work, so a group is counted the
+// same way the comment counts the reviewed plan: statements and vschema
+// rewrites together.
+func (g DeploymentPlanGroup) Empty() bool {
+	statements, vschema := countChanges(g.Changes)
+	return statements+vschema == 0
 }
 
 // DeploymentDriftEntry is one rollout member's classification against the
@@ -307,7 +356,7 @@ type KeyspaceShardChange struct {
 // RenderPlanComment renders the plan comment markdown. The DDL takes every
 // byte the rest of the comment leaves under GitHub's size limit.
 func RenderPlanComment(data PlanCommentData) string {
-	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+	return renderWithinCommentLimit(countCommentDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {
 		return renderPlanComment(data, budget)
 	})
 }
@@ -338,17 +387,33 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the reviewed primary plan is a clean no-op.
-	writeDeploymentDrift(&sb, data.DeploymentDrift)
+	writeDeploymentDrift(&sb, data.DeploymentDrift, data.Changes)
+	targetPlans := rendersTargetPlans(data.DeploymentDrift)
+	summary := data
+	if targetPlans {
+		writeTargetPlans(&sb, data, budget, false)
+		summary.Changes = combinedTargetPlanChanges(data)
+	}
 
 	// Count changes
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
+	summaryStatements, summaryVSchema := countChanges(summary.Changes)
 
 	// No changes — short-circuit with a single clean message. The
 	// ignore_namespaces disclosure still renders: a no-changes result is
 	// exactly where a reviewer needs to tell a withheld namespace apart from a
 	// genuinely unchanged one.
+	//
+	// A reviewed target with nothing to run while other targets still have work
+	// summarizes their plans instead, without the apply footer: a PR apply runs
+	// from the reviewed plan, and an empty one does not run the other targets'
+	// plans.
 	if totalChanges == 0 {
+		if targetPlans {
+			writePlanSummary(&sb, summary, summaryStatements, summaryVSchema)
+			return appendAgentHint(sb.String(), data.AgentHint)
+		}
 		writeNoChangesDetected(&sb, data)
 		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
@@ -358,8 +423,10 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
-	// Detailed changes
-	writeKeyspaceChanges(&sb, data, budget)
+	// Detailed changes, unless every target's plan was already rendered above.
+	if !targetPlans {
+		writeKeyspaceChanges(&sb, data, budget)
+	}
 
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
@@ -429,8 +496,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writeErrors(&sb, data.Errors)
 	}
 
-	// Summary and options (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	// Summary and options (after DDL, matching CLI layout). Target plans are
+	// summarized together, as a sharded keyspace's shards are.
+	writePlanSummary(&sb, summary, summaryStatements, summaryVSchema)
 	writeOptions(&sb, data)
 
 	// Footer
@@ -639,22 +707,27 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		return
 	}
 
-	parts := ui.PlanSummaryParts(countStatementTypes(data.Changes, data.DatabaseType), totalStatements, true)
-	if keyspacesWithVSchema > 0 && !data.IsMySQL {
-		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
-	}
-
-	if len(parts) > 0 {
-		fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", strings.Join(parts, ", "))
-	} else {
-		// Fallback for unrecognized statement types
-		fmt.Fprintf(sb, "📋 **Plan**: %d DDL %s\n\n", totalStatements, pluralize("statement", totalStatements))
-	}
+	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements, keyspacesWithVSchema))
 
 	// Disclosed directly under the plan summary so the exclusion reads as
 	// part of the plan result: what was counted, then what was withheld.
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 	writeExemptTables(sb, data.ExemptTables)
+}
+
+// planSummaryText renders what a plan would do as the plan summary counts it,
+// e.g. "**2** alters, **1** vschema update", from the plan's changes and its
+// counted totals.
+func planSummaryText(changes []KeyspaceChangeData, databaseType string, isMySQL bool, totalStatements, keyspacesWithVSchema int) string {
+	parts := ui.PlanSummaryParts(countStatementTypes(changes, databaseType), totalStatements, true)
+	if keyspacesWithVSchema > 0 && !isMySQL {
+		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
+	}
+	if len(parts) == 0 {
+		// Fallback for unrecognized statement types
+		return fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // writeIgnoredNamespaces renders the ignore_namespaces disclosure line. No-op
@@ -846,8 +919,34 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 	}
 }
 
+// noChangesDetected is the line that closes a comment with nothing to apply.
+const noChangesDetected = "✅ **No schema changes detected**"
+
+// changingTargetCount counts the rollout's members whose own plan runs work.
+//
+// It answers only for a grouped rollup, which is a clean independent one: a
+// mirrored rollup that passed has already established that every member matches
+// the reviewed plan, so an empty reviewed plan is empty everywhere, and a rollup
+// that did not pass carries no per-member plans to count.
+func changingTargetCount(drift *DeploymentDriftData) int {
+	if drift == nil {
+		return 0
+	}
+	var changing int
+	for _, g := range drift.Plans {
+		if !g.Empty() {
+			changing += len(g.Members)
+		}
+	}
+	return changing
+}
+
+// writeNoChangesDetected closes a comment with nothing to apply. It is never
+// reached while another target still has work: an empty reviewed plan is a
+// no-op only for the reviewed target, so those comments render the other
+// targets' plans and summary instead.
 func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
-	sb.WriteString("✅ **No schema changes detected**\n")
+	sb.WriteString(noChangesDetected + "\n")
 	if data.RecoveredApplyOwnedCheckState {
 		sb.WriteString("\n" + glyph.Info + " SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
 	}
@@ -1131,11 +1230,23 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 	return status + "\x02" + strings.Join(s.Statements, "\x01")
 }
 
-// shardNamesInlineLimit caps how many shard names render inline in a PR
-// comment. Beyond it, listing every range reads as a wall — a wide keyspace
-// collapses to a count, with the names behind a collapsed block where the
-// rendering has room for one.
+// shardNamesInlineLimit caps how many member names render inline in a PR
+// comment, for the shards of a keyspace and the targets of a rollout alike.
+// Beyond it, listing every name reads as a wall — a wide group collapses to a
+// count, with the names behind a collapsed block where the rendering has room
+// for one.
 const shardNamesInlineLimit = 8
+
+// planGroupNoun is what the members of a plan group are called: the shards of a
+// keyspace, or the targets of a rollout. Both render through the same group
+// headings, so a rollout whose targets need different work reads the way a
+// keyspace whose shards do.
+type planGroupNoun struct{ singular, plural string }
+
+var (
+	shardNoun  = planGroupNoun{singular: "shard", plural: "shards"}
+	targetNoun = planGroupNoun{singular: "target", plural: "targets"}
+)
 
 // planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`"
 // when few enough to read inline, stating coverage beyond that — "12 of 32
@@ -1144,14 +1255,18 @@ const shardNamesInlineLimit = 8
 // list; the full names stay reachable in the DDL section's collapsed
 // shard-group blocks.
 func planShardList(shards []string, totalShards int) string {
-	if len(shards) > shardNamesInlineLimit {
-		return shardCoveragePhrase(len(shards), totalShards)
+	return planGroupList(shardNoun, shards, totalShards)
+}
+
+func planGroupList(noun planGroupNoun, members []string, total int) string {
+	if len(members) > shardNamesInlineLimit {
+		return groupCoveragePhrase(noun, len(members), total)
 	}
-	quoted := inlineCodeList(shards)
+	quoted := inlineCodeList(members)
 	if len(quoted) == 1 {
-		return "shard " + quoted[0]
+		return noun.singular + " " + quoted[0]
 	}
-	return "shards " + strings.Join(quoted, ", ")
+	return noun.plural + " " + strings.Join(quoted, ", ")
 }
 
 // shardCoveragePhrase states how much of a keyspace a shard group covers:
@@ -1159,13 +1274,17 @@ func planShardList(shards []string, totalShards int) string {
 // a subset, or a bare count when the keyspace total is unknown — a subset
 // must never read like whole-keyspace coverage.
 func shardCoveragePhrase(count, totalShards int) string {
-	if count == totalShards {
-		return fmt.Sprintf("all %d shards", count)
+	return groupCoveragePhrase(shardNoun, count, totalShards)
+}
+
+func groupCoveragePhrase(noun planGroupNoun, count, total int) string {
+	if count == total {
+		return fmt.Sprintf("all %d %s", count, noun.plural)
 	}
-	if totalShards > 0 {
-		return fmt.Sprintf("%d of %d shards", count, totalShards)
+	if total > 0 {
+		return fmt.Sprintf("%d of %d %s", count, total, noun.plural)
 	}
-	return fmt.Sprintf("%d shards", count)
+	return fmt.Sprintf("%d %s", count, noun.plural)
 }
 
 // writeShardGroupHeading writes a shard group's bold heading above its DDL
@@ -1175,12 +1294,16 @@ func shardCoveragePhrase(count, totalShards int) string {
 // expands into the full name list, so the names stay reachable without
 // walling the comment.
 func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards int) {
-	if len(shards) <= shardNamesInlineLimit {
-		fmt.Fprintf(sb, "**%s**\n\n", planShardList(shards, totalShards))
+	writeGroupHeading(sb, shardNoun, shards, totalShards)
+}
+
+func writeGroupHeading(sb *strings.Builder, noun planGroupNoun, members []string, total int) {
+	if len(members) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "**%s**\n\n", planGroupList(noun, members, total))
 		return
 	}
 	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
-		shardCoveragePhrase(len(shards), totalShards), strings.Join(inlineCodeList(shards), ", "))
+		groupCoveragePhrase(noun, len(members), total), strings.Join(inlineCodeList(members), ", "))
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
@@ -1193,13 +1316,19 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 // means a different thing under each. Mirrored members agree with the reviewed
 // plan; independent members were never compared to it, so the uniform line says
 // they were each planned rather than that they match.
-func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
+func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, reviewed []KeyspaceChangeData) {
 	if drift == nil {
 		return
 	}
 
 	if !drift.Computed {
 		sb.WriteString(glyph.Attention + " **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.\n\n")
+		return
+	}
+
+	// A rollout with nothing left to apply anywhere is said once, by the
+	// comment's no-changes line.
+	if rolloutAtThisSchema(drift, reviewed) {
 		return
 	}
 
@@ -1214,13 +1343,23 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	names := inlineCodeList(driftMemberNames(drift.Deployments))
 	switch {
 	case drift.Clean && drift.Independent:
+		// When targets still have work, each plan renders below under the
+		// targets that run it, which says everything this line would. A target
+		// that will refuse a change still needs naming, and the list that names
+		// it needs a line saying what it is.
+		if rendersTargetPlans(drift) {
+			if anyDeploymentBlocked(drift.Deployments) {
+				sb.WriteString("**Some targets carry changes blocked at apply:**\n\n")
+			}
+			break
+		}
 		// Independent members were deliberately never compared to each other, so
 		// the mirrored headline would assert agreement the rollup did not check.
-		// It says what was actually established: every target has a plan.
-		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
+		// Without groups, all that is known is the contract.
+		fmt.Fprintf(sb, "**Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
 			len(drift.Deployments), strings.Join(names, ", "))
 	case drift.Clean:
-		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
+		fmt.Fprintf(sb, "**Same plan on all %d deployments** (%s).\n\n",
 			len(drift.Deployments), strings.Join(names, ", "))
 	case drift.Independent:
 		// A member that could not be planned blocks under either contract, but
@@ -1279,6 +1418,125 @@ func blockedSuffix(blocked int) string {
 		return ""
 	}
 	return fmt.Sprintf(" · blocked: %d", blocked)
+}
+
+// rolloutAtThisSchema reports whether a clean rollout has nothing left to apply
+// on any member, so the comment's no-changes line speaks for all of them.
+//
+// Mirrored members run the reviewed plan, so the reviewed plan answers for all
+// of them. Independent members answer only through their own grouped plans; a
+// rollup that carries none has not shown that the other targets have nothing to
+// run.
+func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeData) bool {
+	if !drift.Clean || anyDeploymentBlocked(drift.Deployments) {
+		return false
+	}
+	statements, vschema := countChanges(reviewed)
+	if statements+vschema > 0 {
+		return false
+	}
+	if drift.Independent {
+		return len(drift.Plans) > 0 && changingTargetCount(drift) == 0
+	}
+	return true
+}
+
+// rendersTargetPlans reports whether the comment renders the rollout's plans one
+// group of targets at a time instead of the reviewed plan alone: a clean
+// rollout of independent targets in which some target still has work.
+//
+// Each such target applies its own plan, so the reviewed plan describes only
+// the targets that share it. Rendering it alone would leave a reviewer to
+// approve statements the comment never showed.
+func rendersTargetPlans(drift *DeploymentDriftData) bool {
+	return drift != nil && drift.Computed && drift.Clean && drift.Independent && changingTargetCount(drift) > 0
+}
+
+// targetPlanChanges is the plan a group of targets renders. The reviewed
+// target's group renders the reviewed plan itself, so what a reviewer reads for
+// it is exactly what the rest of the comment describes; every other group
+// renders its own members' plan.
+func targetPlanChanges(g DeploymentPlanGroup, data PlanCommentData) []KeyspaceChangeData {
+	if g.Primary && hasChanges(data.Changes) {
+		return data.Changes
+	}
+	return g.Changes
+}
+
+// writeTargetPlans renders the rollout's plans the way a sharded keyspace
+// renders its shards: one heading per group naming the targets that run it,
+// with the group's DDL under it, and a group already at the desired schema
+// saying so in place of DDL. More than one group is introduced as divergence,
+// and a single group still names its targets, so every target is shown with
+// the plan it runs. collapse folds a plan with more than one change into a
+// details block, as a multi-environment section does for its own plan.
+func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget, collapse bool) {
+	drift := data.DeploymentDrift
+	if len(drift.Plans) > 1 {
+		sb.WriteString("Targets diverge — what applies where:\n\n")
+	}
+	for _, g := range drift.Plans {
+		writeGroupHeading(sb, targetNoun, g.Members, len(drift.Deployments))
+		if g.Empty() {
+			sb.WriteString("_Already applied — no change._\n\n")
+			continue
+		}
+		group := data
+		group.Changes = targetPlanChanges(g, data)
+		statements, vschema := countChanges(group.Changes)
+		if collapse && statements+vschema > 1 {
+			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)
+			continue
+		}
+		writeKeyspaceChanges(sb, group, budget)
+	}
+}
+
+// combinedTargetPlanChanges merges every target's plan into the one change list
+// the plan summary counts, the way a sharded keyspace's summary counts each
+// distinct statement once however many shards run it.
+func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
+	var combined []KeyspaceChangeData
+	byKeyspace := make(map[string]int)
+	seen := make(map[string]map[string]struct{})
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Empty() {
+			continue
+		}
+		for _, ks := range targetPlanChanges(g, data) {
+			i, ok := byKeyspace[ks.Keyspace]
+			if !ok {
+				i = len(combined)
+				byKeyspace[ks.Keyspace] = i
+				combined = append(combined, KeyspaceChangeData{Keyspace: ks.Keyspace})
+				seen[ks.Keyspace] = make(map[string]struct{})
+			}
+			combined[i].VSchemaChanged = combined[i].VSchemaChanged || ks.VSchemaChanged
+			for _, stmt := range keyspaceStatements(ks) {
+				if _, dup := seen[ks.Keyspace][stmt]; dup {
+					continue
+				}
+				seen[ks.Keyspace][stmt] = struct{}{}
+				combined[i].Statements = append(combined[i].Statements, stmt)
+			}
+		}
+	}
+	return combined
+}
+
+// countCommentDDLBlocks counts the DDL sections a plan's comment renders: the
+// reviewed plan's, or every target plan's when the rollout renders them.
+func countCommentDDLBlocks(data PlanCommentData) int {
+	if !rendersTargetPlans(data.DeploymentDrift) {
+		return countPlanDDLBlocks(data.Changes)
+	}
+	count := 0
+	for _, g := range data.DeploymentDrift.Plans {
+		if !g.Empty() {
+			count += countPlanDDLBlocks(targetPlanChanges(g, data))
+		}
+	}
+	return count
 }
 
 // driftDetailSuffix renders a deployment's drift detail as a trailing clause, or
@@ -1731,7 +1989,7 @@ func multiEnvPlansRenderOnce(data MultiEnvPlanCommentData) bool {
 // shared across exactly those blocks.
 func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
 	if multiEnvPlansRenderOnce(data) {
-		return countPlanDDLBlocks(data.Plans[data.Environments[0]].Changes)
+		return countCommentDDLBlocks(*data.Plans[data.Environments[0]])
 	}
 	count := 0
 	for _, env := range data.Environments {
@@ -1739,7 +1997,7 @@ func countMultiEnvPlanDDLBlocks(data MultiEnvPlanCommentData) int {
 			continue
 		}
 		if plan, ok := data.Plans[env]; ok && plan != nil {
-			count += countPlanDDLBlocks(plan.Changes)
+			count += countCommentDDLBlocks(*plan)
 		}
 	}
 	return count
@@ -1892,16 +2150,28 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's reviewed primary plan is a clean no-op.
-	writeDeploymentDrift(sb, plan.DeploymentDrift)
+	writeDeploymentDrift(sb, plan.DeploymentDrift, plan.Changes)
+	targetPlans := rendersTargetPlans(plan.DeploymentDrift)
+	summary := *plan
+	if targetPlans {
+		writeTargetPlans(sb, *plan, budget, true)
+		summary.Changes = combinedTargetPlanChanges(*plan)
+	}
 
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
+	summaryStatements, summaryVSchema := countChanges(summary.Changes)
 
 	// The ignore_namespaces disclosure renders under each environment's
 	// summary (writePlanSummary) or no-changes message, because entries can
-	// resolve differently per environment.
+	// resolve differently per environment. A reviewed target with nothing to
+	// run while other targets still have work summarizes their plans instead.
 	if totalChanges == 0 {
-		sb.WriteString("✅ **No schema changes detected**\n\n")
+		if targetPlans {
+			writePlanSummary(sb, summary, summaryStatements, summaryVSchema)
+			return
+		}
+		sb.WriteString(noChangesDetected + "\n\n")
 		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		writeExemptTables(sb, plan.ExemptTables)
 		return
@@ -1910,9 +2180,11 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Detailed changes. A single change is small enough to show inline; more
 	// than one is collapsed so the DDL doesn't dominate the comment while the
 	// unsafe/lint warnings and summary below stay visible at a glance.
-	if totalChanges == 1 {
+	switch {
+	case targetPlans:
+	case totalChanges == 1:
 		writeKeyspaceChanges(sb, *plan, budget)
-	} else {
+	default:
 		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements, budget)
 	}
 
@@ -1962,8 +2234,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		writeErrors(sb, plan.Errors)
 	}
 
-	// Summary (after DDL, matching CLI layout)
-	writePlanSummary(sb, *plan, totalStatements, keyspacesWithVSchema)
+	// Summary (after DDL, matching CLI layout). Target plans are summarized
+	// together, as a sharded keyspace's shards are.
+	writePlanSummary(sb, summary, summaryStatements, summaryVSchema)
 }
 
 // writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
@@ -2083,8 +2356,16 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 
 // AnyEnvHasDriftToShow reports whether any environment has drift that must be
 // surfaced even when no environment plans changes: a deployment that diverged or
-// could not be verified. A clean uniform rollup is not "drift to show" — with no
-// changes anywhere the simple no-changes message is clearer.
+// could not be verified, or a rollout still converging. A clean uniform rollup
+// is not "drift to show" — with no changes anywhere the simple no-changes
+// message is clearer.
+//
+// A converging rollout passes its contract, so it is clean and says nothing here
+// on that count. It is still the one case where no environment planning changes
+// does not mean the fleet holds this schema: the reviewed target is at the
+// desired schema and another target is not. Callers consult this only when
+// nothing else would post a comment, so leaving it out is what decides whether
+// the reviewer is told at all.
 func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 	for _, env := range data.Environments {
 		plan, ok := data.Plans[env]
@@ -2093,6 +2374,9 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 		}
 		d := plan.DeploymentDrift
 		if !d.Computed || !d.Clean {
+			return true
+		}
+		if changingTargetCount(d) > 0 {
 			return true
 		}
 	}
@@ -2116,8 +2400,8 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 // agree up to the cut and differ after it would read as one.
 func plansIdentical(a, b *PlanCommentData) bool {
 	var renderedA, renderedB strings.Builder
-	writeEnvironmentPlanSection(&renderedA, a, newUnboundedDDLBudget(countPlanDDLBlocks(a.Changes)))
-	writeEnvironmentPlanSection(&renderedB, b, newUnboundedDDLBudget(countPlanDDLBlocks(b.Changes)))
+	writeEnvironmentPlanSection(&renderedA, a, newUnboundedDDLBudget(countCommentDDLBlocks(*a)))
+	writeEnvironmentPlanSection(&renderedB, b, newUnboundedDDLBudget(countCommentDDLBlocks(*b)))
 	return renderedA.String() == renderedB.String()
 }
 

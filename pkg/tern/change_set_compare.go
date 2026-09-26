@@ -154,7 +154,7 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			return nil, nil, fmt.Errorf("nil schema change")
 		}
 		ns := sc.Namespace
-		if sc.Metadata["vschema_changed"] == "true" {
+		if apitypes.HasVSchemaWork(sc.Metadata) {
 			vschema[ns] = true
 		}
 		hasTableChanges := false
@@ -162,8 +162,9 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			if tc == nil {
 				return nil, nil, fmt.Errorf("nil table change in namespace %q", ns)
 			}
-			// In the plan/proto representation a vschema change is signalled via
-			// Metadata["vschema_changed"] and carries no table DDL. A vschema table
+			// In the plan/proto representation a vschema change is signalled by the
+			// metadata keys HasVSchemaWork reads — a rendered diff, the changed
+			// flag, or both — and carries no table DDL. A vschema table
 			// change indicates malformed input (e.g. a change set built from an
 			// apply request's DdlChanges), so fail closed rather than skip it and
 			// risk a false match. Checked before the shard skip so a sharded
@@ -234,8 +235,9 @@ func (cs ChangeSet) AuthoritativeTableChanges() []*ternv1.TableChange {
 
 // HasWork reports whether applying the change set would change anything: a
 // table change in any representation, or a namespace whose VSchema changes. It
-// reads either VSchema signal a plan can carry, so a change set that says it
-// changes a VSchema in only one of the two ways still counts as work.
+// reads VSchema work through the same predicate the comparison and the comment
+// do, so the check cannot count a namespace as changing that the comment shows
+// as already at this schema, or the reverse.
 func (cs ChangeSet) HasWork() bool {
 	if len(cs.AuthoritativeTableChanges()) > 0 {
 		return true
@@ -244,7 +246,7 @@ func (cs ChangeSet) HasWork() bool {
 		if sc == nil {
 			continue
 		}
-		if sc.Metadata[apitypes.VSchemaChangedMetadataKey] == "true" || sc.Metadata[apitypes.VSchemaDiffMetadataKey] != "" {
+		if apitypes.HasVSchemaWork(sc.Metadata) {
 			return true
 		}
 	}
