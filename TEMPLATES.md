@@ -1383,7 +1383,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-📋 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+**Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 ```sql
 CREATE TABLE `users` (
@@ -1436,7 +1436,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-📋 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+**Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 - `eu` (primary) ✅ matches the reviewed plan
 - `au` ✅ matches the reviewed plan · blocked: 1
@@ -1603,7 +1603,9 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-📋 **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
+**Planned separately for all 3 targets** — 2 need this change, 1 is already at this schema.
+
+📋 **Plan** for `primary/testapp_1`, `primary/testapp_2`: **2** tables to create, **1** table to alter
 
 ```sql
 CREATE TABLE `users` (
@@ -1634,7 +1636,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📋 **Plan**: **2** tables to create, **1** table to alter
+✅ `primary/testapp_3` is already at this schema.
 
 
 ---
@@ -1656,9 +1658,80 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-📋 **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
+**Planned separately for all 3 targets** — 2 need this change, 1 is already at this schema.
+
+📋 **Plan** for `primary/testapp_2`, `primary/testapp_3`: **2** tables to create, **1** table to alter
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+✅ `primary/testapp_1` is already at this schema.
 
 ⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, and applying this plan will not run it for them.
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-distinct-plans"></a><strong>Rollout Plans (Distinct Plans)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+**Planned separately for all 3 targets** — 2 distinct plans. Each target applies its own.
+
+📋 **Plan** for `primary/testapp_1`, `primary/testapp_2`: **1** table to alter
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
+```
+
+📋 **Plan** for `primary/testapp_3`: **1** table to alter
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
 
 </details>
 

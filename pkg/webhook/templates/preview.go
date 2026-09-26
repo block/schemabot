@@ -614,7 +614,8 @@ func previewRolloutMembers() []DeploymentDriftEntry {
 
 // PreviewCommentPlanRolloutConverging renders a plan comment for a rollout of
 // independent targets partway through converging: the reviewed target and one
-// other still need the change, and the third already holds it.
+// other still need the change, and the third already holds it. The plan renders
+// under the two targets that run it, and the third is named as already there.
 func PreviewCommentPlanRolloutConverging() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -639,10 +640,9 @@ func PreviewCommentPlanRolloutConverging() string {
 
 // PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
 // whose reviewed target already holds the desired schema while other targets do
-// not. The reviewed plan is empty, so the comment renders no DDL — and counts the
-// targets that are still missing the change rather than reading as a no-op. It
-// counts them rather than naming them: the rollup line lists every member, but
-// nothing here attributes a member to the group that still needs the change.
+// not. The reviewed target has no plan to show, so the comment renders the plan
+// of the targets still missing the change, names the reviewed target as already
+// there, and says an apply of this plan will not run the others.
 func PreviewCommentPlanRolloutConvergedPrimary() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -660,6 +660,37 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 			Plans: []DeploymentPlanGroup{
 				{Members: []string{"primary/testapp_1"}, Primary: true},
 				{Members: []string{"primary/testapp_2", "primary/testapp_3"}, Changes: samplePlanChanges()},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
+// independent targets that need different work: the reviewed target and one
+// other need the email column, and the third needs it with an index as well.
+// Each target applies its own plan, so each plan renders under its targets.
+func PreviewCommentPlanRolloutDistinctPlans() string {
+	email := "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;"
+	reviewed := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{email}}}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: reviewed},
+				{Members: []string{"primary/testapp_3"}, Changes: []KeyspaceChangeData{{
+					Keyspace:   "testapp",
+					Statements: []string{email, "ALTER TABLE `users` ADD INDEX `idx_email` (`email`);"},
+				}}},
 			},
 		},
 	})
