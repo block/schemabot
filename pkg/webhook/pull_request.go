@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1093,16 +1094,70 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 		}
 	}
 
-	// Recompute aggregate on the new HEAD SHA after cleaning up stale checks
-	if cleaned {
-		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-	} else {
+	if !cleaned {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "stale_check_cleanup",
 			Repository: repo,
 			Status:     "noop",
 		})
+		return
 	}
+
+	// The PR can plan a database that has no stored check row yet: one it newly
+	// touches, or one planned under a new type. Its plan runs concurrently with
+	// this cleanup, so folding now could publish the aggregate from the rows just
+	// cleaned alone, and a plan-only row cleaned to success would pass the gate
+	// before the replacement result exists. That plan folds the aggregate itself
+	// once it stores its rows. This re-read follows the writes above, so
+	// whichever of the two folds last sees both.
+	checks, err = h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("failed to re-read checks after stale cleanup; cleanup will not recompute the aggregate, and the next plan or check event recomputes it",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		return
+	}
+	if awaiting := plannedDatabasesWithoutCheckState(checks, affectedDatabases); len(awaiting) > 0 {
+		h.logger.Info("stale cleanup leaves the aggregate to the plans of databases with no stored check yet",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"awaiting_databases", checkDatabaseKeyStrings(awaiting))
+		return
+	}
+	h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+}
+
+// plannedDatabasesWithoutCheckState returns the databases the PR plans that
+// have no stored per-database check row, in a stable order.
+func plannedDatabasesWithoutCheckState(checks []*storage.Check, planned map[checkDatabaseKey]bool) []checkDatabaseKey {
+	stored := make(map[checkDatabaseKey]bool, len(checks))
+	for _, check := range checks {
+		if isAggregateCheck(check) {
+			continue
+		}
+		stored[checkDatabaseKeyForCheck(check)] = true
+	}
+	var missing []checkDatabaseKey
+	for key := range planned {
+		if !stored[key] {
+			missing = append(missing, key)
+		}
+	}
+	slices.SortFunc(missing, func(a, b checkDatabaseKey) int {
+		return cmp.Or(cmp.Compare(a.databaseName, b.databaseName), cmp.Compare(a.databaseType, b.databaseType))
+	})
+	return missing
+}
+
+func checkDatabaseKeyStrings(keys []checkDatabaseKey) []string {
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key.databaseName+"/"+key.databaseType)
+	}
+	return out
 }
 
 func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
