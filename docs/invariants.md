@@ -573,8 +573,11 @@ interface (`pkg/storage/storage.go`, `pkg/storage/internal/sqlstore/checks.go`,
 A later commit that removes the schema change must not make the aggregate pass by cleanup alone:
 the check stays blocked (`schema_removed_after_apply_started`) until the apply settles and an
 operator reconciles the target. Closing and reopening the PR does not wash this state away.
-*Enforced:* stale-cleanup guards (`pkg/webhook/check_records.go`); close and reopen handlers
-release nothing they cannot read (`pkg/webhook/pull_request.go`).
+*Enforced:* stale-check cleanup, which blocks a row a started apply owns instead of clearing it
+(`cleanupStaleChecks` in `pkg/webhook/pull_request.go`, `checkHasStartedApply` in
+`pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
+while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
+close and reopen handlers release nothing they cannot read (`pkg/webhook/pull_request.go`).
 
 ### MG-7: A completed rollback never shows green
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -54,4 +55,30 @@ func TestAutoPlanCoverageActionsAreUnconditional(t *testing.T) {
 	}
 	assert.False(t, slices.Contains(storage.AutoPlanPullRequestActions, "edited"),
 		"a retarget plans conditionally, so it cannot be counted as coverage")
+}
+
+// TestCheckDatabaseKeysMatchNameAndType pins that a stored check row counts as
+// still in the PR only when a discovered config plans the same database under
+// the same type. A row recorded under a database's previous type is stale, so
+// stale cleanup settles it instead of leaving it to hold the aggregate open.
+func TestCheckDatabaseKeysMatchNameAndType(t *testing.T) {
+	affected := checkDatabaseKeysForConfigs([]ghclient.DiscoveredConfig{{
+		Config: &ghclient.SchemabotConfig{Database: "orders", Type: ghclient.DatabaseTypeStrata},
+	}})
+
+	tests := []struct {
+		name  string
+		check *storage.Check
+		want  bool
+	}{
+		{"same name and type", &storage.Check{DatabaseName: "orders", DatabaseType: storage.DatabaseTypeStrata}, true},
+		{"same name and type in another case", &storage.Check{DatabaseName: "Orders", DatabaseType: "STRATA"}, true},
+		{"same name under the previous type", &storage.Check{DatabaseName: "orders", DatabaseType: storage.DatabaseTypeMySQL}, false},
+		{"another database of the same type", &storage.Check{DatabaseName: "payments", DatabaseType: storage.DatabaseTypeStrata}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, affected[checkDatabaseKeyForCheck(tc.check)])
+		})
+	}
 }
