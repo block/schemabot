@@ -589,6 +589,57 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, state.Apply.FailedRetryable, final.State, "the excluded apply keeps its state for an operator to reconcile")
 	})
 
+	// A rollout across region-a, region-b, and region-c records failed after
+	// region-a fails, while region-b's operation is still running and region-c's
+	// never started. A second apply on region-b is refused until that operation
+	// settles, because a driver is still changing that deployment. region-a and
+	// region-c are free at once: nothing is running on either.
+	t.Run("Create_RefusesDeploymentWithStartedOperationUnderFinishedParent", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_started_operation_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_failed_early", 9300, state.Apply.Pending, "production", "region-a")
+
+		operationIDs := map[string]int64{}
+		for _, deployment := range []string{"region-a", "region-b", "region-c"} {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: deployment, OperationKey: "schema"})
+			require.NoError(t, err)
+			operationIDs[deployment] = id
+		}
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationIDs["region-a"], state.ApplyOperation.Failed))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationIDs["region-b"], state.ApplyOperation.Running))
+		rollout.State = state.Apply.Failed
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		createOn := func(identifier string, planID int64, deployment string) error {
+			_, err := store.Applies().Create(ctx, &storage.Apply{
+				ApplyIdentifier: identifier,
+				LockID:          lock.ID,
+				PlanID:          planID,
+				Database:        lock.DatabaseName,
+				DatabaseType:    lock.DatabaseType,
+				Repository:      lock.Repository,
+				PullRequest:     lock.PullRequest,
+				Environment:     "production",
+				Deployment:      deployment,
+				Engine:          storage.EngineForType(lock.DatabaseType),
+				State:           state.Apply.Pending,
+			})
+			return err
+		}
+
+		err := createOn("apply_region_b_while_running", 9301, "region-b")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+		assert.Contains(t, err.Error(), "apply_rollout_failed_early", "the refusal names the apply still working on the deployment")
+		assert.Contains(t, err.Error(), "region-b")
+
+		require.NoError(t, createOn("apply_region_a_after_failure", 9302, "region-a"), "a failed operation holds no deployment")
+		require.NoError(t, createOn("apply_region_c_never_started", 9303, "region-c"), "an operation the finished rollout never started holds no deployment")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, operationIDs["region-b"]))
+		require.NoError(t, createOn("apply_region_b_after_settle", 9304, "region-b"), "the deployment frees once its operation settles")
+	})
+
 	t.Run("ConcurrentClaim_SingleWinner", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
