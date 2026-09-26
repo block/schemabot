@@ -776,7 +776,7 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		c.logger.Info("cancel found task-less apply already terminal; accepting without a state change",
 			append(apply.LogAttrs(), "requested_by", caller)...)
-		return &ternv1.CancelResponse{Accepted: true}, nil
+		return cancelAlreadySettledResponse(apply.State, 0), nil
 	}
 	previousState := apply.State
 	if err := c.markApplyCancelled(ctx, apply.ID); err != nil {
@@ -1892,6 +1892,19 @@ func (c *LocalClient) settleCancelAllTasksTerminal(ctx context.Context, applyID 
 		c.logger.Info("cancel found all tasks terminal and the apply already settled; keeping its outcome",
 			append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller)...)
 		return cancelAlreadySettledResponse(apply.State, skippedCount), nil
+	}
+
+	// A multi-operation drive owns only its operation. Its tasks already carry
+	// the outcome, and the operator derives the operation row from them and
+	// projects the parent, so the parent write is the operator's to make. A
+	// direct write here fails closed under the operation-only lease and would
+	// turn an accepted cancel into a drive error the claim loop re-runs forever.
+	// The durable request stays pending until the projection resolves the
+	// stored apply.
+	if suppressParentApplyWrites(ctx) {
+		c.logger.Info("cancel found all tasks terminal; operation drive leaves the apply outcome to the operator's projection",
+			append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller)...)
+		return &ternv1.CancelResponse{Accepted: true, SkippedCount: skippedCount}, nil
 	}
 
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)

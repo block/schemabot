@@ -129,3 +129,99 @@ func TestLocalClient_CancelAfterTasksFinishedRecordsTheirOutcome(t *testing.T) {
 	driverCopy.CompletedAt = &finishedAt
 	require.NoError(t, stor.Applies().Update(ctx, &driverCopy), "the driver's completed write agrees with the recorded outcome")
 }
+
+// An operator cancels a task-less apply that already completed. The cancel is
+// accepted and reports the recorded outcome, the same answer a late cancel over
+// an apply with tasks gets, and the apply keeps its completed outcome.
+func TestLocalClient_LateCancelOnTasklessApplyReportsItsOutcome(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newTasklessControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, nil)
+	completedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	apply.State = state.Apply.Completed
+	apply.CompletedAt = &completedAt
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+
+	resp, err := client.cancelOwnedApply(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	}, "operator")
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted, "a cancel over a settled apply resolves instead of retrying")
+	assert.Equal(t, int64(0), resp.CancelledCount)
+	assert.Equal(t, int64(0), resp.SkippedCount)
+	assert.Equal(t, "Schema change already completed", resp.ErrorMessage)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Completed, settled.State, "a late cancel must not rewrite a completed outcome")
+	assert.Empty(t, eng.recorded(), "a task-less apply has no engine work to cancel")
+}
+
+// A multi-operation drive holds only its operation lease when it consumes an
+// operator's cancel, and every task it would cancel has already finished. The
+// parent apply row belongs to the operator's projection, so the drive accepts
+// the cancel without writing the parent and leaves the durable request pending
+// for the projection to complete once it resolves the stored apply. Writing the
+// parent here would be refused under the operation-only lease and turn the
+// cancel into a drive error that the claim loop re-runs forever.
+func TestLocalClient_CancelAfterTasksFinishedUnderOperationLeaseLeavesParentToProjection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newTasklessControlClient(t, dsn, stor)
+
+	apply, _ := dispatchApplyWithCompletedTask(t, stor, client, "operation_cancel_note")
+	op, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "op-driver-"+t.Name())
+	require.NoError(t, err)
+	require.NotNil(t, op, "the queued apply's operation row must be claimable")
+	require.Equal(t, apply.ID, op.ApplyID, "the claimed operation row must belong to the dispatched apply")
+	apply.State = state.Apply.Running
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+
+	cancelResp, err := client.Cancel(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, cancelResp.Accepted)
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
+
+	opCtx := storage.WithOperationLease(ctx, op.Lease())
+	reloaded, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	standDown, err := client.processPendingCancelControlRequest(opCtx, reloaded)
+	require.NoError(t, err, "a cancel over finished tasks must not fail the operation drive")
+	assert.True(t, standDown, "the drive must consume the pending cancel")
+
+	parent, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Running, parent.State,
+		"the apply row belongs to the operator's projection and must not be written under the operation lease alone")
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
+	assert.NotContains(t, eng.recorded(), "Cancel", "finished tasks have no engine work to cancel")
+}
