@@ -456,12 +456,11 @@ func TestRenderPlanComment_PlanGroupsDescribeThisRound(t *testing.T) {
 			}
 		}
 		members[0].Primary = true
+		// The primary's group is the reviewed plan, so the comment's own plan is
+		// the first group's.
 		return RenderPlanComment(PlanCommentData{
 			Database: "testapp", Environment: "production", IsMySQL: true,
-			Changes: []KeyspaceChangeData{{
-				Keyspace:   "testapp",
-				Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-			}},
+			Changes: plans[0].Changes,
 			DeploymentDrift: &DeploymentDriftData{
 				Computed: true, Clean: true, Independent: true,
 				Deployments: members,
@@ -477,42 +476,52 @@ func TestRenderPlanComment_PlanGroupsDescribeThisRound(t *testing.T) {
 		name   string
 		plans  []DeploymentPlanGroup
 		expect string
+		mark   string
 	}{
 		{
 			name:   "every target needs the same change",
 			plans:  []DeploymentPlanGroup{group(1, "a", "b", "c")},
 			expect: "every target needs the same change.",
+			mark:   "📋",
 		},
 		{
 			name:   "some targets are already there",
 			plans:  []DeploymentPlanGroup{group(1, "a", "c", "d"), group(0, "b", "e")},
 			expect: "3 need this change, 2 are already at this schema.",
+			mark:   "📋",
 		},
 		{
 			name:   "a single target still needs it",
 			plans:  []DeploymentPlanGroup{group(1, "a"), group(0, "b")},
 			expect: "1 needs this change, 1 is already at this schema.",
+			mark:   "📋",
 		},
 		{
 			name:   "targets need different changes",
 			plans:  []DeploymentPlanGroup{group(1, "a", "b", "c"), group(2, "d", "e")},
 			expect: "2 distinct plans. Each target applies its own.",
+			mark:   "📋",
 		},
 		{
 			name:   "different changes with some already there",
 			plans:  []DeploymentPlanGroup{group(1, "a", "b"), group(2, "c"), group(0, "d", "e")},
 			expect: "2 distinct plans across the 3 targets that change; 2 are already at this schema.",
+			mark:   "📋",
 		},
 		{
 			name:   "the whole fleet is already there",
 			plans:  []DeploymentPlanGroup{group(0, "a", "b", "c")},
 			expect: "every target is already at this schema.",
+			mark:   "✅",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Contains(t, render(tc.plans), tc.expect)
+			out := render(tc.plans)
+			assert.Contains(t, out, tc.expect)
+			assert.Contains(t, out, tc.mark+" **Planned separately for all",
+				"the checkmark is reserved for a round with nothing left to apply")
 		})
 	}
 }
@@ -656,6 +665,66 @@ func TestRenderPlanComment_FullyConvergedRolloutIsStillANoOp(t *testing.T) {
 
 // planGroupChanges builds a group plan running the given number of statements.
 // A group running none is already at the desired schema.
+// A clean rollout's line carries the checkmark only when nothing is left to
+// apply, the meaning it has on the rest of the comment. A shared plan with work,
+// a converging rollout whose reviewed target is already done, and independent
+// targets whose own plans were not grouped all lead with the plan mark instead.
+func TestRenderPlanComment_CleanRolloutMarksOnlyNothingToApplyAsDone(t *testing.T) {
+	email := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}}}
+	mirrored := []DeploymentDriftEntry{
+		{Deployment: "eu", Primary: true, Class: "match"},
+		{Deployment: "au", Class: "match"},
+	}
+	independent := []DeploymentDriftEntry{
+		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+		{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+	}
+	cases := []struct {
+		name     string
+		reviewed []KeyspaceChangeData
+		drift    DeploymentDriftData
+		want     string
+	}{
+		{
+			name:     "mirrored deployments share a plan with work",
+			reviewed: email,
+			drift:    DeploymentDriftData{Computed: true, Clean: true, Deployments: mirrored},
+			want:     "📋 **Same plan on all 2 deployments**",
+		},
+		{
+			name:  "mirrored deployments are all at the schema",
+			drift: DeploymentDriftData{Computed: true, Clean: true, Deployments: mirrored},
+			want:  "✅ **Same plan on all 2 deployments**",
+		},
+		{
+			name: "the reviewed target is done and another is not",
+			drift: DeploymentDriftData{
+				Computed: true, Clean: true, Independent: true, Deployments: independent,
+				Plans: []DeploymentPlanGroup{
+					{Members: []string{"primary/testapp_1"}, Primary: true},
+					{Members: []string{"primary/testapp_2"}, Changes: email},
+				},
+			},
+			want: "📋 **Planned separately for all 2 targets**",
+		},
+		{
+			name:  "independent targets whose plans were not grouped",
+			drift: DeploymentDriftData{Computed: true, Clean: true, Independent: true, Deployments: independent},
+			want:  "📋 **Planned separately for all 2 targets**",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RenderPlanComment(PlanCommentData{
+				Database: "testapp", Environment: "production", IsMySQL: true,
+				Changes:         tc.reviewed,
+				DeploymentDrift: &tc.drift,
+			})
+			assert.Contains(t, out, tc.want)
+		})
+	}
+}
+
 func planGroupChanges(statements int) []KeyspaceChangeData {
 	if statements == 0 {
 		return nil

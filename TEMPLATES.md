@@ -1383,7 +1383,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+📋 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 ```sql
 CREATE TABLE `users` (
@@ -1436,7 +1436,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+📋 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 - `eu` (primary) ✅ matches the reviewed plan
 - `au` ✅ matches the reviewed plan · blocked: 1
@@ -1603,7 +1603,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
+📋 **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
 
 ```sql
 CREATE TABLE `users` (
@@ -1656,7 +1656,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
+📋 **Planned separately for all 3 targets** (`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`) — 2 need this change, 1 is already at this schema.
 
 ⚠️ **No schema changes for the reviewed target** — 2 targets still need this change, and applying this plan will not run it for them.
 

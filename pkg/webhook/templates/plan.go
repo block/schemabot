@@ -387,7 +387,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the reviewed primary plan is a clean no-op.
-	writeDeploymentDrift(&sb, data.DeploymentDrift)
+	writeDeploymentDrift(&sb, data.DeploymentDrift, data.Changes)
 
 	// Count changes
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
@@ -1283,7 +1283,7 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 // means a different thing under each. Mirrored members agree with the reviewed
 // plan; independent members were never compared to it, so the uniform line says
 // they were each planned rather than that they match.
-func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
+func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, reviewed []KeyspaceChangeData) {
 	if drift == nil {
 		return
 	}
@@ -1308,11 +1308,11 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		// the mirrored headline would assert agreement the rollup did not check.
 		// It says what was actually established: every target has a plan, and how
 		// far those plans agree this round.
-		fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — %s\n\n",
-			len(drift.Deployments), strings.Join(names, ", "), describePlanGroups(drift.Plans))
+		fmt.Fprintf(sb, "%s **Planned separately for all %d targets** (%s) — %s\n\n",
+			cleanRolloutMark(drift, reviewed), len(drift.Deployments), strings.Join(names, ", "), describePlanGroups(drift.Plans))
 	case drift.Clean:
-		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
-			len(drift.Deployments), strings.Join(names, ", "))
+		fmt.Fprintf(sb, "%s **Same plan on all %d deployments** (%s).\n\n",
+			cleanRolloutMark(drift, reviewed), len(drift.Deployments), strings.Join(names, ", "))
 	case drift.Independent:
 		// A member that could not be planned blocks under either contract, but
 		// only mirrored members can be out of agreement with each other. Calling
@@ -1412,6 +1412,28 @@ func describePlanGroups(groups []DeploymentPlanGroup) string {
 		return fmt.Sprintf("%d distinct plans across the %d targets that change; %s already at this schema.",
 			plans, changing, countedVerb(converged, "is", "are"))
 	}
+}
+
+// cleanRolloutMark picks the mark that leads a clean rollout's line, with the
+// meaning the checkmark has everywhere else in the comment: nothing is left to
+// apply. A round in which any target still has work leads with the plan mark
+// the comment's own plan summary uses, so a rollout that passed its contract
+// but has not converged does not read as done.
+//
+// Mirrored members run the reviewed plan, so the reviewed plan answers for all
+// of them. Independent members answer only through their own grouped plans; a
+// rollup that carries none has not shown that the other targets have nothing to
+// run, so it does not earn the checkmark either.
+func cleanRolloutMark(drift *DeploymentDriftData, reviewed []KeyspaceChangeData) string {
+	const done, planned = "✅", "📋"
+	statements, vschema := countChanges(reviewed)
+	if statements+vschema > 0 {
+		return planned
+	}
+	if drift.Independent && (len(drift.Plans) == 0 || changingTargetCount(drift) > 0) {
+		return planned
+	}
+	return done
 }
 
 // countedVerb renders a count and the verb that agrees with it, e.g. "3 need" or
@@ -2034,7 +2056,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's reviewed primary plan is a clean no-op.
-	writeDeploymentDrift(sb, plan.DeploymentDrift)
+	writeDeploymentDrift(sb, plan.DeploymentDrift, plan.Changes)
 
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
