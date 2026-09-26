@@ -9,7 +9,7 @@ The wizard and explicit CLI flags use the same setup workflow.
 
 ## Before you start
 
-Use MySQL or PostgreSQL with an existing application database. You can paste a connection string or enter host, port, database, username, and password
+Use MySQL, PostgreSQL, or Vitess with an existing application database. You can paste a connection string or enter host, port, database, username, and password
 inside the wizard. Passwords and pasted strings are hidden. The final review asks you to
 confirm saving entered credentials in private, **unencrypted** files under
 `~/.schemabot/credentials`, outside the project. These files persist across terminal and
@@ -21,7 +21,7 @@ Environment-variable and absolute file references remain available as an advance
 a referenced file must contain only the connection string. References stay references,
 so environment variables must remain available to later CLI invocations. Schema files
 never contain credentials. OS credential-store integration is not implemented.
-Vitess is not offered by the wizard yet; use [server configuration](configuration.md).
+Vitess uses PlanetScale deploy requests and needs a separate MySQL database for SchemaBot’s state.
 
 The wizard asks **Where should SchemaBot store its own data?**
 
@@ -39,12 +39,86 @@ wizard toggle: drain in-flight work, stop the runtime, transfer the complete sta
 update its connection configuration, and verify it before restarting. Keep the original state
 until the new connection is verified. Re-running `init` never replaces existing state storage.
 
+For Vitess, the application connection is your vtgate address, and the wizard also asks for the
+PlanetScale organization and a [service token](#configure-the-planetscale-service-token).
+SchemaBot opens deploy requests with that token and reads keyspaces from the `main` branch.
+Its own state lives in a MySQL database outside Vitess.
+
 Setup initializes SchemaBot's metadata tables in the state database. Baseline planning also
 needs the engine's scratch privileges. Setup never applies application schema changes.
 
 Private databases do not need a public endpoint. Run SchemaBot somewhere that can reach
 them: on your VPN, through an existing tunnel, or on a machine inside the private network.
 If a connection check fails, keep the wizard open, restore access, and retry.
+
+## Vitess and PlanetScale
+
+Connect your vtgate endpoint, choose your PlanetScale organization, and verify a service-token
+reference. SchemaBot discovers keyspaces from the `main` branch and keeps its own data in a
+separate MySQL database.
+
+### Connect to your Vitess database
+
+The first connection uses a PlanetScale **branch password** for `main`. This provides a
+SQL username and password for the database connection, separate from your PlanetScale
+account login and the API service token.
+
+See the PlanetScale API's [Create a password](https://planetscale.com/docs/api/reference/create_password)
+endpoint. Its response includes `username`, `plain_text` (the password), and `access_host_url`
+(the connection host). Save the password when it is created; it cannot be retrieved later.
+Use these credentials and the endpoint's TLS settings in the wizard's database connection.
+
+The second connection is to the separate MySQL database where SchemaBot stores its plans
+and progress. It uses that MySQL server's credentials.
+
+![Connect a Vitess database, verify its schema, and preview a change](../assets/init-vitess-demo.gif)
+
+### Configure the PlanetScale service token
+
+The service token lets SchemaBot manage branches and deploy requests through the PlanetScale
+API. It is separate from the username and password in your database connection string.
+
+1. In your PlanetScale organization's **Settings → Service tokens**, create a token for
+   SchemaBot. Copy its **ID** and **secret**; the display name is only a label.
+2. Choose **Edit token permissions → Add database access** and select the database you are
+   connecting. Grant the permissions below, then save. Scope access to this database.
+
+| Permission | What SchemaBot uses it for |
+| --- | --- |
+| `read_branch` | Discover keyspaces and read branch schemas and VSchemas. |
+| `create_branch` | Prepare a development branch for a schema change. |
+| `connect_branch` | Create credentials to run the proposed DDL on that development branch. |
+| `delete_branch` | Clean up development branches. |
+| `read_deploy_request` | Read deploy request state and progress. |
+| `create_deploy_request` | Open, queue, cut over, cancel, and revert deploy requests. |
+| `write_branch_vschema` | Stage VSchema changes on the development branch. |
+
+These permissions follow the [PlanetScale API reference](https://planetscale.com/docs/api/reference/service-tokens)
+and the operations SchemaBot performs. Organization-wide permissions and permission to delete
+production branches are not needed for this setup. If your database requires deploy-request
+approval, an eligible reviewer still needs to approve in PlanetScale; the token cannot approve
+its own requests. See [PlanetScale's approval rules](https://planetscale.com/docs/api/service-tokens#service-tokens-and-deploy-requests-approvals).
+
+3. Store the ID and secret together, separated by a colon. For example, a private file outside
+   your project at `/Users/alex/.config/schemabot/planetscale-token` contains just:
+
+   ```text
+   TOKEN_ID:TOKEN_SECRET
+   ```
+
+   Restrict the file to your user. On the **Connect the PlanetScale API** screen, enter:
+
+   ```text
+   file:/Users/alex/.config/schemabot/planetscale-token
+   ```
+
+   Or use `env:PLANETSCALE_TOKEN` if that variable already contains the same value. Set it
+   before launching the wizard, and keep it available to later SchemaBot commands. The
+   wizard's `name:value` wording refers to the token ID and secret, not its display name.
+
+The wizard checks the token by listing keyspaces on `main`. This confirms read access, not
+all of the write permissions above. If setup succeeds but an apply is denied, check the
+permissions on this token for this database. Setup does not create a deploy request to test them.
 
 ## Follow the wizard
 
@@ -60,7 +134,8 @@ Environment, schema directory, and profile defaults remain editable in the final
 Before setting up a runtime, SchemaBot reads the target catalog to discover namespaces. One
 result is selected automatically; multiple results appear in a searchable list. Use Space to
 select namespaces and Enter to continue. MySQL stays within the database named in the DSN;
-PostgreSQL lists accessible application schemas. No results or a failed connection stops here
+PostgreSQL lists accessible application schemas; Vitess lists the keyspaces of the `main`
+branch. No results or a failed connection stops here
 with a chance to retry, edit the connection, or press `m` to enter namespaces manually.
 Explicit `--namespace` flags also bypass discovery. Discovery uses only the application connection. State metadata is initialized only after the final review.
 
@@ -105,6 +180,9 @@ $ schemabot init --non-interactive --json --type mysql \
 ```
 
 Use `--integrated` instead of `--storage-dsn` to create SchemaBot’s own database on the application server. The flags are mutually exclusive.
+
+For Vitess, also pass `--organization` and `--api-token env:PLANETSCALE_TOKEN`.
+Use `--api-url` only for a PlanetScale-compatible private endpoint.
 
 Paths and plan IDs vary. Existing schema directories with a valid `schemabot.yaml` are verified and
 reused automatically, including with flags. `--reuse-schema` is also accepted. Select a named

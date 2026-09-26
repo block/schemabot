@@ -18,7 +18,12 @@ import (
 // DiscoverNamespaces reads only the target catalog. It neither registers a
 // runtime nor opens the state database, so abandoning setup has no side effects.
 // MySQL stays within the DSN's database, matching the existing pull semantics.
-func DiscoverNamespaces(ctx context.Context, engine, dsn string) ([]string, error) {
+// Vitess keyspaces come from the PlanetScale API, the same source pull uses.
+func DiscoverNamespaces(ctx context.Context, target Target) ([]string, error) {
+	if target.Engine == "vitess" {
+		return listPlanetScaleKeyspaces(ctx, target)
+	}
+	engine, dsn := target.Engine, target.DSN
 	if strings.TrimSpace(dsn) == "" {
 		return nil, fmt.Errorf("set a database connection before discovering namespaces")
 	}
