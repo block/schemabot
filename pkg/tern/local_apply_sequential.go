@@ -54,6 +54,9 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		if action == taskHandover {
 			return
 		}
+		if action == taskAbort {
+			return
+		}
 		if action == taskStopped {
 			stoppedByUser = true
 			break
@@ -111,7 +114,7 @@ const (
 	taskContinue taskAction = iota // Task completed successfully, proceed to next
 	taskFailed                     // Task failed, stop processing
 	taskStopped                    // Task/apply was stopped by user, stop processing
-	taskSkip                       // Task should be skipped (error fetching state)
+	taskSkip                       // Task is already terminal in storage; move on to the next
 	taskAbort                      // Current owner should exit without changing final state
 	taskHandover                   // This drive's context was cancelled; the apply stays active for another driver to claim
 )
@@ -125,16 +128,20 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 			"task_id", task.TaskIdentifier, "table", task.TableName)
 		return taskHandover
 	}
+	// The re-read decides whether this task's DDL runs, so a read that cannot
+	// answer ends the drive attempt without finalizing: skipping the task would
+	// let finalization record the apply completed with this task's DDL never run.
+	// The apply stays active for a later drive to re-read the task and run it.
 	freshTask, err := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 	if err != nil {
-		logger.Error("failed to fetch task state",
-			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-		return taskSkip
+		logger.Error("re-reading task state before start failed; current apply owner will exit for operator retry",
+			append(task.LogAttrs(), "error", err)...)
+		return taskAbort
 	}
 	if freshTask == nil {
-		logger.Error("task not found",
-			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State)
-		return taskSkip
+		logger.Error("task row not found when re-reading it before start; current apply owner will exit for operator retry",
+			task.LogAttrs()...)
+		return taskAbort
 	}
 	if freshTask.State == state.Task.Stopped {
 		logger.Info("task was stopped by user, skipping", "task_id", task.TaskIdentifier, "table", task.TableName)

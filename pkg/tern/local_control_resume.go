@@ -402,6 +402,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		if action == taskHandover {
 			return
 		}
+		if action == taskAbort {
+			return
+		}
 		if action == taskStopped {
 			stoppedByUser = true
 			break
