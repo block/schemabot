@@ -507,6 +507,125 @@ func TestConflictCheckStampsOwnProcessTerminalReport(t *testing.T) {
 	assert.NotNil(t, running.CompletedAt)
 }
 
+// retainedTerminalReports are the outcomes the engine keeps reporting for the
+// last schema change it ran on a database after that work has ended.
+var retainedTerminalReports = map[string]*engine.ProgressResult{
+	"completed": {State: engine.StateCompleted, Message: "Complete"},
+	"failed":    {State: engine.StateFailed, Message: "Failed"},
+}
+
+// staleLeaseApply builds a running apply whose lease went stale while held by
+// owner, so the conflict check probes the engine rather than deferring to a
+// live driver.
+func staleLeaseApply(id int64, owner string) *storage.Apply {
+	return &storage.Apply{
+		ID: id, ApplyIdentifier: "apply-stale-lease", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Running,
+		LeaseOwner: owner, LeaseToken: "token-stale",
+		UpdatedAt: time.Now().Add(-2 * storage.ApplyLeaseStaleAfter),
+	}
+}
+
+// An apply queued behind a finished one has a pending task and no lease yet,
+// while the engine still reports the finished apply's outcome for the same
+// database. That outcome is not the queued task's: the task has not started, so
+// it stays pending for its driver to run, and the next dispatch is refused
+// rather than admitted over queued work.
+func TestConflictCheckKeepsQueuedTaskPendingUnderAnEarlierRunsOutcome(t *testing.T) {
+	for name, report := range retainedTerminalReports {
+		t.Run(name, func(t *testing.T) {
+			queued := &storage.Task{
+				ID:             15,
+				ApplyID:        151,
+				TaskIdentifier: "task-queued",
+				Database:       "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				TableName:      "users",
+				State:          state.Task.Pending,
+			}
+			client := newNoActiveChangeClient("testdb", []*storage.Task{queued})
+			client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: &storage.Apply{
+				ID: 151, ApplyIdentifier: "apply-queued", Database: "testdb",
+				DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Pending,
+			}}
+			client.spiritEngine = &fakeControlEngine{progressResult: report}
+
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+			require.Error(t, err, "queued work must refuse a new apply")
+			assert.Contains(t, err.Error(), "schema change already in progress")
+			assert.Equal(t, state.Task.Pending, queued.State, "the queued task must stay pending so its driver runs it")
+			assert.Empty(t, queued.ErrorMessage)
+			assert.Nil(t, queued.CompletedAt)
+		})
+	}
+}
+
+// Even under a lease this process last held, a task that is not in flight has
+// no engine work a terminal report could be the outcome of. A pending task
+// stays pending, and a retryable task keeps its retry rather than being failed
+// permanently, whichever outcome the engine retained.
+func TestConflictCheckLeavesTaskNotInFlightUnderOwnProcessTerminalReport(t *testing.T) {
+	for _, taskState := range []string{state.Task.Pending, state.Task.FailedRetryable} {
+		for name, report := range retainedTerminalReports {
+			t.Run(taskState+"/"+name, func(t *testing.T) {
+				task := &storage.Task{
+					ID:             16,
+					ApplyID:        161,
+					TaskIdentifier: "task-not-in-flight",
+					Database:       "testdb",
+					DatabaseType:   storage.DatabaseTypeMySQL,
+					TableName:      "users",
+					State:          taskState,
+				}
+				client := newNoActiveChangeClient("testdb", []*storage.Task{task})
+				client.storage.(*exactProgressStorage).applies = &mockApplyStore{
+					apply: staleLeaseApply(161, storage.LeaseOwnerProcess()+"/driver-0"),
+				}
+				client.spiritEngine = &fakeControlEngine{progressResult: report}
+				plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+				blocking, _ := client.findBlockingTask(t.Context(), []*storage.Task{task}, plan, "", "", 0, newConflictScanMemo())
+				require.True(t, blocking.blocks(), "a task that is not in flight must keep blocking")
+				assert.Equal(t, "task-not-in-flight", blocking.taskIdentifier)
+				assert.Equal(t, taskState, task.State, "the task must be left in its own state")
+				assert.Nil(t, task.CompletedAt)
+			})
+		}
+	}
+}
+
+// An in-flight task whose apply records no lease holder cannot be tied to this
+// process: the lease was released, or the work runs under an operation lease the
+// apply row does not carry, possibly on another process. A terminal report from
+// this process's engine memory therefore does not settle the task; it keeps
+// blocking for the driver that owns it.
+func TestConflictCheckRefusesUnattributedTerminalReport(t *testing.T) {
+	for name, report := range retainedTerminalReports {
+		t.Run(name, func(t *testing.T) {
+			running := &storage.Task{
+				ID:             17,
+				ApplyID:        171,
+				TaskIdentifier: "task-unattributed",
+				Database:       "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				TableName:      "users",
+				State:          state.Task.Running,
+			}
+			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+			client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: staleLeaseApply(171, "")}
+			client.spiritEngine = &fakeControlEngine{progressResult: report}
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+			blocking, _ := client.findBlockingTask(t.Context(), []*storage.Task{running}, plan, "", "", 0, newConflictScanMemo())
+			require.True(t, blocking.blocks(), "an unattributed terminal report must not settle the task")
+			assert.Equal(t, "task-unattributed", blocking.taskIdentifier)
+			assert.Equal(t, state.Task.Running, running.State, "the task must be left for its driver")
+			assert.Nil(t, running.CompletedAt)
+		})
+	}
+}
+
 // Crash recovery survives ownership gating: when the stale lease belongs to a
 // process that crashed (a restarted process has a new pid, so even the same pod
 // counts as another process) and the engine has no active work, the abandoned

@@ -991,6 +991,12 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
 //     investigate if the same task repeats here without converging.
+//   - "unattributed_terminal_report": this process's engine memory reports
+//     terminal for an in-flight task, but the apply records no lease holder
+//     (its lease was released, or its work runs under an operation lease), so
+//     the report cannot be attributed to this process and was refused. The
+//     driver that claims the apply or its operation settles the task;
+//     investigate if the same task repeats here without converging.
 //   - "pending_control_request": a stopped task's apply carries an operator
 //     command a driver has not delivered yet, so the task still holds its
 //     database. A sustained rate means commands are queued but not being
