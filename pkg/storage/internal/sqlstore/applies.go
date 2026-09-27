@@ -550,6 +550,13 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 // and the drive settles it from the terminal parent, which is what ends it.
 // Gating on a fresh lease instead would end the reservation while a live
 // driver's heartbeat lags.
+//
+// An operation parked at a cutover barrier has no such release. The
+// stale-active claim leaves it to the cutover claim, and the cutover claim
+// will not start it behind a failed earlier sibling under halt. It keeps the
+// rollout's targets reserved anyway: the engine may still hold the run that
+// parked it, so releasing the targets on the row's state alone would admit a
+// second drive beside that run.
 func operationInProgressPredicate(dialect Dialect, alias string) (string, []any) {
 	notInProgress := terminalApplyStates()
 	notInProgress = append(notInProgress, state.ApplyOperation.Pending, state.ApplyOperation.FailedRetryable)

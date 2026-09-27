@@ -652,14 +652,10 @@ func TestApplies(t *testing.T, h Harness) {
 
 	// A rollout across region-a, region-b, and region-c records failed after
 	// region-a fails, while region-b's operation is still running and region-c's
-	// never started. A second apply on region-b is refused until that operation
-	// settles, because a driver is still changing that deployment. region-a and
-	// region-c are free at once: nothing is running on either.
-	// A rollout's parent can record failed while one of its operations is still
-	// running. Until that operation reaches a terminal state the rollout is still
-	// live: its drive can reopen the parent and start the never-started
-	// operation. So the whole target set stays reserved, with or without a lease
-	// on the running operation, and frees once nothing is in progress.
+	// never started. Until region-b's operation reaches a terminal state the
+	// rollout is still live: its drive can reopen the parent and start region-c.
+	// So a second apply is refused on all three deployments, with or without a
+	// lease on the running operation, and each frees once nothing is in progress.
 	t.Run("Create_RefusesRolloutTargetsWhileAnOperationIsInProgress", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -765,24 +761,29 @@ func TestApplies(t *testing.T, h Harness) {
 	// Moving an existing apply back into an active state runs the same check as
 	// creating one, so neither the general update nor the resume claim of a
 	// stopped apply can activate an apply on a target of a rollout whose parent
-	// recorded failed while one of its operations is still running.
+	// recorded failed while one of its operations is still running. The rollout
+	// is keyed to region-a, runs on region-b, and has not started region-c, so
+	// neither apply being activated shares a deployment with the running
+	// operation: one is on the rollout's own deployment, which has no operation
+	// row, and the other is on the operation that never started.
 	t.Run("Activate_RefusesTargetsOfRolloutWithAnOperationInProgress", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_activate_started_operation_db", storage.DatabaseTypeMySQL)
-		stopped := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_stopped_on_region_b", 9330, state.Apply.Stopped, "production", "region-b")
-		waiting := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_pending_on_region_c", 9331, state.Apply.Pending, "production", "region-c")
-		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_failed_early", 9332, state.Apply.Pending, "production", "region-a")
-		for _, deployment := range []string{"region-b", "region-c"} {
-			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: deployment, OperationKey: "schema", State: state.ApplyOperation.Running})
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_failed_early", 9332, state.Apply.Failed, "production", "region-a")
+		waiting := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_pending_on_region_a", 9331, state.Apply.Pending, "production", "region-a")
+		stopped := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_stopped_on_region_c", 9330, state.Apply.Stopped, "production", "region-c")
+		for deployment, operationState := range map[string]string{
+			"region-b": state.ApplyOperation.Running,
+			"region-c": state.ApplyOperation.Pending,
+		} {
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: deployment, OperationKey: "schema", State: operationState})
 			require.NoError(t, err)
 		}
-		rollout.State = state.Apply.Failed
-		require.NoError(t, store.Applies().Update(ctx, rollout))
 
 		waiting.State = state.Apply.Running
 		err := store.Applies().Update(ctx, waiting)
-		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "the update must not activate an apply on a deployment another apply is still changing")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "the update must not activate an apply on the deployment of a rollout still in progress")
 		assert.Contains(t, err.Error(), "apply_rollout_failed_early")
 
 		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -795,7 +796,7 @@ func TestApplies(t *testing.T, h Harness) {
 		require.False(t, alreadyPending)
 		claimed, err := store.Applies().ClaimApplyByID(ctx, stopped.ID, "driver-a")
 		require.NoError(t, err)
-		assert.Nil(t, claimed, "the resume claim must not take a deployment another apply is still changing")
+		assert.Nil(t, claimed, "the resume claim must not take a deployment of a rollout still in progress")
 		settled, err := store.ControlRequests().GetByOperation(ctx, stopped.ID, storage.ControlOperationStart)
 		require.NoError(t, err)
 		require.NotNil(t, settled)
