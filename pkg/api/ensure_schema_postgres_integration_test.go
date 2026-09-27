@@ -92,6 +92,34 @@ func TestEnsureSchemaPostgres_ConvergesMissingColumn(t *testing.T) {
 	assert.True(t, columns["caller"])
 }
 
+// A storage database converged by a binary that did not record lock acquirers
+// gains the nullable acquirer columns on the next startup — both are
+// metadata-only, so they converge without manual remediation — and the locks
+// already held read back with no acquirer recorded.
+func TestEnsureSchemaPostgres_AddsLockAcquirerColumns(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	_, err := db.ExecContext(ctx, "ALTER TABLE locks DROP COLUMN acquired_by, DROP COLUMN acquired_by_operator_groups")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO locks (database_name, database_type, repository, pull_request, owner) VALUES ('orders', 'postgresql', 'org/repo', 7, 'org/repo#7')")
+	require.NoError(t, err)
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+
+	columns, err := postgresTableColumns(ctx, db, "locks")
+	require.NoError(t, err)
+	assert.True(t, columns["acquired_by"])
+	assert.True(t, columns["acquired_by_operator_groups"])
+	var acquiredBy, acquiredByGroups sql.NullString
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT acquired_by, acquired_by_operator_groups FROM locks WHERE database_name = 'orders'").Scan(&acquiredBy, &acquiredByGroups))
+	assert.False(t, acquiredBy.Valid, "a lock held across the schema change records no acquirer")
+	assert.False(t, acquiredByGroups.Valid)
+}
+
 // A convergence changes the shape of SchemaBot's storage and nothing else in
 // it: it records no row about itself in the database it is converging. That is
 // what lets one implementation serve both a boot against a database with no

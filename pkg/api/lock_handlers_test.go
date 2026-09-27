@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -39,6 +40,10 @@ func (s *capturingLockStore) Release(_ context.Context, database, dbType, owner 
 func (s *capturingLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
 	s.getDatabase = database
 	s.getType = dbType
+	if s.acquired != nil {
+		stored := *s.acquired
+		return &stored, nil
+	}
 	return &storage.Lock{DatabaseName: database, DatabaseType: dbType, Owner: "Org/Repo#42"}, nil
 }
 
@@ -105,4 +110,58 @@ func TestLockHandlersCanonicalizeIdentityKeys(t *testing.T) {
 			tc.assertCall(t, store)
 		})
 	}
+}
+
+// A lock acquired through the API records the verified caller behind it and
+// every operator group of the locked database that caller belongs to, so a
+// later release can tell whose grant the lock falls under. The owner string
+// the caller sends plays no part in it.
+func TestLockAcquireRecordsAcquirer(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	body := `{"database":"payments","database_type":"mysql","owner":"cli:someone-else@laptop"}`
+
+	acquire := func(t *testing.T, cfg *ServerConfig, user *auth.User) *storage.Lock {
+		t.Helper()
+		store := &capturingLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: store}, cfg, nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockAcquire, user, http.MethodPost, "/api/locks/acquire", body)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		require.NotNil(t, store.acquired)
+		assert.Equal(t, "cli:someone-else@laptop", store.acquired.Owner)
+		assert.NotContains(t, rec.Body.String(), user.Subject,
+			"the acquirer is recorded, not returned on the lock read surface")
+		return store.acquired
+	}
+
+	t.Run("scoped operator records every operator group they hold on the database", func(t *testing.T) {
+		cfg := scopedWriteConfig()
+		payments := cfg.Databases["payments"]
+		payments.OperatorGroups = []string{"payments-team", "payments-oncall"}
+		cfg.Databases["payments"] = payments
+
+		lock := acquire(t, cfg, &auth.User{Subject: "bob", Groups: []string{"payments-team", "payments-oncall", "unrelated"}})
+		require.NotNil(t, lock.Acquirer)
+		assert.Equal(t, "bob", lock.Acquirer.Subject)
+		assert.Equal(t, []string{"payments-oncall", "payments-team"}, lock.Acquirer.OperatorGroups)
+	})
+
+	t.Run("admin outside every operator group records no groups", func(t *testing.T) {
+		lock := acquire(t, scopedWriteConfig(), &auth.User{Subject: "alice", Groups: []string{"schema-admins"}})
+		require.NotNil(t, lock.Acquirer)
+		assert.Equal(t, "alice", lock.Acquirer.Subject)
+		assert.NotNil(t, lock.Acquirer.OperatorGroups, "a recorded acquirer with no groups is an empty list, not an unrecorded one")
+		assert.Empty(t, lock.Acquirer.OperatorGroups)
+	})
+
+	t.Run("admin who is also an operator records the operator group", func(t *testing.T) {
+		lock := acquire(t, scopedWriteConfig(), &auth.User{Subject: "carol", Groups: []string{"schema-admins", "payments-team"}})
+		require.NotNil(t, lock.Acquirer)
+		assert.Equal(t, "carol", lock.Acquirer.Subject)
+		assert.Equal(t, []string{"payments-team"}, lock.Acquirer.OperatorGroups)
+	})
+
+	t.Run("deployment with no scoped operator grants records no acquirer", func(t *testing.T) {
+		lock := acquire(t, testServerConfig(), &auth.User{Subject: "dave", Groups: []string{"payments-team"}})
+		assert.Nil(t, lock.Acquirer)
+	})
 }
