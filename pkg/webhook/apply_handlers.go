@@ -577,6 +577,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     should re-drive; the same window may succeed on a later attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (silent fan-out skip, no pending confirmation, gate blocks, lock conflict,
+//     a pending confirmation planned for another environment,
 //     stale-schema/base/plan rejection, or a hand-off to executeApply, which
 //     may itself fail before dispatching). A schema-request failure is terminal
 //     only when handleSchemaRequestError recognizes it as a user-facing
@@ -810,8 +811,33 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		}
 		return true, fmt.Errorf("apply-confirm command load confirmation plan %s#%d: %w", repo, pr, planLoadErr)
 	}
+	// The pending confirmation authorizes the environment it was planned for
+	// and nothing else: confirming it into another environment would dispatch
+	// there with no plan comment, no disclosure, and no ordering gate for that
+	// environment. The lock is kept, so the operator can still confirm the
+	// environment the plan was made for.
+	if confirmationPlanTargetsOtherEnvironment(storedPlan, environment) {
+		h.logger.Warn("apply-confirm rejected: pending confirmation was planned for another environment",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_environment", storedPlan.Environment,
+			"pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
+		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
+			fmt.Sprintf(msgConfirmationPlanForOtherEnvironment, storedPlan.Environment, environment, storedPlan.Environment, environment))
+		return false, nil
+	}
 	if rejected := h.assertPlanStillCurrent(ctx, repo, pr, installationID, storedPlan, confirmPRInfo.HeadSHA, environment, requestedBy); rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, existingLock.PendingPlanID, "stale-plan rejection")
+		return false, nil
+	}
+
+	// Re-check environment ordering at confirm time, as the review and checks
+	// gates are: a prior environment can stop being clean between the plan and
+	// its confirmation without the PR HEAD moving. A block keeps the pending
+	// confirmation pinned, since the plan itself is not known to be wrong.
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command prior environment gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
+		h.logger.Info("apply-confirm blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		return false, nil
 	}
 
