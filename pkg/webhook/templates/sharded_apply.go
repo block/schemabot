@@ -52,6 +52,13 @@ type ShardedApplyData struct {
 	// when the stored plan carries none.
 	VSchemaChanges []apitypes.VSchemaChange
 
+	// Finalizes holds the keyspaces the engine finalizes without a VSchema
+	// change, one per finalizer operation, rendered in their own section so
+	// the comment never shows a VSchema change the plan did not carry. They
+	// are work the apply runs rather than schema changes, so they do not count
+	// toward the outcome line's grammar or the status line's fraction.
+	Finalizes []ShardedFinalize
+
 	// Tenant is the deployment's tenant identity, appended as --tenant to every
 	// pasteable command hint so copied commands address this deployment in
 	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
@@ -175,6 +182,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	writeShardedFailure(&sb, data)
 	writeShardKeyspaceSections(&sb, data.Keyspaces)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
+	writeFinalizeStatus(&sb, data.Finalizes)
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
@@ -202,8 +210,42 @@ func RenderShardedApplySummaryComment(data ShardedApplyData) string {
 	writeShardedFailure(&sb, data)
 	writeShardKeyspaceSections(&sb, data.Keyspaces)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
+	writeFinalizeStatus(&sb, data.Finalizes)
 	writeShardedFooter(&sb, data)
 	return sb.String()
+}
+
+// ShardedFinalize is one keyspace's finalize in a sharded apply: the keyspace,
+// and its finalizer's display status in the VSchema status vocabulary
+// ("applying", "applied", "failed", "cancelled", "stopped", or "" for pending).
+type ShardedFinalize struct {
+	Keyspace string
+	Status   string
+}
+
+// writeFinalizeStatus writes the section listing each keyspace the engine
+// finalizes without a VSchema change, with its finalizer's status.
+func writeFinalizeStatus(sb *strings.Builder, finalizes []ShardedFinalize) {
+	if len(finalizes) == 0 {
+		return
+	}
+	sb.WriteString("\n### Finalize\n\n")
+	for _, f := range finalizes {
+		fmt.Fprintf(sb, "**%s**: %s\n\n", inlineCode(f.Keyspace), finalizeStatusLabel(f.Status))
+	}
+}
+
+// finalizeStatusLabel renders a finalizer's display status as the Finalize
+// section words it.
+func finalizeStatusLabel(status string) string {
+	switch status {
+	case "applying":
+		return "Finalizing..."
+	case "applied":
+		return "Finalized"
+	default:
+		return ui.VSchemaStatusLabel(status)
+	}
 }
 
 // allShardStatuses flattens every keyspace's shards in resolved order, feeding

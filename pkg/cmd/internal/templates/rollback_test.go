@@ -29,3 +29,17 @@ func TestRollbackAndProgressPreservePlanSQL(t *testing.T) {
 		})
 	}
 }
+
+// A rollback whose only work in payments is the engine's finalize, and whose
+// commerce keyspace reverts its VSchema, lists both under the changes the
+// operator is asked to confirm, rather than an empty list.
+func TestRollbackPlanListsFinalizeOnlyKeyspaces(t *testing.T) {
+	plan := &apitypes.PlanResponse{Database: "shop", DatabaseType: "vitess", Environment: "staging", Changes: []*apitypes.SchemaChangeResponse{
+		{Namespace: "commerce", Metadata: map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.NeedsFinalizerMetadataKey: "true"}},
+		{Namespace: "payments", Metadata: map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"}},
+	}}
+
+	preview := ansi.Strip(captureStdout(t, func() { WriteRollbackPlan(plan, "apply-example-85") }))
+
+	assert.Contains(t, preview, "The following changes will be applied to rollback:\n\n  commerce: VSchema update\n  payments: finalized by the engine once every shard's DDL has landed\n")
+}

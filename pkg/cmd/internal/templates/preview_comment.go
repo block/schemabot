@@ -379,6 +379,7 @@ func previewCommentShardedAllOutput() {
 		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
 		{"APPLY ACROSS MULTIPLE KEYSPACES", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyMultiKeyspace()) }},
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
+		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
 		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}

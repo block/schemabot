@@ -135,6 +135,12 @@ func describeDriftDiff(diff tern.ChangeSetDiff) string {
 	if n := len(diff.MissingVSchema); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d missing vschema", n))
 	}
+	if n := len(diff.UnexpectedFinalize); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d unexpected finalize", n))
+	}
+	if n := len(diff.MissingFinalize); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d missing finalize", n))
+	}
 	if len(parts) == 0 {
 		return ""
 	}

@@ -159,6 +159,20 @@ func (sc *SchemaChangeResponse) HasVSchemaChange() bool {
 	return sc.Metadata[VSchemaDiffMetadataKey] != "" || sc.Metadata[VSchemaChangedMetadataKey] == "true"
 }
 
+// NeedsFinalizerMetadataKey is the plan change-metadata key ("true") under
+// which an engine asks for a namespace's group finalizer to run once its DDL
+// lands, independent of a VSchema change. It mirrors
+// engine.MetadataNeedsFinalizer; apitypes keeps its own copy so this package
+// stays dependency-free.
+const NeedsFinalizerMetadataKey = "needs_finalizer"
+
+// NeedsFinalizer reports whether the engine asked for this namespace to be
+// finalized after its DDL. The finalizer is work an apply runs, so a plan whose
+// only work is a finalizer still has changes.
+func (sc *SchemaChangeResponse) NeedsFinalizer() bool {
+	return sc.Metadata[NeedsFinalizerMetadataKey] == "true"
+}
+
 // VSchemaChange is one keyspace's VSchema application state for display. Each
 // keyspace that changes its VSchema carries its own status and diff so a
 // multi-keyspace deploy renders each keyspace independently.
