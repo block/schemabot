@@ -1156,8 +1156,46 @@ func checkDatabaseKeyStrings(keys map[checkDatabaseKey]bool) []string {
 // blocking, and a plan-only row passes.
 //
 // A plan that finishes after the PR moved to a newer commit settles nothing,
-// because the newer commit's cleanup and plans own those rows.
+// because the newer commit's cleanup and plans own those rows. The PR head is
+// read only when there is an old-type row to settle, so a plan of a database
+// whose type never changed adds no GitHub call.
 func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
+	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("load checks for %s#%d to settle %s rows under types other than %s: %w", repo, pr, databaseName, databaseType, err)
+	}
+	planned := newCheckDatabaseKey(databaseName, databaseType)
+	var oldTypeChecks []*storage.Check
+	replacedEnvironments := map[string]bool{}
+	for _, check := range checks {
+		if isAggregateCheck(check) {
+			continue
+		}
+		key := checkDatabaseKeyForCheck(check)
+		if key.databaseName != planned.databaseName {
+			continue
+		}
+		if key.databaseType == planned.databaseType {
+			if check.HeadSHA == headSHA {
+				replacedEnvironments[storage.CanonicalKey(check.Environment)] = true
+			}
+			continue
+		}
+		if check.HeadSHA == headSHA {
+			h.logger.Debug("check under a database's old type is already settled on this commit",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
+		}
+		oldTypeChecks = append(oldTypeChecks, check)
+	}
+	if len(oldTypeChecks) == 0 {
+		h.logger.Debug("plan of a database leaves no rows under an old type to settle",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", databaseName, "database_type", databaseType)
+		return nil
+	}
+
 	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		return fmt.Errorf("verify head of %s#%d before settling %s rows under types other than %s on %s: %w", repo, pr, databaseName, databaseType, headSHA, err)
@@ -1176,33 +1214,8 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghc
 	for _, environment := range environments {
 		plannedEnvironments[storage.CanonicalKey(environment)] = true
 	}
-	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
-	if err != nil {
-		return fmt.Errorf("load checks for %s#%d to settle %s rows under types other than %s: %w", repo, pr, databaseName, databaseType, err)
-	}
-	planned := newCheckDatabaseKey(databaseName, databaseType)
-	replacedEnvironments := map[string]bool{}
-	for _, check := range checks {
-		if !isAggregateCheck(check) && checkDatabaseKeyForCheck(check) == planned && check.HeadSHA == headSHA {
-			replacedEnvironments[storage.CanonicalKey(check.Environment)] = true
-		}
-	}
-	for _, check := range checks {
-		if isAggregateCheck(check) {
-			continue
-		}
-		key := checkDatabaseKeyForCheck(check)
-		if key.databaseName != planned.databaseName || key.databaseType == planned.databaseType {
-			continue
-		}
+	for _, check := range oldTypeChecks {
 		environment := storage.CanonicalKey(check.Environment)
-		if check.HeadSHA == headSHA {
-			h.logger.Debug("check under a database's old type is already settled on this commit",
-				"repo", repo, "pr", pr, "head_sha", headSHA,
-				"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
-				"environment", check.Environment, "check_id", check.ID)
-			continue
-		}
 		if plannedEnvironments[environment] && !replacedEnvironments[environment] {
 			h.logger.Warn("check under a database's old type keeps blocking because no result under its new type is stored for this environment on this commit",
 				"repo", repo, "pr", pr, "head_sha", headSHA,

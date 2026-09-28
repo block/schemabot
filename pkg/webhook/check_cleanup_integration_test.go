@@ -429,6 +429,25 @@ func TestE2EStaleCheckCleanupDatabaseTypeChangedPlanOnSupersededCommitSettlesNot
 	assert.Equal(t, checkConclusionActionRequired, mysqlCheck.Conclusion)
 }
 
+// A database whose type never changed is planned. Its plan has no row under
+// an old type to settle, so it does not read the PR head from GitHub: a
+// GitHub that cannot serve the PR does not fail the plan's settle step.
+func TestE2EStaleCheckCleanupPlanWithoutOldTypeRowsReadsNoPullRequest(t *testing.T) {
+	dbName := "webhook_stale_type_unchanged"
+	svc := setupE2EService(t, dbName)
+	seedPlanCheck(t, svc, "newsha222", "staging", storage.DatabaseTypeMySQL, dbName, 101, true, checkConclusionActionRequired)
+
+	server := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	h := newE2EHandler(t, svc, client)
+	ghClient, err := h.clientForRepo("octocat/hello-world", 0)
+	require.NoError(t, err)
+	require.NoError(t, h.settleChecksReplacedByNewType(t.Context(), ghClient, "octocat/hello-world", 1, "newsha222", dbName, storage.DatabaseTypeMySQL))
+}
+
 // seedOldTypeChecks stores a plan-only row under a database's previous type,
 // Strata, for each environment, as a PR's earlier commit leaves them before
 // the database is planned as MySQL.
