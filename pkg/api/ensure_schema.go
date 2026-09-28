@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
@@ -588,8 +590,8 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 	}
 
 	tableChanges := flatTableChanges(changes)
-	if removesSchemaObjects(changes) {
-		logger.Info("the outstanding delta removes schema objects; converging it in one engine run rather than one per table",
+	if holdsUnsafeChange(changes) {
+		logger.Info("the outstanding delta holds a statement the engine called unsafe; converging it in one engine run rather than one per table",
 			"database", storageSchemaNamespace,
 			"ddl_count", len(tableChanges),
 		)
@@ -649,16 +651,27 @@ const storageConvergencePollInterval = 100 * time.Millisecond
 //
 // What per-table runs give up is the shared cutover a combined run performs.
 // A convergence that fails partway now leaves some tables converged and the
-// rest as they were. That is safe for a delta that only adds, for reasons the
-// bootstrap already rests on. Every statement in such a delta is additive
-// (AV-9), and the gate deciding that runs over the whole delta before the first
-// run starts, so a converged table holds strictly more than it did and none is
-// left in a shape between two releases. The convergence records nothing about
-// itself (AV-12), so the next boot re-derives what is left from the live schema
-// rather than from a marker this one would have had to write. And an instance
-// whose convergence returned an error fails startup rather than serving against
-// storage it did not finish converging, so no pod queries a half-converged
-// schema.
+// rest as they were. The split is safe for a delta holding no statement the
+// engine called unsafe. It rests on that verdict alone, and not on every such
+// statement being an addition. Most are. But the verdict also passes statements
+// that take something away without destroying anything, such as dropping an
+// index already made invisible or a column change the engine's linter
+// accepts. The claim is narrower than "a converged table holds strictly more
+// than it did". Each statement is one the bootstrap already runs unattended on
+// any boot, because it is exactly what the refusal gate lets through (AV-9).
+// So a partial convergence leaves storage in a state the bootstrap would have
+// been willing to produce one statement at a time. The gate runs over the
+// whole delta before the first run starts, so no run carries a statement it
+// withheld. The convergence records nothing about itself (AV-12), so the next
+// boot re-derives what is left from the live schema rather than from a marker
+// this one would have had to write. And an instance whose convergence returned
+// an error fails startup rather than serving against storage it did not finish
+// converging, so no pod queries a half-converged schema.
+//
+// That makes the split exactly as safe as the verdict it reads, and no safer.
+// A change to what the engine calls unsafe changes what gets split, which is
+// the intent: the one verdict decides both what the bootstrap runs unattended
+// and what it runs one table at a time.
 //
 // Stopping partway was already reachable either way: a budget that expires or a
 // platform stopping the instance (AV-13) ends a combined run exactly as
@@ -668,18 +681,18 @@ const storageConvergencePollInterval = 100 * time.Millisecond
 // per-table runs leave the tables that finished converged, so the next boot
 // starts from where this one stopped.
 //
-// None of that reasoning survives a delta that removes something. A partial
-// result is then a storage schema missing an object the rest of the fleet may
-// still be reading, and no later boot puts it back: the next diff reads the
-// removal as already done. So a delta holding any statement the engine called
-// unsafe — reachable only where destroying storage state was explicitly
-// permitted (AV-9) — converges in one run, exactly as it did before tables were
-// split apart. The split is an optimization of the path that only adds, and it
-// is confined to it.
+// None of that reasoning survives a delta holding a statement the engine
+// called unsafe. A partial result can then be a storage schema missing an
+// object the rest of the fleet may still be reading, and no later boot puts it
+// back: the next diff reads the removal as already done. So such a delta,
+// reachable only where destroying storage state was explicitly permitted
+// (AV-9), converges in one run, as every delta did before tables were split
+// apart. The split is an optimization of the path the bootstrap runs
+// unattended, and it is confined to it.
 type storageConvergenceRun struct {
 	// changes is the whole plan for this run. A per-table run carries one
-	// table's statements; the single run a removing delta converges in carries
-	// all of them.
+	// table's statements; the single run a delta holding an unsafe statement
+	// converges in carries all of them.
 	changes []engine.SchemaChange
 	// table is the table this run converges, for logs and for the observations
 	// reported while it runs. It is empty on the run that converges a whole
@@ -727,15 +740,18 @@ func storagePhaseOf(op ddl.StatementType) int {
 	}
 }
 
-// removesSchemaObjects reports whether a planned convergence takes anything
-// away. It is asked of the engine's own per-statement verdict rather than of
-// the statement text, so it stays the same question the refusal gate asks.
+// holdsUnsafeChange reports whether a planned convergence holds any statement
+// the engine called unsafe. It reads the engine's own per-statement verdict
+// rather than the statement text, so it asks the same question the refusal gate
+// asks. It does not ask whether anything is removed: a statement can take
+// something away and still not be unsafe, and such a statement is split like
+// any other.
 //
-// A delta reaching here with a removal in it is one a deployment or an
-// operator explicitly permitted (AV-9); the default path has already withheld
-// every such statement, and what is left of a partitioned one carries only its
-// additions.
-func removesSchemaObjects(changes []engine.SchemaChange) bool {
+// A delta reaching here with an unsafe statement in it is one a deployment or
+// an operator explicitly permitted (AV-9). The default path has already
+// withheld every such statement, and what is left of a partitioned one carries
+// only its additions.
+func holdsUnsafeChange(changes []engine.SchemaChange) bool {
 	for _, sc := range changes {
 		for _, tc := range sc.TableChanges {
 			if tc.IsUnsafe {
@@ -747,8 +763,8 @@ func removesSchemaObjects(changes []engine.SchemaChange) bool {
 }
 
 // storageConvergenceRuns splits a planned convergence into the runs that
-// execute it: one per table where every statement adds, and a single run over
-// the whole delta where any of them removes something.
+// execute it: one per table where the engine called no statement unsafe, and a
+// single run over the whole delta where it called any of them unsafe.
 //
 // The order is deliberate on both keys. Phase first, so the statements stay in
 // the order a single engine run would have executed them in. Then table name,
@@ -758,7 +774,7 @@ func removesSchemaObjects(changes []engine.SchemaChange) bool {
 // a partial convergence something an operator can reason about instead of
 // something they have to go and read.
 func storageConvergenceRuns(changes []engine.SchemaChange) []storageConvergenceRun {
-	if removesSchemaObjects(changes) {
+	if holdsUnsafeChange(changes) {
 		return wholeDeltaConvergenceRun(changes)
 	}
 	return perTableConvergenceRuns(changes)
@@ -857,21 +873,19 @@ func applyStorageConvergenceRun(ctx context.Context, eng engine.Engine, dsn stri
 		return convergenceStopReason(ctx, o.convergenceTimeout, run.totalDDL, logger)
 	}
 
-	logger.Info("converging storage table",
-		"database", storageSchemaNamespace,
-		"table", run.table,
-		"run", run.position,
-		"run_count", run.runCount,
-		"ddl_count", run.runDDL,
-	)
+	if run.table != "" {
+		logger.Info("converging storage table", append(run.logAttrs(), "ddl_count", run.runDDL)...)
+	} else {
+		logger.Info("converging storage tables in one engine run", append(run.logAttrs(), "ddl_count", run.runDDL)...)
+	}
 
 	if _, err := eng.Apply(ctx, &engine.ApplyRequest{
 		Database:    storageSchemaNamespace,
 		Changes:     run.changes,
 		Credentials: &engine.Credentials{DSN: dsn},
 	}); err != nil {
-		return fmt.Errorf("apply storage schema change to table %q (run %d of %d): %w",
-			run.table, run.position, run.runCount, err)
+		return fmt.Errorf("apply storage schema change to %s (run %d of %d): %w",
+			run.target(), run.position, run.runCount, err)
 	}
 
 	// Wait for this run to complete by polling Progress. The engine runs the
@@ -891,8 +905,8 @@ func applyStorageConvergenceRun(ctx context.Context, eng engine.Engine, dsn stri
 			if ctx.Err() != nil {
 				return stopConvergence(ctx, eng, dsn, o.convergenceTimeout, run.totalDDL, logger)
 			}
-			return fmt.Errorf("check progress of storage schema change to table %q (run %d of %d): %w",
-				run.table, run.position, run.runCount, err)
+			return fmt.Errorf("check progress of storage schema change to %s (run %d of %d): %w",
+				run.target(), run.position, run.runCount, err)
 		}
 
 		// Straight out of the poll the wait already runs — an operator watching
@@ -902,19 +916,13 @@ func applyStorageConvergenceRun(ctx context.Context, eng engine.Engine, dsn stri
 		if progress.State == engine.StateFailed {
 			// Surface the cause in an Error log here — callers typically wrap the
 			// returned error as a structured attribute, which is easy to miss in
-			// log search. Include the table, the run's place in the convergence,
+			// log search. Include the tables, the run's place in the convergence,
 			// and the underlying message so a failed bootstrap is triageable from
 			// the message line alone, including how much of it had already run.
 			logger.Error("storage schema change failed; SchemaBot storage will not initialize",
-				"database", storageSchemaNamespace,
-				"table", run.table,
-				"run", run.position,
-				"run_count", run.runCount,
-				"ddl_count", run.totalDDL,
-				"error", progress.ErrorMessage,
-			)
-			return fmt.Errorf("storage schema change to table %q failed (run %d of %d, %d change(s) planned): %s",
-				run.table, run.position, run.runCount, run.totalDDL, progress.ErrorMessage)
+				append(run.logAttrs(), "ddl_count", run.totalDDL, "error", progress.ErrorMessage)...)
+			return fmt.Errorf("storage schema change to %s failed (run %d of %d, %d change(s) planned): %s",
+				run.target(), run.position, run.runCount, run.totalDDL, progress.ErrorMessage)
 		}
 
 		if progress.State.IsTerminal() {
@@ -937,6 +945,52 @@ func applyStorageConvergenceRun(ctx context.Context, eng engine.Engine, dsn stri
 		case <-ticker.C:
 		}
 	}
+}
+
+// tables names every table this run converges, in name order and each once.
+// A per-table run has one; the run over a whole delta has all of the delta's.
+func (r storageConvergenceRun) tables() []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, sc := range r.changes {
+		for _, tc := range sc.TableChanges {
+			if !seen[tc.Table] {
+				seen[tc.Table] = true
+				names = append(names, tc.Table)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// target names what this run converges, for an error message: the one table
+// of a per-table run, or every table the run over a whole delta carries. A run
+// over a whole delta has no single table, and naming none would print an empty
+// name where the operator looks for the table that failed.
+func (r storageConvergenceRun) target() string {
+	if r.table != "" {
+		return fmt.Sprintf("table %q", r.table)
+	}
+	quoted := make([]string, 0, len(r.changes))
+	for _, name := range r.tables() {
+		quoted = append(quoted, strconv.Quote(name))
+	}
+	return "tables " + strings.Join(quoted, ", ")
+}
+
+// logAttrs is the triage set for a log about this run: the storage database,
+// what the run converges, and its place in the convergence. A per-table run
+// logs its table; the run over a whole delta logs every table it carries,
+// under a key of its own, rather than an empty table.
+func (r storageConvergenceRun) logAttrs() []any {
+	attrs := []any{"database", storageSchemaNamespace}
+	if r.table != "" {
+		attrs = append(attrs, "table", r.table)
+	} else {
+		attrs = append(attrs, "tables", r.tables())
+	}
+	return append(attrs, "run", r.position, "run_count", r.runCount)
 }
 
 // observe narrows one engine poll to what an operator is watching for. The

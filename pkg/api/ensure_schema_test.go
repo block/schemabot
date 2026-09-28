@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"strings"
@@ -401,13 +402,14 @@ func TestStorageConvergenceRuns(t *testing.T) {
 	})
 
 	// Splitting a delta apart means a convergence that fails partway leaves
-	// some of it applied. That is harmless while every statement adds, and is
-	// not harmless once one of them removes something: a storage schema left
-	// missing an object the fleet still reads is not a state a later boot
-	// repairs, because the next diff reads the removal as already done. A
-	// delta holding any statement the engine called unsafe therefore converges
-	// in one run, the way every delta did before tables were split apart.
-	t.Run("a delta that removes something converges in one run", func(t *testing.T) {
+	// some of it applied. That is harmless while every statement is one the
+	// bootstrap runs unattended, and is not harmless once the engine calls one
+	// of them unsafe: a storage schema left missing an object the fleet still
+	// reads is not a state a later boot repairs, because the next diff reads
+	// the removal as already done. A delta holding any statement the engine
+	// called unsafe therefore converges in one run, the way every delta did
+	// before tables were split apart.
+	t.Run("a delta holding an unsafe statement converges in one run", func(t *testing.T) {
 		t.Parallel()
 		removal := alter("applies")
 		removal.DDL = "ALTER TABLE `applies` DROP COLUMN `caller`"
@@ -418,10 +420,10 @@ func TestStorageConvergenceRuns(t *testing.T) {
 			Namespace:    "schemabot",
 			TableChanges: []engine.TableChange{alter("plans"), removal, alter("tasks")},
 		}}
-		require.True(t, removesSchemaObjects(changes))
+		require.True(t, holdsUnsafeChange(changes))
 
 		runs := storageConvergenceRuns(changes)
-		require.Len(t, runs, 1, "a delta that removes something must not be split across runs")
+		require.Len(t, runs, 1, "a delta holding an unsafe statement must not be split across runs")
 		assert.Equal(t, changes, runs[0].changes, "the one run carries the whole delta")
 		assert.Empty(t, runs[0].table, "a run over the whole delta is about no single table")
 		assert.Equal(t, 1, runs[0].position)
@@ -430,14 +432,31 @@ func TestStorageConvergenceRuns(t *testing.T) {
 		assert.Equal(t, 3, runs[0].totalDDL)
 	})
 
-	t.Run("a delta that only adds is split", func(t *testing.T) {
+	t.Run("a delta with no unsafe statement is split", func(t *testing.T) {
 		t.Parallel()
 		changes := []engine.SchemaChange{{
 			Namespace:    "schemabot",
 			TableChanges: []engine.TableChange{alter("plans"), alter("applies")},
 		}}
-		assert.False(t, removesSchemaObjects(changes))
+		assert.False(t, holdsUnsafeChange(changes))
 		assert.Len(t, storageConvergenceRuns(changes), 2)
+	})
+
+	// The split reads the engine's verdict, not the statement. A statement
+	// can take something away without the engine calling it unsafe, such as
+	// dropping an index already made invisible, and that statement is one the
+	// bootstrap runs unattended like any other, so it is split like any other.
+	t.Run("a removal the engine did not call unsafe is split", func(t *testing.T) {
+		t.Parallel()
+		invisible := alter("applies")
+		invisible.DDL = "ALTER TABLE `applies` DROP INDEX `idx_invisible`"
+
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), invisible},
+		}}
+		assert.False(t, holdsUnsafeChange(changes))
+		assert.Equal(t, []string{"applies", "plans"}, runTables(storageConvergenceRuns(changes)))
 	})
 }
 
@@ -566,6 +585,89 @@ func (e *recordingApplyEngine) Progress(ctx context.Context, _ *engine.ProgressR
 
 func (e *recordingApplyEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	return &engine.ControlResult{}, nil
+}
+
+// failingProgressEngine accepts a run and reports it failed on the first poll,
+// which is the path a convergence takes when the engine rejects a statement.
+// Every other method is the embedded nil interface.
+type failingProgressEngine struct {
+	engine.Engine
+}
+
+func (e *failingProgressEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	return &engine.ApplyResult{}, nil
+}
+
+func (e *failingProgressEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{
+		State:        engine.StateFailed,
+		ErrorMessage: "Duplicate entry 'x' for key 'idx_unique'",
+	}, nil
+}
+
+// A failed convergence names what failed, in the error the bootstrap returns
+// and in the log an operator searches for. A per-table run names its table. A
+// run over a whole delta has no single table, so it names every table it
+// carries rather than printing an empty name where the operator looks for the
+// one that failed.
+func TestApplyStorageConvergenceRunNamesWhatFailed(t *testing.T) {
+	t.Parallel()
+
+	alter := func(table, ddlText string, unsafe bool) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementAlterTable,
+			DDL:       ddlText,
+			IsUnsafe:  unsafe,
+		}
+	}
+	converge := func(t *testing.T, run storageConvergenceRun) (string, error) {
+		t.Helper()
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		err := applyStorageConvergenceRun(t.Context(), &failingProgressEngine{}, closedPortDSN, run,
+			ensureSchemaOptions{convergenceTimeout: time.Minute}, logger)
+		return logBuf.String(), err
+	}
+
+	t.Run("a per-table run names its table", func(t *testing.T) {
+		t.Parallel()
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace: "schemabot",
+			TableChanges: []engine.TableChange{
+				alter("tasks", "ALTER TABLE `tasks` ADD UNIQUE INDEX `idx_unique` (`x`)", false),
+			},
+		}})
+		require.Len(t, runs, 1)
+
+		logs, err := converge(t, runs[0])
+		require.EqualError(t, err, "storage schema change to table \"tasks\" failed (run 1 of 1, 1 change(s) planned): "+
+			"Duplicate entry 'x' for key 'idx_unique'")
+		assert.Contains(t, logs, `msg="converging storage table"`)
+		assert.Contains(t, logs, "table=tasks")
+	})
+
+	t.Run("a run over a whole delta names every table it carries", func(t *testing.T) {
+		t.Parallel()
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace: "schemabot",
+			TableChanges: []engine.TableChange{
+				alter("tasks", "ALTER TABLE `tasks` ADD UNIQUE INDEX `idx_unique` (`x`)", false),
+				alter("applies", "ALTER TABLE `applies` DROP COLUMN `caller`", true),
+				alter("tasks", "ALTER TABLE `tasks` ADD COLUMN `note` TEXT NULL", false),
+			},
+		}})
+		require.Len(t, runs, 1)
+		require.Empty(t, runs[0].table, "the run under test is the one over the whole delta")
+
+		logs, err := converge(t, runs[0])
+		require.EqualError(t, err, "storage schema change to tables \"applies\", \"tasks\" failed (run 1 of 1, 3 change(s) planned): "+
+			"Duplicate entry 'x' for key 'idx_unique'")
+		assert.Contains(t, logs, `msg="converging storage tables in one engine run"`)
+		assert.Contains(t, logs, "tables=\"[applies tasks]\"")
+		assert.NotContains(t, logs, `table=""`, "no log about the run may name an empty table")
+		assert.NotContains(t, logs, "table= ", "no log about the run may name an empty table")
+	})
 }
 
 // A convergence stopped between two runs stops there. The engine executes a
