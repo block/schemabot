@@ -102,7 +102,7 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Environment", "Where are you working? Start with development if you’re trying things out.", value(cmd.Environment, "development")},
 		{"Connect your database", "Use a connection variable you’ve already set. Confirm it below, or edit the variable name.", value(cmd.DSN, "env:DATABASE_URL")},
 		{"PlanetScale organization", "Which PlanetScale organization owns this database?", cmd.Organization},
-		{"Connect the PlanetScale API", "Use a variable holding a service token as name:value. SchemaBot opens deploy requests with it.", value(cmd.APIToken, "env:PLANETSCALE_TOKEN")},
+		{"Connect the PlanetScale API", "Use a service token scoped to this database, stored as TOKEN_ID:TOKEN_SECRET.\nEnter env:VARIABLE or file:/absolute/path.\nPermissions: https://github.com/block/schemabot/blob/main/docs/init.md#configure-the-planetscale-service-token", value(cmd.APIToken, "env:PLANETSCALE_TOKEN")},
 		{"Connect SchemaBot’s state database", "Plans and progress live in a separate database. It can share your application’s server.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
 		{"Namespaces", "Which namespaces would you like to bring in? You can list several, separated by commas.", strings.Join(cmd.Namespaces, ", ")},
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
@@ -150,8 +150,10 @@ func (m *initWizard) hint(step int) string {
 		switch step {
 		case stepName:
 			return "Use your PlanetScale database name. SchemaBot addresses the database by it."
+		case stepDSN:
+			return "Use the host, username, and password for your main branch.\nThese are database credentials, separate from your API token.\nhttps://planetscale.com/docs/api/reference/create_password"
 		case stepStorageDSN:
-			return "Use a separate MySQL database for SchemaBot’s plans and progress."
+			return "SchemaBot needs a separate MySQL database to store plans and progress.\nUse that MySQL server’s connection details here."
 		}
 	}
 	return m.fields[step].hint
@@ -438,15 +440,23 @@ func (m *initWizard) contentView() string {
 		if m.step == stepEngine {
 			b.WriteString(bold.Render("Let’s connect your database.") + "\n\n")
 			b.WriteString(wrap.Render("Connect your database, bring its schema into your project, and get ready for your first change.") + "\n\n")
-		} else if m.step != stepDSN && m.step != stepStorageDSN {
+		} else if m.step != stepDSN && m.step != stepStorageDSN && m.step != stepAPIToken {
 			b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
 		}
 		if m.step <= stepName && m.existingProject != "" {
 			b.WriteString(wrap.Render(muted.Render(m.existingProject)) + "\n\n")
 		}
 		if m.step == stepDSN || m.step == stepStorageDSN {
-			b.WriteString(bold.Render(f.label) + "\n\n")
-			if m.isVitess() && m.step == stepStorageDSN {
+			label := f.label
+			if m.isVitess() {
+				if m.step == stepDSN {
+					label = "Connect to your Vitess database"
+				} else {
+					label = "Store SchemaBot’s plans and progress"
+				}
+			}
+			b.WriteString(bold.Render(label) + "\n\n")
+			if m.isVitess() {
 				b.WriteString(wrap.Render(muted.Render(m.hint(m.step))) + "\n\n")
 			}
 			b.WriteString(wrap.Render(m.connectionEditorView()))
@@ -468,7 +478,7 @@ func (m *initWizard) contentView() string {
 			b.WriteString(m.input.View() + "\n\n")
 			if m.connectionStep(m.step) {
 				b.WriteString(wrap.Render(m.connectionSummary) + "\n\n")
-				b.WriteString(muted.Render("Credentials stay in your environment.") + "\n\n")
+				b.WriteString(muted.Render("The token stays in your environment or credential file.") + "\n\n")
 				if m.checkingConnection {
 					b.WriteString(m.spinner.View() + " Checking connection…\n\n")
 				}

@@ -146,8 +146,7 @@ its own requests. See [PlanetScale's approval rules](https://planetscale.com/doc
    ```
 
    Or use `env:PLANETSCALE_TOKEN` if that variable already contains the same value. Set it
-   before launching the wizard, and keep it available to later SchemaBot commands. The
-   wizard's `name:value` wording refers to the token ID and secret, not its display name.
+   before launching the wizard, and keep it available to later SchemaBot commands.
 
 The wizard checks the token by listing keyspaces on `main`. This confirms read access, not
 all of the write permissions above. If setup succeeds but an apply is denied, check the

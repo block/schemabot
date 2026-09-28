@@ -608,6 +608,8 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, stepDSN, m.step)
 	require.Contains(t, m.View(), "vtgate:3306")
+	require.Contains(t, m.View(), "Connect to your Vitess database")
+	require.Contains(t, m.View(), "create_password")
 	wizardKey(m, tea.KeyEnter)
 	m.Update(initConnectionMsg{generation: m.generation})
 	wizardKey(m, tea.KeyEnter)
@@ -619,6 +621,8 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, stepAPIToken, m.step)
 	require.Contains(t, m.View(), `Token: "tok-name"`)
+	require.Contains(t, m.View(), "TOKEN_ID:TOKEN_SECRET")
+	require.Contains(t, m.View(), "planetscale-service-token")
 	require.NotContains(t, m.View(), "tok-secret")
 	var checked localsetup.Target
 	m.checkAPI = func(_ context.Context, target localsetup.Target) error { checked = target; return nil }
@@ -630,6 +634,8 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, stepStorageDSN, m.step)
 	require.Contains(t, m.View(), "separate MySQL database")
+	require.Contains(t, m.View(), "Store SchemaBot’s plans and progress")
+	require.NotContains(t, m.View(), "create_password")
 	m.connectionEditor.mode = "reference"
 	var storageEngine string
 	m.check = func(_ context.Context, engine, _ string) error { storageEngine = engine; return nil }

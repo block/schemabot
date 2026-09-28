@@ -116,9 +116,9 @@ steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in
 if args.paste_connection:
     steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.8, '\x1b[200~' + pasted_connection + '\x1b[201~'), (1.0, '\r')])])
 else:
-    steps.extend([('Connect your database', [(1.5, '\r')])])
+    steps.extend([('Connect to your Vitess database' if args.engine == 'vitess' else 'Connect your database', [(2.5, '\r')])])
 if args.engine == 'vitess':
-    steps.extend([('PlanetScale organization', [(0.25, c) for c in args.organization] + [(0.7, '\r')]), ('Connect the PlanetScale API', [(1.5, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')])])
+    steps.extend([('PlanetScale organization', [(0.25, c) for c in args.organization] + [(0.7, '\r')]), ('Connect the PlanetScale API', [(4.0, '\r')]), ('Store SchemaBot’s plans and progress', [(3.0, '\r')])])
 elif args.integrated:
     steps.append(('Where should SchemaBot store its own data?', [(3.0, '\r')]))
 else:
