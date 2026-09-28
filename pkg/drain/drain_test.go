@@ -43,3 +43,19 @@ func TestWaitGivesUpAtTheTimeout(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, timeout)
 	assert.Less(t, elapsed, 5*time.Second)
 }
+
+// Work that finished at the same moment its deadline elapsed is finished, and
+// must be reported that way every time. Both cases of the select are ready
+// here, so a wait that only read the deadline branch would report abandoning
+// work that had already returned — on roughly half the shutdowns that reach
+// this, and most often on the short allotments a shared budget hands out.
+func TestWaitUntilReportsWorkThatFinishedAsItsDeadlineElapsed(t *testing.T) {
+	for range 1000 {
+		done := make(chan struct{})
+		close(done)
+		deadline := make(chan time.Time, 1)
+		deadline <- time.Now()
+
+		require.True(t, waitUntil(done, deadline))
+	}
+}

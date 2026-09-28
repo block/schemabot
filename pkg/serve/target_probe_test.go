@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -67,7 +68,7 @@ func TestStopTargetProbeCancelsAndJoinsInFlightProbe(t *testing.T) {
 
 	stopped := make(chan struct{})
 	go func() {
-		srv.stopTargetProbe()
+		srv.stopTargetProbe(nil)
 		close(stopped)
 	}()
 	select {
@@ -84,11 +85,40 @@ func TestStopTargetProbeCancelsAndJoinsInFlightProbe(t *testing.T) {
 	assert.NotContains(t, logs.String(), "outcome=", "a probe cut short by shutdown records no outcome")
 }
 
+// A probe that does not observe its cancellation — a target reachable but not
+// answering holds a pool worker, and with it the goroutine feeding that pool —
+// must not hold the close open. This stage runs first, so an unbounded wait
+// here would be a wait every bounded stage after it sits behind, on a probe of
+// a database the process is on its way to stopping using.
+func TestStopTargetProbeGivesUpOnAProbeThatIgnoresItsCancellation(t *testing.T) {
+	var logs bytes.Buffer
+	srv := &Server{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+
+	// The state startTargetProbe leaves behind: a cancel to call, and a
+	// goroutine that has not closed probeDone and never will.
+	_, cancel := context.WithCancel(t.Context())
+	srv.probeCancel = cancel
+	srv.probeDone = make(chan struct{})
+
+	budget := drain.NewBudget(time.Nanosecond)
+	require.True(t, budget.Spent())
+
+	start := time.Now()
+	srv.stopTargetProbe(budget)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, targetProbeDrainTimeout, "a spent budget leaves the join less than its own bound")
+	assert.Contains(t, logs.String(), "target probe did not exit within the shutdown drain")
+	assert.Contains(t, logs.String(), "budget_spent=true")
+	assert.NotContains(t, logs.String(), "target probe stopped",
+		"the close must not report a probe stopped while its goroutine is still running")
+}
+
 // A server whose Start launched no probe closes without waiting on one.
 func TestStopTargetProbeWithoutProbeIsNoOp(t *testing.T) {
 	var logs bytes.Buffer
 	srv := &Server{logger: slog.New(slog.NewTextHandler(&logs, nil))}
-	srv.stopTargetProbe()
+	srv.stopTargetProbe(nil)
 	assert.NotContains(t, logs.String(), "target probe stopped")
 }
 

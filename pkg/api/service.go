@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/ratelimit"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
@@ -160,7 +161,12 @@ type Service struct {
 	// but claim nothing and drive nothing. They are waited on apart from the
 	// drivers so that a reaper which does not return cannot decide whether the
 	// stages that bring this process's own drives down get to run.
-	maintenanceWg        sync.WaitGroup
+	maintenanceWg sync.WaitGroup
+	// shutdownBudget is the one deadline every stage of this service's shutdown
+	// waits inside, set by whoever is closing the service before the first stop
+	// call. Nil means unbudgeted: each stage waits its own bound in full, which
+	// is what a caller that never armed one gets.
+	shutdownBudget       atomic.Pointer[drain.Budget]
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
 	retryableExpiryEvery time.Duration

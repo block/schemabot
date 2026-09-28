@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -158,5 +159,39 @@ func TestStopPendingDropsCleanerDoesNotReportStoppedWhenItOutlastsItsDrain(t *te
 	output := logs.String()
 	assert.Contains(t, output, "background monitor did not return within the shutdown drain")
 	assert.Contains(t, output, "pending_drops_cleaner")
+	assert.NotContains(t, output, "pending drops cleaner stopped")
+}
+
+// Every monitor this service stops waits inside the one shutdown budget, so a
+// shutdown that has already spent it does not then pay five seconds a monitor.
+// The stage still runs and still warns; it gets what is left rather than a
+// fresh bound of its own, which is the difference between a close that fits a
+// termination grace period and one that sums every stage's bound.
+func TestStoppingAMonitorSpendsOnlyWhatIsLeftOfTheShutdownBudget(t *testing.T) {
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
+
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	_, cancel := context.WithCancel(t.Context())
+	svc.pendingDropsCancel = cancel
+
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	svc.pendingDropsWg.Go(func() { <-stuck })
+
+	budget := drain.NewBudget(time.Nanosecond)
+	require.True(t, budget.Spent())
+	svc.SetShutdownBudget(budget)
+
+	start := time.Now()
+	svc.StopPendingDropsCleaner()
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, monitorDrainTimeout, "a spent budget leaves the monitor less than its own bound")
+
+	output := logs.String()
+	assert.Contains(t, output, "background monitor did not return within the shutdown drain")
+	assert.Contains(t, output, "budget_spent=true")
 	assert.NotContains(t, output, "pending drops cleaner stopped")
 }

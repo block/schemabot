@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -93,4 +95,35 @@ func TestDurableWebhookClaimsClearWhenTheirDriveReturns(t *testing.T) {
 
 	release()
 	assert.Empty(t, h.durableWebhookClaimsSnapshot())
+}
+
+// A shutdown whose earlier stages already spent the budget does not then wait
+// this pool's full ten seconds on top. The drain still runs and still names
+// what it abandoned; it just gets what is left of the shared deadline, which is
+// what keeps a shutdown where several stages hang inside the deployment's
+// termination grace period rather than the sum of every stage's bound.
+func TestStopDurableWebhookDispatchSpendsOnlyWhatIsLeftOfTheShutdownBudget(t *testing.T) {
+	h := newDurableDriverHandler(t, newScriptedWebhookEventStore(), nil, nil)
+	h.durableWebhookPollInterval = time.Hour
+
+	var logs bytes.Buffer
+	h.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	h.StartDurableWebhookDispatch(t.Context())
+
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	h.durableWebhookWg.Go(func() { <-stuck })
+
+	budget := drain.NewBudget(time.Nanosecond)
+	require.True(t, budget.Spent())
+	h.SetShutdownBudget(budget)
+
+	start := time.Now()
+	h.StopDurableWebhookDispatch()
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, durableWebhookDrainTimeout, "a spent budget leaves the drain less than its own bound")
+	assert.Contains(t, logs.String(), "did not return within the shutdown drain")
+	assert.Contains(t, logs.String(), "budget_spent=true")
 }
