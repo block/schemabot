@@ -2287,6 +2287,21 @@ func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 	assert.NotContains(t, result, "Retry the apply command")
 }
 
+func TestRenderApplyBlockedByStalePriorEnvCheck(t *testing.T) {
+	result := RenderApplyBlockedByStalePriorEnvCheck("staging",
+		"0123456789abcdef0123456789abcdef01234567", "abcdef1234567890abcdef1234567890abcdef12")
+
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
+	assert.Contains(t, result, "The `staging` check for this PR was recorded on commit `0123456`, but this apply read the schema at commit `abcdef1`.")
+	assert.Contains(t, result, "Re-check `staging` on the PR head with:")
+	assert.NotContains(t, result, "latest commit",
+		"the head can move while the command runs, so the comment must not claim which commit is newer")
+	assert.Contains(t, result, "schemabot plan -e staging")
+	assert.Contains(t, result, "apply `staging`")
+	assert.NotContains(t, result, "could not find a completed")
+	assert.NotContains(t, result, "Retry the apply command")
+}
+
 func TestRenderApplyBlockedByUntrustedPriorEnvCheck(t *testing.T) {
 	result := RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"schemabot-staging"})
 

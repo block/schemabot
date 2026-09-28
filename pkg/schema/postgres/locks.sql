@@ -7,6 +7,8 @@ CREATE TABLE locks (
   owner varchar(255) NOT NULL,
   pending_plan_id varchar(255) NOT NULL DEFAULT '',
   disclosed_copy_discard boolean NOT NULL DEFAULT FALSE,
+  acquired_by varchar(255) DEFAULT NULL,
+  acquired_by_operator_groups jsonb DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id)

@@ -5,6 +5,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -14,7 +15,7 @@ import (
 
 // lockColumns lists all columns for SELECT queries.
 const lockColumns = `id, database_name, database_type, repository, pull_request, owner,
-	pending_plan_id, disclosed_copy_discard, created_at, updated_at`
+	pending_plan_id, disclosed_copy_discard, acquired_by, acquired_by_operator_groups, created_at, updated_at`
 
 // lockStore implements storage.LockStore using MySQL.
 type lockStore struct {
@@ -40,18 +41,25 @@ func canonicalizeLock(lock *storage.Lock) {
 // or rollback attempt's confirmation plan must be the one the corresponding
 // confirm command loads, and its disclosure record travels with it. A re-acquire
 // that passes an empty PendingPlanID (CLI) leaves the existing values intact.
+// A re-acquire never changes the recorded acquirer: only the insert that
+// creates the row writes it.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 	canonicalizeLock(lock)
+	acquirer, err := encodeLockAcquirer(lock)
+	if err != nil {
+		return err
+	}
 	op := fmt.Sprintf("acquire lock for %s/%s owner=%s", lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	return withLockRetry(ctx, s.classifier, op, func() error {
-		return s.acquireOnce(ctx, lock)
+		return s.acquireOnce(ctx, lock, acquirer)
 	})
 }
 
 // acquireOnce performs a single claim attempt. Concurrent same-owner callers
 // racing to claim the same key can hit a transient InnoDB lock conflict on the
-// INSERT below; Acquire retries those. Acquire canonicalizes the lock first.
-func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
+// INSERT below; Acquire retries those. Acquire canonicalizes the lock and
+// encodes its acquirer first.
+func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquirer lockAcquirerColumns) error {
 	existing, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {
 		return fmt.Errorf("read existing lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
@@ -69,9 +77,11 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 	// Get above. The INSERT loser sees a duplicate-key error, not a held lock:
 	// re-read and treat a same-owner winner as success.
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, lock.DisclosedCopyDiscard)
+		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard,
+			acquired_by, acquired_by_operator_groups)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, lock.DisclosedCopyDiscard,
+		acquirer.subject, acquirer.operatorGroups)
 	if err == nil {
 		return nil
 	}
@@ -94,6 +104,38 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 		return storage.ErrLockHeld
 	}
 	return s.refreshPendingConfirmation(ctx, lock, winner)
+}
+
+// lockAcquirerColumns holds the insert values of the acquired_by and
+// acquired_by_operator_groups columns; a nil value is written as NULL.
+type lockAcquirerColumns struct {
+	subject        any
+	operatorGroups any
+}
+
+// encodeLockAcquirer renders the acquirer columns for a lock insert: both NULL
+// when no verified caller was behind the acquire, else the subject and the
+// operator groups as a JSON array — an empty array, never NULL, when the
+// caller held none — so a recorded acquirer is always distinguishable from an
+// unrecorded one.
+func encodeLockAcquirer(lock *storage.Lock) (lockAcquirerColumns, error) {
+	if lock.Acquirer == nil {
+		return lockAcquirerColumns{}, nil
+	}
+	if lock.Acquirer.Subject == "" {
+		return lockAcquirerColumns{}, fmt.Errorf("lock acquirer for %s/%s owner=%s names no subject",
+			lock.DatabaseName, lock.DatabaseType, lock.Owner)
+	}
+	groups := lock.Acquirer.OperatorGroups
+	if groups == nil {
+		groups = []string{}
+	}
+	encoded, err := json.Marshal(groups)
+	if err != nil {
+		return lockAcquirerColumns{}, fmt.Errorf("marshal lock acquirer operator groups for %s/%s owner=%s: %w",
+			lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
+	}
+	return lockAcquirerColumns{subject: lock.Acquirer.Subject, operatorGroups: string(encoded)}, nil
 }
 
 // refreshPendingConfirmation overwrites the stored confirmation plan reference,
@@ -333,15 +375,45 @@ func scanLocks(rows *sql.Rows) ([]*storage.Lock, error) {
 // scanLockInto scans lock data from any scanner (Row or Rows).
 func scanLockInto(s scanner) (*storage.Lock, error) {
 	var lock storage.Lock
+	var acquiredBy sql.NullString
+	var acquiredByGroups []byte
 
 	err := s.Scan(
 		&lock.ID, &lock.DatabaseName, &lock.DatabaseType,
 		&lock.Repository, &lock.PullRequest, &lock.Owner,
-		&lock.PendingPlanID, &lock.DisclosedCopyDiscard, &lock.CreatedAt, &lock.UpdatedAt,
+		&lock.PendingPlanID, &lock.DisclosedCopyDiscard,
+		&acquiredBy, &acquiredByGroups,
+		&lock.CreatedAt, &lock.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	acquirer, err := lockAcquirerFromColumns(&lock, acquiredBy, acquiredByGroups)
+	if err != nil {
+		return nil, err
+	}
+	lock.Acquirer = acquirer
 	return &lock, nil
+}
+
+// lockAcquirerFromColumns rebuilds the acquirer from its stored columns. A row
+// carrying operator groups but no subject was not written by
+// encodeLockAcquirer, so it is reported rather than read as either answer.
+func lockAcquirerFromColumns(lock *storage.Lock, acquiredBy sql.NullString, acquiredByGroups []byte) (*storage.LockAcquirer, error) {
+	if !acquiredBy.Valid {
+		if len(acquiredByGroups) > 0 {
+			return nil, fmt.Errorf("lock %s/%s owner=%s records acquirer operator groups without an acquirer",
+				lock.DatabaseName, lock.DatabaseType, lock.Owner)
+		}
+		return nil, nil
+	}
+	acquirer := &storage.LockAcquirer{Subject: acquiredBy.String}
+	if len(acquiredByGroups) > 0 {
+		if err := json.Unmarshal(acquiredByGroups, &acquirer.OperatorGroups); err != nil {
+			return nil, fmt.Errorf("unmarshal acquired_by_operator_groups for lock %s/%s owner=%s: %w",
+				lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
+		}
+	}
+	return acquirer, nil
 }

@@ -170,7 +170,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
 	// Environment ordering enforcement: prior server-configured environments must be clean before applying.
-	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, prInfo.HeadSHA, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command prior environment gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -846,7 +846,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// gates are: a prior environment can stop being clean between the plan and
 	// its confirmation without the PR HEAD moving. A block keeps the pending
 	// confirmation pinned, since the plan itself is not known to be wrong.
-	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, confirmPRInfo.HeadSHA, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command prior environment gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply-confirm blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)

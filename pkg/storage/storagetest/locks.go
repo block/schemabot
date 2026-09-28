@@ -229,6 +229,133 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.False(t, stored.DisclosedCopyDiscard)
 	})
 
+	// The acquirer is who a lock row belongs to for authorization, so it is
+	// read back by every lock read, and it is a property of the row: nothing
+	// short of releasing the lock and acquiring a new one changes it, which is
+	// what lets a reader pin the acquirer it checked by the lock's ID.
+	t.Run("Acquire_RecordsAcquirer", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "acquirer_db",
+			DatabaseType: storage.DatabaseTypeMySQL,
+			Repository:   "org/repo",
+			Owner:        "cli:bob@laptop",
+			Acquirer: &storage.LockAcquirer{
+				Subject:        "bob@example.com",
+				OperatorGroups: []string{"orders-oncall", "orders-operators"},
+			},
+		}))
+		want := &storage.LockAcquirer{
+			Subject:        "bob@example.com",
+			OperatorGroups: []string{"orders-oncall", "orders-operators"},
+		}
+
+		stored, err := store.Locks().Get(ctx, "acquirer_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, want, stored.Acquirer)
+
+		listed, err := store.Locks().List(ctx)
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.Equal(t, want, listed[0].Acquirer)
+
+		byPR, err := store.Locks().GetByPR(ctx, "org/repo", 0)
+		require.NoError(t, err)
+		require.Len(t, byPR, 1)
+		assert.Equal(t, want, byPR[0].Acquirer)
+
+		// A same-owner re-acquire by somebody else, carrying a new pending
+		// plan, refreshes the plan and leaves the acquirer as recorded.
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName:  "acquirer_db",
+			DatabaseType:  storage.DatabaseTypeMySQL,
+			Repository:    "org/repo",
+			Owner:         "cli:bob@laptop",
+			PendingPlanID: "plan-2",
+			Acquirer:      &storage.LockAcquirer{Subject: "mallory@example.com", OperatorGroups: []string{"other-team"}},
+		}))
+		refreshed, err := store.Locks().Get(ctx, "acquirer_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, refreshed)
+		assert.Equal(t, "plan-2", refreshed.PendingPlanID)
+		assert.Equal(t, stored.ID, refreshed.ID)
+		assert.Equal(t, want, refreshed.Acquirer, "a re-acquire must not change who the lock row belongs to")
+
+		// Only a new lock row carries a new acquirer, and it is a new ID.
+		require.NoError(t, store.Locks().Release(ctx, "acquirer_db", storage.DatabaseTypeMySQL, "cli:bob@laptop"))
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "acquirer_db",
+			DatabaseType: storage.DatabaseTypeMySQL,
+			Repository:   "org/repo",
+			Owner:        "cli:carol@desktop",
+			Acquirer:     &storage.LockAcquirer{Subject: "carol@example.com", OperatorGroups: []string{"orders-operators"}},
+		}))
+		reacquired, err := store.Locks().Get(ctx, "acquirer_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, reacquired)
+		assert.NotEqual(t, stored.ID, reacquired.ID)
+		assert.Equal(t, &storage.LockAcquirer{Subject: "carol@example.com", OperatorGroups: []string{"orders-operators"}},
+			reacquired.Acquirer)
+	})
+
+	// A verified caller who holds none of the database's operator groups is
+	// still a recorded acquirer, and must read back as one: "recorded, shares
+	// a grant with no operator" and "never recorded" are different answers.
+	t.Run("Acquire_RecordsAcquirerWithoutOperatorGroups", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "admin_acquirer_db",
+			DatabaseType: storage.DatabaseTypeMySQL,
+			Repository:   "org/repo",
+			Owner:        "cli:alice@laptop",
+			Acquirer:     &storage.LockAcquirer{Subject: "alice@example.com"},
+		}))
+
+		stored, err := store.Locks().Get(ctx, "admin_acquirer_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		require.NotNil(t, stored.Acquirer)
+		assert.Equal(t, "alice@example.com", stored.Acquirer.Subject)
+		assert.Empty(t, stored.Acquirer.OperatorGroups)
+	})
+
+	// Locks taken without a verified caller behind them (a PR's apply) record
+	// no acquirer at all.
+	t.Run("Acquire_WithoutAcquirer", func(t *testing.T) {
+		store := h.NewStorage(t)
+
+		stored := CreateLock(t, store, "no_acquirer_db", storage.DatabaseTypeMySQL)
+		require.NotNil(t, stored)
+		assert.Nil(t, stored.Acquirer)
+	})
+
+	// An acquirer that names nobody is a caller bug, not an unrecorded
+	// acquirer: storing it would be indistinguishable from a real identity
+	// with an empty name, so the acquire is refused and nothing is written.
+	t.Run("Acquire_RejectsAcquirerWithoutSubject", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		err := store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "nameless_db",
+			DatabaseType: storage.DatabaseTypeMySQL,
+			Repository:   "org/repo",
+			Owner:        "cli:someone@laptop",
+			Acquirer:     &storage.LockAcquirer{OperatorGroups: []string{"orders-operators"}},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "names no subject")
+
+		stored, err := store.Locks().Get(ctx, "nameless_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, stored)
+	})
+
 	t.Run("Release", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

@@ -571,6 +571,7 @@ Common fail-closed scenarios:
 | Accepted apply cannot be tracked | The engine accepted work, but SchemaBot could not store or reload the apply ID needed for progress and check ownership. | Treat this as a storage or apply-tracking incident. Inspect engine state and the `applies` table before retrying; do not rely on branch protection until a new plan reflects the live schema. |
 | Accepted apply could not update required check state | The apply may be running, but SchemaBot could not mark the stored check row `in_progress` with the accepted `apply_id`. | Inspect the accepted apply, storage health, and aggregate check. Retry only after confirming the live schema state and stored check state agree. |
 | Prior-environment check state could not be read | SchemaBot cannot prove that an earlier environment is clean. | Treat this as a SchemaBot storage health issue. Restore storage access, then repeat the blocked command, for example `schemabot apply -e production`. Do not bypass the promotion gate unless this is an explicit breakglass decision. |
+| Prior-environment check recorded on another commit | The earlier environment's stored check state names a commit other than the one the apply read its schema from, usually because a push landed after that environment was applied. Its result says nothing about the commit being applied. | Comment `schemabot plan -e <prior-environment>` to re-check the earlier environment on the PR head. If the plan finds changes, apply it and wait for the SchemaBot check to succeed, then repeat the blocked command. |
 | Stored check ownership miss | A newer plan or apply owns the stored check state for the same PR, environment, and database. Letting the older driver write would overwrite newer safety state. | Inspect the newest apply for that repo/PR/environment/database with the CLI, for example `schemabot status -d <database> -e <environment>` or `schemabot progress <apply-id>`. Let the newest apply finish, or reconcile it with operator commands before retrying PR comments. |
 | Schema changes were removed while an apply may still be running | The live database may still change even though the current PR no longer represents that change. | Inspect the in-flight apply in Tern or with the CLI. If the change reached the live database, either put the schema change back in the PR and comment `schemabot plan -e <environment>` before applying again, or roll back/reconcile the live schema first. |
 | Stale in-progress row after a pod crash | Stored check state says an apply is running, but the watcher may have died before publishing the terminal result. | Comment `schemabot plan -e <environment>` or `schemabot apply -e <environment>` to trigger stale-check reconciliation. If reconciliation fails, inspect SchemaBot storage and the latest apply for that database. |
@@ -1097,11 +1098,20 @@ another SchemaBot deployment.
 
 | Prior environment state | Apply allowed? | Reason |
 | --- | --- | --- |
-| `success` | Yes | Prior environment is clean. |
-| `action_required` | No | Apply the prior environment first. |
+| `success` on the PR head commit | Yes | Prior environment is clean for the commit being applied. |
+| `action_required` on the PR head commit | No | Apply the prior environment first. |
 | `in_progress` | No | Wait for the prior environment to finish. |
-| `failure` | No | Fix and re-apply the prior environment. |
+| `failure` on the PR head commit | No | Fix and re-apply the prior environment. |
+| Completed on another commit | No | The result says nothing about the commit being applied. Re-check the prior environment on the PR head with `schemabot plan -e <prior-environment>`. |
 | No record | No | SchemaBot cannot prove the prior environment is clean. |
+
+Stored check state is one row per PR, environment, and database, not one per
+commit, so after a push the row still names the previous commit until the plan
+for the new head lands. The gate compares the row's commit with the commit the
+apply read its schema from, retries briefly while the row is missing, running,
+or on another commit, and then blocks. The block comment names both commits and
+asks for a re-check on the PR head; retrying the later apply alone does not
+help until that re-check has recorded a result on the head.
 
 The lookup path depends on which SchemaBot deployment owns the prior
 environment:

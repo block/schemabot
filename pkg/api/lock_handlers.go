@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -82,15 +84,23 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
+	acquirer, noAcquirerReason := s.config.lockAcquirer(ctx, req.Database)
+	if acquirer == nil {
+		s.logger.Debug("lock acquire records no acquirer",
+			"database", req.Database, "database_type", req.DatabaseType, "owner", req.Owner,
+			"reason", noAcquirerReason)
+	}
+
 	lock := &storage.Lock{
 		DatabaseName: req.Database,
 		DatabaseType: req.DatabaseType,
 		Owner:        req.Owner,
 		Repository:   req.Repository,
 		PullRequest:  req.PullRequest,
+		Acquirer:     acquirer,
 	}
 
-	ctx := r.Context()
 	err := s.storage.Locks().Acquire(ctx, lock)
 	if errors.Is(err, storage.ErrLockHeld) {
 		metrics.RecordLockOperation(ctx, "acquire", req.Database, "conflict")
@@ -250,6 +260,35 @@ func (s *Service) handleLockList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, LockListResponse{Locks: infos})
+}
+
+// lockAcquirer returns the verified caller to record on a lock being acquired
+// on database: the caller's subject and every operator group of that database
+// they are a member of, by configured name. Whether a scoped operator shares a
+// grant with a lock's acquirer is decided against this record, so it holds all
+// of the caller's operator groups for the database, not only the one that
+// authorized the acquire, and an empty list when they hold none (a deployment
+// admin acting through a write group alone shares a grant with no operator).
+//
+// It returns nil, with the reason, when there is no verified caller to record:
+// on a deployment with no scoped operator grants configured there is no grant
+// to share, and a request without an authenticated identity names nobody.
+func (c *ServerConfig) lockAcquirer(ctx context.Context, database string) (*storage.LockAcquirer, string) {
+	if !c.scopedWriteEnabled() {
+		return nil, DirectWriteReasonScopedLaneDisabled
+	}
+	subject, ok := auth.VerifiedSubject(ctx)
+	if !ok {
+		if _, authenticated := auth.AuthenticatedSubject(ctx); authenticated {
+			return nil, DirectWriteReasonUnverifiedIdentity
+		}
+		return nil, DirectWriteReasonMissingIdentity
+	}
+	groups := []string{}
+	if dbConfig, ok := c.DatabaseConfigs()[database]; ok {
+		groups = auth.MatchedGroups(auth.UserFromContext(ctx).Groups, trimmedNonEmpty(dbConfig.OperatorGroups))
+	}
+	return &storage.LockAcquirer{Subject: subject, OperatorGroups: groups}, ""
 }
 
 // lockToInfo converts a storage.Lock to an API LockInfo.

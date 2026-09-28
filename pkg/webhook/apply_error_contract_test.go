@@ -284,7 +284,7 @@ func TestApplyConfirmCommandCorePriorEnvironmentBlockIsTerminalAndKeepsPendingLo
 	store := newApplyConfirmContractStorage(locks)
 	store.plan.Environment = "production"
 	store.checks = &sequenceCheckStore{results: []*storage.Check{{
-		Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders",
+		Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", HeadSHA: "abc123",
 		Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true,
 	}}}
 	h, mux, comments := newApplyGateContractHandlerWithConfig(t, promotionOrderedContractConfig(), store)
