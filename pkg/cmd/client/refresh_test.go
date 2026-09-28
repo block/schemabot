@@ -2,6 +2,8 @@ package client
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -101,6 +103,106 @@ func TestResolveBearerToken(t *testing.T) {
 		assert.Contains(t, err.Error(), "expired")
 		assert.Contains(t, err.Error(), "check the local clock")
 		assert.Equal(t, "stale-token", tok, "stale token is still returned so the command can run and re-login can fix it")
+	})
+}
+
+// refreshSeen reports how many refresh_token grants the fake provider served
+// and the client ID presented with the last one.
+func (f *fakeOIDC) refreshSeen() (int, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.refreshCalls, f.refreshedFor
+}
+
+// A refresh token is renewed at the issuer and for the client it was issued
+// by. When `schemabot login --issuer --client-id` recorded that pair on the
+// profile, refresh goes there even though the profile's oidc settings name a
+// different provider, and it works on a profile with no oidc settings at all.
+// A profile saved without the pair keeps refreshing with its oidc settings.
+func TestResolveBearerTokenRefreshesAtTokenIssuer(t *testing.T) {
+	t.Run("recorded pair wins over the oidc settings", func(t *testing.T) {
+		t.Setenv("SCHEMABOT_TOKEN", "")
+		t.Setenv("SCHEMABOT_PROFILE", "")
+		configured, loggedIn := newFakeOIDC(t), newFakeOIDC(t)
+		writeConfig(t, &Config{Profiles: map[string]Profile{"default": {
+			Endpoint:      "https://schemabot.example",
+			Token:         testIDToken(`{"exp":1}`),
+			RefreshToken:  "flag-refresh-token",
+			TokenIssuer:   loggedIn.issuer(),
+			TokenClientID: "flag-client",
+			OIDC:          &OIDCLogin{Issuer: configured.issuer(), ClientID: "cli-client"},
+		}}}, 0o600)
+
+		tok, err := ResolveBearerToken(t.Context(), "", "", "")
+		require.NoError(t, err)
+		assert.Equal(t, loggedIn.refreshedIDToken, tok)
+
+		calls, clientID := loggedIn.refreshSeen()
+		assert.Equal(t, 1, calls)
+		assert.Equal(t, "flag-client", clientID)
+		calls, _ = configured.refreshSeen()
+		assert.Zero(t, calls, "the refresh token must not be sent to an issuer that did not issue it")
+
+		// The renewed tokens still came from the recorded pair, so it is kept.
+		reloaded, err := LoadConfig()
+		require.NoError(t, err)
+		saved := reloaded.Profiles["default"]
+		assert.Equal(t, loggedIn.refreshedIDToken, saved.Token)
+		assert.Equal(t, loggedIn.refreshToken, saved.RefreshToken)
+		assert.Equal(t, loggedIn.issuer(), saved.TokenIssuer)
+		assert.Equal(t, "flag-client", saved.TokenClientID)
+	})
+
+	t.Run("recorded pair refreshes a profile without oidc settings", func(t *testing.T) {
+		t.Setenv("SCHEMABOT_TOKEN", "")
+		t.Setenv("SCHEMABOT_PROFILE", "")
+		loggedIn := newFakeOIDC(t)
+		writeConfig(t, &Config{Profiles: map[string]Profile{"default": {
+			Endpoint:      "https://schemabot.example",
+			Token:         testIDToken(`{"exp":1}`),
+			RefreshToken:  "flag-refresh-token",
+			TokenIssuer:   loggedIn.issuer(),
+			TokenClientID: "flag-client",
+		}}}, 0o600)
+
+		tok, err := ResolveBearerToken(t.Context(), "", "", "")
+		require.NoError(t, err)
+		assert.Equal(t, loggedIn.refreshedIDToken, tok)
+		calls, clientID := loggedIn.refreshSeen()
+		assert.Equal(t, 1, calls)
+		assert.Equal(t, "flag-client", clientID)
+	})
+
+	t.Run("profile without the recorded pair refreshes with its oidc settings", func(t *testing.T) {
+		t.Setenv("SCHEMABOT_TOKEN", "")
+		t.Setenv("SCHEMABOT_PROFILE", "")
+		configured := newFakeOIDC(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		dir := filepath.Join(home, ".schemabot")
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		saved := fmt.Sprintf(`profiles:
+  default:
+    endpoint: https://schemabot.example
+    token: %s
+    refresh_token: old-refresh-token
+    oidc:
+      issuer: %s
+      client_id: cli-client
+`, testIDToken(`{"exp":1}`), configured.issuer())
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(saved), 0o600))
+
+		tok, err := ResolveBearerToken(t.Context(), "", "", "")
+		require.NoError(t, err)
+		assert.Equal(t, configured.refreshedIDToken, tok)
+		calls, clientID := configured.refreshSeen()
+		assert.Equal(t, 1, calls)
+		assert.Equal(t, "cli-client", clientID)
+
+		reloaded, err := LoadConfig()
+		require.NoError(t, err)
+		assert.Empty(t, reloaded.Profiles["default"].TokenIssuer)
+		assert.Empty(t, reloaded.Profiles["default"].TokenClientID)
 	})
 }
 
