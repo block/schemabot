@@ -593,7 +593,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false, nil)
 		require.Error(t, err)
 		assert.False(t, blocked, "evaluation failure must not report a merit block")
 
@@ -623,7 +623,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", true)
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", true, nil)
 		require.Error(t, err)
 		assert.False(t, blocked, "evaluation failure must not report a merit block")
 		assert.Empty(t, comments, "a durable attempt must not post per-retry evaluation-failure comments")
@@ -642,7 +642,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false, nil)
 		require.NoError(t, err)
 		assert.True(t, blocked)
 
@@ -674,7 +674,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false, nil)
 		require.NoError(t, err)
 		assert.False(t, blocked)
 		assert.Empty(t, comments, "an approved review must not draw a gate comment")

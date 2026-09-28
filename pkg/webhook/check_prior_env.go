@@ -48,6 +48,7 @@ func (h *Handler) checkPriorEnvironments(
 	environments []string,
 	installationID int64,
 	suppressRetryComments bool,
+	preflight *applyPreflight,
 ) (blocked bool, err error) {
 	config := h.service.Config()
 
@@ -65,8 +66,9 @@ func (h *Handler) checkPriorEnvironments(
 			"environment", environment,
 			"promotion_order", order)
 		metrics.RecordPromotionConfigErrorBlock(ctx, repo, database, environment)
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByUnlistedEnvironment(environment, order))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByUnlistedEnvironment(environment, order),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	}
 
@@ -92,7 +94,7 @@ func (h *Handler) checkPriorEnvironments(
 
 		if config.IsEnvironmentAllowed(priorEnv) {
 			// This instance owns the prior environment — check local database
-			blocked, err := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID, suppressRetryComments)
+			blocked, err := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID, suppressRetryComments, preflight)
 			if err != nil {
 				return false, err
 			}
@@ -101,7 +103,7 @@ func (h *Handler) checkPriorEnvironments(
 			}
 		} else {
 			// Another instance owns this environment — check GitHub Checks API
-			blocked, err := h.checkPriorEnvViaGitHub(ctx, repo, pr, database, environment, priorEnv, installationID, suppressRetryComments)
+			blocked, err := h.checkPriorEnvViaGitHub(ctx, repo, pr, database, environment, priorEnv, installationID, suppressRetryComments, preflight)
 			if err != nil {
 				return false, err
 			}
@@ -159,6 +161,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 	database, dbType, environment, priorEnv string,
 	installationID int64,
 	suppressRetryComments bool,
+	preflight *applyPreflight,
 ) (blocked bool, err error) {
 	check, err := h.waitForLocalPriorEnvCheck(ctx, repo, pr, database, dbType, environment, priorEnv)
 	if err != nil {
@@ -180,8 +183,9 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
 			"attempts", h.priorEnvCheckMaxAttemptCount())
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	}
 
@@ -200,8 +204,9 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"environment", environment, "prior_environment", priorEnv,
 			"check_status", check.Status, "check_conclusion", check.Conclusion,
 			"attempts", h.priorEnvCheckMaxAttemptCount())
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	default:
 		status := "has pending changes"
@@ -210,8 +215,9 @@ func (h *Handler) checkPriorEnvViaLocal(
 			status = "failed"
 			action = fmt.Sprintf("Fix the issue and re-apply %s", priorEnv)
 		}
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	}
 }
@@ -284,6 +290,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	database, environment, priorEnv string,
 	installationID int64,
 	suppressRetryComments bool,
+	preflight *applyPreflight,
 ) (blocked bool, err error) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
@@ -338,8 +345,9 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		for _, appSlug := range untrustedApps {
 			metrics.RecordUntrustedAggregateNamedCheck(ctx, repo, environment, appSlug, metrics.CheckTrustGatePromotion)
 		}
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName, untrustedApps))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName, untrustedApps),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	}
 
@@ -350,8 +358,9 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"environment", environment, "prior_environment", priorEnv,
 			"check_name", checkName,
 			"attempts", h.priorEnvCheckMaxAttemptCount())
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	}
 
@@ -371,8 +380,9 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"check_name", checkName,
 			"check_status", checkResult.Status, "check_conclusion", checkResult.Conclusion,
 			"attempts", h.priorEnvCheckMaxAttemptCount())
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	default:
 		status := "has pending changes"
@@ -381,8 +391,9 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			status = "failed"
 			action = fmt.Sprintf("Fix the issue and re-apply %s", priorEnv)
 		}
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action),
+			preflight.rowsAfter(ctx, gatePriorEnvironments)))
 		return true, nil
 	}
 }
