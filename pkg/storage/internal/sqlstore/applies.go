@@ -1329,12 +1329,25 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	return nil
 }
 
+// derivedStateUpdate renders the projection's compare-and-swap over applies
+// alone, with guardPredicate appended to the id-and-expected-state match. The
+// four SET placeholders bind newState, errorMessage, startedAt and completedAt.
+// started_at is stamped only when it is still NULL so the projection can move
+// the parent into an active state without ever rewinding a recorded start.
+func derivedStateUpdate(guardPredicate string) string {
+	return `
+		UPDATE applies
+		SET state = ?, error_message = ?, started_at = COALESCE(started_at, ?), completed_at = ?, updated_at = NOW()
+		WHERE id = ? AND state = ?` + guardPredicate
+}
+
 // derivedStateGuard is the lease authorization for a rollout-projection write.
-// predicate is appended to the CAS UPDATE's WHERE clause and predicateArgs holds
-// its bind values; ensureStillOwned re-checks ownership on a zero-rows result so
-// the caller can fail closed on a lost lease (nil for an unguarded write).
+// query is the complete CAS UPDATE; it binds the projected values, then applyID
+// and expectedState, then predicateArgs. ensureStillOwned re-checks ownership
+// on a zero-rows result so the caller can fail closed on a lost lease (nil for
+// an unguarded write).
 type derivedStateGuard struct {
-	predicate        string
+	query            string
 	predicateArgs    []any
 	ensureStillOwned func(ctx context.Context, db queryRower) error
 }
@@ -1344,7 +1357,16 @@ type derivedStateGuard struct {
 // mirroring taskStore.Update: a multi-operation drive advances the parent only
 // through the projection, scoped to an operation that still holds its token and
 // belongs to applyID. The apply-lease path keeps the single-operation behavior.
-func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedStateGuard, error) {
+//
+// The operation token lives on a different row from the one being written, so
+// the operation-lease statement joins that row and checks it through
+// LeaseTokenFence. A re-lease rotates the operation token and then writes the
+// parent apply in the same transaction; a token check that did not lock the
+// operation row would read it from the projection's snapshot, wait out the
+// re-lease on the parent row, and pass against the token it had just replaced.
+// The joined statement writes the same columns as derivedStateUpdate, with
+// started_at qualified because apply_operations has a column of that name.
+func derivedStateGuardForContext(ctx context.Context, dialect Dialect, applyID int64) (derivedStateGuard, error) {
 	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return derivedStateGuard{}, fmt.Errorf("invalid operation lease for apply %d: %w", applyID, storage.ErrApplyLeaseLost)
@@ -1353,11 +1375,18 @@ func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedSta
 			return derivedStateGuard{}, fmt.Errorf("operation lease for apply %d cannot write derived state for apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
 		}
 		return derivedStateGuard{
-			predicate: ` AND EXISTS (
-				SELECT 1 FROM apply_operations ao
-				WHERE ao.id = ? AND ao.apply_id = ? AND ao.lease_token = ?
-			)`,
-			predicateArgs: []any{opLease.OperationID, applyID, opLease.Token},
+			query: dialect.JoinedUpdate(
+				"applies", "a", "apply_operations", "ao", "ao.apply_id = a.id",
+				[]JoinedUpdateAssignment{
+					{Column: "state", Expr: "?"},
+					{Column: "error_message", Expr: "?"},
+					{Column: "started_at", Expr: "COALESCE(a.started_at, ?)"},
+					{Column: "completed_at", Expr: "?"},
+					{Column: "updated_at", Expr: "NOW()"},
+				},
+				"a.id = ? AND a.state = ? AND ao.id = ? AND "+dialect.LeaseTokenFence("apply_operations", "ao", "id", "lease_token"),
+			),
+			predicateArgs: []any{opLease.OperationID, opLease.Token},
 			ensureStillOwned: func(ctx context.Context, db queryRower) error {
 				return ensureOperationLeaseOwnsApply(ctx, db, opLease, applyID)
 			},
@@ -1370,7 +1399,7 @@ func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedSta
 	}
 	if hasLease {
 		return derivedStateGuard{
-			predicate:     " AND lease_token = ?",
+			query:         derivedStateUpdate(" AND lease_token = ?"),
 			predicateArgs: []any{lease.Token},
 			ensureStillOwned: func(ctx context.Context, db queryRower) error {
 				return ensureApplyLeaseStillOwned(ctx, db, lease)
@@ -1378,7 +1407,7 @@ func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedSta
 		}, nil
 	}
 
-	return derivedStateGuard{}, nil
+	return derivedStateGuard{query: derivedStateUpdate("")}, nil
 }
 
 // ensureOperationLeaseOwnsApply returns ErrApplyLeaseLost unless the operation
@@ -1408,21 +1437,15 @@ func ensureOperationLeaseOwnsApply(ctx context.Context, db queryRower, lease sto
 // miss (state no longer matches) returns swapped=false so the caller can skip
 // side-effects and reconcile on the next poll.
 func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
-	guard, err := derivedStateGuardForContext(ctx, applyID)
+	guard, err := derivedStateGuardForContext(ctx, s.dialect, applyID)
 	if err != nil {
 		return false, err
 	}
 
-	// started_at is stamped only when it is still NULL so the projection can move
-	// the parent into an active state without ever rewinding a recorded start.
 	args := []any{newState, errorMessage, startedAt, completedAt, applyID, expectedState}
 	args = append(args, guard.predicateArgs...)
 
-	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE applies
-		SET state = ?, error_message = ?, started_at = COALESCE(started_at, ?), completed_at = ?, updated_at = NOW()
-		WHERE id = ? AND state = ?%s
-	`, guard.predicate), args...)
+	result, err := s.db.ExecContext(ctx, guard.query, args...)
 	if err != nil {
 		return false, fmt.Errorf("compare-and-swap derived apply state for apply %d (%q -> %q): %w", applyID, expectedState, newState, err)
 	}

@@ -4,6 +4,7 @@ package sqlstore
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -763,6 +764,83 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 			t.Fatal("guarded write did not return after the steal committed")
 		}
 		assert.Equal(t, "pending", operationState(t, opID))
+	})
+
+	// A displaced operation driver's rollout projection must not land over the
+	// driver that re-leased its failed_retryable operation. The re-lease rotates
+	// the operation token and then charges the parent apply's retry budget in
+	// the same transaction, so a projection that started before the re-lease
+	// committed waits behind it; once the re-lease commits, the fence must see
+	// the rotated token rather than pass against the projection's snapshot.
+	t.Run("operation lease fence on the rollout projection fails closed against a concurrent re-lease", func(t *testing.T) {
+		applies := store.Applies()
+		applyID := seedApply(t, "apply-guard-projection", "tok-apply")
+		_, err := db.ExecContext(t.Context(),
+			`UPDATE applies SET state = $1, error_message = 'copy failed' WHERE id = $2`, state.Apply.FailedRetryable, applyID)
+		require.NoError(t, err)
+		opID := seedOperation(t, applyID, "op-1", state.ApplyOperation.FailedRetryable, "tok-op")
+		persistedApply := func(t *testing.T) *storage.Apply {
+			t.Helper()
+			persisted, err := applies.Get(t.Context(), applyID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			return persisted
+		}
+
+		// The re-lease stays open past the projection's start, as the claim
+		// transaction in FindNextApplyOperation does between rotating the token
+		// and charging the retry budget.
+		releaseTx, err := db.BeginTx(t.Context(), nil)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			if err := releaseTx.Rollback(); !errors.Is(err, sql.ErrTxDone) {
+				assert.NoError(t, err, "roll back the re-lease transaction")
+			}
+		})
+		_, err = releaseTx.ExecContext(t.Context(),
+			`UPDATE apply_operations SET lease_owner = 'driver-b', lease_token = 'tok-b' WHERE id = $1`, opID)
+		require.NoError(t, err)
+		_, err = releaseTx.ExecContext(t.Context(),
+			`UPDATE applies SET attempt = attempt + 1 WHERE id = $1 AND state = $2`, applyID, state.Apply.FailedRetryable)
+		require.NoError(t, err)
+
+		type projectionOutcome struct {
+			swapped bool
+			err     error
+		}
+		displacedCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "driver-a", Token: "tok-op"})
+		result := make(chan projectionOutcome, 1)
+		go func() {
+			swapped, err := applies.UpdateDerivedState(displacedCtx, applyID, state.Apply.FailedRetryable, state.Apply.Running, "", nil, nil)
+			result <- projectionOutcome{swapped: swapped, err: err}
+		}()
+
+		waitForPostgresApplyRowLockWaiter(t, db)
+		require.NoError(t, releaseTx.Commit())
+
+		select {
+		case got := <-result:
+			require.ErrorIs(t, got.err, storage.ErrApplyLeaseLost)
+			assert.False(t, got.swapped)
+		case <-time.After(reopenRaceDeadline):
+			require.FailNow(t, "displaced projection did not return after the re-lease committed")
+		}
+		displaced := persistedApply(t)
+		assert.Equal(t, state.Apply.FailedRetryable, displaced.State, "a displaced driver must not write the parent projection")
+		assert.Equal(t, "copy failed", displaced.ErrorMessage)
+		assert.Nil(t, displaced.StartedAt)
+
+		// The driver that re-leased the operation still advances the parent.
+		startedAt := time.Now().UTC().Truncate(time.Second)
+		ownerCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "driver-b", Token: "tok-b"})
+		swapped, err := applies.UpdateDerivedState(ownerCtx, applyID, state.Apply.FailedRetryable, state.Apply.Running, "", &startedAt, nil)
+		require.NoError(t, err)
+		assert.True(t, swapped)
+		advanced := persistedApply(t)
+		assert.Equal(t, state.Apply.Running, advanced.State)
+		assert.Empty(t, advanced.ErrorMessage)
+		require.NotNil(t, advanced.StartedAt, "the projection stamps started_at while it is still NULL")
+		assert.WithinDuration(t, startedAt, *advanced.StartedAt, time.Second)
 	})
 }
 
