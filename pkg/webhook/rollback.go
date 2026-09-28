@@ -668,7 +668,8 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	if err != nil {
 		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
 		h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Failed to execute rollback: "+err.Error())
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy,
+			"Failed to execute rollback. See SchemaBot server logs for details.")
 		return false, nil
 	}
 

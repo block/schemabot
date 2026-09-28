@@ -1130,6 +1130,12 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		if _, ok := errors.AsType[*planRoutingMetadataError](err); ok {
+			s.logger.Warn("apply rejected because the stored plan lacks routing metadata", "plan_id", req.PlanID,
+				"environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
 		if errors.Is(err, storage.ErrActiveApplyExists) {
 			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
@@ -1200,6 +1206,16 @@ type planEnvironmentMismatchError struct {
 	PlanID               string
 	PlanEnvironment      string
 	RequestedEnvironment string
+}
+
+type planRoutingMetadataError struct {
+	PlanID string
+	Field  string
+}
+
+func (e *planRoutingMetadataError) Error() string {
+	return fmt.Sprintf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply",
+		e.PlanID, e.Field)
 }
 
 func (e *planEnvironmentMismatchError) Error() string {
@@ -1310,14 +1326,14 @@ func (s *Service) loadPlanForApply(ctx context.Context, span trace.Span, req App
 		return nil, applyErr
 	}
 	if plan.Deployment == "" {
-		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "deployment")
+		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "deployment"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored deployment")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
 		return nil, applyErr
 	}
 	if plan.Target == "" {
-		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "target")
+		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "target"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored target")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")

@@ -5869,6 +5869,21 @@ func TestApplyHandler(t *testing.T) {
 		assert.Empty(t, tasks.tasks)
 	})
 
+	t.Run("returns bad request when the plan lacks routing metadata", func(t *testing.T) {
+		plan := executeApplyTestPlan()
+		plan.Deployment = ""
+		svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, &capturingApplyStore{})
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+		assert.Contains(t, resp.Error, `missing server-side routing metadata field "deployment"`)
+		assert.Contains(t, resp.Error, "create a new plan and retry apply")
+	})
+
 	// When the plan read itself fails, the apply is a server failure: a 500
 	// with the storage error code, and the raw storage error (which can carry
 	// hostnames) stays in the server log rather than the response.
