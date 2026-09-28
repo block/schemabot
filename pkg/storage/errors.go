@@ -18,6 +18,11 @@ var (
 	// ErrLockNotOwned is returned when attempting to release a lock not owned by caller.
 	ErrLockNotOwned = errors.New("lock not owned by caller")
 
+	// ErrLockReplaced is returned when a release pinned to one lock row finds
+	// the lock key held by a different row: the lock the caller checked was
+	// released and a new one acquired in its place.
+	ErrLockReplaced = errors.New("lock was replaced by a new lock")
+
 	// ErrLockIntentChanged is returned when an apply's captured lock owner or
 	// pending plan no longer matches at durable apply creation time.
 	ErrLockIntentChanged = errors.New("lock intent changed")

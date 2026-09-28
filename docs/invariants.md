@@ -1576,8 +1576,12 @@ classification (`pkg/auth/tiers.go`), with a structural sweep test over the rout
 Forwarded identity headers are trusted only from explicitly listed proxies, a gateway-verified
 service caller never reaches the write tier by self-asserting user headers, and every write and
 control action is attributed to the verified caller rather than to any client-supplied caller
-string. *Enforced:* the trust-anchor config, which refuses to start without one, and
-identity-precedence rules in the auth layer (`pkg/auth`).
+string. A client-supplied string never proves ownership either: a scoped operator releases a lock
+only when its recorded verified acquirer shared one of the operator's groups for that database, and
+a lock with no recorded acquirer is released only under a deployment-wide grant. *Enforced:* the
+trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
+layer (`pkg/auth`); the scoped lock release in `pkg/api/lock_handlers.go`, pinned to the lock row it
+checked (`ReleaseByID` in `pkg/storage/internal/sqlstore/locks.go`).
 
 ### AZ-4: Applying takes an authorized actor
 
