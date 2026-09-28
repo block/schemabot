@@ -304,7 +304,7 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 	}
 	var stmts []string
 	for _, s := range parsed {
-		stmt := strings.TrimSpace(s.Statement)
+		stmt := strings.TrimSpace((*s.StmtNode).Text())
 		if stmt != "" {
 			stmts = append(stmts, stmt)
 		}

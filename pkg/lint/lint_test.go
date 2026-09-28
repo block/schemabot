@@ -145,8 +145,7 @@ func TestLintSchema_InvalidSQL(t *testing.T) {
 
 // A schema file that declares two tables has both of them linted: the
 // `orders` table with an INT primary key and the `events` table with a latin1
-// charset each report their own finding against their own table, rather than
-// the file producing no findings at all.
+// charset each report their own finding against their own table.
 func TestLintSchema_MultipleCreateTablesInOneFile(t *testing.T) {
 	linter := New()
 

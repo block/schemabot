@@ -152,8 +152,8 @@ func (l *Linter) LintSchema(schemaFiles map[string]string) ([]Result, error) {
 // parser and returns one CreateTable per CREATE TABLE statement. Each table is
 // built from its own statement's AST node, so a file that declares several
 // tables has every one of them linted. A file the parser rejects is an error;
-// statements of other kinds are skipped, because this audit covers table
-// definitions only.
+// supported statements of other kinds are skipped, because this audit covers
+// table definitions only.
 func parseCreateTables(filename, content string) ([]*statement.CreateTable, error) {
 	if strings.TrimSpace(content) == "" {
 		slog.Debug("schema lint skipped empty schema file", "file", filename)
