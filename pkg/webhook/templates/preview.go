@@ -1044,6 +1044,13 @@ func PreviewCommentApplyBlockedByMissingPriorEnvCheck() string {
 	return RenderApplyBlockedByMissingPriorEnvCheck("staging")
 }
 
+// PreviewCommentApplyBlockedByStalePriorEnvCheck renders a sample block for a
+// prior environment whose stored check state names an earlier commit than the
+// PR's latest commit.
+func PreviewCommentApplyBlockedByStalePriorEnvCheck() string {
+	return RenderApplyBlockedByStalePriorEnvCheck("staging", previewStaleSHA, previewHeadSHA)
+}
+
 // PreviewCommentApplyBlockedByUntrustedPriorEnvCheck renders a sample block
 // for a prior-environment check created only by untrusted GitHub Apps.
 func PreviewCommentApplyBlockedByUntrustedPriorEnvCheck() string {
