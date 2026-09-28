@@ -928,7 +928,25 @@ reviewed one. Apply-confirm answers an empty re-plan the same way.
 ### Apply confirmed
 
 `schemabot apply-confirm -e <environment>` verifies review and PR-check gates,
-verifies the lock, re-plans for drift, and then submits the apply.
+verifies the lock, verifies the plan the lock pins, re-runs the environment
+ordering gate, re-plans for drift, and then submits the apply.
+
+The pinned plan is the only record of which environment the operator reviewed,
+so the confirmation is refused when that record cannot vouch for the command:
+
+- If the lock pins no plan SchemaBot can load, nothing is applied and the
+  comment asks for a fresh `schemabot apply -e <environment>`, which pins a new
+  plan.
+- If the pinned plan was made for a different environment than `-e` names,
+  nothing is applied; the comment gives the `apply-confirm` command for the
+  planned environment and the `apply` command for the requested one.
+- If a prior environment in the rollout order has pending changes again, the
+  same block that stops `schemabot apply` stops the confirmation.
+
+Each refusal keeps the pending confirmation pinned, so the plan the operator
+reviewed can still be confirmed once the reason is resolved. Only a stale plan
+(the PR head moved since it was posted) releases the pin, because that plan can
+no longer be confirmed at all.
 
 When Tern accepts the apply, SchemaBot marks the internal record `in_progress`
 and stores the accepted `apply_id`. Accepted applies must have a stored apply ID;

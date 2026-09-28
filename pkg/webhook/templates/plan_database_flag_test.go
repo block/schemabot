@@ -102,6 +102,49 @@ func TestPlanCommentScopedDatabasePrecedesTenant(t *testing.T) {
 	assert.Contains(t, locked, "\nschemabot unlock -d orders --tenant acme\n")
 }
 
+// The locked plan footer's apply-confirm command repeats every option the apply
+// was requested with, after the target and tenant, so the operator confirms
+// the plan they were shown rather than a default one.
+func TestLockedPlanCommentConfirmCommandCarriesApplyOptions(t *testing.T) {
+	data := planWithChanges()
+	data.ScopedDatabase = "orders"
+	data.Tenant = "acme"
+	data.IsLocked = true
+	data.PendingManualConfirmation = true
+	data.AllowUnsafe = true
+	data.DeferCutover = true
+	data.SkipRevert = true
+
+	assert.Contains(t, RenderPlanComment(data), "\nschemabot apply-confirm -e staging -d orders --tenant acme --allow-unsafe --defer-cutover --skip-revert\n")
+}
+
+// An apply-confirm that names another environment than the pending
+// confirmation was planned for is answered with two recovery commands, and
+// both keep the rejected command's database scope, tenant, and option flags:
+// the operator chose those, and apply-confirm reads them from the comment it
+// arrives in and nowhere else. An unscoped command is answered unscoped.
+func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *testing.T) {
+	scoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "orders", ApplyCommandOptions{Tenant: "acme", DeferCutover: true})
+	assert.Contains(t, scoped, "planned for `staging`, not `production`")
+	assert.Contains(t, scoped, "Run `schemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover` to confirm that plan")
+	assert.Contains(t, scoped, "or `schemabot apply -e production -d orders --tenant acme --defer-cutover` to plan this environment")
+
+	unscoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "", ApplyCommandOptions{})
+	assert.Contains(t, unscoped, "Run `schemabot apply-confirm -e staging` to confirm that plan")
+	assert.Contains(t, unscoped, "or `schemabot apply -e production` to plan this environment")
+}
+
+// The missing-plan rejection's recovery command carries the rejected command's
+// database scope, tenant, and option flags, so it can be pasted as-is on a PR
+// that manages several databases. An unscoped command is answered unscoped.
+func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
+	scoped := RenderConfirmationPlanUnavailable("production", "orders", ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true})
+	assert.Contains(t, scoped, "Run `schemabot apply -e production -d orders --tenant acme --allow-unsafe` to plan this environment again")
+
+	unscoped := RenderConfirmationPlanUnavailable("production", "", ApplyCommandOptions{})
+	assert.Contains(t, unscoped, "Run `schemabot apply -e production` to plan this environment again")
+}
+
 // A plan run without -e answers with one comment covering every environment,
 // and each of its commands carries the operator's -d the same way the
 // single-environment comment does.
