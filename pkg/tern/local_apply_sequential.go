@@ -15,7 +15,7 @@ import (
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
-func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) error {
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
@@ -34,7 +34,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	)
 
 	if !c.recordDriveStarted(ctx, apply, logger) {
-		return
+		return nil
 	}
 
 	var failedTask *storage.Task
@@ -44,7 +44,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
-			return
+			return nil
 		} else if standDown {
 			stoppedByUser = true
 			break
@@ -52,16 +52,16 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 
 		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskHandover {
-			return
+			return nil
 		}
 		if action == taskAbort {
-			return
+			return nil
 		}
 		if action == taskMissing {
 			// A fresh drive has no operator projection to refuse, so exiting
 			// without a verdict is the whole fail-closed behaviour here; the
 			// operator's resume of the still-active apply reports the cause.
-			return
+			return nil
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -89,7 +89,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			break
 		}
 		if action == taskAbort || action == taskHandover {
-			return
+			return nil
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -106,9 +106,10 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	if err := c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser); err != nil {
 		logger.Error("sequential drive exiting without finalizing the apply; it stays active for a later claim to finalize, so its pending control requests stay pending and no terminal summary is posted",
 			"deployment", apply.Deployment, "error", err)
-		return
+		return err
 	}
 	logger.Info("sequential apply finished", "state", apply.State)
+	return nil
 }
 
 // taskAction indicates the outcome of a single task execution step.
@@ -302,6 +303,7 @@ type atomicPollState struct {
 	lastTaskState   string
 	lastLoggedState string
 	lastProgressLog time.Time
+	terminalErr     error
 
 	// stateEnteredAt tracks when the current waiting state was entered,
 	// used for timeout enforcement on deferred cutover and revert window.

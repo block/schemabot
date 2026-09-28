@@ -362,7 +362,9 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 	}
-	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier)
+	if err := c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier); err != nil {
+		return true, err
+	}
 	return true, ctx.Err()
 }
 
@@ -1334,8 +1336,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		// heartbeats the operation row instead.
 		stopHeartbeat := c.startParentApplyHeartbeat(pollCtx, apply, suppressParent, cancelPoll)
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
-		return nil
+		return c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 	}
 
 	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
@@ -1350,7 +1351,9 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		defer cancelResume()
 		defer stopHeartbeat()
 		defer stopEngineLogging()
-		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+		if err := c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier); err != nil {
+			c.logger.Warn("detached grouped drive exited with an error", append(apply.MutableLogAttrs(), "error", err)...)
+		}
 	}()
 	return nil
 }
@@ -2096,7 +2099,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if state.IsState(apply.State, state.Apply.Pending) && apply.StartedAt == nil {
-		c.dispatchQueuedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+		if err := c.dispatchQueuedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier); err != nil {
+			return err
+		}
 		return ctx.Err()
 	}
 
@@ -2349,7 +2354,7 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	return err
 }
 
-func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
 	applyCtx, cancelApply := context.WithCancel(ctx)
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	defer c.clearApplyCancel(cancelGeneration)
@@ -2362,5 +2367,5 @@ func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Ap
 		"task_count", len(tasks),
 	)
 
-	c.runApplyExecution(applyCtx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+	return c.runApplyExecution(applyCtx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 }

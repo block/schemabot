@@ -185,7 +185,12 @@ func TestPollForCompletionAtomic_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 			observer := &terminalRecordingObserver{}
 			client.SetObserver(apply.ID, observer)
 
-			client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+			pollErr := client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+			if tc.writeErr != nil {
+				require.ErrorIs(t, pollErr, tc.writeErr)
+			} else {
+				require.NoError(t, pollErr)
+			}
 
 			assert.Equal(t, tc.wantStoredState, snapshot.stored.State)
 			require.Len(t, controlRequests.requests, 1)
