@@ -875,6 +875,15 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "invalid-blocking-budget",
 			cause:  fmt.Sprintf("the blocking budget for the change to %s is not a bound the engine can enforce", quotedTable(table)),
 			remedy: "correct the engine's blocking budget configuration, then re-run"}, true
+	case executor.CodeRowSecurityRefused:
+		return &refusal{reason: "row-security-refused",
+			cause:  fmt.Sprintf("the row security change for %s was refused by the engine", quotedTable(table)),
+			remedy: "check the declaration, target, and privileges before re-planning"}, true
+	case executor.CodeRowSecurityOutcomeUnknown:
+		// An uncertain commit cannot be retried as though it rolled back.
+		return &refusal{reason: "row-security-outcome-unknown",
+			cause:  fmt.Sprintf("whether the row security change for %s committed is unknown", quotedTable(table)),
+			remedy: "inspect the target policies before re-running"}, true
 	case executor.CodeBlockingOutcomeUnknown:
 		// The statement's commit was sent and its answer never arrived, so
 		// whether the change landed is open. The engine leaves the retry

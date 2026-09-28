@@ -2427,6 +2427,9 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// DDL onto its own result, so the apply waits for an operator to
 		// read the catalog instead.
 		executor.CodeBlockingOutcomeUnknown: "a retry replays a statement that may have committed",
+		// RLS changes have the same uncertain-commit boundary: inspect the
+		// policies before deciding whether another apply is appropriate.
+		executor.CodeRowSecurityOutcomeUnknown: "a retry replays a policy change that may have committed",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
