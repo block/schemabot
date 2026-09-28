@@ -276,6 +276,42 @@ func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.St
 	return nil
 }
 
+// preCutoverStateForRestore names the state a cutover the data plane does not
+// accept returns the apply to. The drive that first sends a cutover reads it
+// off the apply before marking it cutting_over. A drive that re-sends a request
+// an earlier drive left pending — its call went unanswered, or its restore
+// write failed — finds the apply already marked, so the state before the mark
+// is derived from the stored tasks: the control plane never marks a task
+// cutting_over for a request, and the task rows follow the data plane's
+// progress, so their derived apply state is what the apply would hold had it
+// never been marked.
+//
+// A derivation that is not itself a state a cutover can be requested from —
+// tasks already cutting over on the data plane, a terminal state, or no task
+// rows — names cutting_over, and the restore then writes nothing: those are
+// states the progress sync settles on its own.
+func preCutoverStateForRestore(ctx context.Context, store storage.Storage, apply *storage.Apply) (string, error) {
+	if !state.IsState(apply.State, state.Apply.CuttingOver) {
+		return apply.State, nil
+	}
+	if store == nil {
+		return "", fmt.Errorf("storage is not available")
+	}
+	taskStore := store.Tasks()
+	if taskStore == nil {
+		return "", fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("load tasks for apply %s before re-sending cutover: %w", apply.ApplyIdentifier, err)
+	}
+	derived := state.DeriveApplyState(taskStates(tasks))
+	if state.IsState(derived, state.Apply.WaitingForCutover) || state.IsRunningApplyState(derived) {
+		return derived, nil
+	}
+	return state.Apply.CuttingOver, nil
+}
+
 // restoreApplyStateAfterUnacceptedCutover returns the apply to the state it held
 // before markApplyCuttingOverForControlRequest, for a cutover the data plane
 // did not accept: the call failed, came back empty, or was refused. A stored
@@ -292,11 +328,13 @@ func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.St
 //
 // A drive whose mark stayed in memory (see suppressParentApplyWrites) writes
 // nothing here either. On a failed write the in-memory apply keeps the stored
-// cutting_over and the caller must leave the cutover request pending: a
-// pending request on a cutting_over apply is re-sent by the next drive, while
-// a failed one would leave the apply wedged.
+// cutting_over and the caller must leave the cutover request pending: the next
+// drive re-sends it, and derives the state to restore from the stored tasks
+// (see preCutoverStateForRestore) should the data plane refuse again.
 func restoreApplyStateAfterUnacceptedCutover(ctx context.Context, store storage.Storage, apply *storage.Apply, preCutoverState string, logger *slog.Logger) error {
 	if state.IsState(apply.State, preCutoverState) {
+		logger.InfoContext(ctx, "cutover was not accepted; apply state is left as stored, the progress sync settles it from the data plane's report",
+			apply.MutableLogAttrs()...)
 		return nil
 	}
 	if suppressParentApplyWrites(ctx) {

@@ -8533,6 +8533,103 @@ func TestGRPCClient_ProcessPendingCutoverRestoreFailureKeepsRequestPending(t *te
 	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
 }
 
+// A drive that re-sends a still-pending cutover finds the apply already stored
+// as cutting_over by the drive that first sent it. When the data plane refuses
+// the re-send, the apply is returned to the state its tasks derive, so the
+// operator can command cutover again instead of being told one is in
+// progress. Tasks already cutting over on the data plane are left alone: the
+// progress sync settles that on its own.
+func TestGRPCClient_RefusedResentCutoverRestoresStateFromTasks(t *testing.T) {
+	tests := []struct {
+		name        string
+		taskStates  []string
+		wantState   string
+		wantUpdates int
+	}{
+		{
+			name:        "tasks parked at waiting_for_cutover",
+			taskStates:  []string{state.Task.WaitingForCutover},
+			wantState:   state.Apply.WaitingForCutover,
+			wantUpdates: 1,
+		},
+		{
+			name:        "one task parked while another still copies",
+			taskStates:  []string{state.Task.WaitingForCutover, state.Task.Running},
+			wantState:   state.Apply.Running,
+			wantUpdates: 1,
+		},
+		{
+			name:        "tasks already cutting over on the data plane",
+			taskStates:  []string{state.Task.CuttingOver},
+			wantState:   state.Apply.CuttingOver,
+			wantUpdates: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &capturingTernServer{cutoverMessage: "cutover is not ready on the data plane"}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+			connectedClient := client.client
+
+			apply, applies, controlRequests := newParkedCutoverApply(client)
+			apply.State = state.Apply.CuttingOver
+			applies.apply.State = state.Apply.CuttingOver
+			tasks := make([]*storage.Task, 0, len(tt.taskStates))
+			for i, taskState := range tt.taskStates {
+				tasks = append(tasks, &storage.Task{
+					ID:             int64(i + 1),
+					ApplyID:        apply.ID,
+					TaskIdentifier: fmt.Sprintf("task-cutover-resent-%d", i+1),
+					TableName:      fmt.Sprintf("table_%d", i+1),
+					State:          taskState,
+				})
+			}
+			client.storage.(*mockStorage).tasks = &mockTaskStore{tasks: tasks}
+
+			err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cutover is not ready on the data plane")
+			assert.Equal(t, tt.wantState, apply.State)
+			assert.Equal(t, tt.wantState, applies.apply.State)
+			assert.Len(t, applies.updates, tt.wantUpdates, "the stored cutting_over is not re-marked; only the restore writes")
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+			assert.Contains(t, controlRequests.requests[0].ErrorMessage, "cutover is not ready on the data plane")
+
+			if state.IsState(tt.wantState, state.Apply.CuttingOver) {
+				return
+			}
+			reissueCutoverAndAssertSent(t, server, client, connectedClient, apply, applies, controlRequests)
+		})
+	}
+}
+
+// A re-sent cutover whose refusal cannot be mapped back to a pre-cutover state,
+// because the task rows cannot be read, fails the drive before the cutover is
+// sent: the request stays pending for the next drive rather than being refused
+// and leaving the apply stored as cutting_over with no way to restore it.
+func TestGRPCClient_ResentCutoverFailsClosedWhenTasksCannotBeRead(t *testing.T) {
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply, applies, controlRequests := newParkedCutoverApply(client)
+	apply.State = state.Apply.CuttingOver
+	applies.apply.State = state.Apply.CuttingOver
+	client.storage.(*mockStorage).tasks = &mockTaskStore{getByApplyIDErr: errors.New("task store unavailable")}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "load tasks for apply apply-cutover-not-accepted before re-sending cutover: task store unavailable")
+	assert.Empty(t, server.getCutoverApplyID(), "cutover is not sent when the restore target is unknown")
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+	assert.Empty(t, applies.updates)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "request stays pending so the next drive re-sends the cutover")
+}
+
 // newParkedCutoverApply wires client storage with a whole-apply drive parked at
 // waiting_for_cutover and a pending operator cutover request.
 func newParkedCutoverApply(client *GRPCClient) (*storage.Apply, *mockApplyStore, *testControlRequestStore) {
