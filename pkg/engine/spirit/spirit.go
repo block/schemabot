@@ -110,6 +110,7 @@ type runningSchemaChange struct {
 	progressCallback  func() string // returns Summary from Spirit's Progress API
 	state             engine.State
 	errorMessage      string // Error details when state is StateFailed
+	permanentFailure  bool   // The failure reproduces on every retry, so it is reported as not retryable
 	started           time.Time
 	deferCutover      bool // Whether to defer cutover until manual trigger
 
@@ -369,7 +370,16 @@ type drainedOutcome struct {
 	database     string
 	message      string
 	errorMessage string // Failure details when state is StateFailed
+	permanent    bool   // The failure reproduces on every retry
 	tables       []engine.TableProgress
+}
+
+// failureIsRetryable reports whether a progress result in state s offers the
+// drive a retry: only a failure does, and only when retrying it could succeed.
+// A permanent failure, such as a copy whose checksum keeps finding lost rows,
+// would repeat the full table copy on every attempt and fail the same way.
+func failureIsRetryable(s engine.State, permanent bool) bool {
+	return s == engine.StateFailed && !permanent
 }
 
 // retainsDrainedOutcome reports whether a drained schema change's final state
@@ -422,6 +432,7 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 		database:     rm.database,
 		message:      fmt.Sprintf("Schema change %s", rm.state),
 		errorMessage: rm.errorMessage,
+		permanent:    rm.permanentFailure,
 		tables:       tables,
 	}
 }
@@ -830,7 +841,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 				State:        d.state,
 				Message:      d.message,
 				ErrorMessage: d.errorMessage,
-				Retryable:    d.state == engine.StateFailed,
+				Retryable:    failureIsRetryable(d.state, d.permanent),
 				Tables:       slices.Clone(d.tables),
 				ResumeState:  req.ResumeState,
 			}, nil
@@ -894,7 +905,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		State:                 state,
 		Message:               message,
 		ErrorMessage:          rm.errorMessage,
-		Retryable:             state == engine.StateFailed,
+		Retryable:             failureIsRetryable(state, rm.permanentFailure),
 		Tables:                tableProgress,
 		ResumeState:           req.ResumeState,
 		ResumedFromCheckpoint: spiritProgress.Resume,

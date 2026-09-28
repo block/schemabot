@@ -463,7 +463,9 @@ func (e *Engine) setSchemaChangeCompleted() {
 
 // setSchemaChangeFailed sets the state to failed with a reason an operator can
 // read. Every caller has already logged err with the target identifiers, so the
-// detail this drops is still available where it is safe to keep it.
+// detail this drops is still available where it is safe to keep it. An err
+// classified permanent (see classifyRunnerError) is recorded as such, so
+// progress tells the drive a retry would only repeat the same failure.
 func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -471,6 +473,7 @@ func (e *Engine) setSchemaChangeFailed(err error) {
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
 			e.runningSchemaChange.errorMessage = failureReason(err)
+			e.runningSchemaChange.permanentFailure = !engine.IsRetryable(err)
 		}
 	}
 }

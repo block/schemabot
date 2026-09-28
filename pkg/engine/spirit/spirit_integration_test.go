@@ -1507,7 +1507,8 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 }
 
 // A UNIQUE index over duplicate values fails checksum consistently, so the
-// engine reports the runner failure as permanent instead of retrying it.
+// engine reports the runner failure as permanent instead of retrying it, and
+// progress tells the drive the failure is not retryable.
 func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -1524,6 +1525,11 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	host, username, password, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
 	eng := New(Config{Logger: discardLogger()})
+	eng.installRunningSchemaChange(&runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -1533,6 +1539,11 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	require.Error(t, err)
 	assert.False(t, engine.IsRetryable(err))
 	assert.ErrorIs(t, err, checksum.ErrDifferencesExhausted)
+
+	result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress()")
+	assert.Equal(t, engine.StateFailed, result.State)
+	assert.False(t, result.Retryable)
 }
 
 // TestEngine_Progress_FailingApplyNeverReportsCompleted verifies that a
