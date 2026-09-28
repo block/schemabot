@@ -8537,8 +8537,9 @@ func TestGRPCClient_ProcessPendingCutoverRestoreFailureKeepsRequestPending(t *te
 // as cutting_over by the drive that first sent it. When the data plane refuses
 // the re-send, the apply is returned to the state its tasks derive, so the
 // operator can command cutover again instead of being told one is in
-// progress. Tasks already cutting over on the data plane are left alone: the
-// progress sync settles that on its own.
+// progress. A derivation that is not a state a cutover can be requested from
+// is never written: tasks already cutting over or completed on the data plane,
+// or an apply with no task rows, are left for the progress sync to settle.
 func TestGRPCClient_RefusedResentCutoverRestoresStateFromTasks(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -8561,6 +8562,18 @@ func TestGRPCClient_RefusedResentCutoverRestoresStateFromTasks(t *testing.T) {
 		{
 			name:        "tasks already cutting over on the data plane",
 			taskStates:  []string{state.Task.CuttingOver},
+			wantState:   state.Apply.CuttingOver,
+			wantUpdates: 0,
+		},
+		{
+			name:        "tasks completed on the data plane",
+			taskStates:  []string{state.Task.Completed},
+			wantState:   state.Apply.CuttingOver,
+			wantUpdates: 0,
+		},
+		{
+			name:        "no task rows",
+			taskStates:  nil,
 			wantState:   state.Apply.CuttingOver,
 			wantUpdates: 0,
 		},
@@ -8628,6 +8641,33 @@ func TestGRPCClient_ResentCutoverFailsClosedWhenTasksCannotBeRead(t *testing.T) 
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
 	require.NoError(t, err)
 	require.NotNil(t, pending, "request stays pending so the next drive re-sends the cutover")
+}
+
+// Under an operation-only lease the parent apply row is not the drive's to
+// write: the mark before the cutover stays in memory, and so does the restore
+// when the data plane refuses it. The request is still failed, so the operator
+// sees the refusal and can command cutover again.
+func TestGRPCClient_RefusedCutoverUnderOperationLeaseNeverWritesParentApply(t *testing.T) {
+	server := &capturingTernServer{cutoverMessage: "cutover is not ready on the data plane"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply, applies, controlRequests := newParkedCutoverApply(client)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: 7,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+
+	err := client.processPendingCutoverControlRequest(ctx, apply, wholeApplyTaskScope())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cutover is not ready on the data plane")
+	assert.Equal(t, state.Apply.WaitingForCutover, apply.State, "the in-memory mark is undone")
+	assert.Equal(t, state.Apply.WaitingForCutover, applies.apply.State)
+	assert.Empty(t, applies.updates, "neither the mark nor the restore writes the parent row")
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
 }
 
 // newParkedCutoverApply wires client storage with a whole-apply drive parked at
