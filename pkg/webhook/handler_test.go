@@ -461,6 +461,28 @@ func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 	return h, comments, reactions
 }
 
+// A test that dispatches a rollback and returns as soon as the handler responds
+// still has that rollback's comment delivered to its own fake GitHub server.
+// The subtest stands in for such a test: its handler is built and torn down
+// inside it, and the parent then reads the comment its server captured, which
+// is only there if the dispatched work finished before the server closed.
+func TestNewTestHandlerDeliversDispatchedWorkBeforeTheServerCloses(t *testing.T) {
+	var comments chan string
+	t.Run("dispatch", func(t *testing.T) {
+		h, c, _ := newTestHandler(t)
+		comments = c
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot rollback apply_abc123 -e staging", isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+	})
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "apply_abc123")
+	default:
+		t.Fatal("the dispatched rollback's comment never reached the dispatching test's server")
+	}
+}
+
 func TestWebhookHelpCommand(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
