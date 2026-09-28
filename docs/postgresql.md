@@ -638,11 +638,11 @@ it commits or fails, and recovery re-plans against the live target before
 further work. A privilege refusal is a permanent failed task, includes the
 required provisioning advice, and leaves the target unchanged.
 
-A namespace containing an RLS table cannot capture a complete rollback baseline,
-including for changes to other tables in that namespace. Forward structural
-plans can still proceed, but rollback is refused under
-[RV-7](invariants.md#rv-7-rollback-needs-the-originals). Access rules are not
-stripped from the baseline to claim rollback support.
+Rollback baseline capture retains RLS settings and policies alongside sibling
+tables. Capturing a complete baseline does not enable RLS execution: a rollback
+that requires changing an RLS declaration remains subject to the same planning
+refusals as a forward change. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
+requires complete originals before rollback can proceed.
 
 ## Configuration and credentials
 

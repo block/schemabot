@@ -2339,8 +2339,8 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 	}, results)
 }
 
-// One RLS table makes namespace capture incomplete; never label a partial
-// baseline as rollback-capable, even for changes to an ordinary sibling table.
+// RLS rendering retains access rules alongside ordinary sibling tables in
+// the captured baseline. This does not enable execution of RLS rollback changes.
 func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "capture_rls")
 	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
@@ -2357,8 +2357,12 @@ func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
 	defer pool.Close()
 	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public")
 	require.NoError(t, err)
-	assert.False(t, captured)
-	assert.Nil(t, files, "an RLS render refusal must not leave a partial rollback baseline")
+	require.True(t, captured)
+	require.Len(t, files, 2)
+	assert.Contains(t, files["documents.sql"], "ENABLE ROW LEVEL SECURITY")
+	assert.Contains(t, files["documents.sql"], "CREATE POLICY")
+	assert.Contains(t, files["documents.sql"], "readers")
+	assert.Contains(t, files["accounts.sql"], "CREATE TABLE")
 }
 
 // Forward structural planning remains available for RLS tables and siblings.
