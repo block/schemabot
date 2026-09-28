@@ -32,6 +32,15 @@ const refusalNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
 	"  `name` varchar(100) DEFAULT NULL\n" +
 	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 
+// refusalAccountsTable is keyed on two character columns, so a statement can
+// change the collation its key compares under.
+const refusalAccountsTable = "CREATE TABLE `accounts` (\n" +
+	"  `owner_token` varchar(64) NOT NULL,\n" +
+	"  `currency` char(3) NOT NULL,\n" +
+	"  `note` varchar(100) DEFAULT NULL,\n" +
+	"  PRIMARY KEY (`owner_token`,`currency`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
 // The engine's refusal verdict is what plan-time execution modes and apply-time
 // routing are both built on, and it comes from Spirit rather than from anything
 // this repo can see in a diff. This pins the shapes each side of the verdict at
@@ -107,6 +116,34 @@ func TestStatementRefusalContract(t *testing.T) {
 			name:       "set to enum conversion",
 			stmt:       "ALTER TABLE orders MODIFY COLUMN perms ENUM('read','write')",
 			wantReason: `unsafe SET to ENUM type conversion on column "perms"`,
+		},
+		{
+			name:       "change the collation of a primary key column",
+			stmt:       "ALTER TABLE accounts MODIFY COLUMN owner_token varchar(64) COLLATE utf8mb4_bin NOT NULL",
+			table:      refusalAccountsTable,
+			wantReason: `changing the collation of primary key column "owner_token" is not supported`,
+		},
+		{
+			name:       "change a primary key column to a binary string type",
+			stmt:       "ALTER TABLE accounts MODIFY COLUMN currency varbinary(12) NOT NULL",
+			table:      refusalAccountsTable,
+			wantReason: `changing the collation of primary key column "currency" is not supported`,
+		},
+		{
+			name:       "convert a table keyed on character columns to another collation",
+			stmt:       "ALTER TABLE accounts CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+			table:      refusalAccountsTable,
+			wantReason: "converting the table's character set changes the collation of its primary key",
+		},
+		{
+			name:  "widen a character primary key column",
+			stmt:  "ALTER TABLE accounts MODIFY COLUMN owner_token varchar(128) NOT NULL",
+			table: refusalAccountsTable,
+		},
+		{
+			name:  "change the collation of a column outside the primary key",
+			stmt:  "ALTER TABLE accounts MODIFY COLUMN note varchar(100) COLLATE utf8mb4_bin",
+			table: refusalAccountsTable,
 		},
 		{
 			name: "add column",
@@ -194,6 +231,23 @@ const refusalCanaryNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
 	"  `cnry_label` varchar(100) DEFAULT NULL\n" +
 	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 
+// refusalCanaryAccountsTable is keyed on a column a statement below redeclares
+// and on a canary column it never mentions, so a collation refusal that
+// reported the whole key would carry the canary.
+const refusalCanaryAccountsTable = "CREATE TABLE `accounts` (\n" +
+	"  `owner_token` varchar(64) NOT NULL,\n" +
+	"  `cnry_region` char(3) NOT NULL,\n" +
+	"  PRIMARY KEY (`owner_token`,`cnry_region`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+// refusalCanaryConvertTable is keyed only on canary columns, for the refusal of
+// a CONVERT TO CHARACTER SET, which re-collates the key without naming it.
+const refusalCanaryConvertTable = "CREATE TABLE `accounts` (\n" +
+	"  `cnry_owner` varchar(64) NOT NULL,\n" +
+	"  `cnry_region` char(3) NOT NULL,\n" +
+	"  PRIMARY KEY (`cnry_owner`,`cnry_region`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
 // Routing marks a refusal reason publishable to the pull request by category:
 // the engine's statement-scope checks report the statement back, and the
 // statement is already on the PR. The target's own definition is the other
@@ -252,6 +306,18 @@ func TestStatementRefusalPublishesNothingFromTheTarget(t *testing.T) {
 			stmt:              "ALTER TABLE orders_log ADD COLUMN shipped_at DATETIME",
 			table:             refusalCanaryNoPrimaryKeyTable,
 			wantFromStatement: "primary key",
+		},
+		{
+			name:              "change the collation of a primary key column",
+			stmt:              "ALTER TABLE accounts MODIFY COLUMN owner_token varchar(64) COLLATE utf8mb4_bin NOT NULL",
+			table:             refusalCanaryAccountsTable,
+			wantFromStatement: `"owner_token"`,
+		},
+		{
+			name:              "convert a table keyed on character columns to another collation",
+			stmt:              "ALTER TABLE accounts CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+			table:             refusalCanaryConvertTable,
+			wantFromStatement: "character set",
 		},
 	}
 	for _, tt := range tests {

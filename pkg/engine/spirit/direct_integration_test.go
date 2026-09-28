@@ -774,3 +774,100 @@ func TestExecutionVerdicts_UnreadableTableFails(t *testing.T) {
 	assert.Empty(t, change.ExecutionMode)
 	assert.Empty(t, change.ModeReason)
 }
+
+// primaryKeyCollationTable is keyed on a character column under the default
+// collation, and primaryKeyCollationTarget is the same table with the key moved
+// to a binary collation, which sorts every uppercase key ahead of every
+// lowercase one.
+const (
+	primaryKeyCollationTable = `CREATE TABLE %s (
+		token varchar(32) COLLATE utf8mb4_0900_ai_ci NOT NULL,
+		amount INT NOT NULL,
+		PRIMARY KEY (token)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
+	primaryKeyCollationTarget = `CREATE TABLE %s (
+		token varchar(32) COLLATE utf8mb4_bin NOT NULL,
+		amount INT NOT NULL,
+		PRIMARY KEY (token)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
+)
+
+// A declarative change to the collation of a primary key column is one the
+// engine refuses, since its copy and checksum work in key ranges the new
+// collation reorders. The plan says so up front: with the direct execution
+// policy enabled and the table within the bound, the statement resolves to the
+// direct verdict, and the reason names the key column the statement changes.
+func TestEngine_Plan_PrimaryKeyCollationChangeRoutesDirect(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "pk_collation_plan")
+
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(primaryKeyCollationTable, "pk_collation_plan"))
+	require.NoError(t, err, "create pk_collation_plan table")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"pk_collation_plan.sql": fmt.Sprintf(primaryKeyCollationTarget, "pk_collation_plan"),
+		}),
+		Credentials: &engine.Credentials{
+			DSN:      dsn,
+			Metadata: directPolicyMetadata(100000),
+		},
+	})
+	require.NoError(t, err, "Plan()")
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Contains(t, changes[0].DDL, "utf8mb4_bin")
+	assert.Equal(t, "direct", changes[0].ExecutionMode, "the refused collation change resolves to the direct verdict")
+	assert.Contains(t, changes[0].ModeReason, `changing the collation of primary key column "token" is not supported`)
+	assert.Contains(t, changes[0].ModeReason, "runs as native MySQL DDL on a table with ~")
+}
+
+// Applying that verdict rebuilds the table natively: the key column ends
+// under the new collation, and every row survives, including keys whose order
+// the new collation changes.
+func TestEngine_ExecuteAlterPhase_DirectPrimaryKeyCollationChange(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "pk_collation_apply")
+
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(primaryKeyCollationTable, "pk_collation_apply"))
+	require.NoError(t, err, "create pk_collation_apply table")
+	_, err = db.ExecContext(t.Context(),
+		"INSERT INTO pk_collation_apply VALUES ('apple', 1), ('Banana', 2), ('cherry', 3), ('Date', 4)")
+	require.NoError(t, err, "seed rows")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"pk_collation_apply"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database,
+		[]string{"ALTER TABLE `pk_collation_apply` MODIFY COLUMN `token` varchar(32) COLLATE utf8mb4_bin NOT NULL"}, false,
+		directPolicy{Enabled: true, MaxTableRows: 100000})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, finalState)
+
+	var collation string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'pk_collation_apply' AND COLUMN_NAME = 'token'",
+		database).Scan(&collation))
+	assert.Equal(t, "utf8mb4_bin", collation, "the key column compares under the new collation")
+
+	var keys string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT GROUP_CONCAT(token ORDER BY token) FROM pk_collation_apply").Scan(&keys))
+	assert.Equal(t, "Banana,Date,apple,cherry", keys, "every row survives, in the new collation's order")
+}

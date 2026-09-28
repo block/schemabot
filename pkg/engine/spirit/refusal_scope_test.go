@@ -33,6 +33,7 @@ func TestPublishableRefusalChecks(t *testing.T) {
 		"enumSetRemoval",
 		"illegalClause",
 		"primarykey",
+		"primarykeycollationstatement",
 		"primarykeyexists",
 		"setReorder",
 	}, check.ChecksInScope(check.ScopeStatement),
