@@ -78,6 +78,29 @@ func TestFinalizerVSchemaChangesSaysWhatEachFinalizerIsFor(t *testing.T) {
 	assert.Contains(t, err.Error(), `plan 3 has neither a VSchema artifact nor a finalize request for namespace "neither"`)
 }
 
+// A finalizer's logs and errors name the work it drives, so a rejected
+// finalize of payments, whose VSchema is unchanged, does not send triage
+// looking for a VSchema document the plan never carried.
+func TestFinalizerWorkNamesWhatTheFinalizerDrives(t *testing.T) {
+	plan := &storage.Plan{
+		ID: 3,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{}}`}, Finalize: true},
+			"payments": {Finalize: true},
+		},
+	}
+	work := func(namespace string) string {
+		t.Helper()
+		changes, err := finalizerVSchemaChanges(plan, namespace)
+		require.NoError(t, err)
+		return finalizerWork(changes)
+	}
+
+	assert.Equal(t, "finalize", work("payments"))
+	assert.Equal(t, "VSchema apply", work("commerce"))
+	assert.Equal(t, "VSchema apply and finalize", work(""))
+}
+
 // A control plane dispatches a finalizer to a data plane that did not plan it.
 // The data plane rebuilds the same plan from the dispatch: a finalize-only
 // namespace comes back finalizing with no artifact demanded, and a namespace

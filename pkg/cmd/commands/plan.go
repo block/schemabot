@@ -228,11 +228,16 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 
 	// Collect VSchema changes from metadata, and the namespaces the engine
-	// asked to finalize without one: a finalize is work the apply runs, so a
-	// plan made only of finalizes must not read as "no changes".
+	// asked to finalize: a finalize is work the apply runs, so a plan made only
+	// of finalizes must not read as "no changes". finalizeOnly holds those with
+	// no VSchema change, which the summary counts on their own.
 	var vschemaChanges []templates.VSchemaChange
+	finalize := map[string]bool{}
 	finalizeOnly := map[string]bool{}
 	for _, sc := range result.Changes {
+		if sc.NeedsFinalizer() {
+			finalize[sc.Namespace] = true
+		}
 		if sc.HasVSchemaChange() {
 			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
@@ -305,7 +310,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 			nc := templates.NamespaceChange{
 				Namespace: ns,
 				Changes:   namespaceMap[ns],
-				Finalize:  finalizeOnly[ns],
+				Finalize:  finalize[ns],
 			}
 			if diff, ok := vsDiffByKS[ns]; ok {
 				nc.VSchemaChanged = true
