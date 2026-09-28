@@ -895,17 +895,22 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// accepted skip marks the window skipped: a failed attempt is retried on the
 	// next progress tick, and until then the window stays open to the queued
 	// revert and skip-revert requests below.
-	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped {
+	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped && !ps.revertTriggered {
 		if !ps.autoSkipRevertLogged {
 			logger.Info("auto-skipping revert window (--skip-revert)")
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 				"Auto-skipping revert window (--skip-revert)", "", "")
 			ps.autoSkipRevertLogged = true
 		}
-		if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
+		skipResult, err := eng.SkipRevert(ctx, controlReq)
+		switch {
+		case err != nil:
 			logger.Error("auto-skip revert failed; the drive retries it at the next progress tick",
 				append(apply.MutableLogAttrs(), "error", err)...)
-		} else {
+		case skipResult == nil || !skipResult.Accepted:
+			logger.Error("auto-skip revert was rejected; the drive retries it at the next progress tick",
+				apply.MutableLogAttrs()...)
+		default:
 			logger.Info("skip-revert triggered", "reason", "--skip-revert")
 			c.markRevertSkipped(ctx, apply)
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
@@ -918,7 +923,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// vs the upfront --skip-revert flag above) was queued; honor it. This is the
 	// apply owner's retry path: the API's immediate skip attempt may have failed
 	// or its process may have died, leaving the request pending for the drive.
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
 			logger.Warn("could not load pending skip-revert control request", "error", err)
 		} else if pending != nil {
@@ -942,15 +947,21 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// revert attempt may have failed or its process may have died, leaving the
 	// request pending for the drive.
 	revertedByControlRequest := false
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
 			logger.Warn("could not load pending revert control request", "error", err)
 		} else if pending != nil {
 			logger.Info("revert requested by user; reverting schema change", "requested_by", controlRequestCaller(pending))
-			if _, err := eng.Revert(ctx, controlReq); err != nil {
+			revertResult, err := eng.Revert(ctx, controlReq)
+			switch {
+			case err != nil:
 				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending, err)
-			} else {
+			case revertResult == nil || !revertResult.Accepted:
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert,
+					storage.LogEventRevertTriggered, pending, errors.New("engine rejected revert request"))
+			default:
 				revertedByControlRequest = true
+				ps.revertTriggered = true
 				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
 					logger.Warn("failed to complete revert control request", "error", err)
 				}
@@ -965,19 +976,24 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// this tick takes precedence — do not also auto-skip the window shut. As with
 	// --skip-revert, only an accepted skip marks the window skipped; a failed one
 	// is retried on the next progress tick.
-	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !revertedByControlRequest {
+	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !ps.revertTriggered && !revertedByControlRequest {
 		revertDeadline := c.revertWindowDeadline(logger, result.ResumeState, ps.stateEnteredAt)
 		if !revertDeadline.IsZero() && now.After(revertDeadline) {
 			if !ps.autoSkipRevertLogged {
 				logger.Info("revert window expired, skipping", "deadline", revertDeadline)
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-					"Revert window expired, finalizing", "", "")
+					"Revert window expired, skipping revert", "", "")
 				ps.autoSkipRevertLogged = true
 			}
-			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
+			skipResult, err := eng.SkipRevert(ctx, controlReq)
+			switch {
+			case err != nil:
 				logger.Error("revert window timeout skip failed; the drive retries it at the next progress tick",
 					append(apply.MutableLogAttrs(), "deadline", revertDeadline, "error", err)...)
-			} else {
+			case skipResult == nil || !skipResult.Accepted:
+				logger.Error("revert window timeout skip was rejected; the drive retries it at the next progress tick",
+					append(apply.MutableLogAttrs(), "deadline", revertDeadline)...)
+			default:
 				c.markRevertSkipped(ctx, apply)
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
 					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, state.Apply.SkippingRevert)

@@ -569,6 +569,7 @@ type fakeControlEngine struct {
 	revertErr               error
 	skipRevertCount         int
 	skipRevertErr           error
+	skipRevertAccepted      *bool
 	externallyAuthoritative bool
 }
 
@@ -644,6 +645,9 @@ func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) 
 	e.skipRevertCount++
 	if e.skipRevertErr != nil {
 		return nil, e.skipRevertErr
+	}
+	if e.skipRevertAccepted != nil {
+		return &engine.ControlResult{Accepted: *e.skipRevertAccepted}, nil
 	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
@@ -3680,7 +3684,7 @@ func TestHandleAtomicProgressTickRetriesRejectedAutoSkipRevert(t *testing.T) {
 	}{
 		{
 			name:           "revert window expired",
-			triggerMessage: "Revert window expired, finalizing",
+			triggerMessage: "Revert window expired, skipping revert",
 			skipMessage:    "Revert window expired, skip-revert triggered",
 		},
 		{
@@ -3743,6 +3747,27 @@ func TestHandleAtomicProgressTickHonorsQueuedRevertWhileAutoSkipRevertFails(t *t
 	require.NotNil(t, resolved)
 	assert.Equal(t, storage.ControlRequestCompleted, resolved.Status, "the carried-out revert resolves its request")
 	assert.Nil(t, f.applies.stored.RevertSkippedAt, "the window was reverted, never skipped")
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.skipRevertCount, "a lagging revert-window state cannot trigger a skip after revert")
+}
+
+func TestHandleAtomicProgressTickRetriesUnacceptedAutoSkipRevert(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{SkipRevert: true})
+	accepted := false
+	f.eng.skipRevertAccepted = &accepted
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.skipRevertCount)
+	assert.False(t, f.ps.revertSkipped)
+	assert.Nil(t, f.applies.stored.RevertSkippedAt)
+	assert.Zero(t, f.eventCount(storage.LogEventSkipRevertTriggered, "Skip-revert triggered (--skip-revert)"))
+
+	accepted = true
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.eng.skipRevertCount)
+	assert.True(t, f.ps.revertSkipped)
+	assert.NotNil(t, f.applies.stored.RevertSkippedAt)
 }
 
 func TestHandleAtomicProgressTickPersistsMetadataOnceAndStopsAfterLeaseLoss(t *testing.T) {

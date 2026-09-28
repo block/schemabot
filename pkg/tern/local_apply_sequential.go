@@ -308,6 +308,11 @@ type atomicPollState struct {
 	// finalizes. A rejected attempt leaves it unset for the next tick to retry.
 	revertSkipped bool
 
+	// revertTriggered is set once the engine accepts an operator revert. It
+	// suppresses skip-revert attempts while progress still reports the lagging
+	// revert-window state.
+	revertTriggered bool
+
 	// autoSkipRevertLogged is set after the drive records the automatic
 	// skip-revert trigger event (--skip-revert or revert window expiry), so
 	// retries of a rejected skip do not fill the user-visible timeline with
