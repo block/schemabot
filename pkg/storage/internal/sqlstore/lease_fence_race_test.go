@@ -20,7 +20,10 @@ import (
 // leaseStealRaceDeadline bounds each wait in a lease-steal race: the displaced
 // write reaching the lease row's lock, and the write returning once the steal
 // commits.
-const leaseStealRaceDeadline = 30 * time.Second
+const (
+	leaseStealRaceDeadline  = 30 * time.Second
+	leaseFenceProbeDeadline = 2 * time.Second
+)
 
 // lockWaiter reports whether a session is blocked on a row lock while running
 // a statement whose text contains fragment.
@@ -33,8 +36,10 @@ type lockWaiter func(t *testing.T, fragment string) bool
 func mysqlLockWaiter(db *sql.DB) lockWaiter {
 	return func(t *testing.T, fragment string) bool {
 		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), leaseFenceProbeDeadline)
+		defer cancel()
 		var waiting int
-		require.NoError(t, db.QueryRowContext(t.Context(), `
+		require.NoError(t, db.QueryRowContext(ctx, `
 			SELECT COUNT(*) FROM performance_schema.data_lock_waits w
 			JOIN performance_schema.threads th ON th.THREAD_ID = w.REQUESTING_THREAD_ID
 			WHERE th.PROCESSLIST_INFO LIKE ?
@@ -47,8 +52,10 @@ func mysqlLockWaiter(db *sql.DB) lockWaiter {
 func postgresLockWaiter(db *sql.DB) lockWaiter {
 	return func(t *testing.T, fragment string) bool {
 		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), leaseFenceProbeDeadline)
+		defer cancel()
 		var waiting int
-		require.NoError(t, db.QueryRowContext(t.Context(), `
+		require.NoError(t, db.QueryRowContext(ctx, `
 			SELECT count(*) FROM pg_stat_activity
 			WHERE wait_event_type = 'Lock' AND query LIKE $1
 		`, "%"+fragment+"%").Scan(&waiting))

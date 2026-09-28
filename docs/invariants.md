@@ -844,7 +844,8 @@ whose drive liveness signal has gone quiet for longer than the operator's whole 
 re-asserted on the guarded write rather than trusted from the scan. Any new non-driver write needs
 a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
+`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
 
