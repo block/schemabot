@@ -1638,7 +1638,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 **target `primary/testapp_3`**
 
-_Already applied — no change._
+✅ **No schema changes detected**
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1663,10 +1663,6 @@ schemabot apply -e production
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 Targets diverge — what applies where:
-
-**target `primary/testapp_1`**
-
-_Already applied — no change._
 
 **targets `primary/testapp_2`, `primary/testapp_3`**
 
@@ -1698,6 +1694,10 @@ CREATE TABLE `orders` (
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+**target `primary/testapp_1`**
+
+✅ **No schema changes detected**
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -8113,15 +8113,15 @@ schemabot apply -e production
 #### Keyspace: `cdb_resolute_sharded`
 Shards diverge — what applies where:
 
-**shard `-40`**
-
-_Already applied — no change._
-
 **shards `40-80`, `80-c0`, `c0-`**
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
+
+**shard `-40`**
+
+✅ **No schema changes detected**
 
 📋 **Plan**: **1** table to alter
 

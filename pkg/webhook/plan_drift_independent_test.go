@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/glyph"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -104,7 +106,8 @@ func TestReviewDriftComment_IndependentCleanDoesNotClaimAgreement(t *testing.T) 
 // A target whose plan the engine will refuse is the one thing a clean
 // independent rollup still has to surface. Members hold different change sets,
 // so the primary's blocked count says nothing about the others — this is the
-// only place a non-primary member's refused DDL reaches the reviewer.
+// only place a non-primary member's refused DDL reaches the reviewer, and it is
+// disclosed under the DDL it refuses.
 func TestReviewDriftComment_IndependentSurfacesBlockedMember(t *testing.T) {
 	diffs := []api.DeploymentPlanDiff{
 		independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false),
@@ -116,16 +119,38 @@ func TestReviewDriftComment_IndependentSurfacesBlockedMember(t *testing.T) {
 	assert.Equal(t, 0, rollup.Entries[0].Blocked)
 	assert.Equal(t, 1, rollup.Entries[1].Blocked, "the blocked change must be counted on the member that carries it")
 
-	assert.Contains(t, out, "**Some targets carry changes blocked at apply:**\n\n")
 	// Both members are addressed by one deployment, so the deployment name alone
-	// would render them as two identical lines and leave the reviewer unable to
-	// tell which target holds the refused change.
-	assert.Contains(t, out, "`commerce/orders-002` ✅ planned against its own schema · blocked: 1",
-		"the blocked count names the member that carries it")
-	assert.Contains(t, out, "`commerce/orders-001` (primary) ✅ planned against its own schema\n",
-		"the member carrying nothing blocked is named too, and reports no count")
-	assert.NotContains(t, out, "could not verify",
-		"a planned member is not an unverifiable one")
+	// would leave the reviewer unable to tell which target holds the refused
+	// change.
+	assert.Contains(t, out, "**target `commerce/orders-002`**\n\n```sql\nALTER TABLE `orders` DROP COLUMN `legacy`;\n```\n\n"+glyph.Refused+" **Cannot apply**: 1 change the engine refuses to execute\n- `orders`\n",
+		"the refused change is disclosed under the target and DDL that carry it")
+	assert.Equal(t, 1, strings.Count(out, "**Cannot apply**"), "the target that refuses nothing carries no disclosure")
+	assert.NotContains(t, out, "planned against its own schema", "every target is already named under the plan it runs")
+}
+
+// Targets that would run the same DDL share a group, but whether the engine
+// refuses that DDL can depend on the target. The disclosure names only the
+// targets that refuse it, so the rest of the group is not reported as failing.
+func TestReviewDriftComment_BlockedChangeNamesOnlyTheTargetsThatRefuseIt(t *testing.T) {
+	const drop = "ALTER TABLE `orders` DROP COLUMN `legacy`"
+	diffs := []api.DeploymentPlanDiff{
+		independentMemberDiff("orders-001", drop, false),
+		independentMemberDiff("orders-002", drop, true),
+		independentMemberDiff("orders-003", drop, false),
+	}
+
+	rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
+	require.True(t, rollup.Clean)
+	assert.Contains(t, out, "**targets `commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`**\n\n```sql\n", "one DDL, one group")
+	assert.Contains(t, out, "- `orders` on target `commerce/orders-002`\n", "only the refusing target is named")
+
+	// When every target in the group refuses the change, the heading already
+	// names them.
+	for i := range diffs {
+		diffs[i].Changes[0].TableChanges[0].ExecutionMode = engine.ExecutionModeBlocked
+	}
+	_, allOut := renderDriftComment(t, diffs, api.PlanIndependent)
+	assert.Contains(t, allOut, "**Cannot apply**: 1 change the engine refuses to execute\n- `orders`\n")
 }
 
 // A member that could not be planned blocks, and the wording has to name that.

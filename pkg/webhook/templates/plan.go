@@ -55,6 +55,14 @@ type BlockedChangeData struct {
 	// rendering too wide to name every shard can state coverage ("12 of 32
 	// shards") instead of a bare count. Zero when unknown.
 	TotalShards int
+	// Targets names the rollout targets that refuse this change, for a target
+	// plan group in which only some targets do: the group is keyed on the work
+	// its targets would run, and whether the engine refuses that work can
+	// depend on the target. Empty when every target in the group refuses it.
+	Targets []string
+	// TotalTargets is how many targets the group holds, so a subset too wide
+	// to name reads as coverage ("3 of 12 targets").
+	TotalTargets int
 }
 
 // DirectChangeData is a planned change the database's direct execution policy
@@ -263,6 +271,9 @@ type DeploymentPlanGroup struct {
 	// What renders is whichever member came first in rollout order, not a
 	// spelling every member would produce.
 	Changes []KeyspaceChangeData
+	// BlockedChanges are the group's changes the engine will refuse at apply,
+	// each naming the targets that refuse it when that is not all of them.
+	BlockedChanges []BlockedChangeData
 }
 
 // Empty reports that the group's members are already at the desired schema and
@@ -432,7 +443,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
 	// the locked apply comment too, so the operator sees the guaranteed
 	// failure before confirming.
-	if len(data.BlockedChanges) > 0 {
+	if len(data.BlockedChanges) > 0 && !targetPlansDiscloseBlocked(data) {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
@@ -919,7 +930,8 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 	}
 }
 
-// noChangesDetected is the line that closes a comment with nothing to apply.
+// noChangesDetected is the line that closes a comment with nothing to apply. A
+// shard or target group with nothing to apply carries it under its heading.
 const noChangesDetected = "✅ **No schema changes detected**"
 
 // changingTargetCount counts the rollout's members whose own plan runs work.
@@ -1179,7 +1191,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dial
 		// A satisfied group already matches the desired schema; say so instead
 		// of rendering an empty code block.
 		if g.Satisfied {
-			sb.WriteString("_Already applied — no change._\n\n")
+			sb.WriteString(noChangesDetected + "\n\n")
 			continue
 		}
 		writePlanDDLBlocks(sb, g.Statements, dialect, budget)
@@ -1193,8 +1205,8 @@ type keyspaceShardGroup struct {
 }
 
 // groupKeyspaceShardsByStatements buckets shards whose statement set and
-// satisfied status are identical, preserving resolved order, so a uniform
-// keyspace yields one group.
+// satisfied status are identical, so a uniform keyspace yields one group.
+// Groups with work come first; within each half they keep resolved order.
 func groupKeyspaceShardsByStatements(shards []KeyspaceShardChange) []keyspaceShardGroup {
 	var order []string
 	bySig := make(map[string]*keyspaceShardGroup)
@@ -1212,7 +1224,23 @@ func groupKeyspaceShardsByStatements(shards []KeyspaceShardChange) []keyspaceSha
 	for _, sig := range order {
 		groups = append(groups, *bySig[sig])
 	}
+	slices.SortStableFunc(groups, func(a, b keyspaceShardGroup) int {
+		return compareWorkFirst(a.Satisfied, b.Satisfied)
+	})
 	return groups
+}
+
+// compareWorkFirst orders a group with work to run ahead of one already at the
+// desired schema, and otherwise leaves the two where they were.
+func compareWorkFirst(aDone, bDone bool) int {
+	switch {
+	case aDone == bDone:
+		return 0
+	case bDone:
+		return -1
+	default:
+		return 1
+	}
 }
 
 // shardGroupSignature keys shards into the same group only when they carry the
@@ -1343,14 +1371,11 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 	switch {
 	case drift.Clean && drift.Independent:
 		// When targets still have work, each plan renders below under the
-		// targets that run it, which says everything this line would. A target
-		// that will refuse a change still needs naming, and the list that names
-		// it needs a line saying what it is.
+		// targets that run it, with any change a target will refuse disclosed
+		// under that plan, which says everything this line and the per-target
+		// list would.
 		if rendersTargetPlans(drift) {
-			if anyDeploymentBlocked(drift.Deployments) {
-				sb.WriteString("**Some targets carry changes blocked at apply:**\n\n")
-			}
-			break
+			return
 		}
 		// Independent members were deliberately never compared to each other, so
 		// the mirrored headline would assert agreement the rollup did not check.
@@ -1523,10 +1548,16 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 	if len(drift.Plans) > 1 {
 		sb.WriteString("Targets diverge — what applies where:\n\n")
 	}
-	for _, g := range drift.Plans {
+	// Targets with work lead, as changing shards do: they are what the apply
+	// will run, and the targets already at the schema follow them.
+	plans := slices.Clone(drift.Plans)
+	slices.SortStableFunc(plans, func(a, b DeploymentPlanGroup) int {
+		return compareWorkFirst(a.Empty(), b.Empty())
+	})
+	for _, g := range plans {
 		writeGroupHeading(sb, targetNoun, g.Members, len(drift.Deployments))
 		if g.Empty() {
-			sb.WriteString("_Already applied — no change._\n\n")
+			sb.WriteString(noChangesDetected + "\n\n")
 			continue
 		}
 		group := data
@@ -1534,10 +1565,32 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		statements, vschema := countChanges(group.Changes)
 		if collapse && statements+vschema > 1 {
 			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)
-			continue
+		} else {
+			writeKeyspaceChanges(sb, group, budget)
 		}
-		writeKeyspaceChanges(sb, group, budget)
+		// A refused change is disclosed under the DDL it refuses, naming the
+		// targets that refuse it, so the reader sees what fails and where.
+		if len(g.BlockedChanges) > 0 {
+			writeBlockedChanges(sb, g.BlockedChanges)
+		}
 	}
+}
+
+// targetPlansDiscloseBlocked reports whether the rendered target plans carry
+// the plan's blocked changes under their own groups, so the plan-wide section
+// would only repeat them. A reviewed plan with blocked changes that no group
+// carries keeps the plan-wide section: a refused change is never left unsaid
+// because the two sources disagree.
+func targetPlansDiscloseBlocked(data PlanCommentData) bool {
+	if !rendersTargetPlans(data.DeploymentDrift) {
+		return false
+	}
+	for _, g := range data.DeploymentDrift.Plans {
+		if len(g.BlockedChanges) > 0 {
+			return true
+		}
+	}
+	return len(data.BlockedChanges) == 0
 }
 
 // combinedTargetPlanChanges merges every target's plan into the one change list
@@ -1608,6 +1661,9 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
+		}
+		if len(c.Targets) > 0 {
+			table = fmt.Sprintf("%s on %s", table, planGroupList(targetNoun, c.Targets, c.TotalTargets))
 		}
 		writeEngineReasonItem(sb, table, c.Reason)
 	}
@@ -2238,7 +2294,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// Blocked changes — statements the engine refuses; the apply will fail on
 	// them, so each environment's section discloses its own.
-	if len(plan.BlockedChanges) > 0 {
+	if len(plan.BlockedChanges) > 0 && !targetPlansDiscloseBlocked(*plan) {
 		writeBlockedChanges(sb, plan.BlockedChanges)
 	}
 

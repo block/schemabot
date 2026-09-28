@@ -106,7 +106,7 @@ func TestRenderPlanComment_ShardedPartiallyApplied(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "Shards diverge — what applies where:", "a partially-applied keyspace is divergent")
-	assert.Contains(t, out, "Already applied — no change.", "satisfied shards are surfaced, not hidden")
+	assert.Contains(t, out, "✅ **No schema changes detected**", "satisfied shards are surfaced, not hidden")
 	assert.Contains(t, out, "**shard `-40`**", "the satisfied shard is named")
 	assert.Contains(t, out, "**shards `40-80`, `80-c0`, `c0-`**", "the changing shards share one group")
 	assert.Equal(t, 1, strings.Count(out, "```sql"), "the satisfied group shows no empty code block")

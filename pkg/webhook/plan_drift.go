@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/engine"
+
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -164,6 +166,21 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			byPlan[e.PlanFingerprint] = at
 		}
 		groups[at].Members = append(groups[at].Members, names[i])
+		for _, bc := range memberBlockedChanges(e.ChangeSet) {
+			addBlockedTarget(&groups[at], bc, names[i])
+		}
+	}
+	// A change every target in the group refuses needs no names beside it: the
+	// group heading already lists them.
+	for gi := range groups {
+		for bi := range groups[gi].BlockedChanges {
+			bc := &groups[gi].BlockedChanges[bi]
+			if len(bc.Targets) == len(groups[gi].Members) {
+				bc.Targets = nil
+				continue
+			}
+			bc.TotalTargets = len(groups[gi].Members)
+		}
 	}
 	// The primary is the first member, so its group is already first. Ordering is
 	// stated as a property of the result rather than left to that coincidence,
@@ -179,6 +196,70 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		}
 	})
 	return groups
+}
+
+// memberBlockedChanges lists the changes in one member's plan that its engine
+// will refuse at apply. Grouping keys members on the work they would run, not on
+// whether their engines accept it, so each member's verdict is read from its own
+// plan. A sharded namespace is read per shard, the way the reviewed plan's
+// blocked changes are, so a change refused on some shards names them.
+func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
+	if len(cs.Shards) > 0 {
+		total := 0
+		var out []templates.BlockedChangeData
+		for _, sp := range cs.Shards {
+			if sp == nil {
+				continue
+			}
+			total++
+			for _, tc := range sp.GetChanges() {
+				if tc.GetExecutionMode() != engine.ExecutionModeBlocked {
+					continue
+				}
+				out = mergeBlockedShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
+			}
+		}
+		for i := range out {
+			out[i].TotalShards = total
+		}
+		return out
+	}
+	var out []templates.BlockedChangeData
+	for _, sc := range cs.Changes {
+		for _, tc := range sc.GetTableChanges() {
+			if tc.GetExecutionMode() == engine.ExecutionModeBlocked {
+				out = append(out, templates.BlockedChangeData{Table: tc.GetTableName(), Reason: tc.GetModeReason()})
+			}
+		}
+	}
+	return out
+}
+
+// mergeBlockedShard records that a shard refuses a table change, folding it into
+// the entry for the same table and reason when one exists.
+func mergeBlockedShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
+	for i := range out {
+		if out[i].Table == table && out[i].Reason == reason {
+			out[i].Shards = append(out[i].Shards, shard)
+			return out
+		}
+	}
+	return append(out, templates.BlockedChangeData{Table: table, Reason: reason, Shards: []string{shard}})
+}
+
+// addBlockedTarget records that a target refuses one of its group's changes,
+// folding it into the group's entry for the same change when another target
+// already refuses it.
+func addBlockedTarget(g *templates.DeploymentPlanGroup, bc templates.BlockedChangeData, target string) {
+	for i := range g.BlockedChanges {
+		existing := &g.BlockedChanges[i]
+		if existing.Table == bc.Table && existing.Reason == bc.Reason && slices.Equal(existing.Shards, bc.Shards) {
+			existing.Targets = append(existing.Targets, target)
+			return
+		}
+	}
+	bc.Targets = []string{target}
+	g.BlockedChanges = append(g.BlockedChanges, bc)
 }
 
 // memberPlanChanges renders one member's plan into the shape the comment renders
