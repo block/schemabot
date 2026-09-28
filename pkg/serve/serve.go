@@ -1334,6 +1334,13 @@ func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logge
 }
 
 func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
+	// A malformed app ID is a configuration error, not credentials that are
+	// still on their way: fail startup rather than serve with GitHub disabled.
+	// An app ID whose secret reference cannot be resolved yet falls through to
+	// Configured, which logs the resolution error and disables the endpoint.
+	if _, err := serverConfig.GitHub.ResolveAppID(); errors.Is(err, api.ErrInvalidGitHubAppID) {
+		return webhookRuntime{}, fmt.Errorf("github: %w", err)
+	}
 	if !serverConfig.GitHub.Configured() {
 		if serverConfig.GitHub.PrivateKey != "" {
 			logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
@@ -1364,7 +1371,10 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub repo-webhook secret: %w", err)
 	}
 
-	appID := serverConfig.GitHub.ResolveAppID()
+	appID, err := serverConfig.GitHub.ResolveAppID()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub app-id: %w", err)
+	}
 	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig))

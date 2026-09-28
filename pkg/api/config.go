@@ -610,7 +610,11 @@ func (g GitHubConfig) PromotionCheckRunNameBase() string {
 // It actually resolves the private key so that file: or secretsmanager: references that
 // point to non-existent resources cause Configured() to return false instead of crashing.
 func (g *GitHubConfig) Configured() bool {
-	appID := g.ResolveAppID()
+	appID, err := g.ResolveAppID()
+	if err != nil {
+		slog.Warn("GitHub App app-id not usable — skipping GitHub setup", "error", err)
+		return false
+	}
 	if appID == 0 && g.PrivateKey == "" {
 		slog.Info("GitHub App not configured — skipping GitHub setup")
 		return false
@@ -637,15 +641,48 @@ func (g *GitHubConfig) Configured() bool {
 	return true
 }
 
+// ErrInvalidGitHubAppID marks an app ID that resolved to a value that is not a
+// positive integer. It is a configuration error, distinct from an app ID that
+// is not configured at all or whose secret reference cannot be resolved yet.
+var ErrInvalidGitHubAppID = errors.New("invalid GitHub App ID")
+
 // ResolveAppID resolves the app ID from config (supports secret references),
-// falling back to GITHUB_APP_ID env var.
-func (g *GitHubConfig) ResolveAppID() int64 {
-	resolved, err := secrets.Resolve(g.AppID, "GITHUB_APP_ID")
-	if err == nil && resolved != "" {
-		n, _ := strconv.ParseInt(resolved, 10, 64)
-		return n
+// falling back to GITHUB_APP_ID env var. Surrounding whitespace is trimmed,
+// since mounted secrets and env vars commonly carry a trailing newline.
+//
+// It returns 0 and a nil error when no app ID is configured. It returns an
+// error when the secret reference cannot be resolved, and an error wrapping
+// ErrInvalidGitHubAppID when the resolved value is not a positive integer. The
+// error names the setting it was read from, never the value.
+func (g *GitHubConfig) ResolveAppID() (int64, error) {
+	const fallbackEnvVar = "GITHUB_APP_ID"
+	setting := "app-id"
+	if g.AppID == "" {
+		setting = fallbackEnvVar
 	}
-	return 0
+	resolved, err := secrets.Resolve(g.AppID, fallbackEnvVar)
+	if err != nil {
+		return 0, fmt.Errorf("resolve %s: %w", setting, err)
+	}
+	resolved = strings.TrimSpace(resolved)
+	if resolved == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(resolved, 10, 64)
+	if err != nil {
+		// strconv's error quotes the input; keep only its cause so the
+		// resolved value never reaches a log line or startup error.
+		cause := err
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) {
+			cause = numErr.Err
+		}
+		return 0, fmt.Errorf("%s must be a positive integer: %w (%w)", setting, ErrInvalidGitHubAppID, cause)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer: %w", setting, ErrInvalidGitHubAppID)
+	}
+	return n, nil
 }
 
 // ResolvePrivateKey resolves the private key value using the secrets resolver.
@@ -3092,9 +3129,12 @@ func (c *ServerConfig) ResolveGitHubAppsByID() (map[int64]ResolvedGitHubApp, err
 	}
 	out := make(map[int64]ResolvedGitHubApp, len(apps))
 	for name, app := range apps {
-		id := app.ResolveAppID()
+		id, err := app.ResolveAppID()
+		if err != nil {
+			return nil, fmt.Errorf("app %q: %w", name, err)
+		}
 		if id == 0 {
-			return nil, fmt.Errorf("app %q has empty or unparseable app-id", name)
+			return nil, fmt.Errorf("app %q has an empty app-id", name)
 		}
 		if existing, ok := out[id]; ok {
 			return nil, fmt.Errorf("apps %q and %q resolve to the same app-id %d", existing.Name, name, id)

@@ -472,9 +472,12 @@ func resolveRepoInstallationClient(ctx context.Context, cfg *ServerConfig, repo 
 	if err != nil {
 		return nil, 0, err
 	}
-	appID := app.Config.ResolveAppID()
+	appID, err := app.Config.ResolveAppID()
+	if err != nil {
+		return nil, 0, fmt.Errorf("app %q: %w", app.Name, err)
+	}
 	if appID == 0 {
-		return nil, 0, fmt.Errorf("app %q has empty or unparseable app-id", app.Name)
+		return nil, 0, fmt.Errorf("app %q has an empty app-id", app.Name)
 	}
 	privateKey, err := app.Config.ResolvePrivateKey()
 	if err != nil {
@@ -569,9 +572,12 @@ func webhookRedriveApps(cfg *ServerConfig, onlyApp string) ([]webhookRedriveApp,
 			continue
 		}
 		appConfig := configured[name]
-		appID := appConfig.ResolveAppID()
+		appID, err := appConfig.ResolveAppID()
+		if err != nil {
+			return nil, fmt.Errorf("app %q: %w", name, err)
+		}
 		if appID == 0 {
-			return nil, fmt.Errorf("app %q has empty or unparseable app-id", name)
+			return nil, fmt.Errorf("app %q has an empty app-id", name)
 		}
 		apps = append(apps, webhookRedriveApp{name: name, id: appID, config: appConfig})
 	}

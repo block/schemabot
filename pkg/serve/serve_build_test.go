@@ -327,6 +327,39 @@ func TestForwardAuthOperatorScopingThroughServerHandler(t *testing.T) {
 	})
 }
 
+// A GitHub App ID that resolves to something other than a positive integer
+// fails server startup with an error naming the setting, instead of the server
+// coming up with the webhook endpoint quietly disabled. An App ID that is not
+// configured at all still starts the server, with the webhook endpoint
+// answering 503.
+func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	t.Run("malformed app-id fails startup", func(t *testing.T) {
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "abc", PrivateKey: "some-key", WebhookSecret: "secret"}}
+		svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+
+		_, err := buildWebhookRuntime(cfg, svc, logger)
+		require.ErrorIs(t, err, api.ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "github: app-id must be a positive integer")
+		assert.NotContains(t, err.Error(), "abc", "the resolved value must not appear in the error")
+	})
+
+	t.Run("unset app-id starts with the webhook endpoint disabled", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		cfg := &api.ServerConfig{}
+		svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+
+		runtime, err := buildWebhookRuntime(cfg, svc, logger)
+		require.NoError(t, err)
+		require.NotNil(t, runtime.handler)
+
+		rec := httptest.NewRecorder()
+		runtime.handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", nil))
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+}
+
 // staticStorageSchemaService stands in for the adapter bound to an instance's
 // own storage, answering with a report no other source could have produced.
 type staticStorageSchemaService struct{ database string }

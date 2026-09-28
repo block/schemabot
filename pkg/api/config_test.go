@@ -3340,6 +3340,17 @@ func TestGitHubConfig_Configured(t *testing.T) {
 		assert.True(t, g.Configured())
 	})
 
+	t.Run("configured when app id carries a trailing newline", func(t *testing.T) {
+		t.Setenv("CONFIGURED_APP_ID_NEWLINE", "123\n")
+		g := GitHubConfig{AppID: "env:CONFIGURED_APP_ID_NEWLINE", PrivateKey: "some-key"}
+		assert.True(t, g.Configured())
+	})
+
+	t.Run("not configured when app id is malformed", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc", PrivateKey: "some-key"}
+		assert.False(t, g.Configured())
+	})
+
 	t.Run("not configured when file reference does not exist", func(t *testing.T) {
 		nonexistent := filepath.Join(t.TempDir(), "nonexistent-key.pem")
 		g := GitHubConfig{AppID: "123", PrivateKey: "file:" + nonexistent}
@@ -3347,32 +3358,102 @@ func TestGitHubConfig_Configured(t *testing.T) {
 	})
 }
 
+// The app ID resolves from config or the GITHUB_APP_ID fallback with
+// surrounding whitespace trimmed, so a mounted secret's trailing newline still
+// yields the ID. An unset app ID is "not configured" (0, no error), while a
+// value that is not a positive integer is a configuration error that names the
+// setting and never echoes the value.
 func TestGitHubConfig_ResolveAppID(t *testing.T) {
 	t.Run("resolves numeric string", func(t *testing.T) {
 		g := GitHubConfig{AppID: "456789"}
-		assert.Equal(t, int64(456789), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(456789), id)
 	})
 
-	t.Run("returns 0 for empty", func(t *testing.T) {
+	t.Run("trims a trailing newline from an env reference", func(t *testing.T) {
+		t.Setenv("RESOLVE_APP_ID_NEWLINE", "12345\n")
+		g := GitHubConfig{AppID: "env:RESOLVE_APP_ID_NEWLINE"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(12345), id)
+	})
+
+	t.Run("trims surrounding whitespace from the env var fallback", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", " 12345\n")
 		g := GitHubConfig{}
-		assert.Equal(t, int64(0), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(12345), id)
 	})
 
-	t.Run("returns 0 for non-numeric", func(t *testing.T) {
-		g := GitHubConfig{AppID: "not-a-number"}
-		assert.Equal(t, int64(0), g.ResolveAppID())
+	t.Run("returns 0 without error when unset", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		g := GitHubConfig{}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("returns 0 without error when an env reference is unset", func(t *testing.T) {
+		t.Setenv("RESOLVE_APP_ID_UNSET", "")
+		g := GitHubConfig{AppID: "env:RESOLVE_APP_ID_UNSET"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("non-numeric value is an error naming the setting", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc"}
+		id, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Equal(t, int64(0), id)
+		assert.Contains(t, err.Error(), "app-id must be a positive integer")
+		assert.Contains(t, err.Error(), "invalid syntax")
+		assert.NotContains(t, err.Error(), "abc", "the resolved value must not appear in the error")
+	})
+
+	t.Run("non-numeric env var fallback is an error naming the env var", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "not-a-number")
+		g := GitHubConfig{}
+		_, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "GITHUB_APP_ID must be a positive integer")
+		assert.NotContains(t, err.Error(), "not-a-number", "the resolved value must not appear in the error")
+	})
+
+	t.Run("non-positive value is an error", func(t *testing.T) {
+		for _, value := range []string{"0", "-5"} {
+			g := GitHubConfig{AppID: value}
+			_, err := g.ResolveAppID()
+			require.ErrorIs(t, err, ErrInvalidGitHubAppID, "app-id %q", value)
+			assert.Contains(t, err.Error(), "app-id must be a positive integer")
+		}
+	})
+
+	t.Run("unresolvable secret reference is an error but not an invalid app ID", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		g := GitHubConfig{AppID: "file:" + nonexistent}
+		_, err := g.ResolveAppID()
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "resolve app-id")
 	})
 
 	t.Run("falls back to env var", func(t *testing.T) {
 		t.Setenv("GITHUB_APP_ID", "999")
 		g := GitHubConfig{}
-		assert.Equal(t, int64(999), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(999), id)
 	})
 
 	t.Run("config takes precedence over env var", func(t *testing.T) {
 		t.Setenv("GITHUB_APP_ID", "999")
 		g := GitHubConfig{AppID: "123"}
-		assert.Equal(t, int64(123), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(123), id)
 	})
 }
 
@@ -4256,6 +4337,7 @@ func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 	})
 
 	t.Run("empty app-id fails closed", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
 		cfg := &ServerConfig{
 			Apps: map[string]GitHubAppConfig{
 				"app-a": {AppID: "", PrivateKey: "x", WebhookSecret: "y"},
@@ -4263,7 +4345,19 @@ func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 		}
 		_, err := cfg.ResolveGitHubAppsByID()
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "empty or unparseable app-id")
+		assert.Contains(t, err.Error(), `app "app-a" has an empty app-id`)
+	})
+
+	t.Run("malformed app-id fails closed naming the App", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "12x45", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), `app "app-a": app-id must be a positive integer`)
+		assert.NotContains(t, err.Error(), "12x45", "the resolved value must not appear in the error")
 	})
 
 	t.Run("nil receiver errors", func(t *testing.T) {
