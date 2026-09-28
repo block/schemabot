@@ -379,3 +379,139 @@ func TestEngine_ExecuteSchemaChange_DirectDropForwardsBypassedStatements(t *test
 		})
 	}
 }
+
+// resumeStoppedDropPhase stands in for a schema change whose first attempt ran
+// the attempted DROP statements and was then stopped, and resumes it through
+// the engine's own Start, which replays the plan from its first statement. It
+// returns the resumed run's final state and failure reason.
+func resumeStoppedDropPhase(t *testing.T, eng *Engine, dsn string, attempted, plan []string) (engine.State, string) {
+	t.Helper()
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	rm := &runningSchemaChange{
+		database:     database,
+		originalDDLs: plan,
+		state:        engine.StateRunning,
+		started:      time.Now(),
+		host:         host,
+		username:     username,
+		password:     password,
+	}
+	eng.installRunningSchemaChange(rm)
+	require.True(t, eng.executeDropStatements(t.Context(), host, username, password, database, attempted),
+		"the first attempt must run its DROP statements")
+
+	eng.mu.Lock()
+	rm.state = engine.StateStopped
+	eng.mu.Unlock()
+
+	result, err := eng.Start(t.Context(), &engine.ControlRequest{Database: database})
+	require.NoError(t, err, "resume the stopped schema change")
+	require.True(t, result.Accepted, "resume must be accepted: %s", result.Message)
+
+	done := make(chan struct{})
+	go func() {
+		rm.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(resumeDeadline):
+		require.FailNow(t, "resumed schema change did not finish", "deadline %s", resumeDeadline)
+	}
+
+	eng.mu.Lock()
+	defer eng.mu.Unlock()
+	return rm.state, rm.errorMessage
+}
+
+// A schema change dropping two tables is stopped after the first drop moved
+// its table into pending drops. Resuming replays the DROP phase from its first
+// statement, so the first table is already gone when the replay reaches it.
+// The replay recognizes that table as its own quarantine and moves on, the
+// second table is quarantined, and the schema change completes with each
+// table in pending drops exactly once.
+func TestEngine_ResumeDropPhase_SkipsTableAlreadyQuarantined(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	for _, name := range []string{"resume_quarantined_first", "resume_quarantined_second"} {
+		_, err := db.ExecContext(t.Context(),
+			fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY AUTO_INCREMENT)", name))
+		require.NoError(t, err, "create table %s", name)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	plan := []string{
+		"DROP TABLE `resume_quarantined_first`",
+		"DROP TABLE `resume_quarantined_second`",
+	}
+	state, reason := resumeStoppedDropPhase(t, eng, dsn, plan[:1], plan)
+	require.Equal(t, engine.StateCompleted, state, "resumed schema change failed: %s", reason)
+
+	var count int
+	err := db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name LIKE 'resume_quarantined_%'").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "both tables must be gone from testdb")
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 2, "each table is quarantined exactly once: %v", quarantined)
+	assert.Contains(t, quarantined[0]+" "+quarantined[1], "_resume_quarantined_first")
+	assert.Contains(t, quarantined[0]+" "+quarantined[1], "_resume_quarantined_second")
+}
+
+// A resumed DROP phase reaches a table that is missing although this schema
+// change never quarantined it, while pending drops holds a same-named table
+// quarantined by some other change. Nothing this schema change did explains
+// the missing table and SchemaBot holds no copy of it, so the replay fails
+// the statement rather than report a recoverable drop, and the table after
+// it is left in place.
+func TestEngine_ResumeDropPhase_FailsOnMissingTableItNeverQuarantined(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+	t.Cleanup(func() {
+		cleanupCtx := context.WithoutCancel(t.Context())
+		_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `resume_untouched_second`")
+		require.NoError(t, err, "drop resume_untouched_second")
+		_, err = db.ExecContext(cleanupCtx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", pendingdrops.Database))
+		require.NoError(t, err, "drop pending drops database")
+	})
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `resume_untouched_second` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create resume_untouched_second")
+
+	// Another change quarantined a table of the same name, so pending drops
+	// holds a copy named for resume_vanished_first that this schema change
+	// did not make.
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `resume_vanished_first` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create resume_vanished_first")
+	foreign, err := pendingdrops.MoveTable(t.Context(), db, "testdb", "resume_vanished_first", time.Now())
+	require.NoError(t, err, "quarantine resume_vanished_first outside the schema change")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	plan := []string{
+		"DROP TABLE `resume_vanished_first`",
+		"DROP TABLE `resume_untouched_second`",
+	}
+	state, reason := resumeStoppedDropPhase(t, eng, dsn, nil, plan)
+	assert.Equal(t, engine.StateFailed, state)
+	assert.Contains(t, reason, "`testdb`.`resume_vanished_first` does not exist and was not quarantined by this schema change")
+
+	var count int
+	err = db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = 'resume_untouched_second'").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "the statement after the failed one must not run")
+
+	assert.Equal(t, []string{foreign}, listQuarantinedTables(t, db),
+		"only the other change's copy may be in pending drops")
+}

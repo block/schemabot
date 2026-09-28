@@ -33,6 +33,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
@@ -125,6 +126,12 @@ type runningSchemaChange struct {
 	// for progress reporting.
 	directPolicy     directPolicy
 	directStatements []*directStatementProgress
+
+	// quarantinedDrops records every table this schema change moved into
+	// pending drops, keyed by source table, so a DROP phase replayed on resume
+	// skips the tables it already moved and still fails on a table that
+	// vanished some other way.
+	quarantinedDrops map[dropTarget]pendingdrops.QuarantinedTable
 
 	// For resume support
 	cancelFunc context.CancelFunc

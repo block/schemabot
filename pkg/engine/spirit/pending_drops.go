@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -19,7 +20,8 @@ import (
 // quarantineDroppedTables executes a DROP TABLE statement as a quarantine:
 // every table named in the statement is renamed into the pending drops
 // database instead of being dropped. IF EXISTS semantics are preserved —
-// missing tables are skipped when the statement allows it.
+// missing tables are skipped when the statement allows it — and a table this
+// schema change already quarantined is skipped when the DROP phase replays.
 func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, password, database, stmt string) error {
 	dropStmt, err := parseDropTableStatement(stmt)
 	if err != nil {
@@ -53,18 +55,15 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 	targets := dropTableTargets(dropStmt, database)
 	tables := make([]pendingdrops.TableMove, 0, len(targets))
 	for _, target := range targets {
-		if dropStmt.IfExists {
-			exists, err := tableExistsInSchema(ctx, db, target.schema, target.table)
-			if err != nil {
-				return fmt.Errorf("check table `%s`.`%s` exists: %w", target.schema, target.table, err)
+		exists, err := tableExistsInSchema(ctx, db, target.schema, target.table)
+		if err != nil {
+			return fmt.Errorf("check table `%s`.`%s` exists: %w", target.schema, target.table, err)
+		}
+		if !exists {
+			if err := e.resolveMissingDropTarget(target, dropStmt.IfExists); err != nil {
+				return err
 			}
-			if !exists {
-				e.logger.Info("DROP TABLE IF EXISTS target does not exist, skipping quarantine",
-					"database", target.schema,
-					"table", target.table,
-				)
-				continue
-			}
+			continue
 		}
 		tables = append(tables, pendingdrops.TableMove{SchemaName: target.schema, TableName: target.table})
 	}
@@ -74,6 +73,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
 	}
 	for _, table := range moved {
+		e.recordQuarantinedDrop(table)
 		e.logger.Info("DROP TABLE intercepted: table quarantined in pending drops and recoverable until the retention period expires",
 			"database", table.SchemaName,
 			"table", table.TableName,
@@ -88,6 +88,74 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		metrics.RecordPendingDropMoved(ctx, table.SchemaName)
 	}
 	return nil
+}
+
+// resolveMissingDropTarget decides what to do with a DROP TABLE target that is
+// no longer in the target database. The DROP phase replays from its first
+// statement when a stopped schema change resumes, so a table this schema
+// change already quarantined is found missing on the replay. That is the state
+// the plan asked for, with the data in pending drops, so it is skipped. IF
+// EXISTS tolerates any other missing table, as MySQL does. A missing table
+// this schema change never quarantined fails the statement: SchemaBot holds no
+// copy of it, and reporting the drop done would tell an operator the data is
+// recoverable when it is not.
+func (e *Engine) resolveMissingDropTarget(target dropTarget, ifExists bool) error {
+	logger := e.changeLogger()
+	if prior, ok := e.quarantinedDrop(target); ok {
+		logger.Info("DROP TABLE target was already quarantined by this schema change, skipping quarantine",
+			"database", target.schema,
+			"table", target.table,
+			"quarantine_database", prior.QuarantineSchema,
+			"quarantine_table", prior.QuarantineTable,
+		)
+		e.emitTableLog(target.table,
+			fmt.Sprintf("table already quarantined as `%s`.`%s` earlier in this schema change; nothing left to quarantine",
+				prior.QuarantineSchema, prior.QuarantineTable))
+		return nil
+	}
+	if ifExists {
+		logger.Info("DROP TABLE IF EXISTS target does not exist, skipping quarantine",
+			"database", target.schema,
+			"table", target.table,
+		)
+		return nil
+	}
+	return engine.OperatorErrorf(nil,
+		"DROP TABLE target `%s`.`%s` does not exist and was not quarantined by this schema change, so pending drops holds no copy of it",
+		target.schema, target.table)
+}
+
+// recordQuarantinedDrop remembers that the running schema change moved a
+// table into pending drops, so a replay of the DROP phase recognizes the
+// table as its own work rather than as a table that vanished.
+func (e *Engine) recordQuarantinedDrop(table pendingdrops.QuarantinedTable) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rm := e.runningSchemaChange
+	if rm == nil {
+		e.logger.Warn("no running schema change to record quarantined table on; a replayed DROP phase will fail on this table",
+			"database", table.SchemaName,
+			"table", table.TableName,
+			"quarantine_table", table.QuarantineTable,
+		)
+		return
+	}
+	if rm.quarantinedDrops == nil {
+		rm.quarantinedDrops = make(map[dropTarget]pendingdrops.QuarantinedTable)
+	}
+	rm.quarantinedDrops[dropTarget{schema: table.SchemaName, table: table.TableName}] = table
+}
+
+// quarantinedDrop returns where the running schema change quarantined target,
+// if it did.
+func (e *Engine) quarantinedDrop(target dropTarget) (pendingdrops.QuarantinedTable, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.runningSchemaChange == nil {
+		return pendingdrops.QuarantinedTable{}, false
+	}
+	prior, ok := e.runningSchemaChange.quarantinedDrops[target]
+	return prior, ok
 }
 
 // tableExistsInSchema checks if a table exists in the given schema.
