@@ -835,6 +835,119 @@ func TestConflictCheckFailsAbandonedTaskWithStaleForeignLease(t *testing.T) {
 	assert.NotNil(t, running.CompletedAt)
 }
 
+// operationDrivenTask builds a running task owned by operation 151 of apply
+// 151, the shape a multi-operation drive leaves: the drive heartbeats only its
+// operation row, so the parent apply's lease reads stale while still naming
+// parentOwner, and the engine probe has no active schema change to report.
+func operationDrivenTask(parentOwner string, operation storage.ApplyOperationStore) (*storage.Task, *LocalClient) {
+	operationID := int64(151)
+	running := &storage.Task{
+		ID: 15, ApplyID: 151, ApplyOperationID: &operationID, TaskIdentifier: "task-operation-driven",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, TableName: "events", State: state.Task.Running,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+	stor := client.storage.(*exactProgressStorage)
+	stor.applies = &mockApplyStore{apply: staleLeaseApply(151, parentOwner)}
+	stor.applyOperations = operation
+	return running, client
+}
+
+// A multi-operation drive is copying `events` under a fresh lease on its own
+// operation row, while the parent apply's lease has gone stale and still names
+// an owner — this process's or another's. The engine probe reports no active
+// schema change, which would read as abandoned work if the parent's lease
+// decided alone. The operation's lease proves a live drive owns the task, so
+// the dispatch is refused, the task is left running for that drive, and the
+// refusal is counted once per scan under its own reason.
+func TestConflictCheckLeavesTaskOfALiveOperationDrive(t *testing.T) {
+	parentOwners := map[string]string{
+		"parent last leased by this process":    storage.LeaseOwnerProcess() + "/driver-0",
+		"parent last leased by another process": "other-host/4242/driver-0",
+	}
+	for name, parentOwner := range parentOwners {
+		t.Run(name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			running, client := operationDrivenTask(parentOwner, &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				151: {ID: 151, ApplyID: 151, LeaseOwner: "drive-host/77/driver-3", LeaseToken: "token-live", UpdatedAt: time.Now()},
+			}})
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+			require.Error(t, err, "a task under a live operation drive must refuse the dispatch")
+			assert.Contains(t, err.Error(), "schema change already in progress")
+			assert.Equal(t, state.Task.Running, running.State, "the task is left running for its drive")
+			assert.Empty(t, running.ErrorMessage)
+			assert.Nil(t, running.CompletedAt)
+
+			points := collectCounterPoints(t, reader, "schemabot.conflict_check.ownership_blocks_total")
+			require.Len(t, points, 1, "one refusal is counted under one reason")
+			assert.Equal(t, int64(1), points[0].Value, "the counter records the refusal once per scan, not once per retry attempt")
+			assert.Equal(t, "fresh_operation_lease", counterAttr(t, points[0], "reason"))
+		})
+	}
+}
+
+// When the lease of the operation that owns an in-flight task cannot be read,
+// a live drive cannot be ruled out, so the idle engine report is not trusted:
+// the dispatch is refused and the task is left untouched rather than failed.
+func TestConflictCheckKeepsTaskWhenItsOperationLeaseIsUnreadable(t *testing.T) {
+	operationStores := map[string]storage.ApplyOperationStore{
+		"operation read fails":         &erroringApplyOperationStore{err: errors.New("storage down")},
+		"operation store not wired up": nil,
+	}
+	for name, operations := range operationStores {
+		t.Run(name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", operations)
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+			require.Error(t, err, "an unreadable operation lease must keep the task blocking")
+			assert.Contains(t, err.Error(), "schema change already in progress")
+			assert.Equal(t, state.Task.Running, running.State, "the task must not be failed on an unproven lease")
+			assert.Empty(t, running.ErrorMessage)
+			assert.Nil(t, running.CompletedAt)
+
+			points := collectCounterPoints(t, reader, "schemabot.conflict_check.ownership_blocks_total")
+			require.Len(t, points, 1, "one refusal is counted under one reason")
+			assert.Equal(t, int64(1), points[0].Value, "the counter records the refusal once per scan, not once per retry attempt")
+			assert.Equal(t, "operation_lease_unreadable", counterAttr(t, points[0], "reason"))
+		})
+	}
+}
+
+// erroringApplyOperationStore fails every operation load, standing in for
+// storage that is unavailable while the conflict check runs.
+type erroringApplyOperationStore struct {
+	storage.ApplyOperationStore
+	err error
+}
+
+func (s *erroringApplyOperationStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
+	return nil, s.err
+}
+
+// A task whose operation's drive has died is abandoned: the operation's lease
+// and the parent's have both gone stale, and the engine has no active schema
+// change. The task is failed so it stops blocking the database, exactly as when
+// the task records no operation at all.
+func TestConflictCheckFailsAbandonedTaskUnderAStaleOperationLease(t *testing.T) {
+	running, client := operationDrivenTask("crashed-host/4242/driver-0", &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		151: {ID: 151, ApplyID: 151, LeaseOwner: "crashed-host/4242/driver-3", LeaseToken: "token-crashed",
+			UpdatedAt: time.Now().Add(-2 * storage.ApplyLeaseStaleAfter)},
+	}})
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+	require.NoError(t, err, "an abandoned task under stale operation and apply leases must be failed and unblock")
+	assert.Equal(t, state.Task.Failed, running.State)
+	assert.Contains(t, running.ErrorMessage, "server may have crashed")
+	assert.NotNil(t, running.CompletedAt)
+}
+
 // Once an abandoned in-flight task has been failed, it no longer blocks the
 // database, so a new apply is admitted.
 func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
