@@ -362,6 +362,46 @@ func TestListKeyspacesStopsWhenNoNextPage(t *testing.T) {
 	assert.Equal(t, []string{"1"}, requested)
 }
 
+func TestListKeyspacesStopsWhenNextPageIsZero(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"next_page":0,"data":[{"name":"orders","shards":1}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+	assert.Equal(t, []string{"1"}, requested)
+}
+
+func TestListKeyspacesDeduplicatesNamesAcrossPages(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"next_page":2,"data":[{"name":"orders","shards":1}]}`,
+		"2": `{"data":[{"name":"orders","shards":1},{"name":"payments","shards":2}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders", "payments"}, keyspaceNames(keyspaces))
+}
+
+func TestListKeyspacesFailsToDecodeALaterPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"next_page":2,"data":[{"name":"orders","shards":1}]}`,
+		"2": `{not-json}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "decode keyspaces for block/orders branch main page 2")
+}
+
 // A failure on a later page fails the listing rather than returning the pages
 // already read, and the error says which branch and page failed.
 func TestListKeyspacesFailsOnALaterPage(t *testing.T) {

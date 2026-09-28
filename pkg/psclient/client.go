@@ -249,6 +249,7 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 	}
 	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces", req.Organization, req.Database, req.Branch)
 	var keyspaces []*ps.Keyspace
+	seen := make(map[string]struct{})
 	page := 1
 	for fetched := 1; ; fetched++ {
 		if fetched > maxKeyspacePages {
@@ -268,7 +269,12 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 		if err := json.Unmarshal(respBody, &payload); err != nil {
 			return nil, fmt.Errorf("decode keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
 		}
-		keyspaces = append(keyspaces, payload.Data...)
+		for _, keyspace := range payload.Data {
+			if _, ok := seen[keyspace.Name]; !ok {
+				seen[keyspace.Name] = struct{}{}
+				keyspaces = append(keyspaces, keyspace)
+			}
+		}
 		if payload.NextPage == nil || *payload.NextPage == 0 {
 			return keyspaces, nil
 		}
