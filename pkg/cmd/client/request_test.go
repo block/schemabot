@@ -1,6 +1,8 @@
 package client
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -274,8 +276,13 @@ func TestAuthTokenWithheldFromCrossOriginRedirect(t *testing.T) {
 	}))
 	t.Cleanup(other.Close)
 	source := redirectServer(t, httptest.NewTLSServer, func() string { return other.URL })
+	roots := x509.NewCertPool()
+	roots.AddCert(source.Certificate())
+	roots.AddCert(other.Certificate())
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 
-	err := getThrough(t, tokenClient(source.Client().Transport, "tok-abc123"), source.URL+"/api/status")
+	err := getThrough(t, tokenClient(base, "tok-abc123"), source.URL+"/api/status")
 	require.NoError(t, err)
 	assert.True(t, reached, "the cross-origin redirect is followed")
 	assert.Empty(t, gotAuth)
@@ -318,6 +325,30 @@ func TestAuthTokenRefusesHTTPSDowngradeRedirect(t *testing.T) {
 	err := getThrough(t, tokenClient(source.Client().Transport, "tok-abc123"), source.URL+"/api/status")
 	require.ErrorIs(t, err, ErrInsecureTokenTransport)
 	assert.False(t, reached, "no plaintext request is sent")
+}
+
+func TestCallerAuthorizationRefusesHTTPSDowngradeRedirect(t *testing.T) {
+	plaintext := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(plaintext.Close)
+	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, source.URL+"/api/status", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer caller-token")
+	resp, err := tokenClient(source.Client().Transport, "").Do(req)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	require.ErrorIs(t, err, ErrInsecureTokenTransport)
+}
+
+func TestUnauthenticatedRequestFollowsHTTPSDowngradeRedirect(t *testing.T) {
+	var reached bool
+	plaintext := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true }))
+	t.Cleanup(plaintext.Close)
+	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
+
+	require.NoError(t, getThrough(t, tokenClient(source.Client().Transport, ""), source.URL+"/api/status"))
+	assert.True(t, reached)
 }
 
 func TestRequestOriginNormalizesDefaultPortAndCase(t *testing.T) {

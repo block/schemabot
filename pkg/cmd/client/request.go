@@ -89,12 +89,14 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.isAuthenticated(first) && downgradesFromHTTPS(chain) {
 		return nil, fmt.Errorf("%w: %s redirected to %s://%s", ErrInsecureTokenTransport, requestOrigin(first.URL), req.URL.Scheme, req.URL.Host)
 	}
+	if !stayedOnFirstOrigin(chain) {
+		redirected := req.Clone(req.Context())
+		redirected.Header.Del("Authorization")
+		slog.Warn("not forwarding authorization to a redirect on another origin; the request continues unauthenticated",
+			"origin", requestOrigin(first.URL), "redirect", req.URL.Scheme+"://"+req.URL.Host)
+		return t.base.RoundTrip(redirected)
+	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
-		if !stayedOnFirstOrigin(chain) {
-			slog.Warn("not forwarding the SchemaBot token to a redirect on another origin; the request continues unauthenticated",
-				"origin", requestOrigin(first.URL), "redirect", req.URL.Scheme+"://"+req.URL.Host)
-			return t.base.RoundTrip(req)
-		}
 		if err := GuardInsecureToken(req.URL); err != nil {
 			return nil, err
 		}
