@@ -504,7 +504,7 @@ func TestEngine_ResumeDropPhase_FailsOnMissingTableItNeverQuarantined(t *testing
 	}
 	state, reason := resumeStoppedDropPhase(t, eng, dsn, nil, plan)
 	assert.Equal(t, engine.StateFailed, state)
-	assert.Contains(t, reason, "`testdb`.`resume_vanished_first` does not exist and was not quarantined by this schema change")
+	assert.Contains(t, reason, "`resume_vanished_first` does not exist and was not quarantined by this schema change")
 
 	var count int
 	err = db.QueryRowContext(t.Context(),
@@ -514,4 +514,37 @@ func TestEngine_ResumeDropPhase_FailsOnMissingTableItNeverQuarantined(t *testing
 
 	assert.Equal(t, []string{foreign}, listQuarantinedTables(t, db),
 		"only the other change's copy may be in pending drops")
+}
+
+// A replay record does not make a missing DROP target safe after retention has
+// removed the recorded pending drops copy. The engine fails closed rather than
+// reporting the table as recoverable.
+func TestEngine_ResumeDropPhase_FailsWhenRecordedCopyWasRemoved(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	eng := New(Config{Logger: slog.Default()})
+	eng.installRunningSchemaChange(&runningSchemaChange{
+		database: database,
+		quarantinedDrops: map[dropTarget]pendingdrops.QuarantinedTable{
+			{schema: database, table: "removed_copy"}: {
+				SchemaName:       database,
+				TableName:        "removed_copy",
+				QuarantineSchema: pendingdrops.Database,
+				QuarantineTable:  "20260101000000_removed_copy",
+			},
+		},
+	})
+
+	err = eng.quarantineDroppedTables(t.Context(), host, username, password, database,
+		"DROP TABLE `removed_copy`")
+	require.Error(t, err)
+	message, ok := engine.OperatorMessageOf(err)
+	require.True(t, ok, "error must carry an operator message")
+	assert.Contains(t, message,
+		"DROP TABLE target `removed_copy` does not exist and its recorded pending drops copy is no longer available")
 }

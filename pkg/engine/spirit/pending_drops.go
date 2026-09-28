@@ -60,7 +60,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			return fmt.Errorf("check table `%s`.`%s` exists: %w", target.schema, target.table, err)
 		}
 		if !exists {
-			if err := e.resolveMissingDropTarget(target, dropStmt.IfExists); err != nil {
+			if err := e.resolveMissingDropTarget(ctx, db, target, dropStmt.IfExists); err != nil {
 				return err
 			}
 			continue
@@ -99,9 +99,18 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 // this schema change never quarantined fails the statement: SchemaBot holds no
 // copy of it, and reporting the drop done would tell an operator the data is
 // recoverable when it is not.
-func (e *Engine) resolveMissingDropTarget(target dropTarget, ifExists bool) error {
+func (e *Engine) resolveMissingDropTarget(ctx context.Context, db *sql.DB, target dropTarget, ifExists bool) error {
 	logger := e.changeLogger()
 	if prior, ok := e.quarantinedDrop(target); ok {
+		exists, err := tableExistsInSchema(ctx, db, prior.QuarantineSchema, prior.QuarantineTable)
+		if err != nil {
+			return fmt.Errorf("check recorded pending drops table `%s` exists: %w", prior.QuarantineTable, err)
+		}
+		if !exists {
+			return engine.OperatorErrorf(nil,
+				"DROP TABLE target `%s` does not exist and its recorded pending drops copy is no longer available",
+				target.table)
+		}
 		logger.Info("DROP TABLE target was already quarantined by this schema change, skipping quarantine",
 			"database", target.schema,
 			"table", target.table,
@@ -121,8 +130,8 @@ func (e *Engine) resolveMissingDropTarget(target dropTarget, ifExists bool) erro
 		return nil
 	}
 	return engine.OperatorErrorf(nil,
-		"DROP TABLE target `%s`.`%s` does not exist and was not quarantined by this schema change, so pending drops holds no copy of it",
-		target.schema, target.table)
+		"DROP TABLE target `%s` does not exist and was not quarantined by this schema change",
+		target.table)
 }
 
 // recordQuarantinedDrop remembers that the running schema change moved a

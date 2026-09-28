@@ -67,14 +67,13 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
    period. Tables whose names do not carry a valid timestamp prefix are never
    auto-dropped, because their age is unknown.
 
-**A resumed schema change does not quarantine a table twice.** When a stopped
-schema change resumes on the same server, its DROP phase replays from the first
-statement, so a table the earlier attempt already moved into `_pending_drops`
-is missing when the replay reaches it. The engine keeps a record of the tables
-the schema change quarantined, skips those, and logs where each one already
-sits. A table that is missing although the schema change never quarantined it
-still fails the statement unless it says `IF EXISTS`, because `_pending_drops`
-holds no copy of it to recover.
+**A resumed schema change does not quarantine a table twice.** Before resuming,
+SchemaBot plans again against the live schema. A table an earlier attempt moved
+into `_pending_drops` is no longer part of the diff, so its completed DROP is
+not sent to the engine again. If the engine replays a stopped DROP phase on the
+same server, it also verifies that its recorded pending drops copy still exists
+before skipping the missing source table. Any other missing table still fails
+unless the statement says `IF EXISTS`.
 
 **Cancelling a schema change quarantines its copy too.** A cancelled change
 leaves a shadow table holding every row copied so far, and — if it had already
