@@ -254,9 +254,12 @@ func TestApplyConfirmCommandCoreMissingPlanIsTerminalAndKeepsPendingLock(t *test
 	assert.False(t, retry, "an unverifiable pending confirmation is a terminal rejection")
 	assert.Empty(t, locks.releasedIfPending, "the unverifiable pending intent must stay pinned")
 	body := requireComment(t, comments, "unverifiable-plan apply-confirm comment")
+	assert.Contains(t, body, "Apply-confirm Refused — Staging")
 	assert.Contains(t, body, "could not verify which environment")
 	assert.Contains(t, body, "nothing was applied")
-	assert.Contains(t, body, "Run `schemabot apply -e staging` to replace that confirmation with a fresh plan")
+	assert.Contains(t, body, "To replace that confirmation with a fresh plan and apply it in one step")
+	assert.Contains(t, body, "```\nschemabot apply -e staging\n```")
+	assert.Contains(t, body, "_Requested by @hubot_")
 }
 
 // The rejection posted for a pending confirmation with no loadable plan carries
@@ -274,7 +277,8 @@ func TestApplyConfirmCommandCoreMissingPlanRecoveryCommandKeepsOperatorFlags(t *
 	require.NoError(t, err)
 	assert.False(t, retry)
 	body := requireComment(t, comments, "unverifiable-plan apply-confirm comment")
-	assert.Contains(t, body, "Run `schemabot apply -e staging -d orders --tenant acme --defer-cutover` to replace that confirmation with a fresh plan and apply it in one step; that apply is subject to the environment ordering gate and pauses for `apply-confirm` only if its plan needs it.")
+	assert.Contains(t, body, "**Database**: `orders`")
+	assert.Contains(t, body, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e staging -d orders --tenant acme --defer-cutover\n```")
 }
 
 // A prior environment with pending changes blocks the confirm as a terminal

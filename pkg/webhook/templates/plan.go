@@ -2084,45 +2084,84 @@ func appendDatabaseFlag(command, database string) string {
 	return fmt.Sprintf("%s -d %s", command, database)
 }
 
-// MsgConfirmationPlanForOtherEnvironment rejects an apply-confirm whose -e
+// ConfirmationRefusalData describes an apply-confirm the pending confirmation
+// cannot vouch for. RequestedEnvironment and Options come from the rejected
+// command, so the recovery commands repeat the database scope, tenant, and
+// option flags the operator already chose. PlanEnvironment is the environment
+// the pending confirmation was planned for; it is empty when no plan could be
+// loaded.
+type ConfirmationRefusalData struct {
+	RequestedBy          string
+	Database             string
+	PlanEnvironment      string
+	RequestedEnvironment string
+	Options              ApplyCommandOptions
+}
+
+// RenderConfirmationPlanForOtherEnvironment refuses an apply-confirm whose -e
 // names a different environment than the pending confirmation was planned for.
 // The confirm command it offers keeps the pending confirmation. The apply
 // command it offers for the requested environment does not: it answers to the
 // environment ordering gate like any apply, and once through it releases this
 // pull request's lock, so the pinned plan is gone and the requested
 // environment is planned and applied in one step, pausing for apply-confirm
-// only when the new plan needs one. The message states both consequences so
+// only when the new plan needs one. The comment states both consequences so
 // an operator who reads only the comment knows what each command costs. It is
-// rendered through the generic error comment, whose clamp bounds it, so the
-// wording stays short enough to survive the longest scoped commands intact.
-const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation is for `%s`, not `%s`; nothing was applied. Run `%s` to confirm that plan. `%s` drops it and plans and applies that environment in one step, subject to the environment ordering gate, pausing for `apply-confirm` only if its plan needs it."
+// a comment of its own rather than a generic error, so no length clamp can cut
+// the commands or the consequences however long the database name is.
+func RenderConfirmationPlanForOtherEnvironment(data ConfirmationRefusalData) string {
+	var sb strings.Builder
 
-// RenderConfirmationPlanForOtherEnvironment builds runnable recovery commands
-// with the same database scope, tenant, and option flags as the rejected
-// command, so pasting one keeps the choices the operator already made.
-func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnvironment, database string, opts ApplyCommandOptions) string {
-	confirmCommand := scopedApplyCommand("schemabot apply-confirm", planEnvironment, database, opts)
-	applyCommand := scopedApplyCommand("schemabot apply", requestedEnvironment, database, opts)
-	return fmt.Sprintf(MsgConfirmationPlanForOtherEnvironment, planEnvironment, requestedEnvironment, confirmCommand, applyCommand)
+	writeConfirmationRefusalHeader(&sb, data)
+	fmt.Fprintf(&sb, "The pending confirmation is for `%s`, not `%s`; nothing was applied.\n\n", data.PlanEnvironment, data.RequestedEnvironment)
+	fmt.Fprintf(&sb, "To confirm the `%s` plan:\n\n", data.PlanEnvironment)
+	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, data.Options))
+	fmt.Fprintf(&sb, "\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n",
+		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment)
+	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeConfirmationRefusalFooter(&sb, data)
+
+	return offerSupportChannel(sb.String())
 }
 
-// MsgConfirmationPlanUnavailable rejects an apply-confirm whose pending
+// RenderConfirmationPlanUnavailable refuses an apply-confirm whose pending
 // confirmation pins no plan SchemaBot can load, so nothing attests which
-// environment the operator reviewed. The verb takes the runnable apply command
-// for the requested environment. That command answers to the environment
-// ordering gate like any apply; once through, it releases this pull request's
-// lock, replacing the unloadable pinned plan with a fresh one that is applied
-// in the same step, pausing for apply-confirm only when the new plan needs one.
-// Like the other-environment refusal, it is bounded by the generic error
-// comment's clamp, so the wording stays short.
-const MsgConfirmationPlanUnavailable = "The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied. Run `%s` to replace that confirmation with a fresh plan and apply it in one step; that apply is subject to the environment ordering gate and pauses for `apply-confirm` only if its plan needs it."
+// environment the operator reviewed. The apply command it offers for the
+// requested environment answers to the environment ordering gate like any
+// apply; once through, it releases this pull request's lock, replacing the
+// unloadable pinned plan with a fresh one that is applied in the same step,
+// pausing for apply-confirm only when the new plan needs one. Like the
+// other-environment refusal, it is a comment of its own, so no length clamp
+// can cut it.
+func RenderConfirmationPlanUnavailable(data ConfirmationRefusalData) string {
+	var sb strings.Builder
 
-// RenderConfirmationPlanUnavailable builds the missing-plan rejection with a
-// recovery command carrying the same database scope, tenant, and option flags
-// as the rejected command.
-func RenderConfirmationPlanUnavailable(requestedEnvironment, database string, opts ApplyCommandOptions) string {
-	applyCommand := scopedApplyCommand("schemabot apply", requestedEnvironment, database, opts)
-	return fmt.Sprintf(MsgConfirmationPlanUnavailable, applyCommand)
+	writeConfirmationRefusalHeader(&sb, data)
+	sb.WriteString("The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
+	fmt.Fprintf(&sb, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n")
+	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeConfirmationRefusalFooter(&sb, data)
+
+	return offerSupportChannel(sb.String())
+}
+
+func writeConfirmationRefusalHeader(sb *strings.Builder, data ConfirmationRefusalData) {
+	writeEnvironmentTitle(sb, glyph.Refused+" Apply-confirm Refused", data.RequestedEnvironment)
+	if data.Database != "" {
+		writeDBLine(sb, data.Database)
+		sb.WriteString("\n")
+	}
+}
+
+func writeConfirmationRefusalFooter(sb *strings.Builder, data ConfirmationRefusalData) {
+	if data.RequestedBy != "" {
+		fmt.Fprintf(sb, "\n_Requested by @%s_\n", data.RequestedBy)
+	}
+}
+
+// writeCommandBlock writes one pasteable command in its own fenced block.
+func writeCommandBlock(sb *strings.Builder, command string) {
+	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
 // allPlansIdentical returns true if all environments have identical changes.

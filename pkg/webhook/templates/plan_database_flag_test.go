@@ -1,9 +1,12 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func planWithChanges() PlanCommentData {
@@ -128,19 +131,30 @@ func TestLockedPlanCommentConfirmCommandCarriesApplyOptions(t *testing.T) {
 // answers to the environment ordering gate, and pauses for apply-confirm only
 // when its plan needs one.
 func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *testing.T) {
-	const applyConsequences = " drops it and plans and applies that environment in one step, subject to the environment ordering gate, pausing for `apply-confirm` only if its plan needs it."
+	const applyConsequences = "To apply `production` instead, dropping the pending `staging` confirmation and planning and applying `production` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n"
 
-	scoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "orders", ApplyCommandOptions{Tenant: "acme", DeferCutover: true})
-	assert.Contains(t, scoped, "The pending confirmation is for `staging`, not `production`; nothing was applied.")
-	assert.Contains(t, scoped, "Run `schemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover` to confirm that plan.")
-	assert.Contains(t, scoped, "`schemabot apply -e production -d orders --tenant acme --defer-cutover`"+applyConsequences)
+	scoped := RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
+		RequestedBy:          "hubot",
+		Database:             "orders",
+		PlanEnvironment:      "staging",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{Tenant: "acme", DeferCutover: true},
+	})
+	assert.True(t, strings.HasPrefix(scoped, "## "+glyph.Refused+" Apply-confirm Refused — Production\n\n**Database**: `orders`\n\n"), scoped)
+	assert.Contains(t, scoped, "The pending confirmation is for `staging`, not `production`; nothing was applied.\n\n")
+	assert.Contains(t, scoped, "To confirm the `staging` plan:\n\n```\nschemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover\n```\n")
+	assert.Contains(t, scoped, applyConsequences+"```\nschemabot apply -e production -d orders --tenant acme --defer-cutover\n```\n")
+	assert.Contains(t, scoped, "\n_Requested by @hubot_\n")
 
-	unscoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "", ApplyCommandOptions{})
-	assert.Contains(t, unscoped, "Run `schemabot apply-confirm -e staging` to confirm that plan.")
-	assert.Contains(t, unscoped, "`schemabot apply -e production`"+applyConsequences)
+	unscoped := RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{PlanEnvironment: "staging", RequestedEnvironment: "production"})
+	assert.True(t, strings.HasPrefix(unscoped, "## "+glyph.Refused+" Apply-confirm Refused — Production\n\nThe pending confirmation"), unscoped)
+	assert.NotContains(t, unscoped, "**Database**")
+	assert.Contains(t, unscoped, "```\nschemabot apply-confirm -e staging\n```\n")
+	assert.Contains(t, unscoped, applyConsequences+"```\nschemabot apply -e production\n```\n")
+	assert.NotContains(t, unscoped, "Requested by")
 }
 
-// The missing-plan rejection's recovery command carries the rejected command's
+// The missing-plan refusal's recovery command carries the rejected command's
 // database scope, tenant, and option flags, so it can be pasted as-is on a PR
 // that manages several databases. An unscoped command is answered unscoped.
 // The command's consequences are pinned in full: it replaces the pending
@@ -148,31 +162,58 @@ func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *test
 // environment ordering gate, and pauses for apply-confirm only when its plan
 // needs one.
 func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
-	const applyConsequences = " to replace that confirmation with a fresh plan and apply it in one step; that apply is subject to the environment ordering gate and pauses for `apply-confirm` only if its plan needs it."
+	const applyConsequences = "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n"
 
-	scoped := RenderConfirmationPlanUnavailable("production", "orders", ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true})
-	assert.Contains(t, scoped, "Run `schemabot apply -e production -d orders --tenant acme --allow-unsafe`"+applyConsequences)
+	scoped := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
+		RequestedBy:          "hubot",
+		Database:             "orders",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true},
+	})
+	assert.True(t, strings.HasPrefix(scoped, "## "+glyph.Refused+" Apply-confirm Refused — Production\n\n**Database**: `orders`\n\n"), scoped)
+	assert.Contains(t, scoped, "The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
+	assert.Contains(t, scoped, applyConsequences+"```\nschemabot apply -e production -d orders --tenant acme --allow-unsafe\n```\n")
+	assert.Contains(t, scoped, "\n_Requested by @hubot_\n")
 
-	unscoped := RenderConfirmationPlanUnavailable("production", "", ApplyCommandOptions{})
-	assert.Contains(t, unscoped, "Run `schemabot apply -e production`"+applyConsequences)
+	unscoped := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{RequestedEnvironment: "production"})
+	assert.NotContains(t, unscoped, "**Database**")
+	assert.Contains(t, unscoped, applyConsequences+"```\nschemabot apply -e production\n```\n")
+	assert.NotContains(t, unscoped, "Requested by")
 }
 
-// Both confirmation refusals are posted through the generic error comment,
-// whose clamp cuts anything past its budget and appends a truncation marker.
-// The recovery guidance sits at the end of each message, so a message that
-// overflows loses exactly the part the operator needs. Every option flag set
-// at once produces the longest commands the messages can carry, and both
-// must still come out of the sanitizer unchanged.
-func TestConfirmationRefusalsFitTheCommentErrorClamp(t *testing.T) {
-	everyFlag := ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
+// Both confirmation refusals are comments of their own, not generic error
+// comments, so the recovery commands and the consequences that follow them
+// survive intact however long the identifiers are. A database name at the
+// engine's identifier limit with every option flag set at once produces the
+// longest commands the comments can carry, and each command must still appear
+// whole, in its own fenced block, with nothing truncated after it.
+func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
+	longDatabase := strings.Repeat("orders_ledger_v2", 4)
+	require.Len(t, longDatabase, 64)
+	everyFlag := ApplyCommandOptions{Tenant: "acme-holdings-eu", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
+	flags := " -d " + longDatabase + " --tenant acme-holdings-eu --allow-unsafe --defer-cutover --skip-revert"
 
-	otherEnvironment := RenderConfirmationPlanForOtherEnvironment("production", "production", "orders", everyFlag)
-	assert.LessOrEqual(t, len([]rune(otherEnvironment)), maxCommentErrorLen)
-	assert.Equal(t, otherEnvironment, sanitizeCommentError(otherEnvironment))
+	otherEnvironment := RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
+		RequestedBy:          "hubot",
+		Database:             longDatabase,
+		PlanEnvironment:      "staging",
+		RequestedEnvironment: "production",
+		Options:              everyFlag,
+	})
+	assert.Greater(t, len([]rune(otherEnvironment)), maxCommentErrorLen, "the scenario must be one the generic error clamp would have cut")
+	assert.Contains(t, otherEnvironment, "```\nschemabot apply-confirm -e staging"+flags+"\n```\n")
+	assert.Contains(t, otherEnvironment, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+flags+"\n```\n\n_Requested by @hubot_\n")
+	assert.NotContains(t, otherEnvironment, "…")
 
-	unavailable := RenderConfirmationPlanUnavailable("production", "orders", everyFlag)
-	assert.LessOrEqual(t, len([]rune(unavailable)), maxCommentErrorLen)
-	assert.Equal(t, unavailable, sanitizeCommentError(unavailable))
+	unavailable := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
+		RequestedBy:          "hubot",
+		Database:             longDatabase,
+		RequestedEnvironment: "production",
+		Options:              everyFlag,
+	})
+	assert.Greater(t, len([]rune(unavailable)), maxCommentErrorLen, "the scenario must be one the generic error clamp would have cut")
+	assert.Contains(t, unavailable, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+flags+"\n```\n\n_Requested by @hubot_\n")
+	assert.NotContains(t, unavailable, "…")
 }
 
 // A plan run without -e answers with one comment covering every environment,
