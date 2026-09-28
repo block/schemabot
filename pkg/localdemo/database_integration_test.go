@@ -26,7 +26,8 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			sample, err := Ensure(ctx, project, engine)
 			require.NoError(t, err)
 			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+				// Teardown runs after t.Context is cancelled. Keep cleanup independent.
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 				defer cancel()
 				require.NoError(t, exec.CommandContext(ctx, "docker", "rm", "-fv", sample.Name).Run())
 			})
