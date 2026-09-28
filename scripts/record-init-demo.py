@@ -53,7 +53,7 @@ os.close(slave)
 engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [(0.9, '\x1b[B'), (0.7, '\x1b[A'), (0.7, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
 if args.paste_connection:
-    steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.035, c) for c in pasted_connection] + [(1.0, '\r')])])
+    steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.8, '\x1b[200~' + pasted_connection + '\x1b[201~'), (1.0, '\r')])])
 else:
     steps.extend([('Connect your database', [(1.5, '\r')])])
 if args.integrated:
