@@ -1191,9 +1191,9 @@ func (op *ApplyOperation) IsTasklessVSchemaOnlyWork(plan *Plan) bool {
 }
 
 // HasFreshLease reports whether a driver holds this apply_operation's lease
-// with a heartbeat newer than ApplyLeaseStaleAfter. It reads the lease the way
-// the operation claim path does: a drive heartbeats its operation row, so the
-// row's last write is the liveness signal. Under a multi-operation drive this
+// with a heartbeat newer than ApplyLeaseStaleAfter according to the supplied
+// clock. A drive heartbeats its operation row, so the row's last write is the
+// liveness signal. Under a multi-operation drive this
 // is the only live lease — the parent apply row's heartbeat can be stale, or
 // carry a leftover owner, while the operation's drive is running.
 func (op *ApplyOperation) HasFreshLease(now time.Time) bool {

@@ -442,6 +442,18 @@ func (c *LocalClient) settleOrphanedTask(ctx context.Context, t *storage.Task, a
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
 		return
 	}
+	op, err := c.taskOperation(ctx, t)
+	if err != nil {
+		c.logger.Warn("conflict check: orphan candidate's operation lease is unreadable; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		return
+	}
+	if op.HasFreshLease(time.Now()) {
+		c.logger.Info("conflict check: orphan candidate's operation has a live drive; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "operation_lease_owner", op.LeaseOwner)...)
+		return
+	}
+	ctx = operationLeaseAbsenceContext(ctx, t, op)
 	c.logger.Info("conflict check: settling orphaned task; its apply is terminal so no driver will ever claim the task",
 		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State, "settled_state", settledState)...)
 
@@ -644,6 +656,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		}
 		return false
 	}
+	settlementCtx := operationLeaseAbsenceContext(ctx, t, op)
 
 	// The raw target credentials (no namespace mapping) are correct here
 	// because per-namespace resolution only exists for MySQL, whose engine
@@ -686,9 +699,15 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		c.logger.Info("conflict check: engine reports terminal state",
 			"task_id", t.TaskIdentifier, "engine_state", result.State,
 			"engine_message", result.Message, "storage_state", t.State)
+		previous := *t
 		now := time.Now()
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, engineStateToStorage(result.State), "")
+		if err := c.persistTaskStateTransition(settlementCtx, t, 0, engineStateToStorage(result.State), ""); err != nil {
+			*t = previous
+			c.logger.Warn("conflict check: terminal task settlement lost its operation lease guard; the task keeps blocking",
+				append(t.LogAttrs(), "error", err)...)
+			return false
+		}
 		return true
 	}
 
@@ -713,10 +732,16 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		}
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
 			"task_id", t.TaskIdentifier, "storage_state", t.State, "started_at", t.StartedAt)
+		previous := *t
 		now := time.Now()
 		t.ErrorMessage = "Task abandoned: engine has no active schema change (server may have crashed)"
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, state.Task.Failed, "")
+		if err := c.persistTaskStateTransition(settlementCtx, t, 0, state.Task.Failed, ""); err != nil {
+			*t = previous
+			c.logger.Warn("conflict check: abandoned task settlement lost its operation lease guard; the task keeps blocking",
+				append(t.LogAttrs(), "error", err)...)
+			return false
+		}
 		return true
 	}
 
@@ -804,7 +829,19 @@ func (c *LocalClient) taskOperation(ctx context.Context, t *storage.Task) (*stor
 	if op == nil {
 		return nil, fmt.Errorf("read operation %d owning task %s: operation row does not exist", operationID, t.TaskIdentifier)
 	}
+	if op.ApplyID != t.ApplyID {
+		return nil, fmt.Errorf("read operation %d owning task %s: operation belongs to apply %d, not apply %d", operationID, t.TaskIdentifier, op.ApplyID, t.ApplyID)
+	}
 	return op, nil
+}
+
+func operationLeaseAbsenceContext(ctx context.Context, t *storage.Task, op *storage.ApplyOperation) context.Context {
+	if op == nil {
+		return ctx
+	}
+	return storage.WithOperationLeaseAbsent(ctx, storage.OperationLeaseAbsence{
+		ApplyID: t.ApplyID, OperationID: op.ID,
+	})
 }
 
 // logApplyEvent appends a log entry for an apply operation.

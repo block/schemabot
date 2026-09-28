@@ -290,6 +290,35 @@ func TestConflictCheckCancelsOrphanedPendingTask(t *testing.T) {
 	}
 }
 
+// A terminal parent does not make a pending task orphaned while a sibling
+// operation drive still owns it. The operation lease remains authoritative, so
+// the task keeps blocking until that drive settles it.
+func TestConflictCheckPreservesTerminalApplyTaskWithFreshOperationLease(t *testing.T) {
+	operationID := int64(62)
+	pending := &storage.Task{
+		ID: 62, ApplyID: 62, ApplyOperationID: &operationID, TaskIdentifier: "task-live-sibling",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Pending,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{pending})
+	stor := client.storage.(*exactProgressStorage)
+	stor.applies = &mockApplyStore{apply: &storage.Apply{
+		ID: 62, ApplyIdentifier: "apply-terminal", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Failed,
+	}}
+	stor.applyOperations = &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		62: {ID: 62, ApplyID: 62, LeaseOwner: "drive-host/77/driver-3", UpdatedAt: time.Now()},
+	}}
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.Pending, pending.State)
+	assert.Empty(t, pending.ErrorMessage)
+	assert.Nil(t, pending.CompletedAt)
+}
+
 // A pending task whose apply is still active is normal queued work — the drive
 // that owns it will start it. The conflict check must leave it pending and
 // refuse the new apply.
@@ -895,6 +924,10 @@ func TestConflictCheckKeepsTaskWhenItsOperationLeaseIsUnreadable(t *testing.T) {
 	operationStores := map[string]storage.ApplyOperationStore{
 		"operation read fails":         &erroringApplyOperationStore{err: errors.New("storage down")},
 		"operation store not wired up": nil,
+		"operation row does not exist": &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{}},
+		"operation belongs to another apply": &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			151: {ID: 151, ApplyID: 999},
+		}},
 	}
 	for name, operations := range operationStores {
 		t.Run(name, func(t *testing.T) {
@@ -916,6 +949,31 @@ func TestConflictCheckKeepsTaskWhenItsOperationLeaseIsUnreadable(t *testing.T) {
 			assert.Equal(t, "operation_lease_unreadable", counterAttr(t, points[0], "reason"))
 		})
 	}
+}
+
+// A claim that lands after the lease read but before settlement keeps the task
+// authoritative to its new drive. The storage write guard rejects settlement,
+// so dispatch remains blocked and the in-memory task is restored.
+func TestConflictCheckKeepsTaskWhenOperationIsClaimedDuringSettlement(t *testing.T) {
+	running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		151: {ID: 151, ApplyID: 151, LeaseOwner: "crashed-host/4242/driver-3", UpdatedAt: time.Now().Add(-2 * storage.ApplyLeaseStaleAfter)},
+	}})
+	store := client.storage.(*exactProgressStorage).tasks.(*exactProgressTaskStore)
+	store.updateErr = func(ctx context.Context, _ *storage.Task) error {
+		guard, ok := storage.OperationLeaseAbsenceFromContext(ctx)
+		require.True(t, ok, "settlement must carry the atomic operation lease guard")
+		assert.Equal(t, storage.OperationLeaseAbsence{ApplyID: 151, OperationID: 151}, guard)
+		return storage.ErrOperationLeaseActive
+	}
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.Running, running.State)
+	assert.Empty(t, running.ErrorMessage)
+	assert.Nil(t, running.CompletedAt)
 }
 
 // erroringApplyOperationStore fails every operation load, standing in for
@@ -1260,6 +1318,7 @@ func restingStoppedTask() (*storage.Task, *storage.Apply) {
 	operationID := int64(11)
 	task := &storage.Task{
 		ID:               1,
+		ApplyID:          1,
 		TaskIdentifier:   "task-stopped",
 		Database:         "testdb",
 		DatabaseType:     storage.DatabaseTypeMySQL,

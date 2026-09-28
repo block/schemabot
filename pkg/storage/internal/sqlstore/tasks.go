@@ -125,7 +125,20 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 
 	leasePredicate := ""
 	var verifyLeaseStillOwned func() error
-	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+	if guard, ok := storage.OperationLeaseAbsenceFromContext(ctx); ok {
+		if guard.ApplyID != task.ApplyID || task.ApplyOperationID == nil || *task.ApplyOperationID != guard.OperationID {
+			return fmt.Errorf("invalid operation lease absence guard for task %d: %w", task.ID, storage.ErrOperationLeaseActive)
+		}
+		leasePredicate = `
+			AND tasks.apply_id = ? AND tasks.apply_operation_id = ?
+			AND NOT EXISTS (
+				SELECT 1 FROM apply_operations ao
+				WHERE ao.id = ? AND ao.apply_id = ? AND ao.lease_owner <> ''
+					AND ao.updated_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
+			)`
+		args = append(args, guard.ApplyID, guard.OperationID, guard.OperationID, guard.ApplyID, int(storage.ApplyLeaseStaleAfter.Seconds()))
+		verifyLeaseStillOwned = func() error { return storage.ErrOperationLeaseActive }
+	} else if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
 		}
