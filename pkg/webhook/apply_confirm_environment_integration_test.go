@@ -109,7 +109,8 @@ func appliesForDatabase(t *testing.T, svc *api.Service, dbName string) []*storag
 // `schemabot apply-confirm -e production`. The confirmation authorizes the
 // staging plan only, so production must not be applied in one step with no
 // production plan comment: the command is rejected, nothing is dispatched, and
-// the staging confirmation stays pinned so it can still be confirmed.
+// the staging confirmation stays pinned so it can still be confirmed. The
+// recovery commands repeat the -d and --defer-cutover the operator typed.
 func TestE2EApplyConfirmRejectsPendingConfirmationForOtherEnvironment(t *testing.T) {
 	dbName := "webhook_confirm_other_env"
 	svc := setupE2EService(t, dbName)
@@ -121,15 +122,15 @@ func TestE2EApplyConfirmRejectsPendingConfirmationForOtherEnvironment(t *testing
 	stagingPlanID := dbName + "_staging_plan"
 	seedPendingConfirmation(t, svc, dbName, stagingPlanID, "staging")
 
-	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e production -d "+dbName)
+	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e production -d "+dbName+" --defer-cutover")
 
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply-confirm")
 		assert.Contains(t, body, "planned for `staging`, not `production`")
 		assert.Contains(t, body, "Nothing was applied")
-		assert.Contains(t, body, "schemabot apply-confirm -e staging -d "+dbName)
-		assert.Contains(t, body, "schemabot apply -e production -d "+dbName)
+		assert.Contains(t, body, "`schemabot apply-confirm -e staging -d "+dbName+" --defer-cutover`")
+		assert.Contains(t, body, "`schemabot apply -e production -d "+dbName+" --defer-cutover`")
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for environment mismatch rejection")

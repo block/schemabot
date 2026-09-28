@@ -258,6 +258,49 @@ func TestApplyConfirmCommandCoreMissingPlanIsTerminalAndKeepsPendingLock(t *test
 	assert.Contains(t, body, "pending confirmation is preserved")
 }
 
+// The rejection posted for a pending confirmation with no loadable plan carries
+// the rejected command's -d scope, tenant, and option flags, so the recovery
+// command it recommends can be pasted as-is.
+func TestApplyConfirmCommandCoreMissingPlanRecoveryCommandKeepsOperatorFlags(t *testing.T) {
+	locks := newApplyConfirmContractLockStore()
+	h, mux, comments := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
+	registerCheckStatusRESTHandlers(mux, nil)
+	registerCurrentBaseSchema(t, mux)
+
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "orders", 12345, "hubot",
+		CommandResult{Action: action.ApplyConfirm, Database: "orders", Tenant: "acme", DeferCutover: true})
+
+	require.NoError(t, err)
+	assert.False(t, retry)
+	body := requireComment(t, comments, "unverifiable-plan apply-confirm comment")
+	assert.Contains(t, body, "Run `schemabot apply -e staging -d orders --tenant acme --defer-cutover` to plan this environment again")
+}
+
+// A prior environment with pending changes blocks the confirm as a terminal
+// answer: the durable delivery must not re-drive it, and the reviewed plan stays
+// pinned for when the prior environment is clean again.
+func TestApplyConfirmCommandCorePriorEnvironmentBlockIsTerminalAndKeepsPendingLock(t *testing.T) {
+	locks := newApplyConfirmContractLockStore()
+	store := newApplyConfirmContractStorage(locks)
+	store.plan.Environment = "production"
+	store.checks = &sequenceCheckStore{results: []*storage.Check{{
+		Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders",
+		Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true,
+	}}}
+	h, mux, comments := newApplyGateContractHandlerWithConfig(t, promotionOrderedContractConfig(), store)
+	registerCheckStatusRESTHandlers(mux, nil)
+	registerCurrentBaseSchema(t, mux)
+
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "production", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+	require.NoError(t, err)
+	assert.False(t, retry, "a prior environment with pending changes is the command's answer, not a transient failure")
+	assert.Empty(t, locks.released, "an ordering block must not release the pending lock")
+	assert.Empty(t, locks.releasedIfPending, "an ordering block must not conditionally release the pending lock")
+	assert.Equal(t, "plan_confirm123", locks.locks[0].PendingPlanID)
+	assert.Contains(t, requireComment(t, comments, "prior environment block comment"), "Apply staging first")
+}
+
 // Failure to read a prior environment leaves promotion ordering unevaluated,
 // so the durable delivery retries while preserving the exact reviewed plan.
 func TestApplyConfirmCommandCorePriorEnvironmentReadFailureIsRetryableAndKeepsPendingLock(t *testing.T) {
@@ -265,13 +308,7 @@ func TestApplyConfirmCommandCorePriorEnvironmentReadFailureIsRetryableAndKeepsPe
 	store := newApplyConfirmContractStorage(locks)
 	store.plan.Environment = "production"
 	store.checks = &applyConfirmErrorCheckStore{err: errors.New("check storage unavailable")}
-	cfg := actorAuthTestConfig(false, func(cfg *api.ServerConfig) {
-		db := cfg.Databases["orders"]
-		db.Environments["production"] = api.EnvironmentConfig{DSN: "root@tcp(localhost)/orders"}
-		cfg.Databases["orders"] = db
-		cfg.EnvironmentOrder = []string{"staging", "production"}
-	})
-	h, mux, _ := newApplyGateContractHandlerWithConfig(t, cfg, store)
+	h, mux, _ := newApplyGateContractHandlerWithConfig(t, promotionOrderedContractConfig(), store)
 	registerCheckStatusRESTHandlers(mux, nil)
 	registerCurrentBaseSchema(t, mux)
 
@@ -282,6 +319,18 @@ func TestApplyConfirmCommandCorePriorEnvironmentReadFailureIsRetryableAndKeepsPe
 	assert.Empty(t, locks.released, "a gate read failure must not release the pending lock")
 	assert.Empty(t, locks.releasedIfPending, "a gate read failure must not conditionally release the pending lock")
 	assert.Equal(t, "plan_confirm123", locks.locks[0].PendingPlanID)
+}
+
+// promotionOrderedContractConfig adds a production environment behind staging
+// so the confirm-time environment ordering gate has a prior environment to
+// consult.
+func promotionOrderedContractConfig() *api.ServerConfig {
+	return actorAuthTestConfig(false, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.Environments["production"] = api.EnvironmentConfig{DSN: "root@tcp(localhost)/orders"}
+		cfg.Databases["orders"] = db
+		cfg.EnvironmentOrder = []string{"staging", "production"}
+	})
 }
 
 func newApplyGateContractHandler(t *testing.T, store storage.Storage) (*Handler, *http.ServeMux, <-chan string) {

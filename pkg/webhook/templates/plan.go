@@ -438,19 +438,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 
 	switch {
 	case data.IsLocked:
-		applyConfirmCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment), data.ScopedDatabase)
-		if data.Tenant != "" {
-			applyConfirmCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
-		}
-		if data.AllowUnsafe {
-			applyConfirmCmd += " --allow-unsafe"
-		}
-		if data.DeferCutover {
-			applyConfirmCmd += " --defer-cutover"
-		}
-		if data.SkipRevert {
-			applyConfirmCmd += " --skip-revert"
-		}
+		applyConfirmCmd := scopedApplyCommand("schemabot apply-confirm", data.Environment, data.ScopedDatabase, ApplyCommandOptions{
+			Tenant:       data.Tenant,
+			AllowUnsafe:  data.AllowUnsafe,
+			DeferCutover: data.DeferCutover,
+			SkipRevert:   data.SkipRevert,
+		})
 
 		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
@@ -2037,6 +2030,35 @@ func scopedCommand(baseCommand, environment, database, tenant string) string {
 	return appendTenantFlag(command, tenant)
 }
 
+// ApplyCommandOptions are the flags an apply or apply-confirm command carries
+// beyond its target. A pasteable hint for either command has to repeat them,
+// because the command reads its options from the comment that carries it and
+// nothing else: a hint that drops --defer-cutover runs the cutover the operator
+// chose to defer, and one that drops --allow-unsafe is blocked again.
+type ApplyCommandOptions struct {
+	Tenant       string
+	AllowUnsafe  bool
+	DeferCutover bool
+	SkipRevert   bool
+}
+
+// scopedApplyCommand renders a pasteable apply or apply-confirm command for one
+// environment: the target first (-e, then -d), the deployment qualifier, then
+// the option flags in the order the locked plan comment lists them.
+func scopedApplyCommand(baseCommand, environment, database string, opts ApplyCommandOptions) string {
+	command := scopedCommand(baseCommand, environment, database, opts.Tenant)
+	if opts.AllowUnsafe {
+		command += " --allow-unsafe"
+	}
+	if opts.DeferCutover {
+		command += " --defer-cutover"
+	}
+	if opts.SkipRevert {
+		command += " --skip-revert"
+	}
+	return command
+}
+
 // appendTenantFlag appends the --tenant flag to a pasteable command hint when
 // tenant is set. In tenant mode, commands without an explicit tenant target
 // are ignored, so every command hint a user may copy-paste must carry the
@@ -2067,10 +2089,11 @@ func appendDatabaseFlag(command, database string) string {
 const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation on this pull request was planned for `%s`, not `%s`. Nothing was applied, and the pending confirmation is preserved. Run `%s` to confirm that plan, or `%s` to plan this environment."
 
 // RenderConfirmationPlanForOtherEnvironment builds runnable recovery commands
-// with the same database scope as the rejected command.
-func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnvironment, database string) string {
-	confirmCommand := appendDatabaseFlag(fmt.Sprintf("schemabot apply-confirm -e %s", planEnvironment), database)
-	applyCommand := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", requestedEnvironment), database)
+// with the same database scope, tenant, and option flags as the rejected
+// command, so pasting one keeps the choices the operator already made.
+func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnvironment, database string, opts ApplyCommandOptions) string {
+	confirmCommand := scopedApplyCommand("schemabot apply-confirm", planEnvironment, database, opts)
+	applyCommand := scopedApplyCommand("schemabot apply", requestedEnvironment, database, opts)
 	return fmt.Sprintf(MsgConfirmationPlanForOtherEnvironment, planEnvironment, requestedEnvironment, confirmCommand, applyCommand)
 }
 
@@ -2081,9 +2104,10 @@ func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnviron
 const MsgConfirmationPlanUnavailable = "The pending confirmation on this pull request is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed. Nothing was applied, and the pending confirmation is preserved. Run `%s` to plan this environment again, then confirm that plan."
 
 // RenderConfirmationPlanUnavailable builds the missing-plan rejection with a
-// recovery command scoped to the same database as the rejected command.
-func RenderConfirmationPlanUnavailable(requestedEnvironment, database string) string {
-	applyCommand := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", requestedEnvironment), database)
+// recovery command carrying the same database scope, tenant, and option flags
+// as the rejected command.
+func RenderConfirmationPlanUnavailable(requestedEnvironment, database string, opts ApplyCommandOptions) string {
+	applyCommand := scopedApplyCommand("schemabot apply", requestedEnvironment, database, opts)
 	return fmt.Sprintf(MsgConfirmationPlanUnavailable, applyCommand)
 }
 

@@ -577,8 +577,10 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     should re-drive; the same window may succeed on a later attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (silent fan-out skip, no pending confirmation, gate blocks, lock conflict,
-//     a pending confirmation planned for another environment,
-//     stale-schema/base/plan rejection, or a hand-off to executeApply, which
+//     a pending confirmation with no loadable plan, a pending confirmation
+//     planned for another environment, a prior environment that is no longer
+//     clean at confirm time, stale-schema/base/plan rejection, or a hand-off
+//     to executeApply, which
 //     may itself fail before dispatching). A schema-request failure is terminal
 //     only when handleSchemaRequestError recognizes it as a user-facing
 //     rejection; an unexpected failure there (for example a transient GitHub
@@ -816,7 +818,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
 		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
-			templates.RenderConfirmationPlanUnavailable(environment, databaseName))
+			templates.RenderConfirmationPlanUnavailable(environment, databaseName, applyCommandOptionsOf(result)))
 		return false, nil
 	}
 	// The pending confirmation authorizes the environment it was planned for
@@ -830,7 +832,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			"environment", environment, "plan_environment", storedPlan.Environment,
 			"pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
 		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
-			templates.RenderConfirmationPlanForOtherEnvironment(storedPlan.Environment, environment, databaseName))
+			templates.RenderConfirmationPlanForOtherEnvironment(storedPlan.Environment, environment, databaseName, applyCommandOptionsOf(result)))
 		return false, nil
 	}
 	// Environment mismatch wins over stale-plan rejection because this outcome
@@ -871,6 +873,19 @@ func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, enviro
 		return false
 	}
 	return plan.Environment == environment
+}
+
+// applyCommandOptionsOf carries the option flags the operator typed on a
+// rejected apply-confirm into the recovery command the rejection recommends.
+// apply-confirm reads its options from the confirm comment alone, so a hint
+// that dropped them would run with defaults the operator did not choose.
+func applyCommandOptionsOf(result CommandResult) templates.ApplyCommandOptions {
+	return templates.ApplyCommandOptions{
+		Tenant:       result.Tenant,
+		AllowUnsafe:  result.AllowUnsafe,
+		DeferCutover: result.DeferCutover,
+		SkipRevert:   result.SkipRevert,
+	}
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command. It is
