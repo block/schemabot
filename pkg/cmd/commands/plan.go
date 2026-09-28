@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -381,13 +382,16 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	for _, tbl := range result.RenderedTables() {
 		ddls = append(ddls, tbl.DDL)
 	}
-	var vschemas []string
+	var vschemas, finalizes []string
 	for _, sc := range result.Changes {
 		if sc.HasVSchemaChange() {
 			vschemas = append(vschemas, sc.Namespace+":"+sc.Metadata[apitypes.VSchemaDiffMetadataKey])
 		}
+		if sc.NeedsFinalizer() {
+			finalizes = append(finalizes, sc.Namespace)
+		}
 	}
-	if len(ddls) == 0 && len(vschemas) == 0 {
+	if len(ddls) == 0 && len(vschemas) == 0 && len(finalizes) == 0 {
 		return "no-changes"
 	}
 
@@ -402,13 +406,15 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	// Sort to make the fingerprint order-independent
 	sort.Strings(ddls)
 	sort.Strings(vschemas)
+	finalizes = slices.Compact(slices.Sorted(slices.Values(finalizes)))
 	sort.Strings(exempt)
 
 	data, _ := json.Marshal(struct {
-		DDLs     []string `json:"ddls"`
-		VSchemas []string `json:"vschemas"`
-		Exempt   []string `json:"exempt"`
-	}{ddls, vschemas, exempt})
+		DDLs      []string `json:"ddls"`
+		VSchemas  []string `json:"vschemas"`
+		Finalizes []string `json:"finalizes"`
+		Exempt    []string `json:"exempt"`
+	}{ddls, vschemas, finalizes, exempt})
 	return string(data)
 }
 

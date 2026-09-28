@@ -136,6 +136,49 @@ func TestNamespacesFromApplyRequest_FinalizeWithVSchemaChangeStillNeedsArtifact(
 	assert.Contains(t, err.Error(), `apply request indicates a vschema change for namespace "shop" but carries no vschema.json artifact`)
 }
 
+// A stored namespace has a VSchema artifact and a finalize request, but its
+// persisted metadata never recorded vschema_changed. Its dispatch still says
+// the VSchema changed, so the data plane demands the artifact instead of
+// reading the finalizer marker as a finalize-only request.
+func TestFinalizerDispatchMetadataKeepsVSchemaChangeWithoutPersistedFlag(t *testing.T) {
+	nsData := &storage.NamespacePlanData{
+		Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{"refunds":{}}}`},
+		Finalize:  true,
+	}
+
+	meta := finalizerDispatchMetadata(nsData)
+	assert.Equal(t, map[string]string{storage.PlanMetadataVSchemaChanged: "true", engine.MetadataNeedsFinalizer: "true"}, meta)
+
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	_, err := c.namespacesFromApplyRequest([]*ternv1.TableChange{{
+		Namespace:  "payments",
+		TableName:  "VSchema: payments",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+		Metadata:   meta,
+	}}, schema.SchemaFiles{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `apply request indicates a vschema change for namespace "payments" but carries no vschema.json artifact`)
+}
+
+// A dispatch marked needs_finalizer that also carries a VSchema diff, deletion,
+// or mutation record is VSchema work even without the vschema_changed flag, so
+// it still needs its vschema.json rather than running only the finalizer.
+func TestNamespacesFromApplyRequest_FinalizeWithVSchemaRecordStillNeedsArtifact(t *testing.T) {
+	for _, key := range []string{storage.PlanMetadataVSchemaDiff, storage.PlanMetadataVSchemaDeletions, storage.PlanMetadataVSchemaMutations} {
+		t.Run(key, func(t *testing.T) {
+			c := newPlanMaterializeClient(&fakePlanStore{})
+			_, err := c.namespacesFromApplyRequest([]*ternv1.TableChange{{
+				Namespace:  "shop",
+				TableName:  "VSchema: shop",
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+				Metadata:   map[string]string{key: "recorded", engine.MetadataNeedsFinalizer: "true"},
+			}}, schema.SchemaFiles{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `apply request indicates a vschema change for namespace "shop" but carries no vschema.json artifact`)
+		})
+	}
+}
+
 // A deployment-scoped finalizer dispatch covers every namespace the plan
 // finalizes, finalize-only ones included; leaving one out fails closed.
 func TestFinalizerDispatchScopeCoversFinalizeOnlyNamespaces(t *testing.T) {

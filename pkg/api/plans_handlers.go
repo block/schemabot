@@ -177,6 +177,9 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 		if nsData.ChangesVSchema() {
 			summary.VSchemaChangeCount++
 		}
+		if nsData.Finalize {
+			summary.FinalizeCount++
+		}
 		for _, change := range nsData.Tables {
 			if summary.ChangeCounts == nil {
 				summary.ChangeCounts = map[string]int{}

@@ -2445,18 +2445,25 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 // dispatch change carries: its persisted VSchema change-metadata, plus
 // needs_finalizer when the engine asked to finalize it. A finalize-only
 // namespace carries needs_finalizer alone, which is how the data plane tells
-// it from a VSchema change (see LocalClient.namespacesFromApplyRequest).
+// it from a VSchema change (see LocalClient.namespacesFromApplyRequest). A
+// namespace with a VSchema artifact always says its VSchema changed, even when
+// its persisted metadata does not, so adding the finalizer marker can never
+// turn a VSchema change into a finalize-only dispatch that skips the artifact.
 func finalizerDispatchMetadata(nsData *storage.NamespacePlanData) map[string]string {
 	if nsData == nil {
 		return nil
 	}
 	meta := storage.VSchemaPlanMetadata(nsData.Metadata)
-	if nsData.Finalize {
-		if meta == nil {
-			meta = map[string]string{}
-		}
-		meta[engine.MetadataNeedsFinalizer] = "true"
+	if !nsData.Finalize {
+		return meta
 	}
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	if nsData.ChangesVSchema() {
+		meta[storage.PlanMetadataVSchemaChanged] = "true"
+	}
+	meta[engine.MetadataNeedsFinalizer] = "true"
 	return meta
 }
 

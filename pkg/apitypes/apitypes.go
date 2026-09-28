@@ -888,6 +888,10 @@ type PlanSummaryResponse struct {
 	BlockedCount int `json:"blocked_count,omitempty"`
 	// VSchemaChangeCount is how many namespaces carry a VSchema change.
 	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
+	// FinalizeCount is how many namespaces the engine asked to finalize once
+	// their DDL lands. A finalizer is work an apply runs, so a plan whose only
+	// work is a finalizer is not a no-change plan.
+	FinalizeCount int `json:"finalize_count,omitempty"`
 }
 
 // PlansResponse is the HTTP response for GET /api/plans.

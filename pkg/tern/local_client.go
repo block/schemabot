@@ -2365,14 +2365,29 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 
 // dispatchChangeFinalizesOnly reports whether a dispatched VSchema-typed change
 // asks only for the namespace's finalizer, with no VSchema document to apply:
-// it is marked needs_finalizer and does not say its VSchema changed. Every
+// it is marked needs_finalizer and carries no sign of a VSchema change. Every
 // other VSchema-typed change is a VSchema change, including one carrying no
 // metadata at all, which is how a dispatch built before the finalizer marker
 // existed says it — so that dispatch still fails closed when its vschema.json
 // is missing.
 func dispatchChangeFinalizesOnly(ch *ternv1.TableChange) bool {
-	return ch.Metadata[engine.MetadataNeedsFinalizer] == "true" &&
-		ch.Metadata[storage.PlanMetadataVSchemaChanged] != "true"
+	return ch.Metadata[engine.MetadataNeedsFinalizer] == "true" && !dispatchChangeSignalsVSchema(ch)
+}
+
+// dispatchChangeSignalsVSchema reports whether a dispatched change's metadata
+// says anything about a VSchema change: the vschema_changed flag, or a recorded
+// diff, deletion, or mutation. Any one of them makes the change VSchema work,
+// so a change that pairs one with needs_finalizer still needs its artifact.
+func dispatchChangeSignalsVSchema(ch *ternv1.TableChange) bool {
+	if ch.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+		return true
+	}
+	for _, key := range []string{storage.PlanMetadataVSchemaDiff, storage.PlanMetadataVSchemaDeletions, storage.PlanMetadataVSchemaMutations} {
+		if ch.Metadata[key] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // materializedTableChangeOperation recovers the storage operation for a
