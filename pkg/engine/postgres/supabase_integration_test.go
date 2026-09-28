@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -214,8 +215,13 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 			ExposedPorts: []string{"5432/tcp"},
 			Cmd:          []string{"postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"},
 			// The temporary initialization server accepts Unix sockets before
-			// Supabase's roles are ready. Wait for the final TCP listener.
-			WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(supabaseOperationDeadline),
+			// Supabase's roles are ready, and Docker's port forwarder accepts
+			// on the mapped port before the final server listens, resetting
+			// the first handshake. Only a query over TCP with the fixture's own
+			// DSN proves the final server is ready.
+			WaitingFor: wait.ForSQL("5432/tcp", "pgx", func(host string, port network.Port) string {
+				return supabaseDSN(host, port.Port())
+			}).WithStartupTimeout(supabaseOperationDeadline),
 		},
 		Started: true,
 	})
@@ -229,8 +235,7 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, err)
 	port, err := container.MappedPort(ctx, "5432/tcp")
 	require.NoError(t, err)
-	dsn := (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
-		Host: net.JoinHostPort(host, port.Port()), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
+	dsn := supabaseDSN(host, port.Port())
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
@@ -239,4 +244,9 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&superuser))
 	require.False(t, superuser, "the fixture must exercise Supabase's restricted postgres role")
 	return dsn, db
+}
+
+func supabaseDSN(host, port string) string {
+	return (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
+		Host: net.JoinHostPort(host, port), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
 }
