@@ -1021,7 +1021,7 @@ func TestResumeApplySequential_AbortsWhenRacedCutoverSettlementRefused(t *testin
 		logs:            logs,
 	}
 
-	c.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{}, nil)
+	require.NoError(t, c.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{}, nil))
 
 	stored, err := applies.Get(t.Context(), apply.ID)
 	require.NoError(t, err)
@@ -1124,7 +1124,7 @@ func TestResumeApplySequential_SettlesLandedStatementWithoutReexecution(t *testi
 	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
 	taskStore.tasks = tasks
 
-	c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil)
+	require.NoError(t, c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil))
 
 	landed, sibling := tasks[0], tasks[1]
 	assert.True(t, state.IsState(landed.State, state.Task.Completed),
@@ -1159,7 +1159,7 @@ func TestResumeApplySequential_AbortsWhenLandedStatementSettlementRefused(t *tes
 	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
 	taskStore.tasks = tasks
 
-	c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil)
+	require.NoError(t, c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil))
 
 	assert.False(t, state.IsTerminalTaskState(tasks[0].State),
 		"a refused settlement write restores the task's in-memory state, got %s", tasks[0].State)
