@@ -276,6 +276,54 @@ func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.St
 	return nil
 }
 
+// restoreApplyStateAfterUnacceptedCutover returns the apply to the state it held
+// before markApplyCuttingOverForControlRequest, for a cutover the data plane
+// did not accept: the call failed, came back empty, or was refused. A stored
+// cutting_over with no cutover behind it wedges the apply: the progress sync
+// never moves stored state backward, so it keeps cutting_over over the
+// data plane's waiting_for_cutover, and a fresh cutover command is answered as
+// already in progress without recording a request, so nothing sends the
+// cutover again.
+//
+// A failed call has an unknown outcome: the data plane may have started the
+// cutover before the answer was lost. Restoring is still safe, because every
+// state such a cutover reports next (cutting_over, revert_window, or a
+// terminal state) outranks the restored state, so the progress sync adopts it.
+//
+// A drive whose mark stayed in memory (see suppressParentApplyWrites) writes
+// nothing here either. On a failed write the in-memory apply keeps the stored
+// cutting_over and the caller must leave the cutover request pending: a
+// pending request on a cutting_over apply is re-sent by the next drive, while
+// a failed one would leave the apply wedged.
+func restoreApplyStateAfterUnacceptedCutover(ctx context.Context, store storage.Storage, apply *storage.Apply, preCutoverState string, logger *slog.Logger) error {
+	if state.IsState(apply.State, preCutoverState) {
+		return nil
+	}
+	if suppressParentApplyWrites(ctx) {
+		apply.State = preCutoverState
+		logger.InfoContext(ctx, "cutover was not accepted under operation lease; parent apply state was never written, restored in memory only",
+			apply.MutableLogAttrs()...)
+		return nil
+	}
+	if store == nil {
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: storage is not available", apply.ApplyIdentifier, preCutoverState)
+	}
+	applyStore := store.Applies()
+	if applyStore == nil {
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: apply store is not available", apply.ApplyIdentifier, preCutoverState)
+	}
+	marked := *apply
+	apply.State = preCutoverState
+	apply.UpdatedAt = time.Now()
+	if err := applyStore.Update(ctx, apply); err != nil {
+		*apply = marked
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: %w", apply.ApplyIdentifier, preCutoverState, err)
+	}
+	logger.InfoContext(ctx, "restored apply state after the data plane did not accept the cutover",
+		append(apply.MutableLogAttrs(), "marked_state", marked.State)...)
+	return nil
+}
+
 func applyReadyForCutoverRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
 	if state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.CuttingOver) {
 		return true, nil

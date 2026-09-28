@@ -815,6 +815,7 @@ type mockApplyStore struct {
 	storage.ApplyStore
 	apply           *storage.Apply
 	updateErr       error
+	laterUpdateErr  error // returned by every Update after the first successful one
 	updates         []*storage.Apply
 	revertSkippedAt *time.Time
 }
@@ -842,6 +843,9 @@ func (m *mockApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 func (m *mockApplyStore) Update(_ context.Context, apply *storage.Apply) error {
 	if m.updateErr != nil {
 		return m.updateErr
+	}
+	if m.laterUpdateErr != nil && len(m.updates) > 0 {
+		return m.laterUpdateErr
 	}
 	stored := *apply
 	m.apply = &stored
@@ -5387,6 +5391,18 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			},
 			expected: state.Apply.CuttingOver,
 		},
+		{
+			name:        "a cutover the data plane started after an unanswered call advances a restored waiting_for_cutover",
+			storedState: state.Apply.WaitingForCutover,
+			remoteState: state.Apply.CuttingOver,
+			expected:    state.Apply.CuttingOver,
+		},
+		{
+			name:        "a revert window the data plane opened after an unanswered call advances a restored waiting_for_cutover",
+			storedState: state.Apply.WaitingForCutover,
+			remoteState: state.Apply.RevertWindow,
+			expected:    state.Apply.RevertWindow,
+		},
 	}
 
 	for _, tc := range tests {
@@ -8383,8 +8399,9 @@ func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 		RequestedBy: "cli:alice",
 	}}}
 	logs := &mockApplyLogStore{}
+	applies := &mockApplyStore{apply: &storedApply}
 	client.storage = &mockStorage{
-		applies:         &mockApplyStore{apply: &storedApply},
+		applies:         applies,
 		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
 		logs:            logs,
 		controlRequests: controlRequests,
@@ -8401,6 +8418,185 @@ func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
 	assert.Contains(t, controlRequests.requests[0].ErrorMessage, "remote cutover failed")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover failed for apply apply-cutover-error (remote remote-cutover-error) (caller: cli:alice)"))
+	assert.Equal(t, state.Apply.WaitingForCutover, applies.apply.State, "stored apply returns to the state it held before the cutover was sent")
+}
+
+// nilCutoverResponseClient answers Cutover with neither a response nor an
+// error, which a real gRPC transport cannot produce but a client can.
+type nilCutoverResponseClient struct {
+	ternv1.TernClient
+}
+
+func (nilCutoverResponseClient) Cutover(context.Context, *ternv1.CutoverRequest, ...grpc.CallOption) (*ternv1.CutoverResponse, error) {
+	return nil, nil
+}
+
+// An apply parked at waiting_for_cutover gets an operator cutover that the data
+// plane does not accept: the call fails, comes back empty, or is refused. The
+// request fails visibly and the stored apply returns to waiting_for_cutover
+// rather than staying at cutting_over with no cutover behind it, so a fresh
+// operator cutover is recorded as a new request and the next drive sends it.
+func TestGRPCClient_ProcessPendingCutoverNotAcceptedRestoresApplyState(t *testing.T) {
+	tests := []struct {
+		name           string
+		configure      func(server *capturingTernServer, client *GRPCClient)
+		wantErr        string
+		wantRequestErr string
+	}{
+		{
+			name: "call fails with data plane unavailable",
+			configure: func(server *capturingTernServer, _ *GRPCClient) {
+				server.cutoverErr = status.Error(codes.Unavailable, "remote cutover unavailable")
+			},
+			wantErr:        "remote cutover unavailable",
+			wantRequestErr: "remote cutover failed",
+		},
+		{
+			name: "data plane returns no response",
+			configure: func(_ *capturingTernServer, client *GRPCClient) {
+				client.client = nilCutoverResponseClient{TernClient: client.client}
+			},
+			wantErr:        "the data plane returned neither a response nor an error",
+			wantRequestErr: "the data plane returned neither a response nor an error",
+		},
+		{
+			name: "data plane refuses the cutover",
+			configure: func(server *capturingTernServer, _ *GRPCClient) {
+				server.cutoverMessage = "cutover is not ready on the data plane"
+			},
+			wantErr:        "cutover is not ready on the data plane",
+			wantRequestErr: "cutover is not ready on the data plane",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &capturingTernServer{}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+			connectedClient := client.client
+			tt.configure(server, client)
+
+			apply, applies, controlRequests := newParkedCutoverApply(client)
+
+			err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+			assert.Equal(t, state.Apply.WaitingForCutover, applies.apply.State)
+			require.Len(t, applies.updates, 2)
+			assert.Equal(t, state.Apply.CuttingOver, applies.updates[0].State)
+			assert.Equal(t, state.Apply.WaitingForCutover, applies.updates[1].State)
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+			assert.Contains(t, controlRequests.requests[0].ErrorMessage, tt.wantRequestErr)
+
+			// The operator comments cutover again. The stored apply is waiting
+			// for cutover, so the API records a new durable request rather than
+			// answering that a cutover is already in progress.
+			reissueCutoverAndAssertSent(t, server, client, connectedClient, apply, applies, controlRequests)
+		})
+	}
+}
+
+// When the cutover is not accepted and the write restoring the pre-cutover
+// state also fails, the request stays pending instead of failing: the next
+// drive re-sends the cutover from the stored cutting_over rather than leaving
+// the apply wedged behind a failed request.
+func TestGRPCClient_ProcessPendingCutoverRestoreFailureKeepsRequestPending(t *testing.T) {
+	server := &capturingTernServer{
+		cutoverErr: status.Error(codes.Unavailable, "remote cutover unavailable"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	apply, applies, controlRequests := newParkedCutoverApply(client)
+	applies.laterUpdateErr = errors.New("storage write unavailable")
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote cutover unavailable")
+	assert.Contains(t, err.Error(), "restore apply apply-cutover-not-accepted to waiting_for_cutover after unaccepted cutover: storage write unavailable")
+	assert.Equal(t, state.Apply.CuttingOver, apply.State, "in-memory apply matches the stored row")
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "request stays pending so the next drive re-sends the cutover")
+
+	applies.laterUpdateErr = nil
+	server.mu.Lock()
+	server.cutoverErr = nil
+	server.cutoverAccepted = true
+	server.cutoverApplyID = ""
+	server.mu.Unlock()
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope()))
+	assert.Equal(t, "remote-cutover-not-accepted", server.getCutoverApplyID())
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+}
+
+// newParkedCutoverApply wires client storage with a whole-apply drive parked at
+// waiting_for_cutover and a pending operator cutover request.
+func newParkedCutoverApply(client *GRPCClient) (*storage.Apply, *mockApplyStore, *testControlRequestStore) {
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-cutover-not-accepted",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-cutover-not-accepted",
+		State:           state.Apply.WaitingForCutover,
+	}
+	storedApply := *apply
+	applies := &mockApplyStore{apply: &storedApply}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies: applies,
+		tasks: &mockTaskStore{tasks: []*storage.Task{{
+			ID:             1,
+			ApplyID:        apply.ID,
+			TaskIdentifier: "task-cutover-not-accepted",
+			TableName:      "users",
+			State:          state.Task.WaitingForCutover,
+		}}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+	return apply, applies, controlRequests
+}
+
+// reissueCutoverAndAssertSent records a fresh operator cutover request, lets
+// the data plane accept it, and asserts the next drive pass sends and completes it.
+func reissueCutoverAndAssertSent(t *testing.T, server *capturingTernServer, client *GRPCClient, connectedClient ternv1.TernClient, apply *storage.Apply, applies *mockApplyStore, controlRequests *testControlRequestStore) {
+	t.Helper()
+	_, alreadyPending, err := controlRequests.RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:bob",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	client.client = connectedClient
+	server.mu.Lock()
+	server.cutoverErr = nil
+	server.cutoverAccepted = true
+	server.cutoverMessage = ""
+	server.cutoverApplyID = ""
+	server.mu.Unlock()
+
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope()))
+	assert.Equal(t, "remote-cutover-not-accepted", server.getCutoverApplyID())
+	assert.Equal(t, "cli:bob", server.getCutoverCaller())
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, pending)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
 }
 
 func TestGRPCClient_UnansweredCutoverStaysPendingAndIsResent(t *testing.T) {
