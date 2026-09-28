@@ -350,6 +350,32 @@ func TestValidateMigrationContext(t *testing.T) {
 	assert.Error(t, validateMigrationContext(`has\backslash`))
 }
 
+// Per-keyspace progress reads a shared vtgate pool, so the keyspace is named in
+// the statement itself instead of being selected with USE, which would leave the
+// pooled connection switched to that keyspace for whichever reader takes it next.
+func TestShowVitessMigrationsQuery(t *testing.T) {
+	t.Run("names the keyspace and filters by context", func(t *testing.T) {
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `commerce` LIKE 'singularity:abc-123'",
+			showVitessMigrationsQuery("commerce", "singularity:abc-123"))
+	})
+
+	t.Run("names the keyspace without a filter when no context is known", func(t *testing.T) {
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `commerce`",
+			showVitessMigrationsQuery("commerce", ""))
+	})
+
+	t.Run("quotes keyspace names that need it", func(t *testing.T) {
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `my-ks` LIKE 'localscale:42'",
+			showVitessMigrationsQuery("my-ks", "localscale:42"))
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `odd``ks`",
+			showVitessMigrationsQuery("odd`ks", ""))
+	})
+}
+
 func TestShardLess(t *testing.T) {
 	assert.True(t, shardLess("-80", "80-"))
 	assert.False(t, shardLess("80-", "-80"))
