@@ -1045,9 +1045,18 @@ func TestEnsureSchema_ConvergesOneTablePerEngineRun(t *testing.T) {
 	assert.Contains(t, logs, fmt.Sprintf("run_count=%d", len(drifted)))
 
 	// The next boot finds nothing left to do, so the split converged the whole
-	// delta rather than a prefix of it.
-	require.NoError(t, EnsureSchema(dsn, bootstrapLogger))
-	assert.Contains(t, logBuf.String(), "storage schema applied successfully")
+	// delta rather than a prefix of it. It logs to a buffer of its own: the
+	// converging boot's lines are already in logBuf, so reading that buffer
+	// would pass even if this boot had to finish what the last one left.
+	var nextBootBuf syncBuffer
+	nextBootLogger := slog.New(slog.NewTextHandler(&nextBootBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, nextBootLogger))
+	nextBoot := nextBootBuf.String()
+	assert.Contains(t, nextBoot, `msg="storage schema up-to-date"`)
+	assert.NotContains(t, nextBoot, "schema change detected",
+		"a boot after a complete convergence plans nothing")
+	assert.Zero(t, strings.Count(nextBoot, `msg="converging storage table"`),
+		"a boot after a complete convergence runs nothing")
 }
 
 // observedTable reports whether any observed subject is the named table. The
