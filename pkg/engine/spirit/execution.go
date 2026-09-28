@@ -31,14 +31,23 @@ import (
 const maxCommitLatency = 100 * time.Millisecond
 
 // classifyRunnerError marks runner failures that a retry would repeat as
-// permanent, so operator retries are not spent repeating a lossy schema change
-// (see retryRepeatsChecksumVerdict). Everything else remains retryable.
+// permanent, so operator retries are not spent repeating a schema change that
+// cannot finish:
+//   - a checksum verdict a retry would reach again, such as a lossy schema
+//     change (see retryRepeatsChecksumVerdict).
+//   - a row the copy could not write into the new table definition (see
+//     rowDataErrorCodes). Every attempt copies the same rows into the same
+//     definition, so only changing the data or the statement clears it.
 //
-// A run refused the table's advisory lock is marked ErrTargetHeld: another run
-// is still working on the table, so the refusal says nothing about this schema
-// change and it can start once that run lets go.
+// Everything else remains retryable. A run refused the table's advisory lock is
+// marked ErrTargetHeld: another run is still working on the table, so the
+// refusal says nothing about this schema change and it can start once that run
+// lets go.
 func classifyRunnerError(err error) error {
 	if retryRepeatsChecksumVerdict(err) {
+		return &engine.PermanentError{Err: err}
+	}
+	if isRowDataError(err) {
 		return &engine.PermanentError{Err: err}
 	}
 	if errors.Is(err, dbconn.ErrLockHeld) {
@@ -65,6 +74,35 @@ func retryRepeatsChecksumVerdict(err error) bool {
 		return false
 	}
 	return checksum.IsReproducible(err)
+}
+
+// rowDataErrorCodes are the MySQL codes that say a row's value cannot be
+// stored in the column the schema change gives it. Spirit copies with INSERT
+// IGNORE, which downgrades these to warnings, and fails the copy on the
+// warning; the code reaches here as a typed MySQL error either way. Each one is
+// a property of the rows and the target definition alone, so a retry replays
+// it. Lock waits, deadlocks, timeouts, and connection loss are deliberately
+// absent: those describe the moment, not the data, and retrying clears them.
+//
+// Duplicate key (1062) is absent too, though a change that collapses unique
+// values is just as deterministic: the copy ignores duplicate-key warnings by
+// design, because a resumed copy re-inserts rows it already wrote, so that
+// change surfaces as reproducible checksum differences instead, which
+// classifyRunnerError already treats as permanent.
+var rowDataErrorCodes = []uint16{
+	1048, // ER_BAD_NULL_ERROR: a NULL in a column the change makes NOT NULL.
+	1265, // WARN_DATA_TRUNCATED: a value the new type or length can only store truncated.
+	1366, // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD: a value the new type or character set cannot represent.
+	1406, // ER_DATA_TOO_LONG: a value longer than the new column allows.
+}
+
+// isRowDataError reports whether err is a MySQL error saying a row cannot be
+// stored under the new table definition.
+func isRowDataError(err error) bool {
+	// Read through mysqlerr rather than asserting a driver type: two MySQL
+	// drivers are linked and their error types are not interchangeable. See
+	// pkg/mysqlerr/number.go.
+	return mysqlerr.Is(err, rowDataErrorCodes...)
 }
 
 // newSpiritMigration builds the Spirit migration for a statement against the
