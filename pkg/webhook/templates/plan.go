@@ -2062,6 +2062,31 @@ func appendDatabaseFlag(command, database string) string {
 	return fmt.Sprintf("%s -d %s", command, database)
 }
 
+// MsgConfirmationPlanForOtherEnvironment rejects an apply-confirm whose -e
+// names a different environment than the pending confirmation was planned for.
+const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation on this pull request was planned for `%s`, not `%s`. Nothing was applied, and the pending confirmation is preserved. Run `%s` to confirm that plan, or `%s` to plan this environment."
+
+// RenderConfirmationPlanForOtherEnvironment builds runnable recovery commands
+// with the same database scope as the rejected command.
+func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnvironment, database string) string {
+	confirmCommand := appendDatabaseFlag(fmt.Sprintf("schemabot apply-confirm -e %s", planEnvironment), database)
+	applyCommand := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", requestedEnvironment), database)
+	return fmt.Sprintf(MsgConfirmationPlanForOtherEnvironment, planEnvironment, requestedEnvironment, confirmCommand, applyCommand)
+}
+
+// MsgConfirmationPlanUnavailable rejects an apply-confirm whose pending
+// confirmation pins no plan SchemaBot can load, so nothing attests which
+// environment the operator reviewed. The verb takes the runnable apply command
+// that plans the requested environment again.
+const MsgConfirmationPlanUnavailable = "The pending confirmation on this pull request is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed. Nothing was applied, and the pending confirmation is preserved. Run `%s` to plan this environment again, then confirm that plan."
+
+// RenderConfirmationPlanUnavailable builds the missing-plan rejection with a
+// recovery command scoped to the same database as the rejected command.
+func RenderConfirmationPlanUnavailable(requestedEnvironment, database string) string {
+	applyCommand := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", requestedEnvironment), database)
+	return fmt.Sprintf(MsgConfirmationPlanUnavailable, applyCommand)
+}
+
 // allPlansIdentical returns true if all environments have identical changes.
 func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 	var firstPlan *PlanCommentData

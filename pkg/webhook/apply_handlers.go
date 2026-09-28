@@ -811,6 +811,14 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		}
 		return true, fmt.Errorf("apply-confirm command load confirmation plan %s#%d: %w", repo, pr, planLoadErr)
 	}
+	if storedPlan == nil {
+		h.logger.Warn("apply-confirm rejected: pending confirmation has no loadable plan",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
+		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
+			templates.RenderConfirmationPlanUnavailable(environment, databaseName))
+		return false, nil
+	}
 	// The pending confirmation authorizes the environment it was planned for
 	// and nothing else: confirming it into another environment would dispatch
 	// there with no plan comment, no disclosure, and no ordering gate for that
@@ -822,9 +830,11 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			"environment", environment, "plan_environment", storedPlan.Environment,
 			"pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
 		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
-			fmt.Sprintf(msgConfirmationPlanForOtherEnvironment, storedPlan.Environment, environment, storedPlan.Environment, environment))
+			templates.RenderConfirmationPlanForOtherEnvironment(storedPlan.Environment, environment, databaseName))
 		return false, nil
 	}
+	// Environment mismatch wins over stale-plan rejection because this outcome
+	// preserves the reviewed intent; stale-plan rejection releases it.
 	if rejected := h.assertPlanStillCurrent(ctx, repo, pr, installationID, storedPlan, confirmPRInfo.HeadSHA, environment, requestedBy); rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, existingLock.PendingPlanID, "stale-plan rejection")
 		return false, nil
@@ -842,11 +852,6 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	}
 
 	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
-	if existingLock.DisclosedCopyDiscard && !disclosedCopyDiscard {
-		h.logger.Info("copy-discard disclosure not applied to this confirm: it was shown for another environment",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"environment", environment, "pending_plan_id", existingLock.PendingPlanID)
-	}
 
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
@@ -856,8 +861,8 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 // pending confirmation was earned for the apply about to run. The lock carries
 // no environment dimension, so a disclosure the operator was shown confirming
 // one environment must not disarm the copy gate in another: the pinned plan
-// names the environment they actually saw. A confirmation with no loadable plan
-// counts as no disclosure, so the apply asks rather than assuming consent.
+// names the environment they actually saw. A missing plan never counts as
+// consent, though apply-confirm rejects that state before reaching this helper.
 func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
 	if !lock.DisclosedCopyDiscard {
 		return false

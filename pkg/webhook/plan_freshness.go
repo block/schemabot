@@ -104,32 +104,21 @@ func (h *Handler) assertPlanStillCurrent(
 	return true
 }
 
-// msgConfirmationPlanForOtherEnvironment rejects an apply-confirm whose -e names
-// a different environment than the pending confirmation was planned for. The
-// format verbs take the pinned plan's environment, the requested environment,
-// the pinned plan's environment again (to confirm it), and the requested
-// environment again (to plan it).
-const msgConfirmationPlanForOtherEnvironment = "The pending confirmation on this pull request was planned for `%s`, not `%s`. Nothing was applied, and the pending confirmation is preserved. Run `schemabot apply-confirm -e %s` to confirm that plan, or `schemabot apply -e %s` to plan this environment."
-
 // confirmationPlanTargetsOtherEnvironment reports whether the pending
 // confirmation was planned for an environment other than the one this
 // apply-confirm names. The lock is keyed by database alone, so the plan it pins
 // is the only record of which environment the operator reviewed and which
-// environment passed the ordering gate when that plan was made. A confirmation
-// with no loadable plan is left to the existing skip semantics of
-// assertPlanStillCurrent.
+// environment passed the ordering gate when that plan was made. The caller
+// rejects a confirmation with no loadable plan before asking this question.
 func confirmationPlanTargetsOtherEnvironment(plan *storage.Plan, environment string) bool {
-	if plan == nil {
-		return false
-	}
 	return plan.Environment != environment
 }
 
 // confirmationPlanForLock loads the plan that the active lock was acquired
 // with — the apply-confirmation plan the human reviewed before clicking
 // apply-confirm. Returns nil when the lock predates this column (empty
-// PendingPlanID) or when the referenced plan row is gone; assertPlanStillCurrent
-// then skips the freshness check rather than failing closed.
+// PendingPlanID) or when the referenced plan row is gone; the caller rejects
+// that unverified confirmation while preserving its lock.
 //
 // Looking up the plan via lock.PendingPlanID (instead of "newest plan for
 // repo+pr+env+database") avoids picking up a later plain `schemabot plan`

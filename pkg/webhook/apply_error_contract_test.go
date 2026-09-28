@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -190,7 +191,7 @@ func TestApplyCommandCoreChecksGateMeritBlockIsTerminal(t *testing.T) {
 // later confirmation can still execute the plan the user reviewed.
 func TestApplyConfirmCommandCoreBaseFreshnessFailureIsRetryableAndKeepsPendingLock(t *testing.T) {
 	locks := newApplyConfirmContractLockStore()
-	h, mux, _ := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
+	h, mux, _ := newApplyGateContractHandler(t, newApplyConfirmContractStorage(locks))
 	registerCheckStatusRESTHandlers(mux, nil)
 	registerBaseFreshnessRef(t, mux)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
@@ -209,7 +210,7 @@ func TestApplyConfirmCommandCoreBaseFreshnessFailureIsRetryableAndKeepsPendingLo
 // releasing the observed pending intent lets the PR create a fresh plan.
 func TestApplyConfirmCommandCoreStaleBaseIsTerminalAndReleasesPendingLock(t *testing.T) {
 	locks := newApplyConfirmContractLockStore()
-	h, mux, _ := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
+	h, mux, _ := newApplyGateContractHandler(t, newApplyConfirmContractStorage(locks))
 	registerCheckStatusRESTHandlers(mux, nil)
 	registerBaseFreshnessRef(t, mux)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
@@ -238,14 +239,97 @@ func TestApplyConfirmCommandCoreStaleBaseIsTerminalAndReleasesPendingLock(t *tes
 	assert.Equal(t, []string{"plan_confirm123"}, locks.releasedIfPending)
 }
 
+// A pending lock without a loadable plan cannot attest which environment the
+// operator reviewed. The confirmation fails closed and leaves the intent pinned
+// so an operator can inspect or replace it explicitly.
+func TestApplyConfirmCommandCoreMissingPlanIsTerminalAndKeepsPendingLock(t *testing.T) {
+	locks := newApplyConfirmContractLockStore()
+	h, mux, comments := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
+	registerCheckStatusRESTHandlers(mux, nil)
+	registerCurrentBaseSchema(t, mux)
+
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+	require.NoError(t, err)
+	assert.False(t, retry, "an unverifiable pending confirmation is a terminal rejection")
+	assert.Empty(t, locks.releasedIfPending, "the unverifiable pending intent must stay pinned")
+	body := requireComment(t, comments, "unverifiable-plan apply-confirm comment")
+	assert.Contains(t, body, "could not verify which environment")
+	assert.Contains(t, body, "pending confirmation is preserved")
+}
+
+// Failure to read a prior environment leaves promotion ordering unevaluated,
+// so the durable delivery retries while preserving the exact reviewed plan.
+func TestApplyConfirmCommandCorePriorEnvironmentReadFailureIsRetryableAndKeepsPendingLock(t *testing.T) {
+	locks := newApplyConfirmContractLockStore()
+	store := newApplyConfirmContractStorage(locks)
+	store.plan.Environment = "production"
+	store.checks = &applyConfirmErrorCheckStore{err: errors.New("check storage unavailable")}
+	cfg := actorAuthTestConfig(false, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.Environments["production"] = api.EnvironmentConfig{DSN: "root@tcp(localhost)/orders"}
+		cfg.Databases["orders"] = db
+		cfg.EnvironmentOrder = []string{"staging", "production"}
+	})
+	h, mux, _ := newApplyGateContractHandlerWithConfig(t, cfg, store)
+	registerCheckStatusRESTHandlers(mux, nil)
+	registerCurrentBaseSchema(t, mux)
+
+	retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "production", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+	require.Error(t, err)
+	assert.True(t, retry, "an unevaluated promotion gate must be re-driven")
+	assert.Empty(t, locks.released, "a gate read failure must not release the pending lock")
+	assert.Empty(t, locks.releasedIfPending, "a gate read failure must not conditionally release the pending lock")
+	assert.Equal(t, "plan_confirm123", locks.locks[0].PendingPlanID)
+}
+
 func newApplyGateContractHandler(t *testing.T, store storage.Storage) (*Handler, *http.ServeMux, <-chan string) {
+	return newApplyGateContractHandlerWithConfig(t, actorAuthTestConfig(false), store)
+}
+
+func newApplyGateContractHandlerWithConfig(t *testing.T, cfg *api.ServerConfig, store storage.Storage) (*Handler, *http.ServeMux, <-chan string) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
 	registerApplyDiscoveryEndpoints(t, mux, "orders")
 	comments := make(chan string, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
-	h := actorAuthStorageTestHandler(actorAuthTestConfig(false), store, ghclient.NewInstallationClient(client, testLogger()))
+	h := actorAuthStorageTestHandler(cfg, store, ghclient.NewInstallationClient(client, testLogger()))
 	return h, mux, comments
+}
+
+type applyConfirmContractStorage struct {
+	*actorAuthStorage
+	checks storage.CheckStore
+}
+
+func (s *applyConfirmContractStorage) Checks() storage.CheckStore {
+	if s.checks != nil {
+		return s.checks
+	}
+	return s.actorAuthStorage.Checks()
+}
+
+type applyConfirmErrorCheckStore struct {
+	storage.CheckStore
+	err error
+}
+
+func (s *applyConfirmErrorCheckStore) Get(_ context.Context, _ string, _ int, _, _, _ string) (*storage.Check, error) {
+	return nil, s.err
+}
+
+func newApplyConfirmContractStorage(locks *actorAuthLockStore) *applyConfirmContractStorage {
+	return &applyConfirmContractStorage{actorAuthStorage: &actorAuthStorage{
+		locks: locks,
+		plan: &storage.Plan{
+			PlanIdentifier: "plan_confirm123",
+			Database:       "orders",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Environment:    "staging",
+			HeadSHA:        "abc123",
+		},
+	}}
 }
 
 func newApplyConfirmContractLockStore() *actorAuthLockStore {

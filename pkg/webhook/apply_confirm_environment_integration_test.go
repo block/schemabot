@@ -113,17 +113,17 @@ func TestE2EApplyConfirmRejectsPendingConfirmationForOtherEnvironment(t *testing
 	stagingPlanID := dbName + "_staging_plan"
 	seedPendingConfirmation(t, svc, dbName, stagingPlanID, "staging")
 
-	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e production")
+	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e production -d "+dbName)
 
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply-confirm")
 		assert.Contains(t, body, "planned for `staging`, not `production`")
 		assert.Contains(t, body, "Nothing was applied")
-		assert.Contains(t, body, "schemabot apply-confirm -e staging")
-		assert.Contains(t, body, "schemabot apply -e production")
+		assert.Contains(t, body, "schemabot apply-confirm -e staging -d "+dbName)
+		assert.Contains(t, body, "schemabot apply -e production -d "+dbName)
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for environment mismatch rejection")
 	}
 
@@ -159,11 +159,11 @@ func TestE2EApplyConfirmExecutesPendingConfirmationForSameEnvironment(t *testing
 			select {
 			case summary := <-result.comments:
 				assert.Contains(t, summary, "Schema Change Applied")
-			case <-time.After(30 * time.Second):
+			case <-time.After(webhookIntegrationPollDeadline):
 				t.Fatal("timed out waiting for summary comment")
 			}
 		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for apply comment")
 	}
 
@@ -175,7 +175,7 @@ func TestE2EApplyConfirmExecutesPendingConfirmationForSameEnvironment(t *testing
 	require.Eventually(t, func() bool {
 		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "production", "mysql", dbName)
 		return err == nil && check != nil && check.Conclusion == "success"
-	}, 30*time.Second, 200*time.Millisecond, "the production check must pass once the confirmed apply completes")
+	}, webhookIntegrationPollDeadline, 200*time.Millisecond, "the production check must pass once the confirmed apply completes")
 }
 
 // `schemabot apply -e production` left a pending confirmation pinned to the
@@ -201,7 +201,7 @@ func TestE2EApplyConfirmBlockedWhenPriorEnvironmentNoLongerClean(t *testing.T) {
 		assert.Contains(t, body, "Staging")
 		assert.Contains(t, body, "schemabot apply -e staging")
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for environment ordering block")
 	}
 
