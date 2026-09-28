@@ -134,6 +134,9 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 // The two baselines SchemaBot renders answer those questions differently
 // because they are read by different parties.
 type baselinePolicy struct {
+	// includeRowSecurity exports access rules for pull. Rollback cannot yet
+	// execute these definitions and must not advertise a recoverable baseline.
+	includeRowSecurity bool
 	// refuseUnmodeledObjects refuses a table that carries objects the
 	// declarative format does not represent — a trigger or a table/column comment
 	// — even though the renderer would happily render its columns and
@@ -148,7 +151,7 @@ type baselinePolicy struct {
 // would describe incompletely is refused rather than written down without
 // its trigger or comment, and every table the plan would hold a file
 // accountable for is present, archive tables included.
-var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true}
+var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecurity: true}
 
 // rollbackBaseline is read only by a rollback re-plan, which manages the
 // same table set the forward plan did. Objects the differ cannot see are
@@ -273,7 +276,7 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 		return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
 	}
 	content, err := schemadiff.Render(model)
-	if errors.Is(err, schemadiff.ErrUnrenderableRowSecurity) {
+	if policy.includeRowSecurity && errors.Is(err, schemadiff.ErrUnrenderableRowSecurity) {
 		content, err = schemadiff.RenderWithRowSecurity(model)
 	}
 	if err != nil {

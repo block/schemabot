@@ -202,3 +202,44 @@ func TestRowSecurityComparisonOperationalError(t *testing.T) {
 	assert.NotContains(t, err.Error(), "does not yet execute")
 	assert.NotErrorIs(t, err, schemadiff.ErrUnsupportedChange)
 }
+
+// Greenfield RLS must refuse before any ordinary CREATE TABLE can be planned.
+func TestEngineRowSecurityMissingTableRefuses(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_missing")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	result, err := New().Plan(ctx, &engine.PlanRequest{
+		Database: "rls_missing", Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
+   CREATE TABLE documents (
+    id bigint PRIMARY KEY
+   );
+   ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+   CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
+  `}}},
+	})
+	require.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
+	assert.Nil(t, result)
+	var absent bool
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT to_regclass('public.documents') IS NULL").Scan(&absent))
+	assert.True(t, absent)
+}
+
+// Unsupported relation dependencies must refuse the whole pull, not omit a policy.
+func TestEnginePullRefusesPolicyRelationDependency(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_dependency")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT
+   USING (EXISTS (SELECT 1 FROM public.accounts WHERE accounts.id = documents.id));
+ `)
+	require.NoError(t, err)
+	eng := NewForTarget(0, 0, "rls_dependency", &engine.Credentials{DSN: dsn})
+	result, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
+	require.ErrorIs(t, err, statement.ErrPolicyRelationDependency)
+	assert.Nil(t, result)
+}

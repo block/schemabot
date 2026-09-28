@@ -88,6 +88,10 @@ or drop policies. Explicit RLS declarations use the stricter comparison above,
 which currently refuses mixed structural and RLS changes. A no-change result
 for a table-only file says nothing about whether its access policies match.
 
+New plans for a namespace containing RLS tables remain rollback-incapable until
+complete RLS definitions can be applied during recovery. Pull still exports the
+full definition; rollback capture never strips access policies to claim support.
+
 For example, an existing table can pull as:
 
 ```sql
@@ -97,7 +101,12 @@ CREATE TABLE documents (
     PRIMARY KEY (id)
 );
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-CREATE POLICY readers ON documents FOR SELECT TO PUBLIC USING (owner_id = 1);
+ALTER TABLE documents NO FORCE ROW LEVEL SECURITY;
+CREATE POLICY readers ON documents
+    AS PERMISSIVE
+    FOR SELECT
+    TO PUBLIC
+    USING ((owner_id = 1));
 ```
 
 Planning this file against that same live definition returns `NoChanges: true`.

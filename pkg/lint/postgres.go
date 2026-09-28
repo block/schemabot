@@ -110,7 +110,7 @@ func parsePostgresTableEntry(tableName, content string) (*pgproto.CreateStmt, []
 	// and index shape. This audit does not judge authorization policies.
 	hasRLS, err := statement.HasRowSecurityDeclaration(content)
 	if err != nil {
-		return nil, nil, &UnlintableTableError{Table: tableName, Detail: err.Error()}
+		return nil, nil, &UnlintableTableError{Table: tableName, Detail: fmt.Sprintf("cannot be parsed: %v", err)}
 	}
 	if hasRLS {
 		desired, err := statement.ParseDesiredWithRowSecurity(content)
