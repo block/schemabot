@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1128,6 +1129,11 @@ func adoptSequentialOutcome(apply *storage.Apply, failedTask *storage.Task, stop
 // The engine owns operation grammar. Detection here only decides whether to
 // supply the stored desired schema; it never authorizes execution.
 func (c *LocalClient) taskNeedsRowSecurityFiles(task *storage.Task) (bool, error) {
+	// Other engines do not use this payload. Do not add a parser requirement
+	// to their existing apply path (including custom engines).
+	if schema.DialectForDatabaseType(c.config.Type) != schema.DialectPostgres {
+		return false, nil
+	}
 	parser, err := c.statementParser()
 	if err != nil {
 		return false, err
