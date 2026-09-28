@@ -247,29 +247,28 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 	}
 }
 
-// TestE2ERollbackConfirmExecutesAndPostsComments verifies the full rollback-confirm
-// flow: rollback plan → rollback-confirm → apply executes → summary comment posted
-// on the correct PR. This catches regressions where watchApplyProgress loses the
-// repo/PR/installationID context and fails to post comments.
-func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
-	dbName := "webhook_rbconfirm_exec"
-	svc := setupE2EService(t, dbName)
+// rollbackTestSchemaWithIndex is the PR's desired users table: the seeded
+// table plus an index, so rolling the PR back drops the index again.
+const rollbackTestSchemaWithIndex = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+// seedCompletedIndexApply creates the users table on the target and runs PR
+// octocat/hello-world#1's apply adding an index to it through to completion,
+// capturing the original files a rollback needs. It returns the completed
+// apply's ID.
+func seedCompletedIndexApply(t *testing.T, svc *api.Service, dbName string) int64 {
+	t.Helper()
 	ctx := t.Context()
 
-	// Step 1: Create initial table
 	cfg, err := mysql.ParseDSN(e2eTargetDSN)
 	require.NoError(t, err)
 	cfg.DBName = dbName
 	cfg.MultiStatements = true
-	appDSN := cfg.FormatDSN()
-	db, err := sql.Open("block-mysql", appDSN)
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
-	_ = db.Close()
+	require.NoError(t, db.Close())
 
-	// Step 2: Plan + apply adding an index (captures original files for rollback)
-	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 	prNumber := int32(1)
 	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
 		Database:    dbName,
@@ -278,7 +277,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 		Repository:  "octocat/hello-world",
 		PullRequest: &prNumber,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			dbName: {Files: map[string]string{"users.sql": schemaWithIndex}},
+			dbName: {Files: map[string]string{"users.sql": rollbackTestSchemaWithIndex}},
 		},
 	})
 	require.NoError(t, err)
@@ -295,6 +294,22 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 		a, err := svc.Storage().Applies().Get(ctx, applyID)
 		return err == nil && a != nil && a.State == "completed"
 	}, 30*time.Second, 500*time.Millisecond, "initial apply should complete")
+	return applyID
+}
+
+// TestE2ERollbackConfirmExecutesAndPostsComments verifies the full rollback-confirm
+// flow: rollback plan → rollback-confirm → apply executes → summary comment posted
+// on the correct PR. This catches regressions where watchApplyProgress loses the
+// repo/PR/installationID context and fails to post comments.
+func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
+	dbName := "webhook_rbconfirm_exec"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Steps 1-2: Create the initial table, then plan + apply adding an index
+	// (captures original files for rollback).
+	schemaWithIndex := rollbackTestSchemaWithIndex
+	applyID := seedCompletedIndexApply(t, svc, dbName)
 
 	// Step 3: Run rollback to generate plan and acquire lock
 	mux := http.NewServeMux()
@@ -376,6 +391,73 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	}
 	require.NotNil(t, rollbackApply, "rollback apply row should exist")
 	assert.Equal(t, "github:testuser@octocat/hello-world#1", rollbackApply.Caller)
+}
+
+// An operator runs `schemabot rollback` on a PR and, before confirming it, a
+// same-PR `schemabot apply -e staging` arrives. The apply is refused with a
+// reply naming rollback-confirm and unlock, and the lock stays pinned to the
+// rollback plan so rollback-confirm still has it to execute. Once the rollback
+// has run, its lock is stale and the same apply command takes the lock over
+// for a fresh plan.
+func TestE2EApplyKeepsPendingRollbackLock(t *testing.T) {
+	dbName := "webhook_apply_rollback_pin"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+	applyID := seedCompletedIndexApply(t, svc, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": rollbackTestSchemaWithIndex,
+	}, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	sendComment := func(comment string) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	sendComment(fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier))
+	awaitCommentContaining(t, result, "Rollback Plan")
+
+	rollbackLock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, rollbackLock)
+	require.True(t, strings.HasPrefix(rollbackLock.PendingPlanID, rollbackPendingPlanPrefix), "rollback should pin its plan on the lock")
+
+	// Same-PR apply while the rollback awaits confirmation: refused, lock kept.
+	sendComment("schemabot apply -e staging")
+	refusal := awaitCommentContaining(t, result, "belongs to a rollback plan that has not been confirmed")
+	assert.Contains(t, refusal, "`schemabot rollback-confirm -e staging`")
+	assert.Contains(t, refusal, "`schemabot unlock`")
+	assert.Contains(t, refusal, dbName)
+
+	lock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "a refused apply must not release the rollback's lock")
+	assert.Equal(t, rollbackLock.PendingPlanID, lock.PendingPlanID, "a refused apply must leave the lock pinned to the rollback plan")
+
+	// The rollback runs, which leaves its lock behind as stale.
+	sendComment("schemabot rollback-confirm -e staging")
+	awaitCommentContaining(t, result, "Rollback Complete")
+
+	// The same apply command now re-plans and re-pins the lock to its own plan.
+	sendComment("schemabot apply -e staging")
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
+		return err == nil && lock != nil && lock.PendingPlanID != "" &&
+			!strings.HasPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix)
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "an apply after the rollback ran should take the stale lock over for its own plan")
 }
 
 // checkWriteRecorder wraps the service's storage so a test can observe every

@@ -223,6 +223,34 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 		}
 
+		// A rollback this PR is still waiting to confirm holds the lock. Planning
+		// on would replace its pin and leave rollback-confirm nothing to confirm,
+		// so the apply is refused until the operator confirms or cancels it.
+		if isSamePRRollbackLock(existingLock, lockOwner) {
+			rollbackPlan, awaiting, rbErr := h.rollbackAwaitsConfirmation(ctx, existingLock)
+			if rbErr != nil {
+				h.logger.Error("apply rejected: cannot tell whether the rollback pinned by this PR's lock has run; the lock stays in place",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", existingLock.PendingPlanID, "error", rbErr)
+				if !result.SuppressRetryComments {
+					h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+						"SchemaBot could not check this PR's pending rollback. The apply was rejected; retry the command, and see server logs if it persists.")
+				}
+				return true, fmt.Errorf("apply command check pending rollback %s#%d: %w", repo, pr, rbErr)
+			}
+			if awaiting {
+				h.logger.Info("apply rejected: lock is pinned to a rollback awaiting confirmation",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", existingLock.PendingPlanID)
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					pendingRollbackApplyRefusal(database, rollbackPlan))
+				return false, nil
+			}
+			h.logger.Info("rollback pinned by this PR's lock has already run; releasing the stale lock to re-plan",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", existingLock.PendingPlanID)
+		}
+
 		// Stale lock from this PR (no active applies) — release it so we can re-plan.
 		// Use owner-scoped Release: ownership can change between the Get above
 		// and this Release (e.g. an unrelated `schemabot unlock` clears the lock
@@ -733,7 +761,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// A same-PR rollback lock uses the same owner string but is confirmed via
 	// rollback-confirm, never here. Reject it before the freshness checks so no
 	// rejection path below can release it.
-	if existingLock.Owner == lockOwner && strings.HasPrefix(existingLock.PendingPlanID, rollbackPendingPlanPrefix) {
+	if isSamePRRollbackLock(existingLock, lockOwner) {
 		h.logger.Info("apply-confirm rejected: lock belongs to rollback plan", "repo", repo, "pr", pr,
 			"database", database, "environment", environment, "pending_plan_id", existingLock.PendingPlanID)
 		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
@@ -873,6 +901,57 @@ func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, enviro
 		return false
 	}
 	return plan.Environment == environment
+}
+
+// isSamePRRollbackLock reports whether this PR holds the lock for a rollback
+// plan. A rollback lock carries the same owner string as the PR's apply lock,
+// so only its pending plan tells the two intents apart; the apply commands must
+// never confirm, replace, or release it as if it were their own.
+func isSamePRRollbackLock(lock *storage.Lock, lockOwner string) bool {
+	return lock.Owner == lockOwner && strings.HasPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix)
+}
+
+// rollbackAwaitsConfirmation reports whether the rollback plan a same-PR
+// rollback lock pins has not run yet, returning the plan when it loads. Only an
+// apply created from that plan proves the rollback ran, after which the lock is
+// stale and a new apply may take it over. A pin whose plan cannot be found
+// proves nothing, so it counts as still awaiting confirmation and the lock
+// stays until an operator confirms or unlocks it.
+func (h *Handler) rollbackAwaitsConfirmation(ctx context.Context, lock *storage.Lock) (*storage.Plan, bool, error) {
+	planID, ok := rollbackPlanIDFromLock(lock)
+	if !ok {
+		h.logger.Warn("rollback lock pins no plan identifier; treating the rollback as awaiting confirmation",
+			"database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"lock_owner", lock.Owner, "pending_plan_id", lock.PendingPlanID)
+		return nil, true, nil
+	}
+	plan, err := h.service.Storage().Plans().Get(ctx, planID)
+	if err != nil {
+		return nil, false, fmt.Errorf("load rollback plan %s pinned by lock %s/%s: %w", planID, lock.DatabaseName, lock.DatabaseType, err)
+	}
+	if plan == nil {
+		h.logger.Warn("rollback lock pins a plan that no longer exists; treating the rollback as awaiting confirmation",
+			"database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"lock_owner", lock.Owner, "pending_plan_id", lock.PendingPlanID)
+		return nil, true, nil
+	}
+	apply, err := h.service.Storage().Applies().GetByPlan(ctx, plan.ID)
+	if err != nil {
+		return nil, false, fmt.Errorf("load apply for rollback plan %s pinned by lock %s/%s: %w", planID, lock.DatabaseName, lock.DatabaseType, err)
+	}
+	return plan, apply == nil, nil
+}
+
+// pendingRollbackApplyRefusal tells the operator why a same-PR apply was
+// refused while a rollback awaits confirmation, and how to settle the rollback
+// first. The rollback's environment is named when its plan loaded.
+func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) string {
+	confirm := "schemabot rollback-confirm"
+	if rollbackPlan != nil && rollbackPlan.Environment != "" {
+		confirm += " -e " + rollbackPlan.Environment
+	}
+	return fmt.Sprintf("The lock this PR holds on `%s` belongs to a rollback plan that has not been confirmed, and a new apply would discard it. "+
+		"Use `%s` to execute the rollback, or `schemabot unlock` to cancel it, then retry the apply.", database, confirm)
 }
 
 // applyCommandOptionsOf carries the option flags the operator typed on a
