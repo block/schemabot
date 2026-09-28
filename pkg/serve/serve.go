@@ -476,6 +476,11 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 		return err
 	}
 
+	// The drives keep running until Close, but new claims stop here: an idle
+	// driver that claimed during the listener drains below would start an
+	// engine only for Close to halt it and hand the apply to a peer.
+	srv.svc.StopClaiming()
+
 	// Graceful shutdown of both HTTP servers; Server.Close (deferred) releases
 	// the rest.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

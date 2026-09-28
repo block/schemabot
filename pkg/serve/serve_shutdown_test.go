@@ -271,6 +271,94 @@ func TestServeKeepsBackgroundWorkRunningUntilCloseAfterShutdownSignal(t *testing
 	assert.ErrorIs(t, background.Err(), context.Canceled, "the background work does not outlive the run")
 }
 
+// A signalled server keeps its in-flight drives running until Close hands their
+// claims back, but it must not take on new work in the meantime: an idle driver
+// that claims a pending apply during the listener drains starts an engine only
+// for Close to halt it seconds later and hand the apply to a peer. The claim
+// gate closes at the signal, so the drains that follow see no new claims.
+//
+// Storage here is a handle that never connects, so every claim attempt fails
+// fast and leaves a log line; the count of those lines is the claim activity.
+// The durable webhook dispatch's stop hook stands in for the drains Close runs
+// before it stops the operator, and reads the count on either side of a window
+// long enough for many polls.
+func TestServeStopsClaimingNewWorkOnShutdownSignal(t *testing.T) {
+	var logs bytes.Buffer
+	var mu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: &logs}, nil))
+	claimAttempts := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Count(logs.String(), "failed to claim apply_operation")
+	}
+
+	db, err := sql.Open("block-mysql", "schemabot@tcp(127.0.0.1:1)/schemabot")
+	require.NoError(t, err)
+	serverClosed := false
+	t.Cleanup(func() {
+		if !serverClosed {
+			utils.CloseAndLog(db)
+		}
+	})
+	authorizer, err := auth.NewLocalAuthorizer(strings.Repeat("a", 64), logger)
+	require.NoError(t, err)
+
+	const pollInterval = 20 * time.Millisecond
+	svc := api.New(mysqlstore.New(db), &api.ServerConfig{}, nil, logger)
+	require.NoError(t, svc.SetOperatorPollInterval(pollInterval))
+
+	started := make(chan struct{}, 1)
+	claimsAcrossDrain := make(chan [2]int, 1)
+	srv := &Server{
+		cfg:       &api.ServerConfig{MetricsPort: freeTCPPort(t)},
+		svc:       svc,
+		logger:    logger,
+		authz:     authorizer,
+		telemetry: &api.Telemetry{MetricsHandler: http.NotFoundHandler()},
+		webhook: webhookRuntime{
+			handler:                     http.NotFoundHandler(),
+			startDurableWebhookDispatch: func(context.Context) { started <- struct{}{} },
+			stopDurableWebhookDispatch: func() {
+				before := claimAttempts()
+				time.Sleep(20 * pollInterval)
+				claimsAcrossDrain <- [2]int{before, claimAttempts()}
+			},
+		},
+	}
+
+	runCtx, signalled, stopWatching := watchForShutdownSignal(t.Context())
+	defer stopWatching()
+
+	served := make(chan error, 1)
+	go func() { served <- serveUntilShutdown(runCtx, srv, signalled, "0", "") }()
+
+	select {
+	case <-started:
+	case <-time.After(runShutdownDeadline):
+		t.Fatalf("the server did not start its background work within %s", runShutdownDeadline)
+	}
+	require.Eventually(t, func() bool { return claimAttempts() > 0 }, runShutdownDeadline, 10*time.Millisecond, "drivers poll for work before the signal")
+
+	self, err := os.FindProcess(os.Getpid())
+	require.NoError(t, err)
+	require.NoError(t, self.Signal(syscall.SIGTERM))
+
+	select {
+	case err := <-served:
+		serverClosed = true
+		require.NoError(t, err, "a signalled server shuts down cleanly")
+	case <-time.After(runShutdownDeadline):
+		t.Fatalf("the server did not shut down within %s of SIGTERM", runShutdownDeadline)
+	}
+
+	select {
+	case counts := <-claimsAcrossDrain:
+		assert.Equal(t, counts[0], counts[1], "idle drivers must not claim new work after the shutdown signal")
+	default:
+		t.Fatal("Close did not stop the durable webhook dispatch")
+	}
+}
+
 // freeTCPPort returns a loopback port that was free a moment ago, for a listener
 // whose address is fixed by configuration rather than chosen at bind time.
 func freeTCPPort(t *testing.T) int {

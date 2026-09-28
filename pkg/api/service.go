@@ -155,7 +155,10 @@ type Service struct {
 	stopRecovery   chan struct{}
 	cancelRecovery context.CancelFunc
 	operatorWake   chan struct{}
-	recoveryWg     sync.WaitGroup
+	// claimingStopped records that stopRecovery has been closed, so the claim
+	// gate can be closed ahead of StopOperator and closed at most once.
+	claimingStopped bool
+	recoveryWg      sync.WaitGroup
 	// maintenanceWg holds the reaper passes, which share the driver lifecycle
 	// but claim nothing and drive nothing. They are waited on apart from the
 	// drivers so that a reaper which does not return cannot decide whether the
