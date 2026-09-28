@@ -891,21 +891,27 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
-	// If --skip-revert was set, auto-skip the revert window immediately.
+	// If --skip-revert was set, auto-skip the revert window immediately. Only an
+	// accepted skip marks the window skipped: a failed attempt is retried on the
+	// next progress tick, and until then the window stays open to the queued
+	// revert and skip-revert requests below.
 	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped {
-		logger.Info("auto-skipping revert window (--skip-revert)")
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			"Auto-skipping revert window (--skip-revert)", "", "")
-		_, err := eng.SkipRevert(ctx, controlReq)
-		if err != nil {
-			logger.Error("auto-skip revert failed", append(apply.MutableLogAttrs(), "error", err)...)
+		if !ps.autoSkipRevertLogged {
+			logger.Info("auto-skipping revert window (--skip-revert)")
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+				"Auto-skipping revert window (--skip-revert)", "", "")
+			ps.autoSkipRevertLogged = true
+		}
+		if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
+			logger.Error("auto-skip revert failed; the drive retries it at the next progress tick",
+				append(apply.MutableLogAttrs(), "error", err)...)
 		} else {
 			logger.Info("skip-revert triggered", "reason", "--skip-revert")
 			c.markRevertSkipped(ctx, apply)
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
+				"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, state.Apply.SkippingRevert)
+			ps.revertSkipped = true
 		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, state.Apply.SkippingRevert)
-		ps.revertSkipped = true
 	}
 
 	// A durable skip-revert control request (the interactive "skip now" command,
@@ -956,21 +962,27 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
 	// Falls back to stateEnteredAt if deployed_at is unavailable. A user revert
-	// this tick takes precedence — do not also auto-skip the window shut.
+	// this tick takes precedence — do not also auto-skip the window shut. As with
+	// --skip-revert, only an accepted skip marks the window skipped; a failed one
+	// is retried on the next progress tick.
 	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !revertedByControlRequest {
 		revertDeadline := c.revertWindowDeadline(logger, result.ResumeState, ps.stateEnteredAt)
 		if !revertDeadline.IsZero() && now.After(revertDeadline) {
-			logger.Info("revert window expired, skipping", "deadline", revertDeadline)
-			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-				"Revert window expired, finalizing", "", "")
+			if !ps.autoSkipRevertLogged {
+				logger.Info("revert window expired, skipping", "deadline", revertDeadline)
+				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+					"Revert window expired, finalizing", "", "")
+				ps.autoSkipRevertLogged = true
+			}
 			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
-				logger.Error("revert window timeout skip failed", append(apply.MutableLogAttrs(), "error", err)...)
+				logger.Error("revert window timeout skip failed; the drive retries it at the next progress tick",
+					append(apply.MutableLogAttrs(), "deadline", revertDeadline, "error", err)...)
 			} else {
 				c.markRevertSkipped(ctx, apply)
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
 					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, state.Apply.SkippingRevert)
+				ps.revertSkipped = true
 			}
-			ps.revertSkipped = true
 		}
 	}
 

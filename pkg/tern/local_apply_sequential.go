@@ -303,8 +303,16 @@ type atomicPollState struct {
 	// used for timeout enforcement on deferred cutover and revert window.
 	stateEnteredAt time.Time
 
-	// revertSkipped is set after SkipRevert is called to prevent repeated calls.
+	// revertSkipped is set once the engine accepts SkipRevert, so the drive
+	// stops re-attempting it and surfaces skipping_revert while the engine
+	// finalizes. A rejected attempt leaves it unset for the next tick to retry.
 	revertSkipped bool
+
+	// autoSkipRevertLogged is set after the drive records the automatic
+	// skip-revert trigger event (--skip-revert or revert window expiry), so
+	// retries of a rejected skip do not fill the user-visible timeline with
+	// duplicate triggers.
+	autoSkipRevertLogged bool
 
 	// resumeEventLogged is set after this drive claim records the
 	// engine-resumed-from-checkpoint timeline event, so the flag the engine
