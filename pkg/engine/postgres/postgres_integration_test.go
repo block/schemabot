@@ -2338,3 +2338,25 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 		{Table: "sessions", Column: "token", Linter: "primary_key", Severity: "warning", Message: `Primary key column "token" in table "sessions" uses "character(36)"; allowed types: bigint, uuid`},
 	}, results)
 }
+
+// One RLS table makes namespace capture incomplete; never label a partial
+// baseline as rollback-capable, even for changes to an ordinary sibling table.
+func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_rls")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+ `)
+	require.NoError(t, err)
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public")
+	require.NoError(t, err)
+	assert.False(t, captured)
+	assert.Nil(t, files, "an RLS render refusal must not leave a partial rollback baseline")
+}

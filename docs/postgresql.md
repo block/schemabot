@@ -649,6 +649,12 @@ rather than a hot standby. Nothing persists â€” the transaction is rolled back â
 but a role provisioned with only the apply-time privileges fails at plan time
 with a permission error on the database.
 
+A namespace containing an RLS table currently cannot capture a complete rollback
+baseline, including for changes to other tables in that namespace. Forward plans
+can still proceed, but rollback is refused under RV-7. Access rules are not
+stripped from the baseline to claim rollback support. Complete RLS rendering is
+a separate follow-up.
+
 ## Supabase compatibility tests
 
 The [Supabase adapter tests](../pkg/engine/postgres/supabase_integration_test.go)

@@ -2427,9 +2427,10 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// DDL onto its own result, so the apply waits for an operator to
 		// read the catalog instead.
 		executor.CodeBlockingOutcomeUnknown: "a retry replays a statement that may have committed",
-		// RLS changes have the same uncertain-commit boundary: inspect the
-		// policies before deciding whether another apply is appropriate.
-		executor.CodeRowSecurityOutcomeUnknown: "a retry replays a policy change that may have committed",
+		// SchemaBot does not invoke the RLS executor yet; this keeps the
+		// outcome vocabulary total. pg-sprite requires catalog inspection
+		// before retrying an unknown commit outcome.
+		executor.CodeRowSecurityOutcomeUnknown: "inspect the catalog before deciding whether to retry",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {

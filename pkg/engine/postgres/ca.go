@@ -34,13 +34,10 @@ const (
 // caCertPath resolves the credentials' CA reference to the bundle path
 // pg-sprite's pool trusts. An absent reference and the embedded RDS bundle
 // both resolve to no path: the pool then keeps the trust the normalized DSN
-// asks for. pg-sprite honors an sslmode the DSN spells as `sslmode=` and only
-// supplies its own RDS verify-full default when it sees none, so the sslmode
-// SchemaBot injects for RDS targets is what the pool dials with. That match
-// holds for the common DSN shapes and not for every one: a keyword DSN that
-// spells the mode with spaces around `=` is explicit to SchemaBot but not to
-// pg-sprite, and the two RDS host checks differ on letter case and on
-// partitions outside the commercial `rds.amazonaws.com` suffix. Both layers
+// asks for. pg-sprite honors explicit sslmode in URL and keyword DSNs,
+// including spaces around the keyword assignment. Its RDS host matching is
+// case-insensitive. SchemaBot's normalized mode is therefore preserved; the
+// layers still differ in their coverage of non-commercial RDS suffixes. Both layers
 // complete verify-full without an sslrootcert with the embedded RDS bundle;
 // verify-ca carries pgx's own verifier and is left to the roots the DSN
 // names. A reference the engine cannot honor is refused —
