@@ -1049,10 +1049,13 @@ func sameApplyOperation(a, b *int64) bool {
 
 // prepareRetryableTasksForResume queues only the task work that previously
 // stopped on a retryable engine failure. Completed tasks remain completed, and
-// pending tasks remain queued behind the retried work.
-func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+// pending tasks remain queued behind the retried work. A requeue write that
+// does not land is returned: the task row is still failed_retryable, so driving
+// on would run its DDL while storage records it at rest. The caller exits the
+// drive with the apply still retryable, and the next claim retries the requeue.
+func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		return
+		return nil
 	}
 	apply.ErrorMessage = ""
 	for _, task := range tasks {
@@ -1062,9 +1065,12 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 		task.Attempt++
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
+			return fmt.Errorf("requeue retryable task %s for retry of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 // prepareStoppedTasksForResume turns an operator-claimed start request back into
@@ -2244,7 +2250,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		}
 	}
 
-	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
+	if err := c.prepareRetryableTasksForResume(ctx, apply, activeTasks); err != nil {
+		logger.Warn("could not requeue retryable tasks for the retry; drive exits with the apply still retryable for the next claim to retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
 
 	if grouped {

@@ -593,7 +593,8 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 // and a terminal report is only trusted for a task in flight whose last lease
 // belongs to this process (the completing process's own report; see
 // terminalReportDescribesTask).
-// Returns true if the task was resolved (no longer blocking).
+// Returns true if the task was resolved (no longer blocking), which requires
+// the settlement to be durably written; a refused write keeps the task blocking.
 func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string, memo *conflictScanMemo) bool {
 	eng := c.getEngine()
 	if eng == nil {
@@ -649,9 +650,21 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		c.logger.Info("conflict check: engine reports terminal state",
 			"task_id", t.TaskIdentifier, "engine_state", result.State,
 			"engine_message", result.Message, "storage_state", t.State)
+		// The task stops blocking only once its settlement is durable:
+		// reporting it resolved on a refused write would admit a new apply
+		// while storage still records the task as in-flight work. A refused
+		// write restores the task, so it keeps blocking and a later conflict
+		// check retries the settlement cleanly.
+		previous := *t
+		settledState := engineStateToStorage(result.State)
 		now := time.Now()
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, engineStateToStorage(result.State), "")
+		if err := c.persistTaskStateTransition(ctx, t, 0, settledState, ""); err != nil {
+			*t = previous
+			c.logger.Error("conflict check: failed to persist the engine's terminal state for a stale task; the task keeps blocking the database",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error", err)...)
+			return false
+		}
 		return true
 	}
 
@@ -676,10 +689,18 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		}
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
 			"task_id", t.TaskIdentifier, "storage_state", t.State, "started_at", t.StartedAt)
+		// As with a terminal report, the task stops blocking only once its
+		// failure is durable.
+		previous := *t
 		now := time.Now()
 		t.ErrorMessage = "Task abandoned: engine has no active schema change (server may have crashed)"
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, state.Task.Failed, "")
+		if err := c.persistTaskStateTransition(ctx, t, 0, state.Task.Failed, ""); err != nil {
+			*t = previous
+			c.logger.Error("conflict check: failed to persist the failure of an abandoned task; the task keeps blocking the database",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", state.Task.Failed, "error", err)...)
+			return false
+		}
 		return true
 	}
 

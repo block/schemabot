@@ -556,6 +556,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
 	var consecutiveErrors int
+	// terminalWriteFailures counts consecutive failed writes of the task's
+	// terminal state. It is separate from consecutiveErrors because every
+	// successful poll resets that one, and the poll that finds the task
+	// terminal is itself successful.
+	var terminalWriteFailures int
 	var resumeEventLogged bool
 	var lastProgressMetadata map[string]string
 	var progressMetadataLeaseLost bool
@@ -626,6 +631,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				continue
 			}
 			prevState := task.State
+			prevCompletedAt := task.CompletedAt
 			// A sequential task drives a single DDL, so its progress is the
 			// first table's: the same projection the grouped sync applies per
 			// task, with the same refinement of a running task into the
@@ -710,7 +716,30 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					logMsg = fmt.Sprintf("Task %s finished: engine_state=%s message=%q rows=%d/%d",
 						task.TaskIdentifier, result.State, result.Message, task.RowsCopied, task.RowsTotal)
 				}
-				c.transitionTaskState(ctx, task, task.ApplyID, task.State, logMsg)
+				// The drive moves on to the next task only once this one's
+				// outcome is durable: a later task's DDL must never run while
+				// storage still records this one in flight, and the apply must
+				// never finalize over a task row that never settled.
+				terminalState := task.State
+				if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, terminalState, logMsg); err != nil {
+					task.State = prevState
+					task.CompletedAt = prevCompletedAt
+					attrs := append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "target_state", terminalState, "engine_state", result.State)
+					if errors.Is(err, storage.ErrApplyLeaseLost) {
+						c.logger.Warn("task finished on the engine but its terminal state was refused because the drive's lease was lost; this driver exits and starts no further task",
+							append(attrs, "error", err)...)
+						return taskAbort
+					}
+					terminalWriteFailures++
+					if terminalWriteFailures >= maxConsecutiveProgressPollErrors {
+						c.logger.Error("task finished on the engine but its terminal state could not be persisted; this driver exits without starting further tasks and leaves the apply for a later drive",
+							append(attrs, "consecutive_write_failures", terminalWriteFailures, "error", err)...)
+						return taskAbort
+					}
+					c.logger.Warn("task finished on the engine but persisting its terminal state failed; the drive retries the write at the next poll and starts no further task until it lands",
+						append(attrs, "consecutive_write_failures", terminalWriteFailures, "error", err)...)
+					continue
+				}
 				logger.Info("task finished",
 					"task_id", task.TaskIdentifier,
 					"table", task.TableName,
@@ -736,7 +765,19 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "stalled_for", stalledFor.Round(time.Second), "engine_state", result.State, "throttled", task.Throttled, "throttle_reason", task.ThrottleReason)...)
 			}
 
-			c.transitionTaskState(ctx, task, 0, task.State, "")
+			polledState := task.State
+			if err := c.persistTaskStateTransition(ctx, task, 0, polledState, ""); err != nil {
+				task.State = prevState
+				attrs := append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "target_state", polledState, "engine_state", result.State)
+				if errors.Is(err, storage.ErrApplyLeaseLost) {
+					c.logger.Warn("task progress write was refused because the drive's lease was lost; this driver exits and starts no further task",
+						append(attrs, "error", err)...)
+					return taskAbort
+				}
+				c.logger.Warn("failed to persist task progress; the drive retries the write at the next poll",
+					append(attrs, "error", err)...)
+				continue
+			}
 
 			// Notify observer with full apply + tasks context
 			if obs := c.getObserver(task.ApplyID); obs != nil {

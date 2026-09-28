@@ -1532,3 +1532,70 @@ func TestLocalClientDrivePlanID(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// A retryable failure paused the apply mid-copy of `users`, and a driver claims
+// it to retry. The drive requeues the failed_retryable task to pending before
+// driving it, and that write fails. The task row is still at rest, so the drive
+// must exit with an error before writing the apply running or handing anything
+// to the engine: running the DDL while storage records the task at rest would
+// leave a copy no stored state accounts for. The apply stays retryable so the
+// next claim retries the requeue.
+func TestResumeApplyWithTasks_RetryStaysPendingWhenRetryableTaskRequeueFails(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
+	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+	c.spiritEngine = eng
+	c.heartbeatInterval = time.Hour
+
+	plan := &storage.Plan{ID: 5}
+	apply := &storage.Apply{
+		ID:              22,
+		ApplyIdentifier: "apply-retry-requeue-refused",
+		PlanID:          plan.ID,
+		Database:        "testapp",
+		Environment:     "staging",
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "engine connection reset",
+	}
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task_email",
+		Database:       "testapp",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.FailedRetryable,
+		ErrorMessage:   "engine connection reset",
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{
+		plans:   &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }},
+		applies: applies,
+		tasks: &updateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			updateErr:              storageErr,
+		},
+		controlRequests: &testControlRequestStore{},
+		logs:            logs,
+	}
+
+	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorContains(t, err, "requeue retryable task task_email for retry of apply apply-retry-requeue-refused")
+	assert.True(t, state.IsState(task.State, state.Task.FailedRetryable), "the refused requeue leaves the task retryable, got %s", task.State)
+	assert.Empty(t, eng.applied, "nothing is handed to the engine")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.FailedRetryable),
+		"the drive exits before writing the apply running; stored state was %q", stored.State)
+	assert.Equal(t, "engine connection reset", stored.ErrorMessage, "the stored apply keeps the failure it paused on")
+	for _, entry := range logs.logs {
+		assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+			"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+	}
+}
