@@ -80,9 +80,15 @@ func TestSupabaseEngine(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, result.Accepted)
 		require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, "documents").State)
+		var columnType string
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT data_type FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = 'documents' AND column_name = 'summary'
+		`).Scan(&columnType))
+		assert.Equal(t, "text", columnType, "the native apply must add the requested column")
 		tx, err := db.BeginTx(ctx, nil)
 		require.NoError(t, err)
-		defer func() { _ = tx.Rollback() }()
+		defer func() { assert.NoError(t, tx.Rollback()) }()
 		_, err = tx.ExecContext(ctx, `
 			SET LOCAL ROLE authenticated;
 			SET LOCAL request.jwt.claim.sub = '11111111-1111-1111-1111-111111111111';
@@ -199,9 +205,9 @@ func supabasePullRequest() *ternv1.PullSchemaRequest {
 
 func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), supabaseOperationDeadline)
-	defer cancel()
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+	// Image downloads use the test deadline; only readiness has a 30-second
+	// startup budget, so a cold Docker cache does not consume that budget.
+	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image:        supabasePostgresImage,
 			Env:          map[string]string{"POSTGRES_PASSWORD": "schemabot_test_only", "POSTGRES_DB": "postgres"},
@@ -217,6 +223,8 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 		t.Cleanup(func() { require.NoError(t, testcontainers.TerminateContainer(container)) })
 	}
 	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), supabaseOperationDeadline)
+	defer cancel()
 	host, err := container.Host(ctx)
 	require.NoError(t, err)
 	port, err := container.MappedPort(ctx, "5432/tcp")
