@@ -749,6 +749,16 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		Caller:      controlReq.RequestedBy,
 	})
 	if err != nil {
+		if isAmbiguousRemoteCallError(err) {
+			// The data plane records a cutover durably on receipt and answers a
+			// re-sent one as already pending, so a call that ended without an
+			// answer leaves the request pending for the next drive to re-send.
+			// Failing it would tell the operator the cutover did not take
+			// effect while the swap may already be under way.
+			logger.WarnContext(ctx, "remote cutover call ended without an answer; the cutover request stays pending and the next drive re-sends it",
+				append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "remote_apply_id", remoteID, "error", err)...)
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: outcome unknown, request left pending: %w", apply.ApplyIdentifier, remoteID, err)
+		}
 		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); failErr != nil {
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, remoteID, err, failErr)
@@ -2478,7 +2488,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
-			if isAmbiguousRemoteApplyDispatchError(err) {
+			if isAmbiguousRemoteCallError(err) {
 				return fmt.Errorf("%s apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", kind, op.ID, apply.ApplyIdentifier, err)
 			}
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
@@ -3315,7 +3325,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
-		if isAmbiguousRemoteApplyDispatchError(err) {
+		if isAmbiguousRemoteCallError(err) {
 			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
 		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
@@ -3387,7 +3397,9 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
 }
 
-func isAmbiguousRemoteApplyDispatchError(err error) bool {
+// isAmbiguousRemoteCallError reports whether a remote call ended without an
+// answer, so the data plane may or may not have acted on it.
+func isAmbiguousRemoteCallError(err error) bool {
 	return errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		status.Code(err) == codes.Canceled ||
@@ -3401,7 +3413,7 @@ func isRetryableRemoteApplyError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if isAmbiguousRemoteApplyDispatchError(err) {
+	if isAmbiguousRemoteCallError(err) {
 		return false
 	}
 

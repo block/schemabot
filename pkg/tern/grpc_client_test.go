@@ -8403,6 +8403,70 @@ func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover failed for apply apply-cutover-error (remote remote-cutover-error) (caller: cli:alice)"))
 }
 
+func TestGRPCClient_UnansweredCutoverStaysPendingAndIsResent(t *testing.T) {
+	// A cutover call that ends without an answer may still have reached the
+	// data plane, which records the cutover durably and swaps on its own. The
+	// request therefore stays pending instead of telling the operator the
+	// cutover did not take effect, and the next drive re-sends it; the data
+	// plane answers the re-send as accepted and the request completes.
+	server := &capturingTernServer{
+		cutoverErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-cutover-unanswered",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-cutover-unanswered",
+		State:           state.Apply.WaitingForCutover,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-unanswered",
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outcome unknown, request left pending")
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	assert.Equal(t, "remote-cutover-unanswered", server.getCutoverApplyID())
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status)
+	assert.Empty(t, controlRequests.requests[0].ErrorMessage)
+	assert.Equal(t, state.Apply.CuttingOver, apply.State)
+
+	server.mu.Lock()
+	server.cutoverErr = nil
+	server.cutoverAccepted = true
+	server.cutoverApplyID = ""
+	server.mu.Unlock()
+
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope()))
+	assert.Equal(t, "remote-cutover-unanswered", server.getCutoverApplyID(), "the next drive re-sends the cutover")
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+}
+
 func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *testing.T) {
 	// An operator can start the remote apply directly after SchemaBot records
 	// durable start intent. The operator adopts the active remote state instead
