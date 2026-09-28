@@ -208,10 +208,11 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The owner string is readable by anyone who can list locks, so it proves
-	// nothing about who took the lock. A scoped operator's release is held to
-	// the lock's recorded acquirer; a deployment write-group member, or any
-	// caller on a deployment without scoped grants, releases by owner alone.
-	if authorization.Reason == DirectWriteReasonScopedAllow {
+	// nothing about who took the lock. Only a deployment write-group member,
+	// or a caller on a deployment without scoped grants, releases by owner
+	// alone; every other allowed caller is held to the lock's recorded
+	// acquirer, so a grant added later is scoped until it is decided otherwise.
+	if !releasesLockByOwnerAlone(authorization.Reason) {
 		s.releaseScopedLock(w, r, req)
 		return
 	}
@@ -247,6 +248,15 @@ const (
 	lockReleaseRefusalAcquirerNoOperatorGroup    = "acquirer_no_operator_group"
 	lockReleaseRefusalAcquirerOtherOperatorGroup = "acquirer_other_operator_group"
 )
+
+// releasesLockByOwnerAlone reports whether a caller allowed under reason may
+// release a lock on the strength of its owner string. Only the deployment
+// write groups and a deployment that grants no operator groups release that
+// way; any other allowed decision, including one this function has not been
+// taught about, is held to the lock's recorded acquirer.
+func releasesLockByOwnerAlone(reason string) bool {
+	return reason == DirectWriteReasonAdminAllow || reason == DirectWriteReasonScopedLaneDisabled
+}
 
 // releaseScopedLock releases a lock for a scoped (non-admin) operator. A
 // scoped operator may release a lock only when the lock's recorded acquirer

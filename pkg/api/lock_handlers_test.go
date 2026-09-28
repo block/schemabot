@@ -314,10 +314,13 @@ func TestScopedLockReleaseIsPerOperatorGroup(t *testing.T) {
 
 	t.Run("a wrong owner is refused as not owned before the grant is consulted", func(t *testing.T) {
 		locks := &memoryLockStore{lock: paymentsLock(7, "cli:someone-else@desktop", teamAcquirer)}
-		rec := release(t, locks, &auth.User{Subject: "bob", Groups: []string{"payments-team"}})
+		rec := release(t, locks, &auth.User{Subject: "mallory", Groups: []string{"payments-oncall"}})
 
 		assert.Equal(t, http.StatusForbidden, rec.Code)
-		assert.Contains(t, rec.Body.String(), apitypes.ErrCodeLockNotOwned)
+		assert.Contains(t, rec.Body.String(), apitypes.ErrCodeLockNotOwned,
+			"a mistyped owner reads as not owned whatever the caller's group, so the CLI maps it to ErrLockNotOwned")
+		assert.NotContains(t, rec.Body.String(), "acquired under operator groups",
+			"the grant is not consulted for a lock the caller did not name")
 		assert.NotNil(t, locks.lock, "a refused release leaves the lock held")
 	})
 
@@ -363,4 +366,17 @@ func TestScopedLockReleaseIsPerOperatorGroup(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), apitypes.ErrCodeLockNotOwned)
 		assert.NotNil(t, locks.lock)
 	})
+}
+
+// Release by owner string alone is the exception, not the default: only the
+// deployment write groups and a deployment with no scoped grants get it. An
+// allow reason the release path has not been taught about is held to the
+// recorded acquirer, so a new grant cannot release by owner until someone
+// decides it should.
+func TestReleasesLockByOwnerAloneIsAnAllowlist(t *testing.T) {
+	assert.True(t, releasesLockByOwnerAlone(DirectWriteReasonAdminAllow))
+	assert.True(t, releasesLockByOwnerAlone(DirectWriteReasonScopedLaneDisabled))
+	assert.False(t, releasesLockByOwnerAlone(DirectWriteReasonScopedAllow))
+	assert.False(t, releasesLockByOwnerAlone("service_allow"), "an unknown allow reason is held to the recorded acquirer")
+	assert.False(t, releasesLockByOwnerAlone(""))
 }
