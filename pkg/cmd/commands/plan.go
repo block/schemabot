@@ -226,14 +226,19 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		return
 	}
 
-	// Collect VSchema changes from metadata
+	// Collect VSchema changes from metadata, and the namespaces the engine
+	// asked to finalize without one: a finalize is work the apply runs, so a
+	// plan made only of finalizes must not read as "no changes".
 	var vschemaChanges []templates.VSchemaChange
+	finalizeOnly := map[string]bool{}
 	for _, sc := range result.Changes {
 		if sc.HasVSchemaChange() {
 			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
 				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
 			})
+		} else if sc.NeedsFinalizer() {
+			finalizeOnly[sc.Namespace] = true
 		}
 	}
 
@@ -246,7 +251,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// the summary counts what the block shows — and for a sharded plan that is
 	// every distinct per-shard statement, the same set the PR comment counts.
 	tables := result.RenderedTables()
-	if len(tables) == 0 && len(vschemaChanges) == 0 {
+	if len(tables) == 0 && len(vschemaChanges) == 0 && len(finalizeOnly) == 0 {
 		templates.WriteNoChanges()
 		templates.WriteExemptTables(result.ExemptTables)
 		return
@@ -281,8 +286,8 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 
 	// Render DDL + VSchema changes grouped by namespace/keyspace
 	isVitess := state.IsPlanetScaleEngine(result.Engine)
-	if len(allChanges) > 0 || len(vschemaChanges) > 0 {
-		// Collect all namespaces (from DDL and VSchema)
+	if len(allChanges) > 0 || len(vschemaChanges) > 0 || len(finalizeOnly) > 0 {
+		// Collect all namespaces (from DDL, VSchema, and finalizes)
 		allNamespaces := make(map[string]bool)
 		for ns := range namespaceMap {
 			allNamespaces[ns] = true
@@ -290,12 +295,16 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		for _, vc := range vschemaChanges {
 			allNamespaces[vc.Keyspace] = true
 		}
+		for ns := range finalizeOnly {
+			allNamespaces[ns] = true
+		}
 
 		var nsChanges []templates.NamespaceChange
 		for ns := range allNamespaces {
 			nc := templates.NamespaceChange{
 				Namespace: ns,
 				Changes:   namespaceMap[ns],
+				Finalize:  finalizeOnly[ns],
 			}
 			if diff, ok := vsDiffByKS[ns]; ok {
 				nc.VSchemaChanged = true
@@ -321,8 +330,8 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 
 	// Write summary
 	switch {
-	case len(vschemaChanges) > 0:
-		templates.WritePlanSummaryWithVSchema(allChanges, vschemaChanges)
+	case len(vschemaChanges) > 0 || len(finalizeOnly) > 0:
+		templates.WritePlanSummaryWithKeyspaceUpdates(allChanges, vschemaChanges, len(finalizeOnly))
 	default:
 		templates.WritePlanSummary(allChanges)
 	}

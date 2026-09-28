@@ -1017,6 +1017,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			ksData.VSchemaChanged = true
 			ksData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
 		}
+		ksData.Finalize = sc.NeedsFinalizer()
 		data.Changes = append(data.Changes, ksData)
 	}
 

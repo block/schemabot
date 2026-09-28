@@ -1573,15 +1573,17 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		}
 	}
 
-	// Don't store empty plans — no DDL changes, no VSchema changes.
-	hasVSchemaChanges := false
+	// Don't store empty plans — no DDL changes and no namespace to finalize. A
+	// namespace the engine asked to finalize is work even without DDL: skipping
+	// it would report a clean plan the apply never finalizes.
+	needsFinalizer := false
 	for _, ns := range namespaces {
-		if ns.ChangesVSchema() {
-			hasVSchemaChanges = true
+		if ns.NeedsFinalizer() {
+			needsFinalizer = true
 			break
 		}
 	}
-	if len(ddlChanges) == 0 && !hasVSchemaChanges {
+	if len(ddlChanges) == 0 && !needsFinalizer {
 		c.logger.Info("Plan: no changes, skipping storage", "plan_id", result.PlanID, "database", c.config.Database)
 		// A clean plan is the case where the disclosure matters most: it is
 		// the only evidence a reviewer has that an exempt table was seen and
@@ -2026,15 +2028,15 @@ func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationM
 	if len(namespaces) == 1 && !manifestNamesDeploymentScopedFinalizer(generationManifest, namespaces[0]) {
 		return namespaces[0], nil
 	}
-	// A deployment-scoped finalizer's drive applies every VSchema-changed
-	// namespace in the stored plan, so a deployment-scoped dispatch must cover
-	// exactly that set — a partial dispatch would silently apply namespaces the
-	// dispatcher never named.
-	planNamespaces := plan.VSchemaNamespaces()
+	// A deployment-scoped finalizer's drive finalizes every namespace in the
+	// stored plan that needs it, so a deployment-scoped dispatch must cover
+	// exactly that set — a partial dispatch would silently finalize namespaces
+	// the dispatcher never named.
+	planNamespaces := plan.FinalizerNamespaces()
 	dispatched := append([]string(nil), namespaces...)
 	sort.Strings(dispatched)
 	if !slices.Equal(dispatched, planNamespaces) {
-		return "", fmt.Errorf("group_finalizer dispatch names namespaces %v but plan %s changes VSchema in %v; a deployment-scoped dispatch must cover the plan's full VSchema set",
+		return "", fmt.Errorf("group_finalizer dispatch names namespaces %v but plan %s finalizes %v; a deployment-scoped dispatch must cover the plan's full finalizer set",
 			namespaces, plan.PlanIdentifier, planNamespaces)
 	}
 	return "", nil
@@ -2260,6 +2262,9 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				nsData.Metadata[key] = value
 			}
 		}
+		if sc.NeedsFinalizer() {
+			nsData.Finalize = true
+		}
 		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
 			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
 				if vs, ok := nsFiles.Files[storage.VSchemaArtifactName]; ok && vs != "" {
@@ -2285,6 +2290,10 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 // plan-time behavior (the artifact is stored only when the plan detected a
 // change). Attaching it unconditionally would create spurious vschema_update
 // tasks on DDL-only plans, since Vitess always ships a vschema.json schema file.
+//
+// A finalizer the engine asked for travels on the same change type, marked
+// needs_finalizer; see dispatchChangeFinalizesOnly for how the two are told
+// apart.
 func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, error) {
 	parser, err := c.statementParser()
 	if err != nil {
@@ -2306,6 +2315,12 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 		}
 		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
 			nsData := ensure(ch.Namespace)
+			if ch.Metadata[engine.MetadataNeedsFinalizer] == "true" {
+				nsData.Finalize = true
+			}
+			if dispatchChangeFinalizesOnly(ch) {
+				continue
+			}
 			vschemaChangedNamespaces[c.planNamespace(ch.Namespace)] = true
 			// The dispatch carries the namespace's persisted VSchema
 			// change-metadata on its VSchema change; merge it key by key
@@ -2346,6 +2361,18 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 	}
 
 	return namespaces, nil
+}
+
+// dispatchChangeFinalizesOnly reports whether a dispatched VSchema-typed change
+// asks only for the namespace's finalizer, with no VSchema document to apply:
+// it is marked needs_finalizer and does not say its VSchema changed. Every
+// other VSchema-typed change is a VSchema change, including one carrying no
+// metadata at all, which is how a dispatch built before the finalizer marker
+// existed says it — so that dispatch still fails closed when its vschema.json
+// is missing.
+func dispatchChangeFinalizesOnly(ch *ternv1.TableChange) bool {
+	return ch.Metadata[engine.MetadataNeedsFinalizer] == "true" &&
+		ch.Metadata[storage.PlanMetadataVSchemaChanged] != "true"
 }
 
 // materializedTableChangeOperation recovers the storage operation for a

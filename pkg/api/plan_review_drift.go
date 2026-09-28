@@ -131,6 +131,12 @@ func driftDiffLogAttrs(diff tern.ChangeSetDiff) []any {
 	if ns := capDriftList(diff.UnexpectedVSchema); len(ns) > 0 {
 		attrs = append(attrs, "diff_unexpected_vschema", ns)
 	}
+	if ns := capDriftList(diff.MissingFinalize); len(ns) > 0 {
+		attrs = append(attrs, "diff_missing_finalize", ns)
+	}
+	if ns := capDriftList(diff.UnexpectedFinalize); len(ns) > 0 {
+		attrs = append(attrs, "diff_unexpected_finalize", ns)
+	}
 	return attrs
 }
 

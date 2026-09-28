@@ -55,3 +55,22 @@ func TestWritePlanBody_CountsWhatADivergentShardAdds(t *testing.T) {
 	assert.Contains(t, out, "📋 Plan: 1 table to create, 1 table to alter", "%s", out)
 	assert.Contains(t, out, "ADD COLUMN email", "the divergent shard's statement is shown, so it is counted")
 }
+
+// A plan whose only work is a finalize the engine asked for is not a clean
+// plan: the CLI names the keyspace, says the finalize runs after its DDL, and
+// counts it in the summary instead of reporting no schema changes.
+func TestWritePlanBody_FinalizeOnlyPlanIsNotClean(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Database: "commerce",
+		Engine:   "strata",
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "payments", Metadata: map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"}},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.NotContains(t, out, "No schema changes detected", "%s", out)
+	assert.Contains(t, out, "payments", "%s", out)
+	assert.Contains(t, out, "~ Finalized by the engine once every shard's DDL has landed", "%s", out)
+	assert.Contains(t, out, "1 keyspace to finalize", "%s", out)
+}

@@ -286,6 +286,11 @@ type KeyspaceChangeData struct {
 	VSchemaChanged bool
 	VSchemaDiff    string
 
+	// Finalize marks a keyspace the engine asked to finalize after its DDL
+	// without a VSchema document to apply. The finalize is work the apply
+	// runs, so it counts as a change like a VSchema update does.
+	Finalize bool
+
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
 	// the single Statements block — so a keyspace whose shards diverge is shown
@@ -341,8 +346,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	writeDeploymentDrift(&sb, data.DeploymentDrift)
 
 	// Count changes
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	// No changes — short-circuit with a single clean message. The
 	// ignore_namespaces disclosure still renders: a no-changes result is
@@ -430,7 +435,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	}
 
 	// Summary and options (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 	writeOptions(&sb, data)
 
 	// Footer
@@ -582,11 +587,27 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
-func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithVSchema int) {
+// countChanges counts a plan's DDL statements and its keyspace-level updates:
+// each keyspace whose VSchema changes or that the engine asks to finalize.
+func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspaceUpdates int) {
 	for _, ks := range changes {
 		totalStatements += keyspaceStatementCount(ks)
-		if ks.VSchemaChanged {
-			keyspacesWithVSchema++
+		if ks.VSchemaChanged || ks.Finalize {
+			keyspaceUpdates++
+		}
+	}
+	return
+}
+
+// countKeyspaceUpdates splits countChanges' keyspace-level updates into the
+// VSchema updates and the finalize-only keyspaces, for the summary labels.
+func countKeyspaceUpdates(changes []KeyspaceChangeData) (vschemaUpdates, finalizes int) {
+	for _, ks := range changes {
+		switch {
+		case ks.VSchemaChanged:
+			vschemaUpdates++
+		case ks.Finalize:
+			finalizes++
 		}
 	}
 	return
@@ -622,8 +643,8 @@ func keyspaceStatements(ks KeyspaceChangeData) []string {
 	return statements
 }
 
-func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithVSchema int) {
-	totalChanges := totalStatements + keyspacesWithVSchema
+func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspaceUpdates int) {
+	totalChanges := totalStatements + keyspaceUpdates
 	if totalChanges == 0 {
 		writeNoChangesDetected(sb, data)
 		sb.WriteString("\n")
@@ -633,8 +654,12 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	parts := ui.PlanSummaryParts(countStatementTypes(data.Changes, data.DatabaseType), totalStatements, true)
-	if keyspacesWithVSchema > 0 && !data.IsMySQL {
-		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
+	vschemaUpdates, finalizes := countKeyspaceUpdates(data.Changes)
+	if vschemaUpdates > 0 && !data.IsMySQL {
+		parts = append(parts, fmt.Sprintf("**%d** vschema %s", vschemaUpdates, pluralize("update", vschemaUpdates)))
+	}
+	if finalizes > 0 {
+		parts = append(parts, fmt.Sprintf("**%d** %s to finalize", finalizes, pluralize("keyspace", finalizes)))
 	}
 
 	if len(parts) > 0 {
@@ -856,7 +881,7 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 // summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
 	counts := countStatementTypes(data.Changes, data.DatabaseType)
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
 
 	parts := ui.AssemblePlanSummary(counts, totalStatements,
 		func(count int, noun, op string) string {
@@ -874,14 +899,20 @@ func SummarizeChanges(data PlanCommentData) string {
 		})
 	ddlSummary := strings.Join(parts, ", ")
 
-	if keyspacesWithVSchema > 0 && !data.IsMySQL {
-		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))
-		if ddlSummary == "" {
-			return vschemaSummary
-		}
-		return ddlSummary + " · " + vschemaSummary
+	summaries := []string{}
+	if ddlSummary != "" {
+		summaries = append(summaries, ddlSummary)
 	}
-	return ddlSummary
+	if keyspaceUpdates > 0 {
+		vschemaUpdates, finalizes := countKeyspaceUpdates(data.Changes)
+		if vschemaUpdates > 0 && !data.IsMySQL {
+			summaries = append(summaries, fmt.Sprintf("%d vschema %s", vschemaUpdates, pluralize("update", vschemaUpdates)))
+		}
+		if finalizes > 0 {
+			summaries = append(summaries, fmt.Sprintf("%d %s to finalize", finalizes, pluralize("keyspace", finalizes)))
+		}
+	}
+	return strings.Join(summaries, " · ")
 }
 
 // countStatementTypes counts CREATE, ALTER, DROP, and other statements across all
@@ -957,7 +988,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
 		hasDDLChanges := len(ks.Statements) > 0 || len(ks.Shards) > 0
-		if !hasDDLChanges && !hasVSchemaChanges {
+		if !hasDDLChanges && !hasVSchemaChanges && !ks.Finalize {
 			continue
 		}
 
@@ -978,6 +1009,10 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			}
 		}
 
+		if ks.Finalize && !hasVSchemaChanges {
+			sb.WriteString(keyspaceFinalizeNote)
+		}
+
 		if hasDDLChanges {
 			if len(ks.Shards) > 0 {
 				writeShardedPlanDDL(sb, ks.Shards, dialect, budget)
@@ -987,6 +1022,11 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 		}
 	}
 }
+
+// keyspaceFinalizeNote is the plan comment's line for a keyspace the engine
+// asked to finalize without a VSchema document to apply. What finalizing does
+// is the engine's; the comment only says that it runs and when.
+const keyspaceFinalizeNote = "_Finalized by the engine once every shard's DDL has landed._\n\n"
 
 // countPlanDDLBlocks counts the DDL sections writeKeyspaceChanges renders for
 // changes — one per unsharded keyspace with statements and one per group of
@@ -1887,8 +1927,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// environment's reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(sb, plan.DeploymentDrift)
 
-	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(plan.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	// The ignore_namespaces disclosure renders under each environment's
 	// summary (writePlanSummary) or no-changes message, because entries can
@@ -1956,7 +1996,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	}
 
 	// Summary (after DDL, matching CLI layout)
-	writePlanSummary(sb, *plan, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(sb, *plan, totalStatements, keyspaceUpdates)
 }
 
 // writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
@@ -2182,7 +2222,7 @@ func capitalizeEnvNames(envs []string) string {
 // hasChanges returns true if there are any schema changes.
 func hasChanges(changes []KeyspaceChangeData) bool {
 	for _, ks := range changes {
-		if len(ks.Statements) > 0 || ks.VSchemaChanged {
+		if len(ks.Statements) > 0 || ks.VSchemaChanged || ks.Finalize {
 			return true
 		}
 	}
