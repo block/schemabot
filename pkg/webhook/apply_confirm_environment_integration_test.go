@@ -127,10 +127,9 @@ func TestE2EApplyConfirmRejectsPendingConfirmationForOtherEnvironment(t *testing
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply-confirm")
-		assert.Contains(t, body, "planned for `staging`, not `production`")
-		assert.Contains(t, body, "Nothing was applied")
-		assert.Contains(t, body, "`schemabot apply-confirm -e staging -d "+dbName+" --defer-cutover`")
-		assert.Contains(t, body, "`schemabot apply -e production -d "+dbName+" --defer-cutover`")
+		assert.Contains(t, body, "The pending confirmation is for `staging`, not `production`; nothing was applied.")
+		assert.Contains(t, body, "Run `schemabot apply-confirm -e staging -d "+dbName+" --defer-cutover` to confirm that plan.")
+		assert.Contains(t, body, "`schemabot apply -e production -d "+dbName+" --defer-cutover` drops it and plans and applies that environment in one step, subject to the environment ordering gate, pausing for `apply-confirm` only if its plan needs it.")
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for environment mismatch rejection")
