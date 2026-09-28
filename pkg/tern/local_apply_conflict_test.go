@@ -72,7 +72,7 @@ func TestConflictCheckPreservesStoppedTask(t *testing.T) {
 	}
 	client := newNoActiveChangeClient("testdb", []*storage.Task{stopped})
 
-	resolved := client.tryResolveStaleTask(t.Context(), stopped, unleasedRunningApply("testdb"), "testdb")
+	resolved := client.tryResolveStaleTask(t.Context(), stopped, unleasedRunningApply("testdb"), "testdb", newConflictScanMemo())
 	assert.False(t, resolved, "stopped task must not be resolved as stale")
 	assert.Equal(t, state.Task.Stopped, stopped.State, "stopped task must remain resumable")
 	assert.Empty(t, stopped.ErrorMessage, "no abandoned-task error should be written to a stopped task")
@@ -101,7 +101,7 @@ func TestConflictCheckPreservesRetryableTask(t *testing.T) {
 	}
 	client := newNoActiveChangeClient("testdb", []*storage.Task{retryable})
 
-	resolved := client.tryResolveStaleTask(t.Context(), retryable, unleasedRunningApply("testdb"), "testdb")
+	resolved := client.tryResolveStaleTask(t.Context(), retryable, unleasedRunningApply("testdb"), "testdb", newConflictScanMemo())
 	assert.False(t, resolved, "retryable task must not be resolved as stale")
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State, "retryable task must remain retryable")
 	assert.Equal(t, "engine connection reset", retryable.ErrorMessage, "original retry error must be preserved")
@@ -144,7 +144,7 @@ func TestConflictCheckHandlesProgressError(t *testing.T) {
 	}
 
 	require.NotPanics(t, func() {
-		resolved := client.tryResolveStaleTask(t.Context(), running, unleasedRunningApply("testdb"), "testdb")
+		resolved := client.tryResolveStaleTask(t.Context(), running, unleasedRunningApply("testdb"), "testdb", newConflictScanMemo())
 		assert.False(t, resolved, "task must not be resolved when the engine progress call errors")
 	})
 	assert.Equal(t, state.Task.Running, running.State, "task state must be left untouched on progress error")
@@ -171,14 +171,36 @@ func TestConflictCheckFailsAbandonedInFlightTask(t *testing.T) {
 				State:          inFlightState,
 			}
 			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+			apply := staleLeaseApply(1, storage.LeaseOwnerProcess()+"/driver-0")
 
-			resolved := client.tryResolveStaleTask(t.Context(), running, unleasedRunningApply("testdb"), "testdb")
+			resolved := client.tryResolveStaleTask(t.Context(), running, apply, "testdb", newConflictScanMemo())
 			assert.True(t, resolved, "abandoned in-flight task must be resolved")
 			assert.Equal(t, state.Task.Failed, running.State, "abandoned in-flight task must be failed")
 			assert.Contains(t, running.ErrorMessage, "server may have crashed")
 			assert.NotNil(t, running.CompletedAt)
 		})
 	}
+}
+
+// An in-flight task under an operation lease has no owner on its parent apply.
+// This process's idle engine cannot distinguish that live work from abandoned
+// work, so the task remains blocking for its driver or the elected reaper.
+func TestConflictCheckRefusesUnattributedNoActiveReport(t *testing.T) {
+	running := &storage.Task{
+		ID: 4, ApplyID: 41, TaskIdentifier: "task-operation-driven", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, TableName: "events", State: state.Task.Running,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+	apply := staleLeaseApply(41, "")
+	client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: apply}
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+	require.Error(t, err, "unattributed in-flight work must keep blocking")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.Running, running.State)
+	assert.Empty(t, running.ErrorMessage)
+	assert.Nil(t, running.CompletedAt)
 }
 
 // A sharded apply is dispatched one shard at a time, and different shards are
@@ -507,6 +529,47 @@ func TestConflictCheckStampsOwnProcessTerminalReport(t *testing.T) {
 	assert.NotNil(t, running.CompletedAt)
 }
 
+// A terminal report that names its tables settles a task only when the task's
+// table is among them. This process can have run a later schema change on the
+// same database under its own lease, so an own-process terminal report for a
+// different table is that later run's outcome and leaves the task blocking; the
+// same report naming the task's table settles it.
+func TestConflictCheckOwnProcessTerminalReportMustNameTaskTable(t *testing.T) {
+	for name, tc := range map[string]struct {
+		reported string
+		settles  bool
+	}{
+		"other table":  {reported: "orders", settles: false},
+		"task's table": {reported: "users", settles: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			running := &storage.Task{
+				ID: 14, ApplyID: 141, TaskIdentifier: "task-own-lease", Database: "testdb",
+				DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Running,
+			}
+			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+			client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: staleLeaseApply(141, storage.LeaseOwnerProcess()+"/driver-0")}
+			client.spiritEngine = &fakeControlEngine{progressResult: &engine.ProgressResult{
+				State: engine.StateCompleted, Message: "Complete",
+				Tables: []engine.TableProgress{{Table: tc.reported, State: "complete", Progress: 100}},
+			}}
+
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+			if !tc.settles {
+				require.Error(t, err, "a terminal report for another table must not settle the task")
+				assert.Contains(t, err.Error(), "schema change already in progress")
+				assert.Equal(t, state.Task.Running, running.State)
+				assert.Nil(t, running.CompletedAt)
+				return
+			}
+			require.NoError(t, err, "a terminal report naming the task's table settles it")
+			assert.Equal(t, state.Task.Completed, running.State)
+			assert.NotNil(t, running.CompletedAt)
+		})
+	}
+}
+
 // retainedTerminalReports are the outcomes the engine keeps reporting for the
 // last schema change it ran on a database after that work has ended.
 var retainedTerminalReports = map[string]*engine.ProgressResult{
@@ -562,13 +625,23 @@ func TestConflictCheckKeepsQueuedTaskPendingUnderAnEarlierRunsOutcome(t *testing
 }
 
 // Even under a lease this process last held, a task that is not in flight has
-// no engine work a terminal report could be the outcome of. A pending task
-// stays pending, and a retryable task keeps its retry rather than being failed
-// permanently, whichever outcome the engine retained.
+// no engine work a terminal report could be the outcome of. Pending, stopped,
+// and retryable tasks remain untouched rather than being settled from whichever
+// outcome the engine retained.
 func TestConflictCheckLeavesTaskNotInFlightUnderOwnProcessTerminalReport(t *testing.T) {
-	for _, taskState := range []string{state.Task.Pending, state.Task.FailedRetryable} {
-		for name, report := range retainedTerminalReports {
-			t.Run(taskState+"/"+name, func(t *testing.T) {
+	testCases := map[string]struct {
+		taskState string
+		reports   map[string]*engine.ProgressResult
+	}{
+		"pending":          {taskState: state.Task.Pending, reports: retainedTerminalReports},
+		"failed_retryable": {taskState: state.Task.FailedRetryable, reports: retainedTerminalReports},
+		"stopped": {taskState: state.Task.Stopped, reports: map[string]*engine.ProgressResult{
+			"stopped": {State: engine.StateStopped, Message: "Stopped"},
+		}},
+	}
+	for stateName, testCase := range testCases {
+		for reportName, report := range testCase.reports {
+			t.Run(stateName+"/"+reportName, func(t *testing.T) {
 				task := &storage.Task{
 					ID:             16,
 					ApplyID:        161,
@@ -576,7 +649,7 @@ func TestConflictCheckLeavesTaskNotInFlightUnderOwnProcessTerminalReport(t *test
 					Database:       "testdb",
 					DatabaseType:   storage.DatabaseTypeMySQL,
 					TableName:      "users",
-					State:          taskState,
+					State:          testCase.taskState,
 				}
 				client := newNoActiveChangeClient("testdb", []*storage.Task{task})
 				client.storage.(*exactProgressStorage).applies = &mockApplyStore{
@@ -588,7 +661,7 @@ func TestConflictCheckLeavesTaskNotInFlightUnderOwnProcessTerminalReport(t *test
 				blocking, _ := client.findBlockingTask(t.Context(), []*storage.Task{task}, plan, "", "", 0, newConflictScanMemo())
 				require.True(t, blocking.blocks(), "a task that is not in flight must keep blocking")
 				assert.Equal(t, "task-not-in-flight", blocking.taskIdentifier)
-				assert.Equal(t, taskState, task.State, "the task must be left in its own state")
+				assert.Equal(t, testCase.taskState, task.State, "the task must be left in its own state")
 				assert.Nil(t, task.CompletedAt)
 			})
 		}
@@ -669,6 +742,9 @@ func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
 		State:          state.Task.Running,
 	}
 	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+	client.storage.(*exactProgressStorage).applies = &mockApplyStore{
+		apply: staleLeaseApply(1, storage.LeaseOwnerProcess()+"/driver-0"),
+	}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
 	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
