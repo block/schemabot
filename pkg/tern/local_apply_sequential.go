@@ -134,13 +134,18 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 	// The apply stays active for a later drive to re-read the task and run it.
 	freshTask, err := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 	if err != nil {
+		if ctx.Err() != nil {
+			logger.Info("drive context cancelled before task start; handing the apply back for another driver to claim",
+				"task_id", task.TaskIdentifier, "table", task.TableName)
+			return taskHandover
+		}
 		logger.Error("re-reading task state before start failed; current apply owner will exit for operator retry",
-			append(task.LogAttrs(), "error", err)...)
+			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
 		return taskAbort
 	}
 	if freshTask == nil {
 		logger.Error("task row not found when re-reading it before start; current apply owner will exit for operator retry",
-			task.LogAttrs()...)
+			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State)
 		return taskAbort
 	}
 	if freshTask.State == state.Task.Stopped {

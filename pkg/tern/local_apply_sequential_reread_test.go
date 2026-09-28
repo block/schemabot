@@ -14,6 +14,16 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+func countLogKey(keys []string, want string) int {
+	var count int
+	for _, key := range keys {
+		if key == want {
+			count++
+		}
+	}
+	return count
+}
+
 // rereadFailingTaskStore answers every task read from the seeded rows except
 // the re-read of one task, which either errors or finds no row. It models a
 // storage blip, or a missing row, landing on exactly the read a sequential
@@ -53,6 +63,7 @@ func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
 	for name, getErr := range rereadFailureCases {
 		t.Run(name, func(t *testing.T) {
 			task := &storage.Task{TaskIdentifier: "task-1", TableName: "users", State: state.Task.Pending}
+			apply := driveLoggerTestApply(state.Apply.Running)
 			var records []capturedLog
 			client := &LocalClient{
 				storage: &exactProgressStorage{tasks: &rereadFailingTaskStore{
@@ -63,7 +74,8 @@ func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
 				logger: slog.New(captureHandler{records: &records}),
 			}
 
-			action := client.checkTaskReady(t.Context(), client.logger, task)
+			logger := client.logger.With(apply.IdentityLogAttrs()...)
+			action := client.checkTaskReady(t.Context(), logger, task)
 
 			assert.Equal(t, taskAbort, action, "an unanswered re-read ends the drive attempt instead of skipping the task")
 			line := requireCapturedLog(t, records, messages[name])
@@ -71,6 +83,10 @@ func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
 			assert.Equal(t, "task-1", line.attrs["task_id"])
 			assert.Equal(t, "users", line.attrs["table"])
 			assert.Equal(t, state.Task.Pending, line.attrs["state"])
+			assertLogCarriesApplyIdentity(t, line)
+			for _, key := range []string{"apply_id", "database", "database_type", "environment", "repo", "pr"} {
+				assert.Equal(t, 1, countLogKey(line.keys, key), "identity attribute %q must be emitted once", key)
+			}
 			if getErr != nil {
 				assert.Equal(t, getErr, line.attrs["error"])
 			} else {
@@ -78,6 +94,43 @@ func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
 			}
 		})
 	}
+}
+
+type cancellingTaskStore struct {
+	*exactProgressTaskStore
+	cancel context.CancelFunc
+}
+
+func (s *cancellingTaskStore) Get(ctx context.Context, _ string) (*storage.Task, error) {
+	s.cancel()
+	return nil, ctx.Err()
+}
+
+// Cancellation while the task re-read is in flight hands the active apply to
+// another driver without reporting the expected ownership handover as a
+// storage failure.
+func TestCheckTaskReady_CancelledDuringRereadHandsOver(t *testing.T) {
+	task := &storage.Task{TaskIdentifier: "task-1", TableName: "users", State: state.Task.Pending}
+	ctx, cancel := context.WithCancel(t.Context())
+	var records []capturedLog
+	client := &LocalClient{
+		storage: &exactProgressStorage{tasks: &cancellingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			cancel:                 cancel,
+		}},
+		logger: slog.New(captureHandler{records: &records}),
+	}
+	apply := driveLoggerTestApply(state.Apply.Running)
+	logger := client.logger.With(apply.IdentityLogAttrs()...)
+
+	action := client.checkTaskReady(ctx, logger, task)
+
+	assert.Equal(t, taskHandover, action)
+	line := requireCapturedLog(t, records, "drive context cancelled before task start; handing the apply back for another driver to claim")
+	assert.Equal(t, slog.LevelInfo, line.level)
+	assertLogCarriesApplyIdentity(t, line)
+	assert.Equal(t, "task-1", line.attrs["task_id"])
+	assert.Equal(t, "users", line.attrs["table"])
 }
 
 // A two-table sequential apply whose first table completes and whose second
