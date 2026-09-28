@@ -23,11 +23,17 @@ import (
 // Reasons are stable for metrics and mirror the PR-door
 // ActorAuthorizationResult vocabulary.
 const (
-	DirectWriteReasonAdminAllow            = "admin_allow"
-	DirectWriteReasonScopedAllow           = "scoped_allow"
-	DirectWriteReasonScopedLaneDisabled    = "scoped_lane_disabled"
-	DirectWriteReasonTargetUnresolved      = "target_unresolved"
-	DirectWriteReasonMissingIdentity       = "missing_identity"
+	DirectWriteReasonAdminAllow         = "admin_allow"
+	DirectWriteReasonScopedAllow        = "scoped_allow"
+	DirectWriteReasonScopedLaneDisabled = "scoped_lane_disabled"
+	DirectWriteReasonTargetUnresolved   = "target_unresolved"
+	DirectWriteReasonMissingIdentity    = "missing_identity"
+	// DirectWriteReasonUnverifiedIdentity is an attribution outcome, not an
+	// authorization one: the caller is authenticated and the write is allowed,
+	// but the identity came from a lane the server did not verify, so no
+	// acquirer is recorded. It is logged by the handler and never reaches the
+	// authorization decision metric.
+	DirectWriteReasonUnverifiedIdentity    = "unverified_identity"
 	DirectWriteReasonNotAdmin              = "not_admin"
 	DirectWriteReasonNotDatabaseOperator   = "not_database_operator"
 	DirectWriteReasonEnvironmentNotAllowed = "environment_not_allowed"
