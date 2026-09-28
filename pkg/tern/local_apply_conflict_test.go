@@ -747,6 +747,63 @@ func TestConflictCheckLogsEachOwnershipRefusalOncePerScan(t *testing.T) {
 	assert.Equal(t, state.Task.Running, running.State, "the task is left for its driver")
 }
 
+// Every reason the conflict check can refuse to settle a task from engine
+// memory is counted once per scan under its own reason label. The label is
+// what an operator groups the counter by, so each reason is pinned by name
+// against the scenario that produces it: an apply with no lease holder and no
+// active report, a report from this process that names a different table, and
+// a terminal report from a lease held by another process.
+func TestConflictCheckCountsEachOwnershipRefusalReasonOncePerScan(t *testing.T) {
+	thisProcess := storage.LeaseOwnerProcess() + "/driver-0"
+	tests := []struct {
+		name       string
+		leaseOwner string
+		report     *engine.ProgressResult
+		reason     string
+	}{
+		{
+			name:       "no lease holder and no active report",
+			leaseOwner: "",
+			report:     &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"},
+			reason:     "unattributed_no_active_report",
+		},
+		{
+			name:       "report from this process names another table",
+			leaseOwner: thisProcess,
+			report:     &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete", Tables: []engine.TableProgress{{Table: "orders"}}},
+			reason:     "terminal_report_other_table",
+		},
+		{
+			name:       "terminal report under a lease held by another process",
+			leaseOwner: "other-pod/12345/driver-0",
+			report:     &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete"},
+			reason:     "foreign_terminal_report",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			running := &storage.Task{
+				ID: 19, ApplyID: 191, TaskIdentifier: "task-refused", Database: "testdb",
+				DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Running,
+			}
+			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+			client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: staleLeaseApply(191, tc.leaseOwner)}
+			client.spiritEngine = &fakeControlEngine{progressResult: tc.report}
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+			require.Error(t, err, "the refused task keeps blocking through every attempt")
+			points := collectCounterPoints(t, reader, "schemabot.conflict_check.ownership_blocks_total")
+			require.Len(t, points, 1, "one refusal is counted under one reason")
+			assert.Equal(t, int64(1), points[0].Value, "the counter records the refusal once per scan, not once per retry attempt")
+			assert.Equal(t, tc.reason, counterAttr(t, points[0], "reason"))
+			assert.Equal(t, state.Task.Running, running.State, "the task is left for its driver")
+		})
+	}
+}
+
 // Crash recovery survives ownership gating: when the stale lease belongs to a
 // process that crashed (a restarted process has a new pid, so even the same pod
 // counts as another process) and the engine has no active work, the abandoned
