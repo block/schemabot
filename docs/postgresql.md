@@ -600,6 +600,12 @@ it commits or fails, and recovery re-plans against the live target before
 further work. A privilege refusal is a permanent failed task, includes the
 required provisioning advice, and leaves the target unchanged.
 
+A namespace containing an RLS table cannot capture a complete rollback baseline,
+including for changes to other tables in that namespace. Forward structural
+plans can still proceed, but rollback is refused under
+[RV-7](invariants.md#rv-7-rollback-needs-the-originals). Access rules are not
+stripped from the baseline to claim rollback support.
+
 ## Configuration and credentials
 
 Select PostgreSQL in the repository's `schemabot.yaml`:
