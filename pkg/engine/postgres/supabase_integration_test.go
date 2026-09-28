@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -219,10 +220,15 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 			// readiness again on TCP. Docker's port proxy accepts a TCP
 			// handshake before anything listens inside the container, so a
 			// port wait can pass during the restart and the first connection
-			// is reset. Wait for the final server's own readiness line.
-			WaitingFor: wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(supabaseOperationDeadline),
+			// is reset. Wait for the final server's own readiness line, then
+			// for authenticated SQL over TCP, so the fixture connects only to
+			// a server that is both the final one and accepting the test role.
+			WaitingFor: wait.ForAll(
+				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+				wait.ForSQL("5432/tcp", "pgx", func(host string, port network.Port) string {
+					return supabaseFixtureDSN(host, port.Port())
+				}),
+			).WithDeadline(supabaseOperationDeadline),
 		},
 		Started: true,
 	})
@@ -236,8 +242,7 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, err)
 	port, err := container.MappedPort(ctx, "5432/tcp")
 	require.NoError(t, err)
-	dsn := (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
-		Host: net.JoinHostPort(host, port.Port()), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
+	dsn := supabaseFixtureDSN(host, port.Port())
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
@@ -246,4 +251,10 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&superuser))
 	require.False(t, superuser, "the fixture must exercise Supabase's restricted postgres role")
 	return dsn, db
+}
+
+// Use one connection definition for readiness and the test session.
+func supabaseFixtureDSN(host, port string) string {
+	return (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
+		Host: net.JoinHostPort(host, port), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
 }
