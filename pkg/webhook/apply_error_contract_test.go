@@ -255,7 +255,8 @@ func TestApplyConfirmCommandCoreMissingPlanIsTerminalAndKeepsPendingLock(t *test
 	assert.Empty(t, locks.releasedIfPending, "the unverifiable pending intent must stay pinned")
 	body := requireComment(t, comments, "unverifiable-plan apply-confirm comment")
 	assert.Contains(t, body, "could not verify which environment")
-	assert.Contains(t, body, "pending confirmation is preserved")
+	assert.Contains(t, body, "nothing was applied")
+	assert.Contains(t, body, "Run `schemabot apply -e staging` to replace that confirmation with a fresh plan")
 }
 
 // The rejection posted for a pending confirmation with no loadable plan carries
@@ -273,7 +274,7 @@ func TestApplyConfirmCommandCoreMissingPlanRecoveryCommandKeepsOperatorFlags(t *
 	require.NoError(t, err)
 	assert.False(t, retry)
 	body := requireComment(t, comments, "unverifiable-plan apply-confirm comment")
-	assert.Contains(t, body, "Run `schemabot apply -e staging -d orders --tenant acme --defer-cutover` to plan and apply this environment again in one step")
+	assert.Contains(t, body, "Run `schemabot apply -e staging -d orders --tenant acme --defer-cutover` to replace that confirmation with a fresh plan and apply it in one step; that apply is subject to the environment ordering gate and pauses for `apply-confirm` only if its plan needs it.")
 }
 
 // A prior environment with pending changes blocks the confirm as a terminal

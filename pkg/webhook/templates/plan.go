@@ -2086,10 +2086,16 @@ func appendDatabaseFlag(command, database string) string {
 
 // MsgConfirmationPlanForOtherEnvironment rejects an apply-confirm whose -e
 // names a different environment than the pending confirmation was planned for.
-// The apply command it offers plans and applies the requested environment in
-// one step and pauses for apply-confirm only when that plan needs one, so the
-// message says so instead of promising a second confirmation.
-const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation on this pull request was planned for `%s`, not `%s`. Nothing was applied, and the pending confirmation is preserved. Run `%s` to confirm that plan, or `%s` to plan and apply this environment in one step; it pauses for `apply-confirm` only when its plan needs one."
+// The confirm command it offers keeps the pending confirmation. The apply
+// command it offers for the requested environment does not: it answers to the
+// environment ordering gate like any apply, and once through it releases this
+// pull request's lock, so the pinned plan is gone and the requested
+// environment is planned and applied in one step, pausing for apply-confirm
+// only when the new plan needs one. The message states both consequences so
+// an operator who reads only the comment knows what each command costs. It is
+// rendered through the generic error comment, whose clamp bounds it, so the
+// wording stays short enough to survive the longest scoped commands intact.
+const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation is for `%s`, not `%s`; nothing was applied. Run `%s` to confirm that plan. `%s` drops it and plans and applies that environment in one step, subject to the environment ordering gate, pausing for `apply-confirm` only if its plan needs it."
 
 // RenderConfirmationPlanForOtherEnvironment builds runnable recovery commands
 // with the same database scope, tenant, and option flags as the rejected
@@ -2103,9 +2109,13 @@ func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnviron
 // MsgConfirmationPlanUnavailable rejects an apply-confirm whose pending
 // confirmation pins no plan SchemaBot can load, so nothing attests which
 // environment the operator reviewed. The verb takes the runnable apply command
-// that plans and applies the requested environment again in one step; that
-// apply pauses for apply-confirm only when its new plan needs one.
-const MsgConfirmationPlanUnavailable = "The pending confirmation on this pull request is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed. Nothing was applied, and the pending confirmation is preserved. Run `%s` to plan and apply this environment again in one step; the new plan replaces the one that could not be loaded, and the apply pauses for `apply-confirm` only when that plan needs it."
+// for the requested environment. That command answers to the environment
+// ordering gate like any apply; once through, it releases this pull request's
+// lock, replacing the unloadable pinned plan with a fresh one that is applied
+// in the same step, pausing for apply-confirm only when the new plan needs one.
+// Like the other-environment refusal, it is bounded by the generic error
+// comment's clamp, so the wording stays short.
+const MsgConfirmationPlanUnavailable = "The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied. Run `%s` to replace that confirmation with a fresh plan and apply it in one step; that apply is subject to the environment ordering gate and pauses for `apply-confirm` only if its plan needs it."
 
 // RenderConfirmationPlanUnavailable builds the missing-plan rejection with a
 // recovery command carrying the same database scope, tenant, and option flags

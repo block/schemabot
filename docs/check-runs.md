@@ -913,8 +913,12 @@ fails, it also publishes a failing aggregate check.
 ### Apply requested
 
 `schemabot apply -e <environment>` re-plans before acquiring a lock. If changes
-exist and pass safety checks, SchemaBot acquires a lock, posts a confirmation
-comment, stores `action_required`, and updates the aggregate.
+exist and pass safety checks, SchemaBot acquires a lock, posts the plan
+comment, stores `action_required`, updates the aggregate, and submits the apply
+in the same step. It pauses for `apply-confirm` instead, keeping the lock
+pinned to that plan, when the plan contains direct-execution changes, when
+applying would discard an unfinished copy, or when the plan it just stored
+cannot be read back for the drift check.
 
 If the apply command finds no changes, SchemaBot plans the environment's other
 rollout members before answering. When none of them has work either, it posts a
@@ -935,13 +939,16 @@ The pinned plan is the only record of which environment the operator reviewed,
 so the confirmation is refused when that record cannot vouch for the command:
 
 - If the lock pins no plan SchemaBot can load, nothing is applied and the
-  comment asks for a fresh `schemabot apply -e <environment>`, which pins a new
-  plan and applies it in one step, pausing for `apply-confirm` only when that
-  plan needs confirmation.
+  comment asks for a fresh `schemabot apply -e <environment>`. That command
+  replaces the unloadable pin with a new plan and applies it in one step,
+  pausing for `apply-confirm` only when that plan needs confirmation, and it
+  answers to the environment ordering gate like any apply.
 - If the pinned plan was made for a different environment than `-e` names,
   nothing is applied; the comment gives the `apply-confirm` command for the
-  planned environment and the `apply` command for the requested one, which
-  plans and applies that environment in one step the same way.
+  planned environment, which keeps the pinned plan, and says what the `apply`
+  command for the requested environment does instead: it drops the pinned
+  plan and plans and applies the requested environment in one step, subject
+  to the same ordering gate.
 - If a prior environment in the rollout order has pending changes again, the
   same block that stops `schemabot apply` stops the confirmation.
 

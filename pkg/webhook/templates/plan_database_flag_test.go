@@ -122,27 +122,57 @@ func TestLockedPlanCommentConfirmCommandCarriesApplyOptions(t *testing.T) {
 // confirmation was planned for is answered with two recovery commands, and
 // both keep the rejected command's database scope, tenant, and option flags:
 // the operator chose those, and apply-confirm reads them from the comment it
-// arrives in and nowhere else. An unscoped command is answered unscoped.
+// arrives in and nowhere else. An unscoped command is answered unscoped. The
+// apply command's consequences are pinned in full: it drops the pending
+// confirmation, plans and applies the requested environment in one step,
+// answers to the environment ordering gate, and pauses for apply-confirm only
+// when its plan needs one.
 func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *testing.T) {
+	const applyConsequences = " drops it and plans and applies that environment in one step, subject to the environment ordering gate, pausing for `apply-confirm` only if its plan needs it."
+
 	scoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "orders", ApplyCommandOptions{Tenant: "acme", DeferCutover: true})
-	assert.Contains(t, scoped, "planned for `staging`, not `production`")
-	assert.Contains(t, scoped, "Run `schemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover` to confirm that plan")
-	assert.Contains(t, scoped, "or `schemabot apply -e production -d orders --tenant acme --defer-cutover` to plan and apply this environment in one step")
+	assert.Contains(t, scoped, "The pending confirmation is for `staging`, not `production`; nothing was applied.")
+	assert.Contains(t, scoped, "Run `schemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover` to confirm that plan.")
+	assert.Contains(t, scoped, "`schemabot apply -e production -d orders --tenant acme --defer-cutover`"+applyConsequences)
 
 	unscoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "", ApplyCommandOptions{})
-	assert.Contains(t, unscoped, "Run `schemabot apply-confirm -e staging` to confirm that plan")
-	assert.Contains(t, unscoped, "or `schemabot apply -e production` to plan and apply this environment in one step")
+	assert.Contains(t, unscoped, "Run `schemabot apply-confirm -e staging` to confirm that plan.")
+	assert.Contains(t, unscoped, "`schemabot apply -e production`"+applyConsequences)
 }
 
 // The missing-plan rejection's recovery command carries the rejected command's
 // database scope, tenant, and option flags, so it can be pasted as-is on a PR
 // that manages several databases. An unscoped command is answered unscoped.
+// The command's consequences are pinned in full: it replaces the pending
+// confirmation with a fresh plan and applies it in one step, answers to the
+// environment ordering gate, and pauses for apply-confirm only when its plan
+// needs one.
 func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
+	const applyConsequences = " to replace that confirmation with a fresh plan and apply it in one step; that apply is subject to the environment ordering gate and pauses for `apply-confirm` only if its plan needs it."
+
 	scoped := RenderConfirmationPlanUnavailable("production", "orders", ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true})
-	assert.Contains(t, scoped, "Run `schemabot apply -e production -d orders --tenant acme --allow-unsafe` to plan and apply this environment again in one step")
+	assert.Contains(t, scoped, "Run `schemabot apply -e production -d orders --tenant acme --allow-unsafe`"+applyConsequences)
 
 	unscoped := RenderConfirmationPlanUnavailable("production", "", ApplyCommandOptions{})
-	assert.Contains(t, unscoped, "Run `schemabot apply -e production` to plan and apply this environment again in one step")
+	assert.Contains(t, unscoped, "Run `schemabot apply -e production`"+applyConsequences)
+}
+
+// Both confirmation refusals are posted through the generic error comment,
+// whose clamp cuts anything past its budget and appends a truncation marker.
+// The recovery guidance sits at the end of each message, so a message that
+// overflows loses exactly the part the operator needs. Every option flag set
+// at once produces the longest commands the messages can carry, and both
+// must still come out of the sanitizer unchanged.
+func TestConfirmationRefusalsFitTheCommentErrorClamp(t *testing.T) {
+	everyFlag := ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
+
+	otherEnvironment := RenderConfirmationPlanForOtherEnvironment("production", "production", "orders", everyFlag)
+	assert.LessOrEqual(t, len([]rune(otherEnvironment)), maxCommentErrorLen)
+	assert.Equal(t, otherEnvironment, sanitizeCommentError(otherEnvironment))
+
+	unavailable := RenderConfirmationPlanUnavailable("production", "orders", everyFlag)
+	assert.LessOrEqual(t, len([]rune(unavailable)), maxCommentErrorLen)
+	assert.Equal(t, unavailable, sanitizeCommentError(unavailable))
 }
 
 // A plan run without -e answers with one comment covering every environment,
