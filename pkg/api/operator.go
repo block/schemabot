@@ -634,6 +634,10 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 
 	s.logger.Debug("operator driver started", "driver", driverID)
 
+	if claimGateClosed(stop) {
+		s.logger.Debug("operator driver stopping before its first claim; claiming has stopped", "driver", driverID)
+		return
+	}
 	s.driveTick(ctx, driverID)
 
 	for {
@@ -645,11 +649,32 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 			s.logger.Debug("operator driver context cancelled", "driver", driverID)
 			return
 		case <-wake:
+			// select picks at random among ready cases, so a wake or tick
+			// queued before claiming stopped can still be chosen over stop.
+			if claimGateClosed(stop) {
+				s.logger.Debug("operator driver stopping instead of a woken claim; claiming has stopped", "driver", driverID)
+				return
+			}
 			s.logger.Debug("operator driver woke for queued apply", "driver", driverID)
 			s.driveTick(ctx, driverID)
 		case <-ticker.C:
+			if claimGateClosed(stop) {
+				s.logger.Debug("operator driver stopping instead of a polled claim; claiming has stopped", "driver", driverID)
+				return
+			}
 			s.driveTick(ctx, driverID)
 		}
+	}
+}
+
+// claimGateClosed reports, without blocking, whether StopClaiming has closed
+// the driver pool's claim gate.
+func claimGateClosed(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
 	}
 }
 
