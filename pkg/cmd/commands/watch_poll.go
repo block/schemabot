@@ -3,12 +3,13 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -62,13 +63,29 @@ func (p *progressPoller) next(onRetry func(progressRetry)) (*apitypes.ProgressRe
 			return nil, fmt.Errorf("fetch progress for apply %s: %w", p.applyID, err)
 		}
 		if failures >= maxConsecutiveProgressFailures {
-			return nil, fmt.Errorf("fetch progress for apply %s: %d consecutive attempts failed; the schema change continues on the server, resume watching with '%s progress %s': %w",
-				p.applyID, failures, cliname.Name(), p.applyID, err)
+			return nil, fmt.Errorf("fetch progress for apply %s: %d consecutive attempts failed; the schema change continues on the server; rerun the original watch command to resume: %w",
+				p.applyID, failures, err)
 		}
 		wait := progressRetryWait(err, failures)
 		onRetry(progressRetry{err: err, attempt: failures, wait: wait})
 		p.sleep(wait)
 	}
+}
+
+func isRetryableFetchError(err error) bool {
+	var connErr *client.ConnectionError
+	if errors.As(err, &connErr) {
+		return true
+	}
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode != "" {
+			return apitypes.IsRetryableErrorCode(apiErr.ErrorCode)
+		}
+		return apiErr.Status >= 500
+	}
+	var netErr net.Error
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr)
 }
 
 // progressRetryWait is the fetch-error backoff for this many consecutive

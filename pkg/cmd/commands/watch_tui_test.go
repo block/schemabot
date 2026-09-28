@@ -34,7 +34,7 @@ func TestFetchProgress_ServerReturns500_ReturnsError(t *testing.T) {
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Empty(t, pmsg.state, "fetchProgress should not set state on error")
 	assert.True(t, pmsg.failed, "should be a fetch error")
-	assert.False(t, pmsg.retryable, "5xx without error code should not be retryable")
+	assert.True(t, pmsg.retryable, "5xx without error code should be retryable")
 	assert.Contains(t, pmsg.errorMsg, "500")
 }
 
@@ -506,10 +506,10 @@ func TestFetchProgress_ErrorCodeClassification(t *testing.T) {
 			retryable: false,
 		},
 		{
-			name:      "no error_code treated as permanent",
+			name:      "server error without error_code is retryable",
 			status:    http.StatusInternalServerError,
 			body:      `{"error":"internal server error"}`,
-			retryable: false,
+			retryable: true,
 		},
 	}
 

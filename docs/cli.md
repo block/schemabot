@@ -862,7 +862,8 @@ non-zero when it failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. A watcher that cannot reach the
 server retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row. The apply keeps running on the server, and the
-error names the `progress` command that resumes watching it.
+error tells the operator to rerun the original watch command, preserving its
+output format and connection flags.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

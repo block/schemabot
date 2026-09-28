@@ -675,13 +675,8 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 
 		if state.IsState(curState, state.NoActiveChange) {
 			// The background poller may not have updated task states yet.
-			// Keep polling unless we've already seen a terminal state.
-			if !state.IsTerminalApplyState(lastGlobalState) {
-				poller.sleep(pollInterval)
-				continue
-			}
-			log.emit("msg", "No active schema change")
-			return nil
+			poller.sleep(pollInterval)
+			continue
 		}
 
 		tables := ddl.FilterInternalTablesTyped(result.Tables)
@@ -984,7 +979,7 @@ func (e *logEmitter) emitApplySummary(outcome string, tableStates map[string]*ta
 // isActiveStatus returns true if the table status represents an active (non-terminal) state.
 func isActiveStatus(status string) bool {
 	switch status {
-	case state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Reverted, state.Apply.RevertWindow:
+	case state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted, state.Apply.RevertWindow:
 		return false
 	default:
 		return true

@@ -3,6 +3,8 @@ package commands
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,7 +15,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -265,10 +266,29 @@ func TestProgressPoller_FailsAfterConsecutiveTransientFailures(t *testing.T) {
 	var connErr *client.ConnectionError
 	require.ErrorAs(t, err, &connErr)
 	assert.Contains(t, err.Error(), "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed")
-	assert.Contains(t, err.Error(), "the schema change continues on the server, resume watching with '"+cliname.Name()+" progress "+scriptedApplyID+"'")
+	assert.Contains(t, err.Error(), "the schema change continues on the server; rerun the original watch command to resume")
 	assert.Len(t, *waits, maxConsecutiveProgressFailures-1)
 	assert.Equal(t, maxConsecutiveProgressFailures-1, strings.Count(out, "Progress unavailable, retrying"))
 	assert.Contains(t, out, `attempt=1/10 retry_in=4s error="cannot connect to http://schemabot.test (is the server running?)"`)
+}
+
+func TestIsRetryableFetchError_TransportAndUnstructuredServerErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "server error without API code", err: &client.APIError{Status: http.StatusBadGateway, Message: "bad gateway"}},
+		{name: "response body interrupted", err: fmt.Errorf("read response: %w", io.ErrUnexpectedEOF)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.True(t, isRetryableFetchError(tc.err))
+		})
+	}
+}
+
+func TestIsActiveStatus_CancelledIsInactive(t *testing.T) {
+	assert.False(t, isActiveStatus(state.Apply.Cancelled))
 }
 
 // A permanent error, such as an apply ID the server does not know, ends the
