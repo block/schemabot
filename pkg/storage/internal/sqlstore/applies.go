@@ -1329,16 +1329,34 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 	return nil
 }
 
-// derivedStateUpdate renders the projection's compare-and-swap over applies
-// alone, with guardPredicate appended to the id-and-expected-state match. The
-// four SET placeholders bind newState, errorMessage, startedAt and completedAt.
-// started_at is stamped only when it is still NULL so the projection can move
-// the parent into an active state without ever rewinding a recorded start.
-func derivedStateUpdate(guardPredicate string) string {
-	return `
-		UPDATE applies
-		SET state = ?, error_message = ?, started_at = COALESCE(started_at, ?), completed_at = ?, updated_at = NOW()
-		WHERE id = ? AND state = ?` + guardPredicate
+// derivedStateUpdate renders the rollout projection's compare-and-swap over
+// applies for the store's dialect, with guardPredicate appended to the
+// id-and-expected-state match. The operation-lease guard joins the leased
+// operation row, so its statement goes through the dialect's joined-UPDATE
+// rendering; the other guards produce a portable single-table UPDATE. Both
+// shapes render one SET list and address applies through the "a" alias, so
+// guardPredicate qualifies apply columns with it. The four SET placeholders
+// bind newState, errorMessage, startedAt and completedAt ahead of the
+// predicate's. started_at is stamped only when it is still NULL so the
+// projection can move the parent into an active state without ever rewinding
+// a recorded start.
+func derivedStateUpdate(dialect Dialect, joinLeasedOperation bool, guardPredicate string) string {
+	assignments := []JoinedUpdateAssignment{
+		{Column: "state", Expr: "?"},
+		{Column: "error_message", Expr: "?"},
+		{Column: "started_at", Expr: "COALESCE(a.started_at, ?)"},
+		{Column: "completed_at", Expr: "?"},
+		{Column: "updated_at", Expr: "NOW()"},
+	}
+	predicate := "a.id = ? AND a.state = ?" + guardPredicate
+	if joinLeasedOperation {
+		return dialect.JoinedUpdate("applies", "a", "apply_operations", "ao", "ao.apply_id = a.id", assignments, predicate)
+	}
+	sets := make([]string, len(assignments))
+	for i, assignment := range assignments {
+		sets[i] = assignment.Column + " = " + assignment.Expr
+	}
+	return "UPDATE applies a SET " + strings.Join(sets, ", ") + " WHERE " + predicate
 }
 
 // derivedStateGuard is the lease authorization for a rollout-projection write.
@@ -1364,8 +1382,8 @@ type derivedStateGuard struct {
 // parent apply in the same transaction; a token check that did not lock the
 // operation row would read it from the projection's snapshot, wait out the
 // re-lease on the parent row, and pass against the token it had just replaced.
-// The joined statement writes the same columns as derivedStateUpdate, with
-// started_at qualified because apply_operations has a column of that name.
+// The join binds the leased operation to the apply being written, so an
+// operation that belongs to another apply cannot authorize the projection.
 func derivedStateGuardForContext(ctx context.Context, dialect Dialect, applyID int64) (derivedStateGuard, error) {
 	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
@@ -1375,17 +1393,7 @@ func derivedStateGuardForContext(ctx context.Context, dialect Dialect, applyID i
 			return derivedStateGuard{}, fmt.Errorf("operation lease for apply %d cannot write derived state for apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
 		}
 		return derivedStateGuard{
-			query: dialect.JoinedUpdate(
-				"applies", "a", "apply_operations", "ao", "ao.apply_id = a.id",
-				[]JoinedUpdateAssignment{
-					{Column: "state", Expr: "?"},
-					{Column: "error_message", Expr: "?"},
-					{Column: "started_at", Expr: "COALESCE(a.started_at, ?)"},
-					{Column: "completed_at", Expr: "?"},
-					{Column: "updated_at", Expr: "NOW()"},
-				},
-				"a.id = ? AND a.state = ? AND ao.id = ? AND "+dialect.LeaseTokenFence("apply_operations", "ao", "id", "lease_token"),
-			),
+			query:         derivedStateUpdate(dialect, true, " AND ao.id = ? AND "+dialect.LeaseTokenFence("apply_operations", "ao", "id", "lease_token")),
 			predicateArgs: []any{opLease.OperationID, opLease.Token},
 			ensureStillOwned: func(ctx context.Context, db queryRower) error {
 				return ensureOperationLeaseOwnsApply(ctx, db, opLease, applyID)
@@ -1399,7 +1407,7 @@ func derivedStateGuardForContext(ctx context.Context, dialect Dialect, applyID i
 	}
 	if hasLease {
 		return derivedStateGuard{
-			query:         derivedStateUpdate(" AND lease_token = ?"),
+			query:         derivedStateUpdate(dialect, false, " AND a.lease_token = ?"),
 			predicateArgs: []any{lease.Token},
 			ensureStillOwned: func(ctx context.Context, db queryRower) error {
 				return ensureApplyLeaseStillOwned(ctx, db, lease)
@@ -1407,7 +1415,7 @@ func derivedStateGuardForContext(ctx context.Context, dialect Dialect, applyID i
 		}, nil
 	}
 
-	return derivedStateGuard{query: derivedStateUpdate("")}, nil
+	return derivedStateGuard{query: derivedStateUpdate(dialect, false, "")}, nil
 }
 
 // ensureOperationLeaseOwnsApply returns ErrApplyLeaseLost unless the operation

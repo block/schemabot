@@ -53,6 +53,7 @@ func TestPostgresStorageParity(t *testing.T) {
 	storagetest.Run(t, h)
 	t.Run("SettingsUpdatedAtAdvances", func(t *testing.T) { testPostgresSettingsUpdatedAtAdvances(t, h) })
 	t.Run("LeaseGuardedApplyLogAppend", func(t *testing.T) { testPostgresLeaseGuardedApplyLogAppend(t, h) })
+	t.Run("DerivedStateProjectionSingleTableGuards", func(t *testing.T) { testPostgresDerivedStateProjectionSingleTableGuards(t, h) })
 	t.Run("MarkMinimizedPreservesStamp", func(t *testing.T) { testPostgresMarkMinimizedPreservesStamp(t, h) })
 	t.Run("MarkDeletedPreservesStamp", func(t *testing.T) { testPostgresMarkDeletedPreservesStamp(t, h) })
 	t.Run("LockUpdatedAtAdvances", func(t *testing.T) { testPostgresLockUpdatedAtAdvances(t, h) })
@@ -478,6 +479,53 @@ func testPostgresLeaseGuardedApplyLogAppend(t *testing.T, h postgresHarness) {
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 	assert.Equal(t, "owned driver log", logs[0].Message)
+}
+
+// testPostgresDerivedStateProjectionSingleTableGuards pins the rollout
+// projection's single-table renderings against a real PostgreSQL server. The
+// unguarded write and the apply-lease write share the operation-lease path's
+// SET list and address the row through the same alias, so both must run under
+// the PostgreSQL grammar: a current apply lease advances the parent and stamps
+// started_at once, a later projection keeps that start, and a stale apply
+// lease fails closed without touching the row.
+func testPostgresDerivedStateProjectionSingleTableGuards(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "projection_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_projection", 710, state.Apply.Pending, "staging")
+
+	startedAt := time.Now().UTC().Truncate(time.Second)
+	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Pending, state.Apply.Running, "", &startedAt, nil)
+	require.NoError(t, err)
+	require.True(t, swapped, "an unguarded projection must advance the parent")
+
+	_, err = h.db.ExecContext(ctx,
+		`UPDATE applies SET lease_owner = $1, lease_token = $2, lease_acquired_at = now() WHERE id = $3`,
+		"driver-a", "owned-token", apply.ID)
+	require.NoError(t, err)
+
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-old", Token: "stale-token"})
+	_, err = store.Applies().UpdateDerivedState(staleCtx, apply.ID, state.Apply.Running, state.Apply.Failed, "stale", nil, nil)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, persisted.State, "a stale apply lease must not write the projection")
+	require.NotNil(t, persisted.StartedAt)
+	assert.WithinDuration(t, startedAt, *persisted.StartedAt, time.Second)
+
+	later := startedAt.Add(time.Hour)
+	ownedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "owned-token"})
+	swapped, err = store.Applies().UpdateDerivedState(ownedCtx, apply.ID, state.Apply.Running, state.Apply.Completed, "", &later, &later)
+	require.NoError(t, err)
+	require.True(t, swapped, "a current apply lease must authorize the projection")
+	completed, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, completed.State)
+	require.NotNil(t, completed.StartedAt)
+	assert.WithinDuration(t, startedAt, *completed.StartedAt, time.Second, "started_at must be preserved, not rewound")
+	require.NotNil(t, completed.CompletedAt)
+	assert.WithinDuration(t, later, *completed.CompletedAt, time.Second)
 }
 
 // testPostgresLockUpdatedAtAdvances proves that the liveness touch and the
