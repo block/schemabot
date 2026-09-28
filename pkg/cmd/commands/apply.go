@@ -34,7 +34,7 @@ type ApplyCmd struct {
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
-	Yield        bool          `help:"Yield lock after successful completion"`
+	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
 	Output       OutputFormat  `short:"o" help:"Output format" default:"interactive" enum:"interactive,log,json"`
 	LogHeartbeat time.Duration `help:"Interval between progress heartbeats in log mode" default:"10s" name:"log-heartbeat"`
@@ -271,20 +271,62 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat); err != nil {
+	applyID, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	if err != nil {
 		return err
 	}
 
-	// Yield lock if requested and apply was successful
 	if cmd.Yield && !cmd.NoLock {
-		if err := client.ReleaseLock(ep, cfg.Database, cfg.Type, owner); err != nil {
-			fmt.Printf("Warning: failed to release lock: %v\n", err)
-		} else {
-			templates.WriteLockReleased(cfg.Database, cfg.Type)
-		}
+		yieldLock(ep, cfg.Database, cfg.Type, owner, applyID)
 	}
 
 	return nil
+}
+
+// shouldYieldLock reports whether --yield may release the database lock for
+// an apply in finalState. Only a settled apply qualifies: a running apply is
+// still changing the database and a stopped one can be resumed, so either one
+// still needs the lock that keeps other operators off the target.
+func shouldYieldLock(finalState string) bool {
+	return state.IsState(finalState, state.SettledApplyStates...)
+}
+
+// yieldLock releases the database lock for --yield once the apply has settled.
+// It reads the apply's state from the server rather than trusting how the
+// command got here: an unwatched apply, a stopped one, and a watch the operator
+// left all return without the apply having finished. Anything that is not a
+// settled state keeps the lock and says how to release it later.
+func yieldLock(ep, database, dbType, owner, applyID string) {
+	if applyID == "" {
+		templates.WriteLockKept(database, dbType, "the server returned no apply ID to check")
+		return
+	}
+	progress, err := client.GetProgress(ep, applyID)
+	if err != nil {
+		templates.WriteLockKept(database, dbType, fmt.Sprintf("the state of apply %s could not be read (%v)", applyID, err))
+		return
+	}
+	if !shouldYieldLock(progress.State) {
+		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, progress.State))
+		return
+	}
+	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
+		fmt.Printf("Warning: failed to release lock: %v\n", err)
+		return
+	}
+	templates.WriteLockReleased(database, dbType)
+}
+
+// lockKeptReason says why --yield kept the lock for an apply that has not
+// settled.
+func lockKeptReason(applyID, applyState string) string {
+	if state.IsState(applyState, state.Apply.Stopped) {
+		return fmt.Sprintf("apply %s is stopped and can still be resumed", applyID)
+	}
+	if state.IsState(applyState, state.NoActiveChange) {
+		return fmt.Sprintf("the server reported no state for apply %s", applyID)
+	}
+	return fmt.Sprintf("apply %s has not finished (state: %s)", applyID, state.NormalizeState(applyState))
 }
 
 // OutputFormat specifies how progress output is rendered during apply watch.
