@@ -792,9 +792,9 @@ Failing closed decides the verdict, not when it is recorded. A fail-closed polic
 claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
 the failure: the apply stays `running_degraded` until that sibling settles and only then takes
 the `failed` verdict. A sibling that is merely pending holds nothing, since the same policy is what
-stops it from ever starting. Recording the verdict over live work would release the reservation on
-the parent's whole target set (OW-5) while a driver is mid-change on one of those targets, and
-would take `stop` and `cancel` away from the operator who still has work to stop.
+stops it from ever starting. Recording the verdict over live work would take `stop` and `cancel`
+away from the operator who still has work to stop. The target reservation survives it, since OW-5
+holds a rollout's targets while any of its operations is in progress.
 
 Settled rather than terminal is what decides whether a sibling still holds its deployment, under
 every policy and not only the fail-closed ones. The two differ by one state: a `stopped` sibling is
@@ -886,7 +886,10 @@ Two applies in the same database and environment may therefore run at once when 
 deployment sets are disjoint, which is the point, while the same target can never be driven
 twice. The reservation covers the parent's whole target set until the parent settles, including
 deployments whose own operation already finished under `on_failure: continue`, because the apply
-rather than the operation is the unit of reconciliation.
+rather than the operation is the unit of reconciliation. A parent that has recorded a terminal
+verdict keeps the whole set reserved while any of its operations is still in progress, since a
+drive can still reopen it (ST-1). An operation is in progress from the moment a driver starts it
+until it reaches a terminal state, and one awaiting a retry only while a driver is retrying it.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
@@ -895,14 +898,12 @@ session, which OW-9 covers. It does not depend on a user-facing database lock be
 API callers and `--no-lock` flows are equally bound.
 
 The rollout verdict correction in ST-1 is the one exception: it writes the parent row without
-re-running the check. The check reads the parent's state, not its operations', so a parent whose
-`failed` verdict was recorded too early reserves none of its deployments while one of its
-operations is still running there. Nothing else excludes a second apply in that window: the
-operation lease guards only the operation's own row, and the advisory lock is held only for the
-deciding transaction. The window closes when a drive holding a lease re-derives the parent. No
-periodic pass does that for a terminal parent, so the window can last for the rest of that
-operation's run. *Enforced:* the exclusivity check in the storage
-apply create and activate paths, under the apply target lock
+re-running the check. It lands from a drive, and the drive's operation is in progress until the
+drive records its result, so the rollout's targets stay reserved up to that point. A second apply
+admitted after that result and before the correction lands is recorded active beside the reopened
+rollout. *Enforced:* the exclusivity check in the storage apply create and activate paths, over
+active parents and over terminal parents with an operation in progress
+(`checkNoActiveApplyForTargets`, `checkNoInProgressRolloutForTargets`), under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
 
 ### OW-6: There is one way to claim work
