@@ -277,8 +277,11 @@ func (c *ServerConfig) lockAcquirer(ctx context.Context, database string) (*stor
 	if !c.scopedWriteEnabled() {
 		return nil, DirectWriteReasonScopedLaneDisabled
 	}
-	subject, ok := auth.AuthenticatedSubject(ctx)
+	subject, ok := auth.VerifiedSubject(ctx)
 	if !ok {
+		if _, authenticated := auth.AuthenticatedSubject(ctx); authenticated {
+			return nil, DirectWriteReasonUnverifiedIdentity
+		}
 		return nil, DirectWriteReasonMissingIdentity
 	}
 	groups := []string{}

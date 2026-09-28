@@ -278,7 +278,7 @@ func TestAuthorizeDirectAdminWrite(t *testing.T) {
 // returns the response, for asserting on handler-level scoped-write denials.
 func scopedDenialRequest(t *testing.T, handler http.HandlerFunc, user *auth.User, method, target, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	ctx := auth.WithUser(t.Context(), user)
+	ctx := auth.WithVerifiedUser(t.Context(), user)
 	req := httptest.NewRequestWithContext(ctx, method, target, strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler(rec, req)

@@ -28,6 +28,7 @@ const (
 	DirectWriteReasonScopedLaneDisabled    = "scoped_lane_disabled"
 	DirectWriteReasonTargetUnresolved      = "target_unresolved"
 	DirectWriteReasonMissingIdentity       = "missing_identity"
+	DirectWriteReasonUnverifiedIdentity    = "unverified_identity"
 	DirectWriteReasonNotAdmin              = "not_admin"
 	DirectWriteReasonNotDatabaseOperator   = "not_database_operator"
 	DirectWriteReasonEnvironmentNotAllowed = "environment_not_allowed"

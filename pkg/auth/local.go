@@ -46,6 +46,6 @@ func (a *LocalAuthorizer) Middleware(next http.Handler) http.Handler {
 		if tier == TierWrite {
 			a.logger.Info("local runtime write authorized", "method", r.Method, "path", r.URL.Path, "subject", "local-runtime")
 		}
-		next.ServeHTTP(w, r.WithContext(WithUser(r.Context(), &User{Subject: "local-runtime"})))
+		next.ServeHTTP(w, r.WithContext(WithVerifiedUser(r.Context(), &User{Subject: "local-runtime"})))
 	})
 }

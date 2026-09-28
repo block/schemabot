@@ -120,11 +120,17 @@ func TestLockAcquireRecordsAcquirer(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	body := `{"database":"payments","database_type":"mysql","owner":"cli:someone-else@laptop"}`
 
-	acquire := func(t *testing.T, cfg *ServerConfig, user *auth.User) *storage.Lock {
+	acquire := func(t *testing.T, cfg *ServerConfig, user *auth.User, verified bool) *storage.Lock {
 		t.Helper()
 		store := &capturingLockStore{}
 		svc := New(&mockStorageWithApplyStores{locks: store}, cfg, nil, logger)
-		rec := scopedDenialRequest(t, svc.handleLockAcquire, user, http.MethodPost, "/api/locks/acquire", body)
+		ctx := auth.WithUser(t.Context(), user)
+		if verified {
+			ctx = auth.WithVerifiedUser(t.Context(), user)
+		}
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/locks/acquire", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		svc.handleLockAcquire(rec, req)
 		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 		require.NotNil(t, store.acquired)
 		assert.Equal(t, "cli:someone-else@laptop", store.acquired.Owner)
@@ -139,14 +145,14 @@ func TestLockAcquireRecordsAcquirer(t *testing.T) {
 		payments.OperatorGroups = []string{"payments-team", "payments-oncall"}
 		cfg.Databases["payments"] = payments
 
-		lock := acquire(t, cfg, &auth.User{Subject: "bob", Groups: []string{"payments-team", "payments-oncall", "unrelated"}})
+		lock := acquire(t, cfg, &auth.User{Subject: "bob", Groups: []string{"payments-team", "payments-oncall", "unrelated"}}, true)
 		require.NotNil(t, lock.Acquirer)
 		assert.Equal(t, "bob", lock.Acquirer.Subject)
 		assert.Equal(t, []string{"payments-oncall", "payments-team"}, lock.Acquirer.OperatorGroups)
 	})
 
 	t.Run("admin outside every operator group records no groups", func(t *testing.T) {
-		lock := acquire(t, scopedWriteConfig(), &auth.User{Subject: "alice", Groups: []string{"schema-admins"}})
+		lock := acquire(t, scopedWriteConfig(), &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}, true)
 		require.NotNil(t, lock.Acquirer)
 		assert.Equal(t, "alice", lock.Acquirer.Subject)
 		assert.NotNil(t, lock.Acquirer.OperatorGroups, "a recorded acquirer with no groups is an empty list, not an unrecorded one")
@@ -154,14 +160,19 @@ func TestLockAcquireRecordsAcquirer(t *testing.T) {
 	})
 
 	t.Run("admin who is also an operator records the operator group", func(t *testing.T) {
-		lock := acquire(t, scopedWriteConfig(), &auth.User{Subject: "carol", Groups: []string{"schema-admins", "payments-team"}})
+		lock := acquire(t, scopedWriteConfig(), &auth.User{Subject: "carol", Groups: []string{"schema-admins", "payments-team"}}, true)
 		require.NotNil(t, lock.Acquirer)
 		assert.Equal(t, "carol", lock.Acquirer.Subject)
 		assert.Equal(t, []string{"payments-team"}, lock.Acquirer.OperatorGroups)
 	})
 
 	t.Run("deployment with no scoped operator grants records no acquirer", func(t *testing.T) {
-		lock := acquire(t, testServerConfig(), &auth.User{Subject: "dave", Groups: []string{"payments-team"}})
+		lock := acquire(t, testServerConfig(), &auth.User{Subject: "dave", Groups: []string{"payments-team"}}, true)
+		assert.Nil(t, lock.Acquirer)
+	})
+
+	t.Run("unverified identity records no acquirer", func(t *testing.T) {
+		lock := acquire(t, scopedWriteConfig(), &auth.User{Subject: "claimed", Groups: []string{"schema-admins", "payments-team"}}, false)
 		assert.Nil(t, lock.Acquirer)
 	})
 }
