@@ -42,6 +42,14 @@ func seedPendingConfirmation(t *testing.T, svc *api.Service, dbName, planID, env
 			assert.NoError(t, err, "release the pending confirmation lock for %s", dbName)
 		}
 	})
+	seedConfirmationPlan(t, svc, dbName, planID, environment)
+}
+
+// seedConfirmationPlan stores the plan a pending confirmation pins: the comment
+// the operator reviewed, rendered for the given environment at the fake PR
+// HEAD, so apply-confirm can verify which environment it authorizes.
+func seedConfirmationPlan(t *testing.T, svc *api.Service, dbName, planID, environment string) {
+	t.Helper()
 	_, err := svc.Storage().Plans().Create(t.Context(), &storage.Plan{
 		PlanIdentifier: planID,
 		Database:       dbName,

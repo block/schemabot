@@ -816,18 +816,10 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 	// Seed a check record (simulating a prior plan that created the check run)
 	seedCheck(t, svc, dbName, "staging", "action_required")
 
-	// Acquire a lock from this PR (simulating a prior `apply` command)
-	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
-		DatabaseName: dbName,
-		DatabaseType: "mysql",
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		Owner:        "octocat/hello-world#1",
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
-	})
+	// The prior `apply` left the lock pinned to the staging plan it posted;
+	// apply-confirm verifies the environment against that plan. Plan
+	// identifiers are unique across the shared test storage.
+	seedPendingConfirmation(t, svc, dbName, "plan-pending-"+dbName, "staging")
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1113,15 +1105,10 @@ func TestE2EApplyConfirmNoChanges(t *testing.T) {
 	seedTargetTable(t, dbName,
 		"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 
-	// Acquire a lock from this PR (simulating a prior `apply` command)
-	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
-		DatabaseName: dbName,
-		DatabaseType: "mysql",
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		Owner:        "octocat/hello-world#1",
-	})
-	require.NoError(t, err)
+	// The prior `apply` left the lock pinned to the staging plan it posted;
+	// apply-confirm verifies the environment against that plan. Plan
+	// identifiers are unique across the shared test storage.
+	seedPendingConfirmation(t, svc, dbName, "plan-pending-"+dbName, "staging")
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
