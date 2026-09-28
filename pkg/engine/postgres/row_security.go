@@ -47,3 +47,25 @@ func planPostgresDefinition(ctx context.Context, pool *pgxpool.Pool, namespace, 
 	}
 	return report, desired.Table(), nil
 }
+
+// desiredTableName returns the table a schema file declares, admitted through
+// the same pg-sprite parse planPostgresDefinition plans with, so the name is
+// the one the plan keys the file's diff under.
+func desiredTableName(sql string) (string, error) {
+	hasRLS, err := statement.HasRowSecurityDeclaration(sql)
+	if err != nil {
+		return "", err
+	}
+	if hasRLS {
+		desired, err := statement.ParseDesiredWithRowSecurity(sql)
+		if err != nil {
+			return "", err
+		}
+		return desired.Table(), nil
+	}
+	desired, err := statement.ParseDesired(sql)
+	if err != nil {
+		return "", err
+	}
+	return desired.Table(), nil
+}
