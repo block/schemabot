@@ -261,13 +261,13 @@ const engineLogGroupLabelPrefix = "engine logs: "
 // drives several targets produces a group per target, and without the target
 // an operator cannot tell which one raised the warning they are reading.
 //
-// Each name is clamped on its own rather than the joined label being cut to
-// length, so a deployment long enough to fill the heading cannot cost the
-// target beside it the characters that tell two targets apart.
+// Both names render whole. A target is the identifier an operator pastes into
+// a console or a query to find the cluster, so a heading that shortens it
+// hands them a name nothing else recognizes.
 func engineLogGroupLabel(deployment, target string) string {
-	label := engineLogGroupLabelPrefix + templates.ElideMiddle(deployment, templates.MaxGroupLabelPartChars)
+	label := engineLogGroupLabelPrefix + deployment
 	if target != "" {
-		label += ", target: " + templates.ElideMiddle(target, templates.MaxGroupLabelPartChars)
+		label += ", target: " + target
 	}
 	return label
 }

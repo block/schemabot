@@ -244,21 +244,16 @@ func TestSummaryWithFailureLogsLeavesAnAuthoredReasonAlone(t *testing.T) {
 	assert.Contains(t, rendered, "== engine logs: region-a ==")
 }
 
-// One deployment can drive several targets whose names differ only at the
-// tail. The heading names both, and each name is clamped on its own, so a
-// long deployment cannot cost the target beside it the characters that tell
-// two groups apart — and the whole heading still fits its budget.
-func TestEngineLogGroupLabelKeepsLongTargetsDistinct(t *testing.T) {
+// The heading names the deployment and the target in full. A target is the
+// identifier an operator looks the cluster up by, so a long one renders whole
+// rather than shortened into a name nothing else recognizes.
+func TestEngineLogGroupLabelRendersLongTargetsWhole(t *testing.T) {
 	const deployment = "payments-production-us-west-2"
-	third := engineLogGroupLabel(deployment, "payments-production-shard-003")
-	fourth := engineLogGroupLabel(deployment, "payments-production-shard-004")
+	const target = "payments-aurora-mysql-production-portfolios-001"
+	label := engineLogGroupLabel(deployment, target)
 
-	assert.NotEqual(t, third, fourth)
-	assert.LessOrEqual(t, len(third), templates.MaxGroupLabelChars)
-	assert.LessOrEqual(t, len(fourth), templates.MaxGroupLabelChars)
-	assert.True(t, strings.HasPrefix(third, engineLogGroupLabelPrefix))
-	assert.Equal(t, "engine logs: region-a, target: cluster-a", engineLogGroupLabel("region-a", "cluster-a"),
-		"names that fit are left alone")
+	assert.Equal(t, "engine logs: payments-production-us-west-2, target: payments-aurora-mysql-production-portfolios-001", label)
+	assert.True(t, strings.HasPrefix(label, engineLogGroupLabelPrefix))
 	assert.Equal(t, "engine logs: region-a", engineLogGroupLabel("region-a", ""))
 }
 
