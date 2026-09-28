@@ -856,6 +856,14 @@ return after submission without opening an interactive watcher. Retain the new
 apply ID and check its status; submission alone does not confirm completion.
 Interactive operators should keep the default automatic watcher.
 
+A watching `apply -o log` or `apply -o json` returns as soon as the apply
+reaches a final state. It exits 0 when the apply completed or was stopped, and
+non-zero when it failed, was cancelled, or was reverted, because in each of
+those the schema change is not on the target. A watcher that cannot reach the
+server retries with backoff, and exits non-zero once polls have kept failing
+for a few minutes in a row. The apply keeps running on the server, and the
+error names the `progress` command that resumes watching it.
+
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted
 apply may still be running. Use [schema intelligence](schema-intelligence.md)
