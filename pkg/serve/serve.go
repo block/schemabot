@@ -362,8 +362,9 @@ func logShutdownCause(ctx context.Context, logger *slog.Logger, signalled <-chan
 // PORT and GRPC_PORT are read from the environment. Prometheus metrics are
 // served on a dedicated listener at cfg.MetricsListenPort, not on the API port.
 //
-// This is the standalone path, so signals are SchemaBot's to handle: everything
-// below runs under a context that ends when one arrives, startup included. The
+// This is the standalone path, so signals are SchemaBot's to handle: startup and
+// the listeners run under a context that ends when one arrives. The background
+// work is the exception, and Close ends it (see serveUntilShutdown). The
 // embedding seam (Build, RegisterGRPC, Start, Close) installs no handler at
 // all — a library that traps signals out from under its host is a worse defect
 // than the one that would fix.
@@ -386,6 +387,22 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		}
 		return err
 	}
+	return serveUntilShutdown(runCtx, srv, signalled, port, grpcPort)
+}
+
+// serveUntilShutdown serves a built server on Run's listeners until runCtx ends
+// or a listener fails, then shuts it down.
+//
+// The background work runs under a context of its own rather than runCtx. The
+// operator's drives end on that context, and a drive that ends before Close
+// opens the claim drain deregisters its claim: Close then has nothing to hand
+// back, and a peer waits out the whole staleness window while this process's
+// engine may still be copying. So the signal only stops the listeners, and Close
+// ends the background work in its own order — engines down, then claims handed
+// back. The context is cancelled after Close returns, so nothing outlives Run.
+func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os.Signal, port, grpcPort string) error {
+	backgroundCtx, cancelBackground := context.WithCancel(context.WithoutCancel(runCtx))
+	defer cancelBackground()
 	defer utils.CloseAndLog(srv)
 
 	// Optionally start a gRPC server for the Tern proto (used by
@@ -413,7 +430,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 
 	// Start background loops (operator, health monitor, pending-drops cleaner,
 	// missing-summary reconciliation). Server.Close stops them.
-	srv.Start(runCtx)
+	srv.Start(backgroundCtx)
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -425,7 +442,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 
 	// Metrics get their own listener so scrapers never traverse the API port
 	// (see ServerConfig.MetricsPort).
-	metricsPort := strconv.Itoa(cfg.MetricsListenPort())
+	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", srv.MetricsHandler())
 	metricsServer := &http.Server{
@@ -458,6 +475,11 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	case err := <-errCh:
 		return err
 	}
+
+	// The drives keep running until Close, but new claims stop here: an idle
+	// driver that claimed during the listener drains below would start an
+	// engine only for Close to halt it and hand the apply to a peer.
+	srv.svc.StopClaiming()
 
 	// Graceful shutdown of both HTTP servers; Server.Close (deferred) releases
 	// the rest.
