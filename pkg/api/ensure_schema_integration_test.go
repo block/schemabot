@@ -655,7 +655,7 @@ func TestEnsureSchema_RollbackFailsWhenADroppedUniqueIndexHasDuplicates(t *testi
 	// The rolled-back binary declares the index, so its boot tries to re-add it
 	// and cannot: the duplicate it would have prevented is already there.
 	err = EnsureSchema(dsn, logger)
-	require.ErrorContains(t, err, "storage schema change failed",
+	require.ErrorContains(t, err, `storage schema change to table "tasks" failed`,
 		"re-adding a unique index over duplicate rows must fail the boot, not be skipped")
 	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "tasks", droppedUniqueIndex),
 		"the unique index cannot be re-added while the duplicate rows remain")
