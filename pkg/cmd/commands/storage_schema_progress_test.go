@@ -33,7 +33,7 @@ func TestStorageProgressPrinter_RepeatsPrintOnceWithinAHeartbeat(t *testing.T) {
 		clock = clock.Add(100 * time.Millisecond)
 	}
 
-	assert.Equal(t, 1, strings.Count(out.String(), "progress=40%"),
+	assert.Equal(t, 1, strings.Count(out.String(), "converged=40%"),
 		"twenty polls inside the first heartbeat window are one thing happening, and one line")
 }
 
@@ -230,8 +230,8 @@ func TestStorageProgressPrinter_EmitsLogfmt(t *testing.T) {
 		},
 		"the convergence before any table progress exists": {
 			observations: []api.StorageConvergenceProgress{{State: "pending", Percent: 3}},
-			want:         []string{"Convergence started", "status=pending", "progress=3%"},
-			absent:       []string{"table="},
+			want:         []string{"Convergence started", "status=pending", "converged=3%"},
+			absent:       []string{"table=", "progress="},
 		},
 		"a transition carries how long the subject has been running": {
 			observations: []api.StorageConvergenceProgress{

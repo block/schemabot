@@ -231,7 +231,11 @@ func storageProgressSubjects(o api.StorageConvergenceProgress) []storageProgress
 		}
 		s := storageProgressSubject{status: o.State}
 		if o.Percent > 0 {
-			s.kvs = append(s.kvs, "progress", fmt.Sprintf("%d%%", o.Percent))
+			// The observation's own percent is how much of the convergence is
+			// behind it, never rows within a table: there is no table on this
+			// line. So it prints under the key that means exactly that, the
+			// same one a table line falls back to below.
+			s.kvs = append(s.kvs, "converged", fmt.Sprintf("%d%%", o.Percent))
 		}
 		return []storageProgressSubject{s}
 	}
