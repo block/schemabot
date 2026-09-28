@@ -1,11 +1,14 @@
 package spirit
 
 import (
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -71,11 +74,70 @@ func TestClassifyRunnerError(t *testing.T) {
 	})
 }
 
+// copyWarningError builds the error a Spirit copy fails with when the target
+// raises a warning on a chunk it inserted, wrapped the way the runner returns
+// it.
+func copyWarningError(code uint16, message string) error {
+	return fmt.Errorf("failed to execute chunklet insert: %w",
+		&dbconn.UnsafeWarningError{Warning: &mysql.MySQLError{Number: code, Message: message}})
+}
+
+// A row the copy cannot write into the new table definition fails every
+// attempt the same way, because every attempt copies the same rows into the
+// same definition. Those failures are permanent; what a retry can clear — a
+// lock that was held, a connection that dropped — stays retryable.
+func TestClassifyRunnerErrorRowData(t *testing.T) {
+	permanent := []struct {
+		name string
+		err  error
+	}{
+		{"NULL into a NOT NULL column", copyWarningError(1048, "Column 'c' cannot be null")},
+		{"value truncated by the new type", copyWarningError(1265, "Data truncated for column 'status' at row 1")},
+		{"value the new type cannot represent", copyWarningError(1366, "Incorrect integer value: 'abc' for column 'n' at row 1")},
+		{"value longer than the new column", copyWarningError(1406, "Data too long for column 'name' at row 1")},
+		{"row data error raised as an error rather than a warning", fmt.Errorf("failed to execute upsert: %w",
+			&mysql.MySQLError{Number: 1048, Message: "Column 'c' cannot be null"})},
+	}
+	for _, tc := range permanent {
+		t.Run(tc.name+" is permanent", func(t *testing.T) {
+			classifiedErr := classifyRunnerError(tc.err)
+
+			assert.False(t, engine.IsRetryable(classifiedErr))
+			var permanentErr *engine.PermanentError
+			assert.ErrorAs(t, classifiedErr, &permanentErr)
+			assert.Equal(t, tc.err.Error(), classifiedErr.Error())
+		})
+	}
+
+	retryable := []struct {
+		name string
+		err  error
+	}{
+		{"lock wait timeout", fmt.Errorf("failed to execute chunklet insert: %w",
+			&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded; try restarting transaction"})},
+		{"deadlock", fmt.Errorf("failed to execute upsert: %w",
+			&mysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock; try restarting transaction"})},
+		{"lost connection", fmt.Errorf("failed to execute chunklet insert: %w", mysql.ErrInvalidConn)},
+		{"bad connection", fmt.Errorf("failed to execute chunklet insert: %w", driver.ErrBadConn)},
+		{"server gone away", fmt.Errorf("failed to execute chunklet insert: %w",
+			&mysql.MySQLError{Number: 2013, Message: "Lost connection to MySQL server during query"})},
+	}
+	for _, tc := range retryable {
+		t.Run(tc.name+" stays retryable", func(t *testing.T) {
+			classifiedErr := classifyRunnerError(tc.err)
+
+			require.Same(t, tc.err, classifiedErr)
+			assert.True(t, engine.IsRetryable(classifiedErr))
+		})
+	}
+}
+
 // A runner failure's retry classification reaches the drive through progress.
 // A copy whose checksum keeps finding rows it would lose fails the same way on
 // every attempt, so progress reports it failed and not retryable, and the drive
 // settles it instead of spending its recovery attempts re-copying the table. A
-// failure that could succeed on a later attempt stays retryable. Both answers
+// failure that could succeed on a later attempt stays retryable. The same holds
+// for a row the copy cannot store under the new definition. Both answers
 // hold before and after the engine drains the finished change.
 func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 	cases := []struct {
@@ -99,6 +161,18 @@ func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 			name: "ALTER whose checksum attempts errored stays retryable",
 			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(
 				fmt.Errorf("checksum failed after several attempts: %w", checksum.ErrAttemptsExhausted))),
+			retryable: true,
+		},
+		{
+			name: "ALTER that cannot store a NULL row under NOT NULL is not retryable",
+			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(
+				copyWarningError(1048, "Column 'c' cannot be null"))),
+			retryable: false,
+		},
+		{
+			name: "ALTER that timed out on a lock wait stays retryable",
+			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(fmt.Errorf("failed to execute chunklet insert: %w",
+				&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded; try restarting transaction"}))),
 			retryable: true,
 		},
 		{

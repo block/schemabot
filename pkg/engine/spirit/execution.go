@@ -26,19 +26,56 @@ import (
 // write-thread autoscaler grow above its starting value.
 const maxCommitLatency = 100 * time.Millisecond
 
-// classifyRunnerError marks runner failures that are verdicts about the data
-// as permanent, so operator retries are not spent repeating a lossy schema
-// change: the snapshot checksum found row differences on every completed
-// attempt, or the lockless checksum proved a divergence the copy cannot heal.
-// Attempts that errored before establishing row differences remain retryable,
-// and so does the lockless checksum's pass budget running out: that verdict
-// proves no divergence, only that ranges were still changing too fast to
-// verify, which a later attempt against a quieter table can resolve.
+// classifyRunnerError marks runner failures that a retry would only reproduce
+// as permanent, so operator retries are not spent repeating a schema change
+// that cannot finish:
+//   - verdicts about the data: the snapshot checksum found row differences on
+//     every completed attempt, or the lockless checksum proved a divergence the
+//     copy cannot heal. Attempts that errored before establishing row
+//     differences remain retryable, and so does the lockless checksum's pass
+//     budget running out: that verdict proves no divergence, only that ranges
+//     were still changing too fast to verify, which a later attempt against a
+//     quieter table can resolve.
+//   - a row the copy could not write into the new table definition (see
+//     rowDataErrorCodes). Every attempt copies the same rows into the same
+//     definition, so only changing the data or the statement clears it.
 func classifyRunnerError(err error) error {
 	if errors.Is(err, checksum.ErrDifferencesExhausted) || errors.Is(err, checksum.ErrPermanentDivergence) {
 		return &engine.PermanentError{Err: err}
 	}
+	if isRowDataError(err) {
+		return &engine.PermanentError{Err: err}
+	}
 	return err
+}
+
+// rowDataErrorCodes are the MySQL codes that say a row's value cannot be
+// stored in the column the schema change gives it. Spirit copies with INSERT
+// IGNORE, which downgrades these to warnings, and fails the copy on the
+// warning; the code reaches here as a typed MySQL error either way. Each one is
+// a property of the rows and the target definition alone, so a retry replays
+// it. Lock waits, deadlocks, timeouts, and connection loss are deliberately
+// absent: those describe the moment, not the data, and retrying clears them.
+//
+// Duplicate key (1062) is absent too, though a change that collapses unique
+// values is just as deterministic: the copy ignores duplicate-key warnings by
+// design, because a resumed copy re-inserts rows it already wrote, so that
+// change surfaces as reproducible checksum differences instead, which
+// classifyRunnerError already treats as permanent.
+var rowDataErrorCodes = []uint16{
+	1048, // ER_BAD_NULL_ERROR: a NULL in a column the change makes NOT NULL.
+	1265, // WARN_DATA_TRUNCATED: a value the new type or length can only store truncated.
+	1366, // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD: a value the new type or character set cannot represent.
+	1406, // ER_DATA_TOO_LONG: a value longer than the new column allows.
+}
+
+// isRowDataError reports whether err is a MySQL error saying a row cannot be
+// stored under the new table definition.
+func isRowDataError(err error) bool {
+	// Read through mysqlerr rather than asserting a driver type: two MySQL
+	// drivers are linked and their error types are not interchangeable. See
+	// pkg/mysqlerr/number.go.
+	return mysqlerr.Is(err, rowDataErrorCodes...)
 }
 
 // newSpiritMigration builds the Spirit migration for a statement against the
