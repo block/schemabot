@@ -488,8 +488,9 @@ func isRollbackConfirmRejection(err error) bool {
 // Every exit at or after the ExecuteApply call is terminal regardless of
 // outcome: once the dispatch is attempted, the rollback DDL may already be
 // executing on the target, so a durable re-drive could double-execute it.
-// The pinned lock is not released on those failures, so recovery for a
-// pre-acceptance failure is the user re-issuing rollback-confirm.
+// The pinned lock is not released on failures where its intent is unchanged,
+// so recovery for those pre-acceptance failures is re-issuing rollback-confirm.
+// If the lock intent changed, recovery starts with a fresh rollback command.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -670,8 +671,9 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 
 	// Every exit from here on is terminal for a durable driver: the dispatch
 	// has been attempted, so the rollback DDL may already be executing and a
-	// re-drive could double-execute it. A dispatch error leaves the pinned
-	// lock in place, so the user can re-issue rollback-confirm.
+	// re-drive could double-execute it. If the lock intent is unchanged, a
+	// dispatch error leaves the pin in place for another rollback-confirm; if
+	// it changed, the user must start with a fresh rollback command.
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
@@ -748,13 +750,13 @@ const msgRollbackLockIntentChanged = "The pending rollback changed while this co
 // rollbackExecutionErrorMessage renders the PR-facing detail for a failed
 // rollback dispatch. A lock intent change is an expected race with its own
 // recovery, so it gets a fixed actionable message rather than the storage
-// error text; other failures keep their guidance, which the error renderer
-// sanitizes.
+// error text. Other failures use fixed guidance while their details remain in
+// server logs.
 func rollbackExecutionErrorMessage(err error) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		return msgRollbackLockIntentChanged
 	}
-	return "Failed to execute rollback: " + err.Error()
+	return "Failed to execute rollback; see server logs for details and retry rollback-confirm."
 }
 
 func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr int, environment, lockOwner string) (*storage.Lock, *storage.Plan, error) {

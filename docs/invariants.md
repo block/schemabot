@@ -1441,7 +1441,9 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
 the sequential and grouped drives). The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
-and rollup paths).
+and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
+apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
+by `verifyExpectedLockIntent` in `pkg/storage/sqlstore/applies.go`).
 
 ### RV-2: Stale plans never apply
 
@@ -1461,7 +1463,9 @@ write-blocking DDL with no cutover and no revert, require the operator to confir
 consequences disclosed to them. The re-plan that runs just before execution re-checks that
 verdict, so a plan that changed after the confirmation stops rather than running something the
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`).
+`pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
+(`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
+`verifyExpectedLockIntent` in `pkg/storage/sqlstore/applies.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 

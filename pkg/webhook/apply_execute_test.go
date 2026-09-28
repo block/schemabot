@@ -39,9 +39,11 @@ func TestRollbackExecutionErrorMessage(t *testing.T) {
 		assert.NotContains(t, msg, storage.ErrLockIntentChanged.Error())
 	})
 
-	t.Run("other dispatch failures keep their guidance", func(t *testing.T) {
-		err := errors.New("plan rbplan-1 is missing server-side routing metadata field \"target\"; create a new plan and retry apply")
-		assert.Equal(t, "Failed to execute rollback: "+err.Error(), rollbackExecutionErrorMessage(err))
+	t.Run("other dispatch failures use fixed guidance", func(t *testing.T) {
+		err := errors.New("dial tcp storage.internal:3306: connection refused")
+		msg := rollbackExecutionErrorMessage(err)
+		assert.Equal(t, "Failed to execute rollback; see server logs for details and retry rollback-confirm.", msg)
+		assert.NotContains(t, msg, err.Error())
 	})
 }
 
