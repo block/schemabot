@@ -117,7 +117,7 @@ func (a *OIDCAuthorizer) Middleware(next http.Handler) http.Handler {
 		}
 
 		authDecision(r, tier, "allow", "")
-		ctx := WithUser(r.Context(), user)
+		ctx := WithVerifiedUser(r.Context(), user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

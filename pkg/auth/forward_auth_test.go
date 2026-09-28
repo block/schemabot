@@ -46,13 +46,46 @@ func newForwardAuth(t *testing.T, cfg auth.ForwardAuthConfig) (http.Handler, *ca
 	captured := &capturedUser{}
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		captured.user = auth.UserFromContext(r.Context())
+		_, captured.verified = auth.VerifiedSubject(r.Context())
 		w.WriteHeader(http.StatusOK)
 	})
 	return authz.Middleware(inner), captured
 }
 
 type capturedUser struct {
-	user *auth.User
+	user     *auth.User
+	verified bool
+}
+
+func TestForwardAuth_IdentityProvenance(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		trusted    string
+		verified   bool
+	}{
+		{name: "proxy", remoteAddr: trustedIPAddr, trusted: trustedCIDR, verified: true},
+		{name: "loopback", remoteAddr: "127.0.0.1:52000", trusted: "127.0.0.0/8", verified: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, captured := newForwardAuth(t, auth.ForwardAuthConfig{
+				TrustedProxyCIDRs: []string{tc.trusted},
+				WriteGroups:       []string{"ops"},
+			})
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", nil)
+			req.RemoteAddr = tc.remoteAddr
+			req.Header.Set("X-Forwarded-User", "alice")
+			req.Header.Set("X-Forwarded-Groups", "ops")
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, tc.verified, captured.verified)
+		})
+	}
 }
 
 func TestNewForwardAuthAuthorizer_RequiresTrustAnchor(t *testing.T) {
