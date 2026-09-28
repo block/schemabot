@@ -27,6 +27,24 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 	})
 }
 
+// A rollback-confirm whose lock stopped pinning the confirmed plan is told that
+// nothing ran and to plan a fresh rollback, in SchemaBot's words rather than
+// the storage error's; other dispatch failures keep their own guidance.
+func TestRollbackExecutionErrorMessage(t *testing.T) {
+	t.Run("lock intent change coaches a fresh rollback", func(t *testing.T) {
+		msg := rollbackExecutionErrorMessage(fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
+		assert.Equal(t, msgRollbackLockIntentChanged, msg)
+		assert.Contains(t, msg, "nothing was applied")
+		assert.Contains(t, msg, "run the rollback command again")
+		assert.NotContains(t, msg, storage.ErrLockIntentChanged.Error())
+	})
+
+	t.Run("other dispatch failures keep their guidance", func(t *testing.T) {
+		err := errors.New("plan rbplan-1 is missing server-side routing metadata field \"target\"; create a new plan and retry apply")
+		assert.Equal(t, "Failed to execute rollback: "+err.Error(), rollbackExecutionErrorMessage(err))
+	})
+}
+
 func TestDDLMatchesStoredPlan(t *testing.T) {
 	tests := []struct {
 		name       string
