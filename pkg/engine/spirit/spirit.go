@@ -89,6 +89,11 @@ type Engine struct {
 	// exit and Drain's release of the tracked state, so tests can interleave
 	// engine activity into that window deterministically.
 	drainRaceWindow func()
+
+	// stopCheckpointWindow is a test seam invoked between Stop's checkpoint
+	// dump and its write of the stopped state, so tests can land an outcome in
+	// that window deterministically.
+	stopCheckpointWindow func()
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.

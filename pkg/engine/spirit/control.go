@@ -10,6 +10,7 @@ package spirit
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/mysql"
@@ -23,6 +24,8 @@ import (
 // Stop pauses a running schema change.
 // Spirit uses a checkpoint table to track progress, so the change can be resumed later.
 // We force a checkpoint before canceling to preserve progress (Spirit only checkpoints every 50s).
+// A change that has already settled, or settles while the checkpoint is written,
+// keeps its outcome: see settledStopOutcome.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.mu.Lock()
 	rm := e.runningSchemaChange
@@ -47,22 +50,13 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	runners := rm.runners
 	database := rm.database
 	tables := rm.tables
+	checkpointWindow := e.stopCheckpointWindow
 	e.mu.Unlock()
 
-	if state == engine.StateStopped {
-		return &engine.ControlResult{
-			Accepted: true,
-			Message:  "Already stopped",
-		}, nil
-	}
-	if state == engine.StateCompleted {
-		// The change landed before the stop arrived. Recording it as stopped
-		// would misrepresent the target; the typed rejection has the caller
-		// reconcile to the completed outcome instead.
-		return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
-	}
-
 	logger := e.schemaChangeLogger(rm)
+	if state.IsTerminal() {
+		return settledStopOutcome(logger, state, database, tables)
+	}
 
 	// Force a checkpoint BEFORE canceling the context.
 	// Spirit only checkpoints every 50s, so without this we could lose progress.
@@ -78,9 +72,18 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 			)
 		}
 	}
+	if checkpointWindow != nil {
+		checkpointWindow()
+	}
 
-	// Cancel the context to signal Spirit to stop
+	// Cancel the context to signal Spirit to stop. The change may have settled
+	// on its own while the checkpoint was written, so its state is read again
+	// under the same lock as the write: an outcome that landed first wins.
 	e.mu.Lock()
+	if current := rm.state; settledOutcomeOutranksStop(current) {
+		e.mu.Unlock()
+		return settledStopOutcome(logger, current, database, tables)
+	}
 	if rm.cancelFunc != nil {
 		rm.cancelFunc()
 	}
@@ -104,6 +107,58 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		Accepted: true,
 		Message:  "Stopped - checkpoint saved for resume",
 	}, nil
+}
+
+// settledOutcomeOutranksStop reports whether the schema change settled on an
+// outcome a stop must leave in place. Every terminal state but stopped does: a
+// stopped change is already the pause the stop asks for.
+func settledOutcomeOutranksStop(state engine.State) bool {
+	return state.IsTerminal() && state != engine.StateStopped
+}
+
+// settledStopOutcome answers a stop that finds the schema change already
+// settled, leaving the settled state in place. Only a change still in motion
+// can be paused: a stopped change already is, and a completed, failed, or
+// cancelled change has an outcome of its own that a stop must never relabel as
+// a resumable pause.
+func settledStopOutcome(logger *slog.Logger, state engine.State, database string, tables []string) (*engine.ControlResult, error) {
+	switch state {
+	case engine.StateStopped:
+		logger.Info("stop requested for a schema change that is already stopped; nothing to do",
+			"database", database,
+			"tables", tables,
+		)
+		return &engine.ControlResult{
+			Accepted: true,
+			Message:  "Already stopped",
+		}, nil
+	case engine.StateCompleted:
+		// The change landed before the stop arrived. Recording it as stopped
+		// would misrepresent the target; the typed rejection has the caller
+		// reconcile to the completed outcome instead.
+		logger.Info("stop rejected: the schema change completed before the stop arrived",
+			"database", database,
+			"tables", tables,
+		)
+		return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
+	case engine.StateFailed:
+		// Start resumes a stopped change from its checkpoint, so recording a
+		// failure as stopped would offer the operator a resume of a change that
+		// failed. The failure stands and recovery is a fresh plan and apply;
+		// retrying the stop can never change that.
+		logger.Warn("stop rejected: the schema change failed before the stop arrived; it stays failed",
+			"database", database,
+			"tables", tables,
+		)
+		return nil, engine.NewPermanentError("stop rejected: the schema change on database %s failed before the stop arrived", database)
+	default:
+		logger.Warn("stop rejected: the schema change already settled before the stop arrived; its state stays in place",
+			"database", database,
+			"tables", tables,
+			"state", state,
+		)
+		return nil, engine.NewPermanentError("stop rejected: the schema change on database %s was already %s before the stop arrived", database, state)
+	}
 }
 
 // Cancel terminates a running schema change without preserving a checkpoint for
