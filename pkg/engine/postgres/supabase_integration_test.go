@@ -217,8 +217,7 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 			// A listening port alone can precede a usable database connection.
 			// Wait for authenticated SQL over TCP, not the temporary Unix socket.
 			WaitingFor: wait.ForSQL("5432/tcp", "pgx", func(host string, port network.Port) string {
-				return (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
-					Host: net.JoinHostPort(host, port.Port()), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
+				return supabaseFixtureDSN(host, port.Port())
 			}).WithStartupTimeout(supabaseOperationDeadline),
 		},
 		Started: true,
@@ -233,8 +232,7 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, err)
 	port, err := container.MappedPort(ctx, "5432/tcp")
 	require.NoError(t, err)
-	dsn := (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
-		Host: net.JoinHostPort(host, port.Port()), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
+	dsn := supabaseFixtureDSN(host, port.Port())
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
@@ -243,4 +241,10 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&superuser))
 	require.False(t, superuser, "the fixture must exercise Supabase's restricted postgres role")
 	return dsn, db
+}
+
+// Use one connection definition for readiness and the test session.
+func supabaseFixtureDSN(host, port string) string {
+	return (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
+		Host: net.JoinHostPort(host, port), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
 }

@@ -876,12 +876,12 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 			cause:  fmt.Sprintf("the blocking budget for the change to %s is not a bound the engine can enforce", quotedTable(table)),
 			remedy: "correct the engine's blocking budget configuration, then re-run"}, true
 	case executor.CodeRowSecurityRefused:
-		// Not emitted by this adapter yet; keep the outcome vocabulary total.
+		// Keep every pg-sprite outcome classified at the adapter boundary.
 		return &refusal{reason: "row-security-refused",
 			cause:  fmt.Sprintf("the row security change for %s was refused by the engine", quotedTable(table)),
 			remedy: "check the declaration, target, and privileges before re-planning"}, true
 	case executor.CodeRowSecurityOutcomeUnknown:
-		// Not emitted by this adapter yet; keep the outcome vocabulary total.
+		// Keep every pg-sprite outcome classified at the adapter boundary.
 		// pg-sprite requires catalog inspection before any retry.
 		return &refusal{reason: "row-security-outcome-unknown",
 			cause:  fmt.Sprintf("whether the row security change for %s committed is unknown", quotedTable(table)),

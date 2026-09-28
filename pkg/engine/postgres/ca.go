@@ -36,8 +36,10 @@ const (
 // both resolve to no path: the pool then keeps the trust the normalized DSN
 // asks for. pg-sprite honors explicit sslmode in URL and keyword DSNs,
 // including spaces around the keyword assignment. Its RDS host matching is
-// case-insensitive. SchemaBot's normalized mode is therefore preserved; the
-// layers still differ in their coverage of non-commercial RDS suffixes. Both layers
+// case-insensitive. Common explicit modes are preserved, but detection is
+// not identical: an empty URL sslmode or sslmode text inside a quoted keyword
+// value can make the layers disagree about whether a mode was supplied.
+// Their coverage of non-commercial RDS suffixes also differs. Both layers
 // complete verify-full without an sslrootcert with the embedded RDS bundle;
 // verify-ca carries pgx's own verifier and is left to the roots the DSN
 // names. A reference the engine cannot honor is refused —
