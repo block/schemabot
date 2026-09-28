@@ -53,10 +53,15 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 		return err
 	}
 
+	// The leased applies row is the INSERT … SELECT's only source row, so the
+	// token check gates the insert and the conflict update alike: a displaced
+	// driver's statement selects nothing and writes neither. The check goes
+	// through LeaseTokenFence so it serializes against a concurrent steal
+	// instead of passing against a token the statement's snapshot still holds.
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id)
 		SELECT ?, ?, ?, ?, ? FROM applies a
-		WHERE a.id = ? AND a.lease_token = ?
+		WHERE a.id = ? AND `+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token")+`
 		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
