@@ -1,7 +1,8 @@
 // Package postgresconn opens SchemaBot-managed PostgreSQL connections:
 // centralized DSN normalization (required TLS for RDS targets, mirroring the
 // TLS mode mysqlconn injects for RDS MySQL), a UTC session timezone unless
-// the DSN sets one, and a storage pool whose credentials survive secret
+// the DSN sets one, plain timestamp parameters written as their UTC reading,
+// and a storage pool whose credentials survive secret
 // rotation. Use Open for target-database connections and OpenReloadable for
 // the single long-lived storage pool.
 package postgresconn
@@ -39,7 +40,12 @@ import (
 // what the package needs is one a fake cannot get subtly wrong.
 var getConnector func(pgx.ConnConfig) driver.Connector = defaultConnector
 
-func defaultConnector(cfg pgx.ConnConfig) driver.Connector { return stdlib.GetConnector(cfg) }
+// defaultConnector is the connector behind every pool this package opens. Each
+// connection it dials writes plain timestamp parameters as their UTC reading
+// (see utcTimestampCodec).
+func defaultConnector(cfg pgx.ConnConfig) driver.Connector {
+	return stdlib.GetConnector(cfg, stdlib.OptionAfterConnect(registerUTCTimestamps))
+}
 
 // nonVerifyingRDSKey identifies one RDS endpoint dialed under one
 // non-verifying TLS posture. The warning is deduplicated on this pair rather
@@ -248,7 +254,7 @@ func Open(dsn string, opts ...Option) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return sql.OpenDB(stdlib.GetConnector(*cfg)), nil
+	return sql.OpenDB(defaultConnector(*cfg)), nil
 }
 
 // dialConfig resolves the config a SchemaBot-managed connection dials with
@@ -475,8 +481,9 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	// Sessions default to timezone=UTC so server-side now() evaluates in UTC
 	// regardless of the server's TimeZone setting. Storage compares plain
 	// timestamp columns against now() in lease-expiry and staleness
-	// predicates, so a non-UTC session would skew those comparisons. An
-	// explicit timezone wins: GUC names are case-insensitive on the server,
+	// predicates, so a non-UTC session would skew those comparisons; the values
+	// written into those columns are held to UTC on the client side by
+	// utcTimestampCodec. An explicit timezone wins: GUC names are case-insensitive on the server,
 	// and pgx preserves DSN key case in RuntimeParams, so the check must be
 	// case-insensitive too or ?TimeZone=... would coexist with the pin in the
 	// startup packet in nondeterministic map order. PGTZ also lands in
