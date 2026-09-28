@@ -457,6 +457,7 @@ func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
 		logger:    testLogger(),
 	}
+	drainWebhookWorkOnCleanup(t, h)
 	return h, comments, reactions
 }
 
