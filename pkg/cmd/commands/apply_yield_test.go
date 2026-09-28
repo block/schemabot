@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -123,20 +124,46 @@ func TestApplyYield_CompletedApplyReleasesLock(t *testing.T) {
 // apply has finished, so it keeps the lock rather than guess.
 func TestApplyYield_UnreadableStateKeepsLock(t *testing.T) {
 	server, releases := yieldTestServer(t, "")
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", AutoApprove: true, Yield: true, Output: OutputFormatLog}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
 
-	out := runYieldApply(t, server, false)
-
+	require.Error(t, runErr)
 	assert.Zero(t, releases.Load(), "an unknown apply state must keep the lock:\n%s", out)
 	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: the state of apply apply-yield could not be read")
 	assert.Contains(t, out, "schemabot unlock -d testdb -t mysql")
 }
 
+func TestApplyYield_FailedWatchKeepsLockWithoutQuiescenceProof(t *testing.T) {
+	server, releases := yieldTestServer(t, state.Apply.Failed)
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", AutoApprove: true, Yield: true, Watch: true, Output: OutputFormatLog}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	assert.Zero(t, releases.Load(), "a failed parent without child operation states must keep its lock:\n%s", out)
+	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield")
+}
+
+func TestYieldLock_EmptyApplyIDReturnsError(t *testing.T) {
+	var yieldErr error
+	out := stripAnsi(captureStdout(func() { yieldErr = yieldLock("unused", "testdb", "mysql", "owner", "") }))
+
+	require.EqualError(t, yieldErr, "release lock for testdb: the server returned no apply ID")
+	assert.Contains(t, out, "the server returned no apply ID to check")
+}
+
+func TestLockKeptReason_NoActiveChange(t *testing.T) {
+	assert.Equal(t, "the server reported no state for apply "+yieldTestApplyID,
+		lockKeptReason(yieldTestApplyID, state.NoActiveChange))
+}
+
 // Only settled applies give the lock up. Every other state, including a
 // stopped apply that is terminal but resumable, keeps it.
 func TestShouldYieldLock(t *testing.T) {
-	for _, s := range state.SettledApplyStates {
-		assert.True(t, shouldYieldLock(s), "settled state %s releases the lock", s)
-		assert.True(t, shouldYieldLock("STATE_"+s), "proto spelling of %s releases the lock", s)
+	for _, s := range []string{state.Apply.Completed, state.Apply.Cancelled, state.Apply.Reverted} {
+		assert.True(t, shouldYieldLock(&apitypes.ProgressResponse{State: s}), "settled state %s releases the lock", s)
+		assert.True(t, shouldYieldLock(&apitypes.ProgressResponse{State: "STATE_" + s}), "proto spelling of %s releases the lock", s)
 	}
 	for _, s := range []string{
 		state.Apply.Pending,
@@ -149,6 +176,9 @@ func TestShouldYieldLock(t *testing.T) {
 		state.NoActiveChange,
 		"",
 	} {
-		assert.False(t, shouldYieldLock(s), "state %q keeps the lock", s)
+		assert.False(t, shouldYieldLock(&apitypes.ProgressResponse{State: s}), "state %q keeps the lock", s)
 	}
+	assert.False(t, shouldYieldLock(&apitypes.ProgressResponse{State: state.Apply.Failed}), "a failed parent alone does not prove child operations are quiet")
+	assert.False(t, shouldYieldLock(&apitypes.ProgressResponse{State: state.Apply.Failed, Operations: []*apitypes.ProgressOperationResponse{{State: state.Apply.Running}}}))
+	assert.True(t, shouldYieldLock(&apitypes.ProgressResponse{State: state.Apply.Failed, Operations: []*apitypes.ProgressOperationResponse{{State: state.Apply.Failed}}}))
 }

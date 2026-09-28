@@ -273,22 +273,38 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	applyID, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
+		if cmd.Yield && !cmd.NoLock && applyID != "" {
+			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, applyID))
+		}
 		return err
 	}
 
 	if cmd.Yield && !cmd.NoLock {
-		yieldLock(ep, cfg.Database, cfg.Type, owner, applyID)
+		return yieldLock(ep, cfg.Database, cfg.Type, owner, applyID)
 	}
 
 	return nil
 }
 
-// shouldYieldLock reports whether --yield may release the database lock for
-// an apply in finalState. Only a settled apply qualifies: a running apply is
-// still changing the database and a stopped one can be resumed, so either one
-// still needs the lock that keeps other operators off the target.
-func shouldYieldLock(finalState string) bool {
-	return state.IsState(finalState, state.SettledApplyStates...)
+// shouldYieldLock reports whether --yield may release the database lock. A
+// failed parent also needs terminal operation rows because its verdict can be
+// recorded while a sibling operation is still writing to the target.
+func shouldYieldLock(progress *apitypes.ProgressResponse) bool {
+	if !state.IsState(progress.State, state.SettledApplyStates...) {
+		return false
+	}
+	if !state.IsState(progress.State, state.Apply.Failed) {
+		return true
+	}
+	if len(progress.Operations) == 0 {
+		return false
+	}
+	for _, operation := range progress.Operations {
+		if !state.IsTerminalApplyState(operation.State) {
+			return false
+		}
+	}
+	return true
 }
 
 // yieldLock releases the database lock for --yield once the apply has settled.
@@ -296,25 +312,25 @@ func shouldYieldLock(finalState string) bool {
 // command got here: an unwatched apply, a stopped one, and a watch the operator
 // left all return without the apply having finished. Anything that is not a
 // settled state keeps the lock and says how to release it later.
-func yieldLock(ep, database, dbType, owner, applyID string) {
+func yieldLock(ep, database, dbType, owner, applyID string) error {
 	if applyID == "" {
 		templates.WriteLockKept(database, dbType, "the server returned no apply ID to check")
-		return
+		return fmt.Errorf("release lock for %s: the server returned no apply ID", database)
 	}
 	progress, err := client.GetProgress(ep, applyID)
 	if err != nil {
 		templates.WriteLockKept(database, dbType, fmt.Sprintf("the state of apply %s could not be read (%v)", applyID, err))
-		return
+		return fmt.Errorf("read apply %s before releasing lock for %s: %w", applyID, database, err)
 	}
-	if !shouldYieldLock(progress.State) {
+	if !shouldYieldLock(progress) {
 		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, progress.State))
-		return
+		return nil
 	}
 	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
-		fmt.Printf("Warning: failed to release lock: %v\n", err)
-		return
+		return fmt.Errorf("release lock for %s: %w", database, err)
 	}
 	templates.WriteLockReleased(database, dbType)
+	return nil
 }
 
 // lockKeptReason says why --yield kept the lock for an apply that has not
