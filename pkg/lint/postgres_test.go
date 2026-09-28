@@ -350,7 +350,7 @@ func TestLintPostgresSchema_UnlintableEntries(t *testing.T) {
 		{
 			name:       "unparsable",
 			ddl:        `CREATE TABLE orders (id bigint PRIMARY KEY`,
-			wantDetail: "is not a create set: split DDL script: failed to parse SQL statements",
+			wantDetail: "syntax error",
 		},
 		{
 			name:       "empty",
@@ -475,4 +475,23 @@ func TestLintPostgresSchema_EmptyAllowedPostgresPKTypesFails(t *testing.T) {
 func lintOnePostgresEntry(t *testing.T, ddl string) ([]Result, error) {
 	t.Helper()
 	return New().LintPostgresSchema(map[string]string{"entry": ddl})
+}
+
+// A validated RLS declaration retains ordinary schema-shape warnings without
+// treating policy clauses as either extra tables or executable changes.
+func TestLintPostgresSchemaWithRowSecurity(t *testing.T) {
+	results, err := New().LintPostgresSchema(map[string]string{"documents": `
+  CREATE TABLE documents (id integer PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
+ `})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "primary_key", results[0].Linter)
+	_, err = New().LintPostgresSchema(map[string]string{"documents": `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON other_table FOR SELECT USING (true);
+ `})
+	require.Error(t, err, "a policy on another table must not be silently ignored")
 }

@@ -17,7 +17,6 @@ import (
 	"unicode"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
-	"github.com/block/pg-sprite/pkg/diffplan"
 	"github.com/block/pg-sprite/pkg/executor"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
@@ -267,18 +266,14 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
-			desired, err := pgstatement.ParseDesired(ns.Files[filename])
+			report, table, err := planPostgresDefinition(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("parse desired PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
-			desiredTables[desired.Table()] = true
-			report, err := diffplan.Plan(ctx, pool, diffplan.Request{Schema: namespace, Desired: desired})
-			if err != nil {
-				return nil, fmt.Errorf("diff PostgreSQL table %q in namespace %q from file %q: %w", desired.Table(), namespace, filename, err)
-			}
+			desiredTables[table] = true
 			changes, tiers, unrecognized, err := tableChanges(report, parser)
 			if err != nil {
-				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", table, namespace, err)
 			}
 			for _, vocabulary := range unrecognized {
 				// The plan renders a blocked placeholder for the statement,
@@ -288,17 +283,17 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				slog.Warn("PostgreSQL planner returned vocabulary SchemaBot does not recognize; the plan blocks the statement with a placeholder verdict",
 					"database", req.Database,
 					"namespace", namespace,
-					"table", desired.Table(),
+					"table", table,
 					"vocabulary", vocabulary.kind,
 					"value", vocabulary.value)
 			}
 			changes, err = blockMissingPrivileges(ctx, pool, req.Database, report, changes, tiers, tableOwner)
 			if err != nil {
-				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", table, namespace, err)
 			}
 			changes, err = blockOversizedTable(ctx, pool, req.Database, report, changes, tableSizeLimit)
 			if err != nil {
-				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", table, namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}

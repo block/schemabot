@@ -53,7 +53,7 @@ func TestSupabaseEngine(t *testing.T) {
 			CREATE INDEX documents_title_idx ON documents (title);`, "CREATE INDEX CONCURRENTLY")
 	})
 
-	t.Run("RLS pull refuses incomplete export", func(t *testing.T) {
+	t.Run("RLS pull round-trips and native DDL preserves isolation", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), supabaseOperationDeadline)
 		defer cancel()
 		seedSupabaseDocuments(t, ctx, db)
@@ -69,10 +69,15 @@ func TestSupabaseEngine(t *testing.T) {
 		require.NoError(t, err)
 		eng := NewForTarget(0, 0, "postgres", &engine.Credentials{DSN: dsn})
 		response, err := eng.PullSchema(ctx, supabasePullRequest())
-		require.Error(t, err)
-		assert.Nil(t, response, "must not return a baseline that loses access rules")
-		assert.Contains(t, err.Error(), "row-level security")
-		assert.Contains(t, err.Error(), "policy")
+		require.NoError(t, err)
+		require.Contains(t, response.Namespaces, "public")
+		definition := response.Namespaces["public"].Tables["documents"]
+		assert.Contains(t, definition, "ENABLE ROW LEVEL SECURITY")
+		assert.Contains(t, definition, "own_document")
+		assert.Contains(t, definition, "auth.uid()")
+		plan, err := eng.Plan(ctx, supabasePlanRequest(dsn, definition))
+		require.NoError(t, err)
+		assert.True(t, plan.NoChanges, "pulled access rules must converge without changes")
 
 		// Native DDL keeps the original relation and its access rules. This
 		// direct adapter apply does not claim declarative RLS management.

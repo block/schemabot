@@ -405,6 +405,10 @@ The envelope differs by dialect:
 - **PostgreSQL.** A schema is the namespace, ordinary and partitioned tables
   are exported, and only `basic` catalog detail is available. The full
   envelope is in [postgresql.md](postgresql.md).
+  Table definitions include RLS settings, policies, and policy comments when present.
+  Unsupported policy definitions refuse the pull. The shape audit does not assess
+  policy access; see [PostgreSQL row-level security](postgresql.md#row-level-security).
+
 - **Lint.** The MySQL family runs Spirit's schema-shape linters. PostgreSQL
   runs the rules with a PostgreSQL analog — `primary_key`, `has_float`,
   `name_case`, `redundant_indexes` — as warnings; see

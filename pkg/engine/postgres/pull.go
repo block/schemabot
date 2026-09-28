@@ -36,8 +36,6 @@ const inspectUnmodeledPostgresTableObjects = `
 SELECT
   EXISTS (SELECT 1 FROM pg_catalog.pg_trigger
           WHERE tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT tgisinternal),
-  c.relrowsecurity OR c.relforcerowsecurity,
-  EXISTS (SELECT 1 FROM pg_catalog.pg_policy WHERE polrelid OPERATOR(pg_catalog.=) c.oid),
   EXISTS (SELECT 1 FROM pg_catalog.pg_description
           WHERE objoid OPERATOR(pg_catalog.=) c.oid AND objsubid OPERATOR(pg_catalog.>=) 0),
   COALESCE(pg_catalog.cardinality(c.reloptions), 0) OPERATOR(pg_catalog.>) 0,
@@ -49,16 +47,14 @@ WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $
 
 type unmodeledTableObjects struct {
 	trigger     bool
-	rowSecurity bool
-	policy      bool
 	comment     bool
 	reloptions  bool
 	inheritance bool
 }
 
 // PullSchema exports tables that the PostgreSQL declarative format can
-// represent. It refuses tables carrying user triggers, row-level security,
-// policies, comments, non-default relation options, or table inheritance, as
+// represent. It refuses tables carrying user triggers,
+// table or column comments, non-default relation options, or table inheritance, as
 // well as shapes rejected by the renderer. PostgreSQL currently supports only
 // basic catalog detail.
 func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -277,6 +273,9 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 		return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
 	}
 	content, err := schemadiff.Render(model)
+	if errors.Is(err, schemadiff.ErrUnrenderableRowSecurity) {
+		content, err = schemadiff.RenderWithRowSecurity(model)
+	}
 	if err != nil {
 		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: render: %w", namespace, table, err)}, nil
 	}
@@ -324,8 +323,6 @@ func pullUnmodeledTableObjects(ctx context.Context, pool *pgxpool.Pool, namespac
 	var objects unmodeledTableObjects
 	err := pool.QueryRow(ctx, inspectUnmodeledPostgresTableObjects, namespace, table).Scan(
 		&objects.trigger,
-		&objects.rowSecurity,
-		&objects.policy,
 		&objects.comment,
 		&objects.reloptions,
 		&objects.inheritance,
@@ -346,8 +343,6 @@ func unmodeledTableObjectsError(namespace, table string, objects unmodeledTableO
 		present bool
 	}{
 		{"trigger", objects.trigger},
-		{"row-level security", objects.rowSecurity},
-		{"policy", objects.policy},
 		{"comment", objects.comment},
 		{"relation options", objects.reloptions},
 		{"table inheritance", objects.inheritance},

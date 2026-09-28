@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/pg-sprite/pkg/statement"
 	pgproto "github.com/pganalyze/pg_query_go/v6"
 	pgquery "github.com/wasilibs/go-pgquery"
 
@@ -104,6 +105,29 @@ func parsePostgresTableEntry(tableName, content string) (*pgproto.CreateStmt, []
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return nil, nil, fmt.Errorf("postgres lint: %w", err)
+	}
+	// Validate the complete RLS declaration before auditing only its table
+	// and index shape. This audit does not judge authorization policies.
+	hasRLS, err := statement.HasRowSecurityDeclaration(content)
+	if err != nil {
+		return nil, nil, &UnlintableTableError{Table: tableName, Detail: err.Error()}
+	}
+	if hasRLS {
+		desired, err := statement.ParseDesiredWithRowSecurity(content)
+		if err != nil {
+			return nil, nil, &UnlintableTableError{Table: tableName, Detail: err.Error()}
+		}
+		var createSet []string
+		for _, stmt := range desired.Statements() {
+			kind, _, err := parser.Classify(stmt.SQL())
+			if err != nil {
+				return nil, nil, &UnlintableTableError{Table: tableName, Detail: err.Error()}
+			}
+			if kind == ddl.StatementCreateTable || kind == ddl.StatementCreateIndex {
+				createSet = append(createSet, stmt.SQL())
+			}
+		}
+		content = strings.Join(createSet, ";\n")
 	}
 	set, err := ddl.ParseCreateSet(parser, content)
 	if err != nil {
