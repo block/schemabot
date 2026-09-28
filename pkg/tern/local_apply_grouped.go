@@ -1078,8 +1078,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ensureApplyFailureMessage(apply, tasks)
 		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 		if err != nil {
-			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-		} else if !swapped {
+			// The stored apply is still active, so nothing that answers for its
+			// outcome may run: completing a pending control request here would
+			// resolve an operator's command against an apply storage still
+			// reports active, and the observer would post a terminal summary for
+			// it. The drive exits and a later claim finalizes the apply.
+			logger.Error("failed to persist the apply's settled state; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
+				"deployment", apply.Deployment, "stored_state", expectedState, "settled_state", apply.State, "error", err)
+			return true
+		}
+		if !swapped {
 			// Another drive advanced the apply between our reload and write; it
 			// owns the terminal transition and its side-effects. Skip ours.
 			logger.Info("apply terminal-state write lost a race; yielding to the owning drive",

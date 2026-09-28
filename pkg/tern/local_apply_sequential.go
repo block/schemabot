@@ -103,7 +103,11 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		"failed_task", failedTask != nil,
 		"stopped_by_user", stoppedByUser,
 	)
-	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
+	if err := c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser); err != nil {
+		logger.Error("sequential drive exiting without finalizing the apply; it stays active for a later claim to finalize, so its pending control requests stay pending and no terminal summary is posted",
+			"deployment", apply.Deployment, "error", err)
+		return
+	}
 	logger.Info("sequential apply finished", "state", apply.State)
 }
 
@@ -1001,7 +1005,14 @@ func recoveryResumesFromCheckpoint(databaseType string) bool {
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
 // Permanent failures cancel remaining pending tasks; retryable failures leave
 // pending tasks queued for operator recovery.
-func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
+//
+// The apply-level side effects of the outcome — settling pending control
+// requests, releasing the active-apply gauge, and notifying the observer that
+// posts the terminal summary — run only once the outcome is durably stored.
+// When the apply cannot be reloaded or the outcome write fails, it returns an
+// error with the stored apply still active: the drive exits, and the claim
+// that picks the apply up next finalizes it and settles its requests then.
+func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) error {
 	now := time.Now()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	// A multi-operation drive owns only its operation: the tasks it drove carry
@@ -1022,12 +1033,10 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
 			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil, "settled_state", apply.State)
-		return
+		return nil
 	}
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
-		logger.Error("failed to reload apply before sequential finalization",
-			append(apply.MutableLogAttrs(), "error", err)...)
-		return
+		return fmt.Errorf("reload apply %s (database %s) before sequential finalization: %w", apply.ApplyIdentifier, apply.Database, err)
 	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
 		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
 			"stored_state", freshApply.State)
@@ -1036,7 +1045,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}
-		return
+		return nil
 	}
 	previousState := apply.State
 	if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
@@ -1048,23 +1057,27 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	}
 	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-	} else {
-		// A sequential apply's failure reaches the operator through the same
-		// apply log stream as every other path, so a failed table does not read
-		// as an apply that went terminal for no stated reason.
-		switch apply.State {
-		case state.Apply.Failed:
-			c.logApplyFailure(ctx, apply, previousState, apply.ErrorMessage)
-		case state.Apply.FailedRetryable:
-			c.logApplyPausedForRetry(ctx, apply, previousState, apply.ErrorMessage)
-		}
+		// The stored apply is still active, so nothing that answers for its
+		// outcome may run: a pending control request completed here would
+		// resolve an operator's command against an apply storage still reports
+		// running, and the observer would post a terminal summary for it.
+		return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
+			apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+	}
+	// A sequential apply's failure reaches the operator through the same
+	// apply log stream as every other path, so a failed table does not read
+	// as an apply that went terminal for no stated reason.
+	switch apply.State {
+	case state.Apply.Failed:
+		c.logApplyFailure(ctx, apply, previousState, apply.ErrorMessage)
+	case state.Apply.FailedRetryable:
+		c.logApplyPausedForRetry(ctx, apply, previousState, apply.ErrorMessage)
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 			logger.Warn("failed to settle pending control requests after sequential finalization",
 				append(apply.MutableLogAttrs(), "error", err)...)
-			return
+			return nil
 		}
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
@@ -1073,7 +1086,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		if obs := c.getObserver(apply.ID); obs != nil {
 			obs.OnProgress(apply, tasks)
 		}
-		return
+		return nil
 	}
 
 	// Notify observer of terminal state, then clean up
@@ -1081,6 +1094,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		obs.OnTerminal(apply, tasks)
 		c.clearObserver(apply.ID)
 	}
+	return nil
 }
 
 // adoptSequentialOutcome mutates the in-memory apply to the outcome its

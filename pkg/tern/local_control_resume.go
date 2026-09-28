@@ -509,7 +509,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	}
 
 	// Update apply state based on task outcomes
-	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
+	if err := c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser); err != nil {
+		return fmt.Errorf("finalize sequential resume: %w", err)
+	}
 	logger.Info("sequential resume finished", "state", apply.State)
 	return nil
 }
@@ -1236,6 +1238,12 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already terminal on resume (final schema check shows no remaining changes)", oldApplyState, terminalState)
+		// A previous drive can have settled every task and exited before it
+		// recorded the apply's outcome, leaving requests the outcome moots
+		// pending. Settle them before the summary posts.
+		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+			return fmt.Errorf("settle pending control requests for grouped resume apply %s %s after final schema check: %w", apply.ApplyIdentifier, terminalState, err)
+		}
 		c.notifyTerminalObserver(apply, allTasks)
 		return nil
 	}
@@ -2190,6 +2198,13 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
 				return err
 			}
+		}
+		// A previous drive can have settled every task and exited before it
+		// recorded the apply's outcome, leaving requests the outcome moots
+		// pending. Settle them before the summary posts, since nothing later
+		// re-claims a completed apply to do it.
+		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+			return fmt.Errorf("settle pending control requests for resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
 		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
