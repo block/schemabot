@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -109,6 +110,25 @@ func MatchedGroup(callerGroups, configured []string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// MatchedGroups returns every configured group any of the caller's groups
+// matches (see groupMatches), by configured name, sorted and deduplicated.
+// It is MatchedGroup for callers that need the whole membership rather than
+// one granting principal: two callers share a configured group exactly when
+// their MatchedGroups against the same configured list intersect.
+func MatchedGroups(callerGroups, configured []string) []string {
+	matched := make([]string, 0, len(configured))
+	for _, want := range configured {
+		if slices.Contains(matched, want) {
+			continue
+		}
+		if slices.ContainsFunc(callerGroups, func(cg string) bool { return groupMatches(cg, want) }) {
+			matched = append(matched, want)
+		}
+	}
+	slices.Sort(matched)
+	return matched
 }
 
 // authDecision records an API auth decision metric for the request.

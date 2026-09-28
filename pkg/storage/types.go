@@ -158,11 +158,40 @@ type Lock struct {
 	// rather than assuming consent.
 	DisclosedCopyDiscard bool
 
+	// Acquirer records the verified caller that created this lock row, for
+	// deciding whose operator grant the lock falls under. Owner cannot answer
+	// that: it is a caller-supplied match token, readable by anyone who can
+	// list locks.
+	//
+	// Nil when nobody verified was behind the acquire: locks taken server-side
+	// (a PR's apply), locks acquired on a deployment with no scoped operator
+	// grants configured, and rows written before this was recorded. Readers
+	// must treat nil as "shares a grant with nobody", never as "shares a grant
+	// with everybody".
+	//
+	// Only the insert that creates the row writes it. A same-owner re-acquire
+	// leaves it untouched, so for a given lock ID the recorded acquirer never
+	// changes.
+	Acquirer *LockAcquirer
+
 	// CreatedAt is when the lock was acquired.
 	CreatedAt time.Time
 
 	// UpdatedAt is when the lock was last updated.
 	UpdatedAt time.Time
+}
+
+// LockAcquirer is the verified caller behind a lock acquire.
+type LockAcquirer struct {
+	// Subject is the caller's verified identity from the auth layer, never
+	// a client-supplied string.
+	Subject string
+
+	// OperatorGroups are the configured operator groups of the locked database
+	// the caller was a member of when they acquired the lock, by their
+	// configured names, sorted. Empty when the caller held none of them (for
+	// example a deployment admin acting through a write group alone).
+	OperatorGroups []string
 }
 
 // Check terminology:

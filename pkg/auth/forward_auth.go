@@ -265,7 +265,7 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 			// service-caller lane before rejecting.
 			if user, handled := a.authorizeGatewayCaller(w, r, tier, xfccURIs); handled {
 				if user != nil {
-					next.ServeHTTP(w, r.WithContext(WithUser(r.Context(), user)))
+					next.ServeHTTP(w, r.WithContext(WithVerifiedUser(r.Context(), user)))
 				}
 				return
 			}
@@ -337,7 +337,14 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 			}
 		}
 		authDecision(r, tier, "allow", reason)
-		ctx := WithUser(r.Context(), &User{Subject: user, Groups: groups})
+		// A loopback caller supplied its own identity headers, so the identity
+		// is admitted for authorization but not marked verified: records that
+		// attribute work to a person must not name a caller-asserted subject.
+		identity := &User{Subject: user, Groups: groups}
+		ctx := WithUser(r.Context(), identity)
+		if reason != reasonLoopbackSource {
+			ctx = WithVerifiedUser(r.Context(), identity)
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
