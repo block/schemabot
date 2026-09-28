@@ -1221,7 +1221,9 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 			continue
 		}
 		if taskInRevertPhase(task) {
-			c.settleLostRevertPhaseTask(ctx, apply, task, engineState)
+			if err := c.settleLostRevertPhaseTask(ctx, apply, task, engineState); err != nil {
+				return settled, err
+			}
 			settled.add(task)
 			continue
 		}
@@ -1242,7 +1244,9 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	for _, task := range unverified {
-		c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState)
+		if err := c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState); err != nil {
+			return settled, err
+		}
 		settled.add(task)
 	}
 	return settled, nil

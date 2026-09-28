@@ -1062,11 +1062,13 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue
 		}
+		previous := *task
 		task.Attempt++
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
 		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
 			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
+			*task = previous
 			return fmt.Errorf("requeue retryable task %s for retry of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 	}
@@ -1077,18 +1079,23 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a driver crash can still be
 // recovered by another operator driver.
-func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) error {
 	if !startRequested {
-		return
+		return nil
 	}
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
+		previous := *task
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
+			*task = previous
+			return fmt.Errorf("requeue stopped task %s for start of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
@@ -2250,12 +2257,22 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		}
 	}
 
+	retryableApplyError := apply.ErrorMessage
 	if err := c.prepareRetryableTasksForResume(ctx, apply, activeTasks); err != nil {
-		logger.Warn("could not requeue retryable tasks for the retry; drive exits with the apply still retryable for the next claim to retry",
+		apply.State = state.Apply.FailedRetryable
+		apply.ErrorMessage = retryableApplyError
+		if updateErr := c.storage.Applies().Update(ctx, apply); updateErr != nil {
+			return fmt.Errorf("restore retryable apply %s after task requeue failed (%w): %w", apply.ApplyIdentifier, err, updateErr)
+		}
+		logger.Warn("could not requeue retryable tasks for the retry; the apply was restored retryable for the next claim",
 			append(apply.MutableLogAttrs(), "error", err)...)
 		return err
 	}
-	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
+	if err := c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested); err != nil {
+		logger.Warn("could not requeue stopped tasks for start; the request remains pending for the next claim",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 
 	if grouped {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
