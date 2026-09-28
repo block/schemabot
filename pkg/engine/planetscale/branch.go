@@ -569,6 +569,22 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 	})
 }
 
+// operatorBranch returns the development branch the operator supplied for this
+// apply, or "" when SchemaBot creates its own. The apply's options are stored
+// with the apply and handed back on every resume, so a fresh drive and a
+// resumed one read the same answer.
+func operatorBranch(options map[string]string) string {
+	return options["branch"]
+}
+
+// deployRequestDeletesBranch reports whether the deploy request should delete
+// its branch once it deploys. Only a branch SchemaBot created is handed to the
+// deploy request for teardown; an operator-supplied branch belongs to the
+// operator and outlives the deploy.
+func deployRequestDeletesBranch(options map[string]string) bool {
+	return operatorBranch(options) == ""
+}
+
 // deployRequestCreatedEvent states, on the operator's timeline, the cutover
 // ownership SchemaBot asked this deploy request to be created with.
 //
