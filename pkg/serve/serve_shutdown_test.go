@@ -3,17 +3,25 @@ package serve
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/storage/mysqlstore"
 )
 
 // buildCancelDeadline bounds a Build that is expected to return on its
@@ -168,6 +176,113 @@ func TestReconcilePassStopIsBounded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// runShutdownDeadline bounds each wait on a served server in the shutdown test:
+// reaching Start, and returning once signalled. Neither waits on anything that
+// is slow by design, so a wait that outlasts it is a hang rather than a slow
+// machine.
+const runShutdownDeadline = 30 * time.Second
+
+// A pod driving a schema change receives SIGTERM during a rolling deploy. The signal stops the listeners at once, but the background work Start
+// launched — the operator's drives among it — keeps running until Close ends it.
+// A drive that ended on the signal itself would deregister its claim before
+// Close opened the claim drain, so Close would have nothing to hand back and a
+// peer would wait out the whole staleness window while this pod's engine could
+// still be copying. Close ends the drives in its own order instead, engines down
+// and then claims handed back, and nothing Start launched outlives the run.
+//
+// The durable webhook dispatch stands in for the operator here: Start hands
+// every loop it launches the same context, and the dispatch is the one whose
+// start and stop a test can observe without a database.
+func TestServeKeepsBackgroundWorkRunningUntilCloseAfterShutdownSignal(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// A lazily-opened handle: never connected, so the background loops fail
+	// their storage reads fast and svc.Close can close it without a database.
+	db, err := sql.Open("block-mysql", "schemabot@tcp(127.0.0.1:1)/schemabot")
+	require.NoError(t, err)
+	// Close (via svc.Close) owns the handle; this cleanup only prevents a leak
+	// when the test fails before the server shuts down.
+	serverClosed := false
+	t.Cleanup(func() {
+		if !serverClosed {
+			utils.CloseAndLog(db)
+		}
+	})
+	authorizer, err := auth.NewLocalAuthorizer(strings.Repeat("a", 64), logger)
+	require.NoError(t, err)
+
+	started := make(chan context.Context, 1)
+	liveWhenCloseStoppedIt := make(chan bool, 1)
+	var backgroundCtx context.Context
+	srv := &Server{
+		cfg:       &api.ServerConfig{MetricsPort: freeTCPPort(t)},
+		svc:       api.New(mysqlstore.New(db), &api.ServerConfig{}, nil, logger),
+		logger:    logger,
+		authz:     authorizer,
+		telemetry: &api.Telemetry{MetricsHandler: http.NotFoundHandler()},
+		webhook: webhookRuntime{
+			handler: http.NotFoundHandler(),
+			// Start and Close both run on the serving goroutine, so the context
+			// captured here is read there without a race.
+			startDurableWebhookDispatch: func(ctx context.Context) {
+				backgroundCtx = ctx
+				started <- ctx
+			},
+			stopDurableWebhookDispatch: func() {
+				liveWhenCloseStoppedIt <- backgroundCtx.Err() == nil
+			},
+		},
+	}
+
+	runCtx, signalled, stopWatching := watchForShutdownSignal(t.Context())
+	defer stopWatching()
+
+	served := make(chan error, 1)
+	go func() { served <- serveUntilShutdown(runCtx, srv, signalled, "0", "") }()
+
+	var background context.Context
+	select {
+	case background = <-started:
+	case <-time.After(runShutdownDeadline):
+		t.Fatalf("the server did not start its background work within %s", runShutdownDeadline)
+	}
+
+	self, err := os.FindProcess(os.Getpid())
+	require.NoError(t, err)
+	require.NoError(t, self.Signal(syscall.SIGTERM))
+
+	select {
+	case err := <-served:
+		serverClosed = true
+		require.NoError(t, err, "a signalled server shuts down cleanly")
+	case <-time.After(runShutdownDeadline):
+		t.Fatalf("the server did not shut down within %s of SIGTERM", runShutdownDeadline)
+	}
+
+	require.ErrorIs(t, runCtx.Err(), context.Canceled, "the signal ends the run")
+	select {
+	case live := <-liveWhenCloseStoppedIt:
+		assert.True(t, live, "the signal must not end the background work before Close stops it")
+	default:
+		t.Fatal("Close did not stop the background work")
+	}
+	assert.ErrorIs(t, background.Err(), context.Canceled, "the background work does not outlive the run")
+}
+
+// freeTCPPort returns a loopback port that was free a moment ago, for a listener
+// whose address is fixed by configuration rather than chosen at bind time.
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+
+	var config net.ListenConfig
+	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok, "a TCP listener reports a TCP address")
+	require.NoError(t, listener.Close())
+	return addr.Port
 }
 
 // lockedWriter serializes writes from the reconciliation goroutine and the test
