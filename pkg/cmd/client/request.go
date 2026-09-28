@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -64,6 +66,14 @@ func SetAuthToken(token string) {
 
 // bearerTransport sets "Authorization: Bearer <token>" on each request when a
 // token is configured and the header is not already set.
+//
+// The token belongs to the server the command addressed, so across a redirect
+// it travels only while every hop stays on the origin (scheme, host, and port)
+// of the request the command sent. A redirect to another origin is still
+// followed, as net/http follows it, but without the token; once a chain has
+// left the origin it stays unauthenticated, as net/http's own stripping of
+// sensitive headers does. An authenticated request redirected from https to
+// plaintext http is refused rather than followed.
 type bearerTransport struct {
 	base   http.RoundTripper
 	token  string
@@ -74,7 +84,17 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.origin != "" && req.URL.Scheme+"://"+req.URL.Host != t.origin {
 		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
 	}
+	chain := redirectChain(req)
+	first := chain[0]
+	if t.isAuthenticated(first) && downgradesFromHTTPS(chain) {
+		return nil, fmt.Errorf("%w: %s redirected to %s://%s", ErrInsecureTokenTransport, requestOrigin(first.URL), req.URL.Scheme, req.URL.Host)
+	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
+		if !stayedOnFirstOrigin(chain) {
+			slog.Warn("not forwarding the SchemaBot token to a redirect on another origin; the request continues unauthenticated",
+				"origin", requestOrigin(first.URL), "redirect", req.URL.Scheme+"://"+req.URL.Host)
+			return t.base.RoundTrip(req)
+		}
 		if err := GuardInsecureToken(req.URL); err != nil {
 			return nil, err
 		}
@@ -83,6 +103,67 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set("Authorization", "Bearer "+t.token)
 	}
 	return t.base.RoundTrip(req)
+}
+
+// isAuthenticated reports whether a request chain carries a credential: the
+// configured token, or an Authorization header the caller set itself.
+func (t *bearerTransport) isAuthenticated(first *http.Request) bool {
+	return t.token != "" || first.Header.Get("Authorization") != ""
+}
+
+// redirectChain returns the requests net/http sent to arrive at req, oldest
+// first and ending with req itself. A request that is not a redirect is a chain
+// of one.
+func redirectChain(req *http.Request) []*http.Request {
+	chain := []*http.Request{req}
+	for hop := req; hop.Response != nil && hop.Response.Request != nil; hop = hop.Response.Request {
+		chain = append(chain, hop.Response.Request)
+	}
+	slices.Reverse(chain)
+	return chain
+}
+
+// stayedOnFirstOrigin reports whether every hop in a redirect chain targets the
+// origin of the request the command sent.
+func stayedOnFirstOrigin(chain []*http.Request) bool {
+	origin := requestOrigin(chain[0].URL)
+	for _, hop := range chain[1:] {
+		if requestOrigin(hop.URL) != origin {
+			return false
+		}
+	}
+	return true
+}
+
+// downgradesFromHTTPS reports whether the latest hop of a redirect chain is
+// plaintext http after an earlier hop was https.
+func downgradesFromHTTPS(chain []*http.Request) bool {
+	if !strings.EqualFold(chain[len(chain)-1].URL.Scheme, "http") {
+		return false
+	}
+	for _, hop := range chain[:len(chain)-1] {
+		if strings.EqualFold(hop.URL.Scheme, "https") {
+			return true
+		}
+	}
+	return false
+}
+
+// requestOrigin renders a URL's origin as scheme://host:port, with the scheme
+// and host lowercased and the scheme's default port made explicit, so the same
+// server compares equal however a redirect spells it.
+func requestOrigin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
 // ErrInsecureTokenTransport is returned when a Bearer token would be sent over

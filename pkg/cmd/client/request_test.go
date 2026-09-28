@@ -3,6 +3,7 @@ package client
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -204,6 +205,135 @@ func TestAuthTokenRefusedOverInsecureRemote(t *testing.T) {
 	err := doGetIntoCtx(t.Context(), "http://schemabot.example.com", "/api/status", &out)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInsecureTokenTransport)
+}
+
+// redirectServer returns a test server that answers every request with a 307
+// to target+path, so a redirected request keeps its method and body.
+func redirectServer(t *testing.T, newServer func(http.Handler) *httptest.Server, target func() string) *httptest.Server {
+	t.Helper()
+	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target()+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// tokenClient returns a client whose bearer transport carries token over base,
+// so a test can exercise the transport against TLS servers without touching
+// the package-level client.
+func tokenClient(base http.RoundTripper, token string) *http.Client {
+	return &http.Client{Transport: &bearerTransport{base: base, token: token}}
+}
+
+// getThrough sends a GET to rawURL with client and closes any response body.
+func getThrough(t *testing.T, client *http.Client, rawURL string) error {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	return err
+}
+
+// A SchemaBot server that redirects /api/status to /api/v2/status on itself is
+// still the server the token was issued for, so the redirected request arrives
+// authenticated.
+func TestAuthTokenFollowsSameOriginRedirect(t *testing.T) {
+	var gotAuth, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/status" {
+			http.Redirect(w, r, "/api/v2/status", http.StatusTemporaryRedirect)
+			return
+		}
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+	setTokenForTest(t, "tok-abc123")
+
+	var out map[string]any
+	require.NoError(t, doGetIntoCtx(t.Context(), srv.URL, "/api/status", &out))
+	assert.Equal(t, "/api/v2/status", gotPath)
+	assert.Equal(t, "Bearer tok-abc123", gotAuth)
+}
+
+// A SchemaBot server on https that redirects to a different https server — here
+// the same address on another port, which net/http alone would still treat as
+// the same host — hands the request to a server the token was not issued for.
+// The redirect is followed, but the second server never sees the token.
+func TestAuthTokenWithheldFromCrossOriginRedirect(t *testing.T) {
+	var gotAuth string
+	var reached bool
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(other.Close)
+	source := redirectServer(t, httptest.NewTLSServer, func() string { return other.URL })
+
+	err := getThrough(t, tokenClient(source.Client().Transport, "tok-abc123"), source.URL+"/api/status")
+	require.NoError(t, err)
+	assert.True(t, reached, "the cross-origin redirect is followed")
+	assert.Empty(t, gotAuth)
+}
+
+// A chain that leaves the token's origin and bounces back to it stays
+// unauthenticated: the path it returns to was chosen by a server the token was
+// never meant for.
+func TestAuthTokenWithheldAfterChainLeavesOrigin(t *testing.T) {
+	var gotAuth, gotPath string
+	var home *httptest.Server
+	elsewhere := redirectServer(t, httptest.NewServer, func() string { return home.URL + "/api/landing" })
+	home = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/status" {
+			http.Redirect(w, r, elsewhere.URL+"/bounce", http.StatusTemporaryRedirect)
+			return
+		}
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(home.Close)
+
+	err := getThrough(t, tokenClient(http.DefaultTransport, "tok-abc123"), home.URL+"/api/status")
+	require.NoError(t, err)
+	assert.Equal(t, "/api/landing/bounce", gotPath)
+	assert.Empty(t, gotAuth)
+}
+
+// An authenticated request to an https SchemaBot server that redirects to
+// plaintext http is refused before the plaintext request is sent, and the
+// refusal names the security reason rather than a connection failure.
+func TestAuthTokenRefusesHTTPSDowngradeRedirect(t *testing.T) {
+	var reached bool
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+	}))
+	t.Cleanup(plaintext.Close)
+	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
+
+	err := getThrough(t, tokenClient(source.Client().Transport, "tok-abc123"), source.URL+"/api/status")
+	require.ErrorIs(t, err, ErrInsecureTokenTransport)
+	assert.False(t, reached, "no plaintext request is sent")
+}
+
+func TestRequestOriginNormalizesDefaultPortAndCase(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{raw: "https://SchemaBot.example.com/api", want: "https://schemabot.example.com:443"},
+		{raw: "https://schemabot.example.com:443/api", want: "https://schemabot.example.com:443"},
+		{raw: "http://127.0.0.1:8080/api", want: "http://127.0.0.1:8080"},
+		{raw: "http://[::1]/api", want: "http://[::1]:80"},
+	} {
+		u, err := url.Parse(tc.raw)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, requestOrigin(u), tc.raw)
+	}
 }
 
 func TestNoTokenAllowedOverInsecureRemote(t *testing.T) {
