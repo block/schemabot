@@ -397,10 +397,10 @@ func (s *recordingLockStore) Release(context.Context, string, string, string) er
 }
 
 // Force lock release bypasses the ownership check, so it is an administrative
-// override: a database operator's grant covers releasing their own team's
-// locks, but never force-releasing someone else's — for example an admin's
-// incident lock holding applies off the database. Only deployment write-group
-// members may force.
+// override: a database operator's grant covers releasing locks their own
+// operator group took, but never force-releasing someone else's — for example
+// an admin's incident lock holding applies off the database. Only deployment
+// write-group members may force.
 func TestForceLockReleaseIsAdminOnly(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	body := `{"database":"payments","database_type":"mysql","force":true}`
@@ -414,6 +414,7 @@ func TestForceLockReleaseIsAdminOnly(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may force")
 		assert.False(t, locks.forceReleased, "the handler must not reach storage on a denied force release")
+		assert.False(t, locks.released, "a denied force release must not fall through to a normal release")
 	})
 
 	t.Run("a deployment write-group member may force", func(t *testing.T) {
@@ -426,14 +427,15 @@ func TestForceLockReleaseIsAdminOnly(t *testing.T) {
 		assert.True(t, locks.forceReleased)
 	})
 
-	t.Run("a scoped operator's normal release on their granted database proceeds", func(t *testing.T) {
-		locks := &recordingLockStore{}
+	t.Run("a scoped operator's normal release of their group's lock proceeds", func(t *testing.T) {
+		locks := &memoryLockStore{lock: paymentsLock(1, "bob",
+			&storage.LockAcquirer{Subject: "bob", OperatorGroups: []string{"payments-team"}})}
 		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
 		operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
 		rec := scopedDenialRequest(t, svc.handleLockRelease, operator, http.MethodDelete, "/api/locks",
 			`{"database":"payments","database_type":"mysql","owner":"bob"}`)
 
-		assert.Equal(t, http.StatusOK, rec.Code)
-		assert.True(t, locks.released, "the ownership-checked release path serves the operator grant")
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Nil(t, locks.lock, "the ownership-checked release path serves the operator grant")
 	})
 }
