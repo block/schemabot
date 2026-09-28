@@ -38,24 +38,9 @@ func planPostgresDefinition(ctx context.Context, pool *pgxpool.Pool, namespace, 
 	if err != nil {
 		return plan.Report{}, "", err
 	}
-	// An omitted declaration must not silently discard live access rules,
-	// including policies on tables where RLS is currently disabled.
-	var liveRLS bool
-	err = pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM pg_class c
-			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE n.nspname = $1 AND c.relname = $2
-			AND (c.relrowsecurity OR c.relforcerowsecurity
-				OR EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid))
-		)
-	`, namespace, desired.Table()).Scan(&liveRLS)
-	if err != nil {
-		return plan.Report{}, desired.Table(), fmt.Errorf("inspect row security for table %q: %w", desired.Table(), err)
-	}
-	if liveRLS {
-		return plan.Report{}, desired.Table(), fmt.Errorf("table %q has live row security settings or policies missing from its declaration: %w", desired.Table(), schemadiff.ErrUnsupportedChange)
-	}
+	// Table-only declarations manage structure, not row security. This keeps
+	// existing files and pre-RLS rollback baselines compatible; the ordinary
+	// planner leaves live policies and settings unchanged.
 	report, err := diffplan.Plan(ctx, pool, diffplan.Request{Schema: namespace, Desired: desired})
 	return report, desired.Table(), err
 }

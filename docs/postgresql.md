@@ -81,6 +81,13 @@ SchemaBot does not turn the review into executable SQL. Direct RLS apply request
 are also refused. Creating a new table with an RLS declaration is not supported
 yet. Atomic RLS apply is a separate follow-up.
 
+Existing table-only files remain supported on tables with live RLS. They manage
+columns and indexes without changing policies or RLS settings; older rollback
+baselines keep this behavior too. Omitting RLS clauses does **not** disable RLS
+or drop policies. Explicit RLS declarations use the stricter comparison above,
+which currently refuses mixed structural and RLS changes. A no-change result
+for a table-only file says nothing about whether its access policies match.
+
 For example, an existing table can pull as:
 
 ```sql

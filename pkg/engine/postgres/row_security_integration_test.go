@@ -116,9 +116,10 @@ func TestEnginePullDisabledRowSecurityPolicies(t *testing.T) {
 	assert.True(t, plan.NoChanges)
 }
 
-// Omitting all security clauses must refuse even if the table shape is unchanged.
-func TestEngineRowSecurityDeclarationRemoved(t *testing.T) {
-	dsn, db := testutil.StartPostgres(t, "rls_removed")
+// Legacy files and rollback originals manage table shape without claiming
+// ownership of access rules. Exercise every live security state.
+func TestEngineTableOnlyDefinitionPreservesRowSecurity(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_legacy")
 	for _, tc := range []struct{ name, security string }{
 		{"enabled", `ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;`},
 		{"forced", `ALTER TABLE public.documents FORCE ROW LEVEL SECURITY;`},
@@ -131,12 +132,57 @@ func TestEngineRowSecurityDeclarationRemoved(t *testing.T) {
 			require.NoError(t, err)
 			_, err = db.ExecContext(ctx, tc.security)
 			require.NoError(t, err)
-			eng := NewForTarget(0, 0, "rls_removed", &engine.Credentials{DSN: dsn})
-			result, err := eng.Plan(ctx, &engine.PlanRequest{Database: "rls_removed", Credentials: &engine.Credentials{DSN: dsn},
-				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `CREATE TABLE documents (id bigint PRIMARY KEY);`}}}})
-			require.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
-			require.ErrorContains(t, err, "missing from its declaration")
-			assert.Nil(t, result)
+			securityState := func() string {
+				var state string
+				require.NoError(t, db.QueryRowContext(ctx, `
+     SELECT json_build_array(c.relrowsecurity, c.relforcerowsecurity,
+      (SELECT json_agg(row_to_json(p) ORDER BY p.polname) FROM pg_policy p WHERE p.polrelid = c.oid))::text
+     FROM pg_class c WHERE c.oid = 'public.documents'::regclass
+    `).Scan(&state))
+				return state
+			}
+			before := securityState()
+			eng := NewForTarget(0, 0, "rls_legacy", &engine.Credentials{DSN: dsn})
+			req := &engine.PlanRequest{Database: "rls_legacy", Credentials: &engine.Credentials{DSN: dsn},
+				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `CREATE TABLE documents (id bigint PRIMARY KEY);`}}}}
+			result, err := eng.Plan(ctx, req)
+			require.NoError(t, err)
+			require.True(t, result.NoChanges)
+			for _, desired := range []string{
+				`CREATE TABLE documents (id bigint PRIMARY KEY, summary text);`,
+				`CREATE TABLE documents (id bigint PRIMARY KEY, summary text); CREATE INDEX summary_idx ON documents (summary);`,
+			} {
+				req.SchemaFiles["public"].Files["documents.sql"] = desired
+				result, err = eng.Plan(ctx, req)
+				require.NoError(t, err)
+				require.Len(t, result.Changes, 1)
+				require.Len(t, result.Changes[0].TableChanges, 1)
+				change := result.Changes[0].TableChanges[0]
+				require.Empty(t, change.ExecutionMode, change.ModeReason)
+				apply := applyRequest(dsn, "documents", change.DDL)
+				apply.Changes = result.Changes
+				applied, err := eng.Apply(ctx, apply)
+				require.NoError(t, err)
+				require.True(t, applied.Accepted)
+				require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, "documents").State)
+				result, err = eng.Plan(ctx, req)
+				require.NoError(t, err)
+				require.True(t, result.NoChanges)
+				assert.Equal(t, before, securityState())
+			}
+			// A pre-upgrade rollback original has no security clauses. Replanning
+			// that shape must still work, without generating policy or RLS changes.
+			req.SchemaFiles["public"].Files["documents.sql"] = `CREATE TABLE documents (id bigint PRIMARY KEY);`
+			result, err = eng.Plan(ctx, req)
+			require.NoError(t, err)
+			assert.False(t, result.NoChanges)
+			for _, ns := range result.Changes {
+				for _, change := range ns.TableChanges {
+					assert.NotContains(t, change.DDL, "POLICY")
+					assert.NotContains(t, change.DDL, "ROW LEVEL SECURITY")
+				}
+			}
+			assert.Equal(t, before, securityState())
 		})
 	}
 }

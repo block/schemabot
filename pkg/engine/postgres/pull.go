@@ -135,7 +135,7 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 // because they are read by different parties.
 type baselinePolicy struct {
 	// refuseUnmodeledObjects refuses a table that carries objects the
-	// declarative format does not represent — a trigger, a policy, a comment
+	// declarative format does not represent — a trigger or a table/column comment
 	// — even though the renderer would happily render its columns and
 	// indexes without them.
 	refuseUnmodeledObjects bool

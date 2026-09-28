@@ -350,7 +350,7 @@ func TestLintPostgresSchema_UnlintableEntries(t *testing.T) {
 		{
 			name:       "unparsable",
 			ddl:        `CREATE TABLE orders (id bigint PRIMARY KEY`,
-			wantDetail: "syntax error",
+			wantDetail: "parse desired schema: syntax error",
 		},
 		{
 			name:       "empty",
