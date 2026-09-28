@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -8402,6 +8403,70 @@ func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover failed for apply apply-cutover-error (remote remote-cutover-error) (caller: cli:alice)"))
 }
 
+func TestGRPCClient_UnansweredCutoverStaysPendingAndIsResent(t *testing.T) {
+	// A cutover call that ends without an answer may still have reached the
+	// data plane, which records the cutover durably and swaps on its own. The
+	// request therefore stays pending instead of telling the operator the
+	// cutover did not take effect, and the next drive re-sends it; the data
+	// plane answers the re-send as accepted and the request completes.
+	server := &capturingTernServer{
+		cutoverErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-cutover-unanswered",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-cutover-unanswered",
+		State:           state.Apply.WaitingForCutover,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-unanswered",
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outcome unknown, request left pending")
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	assert.Equal(t, "remote-cutover-unanswered", server.getCutoverApplyID())
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status)
+	assert.Empty(t, controlRequests.requests[0].ErrorMessage)
+	assert.Equal(t, state.Apply.CuttingOver, apply.State)
+
+	server.mu.Lock()
+	server.cutoverErr = nil
+	server.cutoverAccepted = true
+	server.cutoverApplyID = ""
+	server.mu.Unlock()
+
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope()))
+	assert.Equal(t, "remote-cutover-unanswered", server.getCutoverApplyID(), "the next drive re-sends the cutover")
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+}
+
 func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *testing.T) {
 	// An operator can start the remote apply directly after SchemaBot records
 	// durable start intent. The operator adopts the active remote state instead
@@ -9664,4 +9729,160 @@ func TestApplyTaskScopePlanID(t *testing.T) {
 		_, err := applyTaskScope{}.planID(&storage.Apply{ApplyIdentifier: "apply-3"})
 		require.Error(t, err)
 	})
+}
+
+// deadlineRecordingTernServer records the deadline each RPC arrives with, so a
+// test can read the bound the client attached without waiting it out.
+type deadlineRecordingTernServer struct {
+	ternv1.UnimplementedTernServer
+	mu        sync.Mutex
+	deadlines map[string]time.Duration
+}
+
+func (s *deadlineRecordingTernServer) record(ctx context.Context, method string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deadlines == nil {
+		s.deadlines = map[string]time.Duration{}
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		s.deadlines[method] = time.Until(deadline)
+	}
+}
+
+func (s *deadlineRecordingTernServer) remaining(method string) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.deadlines[method]
+	return d, ok
+}
+
+func (s *deadlineRecordingTernServer) Progress(ctx context.Context, _ *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	s.record(ctx, ternv1.Tern_Progress_FullMethodName)
+	return &ternv1.ProgressResponse{}, nil
+}
+
+func (s *deadlineRecordingTernServer) Plan(ctx context.Context, _ *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	s.record(ctx, ternv1.Tern_Plan_FullMethodName)
+	return &ternv1.PlanResponse{}, nil
+}
+
+// assertDeadlineNear asserts a recorded deadline sits just under want: the
+// client attached it, and it is the bound for this method rather than some
+// other one.
+func assertDeadlineNear(t *testing.T, server *deadlineRecordingTernServer, method string, want time.Duration) {
+	t.Helper()
+	got, ok := server.remaining(method)
+	require.True(t, ok, "%s must reach the server with a deadline", method)
+	assert.LessOrEqual(t, got, want, method)
+	assert.Greater(t, got, want-10*time.Second, method)
+}
+
+// A driver calls the data plane on a context with no deadline while its
+// heartbeat keeps the lease alive. The production client attaches a default
+// deadline to every such call, so a data plane that stops answering fails the
+// call instead of holding the apply forever.
+func TestGRPCClientAttachesDefaultDeadlines(t *testing.T) {
+	server := &deadlineRecordingTernServer{}
+	client := newRetryTestClient(t, server)
+
+	_, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: "tern-1"})
+	require.NoError(t, err)
+	_, err = client.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders"})
+	require.NoError(t, err)
+
+	assertDeadlineNear(t, server, ternv1.Tern_Progress_FullMethodName, grpcControlRPCDeadline)
+	assertDeadlineNear(t, server, ternv1.Tern_Plan_FullMethodName, grpcHeavyRPCDeadline)
+}
+
+// A caller that sets its own deadline keeps it, even one longer than the
+// default: an operator's storage schema apply carries a convergence budget
+// that can outlast the heavy bound, and the default must not cut it short.
+func TestGRPCClientKeepsTheCallerDeadline(t *testing.T) {
+	server := &deadlineRecordingTernServer{}
+	client := newRetryTestClient(t, server)
+
+	callerBound := grpcHeavyRPCDeadline + 10*time.Minute
+	ctx, cancel := context.WithTimeout(t.Context(), callerBound)
+	defer cancel()
+	_, err := client.Plan(ctx, &ternv1.PlanRequest{Database: "orders"})
+	require.NoError(t, err)
+
+	assertDeadlineNear(t, server, ternv1.Tern_Plan_FullMethodName, callerBound)
+}
+
+// hangingTernServer never answers Progress, standing in for a data plane
+// behind a black-holed connection.
+type hangingTernServer struct {
+	ternv1.UnimplementedTernServer
+}
+
+func (s *hangingTernServer) Progress(ctx context.Context, _ *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	<-ctx.Done()
+	return nil, status.FromContextError(ctx.Err()).Err()
+}
+
+// A call the data plane never answers returns DEADLINE_EXCEEDED at the default
+// bound. The bound is injected short so the test does not wait out the
+// production one.
+func TestDefaultRPCDeadlineEndsAHungCall(t *testing.T) {
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err)
+	grpcServer := grpc.NewServer()
+	ternv1.RegisterTernServer(grpcServer, &hangingTernServer{})
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(grpcServer.Stop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(func(string) time.Duration { return 100 * time.Millisecond })),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(conn) })
+
+	start := time.Now()
+	_, err = ternv1.NewTernClient(conn).Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: "tern-1"})
+	require.Error(t, err)
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	assert.Less(t, time.Since(start), 10*time.Second, "the call must return at the default deadline")
+}
+
+// Every Tern RPC is assigned a bound on purpose. An RPC added later lands in
+// no class and fails here, so its author decides whether the short control
+// bound would cut its legitimate work off.
+func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
+	heavy := map[string]bool{
+		ternv1.Tern_Apply_FullMethodName:             true,
+		ternv1.Tern_Plan_FullMethodName:              true,
+		ternv1.Tern_PlanDiff_FullMethodName:          true,
+		ternv1.Tern_PullSchema_FullMethodName:        true,
+		ternv1.Tern_Revert_FullMethodName:            true,
+		ternv1.Tern_SkipRevert_FullMethodName:        true,
+		ternv1.Tern_StorageSchemaPlan_FullMethodName: true,
+	}
+	control := map[string]bool{
+		ternv1.Tern_Progress_FullMethodName: true,
+		ternv1.Tern_Logs_FullMethodName:     true,
+		ternv1.Tern_Cutover_FullMethodName:  true,
+		ternv1.Tern_Health_FullMethodName:   true,
+		ternv1.Tern_Stop_FullMethodName:     true,
+		ternv1.Tern_Cancel_FullMethodName:   true,
+		ternv1.Tern_Start_FullMethodName:    true,
+	}
+
+	require.Empty(t, ternv1.Tern_ServiceDesc.Streams, "streaming RPCs bypass the unary deadline interceptor")
+	for _, m := range ternv1.Tern_ServiceDesc.Methods {
+		method := "/" + ternv1.Tern_ServiceDesc.ServiceName + "/" + m.MethodName
+		switch {
+		case heavy[method]:
+			assert.Equal(t, grpcHeavyRPCDeadline, grpcMethodDeadline(method), method)
+		case control[method]:
+			assert.Equal(t, grpcControlRPCDeadline, grpcMethodDeadline(method), method)
+		case method == ternv1.Tern_StorageSchemaApply_FullMethodName:
+			assert.Greater(t, grpcMethodDeadline(method), apitypes.MaxStorageApplyTimeout,
+				"a storage convergence may run for the longest budget a request names")
+		default:
+			t.Errorf("%s has no deadline class; add it to the heavy or control list", method)
+		}
+	}
 }
