@@ -531,3 +531,84 @@ func TestEngine_ReleaseCancelledArtifacts_RetainsSharedMetadataWhileTheSchemaIsB
 		"testdb." + deferredCutoverSentinelTable,
 	}, result.Discarded)
 }
+
+// pinArtifact makes dropping the named artifact fail, by pointing a foreign key
+// at it from a table outside the release. It is how a test stops a release
+// part-way at a known step.
+func pinArtifact(t *testing.T, db *sql.DB, artifact string) {
+	t.Helper()
+	const holder = "artifact_pin"
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(
+		"CREATE TABLE %s (id INT PRIMARY KEY, FOREIGN KEY (id) REFERENCES %s (id))",
+		quoteIdentifier(holder), quoteIdentifier(artifact)))
+	require.NoError(t, err, "pin artifact %s", artifact)
+	// Registered after the release's own cleanup, so it runs first and the
+	// pinned artifact can be dropped behind it.
+	dropTablesOnCleanup(t, db, holder)
+}
+
+// A release that fails after moving the copy into the quarantine still reports
+// where the copy went. Reporting only the error would tell an operator the copy
+// was left in place, and they would look for it where it no longer is.
+func TestEngine_ReleaseCancelledArtifacts_FailureAfterPreservingReportsTheCopy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "invoices"
+	checkpoint := utils.CheckpointTableName(baseTable)
+	releaseTestCleanup(t, db, baseTable, checkpoint)
+	seedArtifact(t, db, baseTable, 1)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 5)
+	seedArtifact(t, db, checkpoint, 1)
+	pinArtifact(t, db, checkpoint)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.Error(t, err, "dropping the pinned checkpoint must fail the release")
+	assert.Contains(t, err.Error(), "testdb."+checkpoint, "the error must name the artifact it could not drop")
+	require.NotNil(t, result, "a release that moved the copy must say so alongside its error")
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1, "the copy must have reached the quarantine before the failure")
+	require.Len(t, result.Preserved, 1)
+	assert.Equal(t, "testdb."+utils.NewTableName(baseTable), result.Preserved[0].Source)
+	assert.Equal(t, pendingdrops.Database+"."+quarantined[0], result.Preserved[0].Destination)
+	assert.Equal(t, 5, quarantinedRowCount(t, db, quarantined[0]), "the copied rows must survive")
+	assert.Empty(t, result.Discarded, "the only table it tried to drop was the pinned one")
+	assert.True(t, tableExists(t, db, checkpoint), "the pinned checkpoint must still be on the target")
+}
+
+// Where the quarantine is off, a release that fails part-way still reports the
+// tables it had already dropped, since they are gone either way.
+func TestEngine_ReleaseCancelledArtifacts_FailureAfterDroppingReportsTheDrops(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "refunds"
+	checkpoint := utils.CheckpointTableName(baseTable)
+	releaseTestCleanup(t, db, baseTable, checkpoint)
+	seedArtifact(t, db, baseTable, 1)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 2)
+	seedArtifact(t, db, checkpoint, 1)
+	pinArtifact(t, db, checkpoint)
+
+	eng := New(Config{DisablePendingDrops: true})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.Error(t, err, "dropping the pinned checkpoint must fail the release")
+	require.NotNil(t, result, "a release that dropped tables must say so alongside its error")
+
+	assert.False(t, tableExists(t, db, utils.NewTableName(baseTable)), "the shadow table was dropped before the failure")
+	assert.Equal(t, []string{"testdb." + utils.NewTableName(baseTable)}, result.Discarded)
+	assert.Empty(t, result.Preserved)
+	assert.True(t, tableExists(t, db, checkpoint), "the pinned checkpoint must still be on the target")
+}

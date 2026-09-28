@@ -432,3 +432,91 @@ func TestLocalClient_CancelRetainsSharedArtifactsWhileTheSchemaIsBusy(t *testing
 	assert.Equal(t, 1, countLogMessagesContaining(logs, "is recoverable at"),
 		"the copy that was reclaimed must still be findable")
 }
+
+// pinTargetTable makes dropping a target table fail, by pointing a foreign key
+// at it from a table outside the release, so a test can stop a release after it
+// has already moved the copy.
+func pinTargetTable(t *testing.T, dsn, table string) {
+	t.Helper()
+	const holder = "artifact_pin"
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err)
+	defer spiritutils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf(
+		"CREATE TABLE `%s` (id INT PRIMARY KEY, FOREIGN KEY (id) REFERENCES `%s` (id))", holder, table))
+	require.NoError(t, err, "pin %s", table)
+
+	// Registered after the pinned table's own cleanup, so it runs first and the
+	// pinned table can be dropped behind it.
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		cleanupDB, err := sql.Open("block-mysql", dsn)
+		if !assert.NoError(t, err, "open target to unpin %s", table) {
+			return
+		}
+		defer spiritutils.CloseAndLog(cleanupDB)
+		_, err = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+holder+"`")
+		assert.NoError(t, err, "unpin %s", table)
+	})
+}
+
+// A release that moves the copy into the quarantine and then fails to drop the
+// checkpoint has not left the copy in place. The schema change's log names
+// where the copy went and says the release stopped part-way, rather than
+// telling an operator to look for the copy where it no longer is. The cancel
+// still completes.
+func TestLocalClient_CancelReportsAReleaseThatStoppedPartWay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer spiritutils.CloseAndLog(stor)
+	client := newSpiritControlClient(t, dsn, stor)
+
+	const table = "partial_users"
+	apply := dispatchQueuedApply(t, stor, client, []storage.TableChange{{
+		Namespace: "testdb",
+		Table:     table,
+		DDL:       "ALTER TABLE `partial_users` ADD COLUMN partial_note VARCHAR(255)",
+		Operation: "alter",
+	}})
+	stopApplyAndTasks(t, stor, apply)
+	seedAbandonedCopy(t, dsn, table, 4)
+	pinTargetTable(t, dsn, spiritutils.CheckpointTableName(table))
+
+	cancelResp, err := client.Cancel(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, cancelResp.Accepted)
+
+	driveCancelForStoppedApply(t, stor, client, apply.ID)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Cancelled, settled.State, "a failed release must not abandon the cancel")
+
+	quarantined := quarantinedCopies(t, dsn, spiritutils.NewTableName(table))
+	require.Len(t, quarantined, 1, "the copy must have reached the quarantine before the failure")
+	assert.True(t, targetTableExists(t, dsn, spiritutils.CheckpointTableName(table)),
+		"the pinned checkpoint must still be on the target")
+
+	logs, err := stor.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs, "is recoverable at"),
+		"the schema change's log must name where the copy was kept")
+	assert.Equal(t, 1, countLogMessagesContaining(logs, "stopped in testdb because the release failed"),
+		"the schema change's log must say where the release stopped")
+	assert.Zero(t, countLogMessagesContaining(logs, "copy was left on the target"),
+		"the copy moved, so the log must not say it was left in place")
+}

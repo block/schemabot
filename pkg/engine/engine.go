@@ -237,6 +237,12 @@ type CancelledArtifactReleaser interface {
 	// Tables must not be empty. Every schema change names at least one table, so
 	// an empty list is a lost one, and the schema-scoped artifacts above would
 	// be reclaimed regardless of it.
+	//
+	// A release that fails part-way returns what it reclaimed before failing
+	// alongside the error, or nil when it failed before reclaiming anything. A
+	// caller must not read the error as nothing having been reclaimed: by then
+	// the copy may already be in quarantine, and an operator told it was left
+	// in place would look for it where it no longer is.
 	ReleaseCancelledArtifacts(ctx context.Context, req *ReleaseArtifactsRequest) (*ReleaseArtifactsResult, error)
 }
 

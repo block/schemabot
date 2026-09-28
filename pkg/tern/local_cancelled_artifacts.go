@@ -66,26 +66,59 @@ func (c *LocalClient) releaseCancelledArtifacts(ctx context.Context, eng engine.
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, cancelledArtifactReleaseTimeout)
+	releaseCtx, cancel := context.WithTimeout(ctx, cancelledArtifactReleaseTimeout)
 	defer cancel()
 
-	return c.storage.Applies().WithExclusiveTarget(ctx, apply, func(ctx context.Context) error {
+	err := c.storage.Applies().WithExclusiveTarget(releaseCtx, apply, func(ctx context.Context) error {
+		reclaimedAny := false
 		for _, namespace := range slices.Sorted(maps.Keys(byNamespace)) {
-			if err := c.releaseNamespaceArtifacts(ctx, eng, apply, namespace, byNamespace[namespace]); err != nil {
-				return err
+			reclaimed, err := c.releaseNamespaceArtifacts(ctx, eng, apply, namespace, byNamespace[namespace])
+			reclaimedAny = reclaimedAny || reclaimed
+			if err != nil {
+				return &artifactReleaseError{namespace: namespace, reclaimedAny: reclaimedAny, err: err}
 			}
 		}
 		return nil
 	})
+	if err != nil && releaseOutranItsHold(releaseCtx, err) {
+		// A statement killed by the deadline can surface as the SQL driver's own
+		// error, such as a bad connection, rather than the context's. The
+		// release's own clock is what says it ran out of time.
+		err = fmt.Errorf("release ran past its %s hold on the target: %w", cancelledArtifactReleaseTimeout, errors.Join(context.DeadlineExceeded, err))
+	}
+	return err
 }
+
+// releaseOutranItsHold reports whether a failed release failed because its hold
+// on the target expired, even where the error it returned does not say so.
+func releaseOutranItsHold(releaseCtx context.Context, err error) bool {
+	return errors.Is(releaseCtx.Err(), context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+// artifactReleaseError is a release that stopped in one schema, carrying
+// whether anything had been reclaimed before it stopped. The two outcomes need
+// different words for an operator: "your copy is still where it was" is only
+// true when nothing moved.
+type artifactReleaseError struct {
+	namespace    string
+	reclaimedAny bool
+	err          error
+}
+
+func (e *artifactReleaseError) Error() string {
+	return fmt.Sprintf("reclaim cancelled schema change artifacts in %s: %v", e.namespace, e.err)
+}
+
+func (e *artifactReleaseError) Unwrap() error { return e.err }
 
 // releaseNamespaceArtifacts reclaims one schema's artifacts and records where
 // its data went, so an operator can answer "where did my copy go" from the pull
-// request timeline rather than a server-log dig.
-func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, namespace string, artifacts *namespaceArtifacts) error {
+// request timeline rather than a server-log dig. It reports whether anything
+// was reclaimed, including by a release that then failed.
+func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, namespace string, artifacts *namespaceArtifacts) (bool, error) {
 	creds, err := c.credentialsForTask(artifacts.task)
 	if err != nil {
-		return fmt.Errorf("resolve credentials to reclaim artifacts in %s: %w", namespace, err)
+		return false, fmt.Errorf("resolve credentials to reclaim artifacts in %s: %w", namespace, err)
 	}
 
 	supported, result, err := engine.ReleaseCancelledArtifacts(ctx, eng, &engine.ReleaseArtifactsRequest{
@@ -98,16 +131,30 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 		// released it when the cancel reached it. There is nothing local.
 		c.logger.Debug("engine leaves no artifacts on the target, so a cancel reclaims nothing",
 			append(apply.LogAttrs(), "engine", eng.Name(), "namespace", namespace)...)
-		return nil
+		return false, nil
 	}
+	// What the release did is recorded before its error is returned: a release
+	// that fails part-way has still moved the copy, and the entry naming where
+	// it went is what an operator follows to recover it.
+	reclaimed := c.recordReleaseResult(ctx, apply, namespace, result)
 	if err != nil {
-		return fmt.Errorf("reclaim cancelled schema change artifacts in %s: %w", namespace, err)
+		return reclaimed, err
 	}
-
-	if len(result.Preserved) == 0 && len(result.Discarded) == 0 {
+	if !reclaimed {
 		c.logger.Info("cancelled schema change left no artifacts on the target",
 			append(apply.LogAttrs(), "namespace", namespace, "tables", artifacts.tables)...)
-	} else {
+	}
+	return reclaimed, nil
+}
+
+// recordReleaseResult writes what one schema's release reclaimed and retained to
+// the server log and the apply log, and reports whether it reclaimed anything.
+func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace string, result *engine.ReleaseArtifactsResult) bool {
+	if result == nil {
+		return false
+	}
+	reclaimed := len(result.Preserved) > 0 || len(result.Discarded) > 0
+	if reclaimed {
 		c.logger.Info("reclaimed cancelled schema change artifacts",
 			append(apply.LogAttrs(),
 				"namespace", namespace,
@@ -130,7 +177,7 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 			retainedArtifactsMessage(result), "", "")
 	}
-	return nil
+	return reclaimed
 }
 
 // releasedArtifactsMessage describes a release for the apply log, naming where
@@ -204,16 +251,34 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 // on both the server log and the apply log. An operator seeing a cancelled
 // schema change needs to know a copy survived it, and why.
 func (c *LocalClient) logSkippedArtifactRelease(ctx context.Context, apply *storage.Apply, err error) {
-	reason := "the release failed"
-	switch {
-	case errors.Is(err, storage.ErrActiveApplyExists):
-		reason = "another schema change is running against the same target and may own the copy"
-	case errors.Is(err, context.DeadlineExceeded):
-		reason = "the release ran past the time it is allowed to hold the target, so it gave the target back"
+	reason := skippedArtifactReleaseReason(err)
+
+	var stopped *artifactReleaseError
+	if errors.As(err, &stopped) && stopped.reclaimedAny {
+		// Part of the release landed, and the entries before this one say where
+		// it went. Saying the copy was left in place would contradict them.
+		c.logger.Warn("cancelled schema change artifact release stopped part-way; the rest was left on the target",
+			append(apply.LogAttrs(), "namespace", stopped.namespace, "reason", reason, "error", err)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Reclaiming the cancelled schema change's artifacts stopped in %s because %s. The entries before this one name what was reclaimed; everything else was left on the target", stopped.namespace, reason), "", "")
+		return
 	}
 
 	c.logger.Warn("cancelled schema change left its artifacts on the target",
 		append(apply.LogAttrs(), "reason", reason, "error", err)...)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("The cancelled schema change's copy was left on the target because %s", reason), "", "")
+}
+
+// skippedArtifactReleaseReason states why a release left artifacts behind, in
+// the terms an operator acts on.
+func skippedArtifactReleaseReason(err error) string {
+	switch {
+	case errors.Is(err, storage.ErrActiveApplyExists):
+		return "another schema change is running against the same target and may own the copy"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the release ran past the time it is allowed to hold the target, so it gave the target back"
+	default:
+		return "the release failed"
+	}
 }

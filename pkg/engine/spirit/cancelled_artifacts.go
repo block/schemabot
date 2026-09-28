@@ -88,16 +88,16 @@ func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database stri
 
 	data, err := existingTables(ctx, db, database, dataBearingArtifacts(tables))
 	if err != nil {
-		return nil, fmt.Errorf("find cancelled schema change copy in database %s: %w", database, err)
+		return result, fmt.Errorf("find cancelled schema change copy in database %s: %w", database, err)
 	}
 	metadata, err := existingTables(ctx, db, database, perTableMetadataArtifacts(tables))
 	if err != nil {
-		return nil, fmt.Errorf("find cancelled schema change metadata in database %s: %w", database, err)
+		return result, fmt.Errorf("find cancelled schema change metadata in database %s: %w", database, err)
 	}
 
 	shared, retained, err := e.disposeOfSchemaScopedArtifacts(ctx, db, database, tables)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	metadata = append(metadata, shared...)
 	if len(retained) > 0 {
@@ -112,23 +112,27 @@ func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database stri
 		// keep it recoverable. Discard it instead, matching what the deployment
 		// already chose for the tables an operator asked to delete.
 		discarded, err := discardArtifacts(ctx, db, database, data)
-		if err != nil {
-			return nil, err
-		}
 		result.Discarded = append(result.Discarded, discarded...)
+		if err != nil {
+			return result, err
+		}
 	} else {
 		preserved, err := preserveArtifacts(ctx, db, database, data)
 		if err != nil {
-			return nil, err
+			return result, err
 		}
 		result.Preserved = append(result.Preserved, preserved...)
 	}
 
+	// The copy is already gone from where it was by this point, so a failure
+	// from here on returns the result alongside the error: reporting it as
+	// nothing reclaimed would send an operator looking for a copy that has
+	// moved.
 	discarded, err := discardArtifacts(ctx, db, database, metadata)
-	if err != nil {
-		return nil, err
-	}
 	result.Discarded = append(result.Discarded, discarded...)
+	if err != nil {
+		return result, err
+	}
 
 	e.logger.Info("released cancelled schema change artifacts",
 		"database", database,
@@ -261,7 +265,8 @@ func preserveArtifacts(ctx context.Context, db *sql.DB, database string, names [
 
 // discardArtifacts drops the given tables outright, reporting each by its full
 // schema.table name so a release reads the same way whichever half disposed of
-// a given artifact.
+// a given artifact. A failure part-way returns the tables already dropped
+// alongside the error, because they are gone either way.
 func discardArtifacts(ctx context.Context, db *sql.DB, database string, names []string) ([]string, error) {
 	if err := verifyReleasableArtifacts(database, names); err != nil {
 		return nil, err
@@ -271,7 +276,7 @@ func discardArtifacts(ctx context.Context, db *sql.DB, database string, names []
 	for _, name := range names {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s",
 			quoteIdentifier(database), quoteIdentifier(name))); err != nil {
-			return nil, fmt.Errorf("discard cancelled schema change artifact %s.%s: %w", database, name, err)
+			return discarded, fmt.Errorf("discard cancelled schema change artifact %s.%s: %w", database, name, err)
 		}
 		discarded = append(discarded, database+"."+name)
 	}
