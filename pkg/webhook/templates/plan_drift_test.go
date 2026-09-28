@@ -780,3 +780,90 @@ func planGroupChanges(statements int) []KeyspaceChangeData {
 	}
 	return []KeyspaceChangeData{ks}
 }
+
+// driftFleet builds count members of one class, the first of them primary,
+// named m00, m01, and so on.
+func driftFleet(count int, class string) []DeploymentDriftEntry {
+	members := make([]DeploymentDriftEntry, count)
+	for i := range members {
+		members[i] = DeploymentDriftEntry{Deployment: fmt.Sprintf("m%02d", i), Class: class}
+	}
+	members[0].Primary = true
+	return members
+}
+
+// A clean rollout's line names every member while the names fit on a line,
+// and past the inline limit folds them under the statement, the way a wide
+// shard group's heading does, so a large fleet does not wall the comment.
+func TestRenderPlanComment_RolloutLineFoldsALargeFleet(t *testing.T) {
+	email := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}}}
+	render := func(drift DeploymentDriftData) string {
+		drift.Computed, drift.Clean = true, true
+		return RenderPlanComment(PlanCommentData{
+			Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
+			Changes: email, DeploymentDrift: &drift,
+		})
+	}
+
+	t.Run("at the limit the names stay inline", func(t *testing.T) {
+		out := render(DeploymentDriftData{Deployments: driftFleet(shardNamesInlineLimit, "match")})
+		assert.Contains(t, out, fmt.Sprintf("**Same plan on all %d deployments** (`m00`,", shardNamesInlineLimit))
+		assert.NotContains(t, out, "<details>")
+	})
+	t.Run("mirrored deployments past the limit", func(t *testing.T) {
+		out := render(DeploymentDriftData{Deployments: driftFleet(shardNamesInlineLimit+1, "match")})
+		assert.Contains(t, out, fmt.Sprintf("<details>\n<summary><b>Same plan on all %d deployments</b>.</summary>\n\n`m00`, `m01`,", shardNamesInlineLimit+1))
+		assert.Contains(t, out, fmt.Sprintf("`m%02d`\n\n</details>", shardNamesInlineLimit), "every name stays reachable")
+	})
+	t.Run("ungrouped independent targets past the limit", func(t *testing.T) {
+		out := render(DeploymentDriftData{Independent: true, Deployments: driftFleet(shardNamesInlineLimit+1, "planned")})
+		assert.Contains(t, out, fmt.Sprintf("<details>\n<summary><b>Planned separately for all %d targets</b> — each target holds its own schema, so their plans are not expected to match.</summary>", shardNamesInlineLimit+1))
+	})
+}
+
+// A long per-member breakdown keeps the members an operator has to act on
+// inline and folds the rest, so a blocked or diverged member in a large fleet
+// is the first thing read rather than one line among many.
+func TestRenderPlanComment_MemberBreakdownFoldsMembersWithNothingToFlag(t *testing.T) {
+	email := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}}}
+	render := func(drift DeploymentDriftData) string {
+		drift.Computed = true
+		return RenderPlanComment(PlanCommentData{
+			Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
+			Changes: email, DeploymentDrift: &drift,
+		})
+	}
+	total := shardNamesInlineLimit + 2
+
+	t.Run("a blocked target among independent targets", func(t *testing.T) {
+		members := driftFleet(total, "planned")
+		members[3].Blocked = 1
+		out := render(DeploymentDriftData{
+			Clean: true, Independent: true, Deployments: members,
+			Plans: []DeploymentPlanGroup{{Members: driftMemberNames(members), Primary: true, Changes: email}},
+		})
+		folded := strings.Index(out, "<details>\n<summary>")
+		blocked := strings.Index(out, "- `m03` ✅ planned against its own schema · blocked: 1\n")
+		require.GreaterOrEqual(t, blocked, 0, out)
+		require.GreaterOrEqual(t, folded, 0, out)
+		assert.Less(t, blocked, folded, "the blocked target reads before the fold")
+		assert.Contains(t, out, fmt.Sprintf("<summary>%d of %d targets ✅ planned against their own schemas</summary>\n\n- `m00` (primary) ✅ planned against its own schema\n", total-1, total))
+	})
+	t.Run("diverged deployments among mirrored ones", func(t *testing.T) {
+		members := driftFleet(total, "match")
+		members[2].Class, members[5].Class = "diverged", "error"
+		out := render(DeploymentDriftData{Deployments: members})
+		folded := strings.Index(out, fmt.Sprintf("<summary>%d of %d deployments ✅ match the reviewed plan</summary>", total-2, total))
+		require.GreaterOrEqual(t, folded, 0, out)
+		assert.Less(t, strings.Index(out, "- `m02` "), folded)
+		assert.Less(t, strings.Index(out, "- `m05` "), folded)
+		assert.Greater(t, strings.Index(out, "- `m01` ✅ matches the reviewed plan"), folded, "a member with nothing to flag folds")
+	})
+	t.Run("at the limit every member stays inline", func(t *testing.T) {
+		members := driftFleet(shardNamesInlineLimit, "match")
+		members[1].Blocked = 1
+		out := render(DeploymentDriftData{Clean: true, Deployments: members})
+		assert.Contains(t, out, "- `m02` ✅ matches the reviewed plan\n")
+		assert.NotContains(t, out, "<details>")
+	})
+}

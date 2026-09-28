@@ -1242,8 +1242,9 @@ const shardNamesInlineLimit = 8
 type planGroupNoun struct{ singular, plural string }
 
 var (
-	shardNoun  = planGroupNoun{singular: "shard", plural: "shards"}
-	targetNoun = planGroupNoun{singular: "target", plural: "targets"}
+	shardNoun      = planGroupNoun{singular: "shard", plural: "shards"}
+	targetNoun     = planGroupNoun{singular: "target", plural: "targets"}
+	deploymentNoun = planGroupNoun{singular: "deployment", plural: "deployments"}
 )
 
 // planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`"
@@ -1354,11 +1355,10 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// Independent members were deliberately never compared to each other, so
 		// the mirrored headline would assert agreement the rollup did not check.
 		// Without groups, all that is known is the contract.
-		fmt.Fprintf(sb, "**Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
-			len(drift.Deployments), strings.Join(names, ", "))
+		writeNamedRolloutLine(sb, fmt.Sprintf("Planned separately for all %d targets", len(drift.Deployments)),
+			" — each target holds its own schema, so their plans are not expected to match.", names)
 	case drift.Clean:
-		fmt.Fprintf(sb, "**Same plan on all %d deployments** (%s).\n\n",
-			len(drift.Deployments), strings.Join(names, ", "))
+		writeNamedRolloutLine(sb, fmt.Sprintf("Same plan on all %d deployments", len(drift.Deployments)), ".", names)
 	case drift.Independent:
 		// A member that could not be planned blocks under either contract, but
 		// only mirrored members can be out of agreement with each other. Calling
@@ -1374,30 +1374,80 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 	if drift.Clean && !anyDeploymentBlocked(drift.Deployments) {
 		return
 	}
+	// A long list keeps the members an operator has to act on inline and folds
+	// the ones with nothing to flag, so a large fleet does not bury them.
+	fold := len(drift.Deployments) > shardNamesInlineLimit
+	var quiet []string
 	for i, d := range drift.Deployments {
-		name := names[i]
-		if d.Primary {
-			name += " (primary)"
+		line := driftMemberLine(drift, d, names[i])
+		if fold && !driftMemberNeedsAttention(d) {
+			quiet = append(quiet, line)
+			continue
 		}
-		switch d.Class {
-		case "match":
-			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan%s\n", name, blockedSuffix(d.Blocked))
-		case "planned":
-			fmt.Fprintf(sb, "- %s ✅ planned against its own schema%s\n", name, blockedSuffix(d.Blocked))
-		case "diverged":
-			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s%s\n", name, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
-		default:
-			// An errored member means different things under the two contracts:
-			// a mirrored member's diff could not be confirmed against the
-			// reviewed plan, while an independent member has no plan at all.
-			reason := "could not verify"
-			if drift.Independent {
-				reason = "could not plan"
-			}
-			fmt.Fprintf(sb, "- %s "+glyph.Failed+" %s%s%s\n", name, reason, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
-		}
+		sb.WriteString(line)
 	}
 	sb.WriteString("\n")
+	if len(quiet) > 0 {
+		fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n\n%s\n</details>\n\n", quietMembersSummary(drift, len(quiet)), strings.Join(quiet, ""))
+	}
+}
+
+// writeNamedRolloutLine renders a clean rollout's one-line statement followed
+// by the members it covers. Past the inline limit the names fold into a details
+// block under the statement, the way a wide shard group's heading does, so the
+// statement stays one line and the names stay reachable.
+func writeNamedRolloutLine(sb *strings.Builder, statement, tail string, names []string) {
+	if len(names) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "**%s** (%s)%s\n\n", statement, strings.Join(names, ", "), tail)
+		return
+	}
+	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b>%s</summary>\n\n%s\n\n</details>\n\n", statement, tail, strings.Join(names, ", "))
+}
+
+// driftMemberLine renders one member's line in the per-member drift breakdown.
+func driftMemberLine(drift *DeploymentDriftData, d DeploymentDriftEntry, name string) string {
+	if d.Primary {
+		name += " (primary)"
+	}
+	switch d.Class {
+	case "match":
+		return fmt.Sprintf("- %s ✅ matches the reviewed plan%s\n", name, blockedSuffix(d.Blocked))
+	case "planned":
+		return fmt.Sprintf("- %s ✅ planned against its own schema%s\n", name, blockedSuffix(d.Blocked))
+	case "diverged":
+		return fmt.Sprintf("- %s "+glyph.Attention+" diverged%s%s\n", name, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
+	default:
+		// An errored member means different things under the two contracts:
+		// a mirrored member's diff could not be confirmed against the
+		// reviewed plan, while an independent member has no plan at all.
+		reason := "could not verify"
+		if drift.Independent {
+			reason = "could not plan"
+		}
+		return fmt.Sprintf("- %s "+glyph.Failed+" %s%s%s\n", name, reason, blockedSuffix(d.Blocked), driftDetailSuffix(d.Detail))
+	}
+}
+
+// driftMemberNeedsAttention reports whether a member's line carries something
+// an operator has to act on: it diverged, could not be planned or verified, or
+// carries a change the engine will refuse at apply.
+func driftMemberNeedsAttention(d DeploymentDriftEntry) bool {
+	switch d.Class {
+	case "match", "planned":
+		return d.Blocked > 0
+	default:
+		return true
+	}
+}
+
+// quietMembersSummary labels the folded members of a long drift breakdown with
+// how many there are and what they have in common. Every member of one rollup
+// is classified under the same contract, so they share one outcome.
+func quietMembersSummary(drift *DeploymentDriftData, count int) string {
+	if drift.Independent {
+		return fmt.Sprintf("%s ✅ planned against their own schemas", groupCoveragePhrase(targetNoun, count, len(drift.Deployments)))
+	}
+	return fmt.Sprintf("%s ✅ match the reviewed plan", groupCoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
 }
 
 func anyDeploymentBlocked(deployments []DeploymentDriftEntry) bool {
