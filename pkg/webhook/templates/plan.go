@@ -2086,7 +2086,10 @@ func appendDatabaseFlag(command, database string) string {
 
 // MsgConfirmationPlanForOtherEnvironment rejects an apply-confirm whose -e
 // names a different environment than the pending confirmation was planned for.
-const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation on this pull request was planned for `%s`, not `%s`. Nothing was applied, and the pending confirmation is preserved. Run `%s` to confirm that plan, or `%s` to plan this environment."
+// The apply command it offers plans and applies the requested environment in
+// one step and pauses for apply-confirm only when that plan needs one, so the
+// message says so instead of promising a second confirmation.
+const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation on this pull request was planned for `%s`, not `%s`. Nothing was applied, and the pending confirmation is preserved. Run `%s` to confirm that plan, or `%s` to plan and apply this environment in one step; it pauses for `apply-confirm` only when its plan needs one."
 
 // RenderConfirmationPlanForOtherEnvironment builds runnable recovery commands
 // with the same database scope, tenant, and option flags as the rejected
@@ -2100,8 +2103,9 @@ func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnviron
 // MsgConfirmationPlanUnavailable rejects an apply-confirm whose pending
 // confirmation pins no plan SchemaBot can load, so nothing attests which
 // environment the operator reviewed. The verb takes the runnable apply command
-// that plans the requested environment again.
-const MsgConfirmationPlanUnavailable = "The pending confirmation on this pull request is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed. Nothing was applied, and the pending confirmation is preserved. Run `%s` to plan this environment again, then confirm that plan."
+// that plans and applies the requested environment again in one step; that
+// apply pauses for apply-confirm only when its new plan needs one.
+const MsgConfirmationPlanUnavailable = "The pending confirmation on this pull request is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed. Nothing was applied, and the pending confirmation is preserved. Run `%s` to plan and apply this environment again in one step; the new plan replaces the one that could not be loaded, and the apply pauses for `apply-confirm` only when that plan needs it."
 
 // RenderConfirmationPlanUnavailable builds the missing-plan rejection with a
 // recovery command carrying the same database scope, tenant, and option flags

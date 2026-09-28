@@ -127,11 +127,11 @@ func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *test
 	scoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "orders", ApplyCommandOptions{Tenant: "acme", DeferCutover: true})
 	assert.Contains(t, scoped, "planned for `staging`, not `production`")
 	assert.Contains(t, scoped, "Run `schemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover` to confirm that plan")
-	assert.Contains(t, scoped, "or `schemabot apply -e production -d orders --tenant acme --defer-cutover` to plan this environment")
+	assert.Contains(t, scoped, "or `schemabot apply -e production -d orders --tenant acme --defer-cutover` to plan and apply this environment in one step")
 
 	unscoped := RenderConfirmationPlanForOtherEnvironment("staging", "production", "", ApplyCommandOptions{})
 	assert.Contains(t, unscoped, "Run `schemabot apply-confirm -e staging` to confirm that plan")
-	assert.Contains(t, unscoped, "or `schemabot apply -e production` to plan this environment")
+	assert.Contains(t, unscoped, "or `schemabot apply -e production` to plan and apply this environment in one step")
 }
 
 // The missing-plan rejection's recovery command carries the rejected command's
@@ -139,10 +139,10 @@ func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *test
 // that manages several databases. An unscoped command is answered unscoped.
 func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
 	scoped := RenderConfirmationPlanUnavailable("production", "orders", ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true})
-	assert.Contains(t, scoped, "Run `schemabot apply -e production -d orders --tenant acme --allow-unsafe` to plan this environment again")
+	assert.Contains(t, scoped, "Run `schemabot apply -e production -d orders --tenant acme --allow-unsafe` to plan and apply this environment again in one step")
 
 	unscoped := RenderConfirmationPlanUnavailable("production", "", ApplyCommandOptions{})
-	assert.Contains(t, unscoped, "Run `schemabot apply -e production` to plan this environment again")
+	assert.Contains(t, unscoped, "Run `schemabot apply -e production` to plan and apply this environment again in one step")
 }
 
 // A plan run without -e answers with one comment covering every environment,

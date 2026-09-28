@@ -936,10 +936,12 @@ so the confirmation is refused when that record cannot vouch for the command:
 
 - If the lock pins no plan SchemaBot can load, nothing is applied and the
   comment asks for a fresh `schemabot apply -e <environment>`, which pins a new
-  plan.
+  plan and applies it in one step, pausing for `apply-confirm` only when that
+  plan needs confirmation.
 - If the pinned plan was made for a different environment than `-e` names,
   nothing is applied; the comment gives the `apply-confirm` command for the
-  planned environment and the `apply` command for the requested one.
+  planned environment and the `apply` command for the requested one, which
+  plans and applies that environment in one step the same way.
 - If a prior environment in the rollout order has pending changes again, the
   same block that stops `schemabot apply` stops the confirmation.
 

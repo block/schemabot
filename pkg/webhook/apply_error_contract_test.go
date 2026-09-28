@@ -273,7 +273,7 @@ func TestApplyConfirmCommandCoreMissingPlanRecoveryCommandKeepsOperatorFlags(t *
 	require.NoError(t, err)
 	assert.False(t, retry)
 	body := requireComment(t, comments, "unverifiable-plan apply-confirm comment")
-	assert.Contains(t, body, "Run `schemabot apply -e staging -d orders --tenant acme --defer-cutover` to plan this environment again")
+	assert.Contains(t, body, "Run `schemabot apply -e staging -d orders --tenant acme --defer-cutover` to plan and apply this environment again in one step")
 }
 
 // A prior environment with pending changes blocks the confirm as a terminal
