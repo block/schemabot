@@ -1070,19 +1070,25 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 // prepareStoppedTasksForResume turns an operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a driver crash can still be
-// recovered by another operator driver.
-func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
+// recovered by another operator driver. A requeue write that does not land is
+// returned: the task row is still stopped, so completing the start would report
+// an operator's command as done while nothing runs. The caller exits the drive
+// with the start request still pending, and the next claim retries it.
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) error {
 	if !startRequested {
-		return
+		return nil
 	}
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
+			return fmt.Errorf("requeue stopped task %s for start of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
@@ -2245,7 +2251,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
-	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
+	if err := c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested); err != nil {
+		logger.Warn("could not requeue stopped tasks for the pending start; drive exits with the start request still pending for the next claim to retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 
 	if grouped {
 		resumeCtx, cancelResume := context.WithCancel(ctx)

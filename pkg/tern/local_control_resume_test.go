@@ -1172,6 +1172,81 @@ func TestResumeApplySequential_AbortsWhenLandedStatementSettlementRefused(t *tes
 	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
 }
 
+// An operator stops an apply mid-copy of `users` and later sends `start`. The
+// drive consumes the start by requeueing the stopped task to pending, and that
+// write fails. The task row is still stopped, so nothing would run: the drive
+// must exit with an error before writing the apply running or handing anything
+// to the engine, leaving the start request pending so the next claim retries
+// it, rather than reporting the operator's start as completed.
+func TestResumeApplyWithTasks_StartStaysPendingWhenStoppedTaskRequeueFails(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
+	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+	c.spiritEngine = eng
+	c.heartbeatInterval = time.Hour
+
+	plan := &storage.Plan{ID: 5}
+	apply := &storage.Apply{
+		ID:              21,
+		ApplyIdentifier: "apply-start-requeue-refused",
+		PlanID:          plan.ID,
+		Database:        "testapp",
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task_email",
+		Database:       "testapp",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.Stopped,
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	requests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ID:          1,
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{
+		plans:   &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }},
+		applies: applies,
+		tasks: &updateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			updateErr:              storageErr,
+		},
+		controlRequests: requests,
+		logs:            logs,
+	}
+
+	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorContains(t, err, "requeue stopped task task_email for start of apply apply-start-requeue-refused")
+	start, err := requests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, start)
+	assert.Equal(t, storage.ControlRequestPending, start.Status, "the operator's start stays pending for the next claim")
+	assert.True(t, state.IsState(task.State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", task.State)
+	assert.Empty(t, eng.applied, "nothing is handed to the engine")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Stopped),
+		"the drive exits before writing the apply running; stored state was %q", stored.State)
+	assert.Nil(t, stored.CompletedAt)
+	for _, entry := range logs.logs {
+		assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+			"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+	}
+}
+
 // A task in an engine-monitored revert phase carries no evidence a schema
 // comparison can settle: post-cutover the live schema matches the reviewed
 // target until the revert lands. Revert-phase states never reach a sequential
