@@ -241,18 +241,19 @@ ifeq ($(FRESH),1)
 endif
 	docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.telemetry.yml up --build
 
-# Start services, apply testapp schema, then show logs (full demo workflow)
-#   make demo              # Start and apply MySQL + Vitess schema (wipes data)
-#   make demo KEEP_DATA=1  # Restart without wiping data (preserves seeded rows)
-#   make demo SKIP_APPLY=1 # Start server only, skip schema applies (for debugging)
 # Start a sample through the same onboarding path as an installed CLI.
-# Use ENGINE=postgres for PostgreSQL. The printed path is your demo project.
+#   make demo                 # Create a sample MySQL project
+#   make demo ENGINE=postgres # Create a sample PostgreSQL project
+# The printed path is your demo project.
 demo: build
 	@demo_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/schemabot-demo.XXXXXX"); \
 	echo "Demo project: $$demo_dir"; \
 	cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type $(or $(ENGINE),mysql)
 
 # Full developer environment, including LocalScale and multiple deployments.
+#   make demo-full              # Start and apply MySQL + Vitess schema (wipes data)
+#   make demo-full KEEP_DATA=1   # Preserve seeded rows
+#   make demo-full SKIP_APPLY=1  # Start services without applying schemas
 demo-full:
 	@# Reset schema files to baseline so the demo starts clean.
 	@./scripts/generate-schema-change.sh reset 2>/dev/null || true

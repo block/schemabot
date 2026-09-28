@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Record the real wizard and first plan with disposable, preconfigured DSNs.
+"""Record the real wizard and first plan using disposable databases.
 
-Requires pyte (pip install pyte), DATABASE_URL and SCHEMABOT_STORAGE_DSN pointing at demo databases.
+Requires pyte (pip install pyte). No apply is issued.
+With --sample, Docker provisions a MySQL or PostgreSQL sample with customers and
+orders; recording edits customers.email. No connection environment variables are needed.
+Without --sample, set DATABASE_URL and SCHEMABOT_STORAGE_DSN to demo databases.
 The target must contain users(id, email varchar(255)): public.users for Postgres,
-shop.users for MySQL. Postgres also needs an empty analytics namespace. No apply is issued.
+shop.users for MySQL. Postgres also needs an empty analytics namespace.
 """
 import argparse
 import codecs

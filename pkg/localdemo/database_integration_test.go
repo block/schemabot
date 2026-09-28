@@ -26,7 +26,7 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			sample, err := Ensure(ctx, project, engine)
 			require.NoError(t, err)
 			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 				defer cancel()
 				require.NoError(t, exec.CommandContext(ctx, "docker", "rm", "-fv", sample.Name).Run())
 			})
@@ -42,6 +42,9 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			var email string
 			require.NoError(t, db.QueryRowContext(ctx, "SELECT email FROM customers WHERE id=1").Scan(&email))
 			require.Equal(t, "alex@example.com", email)
+			var status string
+			require.NoError(t, db.QueryRowContext(ctx, "SELECT status FROM orders WHERE id=1").Scan(&status))
+			require.Equal(t, "pending", status)
 			_, err = db.ExecContext(ctx, "UPDATE customers SET email='changed@example.com' WHERE id=1")
 			require.NoError(t, err)
 			same, err := Ensure(ctx, project, engine)

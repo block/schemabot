@@ -1627,12 +1627,13 @@ or overwrite a concurrent configuration update. Retrying an identical registrati
 
 Initialization verifies the imported schema before publishing it and never applies changes to an
 existing target. An explicitly requested sample is created and seeded separately before entering
-the same import-and-verify workflow. It must not overwrite existing schema files or redirect an existing profile to another
-connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+the same import-and-verify workflow. It must not overwrite existing schema files or redirect
+an existing profile to another connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
 its state so the retry uses the same execution authority.
 
 *Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
-`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
+`pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
+`pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
 
 ## Structural enforcement
 
