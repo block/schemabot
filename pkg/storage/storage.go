@@ -142,6 +142,14 @@ type LockStore interface {
 	// Returns ErrLockNotOwned if the lock is not owned by the caller.
 	Release(ctx context.Context, database, dbType, owner string) error
 
+	// ReleaseByID releases the lock only while the row with the given ID still
+	// holds it under the given owner, so a caller that authorized the release
+	// against that row's recorded acquirer can never delete a newer lock. It
+	// returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
+	// different row holds the lock, and ErrLockNotOwned when the row is held
+	// under another owner.
+	ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error
+
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
 	// rollback intent owned by the same PR remains intact.
