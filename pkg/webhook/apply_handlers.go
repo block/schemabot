@@ -251,15 +251,19 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"pending_plan_id", existingLock.PendingPlanID)
 		}
 
-		// Stale lock from this PR (no active applies) — release it so we can re-plan.
-		// Use owner-scoped Release: ownership can change between the Get above
-		// and this Release (e.g. an unrelated `schemabot unlock` clears the lock
-		// and another PR acquires it). ErrLockNotFound / ErrLockNotOwned are
-		// expected and silently no-op'd — the loop below will reacquire if free.
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
+		// Release only the intent inspected above. A concurrent command can
+		// replace the pin while this apply is deciding whether it is stale, and
+		// that newer intent must remain held.
+		released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(
+			ctx, database, dbType, lockOwner, existingLock.PendingPlanID,
+		)
+		if relErr != nil {
 			h.logger.Error("failed to release stale lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", relErr)
+		} else if !released {
+			h.logger.Info("stale lock intent changed before release; keeping the current lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"observed_pending_plan_id", existingLock.PendingPlanID)
 		}
 	}
 
@@ -946,8 +950,12 @@ func (h *Handler) rollbackAwaitsConfirmation(ctx context.Context, lock *storage.
 // refused while a rollback awaits confirmation, and how to settle the rollback
 // first. The rollback's environment is named when its plan loaded.
 func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) string {
+	if rollbackPlan == nil {
+		return fmt.Sprintf("The lock this PR holds on `%s` belongs to a rollback plan that is unavailable, and a new apply would discard it. "+
+			"Use `schemabot unlock` to cancel it, then retry the apply.", database)
+	}
 	confirm := "schemabot rollback-confirm"
-	if rollbackPlan != nil && rollbackPlan.Environment != "" {
+	if rollbackPlan.Environment != "" {
 		confirm += " -e " + rollbackPlan.Environment
 	}
 	return fmt.Sprintf("The lock this PR holds on `%s` belongs to a rollback plan that has not been confirmed, and a new apply would discard it. "+
