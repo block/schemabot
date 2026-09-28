@@ -634,7 +634,7 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 
 	s.logger.Debug("operator driver started", "driver", driverID)
 
-	if claimGateClosed(stop) {
+	if !s.admitClaimPass(stop) {
 		s.logger.Debug("operator driver stopping before its first claim; claiming has stopped", "driver", driverID)
 		return
 	}
@@ -651,20 +651,29 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 		case <-wake:
 			// select picks at random among ready cases, so a wake or tick
 			// queued before claiming stopped can still be chosen over stop.
-			if claimGateClosed(stop) {
+			if !s.admitClaimPass(stop) {
 				s.logger.Debug("operator driver stopping instead of a woken claim; claiming has stopped", "driver", driverID)
 				return
 			}
 			s.logger.Debug("operator driver woke for queued apply", "driver", driverID)
 			s.driveTick(ctx, driverID)
 		case <-ticker.C:
-			if claimGateClosed(stop) {
+			if !s.admitClaimPass(stop) {
 				s.logger.Debug("operator driver stopping instead of a polled claim; claiming has stopped", "driver", driverID)
 				return
 			}
 			s.driveTick(ctx, driverID)
 		}
 	}
+}
+
+// admitClaimPass serializes claim-pass admission with StopClaiming. A pass
+// admitted while the gate is open may finish after closure; once closure owns
+// operatorMu, every later admission observes the closed gate and stops.
+func (s *Service) admitClaimPass(stop <-chan struct{}) bool {
+	s.operatorMu.Lock()
+	defer s.operatorMu.Unlock()
+	return !claimGateClosed(stop)
 }
 
 // claimGateClosed reports, without blocking, whether StopClaiming has closed
