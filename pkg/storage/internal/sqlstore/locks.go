@@ -223,6 +223,45 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 	return nil
 }
 
+// ReleaseByID deletes the lock only while the row the caller read still holds
+// it. The row ID pins everything recorded on that row, the acquirer included,
+// since only the insert that creates a row writes it; a caller that authorized
+// against the row it read therefore cannot delete a lock acquired after that
+// read. When nothing is deleted the lock is re-read, so the caller learns
+// whether it is gone, held by a new row, or held under another owner.
+func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM locks
+		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
+	`, id, database, dbType, owner)
+	if err != nil {
+		return fmt.Errorf("release lock row %d for %s/%s owner=%s: %w", id, database, dbType, owner, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected releasing lock row %d for %s/%s owner=%s: %w",
+			id, database, dbType, owner, err)
+	}
+	if rowsAffected > 0 {
+		return nil
+	}
+
+	current, err := s.Get(ctx, database, dbType)
+	if err != nil {
+		return fmt.Errorf("read lock after release of row %d affected no rows for %s/%s owner=%s: %w",
+			id, database, dbType, owner, err)
+	}
+	if current == nil {
+		return storage.ErrLockNotFound
+	}
+	if current.ID != id {
+		return storage.ErrLockReplaced
+	}
+	return storage.ErrLockNotOwned
+}
+
 // ReleaseIfPendingPlanID atomically releases only the lock intent the caller
 // observed. Same-owner commands can replace pending_plan_id (for example, an
 // apply lock can become a rollback lock), so owner-only release is insufficient

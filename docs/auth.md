@@ -698,8 +698,10 @@ There are two details to account for:
   trail. Leave production out of `operator_environments` if you want these
   teams to use PRs there.
 - **Locks cover all environments.** A staging operator can lock its database
-  across the deployment, which can also hold up production changes. Forcing
-  someone else's lock to release requires an admin.
+  across the deployment, which can also hold up production changes. An
+  operator can release a lock only when it was taken by a member of one of
+  their operator groups for that database; any other lock, and forcing a
+  release, requires an admin.
 
 <a id="calling-schemabot-as-a-service"></a>
 
