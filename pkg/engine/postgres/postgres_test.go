@@ -1229,8 +1229,8 @@ func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
 
 // Two schema files in one namespace that declare the same table give the plan
 // no single desired definition: diffing each on its own would drop from the
-// live table whatever only the other file declares. The plan fails before
-// touching the target, naming the table and both files.
+// live table whatever only the other file declares. The namespace planner
+// fails before diffing any file, naming the table and both files.
 func TestPlanSchemasRefusesTableDeclaredByTwoFiles(t *testing.T) {
 	req := &engine.PlanRequest{
 		Database: "orders_db",
