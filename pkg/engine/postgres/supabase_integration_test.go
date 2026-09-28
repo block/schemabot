@@ -88,6 +88,15 @@ func TestSupabaseEngine(t *testing.T) {
 			SET LOCAL request.jwt.claim.sub = '11111111-1111-1111-1111-111111111111';
 		`)
 		require.NoError(t, err)
+		var role string
+		var superuser, bypassRLS bool
+		require.NoError(t, tx.QueryRowContext(ctx, `
+			SELECT current_user, rolsuper, rolbypassrls
+			FROM pg_roles WHERE rolname = current_user
+		`).Scan(&role, &superuser, &bypassRLS))
+		assert.Equal(t, "authenticated", role)
+		assert.False(t, superuser)
+		assert.False(t, bypassRLS, "visibility must be checked as an application reader")
 		var count int
 		require.NoError(t, tx.QueryRowContext(ctx, "SELECT count(*) FROM public.documents").Scan(&count))
 		assert.Equal(t, 1, count, "authenticated readers still see only their permitted row")
