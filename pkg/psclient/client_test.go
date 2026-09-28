@@ -2,9 +2,11 @@ package psclient
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -276,6 +278,161 @@ func TestDeployRequestAutoCutoverRefusesWithoutBaseURL(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no PlanetScale API base URL")
+}
+
+// keyspacesServer serves the keyspace list endpoint for branch main of
+// block/orders, answering each requested page with the body pages maps it to.
+// A page with no entry is answered 404, so a request the test did not expect
+// fails loudly. The pages requested, in order, are appended to requested.
+func keyspacesServer(t *testing.T, pages map[string]string, requested *[]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/organizations/block/databases/orders/branches/main/keyspaces", r.URL.Path)
+		assert.Equal(t, "token-name:token-value", r.Header.Get("Authorization"))
+		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
+		page := r.URL.Query().Get("page")
+		*requested = append(*requested, page)
+		body, ok := pages[page]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"page not found"}`))
+			return
+		}
+		if body == "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"keyspace listing unavailable"}`))
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func listOrdersKeyspaces(t *testing.T, baseURL string) ([]*ps.Keyspace, error) {
+	t.Helper()
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", baseURL)
+	require.NoError(t, err)
+	return client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+}
+
+func keyspaceNames(keyspaces []*ps.Keyspace) []string {
+	names := make([]string, 0, len(keyspaces))
+	for _, ks := range keyspaces {
+		names = append(names, ks.Name)
+	}
+	return names
+}
+
+// A branch with more keyspaces than fit on one page is listed in full: every
+// page the API reports is read, in order, so progress and failure detail cover
+// the keyspaces on the later pages too.
+func TestListKeyspacesReadsEveryPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"type":"list","current_page":1,"next_page":2,"data":[{"name":"orders","shards":2},{"name":"orders_lookup","shards":1}]}`,
+		"2": `{"type":"list","current_page":2,"next_page":3,"data":[{"name":"payments","shards":4}]}`,
+		"3": `{"type":"list","current_page":3,"next_page":null,"data":[{"name":"refunds","shards":1}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders", "orders_lookup", "payments", "refunds"}, keyspaceNames(keyspaces))
+	assert.Equal(t, 4, keyspaces[2].Shards)
+	assert.Equal(t, []string{"1", "2", "3"}, requested)
+}
+
+// A single page with no next page is the whole branch, and is read once.
+func TestListKeyspacesStopsWhenNoNextPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"type":"list","current_page":1,"data":[{"name":"orders","shards":1}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+	assert.Equal(t, []string{"1"}, requested)
+}
+
+// A failure on a later page fails the listing rather than returning the pages
+// already read, and the error says which branch and page failed.
+func TestListKeyspacesFailsOnALaterPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"type":"list","current_page":1,"next_page":2,"data":[{"name":"orders","shards":2}]}`,
+		"2": "",
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main page 2")
+	assert.Contains(t, err.Error(), "keyspace listing unavailable")
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusInternalServerError, apiErr.StatusCode)
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// An API that keeps reporting another page is not followed forever: the
+// listing stops at the page bound and fails.
+func TestListKeyspacesFailsPastThePageBound(t *testing.T) {
+	var requested []string
+	pages := make(map[string]string, maxKeyspacePages+1)
+	for page := 1; page <= maxKeyspacePages+1; page++ {
+		pages[strconv.Itoa(page)] = fmt.Sprintf(`{"current_page":%d,"next_page":%d,"data":[{"name":"ks%d"}]}`, page, page+1, page)
+	}
+	srv := keyspacesServer(t, pages, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), fmt.Sprintf("API still reports page %d after %d pages", maxKeyspacePages+1, maxKeyspacePages))
+	assert.Len(t, requested, maxKeyspacePages)
+}
+
+// A next page that does not move forward would re-read the same keyspaces
+// forever, so it fails the listing at once.
+func TestListKeyspacesFailsWhenNextPageDoesNotAdvance(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"current_page":1,"next_page":2,"data":[{"name":"orders"}]}`,
+		"2": `{"current_page":2,"next_page":2,"data":[{"name":"payments"}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "page 2 reports next page 2, which does not advance")
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// Without a base URL the pages cannot be requested, and the listing refuses
+// rather than return only what the SDK's first page would hold.
+func TestListKeyspacesRefusesWithoutBaseURL(t *testing.T) {
+	client, err := NewPSClient("token-name", "token-value")
+	require.NoError(t, err)
+	client.(*psClientWrapper).baseURL = ""
+
+	_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main: no PlanetScale API base URL")
 }
 
 // recordingTransport counts the requests routed through it, so a test can show

@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +62,9 @@ type PSClient interface {
 	CreateBranchPassword(ctx context.Context, req *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error)
 
 	// Keyspace operations
+
+	// ListKeyspaces returns every keyspace on the branch, across all the pages
+	// the API reports, or an error; never a partial list.
 	ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error)
 	GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error)
 	UpdateKeyspaceVSchema(ctx context.Context, req *ps.UpdateKeyspaceVSchemaRequest) (*ps.VSchema, error)
@@ -217,8 +222,61 @@ func (w *psClientWrapper) CreateBranchPassword(ctx context.Context, req *ps.Data
 
 // Keyspace operations
 
+// keyspacesPerPage is the page size requested when listing keyspaces. The
+// loop follows the API's next_page rather than counting results, so a server
+// that caps pages at a smaller size is still read to the end.
+const keyspacesPerPage = 100
+
+// maxKeyspacePages bounds how many pages a keyspace listing reads. It sits far
+// above any real branch, so reaching it means the API keeps reporting another
+// page, and the listing fails rather than loop or return a partial view.
+const maxKeyspacePages = 100
+
+// ListKeyspaces returns every keyspace on the branch, reading each page the API
+// reports.
+//
+// Callers treat the result as the whole branch: progress and failure detail are
+// gathered keyspace by keyspace, so a keyspace missing from the list is one whose
+// schema change nobody sees. The SDK's list call reads only the first page and
+// takes no page options, so the listing uses raw HTTP via baseURL and returns an
+// error if baseURL is not set.
+//
+// The HTTP client's timeout applies to each page request. The listing as a whole
+// is bounded by maxKeyspacePages and by ctx.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
-	return w.client.Keyspaces.List(ctx, req)
+	if w.baseURL == "" {
+		return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: no PlanetScale API base URL", req.Organization, req.Database, req.Branch)
+	}
+	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces", req.Organization, req.Database, req.Branch)
+	var keyspaces []*ps.Keyspace
+	page := 1
+	for fetched := 1; ; fetched++ {
+		if fetched > maxKeyspacePages {
+			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: API still reports page %d after %d pages", req.Organization, req.Database, req.Branch, page, maxKeyspacePages)
+		}
+		query := url.Values{}
+		query.Set("page", strconv.Itoa(page))
+		query.Set("per_page", strconv.Itoa(keyspacesPerPage))
+		respBody, err := w.doRawJSON(ctx, http.MethodGet, basePath+"?"+query.Encode(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
+		}
+		var payload struct {
+			Data     []*ps.Keyspace `json:"data"`
+			NextPage *int           `json:"next_page"`
+		}
+		if err := json.Unmarshal(respBody, &payload); err != nil {
+			return nil, fmt.Errorf("decode keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
+		}
+		keyspaces = append(keyspaces, payload.Data...)
+		if payload.NextPage == nil || *payload.NextPage == 0 {
+			return keyspaces, nil
+		}
+		if *payload.NextPage <= page {
+			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: page %d reports next page %d, which does not advance", req.Organization, req.Database, req.Branch, page, *payload.NextPage)
+		}
+		page = *payload.NextPage
+	}
 }
 
 func (w *psClientWrapper) GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
