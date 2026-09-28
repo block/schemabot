@@ -10,6 +10,7 @@ import (
 	"github.com/block/pg-sprite/pkg/diffplan"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -113,4 +114,45 @@ func TestEnginePullDisabledRowSecurityPolicies(t *testing.T) {
 		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": definition}}}})
 	require.NoError(t, err)
 	assert.True(t, plan.NoChanges)
+}
+
+// Omitting all security clauses must refuse even if the table shape is unchanged.
+func TestEngineRowSecurityDeclarationRemoved(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_removed")
+	for _, tc := range []struct{ name, security string }{
+		{"enabled", `ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;`},
+		{"forced", `ALTER TABLE public.documents FORCE ROW LEVEL SECURITY;`},
+		{"policy while disabled", `CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			_, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS public.documents; CREATE TABLE public.documents (id bigint PRIMARY KEY);`)
+			require.NoError(t, err)
+			_, err = db.ExecContext(ctx, tc.security)
+			require.NoError(t, err)
+			eng := NewForTarget(0, 0, "rls_removed", &engine.Credentials{DSN: dsn})
+			result, err := eng.Plan(ctx, &engine.PlanRequest{Database: "rls_removed", Credentials: &engine.Credentials{DSN: dsn},
+				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `CREATE TABLE documents (id bigint PRIMARY KEY);`}}}})
+			require.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
+			require.ErrorContains(t, err, "missing from its declaration")
+			assert.Nil(t, result)
+		})
+	}
+}
+
+func TestRowSecurityComparisonOperationalError(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "rls_operational")
+	pool, err := pgxpool.New(t.Context(), dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, _, err = planPostgresDefinition(ctx, pool, "public", `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+ `)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "does not yet execute")
+	assert.NotErrorIs(t, err, schemadiff.ErrUnsupportedChange)
 }
