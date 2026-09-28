@@ -612,6 +612,67 @@ func TestEngine_Plan_NoChanges(t *testing.T) {
 	assert.True(t, result.NoChanges, "expected NoChanges, got DDL: %v", result.FlatDDL())
 }
 
+// The live database has `orders (id, status)`. Two schema files both declare
+// `orders`: orders.sql matches the live table and orders_extras.sql replaces
+// `status` with `note`. The differ keeps one definition per table, so planning
+// either one would silently discard the other and could drop `status`. The
+// plan is refused with an error naming the table and both files, on every
+// run, and the same holds when the two files sit in different namespaces,
+// since every namespace is diffed against the one database together.
+func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create table")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	liveOrders := `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	withNote := `CREATE TABLE orders (
+		id INT NOT NULL,
+		note VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+
+	t.Run("two files in one namespace", func(t *testing.T) {
+		// Map iteration order varies between runs, so plan repeatedly: every
+		// run must refuse with the same, fully named error.
+		for range 10 {
+			result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database: "testdb",
+				SchemaFiles: testSchemaFiles(map[string]string{
+					"orders.sql":        liveOrders,
+					"orders_extras.sql": withNote,
+				}),
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.EqualError(t, err, `table "orders" is declared by both schema files "testdb/orders.sql" and "testdb/orders_extras.sql". Declare each table in exactly one schema file`)
+			assert.Nil(t, result)
+		}
+	})
+
+	t.Run("two files in different namespaces", func(t *testing.T) {
+		result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+			Database: "testdb",
+			SchemaFiles: schema.SchemaFiles{
+				"billing": &schema.Namespace{Files: map[string]string{"orders.sql": withNote}},
+				"testdb":  &schema.Namespace{Files: map[string]string{"orders.sql": liveOrders}},
+			},
+			Credentials: &engine.Credentials{DSN: dsn},
+		})
+		require.EqualError(t, err, `table "orders" is declared by both schema files "billing/orders.sql" and "testdb/orders.sql". Declare each table in exactly one schema file`)
+		assert.Nil(t, result)
+	})
+}
+
 func TestEngine_Plan_NewTable(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 
