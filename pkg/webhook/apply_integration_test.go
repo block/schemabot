@@ -1541,7 +1541,7 @@ func TestE2EApplyProductionBlockedWhenStagingSuccessIsForEarlierCommit(t *testin
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply Blocked")
-		assert.Contains(t, body, "The `staging` check for this PR was recorded on commit `fedcba9`, not on the latest commit `abc123`.")
+		assert.Contains(t, body, "The `staging` check for this PR was recorded on commit `fedcba9`, but this apply read the schema at commit `abc123`.")
 		assert.Contains(t, body, "schemabot plan -e staging")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for earlier-commit blocked comment")

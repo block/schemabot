@@ -324,12 +324,24 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 		stagingDB = "orders"
 	)
 
-	successOn := func(sha string) *storage.Check {
+	rowOn := func(sha, status, conclusion string) *storage.Check {
 		return &storage.Check{
 			ID: 7, HeadSHA: sha, Environment: "staging", DatabaseType: "mysql", DatabaseName: stagingDB,
-			Status: checkStatusCompleted, Conclusion: checkConclusionSuccess,
+			Status: status, Conclusion: conclusion,
 		}
 	}
+	successOn := func(sha string) *storage.Check {
+		return rowOn(sha, checkStatusCompleted, checkConclusionSuccess)
+	}
+	// repeat returns the same row for every attempt, so the retry window is
+	// exhausted without the row ever moving to the head.
+	repeat := func(check *storage.Check) []*storage.Check {
+		return []*storage.Check{check, check, check}
+	}
+	// The block comment for a completed row on another commit names both
+	// commits without saying which is newer: the head can move while the
+	// command runs, so the comparison commit is not always the latest.
+	const staleRowGuidance = "The `staging` check for this PR was recorded on commit `0123456`, but this apply read the schema at commit `abcdef1`."
 
 	setup := func(t *testing.T, results []*storage.Check) (*Handler, *sequenceCheckStore, chan string) {
 		t.Helper()
@@ -360,7 +372,7 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 	}
 
 	t.Run("success on an earlier commit blocks", func(t *testing.T) {
-		h, checks, comments := setup(t, []*storage.Check{successOn(commitA), successOn(commitA), successOn(commitA)})
+		h, checks, comments := setup(t, repeat(successOn(commitA)))
 
 		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
 		require.NoError(t, err)
@@ -370,11 +382,83 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 		select {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked")
-			assert.Contains(t, body, "The `staging` check for this PR was recorded on commit `0123456`, not on the latest commit `abcdef1`.")
+			assert.Contains(t, body, staleRowGuidance)
 			assert.Contains(t, body, "schemabot plan -e staging")
 			assert.NotContains(t, body, "could not find a completed")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for earlier-commit block comment")
+		}
+	})
+
+	// A completed non-success row on another commit gets the re-check guidance,
+	// not the outcome it recorded: that outcome was for a commit other than the
+	// one being applied, so fixing or applying staging as it stands would be
+	// the wrong first step.
+	for _, tc := range []struct {
+		name       string
+		conclusion string
+		outcome    string
+	}{
+		{name: "failure on an earlier commit asks for a re-check on the head", conclusion: checkConclusionFailure, outcome: "Fix the issue and re-apply staging"},
+		{name: "action_required on an earlier commit asks for a re-check on the head", conclusion: checkConclusionActionRequired, outcome: "Apply staging first"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, checks, comments := setup(t, repeat(rowOn(commitA, checkStatusCompleted, tc.conclusion)))
+
+			blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+			require.NoError(t, err)
+			assert.True(t, blocked)
+			assert.Equal(t, attempts, checks.calls, "a completed row for another commit is retried before blocking")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, staleRowGuidance)
+				assert.Contains(t, body, "schemabot plan -e staging")
+				assert.NotContains(t, body, tc.outcome,
+					"the outcome recorded for another commit is not the reason to give")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for earlier-commit block comment")
+			}
+		})
+	}
+
+	// A running check is reported as running whichever commit it names: its
+	// row is about to change, so waiting is the operator's next step either
+	// way, and the head comparison applies once the row has completed.
+	t.Run("in_progress on an earlier commit reports the check as running", func(t *testing.T) {
+		h, checks, comments := setup(t, repeat(rowOn(commitA, checkStatusInProgress, "")))
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+		assert.Equal(t, attempts, checks.calls, "a running row is retried before blocking")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Staging is currently in progress. Wait for it to complete before applying to production.")
+			assert.NotContains(t, body, "recorded on commit")
+			assert.NotContains(t, body, "schemabot plan -e staging")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for in-progress block comment")
+		}
+	})
+
+	// A completed non-success row on the head keeps reporting its own outcome:
+	// the head comparison only changes the guidance for rows on another commit.
+	t.Run("failure on the head commit reports the failure", func(t *testing.T) {
+		h, checks, comments := setup(t, []*storage.Check{rowOn(commitB, checkStatusCompleted, checkConclusionFailure)})
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+		assert.Equal(t, 1, checks.calls, "a completed row on the head is not retried")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Staging failed. Fix the issue and re-apply staging before applying to production.")
+			assert.NotContains(t, body, "recorded on commit")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for failed-prior-environment block comment")
 		}
 	})
 
@@ -422,6 +506,24 @@ func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
 			assert.Contains(t, body, "Could not verify staging status: failed to resolve the PR head commit.")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for fail-closed comment")
+		}
+	})
+
+	// A durable attempt that cannot resolve the PR head still stops the apply,
+	// but leaves the comment to the attempt that is allowed to post one, like
+	// every other read failure in the gate.
+	t.Run("unknown head commit on a durable attempt posts no comment", func(t *testing.T) {
+		h, checks, comments := setup(t, []*storage.Check{successOn(commitA)})
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "", stagingDB, "mysql", "production", "staging", 12345, true)
+		require.ErrorContains(t, err, "head commit is empty")
+		assert.False(t, blocked)
+		assert.Equal(t, 0, checks.calls)
+
+		select {
+		case body := <-comments:
+			t.Fatalf("no comment should be posted when retry comments are suppressed, got: %s", body)
+		case <-time.After(200 * time.Millisecond):
 		}
 	})
 }

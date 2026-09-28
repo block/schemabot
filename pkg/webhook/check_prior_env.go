@@ -206,6 +206,13 @@ func (h *Handler) checkPriorEnvViaLocal(
 		return true, nil
 	}
 
+	// Every branch below except the first blocks; the order decides the
+	// guidance. A running check is reported as running whichever commit it
+	// names, since its row is about to change anyway and the operator's next
+	// step is to wait. A completed row is then held to the head: one recorded
+	// on another commit asks for a re-check on the head, whatever it concluded,
+	// because its outcome says nothing about the commit being applied. Only a
+	// completed non-success row on the head reports that outcome as the reason.
 	switch {
 	case check.Conclusion == checkConclusionSuccess && storedPriorEnvCheckIsForHead(check, headSHA):
 		h.logger.Debug("prior environment check passed on the PR head commit, allowing apply",

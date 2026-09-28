@@ -1045,8 +1045,8 @@ func PreviewCommentApplyBlockedByMissingPriorEnvCheck() string {
 }
 
 // PreviewCommentApplyBlockedByStalePriorEnvCheck renders a sample block for a
-// prior environment whose stored check state names an earlier commit than the
-// PR's latest commit.
+// prior environment whose stored check state names a commit other than the one
+// the apply read its schema from.
 func PreviewCommentApplyBlockedByStalePriorEnvCheck() string {
 	return RenderApplyBlockedByStalePriorEnvCheck("staging", previewStaleSHA, previewHeadSHA)
 }
