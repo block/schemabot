@@ -701,12 +701,14 @@ func TestConflictCheckRefusesUnattributedTerminalReport(t *testing.T) {
 }
 
 // The conflict check re-probes a blocking task on each of its retry attempts. A
-// refusal to settle it from engine memory is one decision, so it is logged once
-// per scan under its own reason, not once per attempt and not under the foreign
-// reason: an apply with no lease holder and one held by another pod point at
-// different causes, and a counter that multiplied by the retry count would make
-// any alert on it read ten times hot.
+// refusal to settle it from engine memory is one decision, so it is logged and
+// counted once per scan under its own reason, not once per attempt and not
+// under the foreign reason: an apply with no lease holder and one held by
+// another pod point at different causes, and a counter that multiplied by the
+// retry count would make any alert on it read ten times hot. The log and the
+// counter are asserted separately because either could regress alone.
 func TestConflictCheckLogsEachOwnershipRefusalOncePerScan(t *testing.T) {
+	reader := newTernMetricsReader(t)
 	running := &storage.Task{
 		ID: 18, ApplyID: 181, TaskIdentifier: "task-unattributed", Database: "testdb",
 		DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Running,
@@ -735,6 +737,13 @@ func TestConflictCheckLogsEachOwnershipRefusalOncePerScan(t *testing.T) {
 	}
 	assert.Equal(t, 1, unattributed, "one refusal is reported once per scan, not once per retry attempt")
 	assert.Equal(t, 0, foreign, "an apply with no lease holder is reported under its own reason, not as a foreign lease")
+
+	points := collectCounterPoints(t, reader, "schemabot.conflict_check.ownership_blocks_total")
+	require.Len(t, points, 1, "one refusal is counted under one reason")
+	assert.Equal(t, int64(1), points[0].Value, "the counter records the refusal once per scan, not once per retry attempt")
+	assert.Equal(t, "unattributed_terminal_report", counterAttr(t, points[0], "reason"))
+	assert.Equal(t, "testdb", counterAttr(t, points[0], "database"))
+	assert.Equal(t, storage.DatabaseTypeMySQL, counterAttr(t, points[0], "database_type"))
 	assert.Equal(t, state.Task.Running, running.State, "the task is left for its driver")
 }
 
