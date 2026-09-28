@@ -549,3 +549,55 @@ func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
 	require.Error(t, err, "PostgreSQL-only DDL must not parse under a MySQL-typed client")
 	assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
 }
+
+func TestCanonicalDDLForDrift_RowSecurity(t *testing.T) {
+	parser := driftParserForDialect(t, schema.DialectPostgres)
+	reviewed := `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `
+	canonical, err := canonicalDDLForDrift(parser, reviewed)
+	require.NoError(t, err)
+	mapped, err := canonicalDDLForDrift(parser, `
+ DROP POLICY readers ON production.documents;
+ CREATE POLICY readers ON production.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `)
+	require.NoError(t, err)
+	assert.Equal(t, canonical, mapped, "namespace identity is carried separately by the drift key")
+	for _, tt := range []struct{ name, sql string }{
+		{"order", `
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ DROP POLICY readers ON staging.documents;
+ `},
+		{"predicate", `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (true);
+ `},
+		{"helper schema", `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = other_auth.uid());
+ `},
+		{"duplicate", `
+ DROP POLICY readers ON staging.documents;
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			changed, err := canonicalDDLForDrift(parser, tt.sql)
+			require.NoError(t, err)
+			assert.NotEqual(t, canonical, changed)
+		})
+	}
+	t.Run("mixed structural operation refuses", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, `
+ DROP POLICY readers ON staging.documents;
+ ALTER TABLE staging.documents ADD COLUMN title text;
+ `)
+		require.Error(t, err)
+	})
+	t.Run("MySQL does not admit PostgreSQL policies", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(driftParserForDialect(t, schema.DialectMySQL), reviewed)
+		require.Error(t, err)
+	})
+}

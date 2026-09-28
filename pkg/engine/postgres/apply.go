@@ -105,6 +105,8 @@ const (
 )
 
 type nativeApply struct {
+	rowSecurity                *pgstatement.DesiredWithRowSecurity
+	reviewedSecurity           []string
 	namespace                  string
 	table                      string
 	sql                        string
@@ -197,6 +199,10 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: native-safe increment requires exactly one planned change", req.Database)
 	}
 	tc := req.Changes[0].TableChanges[0]
+	if operation, err := pgstatement.ParseRowSecurityChange(tc.DDL); err == nil {
+		return validateRowSecurityApply(req, operation)
+	}
+
 	hasRLS, err := pgstatement.HasRowSecurityDeclaration(tc.DDL)
 	if err != nil {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
@@ -1263,6 +1269,12 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
+	if change.rowSecurity != nil {
+		_, err := executor.ExecuteReviewedRowSecurity(ctx, pool, change.namespace, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		})
+		return err
+	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {
 		return fmt.Errorf("parse planned PostgreSQL DDL for table %q: %w", change.table, err)

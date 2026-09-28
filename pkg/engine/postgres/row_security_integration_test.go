@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/pg-sprite/pkg/diffplan"
+	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -22,7 +22,7 @@ import (
 )
 
 // Pull keeps settings, policies, and policy comments. The exported definition
-// converges without executable changes, while altered policies remain refused.
+// converges without executable changes; altered policies form one atomic operation.
 func TestEngineRowSecurityRoundTrip(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "rls_roundtrip")
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -58,7 +58,7 @@ func TestEngineRowSecurityRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, plan.NoChanges)
 
-	t.Run("changed policy refuses planning", func(t *testing.T) {
+	t.Run("changed policy produces one unsafe operation", func(t *testing.T) {
 		req.SchemaFiles["public"].Files["documents.sql"] = `
 			CREATE TABLE documents (
 				id bigint PRIMARY KEY,
@@ -69,19 +69,17 @@ func TestEngineRowSecurityRoundTrip(t *testing.T) {
 			CREATE POLICY readers ON documents FOR SELECT USING (true);
 		`
 		result, err := eng.Plan(ctx, req)
-		require.Error(t, err)
-		assert.Nil(t, result)
-		var review *diffplan.RowSecurityReviewRequired
-		require.ErrorAs(t, err, &review)
-		require.Len(t, review.Review.Changes, 1)
-		assert.Equal(t, schemadiff.SecurityPolicyChanged, review.Review.Changes[0].Kind)
-		assert.Equal(t, "readers", review.Review.Changes[0].Policy)
+		require.NoError(t, err)
+		require.Len(t, result.Changes, 1)
+		require.Len(t, result.Changes[0].TableChanges, 1)
+		assert.True(t, result.Changes[0].TableChanges[0].IsUnsafe)
+
 	})
 
 	t.Run("direct RLS apply is refused", func(t *testing.T) {
 		result, err := eng.Apply(ctx, applyRequest(dsn, "documents",
 			"ALTER TABLE public.documents DISABLE ROW LEVEL SECURITY"))
-		require.ErrorContains(t, err, "require an atomic apply path")
+		require.ErrorContains(t, err, "requires the reviewed desired schema files")
 		assert.Nil(t, result)
 		var enabled, forced bool
 		require.NoError(t, db.QueryRowContext(ctx, `
@@ -194,7 +192,7 @@ func TestRowSecurityComparisonOperationalError(t *testing.T) {
 	defer pool.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, _, err = planPostgresDefinition(ctx, pool, "public", `
+	_, _, _, err = planRowSecurityOperation(ctx, pool, "public", `
   CREATE TABLE documents (id bigint PRIMARY KEY);
   ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
  `)
@@ -218,7 +216,7 @@ func TestEngineRowSecurityMissingTableRefuses(t *testing.T) {
    CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
   `}}},
 	})
-	require.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
+	require.ErrorIs(t, err, executor.ErrTableNotFound)
 	assert.Nil(t, result)
 	var absent bool
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT to_regclass('public.documents') IS NULL").Scan(&absent))

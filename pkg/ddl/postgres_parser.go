@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	pgproto "github.com/pganalyze/pg_query_go/v6"
 	pgquery "github.com/wasilibs/go-pgquery"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -690,4 +691,14 @@ func restoreDropColumnKeyword(stmt *pgproto.Node, canonical string) string {
 		canonical = pattern.ReplaceAllString(canonical, "DROP COLUMN $1$2")
 	}
 	return canonical
+}
+
+// CanonicalRowSecurity delegates PostgreSQL operation grammar to pg-sprite.
+// Ordinary statement classification stays separate from atomic RLS operations.
+func (postgresStatementParser) CanonicalRowSecurity(sql string) (string, error) {
+	change, err := pgstatement.ParseRowSecurityChange(sql)
+	if err != nil {
+		return "", err
+	}
+	return change.CanonicalSQLForNamespace()
 }

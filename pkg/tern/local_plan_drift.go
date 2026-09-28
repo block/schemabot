@@ -403,6 +403,13 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("empty DDL")
 	}
+	// An atomic operation is compared as one ordered sequence. Its engine owns
+	// grammar admission; ordinary statement and create-set parsing remain strict.
+	if rls, ok := p.(interface{ CanonicalRowSecurity(string) (string, error) }); ok {
+		if canonical, err := rls.CanonicalRowSecurity(raw); err == nil {
+			return canonical, nil
+		}
+	}
 	if stmtType, _, err := p.Classify(raw); err == nil {
 		return canonicalDriftStatement(p, raw, stmtType)
 	}

@@ -266,6 +266,15 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
+			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
+			if err != nil {
+				return nil, fmt.Errorf("plan PostgreSQL row security in %q/%q: %w", namespace, filename, err)
+			}
+			if handled {
+				desiredTables[table] = true
+				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
+				continue
+			}
 			report, table, err := planPostgresDefinition(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
 				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
