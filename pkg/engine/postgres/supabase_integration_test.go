@@ -213,9 +213,16 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 			Env:          map[string]string{"POSTGRES_PASSWORD": "schemabot_test_only", "POSTGRES_DB": "postgres"},
 			ExposedPorts: []string{"5432/tcp"},
 			Cmd:          []string{"postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"},
-			// The temporary initialization server accepts Unix sockets before
-			// Supabase's roles are ready. Wait for the final TCP listener.
-			WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(supabaseOperationDeadline),
+			// The entrypoint runs a temporary initialization server, which
+			// listens only on the Unix socket and announces readiness once,
+			// then stops it and starts the final server, which announces
+			// readiness again on TCP. Docker's port proxy accepts a TCP
+			// handshake before anything listens inside the container, so a
+			// port wait can pass during the restart and the first connection
+			// is reset. Wait for the final server's own readiness line.
+			WaitingFor: wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(supabaseOperationDeadline),
 		},
 		Started: true,
 	})
