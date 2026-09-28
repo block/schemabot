@@ -3594,3 +3594,16 @@ func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
 	assert.Contains(t, err.Error(), "open pg-sprite apply pool")
 	assert.Contains(t, err.Error(), "read CA bundle")
 }
+
+// Malformed SQL must retain the operator-facing refusal, not expose parser internals.
+func TestValidateOptimisticApplyRefusesMalformedSQL(t *testing.T) {
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets", DDL: "ALTER TABLE public.widgets ADD COLUMN",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+	_, err := validateOptimisticApply(req)
+	require.EqualError(t, err, `apply PostgreSQL table "widgets": planned DDL is not one statement or a valid greenfield create set`)
+}

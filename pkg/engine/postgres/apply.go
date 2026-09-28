@@ -199,7 +199,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	tc := req.Changes[0].TableChanges[0]
 	hasRLS, err := pgstatement.HasRowSecurityDeclaration(tc.DDL)
 	if err != nil {
-		return nativeApply{}, fmt.Errorf("parse PostgreSQL apply for table %q: %w", tc.Table, err)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
 	if hasRLS {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require an atomic apply path that SchemaBot does not provide yet", tc.Table)

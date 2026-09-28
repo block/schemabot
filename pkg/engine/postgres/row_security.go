@@ -42,5 +42,8 @@ func planPostgresDefinition(ctx context.Context, pool *pgxpool.Pool, namespace, 
 	// existing files and pre-RLS rollback baselines compatible; the ordinary
 	// planner leaves live policies and settings unchanged.
 	report, err := diffplan.Plan(ctx, pool, diffplan.Request{Schema: namespace, Desired: desired})
-	return report, desired.Table(), err
+	if err != nil {
+		return plan.Report{}, desired.Table(), fmt.Errorf("plan PostgreSQL table %q: %w", desired.Table(), err)
+	}
+	return report, desired.Table(), nil
 }
