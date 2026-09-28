@@ -2338,3 +2338,55 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 		{Table: "sessions", Column: "token", Linter: "primary_key", Severity: "warning", Message: `Primary key column "token" in table "sessions" uses "character(36)"; allowed types: bigint, uuid`},
 	}, results)
 }
+
+// One RLS table makes namespace capture incomplete; never label a partial
+// baseline as rollback-capable, even for changes to an ordinary sibling table.
+func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_rls")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+ `)
+	require.NoError(t, err)
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public")
+	require.NoError(t, err)
+	assert.False(t, captured)
+	assert.Nil(t, files, "an RLS render refusal must not leave a partial rollback baseline")
+}
+
+// Forward structural planning remains available for RLS tables and siblings.
+func TestEngineForwardPlanWithRowSecurity(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "forward_rls")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+ `)
+	require.NoError(t, err)
+	result, err := New().Plan(ctx, &engine.PlanRequest{
+		Database: "forward_rls", Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"documents.sql": `CREATE TABLE documents (id bigint PRIMARY KEY, summary text);`,
+			"accounts.sql":  `CREATE TABLE accounts (id bigint PRIMARY KEY, label text);`,
+		}}},
+	})
+	require.NoError(t, err)
+	require.False(t, result.NoChanges)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 2)
+	for _, change := range result.Changes[0].TableChanges {
+		assert.Empty(t, change.ExecutionMode, change.ModeReason)
+		assert.Contains(t, change.DDL, "ADD COLUMN")
+		assert.NotContains(t, change.DDL, "POLICY")
+	}
+}
