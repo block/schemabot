@@ -244,8 +244,8 @@ func TestInitDetailsPlanetScaleTLS(t *testing.T) {
 }
 
 func TestInitAdaptivePlanetScaleToken(t *testing.T) {
-	for _, details := range []bool{false, true} {
-		t.Run(fmt.Sprint(details), func(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancel), func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
 			t.Setenv("PLANETSCALE_TOKEN", "")
@@ -253,19 +253,11 @@ func TestInitAdaptivePlanetScaleToken(t *testing.T) {
 			m := newInitWizard(&cmd, "demo", io.Discard)
 			m.step = stepAPIToken
 			m.loadField()
-			if details {
-				wizardKey(m, tea.KeyDown)
-			}
 			wizardKey(m, tea.KeyEnter)
-			if details {
-				m.input.SetValue("token-id")
-				wizardKey(m, tea.KeyEnter)
-			}
+			m.input.SetValue("token-id")
+			wizardKey(m, tea.KeyEnter)
 			require.Equal(t, textinput.EchoPassword, m.input.EchoMode)
-			value := "token-id:private-secret"
-			if details {
-				value = "private-secret"
-			}
+			value := "private-secret"
 			m.input.SetValue(value)
 			require.NotContains(t, m.View(), "private-secret")
 			wizardKey(m, tea.KeyEnter)
@@ -277,6 +269,12 @@ func TestInitAdaptivePlanetScaleToken(t *testing.T) {
 			require.NoDirExists(t, filepath.Join(home, ".schemabot"))
 			m.fields[stepAPIToken].value = m.input.Value()
 			require.ErrorIs(t, m.copyToCommand(&cmd, &Globals{}), ErrSilent)
+			if cancel {
+				wizardKey(m, tea.KeyEsc)
+				require.True(t, m.cancelled)
+				require.NoDirExists(t, filepath.Join(home, ".schemabot"))
+				return
+			}
 			m.confirmed = true
 			require.NoError(t, m.copyToCommand(&cmd, &Globals{}))
 			stored, err := resolveInitConnection(cmd.APIToken)

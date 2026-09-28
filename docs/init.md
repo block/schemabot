@@ -134,7 +134,7 @@ production branches are not needed for this setup. If your database requires dep
 approval, an eligible reviewer still needs to approve in PlanetScale; the token cannot approve
 its own requests. See [PlanetScale's approval rules](https://planetscale.com/docs/api/service-tokens#service-tokens-and-deploy-requests-approvals).
 
-3. In the wizard, paste `TOKEN_ID:TOKEN_SECRET` or enter the ID and secret separately.
+3. In the wizard, enter the token ID and secret.
    Secret input is hidden. After you confirm setup, SchemaBot saves the token in a private,
    unencrypted file under `~/.schemabot/credentials`. You can also use an existing environment
    variable or file. For example, a private file outside
