@@ -2383,6 +2383,8 @@ func TestEngineForwardPlanWithRowSecurity(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.NoChanges)
 	require.Len(t, result.Changes, 1)
+	assert.False(t, result.Changes[0].OriginalFilesCaptured)
+	assert.Nil(t, result.Changes[0].OriginalFiles)
 	require.Len(t, result.Changes[0].TableChanges, 2)
 	for _, change := range result.Changes[0].TableChanges {
 		assert.Empty(t, change.ExecutionMode, change.ModeReason)
