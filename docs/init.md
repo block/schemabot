@@ -99,7 +99,9 @@ account login and the API service token.
 See the PlanetScale API's [Create a password](https://planetscale.com/docs/api/reference/create_password)
 endpoint. Its response includes `username`, `plain_text` (the password), and `access_host_url`
 (the connection host). Save the password when it is created; it cannot be retrieved later.
-Use these credentials and the endpoint's TLS settings in the wizard's database connection.
+The wizard's **Enter connection details** option enables verified TLS automatically for
+PlanetScale hosts ending in `.psdb.cloud`. When pasting a Go MySQL connection string, include
+`tls=true` to verify the server certificate and hostname.
 
 The second connection is to the separate MySQL database where SchemaBot stores its plans
 and progress. It uses that MySQL server's credentials.
@@ -132,7 +134,10 @@ production branches are not needed for this setup. If your database requires dep
 approval, an eligible reviewer still needs to approve in PlanetScale; the token cannot approve
 its own requests. See [PlanetScale's approval rules](https://planetscale.com/docs/api/service-tokens#service-tokens-and-deploy-requests-approvals).
 
-3. Store the ID and secret together, separated by a colon. For example, a private file outside
+3. In the wizard, paste `TOKEN_ID:TOKEN_SECRET` or enter the ID and secret separately.
+   Secret input is hidden. After you confirm setup, SchemaBot saves the token in a private,
+   unencrypted file under `~/.schemabot/credentials`. You can also use an existing environment
+   variable or file. For example, a private file outside
    your project at `/Users/alex/.config/schemabot/planetscale-token` contains just:
 
    ```text
