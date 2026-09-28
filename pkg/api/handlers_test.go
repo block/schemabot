@@ -5798,6 +5798,19 @@ func TestServiceClose(t *testing.T) {
 	assert.NoError(t, svc.Close())
 }
 
+// serveApplyRequest sends body to POST /api/apply through the service's routes
+// and returns the recorded response.
+func serveApplyRequest(t *testing.T, svc *Service, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	return w
+}
+
 func TestApplyHandler(t *testing.T) {
 	t.Run("returns bad request for unsupported apply feature", func(t *testing.T) {
 		plan := executeApplyTestPlan()
@@ -5819,6 +5832,59 @@ func TestApplyHandler(t *testing.T) {
 		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
 		assert.Equal(t, `apply rejected: database "testdb": deferred cutover is not supported for database_type: postgres`, resp.Error)
 		assert.Nil(t, applies.apply)
+	})
+
+	// A caller naming a plan_id SchemaBot never stored gets a 404 telling them
+	// to check the ID, not a 500 that reads like a server outage.
+	t.Run("returns not found for an unknown plan", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(nil, &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-missing","environment":"staging"}`)
+
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Equal(t, "apply rejected: plan not found: plan-missing; check the plan_id or create a new plan", resp.Error)
+		assert.Nil(t, applies.apply, "an unknown plan must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// A plan reviewed for staging is refused when the caller asks to apply it
+	// to production: the request is wrong, so it is a 400 naming both
+	// environments, and nothing is queued against production.
+	t.Run("returns bad request when the plan was created for another environment", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"production"}`)
+
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+		assert.Equal(t, `apply rejected: plan plan-1 was created for environment "staging", not "production"; apply it to "staging" or create a plan for "production"`, resp.Error)
+		assert.Nil(t, applies.apply, "a mismatched environment must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// When the plan read itself fails, the apply is a server failure: a 500
+	// with the storage error code, and the raw storage error (which can carry
+	// hostnames) stays in the server log rather than the response.
+	t.Run("returns internal error without storage detail when the plan lookup fails", func(t *testing.T) {
+		logger := slog.New(slog.DiscardHandler)
+		storageErr := errors.New("dial tcp 10.0.0.5:3306: connect: connection refused")
+		svc := New(&mockStorageWithPlanLookup{plans: &mockPlanLookupStore{err: storageErr}}, testServerConfig(), nil, logger)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, "apply failed: failed to get plan plan-1; see server logs, then retry", resp.Error)
+		assert.NotContains(t, w.Body.String(), "10.0.0.5")
 	})
 
 	t.Run("returns conflict when an active apply already exists", func(t *testing.T) {
