@@ -59,8 +59,9 @@ func TestAutoPlanCoverageActionsAreUnconditional(t *testing.T) {
 
 // TestCheckDatabaseKeysMatchNameAndType pins that a stored check row counts as
 // still in the PR only when a discovered config plans the same database under
-// the same type. A row recorded under a database's previous type is stale, so
-// stale cleanup settles it instead of leaving it to hold the aggregate open.
+// the same type. A row recorded under a database's previous type does not
+// match, so it is left on its earlier commit, where it holds the aggregate
+// open until the plan of the new type stores a result and settles it.
 func TestCheckDatabaseKeysMatchNameAndType(t *testing.T) {
 	affected := checkDatabaseKeysForConfigs([]ghclient.DiscoveredConfig{{
 		Config: &ghclient.SchemabotConfig{Database: "orders", Type: ghclient.DatabaseTypeStrata},

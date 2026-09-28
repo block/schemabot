@@ -178,6 +178,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	if checkErr != nil && rolloutStillPending(drift) {
 		h.failClosedOnUnstoredRollout(ctx, client, repo, pr, schemaResult.HeadSHA, environment, drift)
 	} else if headSHA != "" {
+		h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
@@ -372,9 +373,6 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// so a failing aggregate can be posted from the in-memory drift result rather
 	// than letting the post-loop aggregate recompute from stale stored rows.
 	driftBlockUnstored := map[string]string{}
-	// Environments whose check record this plan stored, so rows the database
-	// left under an old type are settled only where a result replaces them.
-	storedEnvironments := map[string]bool{}
 	// Environments whose check record could not be persisted while some rollout
 	// member, the primary included, has work (MG-12), kept for the same reason.
 	pendingWorkUnstored := map[string]string{}
@@ -482,9 +480,6 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		if sha != "" {
 			headSHA = sha
 		}
-		if checkErr == nil && sha != "" {
-			storedEnvironments[storage.CanonicalKey(env)] = true
-		}
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
 		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
@@ -512,18 +507,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// is empty. Post a failing aggregate so branch protection isn't stuck
 	// waiting for a check that will never arrive.
 	if headSHA != "" {
-		// A row the database left under an old type blocks the aggregate until
-		// this plan's result replaces it, so it is settled before the fold.
-		// Failing to settle leaves it blocking, so the fold still runs.
-		plannedEnvironments := make(map[string]bool, len(environments))
-		for _, env := range environments {
-			plannedEnvironments[storage.CanonicalKey(env)] = true
-		}
-		if err := h.settleChecksReplacedByNewType(ctx, repo, pr, headSHA, multiEnvData.Database, multiEnvData.DatabaseType, storedEnvironments, plannedEnvironments); err != nil {
-			h.logger.Error("checks under the database's old type keep blocking the aggregate because they could not be settled",
-				"repo", repo, "pr", pr, "head_sha", headSHA,
-				"database", multiEnvData.Database, "database_type", multiEnvData.DatabaseType, "error", err)
-		}
+		h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, multiEnvData.Database, multiEnvData.DatabaseType)
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	} else if len(multiEnvData.Errors) > 0 {
 		prInfo, fetchErr := client.FetchPullRequest(ctx, repo, pr)
@@ -1138,4 +1122,15 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	data.Errors = append(data.Errors, malformedShardErrors...)
 
 	return data
+}
+
+// settleChecksReplacedByNewTypeBeforeFold settles the rows a planned database
+// left under an old type, ahead of the plan's aggregate fold. A row that
+// cannot be settled keeps blocking the aggregate, so the fold still runs.
+func (h *Handler) settleChecksReplacedByNewTypeBeforeFold(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) {
+	if err := h.settleChecksReplacedByNewType(ctx, client, repo, pr, headSHA, databaseName, databaseType); err != nil {
+		h.logger.Error("checks under the database's old type keep blocking the aggregate because they could not be settled",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", databaseName, "database_type", databaseType, "error", err)
+	}
 }

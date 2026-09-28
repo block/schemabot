@@ -1146,18 +1146,47 @@ func checkDatabaseKeyStrings(keys map[checkDatabaseKey]bool) []string {
 // second database still planning keeps the aggregate open through its own old
 // row.
 //
-// A row is settled in an environment the plan stored a result for, and in an
-// environment the plan does not cover, since nothing will replace it there. In
-// an environment the plan covers but did not store, because it failed there,
-// the row keeps blocking until a later plan stores that environment. Settling
-// follows stale cleanup: a started apply keeps its row blocking, and a
-// plan-only row passes.
-func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, repo string, pr int, headSHA, databaseName, databaseType string, storedEnvironments, plannedEnvironments map[string]bool) error {
+// Whether a result replaces a row is read from stored check state, not from
+// what the calling plan stored, so a plan of one environment and a plan of
+// every environment settle the same rows. A row is settled in an environment
+// where a row under the new type is stored on headSHA, and in an environment
+// this deployment does not plan the database in, since nothing will replace it
+// there. Anywhere else the row keeps blocking until a later plan stores that
+// environment. Settling follows stale cleanup: a started apply keeps its row
+// blocking, and a plan-only row passes.
+//
+// A plan that finishes after the PR moved to a newer commit settles nothing,
+// because the newer commit's cleanup and plans own those rows.
+func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("verify head of %s#%d before settling %s rows under types other than %s on %s: %w", repo, pr, databaseName, databaseType, headSHA, err)
+	}
+	if prInfo.HeadSHA != headSHA {
+		h.logger.Info("plan of a database's new type settles no rows because the PR moved to a newer commit",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", prInfo.HeadSHA,
+			"database", databaseName, "database_type", databaseType)
+		return nil
+	}
+	environments, err := h.allowedDatabaseEnvironments(databaseName)
+	if err != nil {
+		return fmt.Errorf("resolve environments of %s to settle its rows under types other than %s on %s#%d: %w", databaseName, databaseType, repo, pr, err)
+	}
+	plannedEnvironments := make(map[string]bool, len(environments))
+	for _, environment := range environments {
+		plannedEnvironments[storage.CanonicalKey(environment)] = true
+	}
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		return fmt.Errorf("load checks for %s#%d to settle %s rows under types other than %s: %w", repo, pr, databaseName, databaseType, err)
 	}
 	planned := newCheckDatabaseKey(databaseName, databaseType)
+	replacedEnvironments := map[string]bool{}
+	for _, check := range checks {
+		if !isAggregateCheck(check) && checkDatabaseKeyForCheck(check) == planned && check.HeadSHA == headSHA {
+			replacedEnvironments[storage.CanonicalKey(check.Environment)] = true
+		}
+	}
 	for _, check := range checks {
 		if isAggregateCheck(check) {
 			continue
@@ -1174,8 +1203,8 @@ func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, repo string
 				"environment", check.Environment, "check_id", check.ID)
 			continue
 		}
-		if plannedEnvironments[environment] && !storedEnvironments[environment] {
-			h.logger.Warn("check under a database's old type keeps blocking because the plan of its new type stored no result for this environment",
+		if plannedEnvironments[environment] && !replacedEnvironments[environment] {
+			h.logger.Warn("check under a database's old type keeps blocking because no result under its new type is stored for this environment on this commit",
 				"repo", repo, "pr", pr, "head_sha", headSHA,
 				"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
 				"environment", check.Environment, "check_id", check.ID)

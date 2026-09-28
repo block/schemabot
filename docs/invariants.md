@@ -577,7 +577,7 @@ operator reconciles the target. Closing and reopening the PR does not wash this 
 *Enforced:* stale-check cleanup and the plan that settles the rows a database left under an old
 type, both of which block a row a started apply owns instead of clearing it (`cleanupStaleChecks`
 and `settleChecksReplacedByNewType` in `pkg/webhook/pull_request.go`, the latter called from
-`handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
+`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
 `pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
 while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
 close and reopen handlers release nothing they cannot read (`pkg/webhook/pull_request.go`).
