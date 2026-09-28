@@ -1179,72 +1179,95 @@ func TestResumeApplySequential_AbortsWhenLandedStatementSettlementRefused(t *tes
 // to the engine, leaving the start request pending so the next claim retries
 // it, rather than reporting the operator's start as completed.
 func TestResumeApplyWithTasks_StartStaysPendingWhenStoppedTaskRequeueFails(t *testing.T) {
-	storageErr := errors.New("storage unavailable")
-	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
-	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
-	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
-	c.spiritEngine = eng
-	c.heartbeatInterval = time.Hour
+	cases := []struct {
+		name         string
+		databaseType string
+		taskCount    int
+		failTask     string
+	}{
+		{name: "sequential first task", taskCount: 1, failTask: "task_email"},
+		{name: "grouped second task", databaseType: storage.DatabaseTypeVitess, taskCount: 2, failTask: "task_name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			storageErr := errors.New("storage unavailable")
+			store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+			enginePlan := alterUsersEmailPlan()
+			if tc.taskCount == 2 {
+				enginePlan.Changes[0].TableChanges = append(enginePlan.Changes[0].TableChanges, engine.TableChange{
+					Table: "orders", Operation: ddl.StatementAlterTable,
+					DDL: "ALTER TABLE `orders` ADD COLUMN `name` varchar(255)",
+				})
+			}
+			c := newPlanMaterializeClientWithPlan(store, enginePlan)
+			eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+			c.spiritEngine = eng
+			c.heartbeatInterval = time.Hour
 
-	plan := &storage.Plan{ID: 5}
-	apply := &storage.Apply{
-		ID:              21,
-		ApplyIdentifier: "apply-start-requeue-refused",
-		PlanID:          plan.ID,
-		Database:        "testapp",
-		Environment:     "staging",
-		State:           state.Apply.Stopped,
-	}
-	task := &storage.Task{
-		ID:             1,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task_email",
-		Database:       "testapp",
-		Namespace:      "testapp",
-		TableName:      "users",
-		DDLAction:      "alter",
-		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
-		State:          state.Task.Stopped,
-	}
-	applies := &snapshotApplyStore{stored: *apply}
-	requests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
-		ID:          1,
-		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationStart,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: "operator",
-	}}}
-	logs := &mockApplyLogStore{}
-	c.storage = &exactProgressStorage{
-		plans:   &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }},
-		applies: applies,
-		tasks: &updateFailingTaskStore{
-			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
-			updateErr:              storageErr,
-		},
-		controlRequests: requests,
-		logs:            logs,
-	}
+			plan := &storage.Plan{ID: 5}
+			apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-start-requeue-refused", PlanID: plan.ID,
+				Database: "testapp", DatabaseType: tc.databaseType, Environment: "staging", State: state.Apply.Stopped}
+			tasks := []*storage.Task{{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task_email", Database: "testapp",
+				Namespace: "testapp", TableName: "users", DDLAction: "alter",
+				DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", State: state.Task.Stopped}}
+			if tc.taskCount == 2 {
+				tasks = append(tasks, &storage.Task{ID: 2, ApplyID: apply.ID, TaskIdentifier: "task_name", Database: "testapp",
+					Namespace: "testapp", TableName: "orders", DDLAction: "alter",
+					DDL: "ALTER TABLE `orders` ADD COLUMN `name` varchar(255)", State: state.Task.Stopped})
+			}
+			applies := &snapshotApplyStore{stored: *apply}
+			requests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationStart,
+				Status: storage.ControlRequestPending, RequestedBy: "operator",
+			}}}
+			logs := &mockApplyLogStore{}
+			taskStore := &selectiveUpdateFailingTaskStore{
+				exactProgressTaskStore: &exactProgressTaskStore{tasks: tasks}, failIdentifier: tc.failTask, updateErr: storageErr}
+			c.storage = &exactProgressStorage{
+				plans: &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}, applies: applies,
+				tasks: taskStore, controlRequests: requests, logs: logs,
+			}
 
-	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
+			err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
-	require.ErrorIs(t, err, storageErr)
-	assert.ErrorContains(t, err, "requeue stopped task task_email for start of apply apply-start-requeue-refused")
-	start, err := requests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStart)
-	require.NoError(t, err)
-	require.NotNil(t, start)
-	assert.Equal(t, storage.ControlRequestPending, start.Status, "the operator's start stays pending for the next claim")
-	assert.True(t, state.IsState(task.State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", task.State)
-	assert.Empty(t, eng.applied, "nothing is handed to the engine")
-	stored, err := applies.Get(t.Context(), apply.ID)
-	require.NoError(t, err)
-	assert.True(t, state.IsState(stored.State, state.Apply.Stopped),
-		"the drive exits before writing the apply running; stored state was %q", stored.State)
-	assert.Nil(t, stored.CompletedAt)
-	for _, entry := range logs.logs {
-		assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
-			"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+			require.ErrorIs(t, err, storageErr)
+			assert.ErrorContains(t, err, "requeue stopped task "+tc.failTask+" for start of apply apply-start-requeue-refused")
+			start, err := requests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStart)
+			require.NoError(t, err)
+			require.NotNil(t, start)
+			assert.Equal(t, storage.ControlRequestPending, start.Status, "the operator's start stays pending for the next claim")
+			assert.True(t, state.IsState(tasks[tc.taskCount-1].State, state.Task.Stopped),
+				"the refused requeue leaves the task stopped, got %s", tasks[tc.taskCount-1].State)
+			if tc.taskCount == 2 {
+				assert.True(t, state.IsState(tasks[0].State, state.Task.Pending), "the landed first requeue remains pending")
+			}
+			assert.Empty(t, eng.applied, "nothing is handed to the engine")
+			stored, err := applies.Get(t.Context(), apply.ID)
+			require.NoError(t, err)
+			assert.True(t, state.IsState(stored.State, state.Apply.Stopped),
+				"the drive exits before writing the apply running; stored state was %q", stored.State)
+			assert.Nil(t, stored.CompletedAt)
+			for _, entry := range logs.logs {
+				if tc.taskCount == 1 {
+					assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+						"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+				}
+			}
+		})
 	}
+}
+
+type selectiveUpdateFailingTaskStore struct {
+	*exactProgressTaskStore
+	failIdentifier string
+	updateErr      error
+}
+
+func (s *selectiveUpdateFailingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if task.TaskIdentifier == s.failIdentifier {
+		return s.updateErr
+	}
+	return s.exactProgressTaskStore.Update(ctx, task)
 }
 
 // A task in an engine-monitored revert phase carries no evidence a schema
