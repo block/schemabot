@@ -620,7 +620,7 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	m.input.SetValue("acme")
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, stepAPIToken, m.step)
-	require.Contains(t, m.View(), "Paste a service token")
+	require.NotContains(t, m.View(), "Paste a service token")
 	require.Contains(t, m.View(), "Enter token ID and secret")
 	require.Contains(t, m.View(), "New service token")
 	require.Contains(t, m.View(), "write_branch_vschema")

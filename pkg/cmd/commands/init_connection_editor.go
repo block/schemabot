@@ -35,7 +35,7 @@ func (m *initWizard) loadConnectionEditor() {
 func (m *initWizard) connectionOptions() []string {
 	options := []string{"Paste a connection string", "Enter connection details", "Use an environment variable or file"}
 	if m.step == stepAPIToken {
-		options = []string{"Paste a service token", "Enter token ID and secret", "Use an environment variable or file"}
+		options = []string{"Enter token ID and secret", "Use an environment variable or file"}
 	}
 	if m.connectionEditor.detected {
 		label := "Use this connection"
@@ -130,6 +130,9 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			}
 			m.err = ""
 			m.input.EchoMode = textinput.EchoNormal
+			if m.step == stepAPIToken {
+				choice++
+			} // Tokens use separate ID and secret fields.
 			switch choice {
 			case 0:
 				e.mode = "paste"
@@ -163,15 +166,6 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	}
 	if key != "enter" || e.mode == "reference" || e.mode == "ready" {
 		return false, nil
-	}
-	if e.mode == "paste" && m.step == stepAPIToken {
-		value := strings.TrimSpace(m.input.Value())
-		id, secret, ok := strings.Cut(value, ":")
-		if !ok || strings.TrimSpace(id) == "" || strings.TrimSpace(secret) == "" {
-			m.err = "Use TOKEN_ID:TOKEN_SECRET, or go back to enter them separately."
-			return true, nil
-		}
-		return true, m.useDraftConnection(value)
 	}
 	if e.mode == "paste" {
 		value, err := normalizeInitConnection(m.fields[stepEngine].value, strings.TrimSpace(m.input.Value()))
@@ -281,9 +275,6 @@ func (m *initWizard) connectionEditorView() string {
 		b.WriteString("\n" + muted.Render("↑/↓ choose · enter continue · shift+tab back · esc cancel"))
 	case "paste":
 		prompt := "Paste your connection string. Input is hidden."
-		if m.step == stepAPIToken {
-			prompt = "Paste TOKEN_ID:TOKEN_SECRET. Input is hidden."
-		}
 		b.WriteString(prompt + "\n\n" + m.input.View())
 	case "details":
 		labels := []string{"Host", "Port", "Database", "Username", "Password (hidden; Enter for none)"}
