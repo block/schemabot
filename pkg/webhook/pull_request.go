@@ -997,8 +997,9 @@ func checkDatabaseKeysForConfigs(configs []ghclient.DiscoveredConfig) map[checkD
 }
 
 // cleanupStaleChecks updates checks for databases no longer in the PR. A row is
-// still affected only when the PR plans a database with the same name and type;
-// a row whose database type no longer matches the discovered config is stale.
+// still affected only when the PR plans a database with the same name and type.
+// A row under a database's old type, for a database the PR now plans under a
+// new type, is left for that plan to settle (see settleChecksReplacedByNewType).
 // When the PR plans databases, cleanup leaves the aggregate to their plans, so a
 // caller passing affected databases must launch those plans only after this
 // returns.
@@ -1057,6 +1058,10 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 		return
 	}
 
+	plannedDatabaseNames := make(map[string]bool, len(affectedDatabases))
+	for key := range affectedDatabases {
+		plannedDatabaseNames[key.databaseName] = true
+	}
 	cleaned := false
 
 	for _, check := range checks {
@@ -1075,7 +1080,18 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			continue
 		}
 
-		// The PR no longer plans this check's database under this type.
+		if plannedDatabaseNames[storage.CanonicalKey(check.DatabaseName)] {
+			// The PR still plans this database, under a new type. The row stays
+			// on its earlier commit, where the aggregate reads it as blocking,
+			// until the new type's plan stores its own result and settles it.
+			h.logger.Info("stale cleanup leaves a check under a database's old type to the plan of its new type",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
+		}
+
+		// The PR no longer plans this check's database.
 		h.logger.Info("cleaning up stale check",
 			"repo", repo, "pr", pr,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
@@ -1083,14 +1099,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			"previous_status", check.Status, "previous_conclusion", check.Conclusion,
 			"previous_blocking_reason", check.BlockingReason, "apply_id", check.ApplyID)
 
-		if checkHasStartedApply(check) {
-			if h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check) {
-				cleaned = true
-			}
-			continue
-		}
-
-		if h.markStalePlanOnlyCheckStateSuccessful(ctx, repo, pr, headSHA, check) {
+		if h.settleStaleCheckState(ctx, repo, pr, headSHA, check) {
 			cleaned = true
 		}
 	}
@@ -1107,10 +1116,9 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 	// Each plan the PR launches folds the aggregate after it stores its rows for
 	// every environment, and runAutoPlanForPR launches them only after this
 	// cleanup returns, so their folds see the rows settled here. Folding here
-	// instead could publish the aggregate before those plans store anything: a
-	// plan-only row settled to success would then pass the gate before the
-	// result that replaces it exists, such as the plan of a database the PR now
-	// plans under a new type.
+	// instead could publish the aggregate before those plans store anything,
+	// with a plan-only row settled to success standing in for results that do
+	// not exist yet.
 	if len(affectedDatabases) > 0 {
 		h.logger.Info("stale cleanup leaves the aggregate to the plans of the databases the PR plans",
 			"repo", repo, "pr", pr, "head_sha", headSHA,
@@ -1128,6 +1136,69 @@ func checkDatabaseKeyStrings(keys map[checkDatabaseKey]bool) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// settleChecksReplacedByNewType settles the rows a database left under its old
+// type once the plan of its new type has stored results. A plan calls it after
+// storing its rows and before folding the aggregate, so the old row blocks the
+// aggregate, from its earlier commit, for as long as the result that replaces
+// it does not exist. That holds for every fold, not only the plan's own: a
+// second database still planning keeps the aggregate open through its own old
+// row.
+//
+// A row is settled in an environment the plan stored a result for, and in an
+// environment the plan does not cover, since nothing will replace it there. In
+// an environment the plan covers but did not store, because it failed there,
+// the row keeps blocking until a later plan stores that environment. Settling
+// follows stale cleanup: a started apply keeps its row blocking, and a
+// plan-only row passes.
+func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, repo string, pr int, headSHA, databaseName, databaseType string, storedEnvironments, plannedEnvironments map[string]bool) error {
+	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("load checks for %s#%d to settle %s rows under types other than %s: %w", repo, pr, databaseName, databaseType, err)
+	}
+	planned := newCheckDatabaseKey(databaseName, databaseType)
+	for _, check := range checks {
+		if isAggregateCheck(check) {
+			continue
+		}
+		key := checkDatabaseKeyForCheck(check)
+		if key.databaseName != planned.databaseName || key.databaseType == planned.databaseType {
+			continue
+		}
+		environment := storage.CanonicalKey(check.Environment)
+		if check.HeadSHA == headSHA {
+			h.logger.Debug("check under a database's old type is already settled on this commit",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
+		}
+		if plannedEnvironments[environment] && !storedEnvironments[environment] {
+			h.logger.Warn("check under a database's old type keeps blocking because the plan of its new type stored no result for this environment",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
+		}
+		h.logger.Info("settling check under a database's old type after the plan of its new type",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"previous_status", check.Status, "previous_conclusion", check.Conclusion, "apply_id", check.ApplyID)
+		h.settleStaleCheckState(ctx, repo, pr, headSHA, check)
+	}
+	return nil
+}
+
+// settleStaleCheckState moves a row nothing will replace onto headSHA. A row a
+// started apply owns keeps blocking, because the live database may already have
+// changed; a plan-only row passes. It reports whether the row was written.
+func (h *Handler) settleStaleCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
+	if checkHasStartedApply(check) {
+		return h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check)
+	}
+	return h.markStalePlanOnlyCheckStateSuccessful(ctx, repo, pr, headSHA, check)
 }
 
 func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
