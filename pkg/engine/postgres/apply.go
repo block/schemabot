@@ -197,6 +197,14 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: native-safe increment requires exactly one planned change", req.Database)
 	}
 	tc := req.Changes[0].TableChanges[0]
+	hasRLS, err := pgstatement.HasRowSecurityDeclaration(tc.DDL)
+	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
+	}
+	if hasRLS {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require an atomic apply path that SchemaBot does not provide yet", tc.Table)
+	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
 	}
@@ -205,6 +213,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	// cannot execute is refused at acceptance, before any work is queued.
 	statements, err := postgresCreateSetStatements(tc.DDL)
 	if err != nil {
+		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
 	if _, err := preflight.RequiredTier(statements); err != nil {

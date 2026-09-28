@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Schema pull](#schema-pull)
+- [Row-level security](#row-level-security)
 - [Supported changes](#supported-changes)
 - [Blocked plans](#blocked-plans)
 - [Apply-time refusals](#apply-time-refusals)
@@ -47,7 +48,7 @@ The pull is refused in full if any selected table cannot round-trip through the
 declarative format. This includes partitioned parents, foreign-key relationships,
 unlogged tables, explicit collations, and sequence defaults that cannot be
 represented safely, as well as tables carrying objects the format does not
-model at all: triggers, row-level security and policies, comments, non-default
+model at all: triggers, table and column comments, non-default
 relation options, and table inheritance. If any selected table is refused, no
 partial output is produced. Only basic catalog detail is supported on
 PostgreSQL; a request for detailed catalog output is rejected rather than
@@ -59,11 +60,64 @@ is not `bigint` or `uuid`, `real` / `double precision` / `float(n)` columns, a
 quoted table name that is not lowercase, and a btree index that another index
 or the primary key already covers. Every finding is a warning, and a clean
 audit returns an empty list for the namespace. Each pulled entry is audited as
-the create set the renderer emits — the `CREATE TABLE` followed by that table's
-`CREATE INDEX` statements — and an entry of any other shape fails the request
+the create set the renderer emits: `CREATE TABLE` and `CREATE INDEX` statements,
+with validated RLS declarations when present. The audit checks table and index
+shape, not access policy correctness. Unsupported declarations fail the request
 rather than producing a partial audit. The rules and the MySQL-only rules they
 leave out are in
 [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
+
+## Row-level security
+
+Pull includes row-level security (RLS) settings, policies, and policy comments
+when a table defines them. Tables without RLS settings or policies keep their
+ordinary table and index definitions; no extra flag is needed. A disabled table
+with policies still exports those policies and an explicit `DISABLE` setting.
+
+A pulled RLS definition can be checked back into its namespace directory and
+planned. An unchanged definition produces no changes. Changes to settings,
+policies, or the table shape in an RLS declaration currently refuse planning;
+SchemaBot does not turn the review into executable SQL. Direct RLS apply requests
+are also refused. Creating a new table with an RLS declaration is not supported
+yet. Atomic RLS apply is a separate follow-up.
+
+Existing table-only files remain supported on tables with live RLS. They manage
+columns and indexes without changing policies or RLS settings; older rollback
+baselines keep this behavior too. Omitting RLS clauses does **not** disable RLS
+or drop policies. Explicit RLS declarations use the stricter comparison above,
+which currently refuses mixed structural and RLS changes. A no-change result
+for a table-only file says nothing about whether its access policies match.
+
+New plans for a namespace containing RLS tables remain rollback-incapable until
+complete RLS definitions can be applied during recovery. Pull still exports the
+full definition; rollback capture never strips access policies to claim support.
+
+For example, an existing table can pull as:
+
+```sql
+CREATE TABLE "documents" (
+    "id" bigint NOT NULL,
+    "owner_id" bigint NOT NULL,
+    CONSTRAINT "documents_pkey" PRIMARY KEY (id)
+);
+
+ALTER TABLE "documents" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "documents" NO FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "readers" ON "documents"
+    AS PERMISSIVE FOR SELECT TO PUBLIC
+    USING ((owner_id = 1));
+```
+
+Planning this file against that same live definition returns `NoChanges: true`.
+Editing the policy to `USING (true)` instead returns a row security comparison
+refusal, with no executable plan or live changes.
+
+RLS comparison and rendering use pg-sprite's validated model. Policy roles and
+qualified helper functions must already exist. Unsupported policy dependencies
+still refuse the entire pull rather than returning an incomplete definition.
+`pull --lint` validates the declaration and audits table and index shape; it
+does not judge whether a policy grants the right access.
 
 ## Supported changes
 
@@ -374,7 +428,7 @@ operational process. `schemabot pull` and `schemabot onboard` write the files
 for the tables the plan holds accountable, so onboarding an existing database
 is a pull, not hand-writing every file; the pull refuses a namespace as a
 whole when any of its tables carries objects the format cannot represent
-(triggers, policies, comments, relation options, inheritance, partitioning,
+(triggers, table or column comments, relation options, inheritance, partitioning,
 or foreign keys on either side), and those tables need a hand-written file or
 a reviewed drop before the rest can be pulled. `CREATE UNLOGGED TABLE`,
 `PARTITION BY` and a child of `INHERITS` flattened to its own columns are all
@@ -600,11 +654,10 @@ it commits or fails, and recovery re-plans against the live target before
 further work. A privilege refusal is a permanent failed task, includes the
 required provisioning advice, and leaves the target unchanged.
 
-A namespace containing an RLS table cannot capture a complete rollback baseline,
-including for changes to other tables in that namespace. Forward structural
-plans can still proceed, but rollback is refused under
-[RV-7](invariants.md#rv-7-rollback-needs-the-originals). Access rules are not
-stripped from the baseline to claim rollback support.
+Rollback baseline capture refuses namespaces containing RLS tables until
+recovery can restore their complete access rules alongside sibling tables.
+It never strips policies to mark a plan rollback-capable. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
+requires complete originals before rollback can proceed.
 
 ## Configuration and credentials
 
@@ -666,7 +719,7 @@ They run in CI's per-package integration shard and with `make test-integration`.
 | --- | --- |
 | Add a nullable column | Pull, plan, apply, and replan converge without losing rows or table grants |
 | Add an index | The adapter executes a concurrent index build and converges to the desired schema |
-| Table with RLS | Pull refuses to omit access rules; a direct native column addition preserves row isolation |
+| Table with RLS | Pull retains access rules and an unchanged plan converges; a direct native column addition preserves row isolation |
 | Copy and swap | The plan is blocked and leaves the table unchanged |
 
 Run just these cases locally:
@@ -681,9 +734,8 @@ A passing refusal case proves rejection, not support for applying that change.
 
 This is a small adapter suite, not a claim of hosted Supabase support. It does
 not exercise Supavisor, the Data API, Auth service, Realtime, or hosted TLS.
-SchemaBot does not yet manage RLS declaratively: its current PostgreSQL pull
-refuses tables with RLS or policies. The RLS test calls the native apply path
-directly and checks visibility with the image's `authenticated` role and
+SchemaBot can pull and compare RLS declarations, but does not yet execute changes
+to them. The RLS test also calls the native apply path directly and checks visibility with the image's `authenticated` role and
 bootstrap `auth.uid()` function. It does not test the full plan-to-apply workflow
 for an RLS table or HTTP authentication.
 

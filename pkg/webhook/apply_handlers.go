@@ -170,7 +170,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
 	// Environment ordering enforcement: prior server-configured environments must be clean before applying.
-	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, prInfo.HeadSHA, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command prior environment gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
