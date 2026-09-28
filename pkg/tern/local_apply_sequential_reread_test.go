@@ -44,23 +44,40 @@ func (s *rereadFailingTaskStore) Get(ctx context.Context, taskIdentifier string)
 	return s.exactProgressTaskStore.Get(ctx, taskIdentifier)
 }
 
-// rereadFailureCases are the two ways a task re-read can fail to answer: the
-// read errors, or it succeeds and finds no row. Both leave the drive unable to
-// say whether the task's DDL still needs to run.
-var rereadFailureCases = map[string]error{
-	"storage error": errors.New("read tasks row: i/o timeout"),
-	"missing row":   nil,
+// rereadFailureCase is one way a task re-read can fail to answer, with the
+// action the drive must take and the error a sequential resume must report.
+type rereadFailureCase struct {
+	getErr    error
+	action    taskAction
+	message   string
+	resumeErr error
 }
 
-// A task re-read that cannot answer is reported as an abort, never a skip, and
-// the two causes log distinct lines so an operator can tell a storage failure
-// from a missing row.
-func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
-	messages := map[string]string{
-		"storage error": "re-reading task state before start failed; current apply owner will exit for operator retry",
-		"missing row":   "task row not found when re-reading it before start; current apply owner will exit for operator retry",
-	}
-	for name, getErr := range rereadFailureCases {
+// rereadFailureCases are the two ways a task re-read can fail to answer: the
+// read errors, or it succeeds and finds no row. Both leave the drive unable to
+// say whether the task's DDL still needs to run. A storage error is transient,
+// so the drive aborts and leaves the apply for a later drive; a missing row
+// cannot heal on its own, so the resume reports the apply undriveable.
+var rereadFailureCases = map[string]rereadFailureCase{
+	"storage error": {
+		getErr:    errors.New("read tasks row: i/o timeout"),
+		action:    taskAbort,
+		message:   "re-reading task state before start failed; current apply owner will exit for operator retry",
+		resumeErr: nil,
+	},
+	"missing row": {
+		getErr:    nil,
+		action:    taskMissing,
+		message:   "task row not found when re-reading it before start; the apply is undriveable and stays claimable until the row is restored or an operator intervenes",
+		resumeErr: ErrApplyTaskRowMissing,
+	},
+}
+
+// A task re-read that cannot answer never skips the task: a storage error
+// aborts the drive attempt and a missing row reports the apply undriveable. The
+// two causes log distinct lines so an operator can tell them apart.
+func TestCheckTaskReady_UnansweredRereadNeverSkips(t *testing.T) {
+	for name, tc := range rereadFailureCases {
 		t.Run(name, func(t *testing.T) {
 			task := &storage.Task{TaskIdentifier: "task-1", TableName: "users", State: state.Task.Pending}
 			apply := driveLoggerTestApply(state.Apply.Running)
@@ -69,7 +86,7 @@ func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
 				storage: &exactProgressStorage{tasks: &rereadFailingTaskStore{
 					exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
 					failTaskIdentifier:     "task-1",
-					getErr:                 getErr,
+					getErr:                 tc.getErr,
 				}},
 				logger: slog.New(captureHandler{records: &records}),
 			}
@@ -77,8 +94,9 @@ func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
 			logger := client.logger.With(apply.IdentityLogAttrs()...)
 			action := client.checkTaskReady(t.Context(), logger, task)
 
-			assert.Equal(t, taskAbort, action, "an unanswered re-read ends the drive attempt instead of skipping the task")
-			line := requireCapturedLog(t, records, messages[name])
+			assert.Equal(t, tc.action, action, "an unanswered re-read ends the drive attempt instead of skipping the task")
+			assert.NotEqual(t, taskSkip, action)
+			line := requireCapturedLog(t, records, tc.message)
 			assert.Equal(t, slog.LevelError, line.level)
 			assert.Equal(t, "task-1", line.attrs["task_id"])
 			assert.Equal(t, "users", line.attrs["table"])
@@ -87,8 +105,8 @@ func TestCheckTaskReady_UnansweredRereadAborts(t *testing.T) {
 			for _, key := range []string{"apply_id", "database", "database_type", "environment", "repo", "pr"} {
 				assert.Equal(t, 1, countLogKey(line.keys, key), "identity attribute %q must be emitted once", key)
 			}
-			if getErr != nil {
-				assert.Equal(t, getErr, line.attrs["error"])
+			if tc.getErr != nil {
+				assert.Equal(t, tc.getErr, line.attrs["error"])
 			} else {
 				assert.NotContains(t, line.attrs, "error", "a missing row carries no error to report")
 			}
@@ -139,7 +157,7 @@ func TestCheckTaskReady_CancelledDuringRereadHandsOver(t *testing.T) {
 // apply stays running and claimable and the second task stays pending for a
 // later drive to re-read and run.
 func TestExecuteApplySequential_UnansweredRereadLeavesApplyActive(t *testing.T) {
-	for name, getErr := range rereadFailureCases {
+	for name, tc := range rereadFailureCases {
 		t.Run(name, func(t *testing.T) {
 			first := &storage.Task{
 				ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
@@ -168,7 +186,7 @@ func TestExecuteApplySequential_UnansweredRereadLeavesApplyActive(t *testing.T) 
 					tasks: &rereadFailingTaskStore{
 						exactProgressTaskStore: &exactProgressTaskStore{tasks: tasks},
 						failTaskIdentifier:     "task-2",
-						getErr:                 getErr,
+						getErr:                 tc.getErr,
 					},
 					controlRequests: &testControlRequestStore{},
 					logs:            &mockApplyLogStore{},
@@ -192,21 +210,30 @@ func TestExecuteApplySequential_UnansweredRereadLeavesApplyActive(t *testing.T) 
 
 // A sequential resume holds the same rule: when the second task cannot be
 // re-read before it starts, the resume exits without finalizing rather than
-// recording the apply completed over a task whose DDL never ran.
+// recording the apply completed over a task whose DDL never ran. A storage
+// error returns nil so the apply is simply re-driven later; a missing row
+// returns ErrApplyTaskRowMissing so the operator refuses to derive an
+// operation verdict from the rows that remain.
 func TestResumeApplySequential_UnansweredRereadLeavesApplyActive(t *testing.T) {
-	for name, getErr := range rereadFailureCases {
+	for name, tc := range rereadFailureCases {
 		t.Run(name, func(t *testing.T) {
 			logs := &mockApplyLogStore{}
 			taskStore := &rereadFailingTaskStore{
 				exactProgressTaskStore: &exactProgressTaskStore{},
 				failTaskIdentifier:     "task_name",
-				getErr:                 getErr,
+				getErr:                 tc.getErr,
 			}
 			c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
 			taskStore.tasks = tasks
 
-			c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil)
+			err := c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil)
 
+			if tc.resumeErr == nil {
+				require.NoError(t, err, "a transient storage error is not reported as an undriveable apply")
+			} else {
+				require.ErrorIs(t, err, tc.resumeErr, "a vanished task row is reported so the operator refuses to project a verdict")
+				assert.Contains(t, err.Error(), "task_name", "the error names the task whose row is gone")
+			}
 			assert.True(t, state.IsState(tasks[0].State, state.Task.Completed),
 				"the first task settles before the failed re-read, got %s", tasks[0].State)
 			assert.Empty(t, eng.applied, "the task that could not be re-read never reaches the engine")

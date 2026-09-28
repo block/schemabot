@@ -57,6 +57,12 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		if action == taskAbort {
 			return
 		}
+		if action == taskMissing {
+			// A fresh drive has no operator projection to refuse, so exiting
+			// without a verdict is the whole fail-closed behaviour here; the
+			// operator's resume of the still-active apply reports the cause.
+			return
+		}
 		if action == taskStopped {
 			stoppedByUser = true
 			break
@@ -117,6 +123,7 @@ const (
 	taskSkip                       // Task is already terminal in storage; move on to the next
 	taskAbort                      // Current owner should exit without changing final state
 	taskHandover                   // This drive's context was cancelled; the apply stays active for another driver to claim
+	taskMissing                    // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
 )
 
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
@@ -131,7 +138,9 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 	// The re-read decides whether this task's DDL runs, so a read that cannot
 	// answer ends the drive attempt without finalizing: skipping the task would
 	// let finalization record the apply completed with this task's DDL never run.
-	// The apply stays active for a later drive to re-read the task and run it.
+	// A storage error leaves the apply active for a later drive to re-read the
+	// task and run it. A missing row is reported as undriveable, because the rows
+	// that remain would otherwise derive a verdict this task never earned.
 	freshTask, err := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -144,9 +153,9 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 		return taskAbort
 	}
 	if freshTask == nil {
-		logger.Error("task row not found when re-reading it before start; current apply owner will exit for operator retry",
+		logger.Error("task row not found when re-reading it before start; the apply is undriveable and stays claimable until the row is restored or an operator intervenes",
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State)
-		return taskAbort
+		return taskMissing
 	}
 	if freshTask.State == state.Task.Stopped {
 		logger.Info("task was stopped by user, skipping", "task_id", task.TaskIdentifier, "table", task.TableName)

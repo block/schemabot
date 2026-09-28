@@ -1203,6 +1203,13 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		s.failOperationWithoutTasks(operationLeaseCtx, operationLeaseCtx, driverID, op, failApply)
 		return
 	}
+	if !resumed && errors.Is(resumeErr, tern.ErrApplyTaskRowMissing) {
+		// The drive failed closed: a task it loaded has no row, so the rows that
+		// remain would derive a verdict the vanished task never earned. Leave
+		// the operation row as found and claimable; resumeClaimedApply already
+		// logged and counted the cause.
+		return
+	}
 
 	// Persist the operation row from its OWN tasks — even when the drive returned
 	// an error. Unlike the single-op path, a multi-op drive has no
@@ -2188,6 +2195,20 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			logger.Error("operator: apply owns task rows the drive did not load; refusing task-less completion and leaving the apply claimable",
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_tasks_not_loaded")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrApplyTaskRowMissing) {
+			// Fail-closed: a task the drive loaded has no row when re-read before
+			// it starts, so the rows that remain cannot stand in for the apply's
+			// verdict. The drive wrote no verdict; the apply stays claimable and
+			// each re-claim fails here, so the stuck work stays visible on this
+			// counter until the row is restored or an operator intervenes.
+			logger.Error("operator: apply task row vanished before its drive; refusing to derive a verdict from the remaining tasks and leaving the apply claimable",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_task_row_missing")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}

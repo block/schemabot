@@ -240,7 +240,8 @@ logged and the drive continues. An error reading something safety-gating ends th
 and leaves the row claimable for another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
-the drive loop (`pkg/api/operator.go`) and the remote progress error limit
+the drive loop (`pkg/api/operator.go`), the pre-start task re-read in the sequential drive
+(`pkg/tern/local_apply_sequential.go`) and the remote progress error limit
 (`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -1344,7 +1345,8 @@ under all of them.
 A loader returning zero rows because of an error is never conflated with an apply that genuinely
 owns zero rows: the first blocks and surfaces, only the second may complete as a no-op. *Breaks if
 violated:* completion reports success for DDL that never ran. *Enforced:* separated error and
-empty handling on recovery load paths (`pkg/api/operator.go`).
+empty handling on recovery load paths (`pkg/api/operator.go`) and on the pre-start task re-read in
+the sequential drive (`pkg/tern/local_apply_sequential.go`).
 
 ### RC-4: Self-healing needs proof
 

@@ -1421,19 +1421,29 @@ func (s *recoverOperationStore) MarkFailed(_ context.Context, _ int64, errMsg st
 	return nil
 }
 
+func (s *recoverOperationStore) MarkCompleted(_ context.Context, _ int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.op.State = state.ApplyOperation.Completed
+	return nil
+}
+
 func (s *recoverOperationStore) Heartbeat(context.Context, int64) error { return nil }
 
 // recoverTestStorage wires the stores the recover flow touches, including the
-// plan lookup the routing tern client requires to build.
+// plan lookup the routing tern client requires to build. tasks is nil unless a
+// test needs the operation's own task rows to be readable after the drive.
 type recoverTestStorage struct {
 	mockStorage
 	applies storage.ApplyStore
 	ops     storage.ApplyOperationStore
 	control storage.ControlRequestStore
+	tasks   storage.TaskStore
 }
 
 func (s *recoverTestStorage) Applies() storage.ApplyStore                  { return s.applies }
 func (s *recoverTestStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
+func (s *recoverTestStorage) Tasks() storage.TaskStore                     { return s.tasks }
 func (s *recoverTestStorage) Plans() storage.PlanStore                     { return &staticPlanStore{} }
 func (s *recoverTestStorage) ControlRequests() storage.ControlRequestStore { return s.control }
 
@@ -1481,6 +1491,57 @@ func TestRecoverMultiApplyOperation_FailsTaskLessOperationAgainstReloadedParent(
 		"the parent apply must be failed after the task-less operation is terminalized against the reloaded running state")
 	assert.Equal(t, state.ApplyOperation.Failed, opStore.op.State,
 		"the task-less operation row must be marked failed")
+}
+
+// When a multi-deployment operation's sequential drive finds one of its task
+// rows gone, the rows that remain would derive a verdict the vanished task never
+// earned: here the surviving task is completed, so deriving from it alone would
+// mark the operation completed with one table's DDL never run. The recover flow
+// must leave the operation row as found — running and claimable — and must not
+// touch the parent projection, so the apply stays visible as stuck rather than
+// settling to a false terminal state.
+func TestRecoverMultiApplyOperation_MissingTaskRowLeavesOperationUnprojected(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	applyStore := &casApplyStore{
+		template: storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply-multi-op-missing-task",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+		},
+		state: state.Apply.Running,
+	}
+	opStore := &recoverOperationStore{op: &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}}
+	survivingTasks := &stubTaskStore{tasks: []*storage.Task{
+		{ID: 1, ApplyID: 7, TaskIdentifier: "task-1", State: state.Task.Completed},
+	}}
+	deploymentClient := &mockTernClient{resumeErr: tern.ErrApplyTaskRowMissing}
+
+	svc := New(
+		&recoverTestStorage{applies: applyStore, ops: opStore, control: &fakeControlRequestStore{}, tasks: survivingTasks},
+		testServerConfig(),
+		map[string]tern.Client{"west/staging": deploymentClient},
+		logger,
+	)
+
+	svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}, storage.OperationLease{})
+
+	assert.Equal(t, state.ApplyOperation.Running, opStore.op.State,
+		"the operation row must stay running and claimable; its surviving completed task must not be projected as the operation's verdict")
+	assert.Equal(t, state.Apply.Running, applyStore.currentState(),
+		"the parent apply must stay running; a vanished task row settles nothing")
 }
 
 // cutoverOpStore backs the cutover claim path: FindNextApplyOperationCutover
