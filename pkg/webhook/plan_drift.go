@@ -20,7 +20,9 @@ import (
 // and a blocked outcome on any divergence, a deployment that could not be diffed
 // or compared, or a failure to compute the rollup at all: without a trustworthy
 // comparison SchemaBot cannot confirm the reviewed change is safe to apply
-// everywhere, so the plan check fails closed.
+// everywhere, so the plan check fails closed. A computed rollup's outcome also
+// counts the members that still have work, so a check whose reviewed primary is
+// already at the desired schema does not pass while another member is not.
 //
 // The primary plan reporting errors is not a drift signal — that generic plan
 // failure already fails the check on its own — so the rollup is skipped and the
@@ -64,11 +66,12 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 	}
 	preview := deploymentDriftPreview(rollup)
 	if rollup.Clean {
-		return reviewDriftOutcome{state: driftClean}, preview
+		return reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}, preview
 	}
 	return reviewDriftOutcome{
 		state:   driftBlocked,
 		summary: summarizeReviewDrift(rollup),
+		work:    memberWorkOf(&rollup),
 	}, preview
 }
 

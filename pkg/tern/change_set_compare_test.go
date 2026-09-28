@@ -196,6 +196,42 @@ func TestChangeSet_AuthoritativeTableChangesEmptyShardRows(t *testing.T) {
 	assert.Equal(t, protoAlterUsersEmail().Ddl, got[0].Ddl)
 }
 
+// A change set has work when it carries a table change in either
+// representation or a VSchema change under either signal, and has none when it
+// carries only empty rows.
+func TestChangeSet_HasWork(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cs   ChangeSet
+		want bool
+	}{
+		{"empty", ChangeSet{}, false},
+		{"only empty rows", ChangeSet{
+			Changes: []*ternv1.SchemaChange{{Namespace: "testapp"}, nil},
+			Shards:  []*ternv1.ShardPlan{{Shard: "-80", Namespace: "testapp"}, nil},
+		}, false},
+		{"collapsed table change", ChangeSet{
+			Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()}}},
+		}, true},
+		{"shard table change", ChangeSet{
+			Shards: []*ternv1.ShardPlan{{Shard: "-80", Namespace: "testapp", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}}},
+		}, true},
+		{"vschema flag", ChangeSet{
+			Changes: []*ternv1.SchemaChange{{Namespace: "testapp", Metadata: map[string]string{"vschema_changed": "true"}}},
+		}, true},
+		{"vschema diff", ChangeSet{
+			Changes: []*ternv1.SchemaChange{{Namespace: "testapp", Metadata: map[string]string{"vschema": "+ tables.users"}}},
+		}, true},
+		{"vschema flag false", ChangeSet{
+			Changes: []*ternv1.SchemaChange{{Namespace: "testapp", Metadata: map[string]string{"vschema_changed": "false"}}},
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.cs.HasWork())
+		})
+	}
+}
+
 // A database mixing a sharded and an unsharded namespace compares each namespace
 // in its authoritative representation; the unsharded namespace is not dropped.
 func TestCompareChangeSets_MixedShardedAndUnsharded(t *testing.T) {

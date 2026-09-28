@@ -3905,9 +3905,14 @@ func (x *CancelRequest) GetCaller() string {
 
 // CancelResponse indicates whether the cancel was accepted.
 type CancelResponse struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	Accepted     bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
-	ErrorMessage string                 `protobuf:"bytes,2,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Accepted bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	// error_message explains a refusal when accepted is false. When accepted is
+	// true it may still be set, to say what actually happened: a cancel that
+	// arrived after the schema change settled is accepted with
+	// "Schema change already <state>". Branch on accepted, not on whether
+	// error_message is empty.
+	ErrorMessage string `protobuf:"bytes,2,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	// Number of tasks that were cancelled.
 	CancelledCount int64 `protobuf:"varint,3,opt,name=cancelled_count,json=cancelledCount,proto3" json:"cancelled_count,omitempty"`
 	// Number of tasks skipped (already in terminal state).

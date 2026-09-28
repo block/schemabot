@@ -51,6 +51,14 @@ var ErrPlanMissingForApplyOperation = fmt.Errorf("plan not found for apply opera
 // visibly stuck until the rows load or an operator intervenes.
 var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader did not return")
 
+// ErrApplyTaskRowMissing is returned by a sequential drive whose pre-start
+// re-read of a task found no row. The drive loaded that task, so the apply is
+// undriveable, not done: the rows that remain would derive a verdict the
+// vanished task never earned. The drive exits without a verdict and the apply
+// stays claimable, so the work stays visibly stuck until the row is restored or
+// an operator intervenes.
+var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.

@@ -12,21 +12,15 @@ package webhook
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
 	"testing"
 
 	mysql "github.com/block/mysql"
-	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
-	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -96,6 +90,23 @@ func driftDSN(t *testing.T, dbName string) string {
 // own registered tern LocalClient. The first spec is the primary (rollout index
 // 0). Returns the service; physical databases are dropped on cleanup.
 func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentSpec) *api.Service {
+	t.Helper()
+	return setupE2ERolloutService(t, dbName, specs, api.PlanMirrored)
+}
+
+// setupE2ERolloutService is setupE2EReviewDriftService with the environment's
+// member planning under test control. Independent planning spells each
+// deployment's routing as a targets list, the shape that tells SchemaBot the
+// members hold schemas of their own.
+func setupE2ERolloutService(t *testing.T, dbName string, specs []deploymentSpec, planning api.MemberPlanning) *api.Service {
+	t.Helper()
+	return setupE2ERolloutServiceWithStorage(t, dbName, specs, planning, nil)
+}
+
+// setupE2ERolloutServiceWithStorage is setupE2ERolloutService with the
+// service's storage passed through wrapStorage, so a test can fault a store the
+// handler writes through. A nil wrapStorage uses the storage unchanged.
+func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []deploymentSpec, planning api.MemberPlanning, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
 	t.Helper()
 	ctx := t.Context()
 
@@ -169,7 +180,12 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = client.Close() })
 
-		deployments[spec.name] = api.DeploymentTarget{Target: dbName + "-" + spec.name + "-target"}
+		target := dbName + "-" + spec.name + "-target"
+		if planning == api.PlanIndependent {
+			deployments[spec.name] = api.DeploymentTarget{Targets: []string{target}}
+		} else {
+			deployments[spec.name] = api.DeploymentTarget{Target: target}
+		}
 		order = append(order, spec.name)
 		ternClients[spec.name+"/"+driftEnv] = client
 	}
@@ -191,7 +207,11 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 		},
 	}
 
-	svc := api.New(st, serverConfig, ternClients, logger)
+	var svcStorage storage.Storage = st
+	if wrapStorage != nil {
+		svcStorage = wrapStorage(st)
+	}
+	svc := api.New(svcStorage, serverConfig, ternClients, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc
 }
@@ -200,33 +220,7 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 // drift fixtures and returns the service so the caller can assert stored state.
 func runDriftPlan(t *testing.T, svc *api.Service, dbName string) {
 	t.Helper()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	client := gh.NewClient(nil)
-	baseURL, err := url.Parse(server.URL + "/")
-	require.NoError(t, err)
-	client.BaseURL = baseURL
-
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	schemaFiles := map[string]string{"users.sql": usersWithEmailSchema}
-	setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
-	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
-
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot plan -e " + driftEnv,
-		isPR:    true,
-	}, nil)
-
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
+	runRolloutCommand(t, svc, dbName, "schemabot plan -e "+driftEnv)
 }
 
 // A non-primary deployment whose live schema already carries the reviewed change

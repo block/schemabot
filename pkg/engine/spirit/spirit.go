@@ -24,7 +24,6 @@ import (
 	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
-	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/table"
@@ -561,14 +560,15 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// blocked verdict below. A malformed policy fails the plan: silently
 	// treating it as disabled would record blocked verdicts the apply-time
 	// routing might not agree with.
-	policy, err := directPolicyFromMetadata(req.Credentials.Metadata)
+	verdicts, err := e.NewExecutionVerdicts(req.Credentials)
 	if err != nil {
-		return nil, fmt.Errorf("resolve direct execution policy: %w", err)
+		return nil, err
 	}
 	// Row estimates for the policy bound connect lazily so plans without
-	// refused statements never open the extra connection.
-	target := &lazyTargetDB{dsn: req.Credentials.DSN}
-	defer target.close()
+	// refused statements never open the extra connection. The existing-copy
+	// disclosure below reads the target through the same connection.
+	defer verdicts.Close()
+	target := verdicts.target
 
 	if !plan.HasChanges() {
 		// The exemption travels on a no-changes plan too: this is exactly where
@@ -616,30 +616,16 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		// Execution-mode verdict: surface statements Spirit deterministically
 		// refuses so the operator learns at plan time how the apply will
 		// behave — routed to direct execution when the policy permits, or
-		// guaranteed to fail when it doesn't. Only ALTERs can be refused, and
-		// gating here keeps the verdict — an informational field — from ever
-		// failing the plan on a statement type the engine's own parser
-		// doesn't accept.
-		if stmtType == ddl.StatementAlterTable {
+		// guaranteed to fail when it doesn't. The diff emits only CREATE,
+		// ALTER, and DROP, so every statement that can be refused here is an
+		// ALTER.
+		if verdictApplies(stmtType) {
 			currentCreateTable, ok := currentByTable[pc.TableName]
 			if !ok {
 				return nil, fmt.Errorf("plan produced an ALTER for table %q, which has no current definition in database %q", pc.TableName, database)
 			}
-			reason, refused, err := check.StatementRefusal(ctx, pc.Statement, currentCreateTable, e.logger)
-			if err != nil {
-				return nil, fmt.Errorf("execution verdict for table %q: %w", pc.TableName, err)
-			}
-			if refused {
-				decision := e.resolveRefusedMode(ctx, target, policy, database, pc.TableName, reason)
-				change.ExecutionMode = decision.mode
-				change.ModeReason = decision.modeReason
-				if decision.mode == engine.ExecutionModeDirect {
-					e.logger.Info("plan routes a statement the engine refuses to direct execution",
-						"database", database, "table", pc.TableName, "reason", reason, "estimated_rows", decision.rows)
-				} else {
-					e.logger.Info("plan contains a statement the engine will refuse at apply time",
-						"database", database, "table", pc.TableName, "reason", decision.modeReason)
-				}
+			if err := verdicts.record(ctx, &change, currentCreateTable); err != nil {
+				return nil, err
 			}
 		}
 

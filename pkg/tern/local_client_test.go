@@ -418,6 +418,16 @@ func (s *exactProgressApplyStore) Update(_ context.Context, apply *storage.Apply
 	return nil
 }
 
+// WithExclusiveTarget runs the work with the target uncontended, the case these
+// fixtures exercise. Contention is a storage decision, covered where the real
+// store enforces it.
+func (s *exactProgressApplyStore) WithExclusiveTarget(ctx context.Context, _ *storage.Apply, fn func(context.Context) error) error {
+	if s.err != nil {
+		return s.err
+	}
+	return fn(ctx)
+}
+
 func (s *exactProgressApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
 	if s.err != nil {
 		return false, s.err
@@ -3749,6 +3759,7 @@ type capturedLog struct {
 	level slog.Level
 	msg   string
 	attrs map[string]any
+	keys  []string
 }
 
 // captureHandler is a minimal slog.Handler that records every emitted record so
@@ -3763,14 +3774,17 @@ func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true 
 
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
 	attrs := make(map[string]any, len(h.bound)+r.NumAttrs())
+	keys := make([]string, 0, len(h.bound)+r.NumAttrs())
 	for _, a := range h.bound {
 		attrs[a.Key] = a.Value.Any()
+		keys = append(keys, a.Key)
 	}
 	r.Attrs(func(a slog.Attr) bool {
 		attrs[a.Key] = a.Value.Any()
+		keys = append(keys, a.Key)
 		return true
 	})
-	*h.records = append(*h.records, capturedLog{level: r.Level, msg: r.Message, attrs: attrs})
+	*h.records = append(*h.records, capturedLog{level: r.Level, msg: r.Message, attrs: attrs, keys: keys})
 	return nil
 }
 

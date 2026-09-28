@@ -1994,7 +1994,8 @@ func TestApplyStore_UpdateBlocksActiveApplyForSameTarget(t *testing.T) {
 
 	active.State = state.Apply.Completed
 	require.NoError(t, store.Applies().Update(ctx, active))
-	require.NoError(t, store.Applies().Update(ctx, completed))
+	require.ErrorIs(t, store.Applies().Update(ctx, completed), storage.ErrApplyReopenRefused,
+		"a free target does not make a finished apply writable as active")
 }
 
 func TestApplyStore_UpdateNonExistent(t *testing.T) {
@@ -2007,9 +2008,7 @@ func TestApplyStore_UpdateNonExistent(t *testing.T) {
 		State: state.Apply.Running,
 	}
 
-	// Update on a non-existent row is a no-op (0 rows affected), not an error.
-	// MySQL UPDATE with WHERE id=? succeeds even when no row matches.
-	require.NoError(t, store.Applies().Update(ctx, apply))
+	require.ErrorIs(t, store.Applies().Update(ctx, apply), storage.ErrApplyNotFound)
 }
 
 // TestApplyStore_UpdateDerivedState verifies the rollout-projection compare-and-
@@ -4050,7 +4049,7 @@ func TestApplyStore_UpdateOptions(t *testing.T) {
 		PullRequest:     123,
 		Environment:     "staging",
 		Engine:          "spirit",
-		State:           state.Apply.Stopped,
+		State:           state.Apply.Pending,
 	}
 	apply.SetOptions(storage.ApplyOptions{Target: "testdb"})
 
@@ -4059,7 +4058,7 @@ func TestApplyStore_UpdateOptions(t *testing.T) {
 
 	retrieved, err := store.Applies().Get(ctx, id)
 	require.NoError(t, err)
-	retrieved.State = state.Apply.Pending
+	retrieved.State = state.Apply.Running
 
 	require.NoError(t, store.Applies().Update(ctx, retrieved))
 

@@ -63,6 +63,26 @@ func previewVitessPlanOutput() {
 	WritePlanSummary(allChanges)
 }
 
+// previewPostgresPlanOutput renders a PostgreSQL plan whose standalone index
+// build on an existing table is named as an index to create in the summary.
+func previewPostgresPlanOutput() {
+	WritePlanHeader(PlanHeaderData{
+		Engine:      "postgres",
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+	})
+
+	changes := []DDLChange{
+		{ChangeType: "CREATE", TableName: "sessions", DDL: "CREATE TABLE sessions (id uuid PRIMARY KEY, user_id bigint NOT NULL, payload jsonb, created_at timestamptz NOT NULL DEFAULT now())"},
+		{ChangeType: "ALTER", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN last_seen_at timestamptz, ADD COLUMN preferences jsonb"},
+		{ChangeType: "CREATE_INDEX", TableName: "orders", DDL: "CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)"},
+	}
+	WriteSQLChanges(changes, schema.DialectPostgres)
+	WritePlanSummary(changes)
+}
+
 func previewPlanNoChangesOutput() {
 	WritePlanHeader(PlanHeaderData{
 		Database:    "testapp",

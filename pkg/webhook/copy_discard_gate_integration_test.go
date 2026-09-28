@@ -135,7 +135,7 @@ func (f discardGateFixture) disclosingPlanID(t *testing.T) string {
 	require.NoError(t, err)
 
 	prNumber := int32(1)
-	planResp, err := f.handler.executePlanWithTransientRetry(t.Context(), api.PlanRequest{
+	_, planResp, err := f.handler.executePlanProtoWithTransientRetry(t.Context(), api.PlanRequest{
 		Database:          schemaResult.Database,
 		Environment:       "staging",
 		Type:              schemaResult.Type,
@@ -441,7 +441,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 	// The plan the operator reviewed: made while the target holds no copy, so
 	// it discloses none.
 	prNumber := int32(pr)
-	planResp, err := h.executePlanWithTransientRetry(t.Context(), api.PlanRequest{
+	_, planResp, err := h.executePlanProtoWithTransientRetry(t.Context(), api.PlanRequest{
 		Database:          schemaResult.Database,
 		Environment:       "staging",
 		Type:              schemaResult.Type,

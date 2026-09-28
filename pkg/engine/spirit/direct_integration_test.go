@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 )
 
@@ -644,4 +645,132 @@ func TestEngine_ResolveRefusedMode_UnknownSizeBlocked(t *testing.T) {
 	assert.Equal(t, "blocked_size_unknown", decision.outcome)
 	assert.Contains(t, decision.modeReason, "dropping primary key is not supported")
 	assert.Contains(t, decision.modeReason, "row count is unavailable")
+}
+
+// An engine that plans a schema change itself and drives this engine against
+// each target records the verdict through ExecutionVerdicts. For the same
+// statement on the same target, that verdict matches what Plan records, both
+// when the policy routes the refused statement to direct execution and when
+// it leaves the statement blocked. A reviewer of such an engine's plan
+// therefore sees what the apply will actually do.
+func TestExecutionVerdicts_RecordMatchesPlan(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_verdicts")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_verdicts (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_verdicts table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	for _, tc := range []struct {
+		name     string
+		metadata map[string]string
+		mode     string
+	}{
+		{name: "policy enabled within bound", metadata: directPolicyMetadata(100000), mode: engine.ExecutionModeDirect},
+		{name: "policy disabled", metadata: nil, mode: engine.ExecutionModeBlocked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			creds := &engine.Credentials{DSN: dsn, Metadata: tc.metadata}
+			result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database: "testdb",
+				SchemaFiles: testSchemaFiles(map[string]string{
+					"direct_verdicts.sql": `CREATE TABLE direct_verdicts (
+						id INT NOT NULL AUTO_INCREMENT,
+						tenant_id INT NOT NULL,
+						PRIMARY KEY (id, tenant_id)
+					)`,
+				}),
+				Credentials: creds,
+			})
+			require.NoError(t, err, "Plan()")
+			planned := result.FlatTableChanges()
+			require.Len(t, planned, 1)
+			require.Equal(t, tc.mode, planned[0].ExecutionMode)
+
+			verdicts, err := eng.NewExecutionVerdicts(creds)
+			require.NoError(t, err)
+			defer verdicts.Close()
+			change := engine.TableChange{Table: planned[0].Table, Operation: planned[0].Operation, DDL: planned[0].DDL}
+			require.NoError(t, verdicts.Record(t.Context(), &change))
+			assert.Equal(t, planned[0].ExecutionMode, change.ExecutionMode)
+			assert.Equal(t, planned[0].ModeReason, change.ModeReason)
+			assert.Contains(t, change.ModeReason, "dropping primary key is not supported")
+		})
+	}
+}
+
+// A statement the engine runs on its default path gets no verdict: an ALTER
+// the engine accepts is recorded with an empty mode. Record sets the whole
+// verdict, so a mode the change already carried does not survive it.
+func TestExecutionVerdicts_AcceptedAlterHasNoVerdict(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_accepted")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE direct_accepted (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id))")
+	require.NoError(t, err, "create direct_accepted table")
+
+	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{DSN: dsn, Metadata: directPolicyMetadata(100000)})
+	require.NoError(t, err)
+	defer verdicts.Close()
+	change := engine.TableChange{
+		Table:         "direct_accepted",
+		Operation:     ddl.StatementAlterTable,
+		DDL:           "ALTER TABLE `direct_accepted` ADD COLUMN `note` varchar(64)",
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    "stale",
+	}
+	require.NoError(t, verdicts.Record(t.Context(), &change))
+	assert.Empty(t, change.ExecutionMode)
+	assert.Empty(t, change.ModeReason)
+}
+
+// The verdict follows the statement the apply will run, not the Operation the
+// caller labelled it with. A caller that plans the statement itself and leaves
+// Operation unset still learns that the engine refuses it, so the plan does not
+// admit an apply the engine then refuses.
+func TestExecutionVerdicts_JudgesTheStatementNotItsOperation(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_unlabelled")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE direct_unlabelled (id INT NOT NULL, tenant_id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err, "create direct_unlabelled table")
+
+	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{DSN: dsn})
+	require.NoError(t, err)
+	defer verdicts.Close()
+	change := engine.TableChange{
+		Table: "direct_unlabelled",
+		DDL:   "ALTER TABLE `direct_unlabelled` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+	}
+	require.Equal(t, ddl.StatementUnknown, change.Operation)
+	require.NoError(t, verdicts.Record(t.Context(), &change))
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, "dropping primary key is not supported")
+}
+
+// An ALTER for a table the target cannot describe fails rather than recording
+// no verdict: the refusal check needs the table's current definition, and
+// judging without it would report the default path for a statement the apply
+// might refuse.
+func TestExecutionVerdicts_UnreadableTableFails(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+	verdicts, err := New(Config{}).NewExecutionVerdicts(&engine.Credentials{DSN: dsn})
+	require.NoError(t, err)
+	defer verdicts.Close()
+	change := engine.TableChange{
+		Table:         "direct_absent",
+		Operation:     ddl.StatementAlterTable,
+		DDL:           "ALTER TABLE `direct_absent` DROP PRIMARY KEY",
+		ExecutionMode: engine.ExecutionModeDirect,
+		ModeReason:    "stale",
+	}
+	err = verdicts.Record(t.Context(), &change)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `execution verdict for table "direct_absent"`)
+	assert.Contains(t, err.Error(), "read current definition")
+	assert.Empty(t, change.ExecutionMode)
+	assert.Empty(t, change.ModeReason)
 }

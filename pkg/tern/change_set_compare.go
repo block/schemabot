@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -229,6 +230,25 @@ func (cs ChangeSet) AuthoritativeTableChanges() []*ternv1.TableChange {
 		out = append(out, sc.TableChanges...)
 	}
 	return out
+}
+
+// HasWork reports whether applying the change set would change anything: a
+// table change in any representation, or a namespace whose VSchema changes. It
+// reads either VSchema signal a plan can carry, so a change set that says it
+// changes a VSchema in only one of the two ways still counts as work.
+func (cs ChangeSet) HasWork() bool {
+	if len(cs.AuthoritativeTableChanges()) > 0 {
+		return true
+	}
+	for _, sc := range cs.Changes {
+		if sc == nil {
+			continue
+		}
+		if sc.Metadata[apitypes.VSchemaChangedMetadataKey] == "true" || sc.Metadata[apitypes.VSchemaDiffMetadataKey] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // driftKeyForTableChange builds the multiset key for a proto table change,

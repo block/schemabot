@@ -37,6 +37,7 @@ type multiOpResumeEngine struct {
 	applyErr              error
 	stopErr               error
 	authoritativeProgress bool
+	applyCalls            int
 }
 
 func (e *multiOpResumeEngine) Name() string { return "multi-op-resume" }
@@ -50,6 +51,7 @@ func (e *multiOpResumeEngine) Plan(context.Context, *engine.PlanRequest) (*engin
 func (e *multiOpResumeEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.applyCalls++
 	if e.applyErr != nil {
 		return nil, e.applyErr
 	}
@@ -257,6 +259,51 @@ func TestLocalClient_SequentialOperationResumeDrivesTasksWithoutParentWrites(t *
 	assert.Equal(t, state.Task.Completed, f.taskState(t, f.tasks[0]),
 		"the operation's task must be driven to completion")
 	f.requireParentUntouched(t)
+}
+
+// The first operation drive of a multi-operation apply finds the parent still
+// queued: pending, never started. The drive dispatches its tasks to the engine
+// and leaves the parent's running state to the operator's projection. Its
+// drive-start running write would be refused under the operation lease, and
+// standing down on that refusal would leave every task pending and repeat the
+// stand-down on every later claim, so the schema change would never start.
+func TestLocalClient_OperationFirstDispatchDrivesTasksWithoutParentWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	modes := map[string][]byte{
+		"sequential": nil,
+		"grouped":    []byte(`{"defer_cutover":"true"}`),
+	}
+	for mode, options := range modes {
+		t.Run(mode, func(t *testing.T) {
+			f := newMultiOpResumeFixture(t, []string{state.Task.Pending})
+			_, err := f.leaseDB.ExecContext(t.Context(),
+				"UPDATE `applies` SET `state` = ?, `started_at` = NULL WHERE `id` = ?",
+				state.Apply.Pending, f.apply.ID)
+			require.NoError(t, err)
+			f.apply.State = state.Apply.Pending
+			f.apply.StartedAt = nil
+			f.apply.Options = options
+			f.eng.planChanges = []engine.SchemaChange{{
+				Namespace:    "testdb",
+				TableChanges: []engine.TableChange{{Table: "users", DDL: multiOpResumeDDL}},
+			}}
+
+			require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.opID),
+				"the first dispatch under the operation lease must reach the engine")
+
+			assert.Equal(t, 1, f.eng.applyCalls, "the operation's task must be handed to the engine")
+			assert.Equal(t, state.Task.Completed, f.taskState(t, f.tasks[0]),
+				"the operation's task must be driven to completion")
+			parent, err := f.stor.Applies().Get(t.Context(), f.apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, parent)
+			assert.Equal(t, state.Apply.Pending, parent.State,
+				"the parent applies row is the projection's to advance; the drive must not write it running")
+			assert.Nil(t, parent.StartedAt, "the parent's started time is the projection's to record")
+		})
+	}
 }
 
 // When the resume re-plan finds no remaining work for the operation's tasks,

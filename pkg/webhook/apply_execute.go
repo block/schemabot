@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -62,7 +63,7 @@ func (h *Handler) executeApply(
 		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
 	}
 
-	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
+	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
@@ -110,14 +111,22 @@ func (h *Handler) executeApply(
 
 	// No changes (neither table DDL nor a VSchema update) — release the lock
 	// (keyed on the pending intent this handler observed, so a lock re-pinned by
-	// a newer plan is preserved) and notify.
+	// a newer plan is preserved) and notify. An empty primary plan speaks only
+	// for the primary where members hold schemas of their own, so the other
+	// members are planned first and their work, if any, answers.
 	if !planResp.HasChanges() {
+		rollout, _ := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+		if rolloutStillPending(rollout) {
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rest of the rollout is not at the desired schema")
+			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout)
+			return
+		}
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so
 		// the schema check reflects that the target is up to date, the same as the
 		// no-change plan path.
-		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
+		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
 			h.logger.Error("failed to record no-changes check after apply",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
 		} else if headSHA != "" {

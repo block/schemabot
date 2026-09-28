@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -283,7 +284,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
 	}
 
-	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
+	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		if isTransientRemotePlanError(err) {
@@ -305,11 +306,19 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// check and refresh the aggregate the same as the no-change plan path, so a
 	// stale non-success record (e.g. a target reconciled out-of-band) cannot
 	// keep the prior-environment gate blocking later environments. Then post a
-	// regular plan comment (no lock, no confirm footer).
+	// regular plan comment (no lock, no confirm footer). An empty primary plan
+	// speaks only for the primary where members hold schemas of their own, so
+	// the other members are planned first and their work, if any, answers.
 	if !planResp.HasChanges() {
+		rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+		if rolloutStillPending(rollout) {
+			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
+			return false, nil
+		}
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 		commentData.ScopedDatabase = result.Database
-		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
+		commentData.DeploymentDrift = rolloutPreview
+		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
 			h.logger.Error("failed to record no-changes check for apply command",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
 		} else if headSHA != "" {

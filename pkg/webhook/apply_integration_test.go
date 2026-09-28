@@ -308,11 +308,11 @@ func TestE2EApplyNoChanges(t *testing.T) {
 	assert.Nil(t, lock, "expected no lock when there are no changes")
 }
 
-// TestE2EApplyNoOpPreservesApplyOwnedInProgressCheck proves the safety property
-// documented on storeApplyPlanCheckRecord: when the apply command's no-changes
-// branch records its passing check, an in_progress row owned by a live apply
-// must survive untouched — the started apply remains authoritative for the
-// row's terminal outcome.
+// TestE2EApplyNoOpPreservesApplyOwnedInProgressCheck proves that when the apply
+// command's no-changes branch records its passing check through
+// storePlanCheckRecord, an in_progress row owned by a live apply must survive
+// untouched — the started apply remains authoritative for the row's terminal
+// outcome.
 //
 // The state is reachable: the active-apply gate only inspects applies while
 // this PR holds the lock, so a concurrent apply can claim the row between the

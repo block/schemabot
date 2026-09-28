@@ -369,7 +369,11 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 // resumeApplySequential processes resumed tasks one at a time in sequence.
 // This preserves the sequential behavior of the original apply when --defer-cutover
 // was NOT used. Each task gets its own eng.Apply + pollTaskToCompletion cycle.
-func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+// It returns ErrApplyTaskRowMissing when a task loaded for this resume no
+// longer has a row, so the operator refuses to derive an operation verdict from
+// the rows that remain; every other early exit leaves the apply claimable and
+// returns nil.
+func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) error {
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
@@ -392,7 +396,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
-			return
+			return nil
 		} else if standDown {
 			stoppedByUser = true
 			break
@@ -400,7 +404,13 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskHandover {
-			return
+			return nil
+		}
+		if action == taskAbort {
+			return nil
+		}
+		if action == taskMissing {
+			return fmt.Errorf("apply %s task %s: %w", apply.ApplyIdentifier, task.TaskIdentifier, ErrApplyTaskRowMissing)
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -447,7 +457,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier)); err != nil {
 				logger.Error("resume aborting: persisting a raced-cutover task settlement failed; the apply stays active for a later drive to redo the settlement",
 					"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-				return
+				return nil
 			}
 			continue
 		} else if _, landed, err := c.verifyReplannedTaskDDL(task, replanned, tasks); err != nil {
@@ -473,7 +483,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				fmt.Sprintf("Task %s already completed (its statement landed before its outcome was recorded)", task.TaskIdentifier)); err != nil {
 				logger.Error("resume aborting: persisting a landed-statement task settlement failed; the apply stays active for a later drive to redo the settlement",
 					append(task.LogAttrs(), "error", err)...)
-				return
+				return nil
 			}
 			continue
 		}
@@ -490,7 +500,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			break
 		}
 		if action == taskAbort || action == taskHandover {
-			return
+			return nil
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -501,6 +511,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	// Update apply state based on task outcomes
 	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
 	logger.Info("sequential resume finished", "state", apply.State)
+	return nil
 }
 
 // shardTableKey identifies a table change within a specific (namespace, shard).
@@ -2278,7 +2289,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
-		c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options)
+		if err := c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options); err != nil {
+			return err
+		}
 	}
 
 	return ctx.Err()

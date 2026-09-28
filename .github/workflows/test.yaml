@@ -216,6 +216,9 @@ jobs:
             postgres:16 \
             ministackorg/ministack:1.5.10 \
             testcontainers/ryuk:0.13.0
+      - name: "Pre-pull Supabase PostgreSQL"
+        if: matrix.shard == 'per-package'
+        run: scripts/ci/prepull-images.sh supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
       - name: "Test"
         # Cap package-level parallelism: the integration suite runs many heavy
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
