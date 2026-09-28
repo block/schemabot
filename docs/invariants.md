@@ -531,7 +531,8 @@ Work from an older head SHA never satisfies branch protection for a newer head, 
 while an apply is mutating the database never becomes the merge-gating source of truth.
 *Enforced:* the commit stamp each check row carries and the guard refusing a write whose commit is
 no longer the head (`pkg/webhook/check_records.go`); stale-webhook and mid-apply plan guards
-(`pkg/webhook/plan.go`). MG-11 is the other direction: making sure a real outcome does reach the
+(`pkg/webhook/plan.go`); the promotion gate, which accepts a prior environment's result only when
+it was recorded on the PR head (`pkg/webhook/check_prior_env.go`). MG-11 is the other direction: making sure a real outcome does reach the
 gating commit.
 
 ### MG-5: Apply-owned check rows are released only by their owner

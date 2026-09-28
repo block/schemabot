@@ -112,8 +112,9 @@ func TestScopedTargetMissingFromPromotionOrder(t *testing.T) {
 
 func TestCheckPriorEnvViaLocalReturnsStorageError(t *testing.T) {
 	const (
-		repo = "octocat/hello-world"
-		pr   = 1
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
 	)
 
 	client, mux := setupGitHubServer(t)
@@ -140,7 +141,7 @@ func TestCheckPriorEnvViaLocalReturnsStorageError(t *testing.T) {
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345, false)
+	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, headSHA, "orders", "mysql", "production", "staging", 12345, false)
 	require.Error(t, err)
 	assert.False(t, blocked)
 
@@ -163,8 +164,9 @@ func TestCheckPriorEnvViaLocalReturnsStorageError(t *testing.T) {
 // comment is posted — the terminal comment is owned by the final attempt.
 func TestCheckPriorEnvViaLocalDurableAttemptSuppressesErrorComment(t *testing.T) {
 	const (
-		repo = "octocat/hello-world"
-		pr   = 1
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
 	)
 
 	client, mux := setupGitHubServer(t)
@@ -191,7 +193,7 @@ func TestCheckPriorEnvViaLocalDurableAttemptSuppressesErrorComment(t *testing.T)
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345, true)
+	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, headSHA, "orders", "mysql", "production", "staging", 12345, true)
 	require.Error(t, err)
 	assert.False(t, blocked)
 
@@ -209,8 +211,9 @@ func TestCheckPriorEnvViaLocalDurableAttemptSuppressesErrorComment(t *testing.T)
 // status instead of suggesting a blind retry of the later apply.
 func TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance(t *testing.T) {
 	const (
-		repo = "octocat/hello-world"
-		pr   = 1
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
 	)
 
 	client, mux := setupGitHubServer(t)
@@ -237,7 +240,7 @@ func TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance(t *testin
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345, false)
+	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, headSHA, "orders", "mysql", "production", "staging", 12345, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "missing prior check should block apply")
 
@@ -258,8 +261,9 @@ func TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance(t *testin
 // and only use the missing-check fail-closed path if the state stays missing.
 func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
 	const (
-		repo = "octocat/hello-world"
-		pr   = 1
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
 	)
 
 	client, mux := setupGitHubServer(t)
@@ -277,7 +281,7 @@ func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
 	checks := &sequenceCheckStore{
 		results: []*storage.Check{
 			nil,
-			{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+			{HeadSHA: headSHA, Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
 		},
 	}
 	installClient := ghclient.NewInstallationClient(client, testLogger())
@@ -292,7 +296,7 @@ func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345, false)
+	blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, headSHA, "orders", "mysql", "production", "staging", 12345, false)
 	require.NoError(t, err)
 	assert.False(t, blocked, "retry should observe the prior environment success and allow apply")
 	assert.Equal(t, 2, checks.calls)
@@ -302,6 +306,226 @@ func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
 		t.Fatalf("unexpected comment posted: %s", body)
 	default:
 	}
+}
+
+// TestCheckPriorEnvViaLocalRequiresCheckOnPRHead covers a production apply
+// sent right after a push: staging's stored check state still records the
+// success from the previous commit, while the plan for the new commit has not
+// landed yet. Only a staging success recorded on the PR's current head may
+// allow the apply; a success from the earlier commit is retried briefly and
+// then blocks with guidance to re-check staging on the latest commit.
+func TestCheckPriorEnvViaLocalRequiresCheckOnPRHead(t *testing.T) {
+	const (
+		repo      = "octocat/hello-world"
+		pr        = 1
+		commitA   = "0123456789abcdef0123456789abcdef01234567"
+		commitB   = "abcdef1234567890abcdef1234567890abcdef12"
+		attempts  = 3
+		stagingDB = "orders"
+	)
+
+	rowOn := func(sha, status, conclusion string) *storage.Check {
+		return &storage.Check{
+			ID: 7, HeadSHA: sha, Environment: "staging", DatabaseType: "mysql", DatabaseName: stagingDB,
+			Status: status, Conclusion: conclusion,
+		}
+	}
+	successOn := func(sha string) *storage.Check {
+		return rowOn(sha, checkStatusCompleted, checkConclusionSuccess)
+	}
+	// repeat returns the same row for every attempt, so the retry window is
+	// exhausted without the row ever moving to the head.
+	repeat := func(check *storage.Check) []*storage.Check {
+		return []*storage.Check{check, check, check}
+	}
+	// The block comment for a completed row on another commit names both
+	// commits without saying which is newer: the head can move while the
+	// command runs, so the comparison commit is not always the latest.
+	const staleRowGuidance = "The `staging` check for this PR was recorded on commit `0123456`, but this apply read the schema at commit `abcdef1`."
+
+	setup := func(t *testing.T, results []*storage.Check) (*Handler, *sequenceCheckStore, chan string) {
+		t.Helper()
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 1)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 99}))
+		})
+
+		checks := &sequenceCheckStore{results: results}
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		service := api.New(&sequenceStorage{checks: checks}, &api.ServerConfig{}, nil, testLogger())
+		t.Cleanup(func() { utils.CloseAndLog(service) })
+
+		return &Handler{
+			service:                    service,
+			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+			logger:                     testLogger(),
+			priorEnvCheckMaxAttempts:   attempts,
+			priorEnvCheckRetryInterval: time.Nanosecond,
+		}, checks, comments
+	}
+
+	t.Run("success on an earlier commit blocks", func(t *testing.T) {
+		h, checks, comments := setup(t, repeat(successOn(commitA)))
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+		require.NoError(t, err)
+		assert.True(t, blocked, "a staging success recorded on an earlier commit must not allow a production apply")
+		assert.Equal(t, attempts, checks.calls, "a row for another commit is retried before blocking")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked")
+			assert.Contains(t, body, staleRowGuidance)
+			assert.Contains(t, body, "schemabot plan -e staging")
+			assert.NotContains(t, body, "could not find a completed")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for earlier-commit block comment")
+		}
+	})
+
+	// A completed non-success row on another commit gets the re-check guidance,
+	// not the outcome it recorded: that outcome was for a commit other than the
+	// one being applied, so fixing or applying staging as it stands would be
+	// the wrong first step.
+	for _, tc := range []struct {
+		name       string
+		conclusion string
+		outcome    string
+	}{
+		{name: "failure on an earlier commit asks for a re-check on the head", conclusion: checkConclusionFailure, outcome: "Fix the issue and re-apply staging"},
+		{name: "action_required on an earlier commit asks for a re-check on the head", conclusion: checkConclusionActionRequired, outcome: "Apply staging first"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, checks, comments := setup(t, repeat(rowOn(commitA, checkStatusCompleted, tc.conclusion)))
+
+			blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+			require.NoError(t, err)
+			assert.True(t, blocked)
+			assert.Equal(t, attempts, checks.calls, "a completed row for another commit is retried before blocking")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, staleRowGuidance)
+				assert.Contains(t, body, "schemabot plan -e staging")
+				assert.NotContains(t, body, tc.outcome,
+					"the outcome recorded for another commit is not the reason to give")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for earlier-commit block comment")
+			}
+		})
+	}
+
+	// A running check is reported as running whichever commit it names: its
+	// row is about to change, so waiting is the operator's next step either
+	// way, and the head comparison applies once the row has completed.
+	t.Run("in_progress on an earlier commit reports the check as running", func(t *testing.T) {
+		h, checks, comments := setup(t, repeat(rowOn(commitA, checkStatusInProgress, "")))
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+		assert.Equal(t, attempts, checks.calls, "a running row is retried before blocking")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Staging is currently in progress. Wait for it to complete before applying to production.")
+			assert.NotContains(t, body, "recorded on commit")
+			assert.NotContains(t, body, "schemabot plan -e staging")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for in-progress block comment")
+		}
+	})
+
+	// A completed non-success row on the head keeps reporting its own outcome:
+	// the head comparison only changes the guidance for rows on another commit.
+	t.Run("failure on the head commit reports the failure", func(t *testing.T) {
+		h, checks, comments := setup(t, []*storage.Check{rowOn(commitB, checkStatusCompleted, checkConclusionFailure)})
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+		assert.Equal(t, 1, checks.calls, "a completed row on the head is not retried")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Staging failed. Fix the issue and re-apply staging before applying to production.")
+			assert.NotContains(t, body, "recorded on commit")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for failed-prior-environment block comment")
+		}
+	})
+
+	t.Run("success on the head commit allows", func(t *testing.T) {
+		h, checks, comments := setup(t, []*storage.Check{successOn(commitB)})
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+		require.NoError(t, err)
+		assert.False(t, blocked, "a staging success recorded on the PR head must allow a production apply")
+		assert.Equal(t, 1, checks.calls, "a success on the head commit needs no retry")
+
+		select {
+		case body := <-comments:
+			t.Fatalf("unexpected comment posted: %s", body)
+		default:
+		}
+	})
+
+	t.Run("row moving to the head commit during retries allows", func(t *testing.T) {
+		h, checks, comments := setup(t, []*storage.Check{successOn(commitA), successOn(commitB)})
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, commitB, stagingDB, "mysql", "production", "staging", 12345, false)
+		require.NoError(t, err)
+		assert.False(t, blocked, "the plan for the new head landing within the retry window must allow the apply")
+		assert.Equal(t, 2, checks.calls)
+
+		select {
+		case body := <-comments:
+			t.Fatalf("unexpected comment posted: %s", body)
+		default:
+		}
+	})
+
+	t.Run("unknown head commit stops the apply", func(t *testing.T) {
+		h, checks, comments := setup(t, []*storage.Check{successOn(commitA)})
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "", stagingDB, "mysql", "production", "staging", 12345, false)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "head commit is empty")
+		assert.False(t, blocked)
+		assert.Equal(t, 0, checks.calls, "the stored check state is not read when there is no head to compare it with")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Could not verify staging status: failed to resolve the PR head commit.")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for fail-closed comment")
+		}
+	})
+
+	// A durable attempt that cannot resolve the PR head still stops the apply,
+	// but leaves the comment to the attempt that is allowed to post one, like
+	// every other read failure in the gate.
+	t.Run("unknown head commit on a durable attempt posts no comment", func(t *testing.T) {
+		h, checks, comments := setup(t, []*storage.Check{successOn(commitA)})
+
+		blocked, err := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "", stagingDB, "mysql", "production", "staging", 12345, true)
+		require.ErrorContains(t, err, "head commit is empty")
+		assert.False(t, blocked)
+		assert.Equal(t, 0, checks.calls)
+
+		select {
+		case body := <-comments:
+			t.Fatalf("no comment should be posted when retry comments are suppressed, got: %s", body)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
 }
 
 func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *testing.T) {
@@ -364,7 +588,7 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 		"orders", "mysql", "production", []string{"staging", "production"}, 12345, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "production blocks when the environment list includes staging before production")
@@ -385,7 +609,7 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	require.NoError(t, h.attachServerEnvironments(schemaResult, "production"))
 	assert.Equal(t, []string{"production"}, schemaResult.Environments)
 
-	blocked, err = h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err = h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 		"orders", "mysql", "production", schemaResult.Environments, 12345, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "production blocks on staging even when this server only has a production target for the database")
@@ -485,7 +709,7 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 	// A production apply walks the override's prior environments: qa passes,
 	// sandbox blocks — the server order's green staging check must not
 	// satisfy the gate.
-	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 		"bureau", "mysql", "production", []string{"production"}, 12345, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "sandbox action_required must block production despite a green staging check")
@@ -509,7 +733,7 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 
 	// An apply targeting an environment absent from the override fails closed
 	// with the database's effective order rendered in the comment.
-	blocked, err = h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err = h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 		"bureau", "mysql", "staging", []string{"production"}, 12345, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "environment absent from the database override must fail closed")
@@ -610,7 +834,7 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		h, comments := setup(t, installClient)
 		registerGitHubEndpoints(t, mux, comments)
 
-		blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
+		blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 			"orders", "mysql", "production", []string{"production"}, 12345, false)
 
 		require.NoError(t, err)
@@ -628,7 +852,7 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		h, comments := setup(t, installClient)
 		registerGitHubEndpoints(t, mux, comments)
 
-		blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
+		blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 			"orders", "mysql", "production", []string{"production"}, 12345, false)
 
 		require.NoError(t, err)
@@ -656,8 +880,9 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 // environments owned by other instances.
 func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testing.T) {
 	const (
-		repo = "octocat/hello-world"
-		pr   = 1
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
 	)
 
 	reader := sdkmetric.NewManualReader()
@@ -704,7 +929,7 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 		"orders", "mysql", "canary", []string{"canary"}, 12345, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "scoped instance must fail closed when an allowed target environment is absent from the promotion order")
@@ -822,7 +1047,7 @@ func TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply(t *testing.T) {
 		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
-	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr,
+	blocked, err := h.checkPriorEnvironments(t.Context(), repo, pr, headSHA,
 		"orders", "mysql", "production", []string{"production"}, 12345, false)
 	require.NoError(t, err)
 	assert.False(t, blocked, "in-order target with a passing prior environment check should be allowed")
