@@ -255,6 +255,12 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
 		{"APPLY BLOCKED: SCHEMA STALE (NEW COMMITS)", func() { fmt.Print(webhooktemplates.PreviewCommentStaleSchemaRejected()) }},
 		{"APPLY BLOCKED: CONFIRMED PLAN STALE", func() { fmt.Print(webhooktemplates.PreviewCommentStalePlanRejected()) }},
+		{"APPLY-CONFIRM REFUSED: PLAN IS FOR ANOTHER ENVIRONMENT", func() {
+			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanForOtherEnvironment())
+		}},
+		{"APPLY-CONFIRM REFUSED: PLAN CANNOT BE LOADED", func() {
+			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanUnavailable())
+		}},
 		{"APPLY BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
