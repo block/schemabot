@@ -1389,6 +1389,42 @@ func TestLocalClient_StopSurfacesErrorWhenEngineHasLiveWork(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, apply.State)
 }
 
+// A stop refused because the engine has already failed is a settled-outcome
+// decline. It bypasses the live-work probe so the durable request processor can
+// resolve it terminally while the drive continues and records the failure.
+func TestLocalClient_StopPreservesSettledEngineFailure(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-failed",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-failed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	stopErr := engine.NewUnsupportedOperationError("schema change already failed")
+	eng := &controlCaptureEngine{
+		stopErr:        stopErr,
+		progressResult: &engine.ProgressResult{State: engine.StateFailed},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr)
+	assert.True(t, engine.IsUnsupportedOperation(err))
+	assert.Nil(t, eng.progressReq, "a settled-outcome decline must not enter the live-work retry path")
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
 // When the live-work probe itself fails, the engine's state is unknown:
 // completing the stop could record running work as stopped. The original stop
 // error surfaces so the drive retries with engine state intact.

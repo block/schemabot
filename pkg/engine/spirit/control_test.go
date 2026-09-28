@@ -59,11 +59,24 @@ func TestStopLeavesFailedSchemaChangeFailed(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), "failed before the stop arrived")
-	assert.False(t, engine.IsRetryable(err), "retrying can never pause a failed change")
+	assert.True(t, engine.IsUnsupportedOperation(err), "the durable request must resolve terminally")
 	assert.False(t, engine.IsAlreadyCompleted(err), "a failed change must never reconcile as completed")
 	assert.False(t, cancelCalled)
 	assert.Equal(t, engine.StateFailed, rm.state)
 	assert.Equal(t, "copy of users hit a duplicate key", rm.errorMessage)
+}
+
+func TestStopLeavesCancelledSchemaChangeCancelled(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.state = engine.StateCancelled
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.True(t, engine.IsUnsupportedOperation(err))
+	assert.Contains(t, err.Error(), "was already cancelled")
+	assert.Equal(t, engine.StateCancelled, rm.state)
 }
 
 // A stop checkpoints the copy before it cancels, and the schema change can
@@ -87,7 +100,7 @@ func TestStopKeepsOutcomeThatLandsDuringCheckpoint(t *testing.T) {
 			wantState: engine.StateFailed,
 			checkErr: func(t *testing.T, err error) {
 				assert.Contains(t, err.Error(), "failed before the stop arrived")
-				assert.False(t, engine.IsRetryable(err))
+				assert.True(t, engine.IsUnsupportedOperation(err))
 				assert.False(t, engine.IsAlreadyCompleted(err))
 			},
 		},

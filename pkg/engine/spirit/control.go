@@ -150,14 +150,14 @@ func settledStopOutcome(logger *slog.Logger, state engine.State, database string
 			"database", database,
 			"tables", tables,
 		)
-		return nil, engine.NewPermanentError("stop rejected: the schema change on database %s failed before the stop arrived", database)
+		return nil, engine.NewUnsupportedOperationError("stop rejected: the schema change on database %s failed before the stop arrived", database)
 	default:
 		logger.Warn("stop rejected: the schema change already settled before the stop arrived; its state stays in place",
 			"database", database,
 			"tables", tables,
 			"state", state,
 		)
-		return nil, engine.NewPermanentError("stop rejected: the schema change on database %s was already %s before the stop arrived", database, state)
+		return nil, engine.NewUnsupportedOperationError("stop rejected: the schema change on database %s was already %s before the stop arrived", database, state)
 	}
 }
 
