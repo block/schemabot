@@ -95,17 +95,17 @@ full definition; rollback capture never strips access policies to claim support.
 For example, an existing table can pull as:
 
 ```sql
-CREATE TABLE documents (
-    id bigint NOT NULL,
-    owner_id bigint NOT NULL,
-    PRIMARY KEY (id)
+CREATE TABLE "documents" (
+    "id" bigint NOT NULL,
+    "owner_id" bigint NOT NULL,
+    CONSTRAINT "documents_pkey" PRIMARY KEY (id)
 );
-ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-ALTER TABLE documents NO FORCE ROW LEVEL SECURITY;
-CREATE POLICY readers ON documents
-    AS PERMISSIVE
-    FOR SELECT
-    TO PUBLIC
+
+ALTER TABLE "documents" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "documents" NO FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "readers" ON "documents"
+    AS PERMISSIVE FOR SELECT TO PUBLIC
     USING ((owner_id = 1));
 ```
 
