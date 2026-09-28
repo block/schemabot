@@ -577,7 +577,10 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     should re-drive; the same window may succeed on a later attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (silent fan-out skip, no pending confirmation, gate blocks, lock conflict,
-//     stale-schema/base/plan rejection, or a hand-off to executeApply, which
+//     a pending confirmation with no loadable plan, a pending confirmation
+//     planned for another environment, a prior environment that is no longer
+//     clean at confirm time, stale-schema/base/plan rejection, or a hand-off
+//     to executeApply, which
 //     may itself fail before dispatching). A schema-request failure is terminal
 //     only when handleSchemaRequestError recognizes it as a user-facing
 //     rejection; an unexpected failure there (for example a transient GitHub
@@ -810,17 +813,47 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		}
 		return true, fmt.Errorf("apply-confirm command load confirmation plan %s#%d: %w", repo, pr, planLoadErr)
 	}
+	if storedPlan == nil {
+		h.logger.Warn("apply-confirm rejected: pending confirmation has no loadable plan",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
+		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
+			templates.RenderConfirmationPlanUnavailable(environment, databaseName, applyCommandOptionsOf(result)))
+		return false, nil
+	}
+	// The pending confirmation authorizes the environment it was planned for
+	// and nothing else: confirming it into another environment would dispatch
+	// there with no plan comment, no disclosure, and no ordering gate for that
+	// environment. The lock is kept, so the operator can still confirm the
+	// environment the plan was made for.
+	if confirmationPlanTargetsOtherEnvironment(storedPlan, environment) {
+		h.logger.Warn("apply-confirm rejected: pending confirmation was planned for another environment",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_environment", storedPlan.Environment,
+			"pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
+		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
+			templates.RenderConfirmationPlanForOtherEnvironment(storedPlan.Environment, environment, databaseName, applyCommandOptionsOf(result)))
+		return false, nil
+	}
+	// Environment mismatch wins over stale-plan rejection because this outcome
+	// preserves the reviewed intent; stale-plan rejection releases it.
 	if rejected := h.assertPlanStillCurrent(ctx, repo, pr, installationID, storedPlan, confirmPRInfo.HeadSHA, environment, requestedBy); rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, existingLock.PendingPlanID, "stale-plan rejection")
 		return false, nil
 	}
 
-	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
-	if existingLock.DisclosedCopyDiscard && !disclosedCopyDiscard {
-		h.logger.Info("copy-discard disclosure not applied to this confirm: it was shown for another environment",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"environment", environment, "pending_plan_id", existingLock.PendingPlanID)
+	// Re-check environment ordering at confirm time, as the review and checks
+	// gates are: a prior environment can stop being clean between the plan and
+	// its confirmation without the PR HEAD moving. A block keeps the pending
+	// confirmation pinned, since the plan itself is not known to be wrong.
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, confirmPRInfo.HeadSHA, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command prior environment gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
+		h.logger.Info("apply-confirm blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
+		return false, nil
 	}
+
+	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
@@ -830,8 +863,8 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 // pending confirmation was earned for the apply about to run. The lock carries
 // no environment dimension, so a disclosure the operator was shown confirming
 // one environment must not disarm the copy gate in another: the pinned plan
-// names the environment they actually saw. A confirmation with no loadable plan
-// counts as no disclosure, so the apply asks rather than assuming consent.
+// names the environment they actually saw. A missing plan never counts as
+// consent, though apply-confirm rejects that state before reaching this helper.
 func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
 	if !lock.DisclosedCopyDiscard {
 		return false
@@ -840,6 +873,19 @@ func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, enviro
 		return false
 	}
 	return plan.Environment == environment
+}
+
+// applyCommandOptionsOf carries the option flags the operator typed on a
+// rejected apply-confirm into the recovery command the rejection recommends.
+// apply-confirm reads its options from the confirm comment alone, so a hint
+// that dropped them would run with defaults the operator did not choose.
+func applyCommandOptionsOf(result CommandResult) templates.ApplyCommandOptions {
+	return templates.ApplyCommandOptions{
+		Tenant:       result.Tenant,
+		AllowUnsafe:  result.AllowUnsafe,
+		DeferCutover: result.DeferCutover,
+		SkipRevert:   result.SkipRevert,
+	}
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command. It is
