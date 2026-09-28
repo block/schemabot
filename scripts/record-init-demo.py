@@ -5,6 +5,8 @@ Requires pyte (pip install pyte). Applies only to disposable --sample databases.
 With --sample, Docker provisions a MySQL or PostgreSQL sample with customers and
 orders; recording edits customers.email. No connection environment variables are needed.
 Without --sample, set DATABASE_URL and SCHEMABOT_STORAGE_DSN to demo databases.
+Vitess also requires PLANETSCALE_TOKEN=TOKEN_ID:TOKEN_SECRET for a disposable API;
+the token ID appears in the recording, and the secret is entered with masking.
 The target must contain users(id, email varchar(255)): public.users for Postgres,
 shop.users for MySQL. Postgres also needs an empty analytics namespace.
 """
@@ -96,6 +98,7 @@ work = Path(tempfile.mkdtemp(prefix='shop-demo-', dir='/tmp'))
 (work / 'schemabot').symlink_to(binary)
 env = dict(os.environ, HOME=str(work / 'home'), SCHEMABOT_PROFILE='', SCHEMABOT_ENDPOINT='', SCHEMABOT_TOKEN='', TERM='xterm-256color', COLORTERM='truecolor', CLICOLOR_FORCE='1', NO_COLOR='', COLORFGBG='0;15')
 pasted_connection = env.get('DATABASE_URL', '')
+token_parts = env.pop('PLANETSCALE_TOKEN', '').split(':', 1) if args.engine == 'vitess' else []
 if args.paste_connection:
     env.pop('DATABASE_URL', None)
 master, slave = pty.openpty()
@@ -118,7 +121,7 @@ if args.paste_connection:
 else:
     steps.extend([('Connect to your Vitess database' if args.engine == 'vitess' else 'Connect your database', [(2.5, '\r')])])
 if args.engine == 'vitess':
-    steps.extend([('PlanetScale organization', [(0.25, c) for c in args.organization] + [(0.7, '\r')]), ('Connect the PlanetScale API', [(4.0, '\r')]), ('Store SchemaBot’s plans and progress', [(3.0, '\r')])])
+    steps.extend([('PlanetScale organization', [(0.25, c) for c in args.organization] + [(0.7, '\r')]), ('Connect the PlanetScale API', [(3.0, '\x1b[B'), (0.7, '\r')]), ('Token ID', [(0.15, c) for c in token_parts[0]] + [(0.7, '\r')]), ('Token secret (hidden)', [(0.12, c) for c in token_parts[1]] + [(0.7, '\r')]), ('Store SchemaBot’s plans and progress', [(3.0, '\r')])])
 elif args.integrated:
     steps.append(('Where should SchemaBot store its own data?', [(3.0, '\r')]))
 else:
@@ -234,5 +237,5 @@ finally:
     else:
         subprocess.run([binary, 'local', 'stop', 'local'], cwd=work, env=env, capture_output=True, timeout=35)
     # Leave the private work directory for troubleshooting; no credentials are
-    # copied to the committed recording (only environment-variable references).
+    # copied to the committed recording (references, token ID, and masked input only).
     print('Private demo workspace:', work)

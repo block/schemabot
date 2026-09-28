@@ -30,11 +30,19 @@ func (m *initWizard) loadConnectionEditor() {
 	_, err := m.resolveConnection(m.fields[m.step].value)
 	m.connectionEditor = initConnectionEditor{mode: "menu", detected: err == nil}
 	m.input.EchoMode = textinput.EchoNormal
+	m.input.Placeholder = ""
 }
 func (m *initWizard) connectionOptions() []string {
 	options := []string{"Paste a connection string", "Enter connection details", "Use an environment variable or file"}
+	if m.step == stepAPIToken {
+		options = []string{"Paste a service token", "Enter token ID and secret", "Use an environment variable or file"}
+	}
 	if m.connectionEditor.detected {
-		options = append([]string{"Use this connection"}, options...)
+		label := "Use this connection"
+		if m.step == stepAPIToken {
+			label = "Use this token"
+		}
+		options = append([]string{label}, options...)
 	}
 	return options
 }
@@ -46,15 +54,25 @@ func (m *initWizard) useDraftConnection(dsn string) tea.Cmd {
 	m.draftConnections[ref] = dsn
 	m.input.SetValue(ref)
 	m.input.EchoMode = textinput.EchoNormal
-	m.connectionSummary = initConnectionDestination(m.fields[stepEngine].value, dsn)
+	m.connectionSummary = m.editorConnectionSummary(dsn)
 	m.connectionEditor.mode = "ready"
 	return tea.Batch(m.checkConnection(), m.spinner.Tick)
 }
 func (m *initWizard) loadConnectionDetail() {
 	e := &m.connectionEditor
 	m.input.EchoMode = textinput.EchoNormal
-	if e.detail == 4 {
+	if e.detail == 4 || m.step == stepAPIToken && e.detail == 1 {
 		m.input.EchoMode = textinput.EchoPassword
+	}
+	m.input.Placeholder = ""
+	if m.step != stepAPIToken && e.detail < 2 {
+		m.input.Placeholder = "localhost"
+		if e.detail == 1 {
+			m.input.Placeholder = "3306"
+			if m.fields[stepEngine].value == "postgres" {
+				m.input.Placeholder = "5432"
+			}
+		}
 	}
 	m.input.SetValue(e.values[e.detail])
 	m.input.CursorEnd()
@@ -104,7 +122,7 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 						return true, nil
 					}
 					m.input.SetValue(m.fields[m.step].value)
-					m.connectionSummary = initConnectionDestination(m.fields[stepEngine].value, dsn)
+					m.connectionSummary = m.editorConnectionSummary(dsn)
 					e.mode = "ready"
 					return true, tea.Batch(m.checkConnection(), m.spinner.Tick)
 				}
@@ -120,25 +138,40 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			case 1:
 				e.mode = "details"
 				e.detail = 0
-				e.values = [5]string{"localhost", "3306", "", "", ""}
-				if m.fields[stepEngine].value == "postgres" {
-					e.values[1] = "5432"
-				}
+				e.values = [5]string{}
 				m.loadConnectionDetail()
 			case 2:
 				e.mode = "reference"
 				m.input.SetValue(m.fields[m.step].value)
 				if strings.HasPrefix(m.input.Value(), "draft:") {
 					m.input.SetValue("env:DATABASE_URL")
+					if m.step == stepAPIToken {
+						m.input.SetValue("env:PLANETSCALE_TOKEN")
+					}
 				}
+				m.showFieldSuggestion()
 				m.input.CursorEnd()
 			}
 			return true, textinput.Blink
 		}
 		return key != "shift+tab" && key != "pgup" && key != "pgdown", nil
 	}
+	if key == "tab" && e.mode == "details" && m.input.Value() == "" && m.input.Placeholder != "" {
+		m.input.SetValue(m.input.Placeholder)
+		m.input.CursorEnd()
+		return true, nil
+	}
 	if key != "enter" || e.mode == "reference" || e.mode == "ready" {
 		return false, nil
+	}
+	if e.mode == "paste" && m.step == stepAPIToken {
+		value := strings.TrimSpace(m.input.Value())
+		id, secret, ok := strings.Cut(value, ":")
+		if !ok || strings.TrimSpace(id) == "" || strings.TrimSpace(secret) == "" {
+			m.err = "Use TOKEN_ID:TOKEN_SECRET, or go back to enter them separately."
+			return true, nil
+		}
+		return true, m.useDraftConnection(value)
 	}
 	if e.mode == "paste" {
 		value, err := normalizeInitConnection(m.fields[stepEngine].value, strings.TrimSpace(m.input.Value()))
@@ -151,6 +184,21 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, nil
 		}
 		return true, m.useDraftConnection(value)
+	}
+	if e.mode == "details" && m.step == stepAPIToken {
+		value := strings.TrimSpace(m.input.Value())
+		if value == "" {
+			m.err = "Fill this in and we can keep going."
+			return true, nil
+		}
+		e.values[e.detail] = value
+		m.err = ""
+		if e.detail == 0 {
+			e.detail = 1
+			m.loadConnectionDetail()
+			return true, textinput.Blink
+		}
+		return true, m.useDraftConnection(e.values[0] + ":" + e.values[1])
 	}
 	if e.mode == "details" {
 		value := m.input.Value()
@@ -176,6 +224,12 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			cfg.DBName = e.values[2]
 			cfg.User = e.values[3]
 			cfg.Passwd = e.values[4]
+			// PlanetScale branch passwords require verified TLS. The details
+			// form has no DSN options field, so choose it for hosted endpoints.
+			host := strings.TrimSuffix(strings.ToLower(e.values[0]), ".")
+			if strings.HasSuffix(host, ".psdb.cloud") {
+				cfg.TLSConfig = "true"
+			}
 			dsn = cfg.FormatDSN()
 		} else {
 			u := url.URL{Scheme: "postgresql", Host: net.JoinHostPort(e.values[0], e.values[1]), Path: "/" + e.values[2], User: url.UserPassword(e.values[3], e.values[4])}
@@ -197,14 +251,19 @@ func (m *initWizard) connectionEditorView() string {
 	case "menu":
 		if e.detected {
 			ref := m.fields[m.step].value
-			if strings.HasPrefix(ref, "draft:") {
+			switch {
+			case m.step == stepAPIToken:
+				if !strings.HasPrefix(ref, "draft:") {
+					b.WriteString("Found " + initTerminalText(ref) + "\n")
+				}
+			case strings.HasPrefix(ref, "draft:"):
 				b.WriteString("Your entered connection\n")
-			} else {
+			default:
 				b.WriteString("Found a connection in " + initTerminalText(ref) + ".\n")
 			}
 			dsn, err := m.resolveConnection(ref)
-			if err == nil {
-				b.WriteString(initConnectionDestination(m.fields[stepEngine].value, dsn) + "\n")
+			if err == nil && m.step != stepAPIToken {
+				b.WriteString(m.editorConnectionSummary(dsn) + "\n")
 			}
 			b.WriteString("\n")
 		}
@@ -221,12 +280,26 @@ func (m *initWizard) connectionEditorView() string {
 		}
 		b.WriteString("\n" + muted.Render("↑/↓ choose · enter continue · shift+tab back · esc cancel"))
 	case "paste":
-		b.WriteString("Paste your connection string. Input is hidden.\n\n" + m.input.View())
+		prompt := "Paste your connection string. Input is hidden."
+		if m.step == stepAPIToken {
+			prompt = "Paste TOKEN_ID:TOKEN_SECRET. Input is hidden."
+		}
+		b.WriteString(prompt + "\n\n" + m.input.View())
 	case "details":
 		labels := []string{"Host", "Port", "Database", "Username", "Password (hidden; Enter for none)"}
+		if m.step == stepAPIToken {
+			labels = []string{"Token ID", "Token secret (hidden)"}
+		}
 		b.WriteString(labels[e.detail] + "\n\n" + m.input.View())
+		if m.input.Value() == "" && m.input.Placeholder != "" {
+			b.WriteString("\n\n" + muted.Render("tab use suggestion · or type your own"))
+		}
 	case "reference":
-		b.WriteString("Use env:VARIABLE or file:/absolute/path.\nThe file should contain only the connection string.\n\n" + m.input.View())
+		hint := "Use env:VARIABLE or file:/absolute/path.\nThe file should contain only the connection string."
+		if m.step == stepAPIToken {
+			hint = "Use env:VARIABLE or file:/absolute/path.\nIts value should be TOKEN_ID:TOKEN_SECRET."
+		}
+		b.WriteString(hint + "\n\n" + m.input.View())
 	case "ready":
 		b.WriteString(m.connectionSummary)
 	}
@@ -251,6 +324,9 @@ func (m *initWizard) connectionEditorView() string {
 	} else if m.err != "" {
 		b.WriteString("\n\n" + failure.Render(m.err))
 	}
+	if e.mode == "reference" && m.input.Value() == "" && m.input.Placeholder != "" {
+		help = "tab use suggestion · " + help
+	}
 	b.WriteString("\n\n" + muted.Render(help))
 	return b.String()
 }
@@ -274,4 +350,12 @@ func initConnectionFailure(message string) string {
 	default:
 		return message
 	}
+}
+
+// Never display the raw token or its secret in connection summaries.
+func (m *initWizard) editorConnectionSummary(value string) string {
+	if m.step == stepAPIToken {
+		return "PlanetScale service token"
+	}
+	return initConnectionDestination(m.fields[stepEngine].value, value)
 }

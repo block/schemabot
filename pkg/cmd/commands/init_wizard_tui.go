@@ -61,6 +61,8 @@ type initField struct{ label, hint, value string }
 type initWizard struct {
 	connectionEditor                         initConnectionEditor
 	draftConnections                         map[string]string
+	suggestions                              map[int]string
+	editedFields                             map[int]bool
 	integrated, choosingStorage              bool
 	connectionSummary                        string
 	existingProject                          string
@@ -102,7 +104,7 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Environment", "Where are you working? Start with development if you’re trying things out.", value(cmd.Environment, "development")},
 		{"Connect your database", "Use a connection variable you’ve already set. Confirm it below, or edit the variable name.", value(cmd.DSN, "env:DATABASE_URL")},
 		{"PlanetScale organization", "Which PlanetScale organization owns this database?", cmd.Organization},
-		{"Connect the PlanetScale API", "Use a service token scoped to this database, stored as TOKEN_ID:TOKEN_SECRET.\nEnter env:VARIABLE or file:/absolute/path.\nPermissions: https://github.com/block/schemabot/blob/main/docs/init.md#configure-the-planetscale-service-token", value(cmd.APIToken, "env:PLANETSCALE_TOKEN")},
+		{"Connect the PlanetScale API", "Use a service token for this database.", value(cmd.APIToken, "env:PLANETSCALE_TOKEN")},
 		{"Connect SchemaBot’s state database", "Plans and progress live in a separate database. It can share your application’s server.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
 		{"Namespaces", "Which namespaces would you like to bring in? You can list several, separated by commas.", strings.Join(cmd.Namespaces, ", ")},
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
@@ -116,6 +118,16 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 			m.fields[stepName].value = cfg.Database
 		}
 		m.existingProject = fmt.Sprintf("Found %s\n%s · %s", initTerminalText(filepath.Join(m.fields[stepSchemaDir].value, "schemabot.yaml")), initTerminalText(cfg.Database), initTerminalText(cfg.Type))
+	}
+	m.suggestions = map[int]string{}
+	m.editedFields = map[int]bool{}
+	for step, supplied := range map[int]string{stepEnvironment: cmd.Environment, stepDSN: cmd.DSN, stepAPIToken: cmd.APIToken, stepStorageDSN: cmd.StorageDSN, stepSchemaDir: cmd.SchemaDir} {
+		if supplied == "" {
+			m.suggestions[step] = m.fields[step].value
+		}
+	}
+	if profile == "default" {
+		m.suggestions[stepProfile] = profile
 	}
 	m.integrated = cmd.Integrated || cmd.StorageDSN == ""
 	m.originalNamespaces = slices.Clone(cmd.Namespaces)
@@ -170,7 +182,7 @@ func (m *initWizard) planetScaleTarget(token string) localsetup.Target {
 }
 func (m *initWizard) summary() string {
 	if m.step == stepAPIToken {
-		return initTokenSummary(m.input.Value())
+		return "PlanetScale service token"
 	}
 	return initConnectionSummary(m.engine(), m.input.Value())
 }
@@ -195,7 +207,10 @@ func (m *initWizard) loadField() {
 	m.input.EchoMode = textinput.EchoNormal
 	m.input.Placeholder = ""
 	m.input.SetValue(m.fields[m.step].value)
-	if m.step == stepDSN || m.step == stepStorageDSN {
+	if !m.connectionStep(m.step) {
+		m.showFieldSuggestion()
+	}
+	if m.connectionStep(m.step) {
 		m.connectionSummary = initConnectionSummary(m.fields[stepEngine].value, m.input.Value())
 		m.loadConnectionEditor()
 	}
@@ -288,7 +303,7 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = max(20, min(72, msg.Width-4))
 		m.input.Width = max(10, m.width-4)
 	case tea.KeyMsg:
-		if (m.step == stepDSN || m.step == stepStorageDSN && !m.choosingStorage) && (!m.checkingConnection || msg.String() == "shift+tab" || msg.String() == "esc" || msg.String() == "ctrl+c") {
+		if (m.step == stepDSN || m.step == stepAPIToken || m.step == stepStorageDSN && !m.choosingStorage) && (!m.checkingConnection || msg.String() == "shift+tab" || msg.String() == "esc" || msg.String() == "ctrl+c") {
 			if handled, cmd := m.connectionKey(msg); handled {
 				return m, cmd
 			}
@@ -314,6 +329,13 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.namespaceKey(msg)
 		}
 		switch msg.String() {
+		case "tab":
+			if m.input.Value() == "" && m.input.Placeholder != "" && m.step != stepNamespaces {
+				m.input.SetValue(m.input.Placeholder)
+				m.input.CursorEnd()
+				m.editedFields[m.step] = true
+				return m, nil
+			}
 		case "pgup", "pgdown":
 			if msg.String() == "pgup" {
 				m.scroll = max(0, m.scroll-max(1, m.height-4))
@@ -337,7 +359,9 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.checkingConnection = false
 			if m.step > stepEngine {
 				if m.step < len(m.fields) && (m.step != stepNamespaces || m.explicitNamespaces) {
-					m.fields[m.step].value = m.input.Value()
+					if m.input.Value() != "" || m.editedFields[m.step] || m.suggestions[m.step] == "" {
+						m.fields[m.step].value = m.input.Value()
+					}
 				}
 				m.step--
 				for m.step > stepEngine && m.hidden(m.step) {
@@ -376,6 +400,9 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmed = true
 				return m, tea.Quit
 			}
+			if m.input.Value() == "" && m.suggestions[m.step] != "" && !m.editedFields[m.step] {
+				m.input.SetValue(m.suggestions[m.step])
+			}
 			if m.err = m.validate(); m.err != "" {
 				return m, nil
 			}
@@ -393,14 +420,15 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, c = m.spinner.Update(msg)
 		return m, c
 	}
-	connectionReadOnly := (m.step == stepDSN || m.step == stepStorageDSN) && m.connectionEditor.mode == "ready"
+	connectionReadOnly := m.connectionStep(m.step) && m.connectionEditor.mode == "ready"
 	if m.step > stepEngine && m.step < len(m.fields) && !connectionReadOnly {
 		var c tea.Cmd
 		before := m.input.Value()
 		m.input, c = m.input.Update(msg)
 		if m.input.Value() != before {
+			m.editedFields[m.step] = true
 			m.connectionChecked = false
-			if (m.step == stepDSN || m.step == stepStorageDSN) && m.connectionEditor.mode == "reference" {
+			if m.connectionStep(m.step) && m.connectionEditor.mode == "reference" {
 				m.connectionSummary = initConnectionSummary(m.fields[stepEngine].value, m.input.Value())
 			}
 			if m.step == stepAPIToken {
@@ -462,7 +490,20 @@ func (m *initWizard) contentView() string {
 			b.WriteString(wrap.Render(m.connectionEditorView()))
 			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
 		}
-		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(m.hint(m.step))) + "\n\n")
+		if m.step == stepAPIToken {
+			b.WriteString(bold.Render(f.label) + "\n\n")
+			if m.connectionEditor.mode == "menu" {
+				b.WriteString(blue.Render("1. Create a token in PlanetScale") + "\n")
+				b.WriteString(wrap.Render("Settings → Service tokens → New service token.\nAdd access to this database with these permissions:") + "\n")
+				b.WriteString(muted.Render("  read_branch · create_branch · connect_branch · delete_branch\n  read_deploy_request · create_deploy_request\n  write_branch_vschema") + "\n\n")
+				b.WriteString(blue.Render("2. Connect the token") + "\n")
+
+			}
+			b.WriteString(wrap.Render(m.connectionEditorView()))
+			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
+		} else {
+			b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(m.hint(m.step))) + "\n\n")
+		}
 		switch {
 		case m.step == stepEngine:
 			for _, engine := range initEngines {
@@ -477,8 +518,6 @@ func (m *initWizard) contentView() string {
 		default:
 			b.WriteString(m.input.View() + "\n\n")
 			if m.connectionStep(m.step) {
-				b.WriteString(wrap.Render(m.connectionSummary) + "\n\n")
-				b.WriteString(muted.Render("The token stays in your environment or credential file.") + "\n\n")
 				if m.checkingConnection {
 					b.WriteString(m.spinner.View() + " Checking connection…\n\n")
 				}
@@ -494,6 +533,9 @@ func (m *initWizard) contentView() string {
 			}
 		}
 		help := "enter continue · shift+tab back · esc cancel"
+		if m.input.Value() == "" && m.suggestions[m.step] != "" {
+			help = "tab use suggestion · " + help
+		}
 		if m.connectionStep(m.step) && !m.connectionChecked {
 			help = "enter check connection · shift+tab back · esc cancel"
 		}
@@ -521,7 +563,7 @@ func (m *initWizard) contentView() string {
 		} else {
 			row("Storage", initConnectionLabel(m.fields[stepStorageDSN].value))
 		}
-		if strings.HasPrefix(m.fields[stepDSN].value, "draft:") || !m.integrated && strings.HasPrefix(m.fields[stepStorageDSN].value, "draft:") {
+		if m.isVitess() && strings.HasPrefix(m.fields[stepAPIToken].value, "draft:") || strings.HasPrefix(m.fields[stepDSN].value, "draft:") || !m.integrated && strings.HasPrefix(m.fields[stepStorageDSN].value, "draft:") {
 			b.WriteString("\nCredentials will be saved outside your project in private, unencrypted\nfiles under ~/.schemabot/credentials.\n")
 		}
 		b.WriteString("\n" + wrap.Render("We’ll set up SchemaBot and verify your schema files.") + "\n\n")
@@ -572,7 +614,10 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 	if err != nil {
 		return err
 	}
-	for _, i := range []int{stepDSN, stepStorageDSN} {
+	for _, i := range []int{stepDSN, stepStorageDSN, stepAPIToken} {
+		if i == stepAPIToken && !m.isVitess() {
+			continue
+		}
 		if i == stepStorageDSN && m.integrated {
 			continue
 		}
@@ -580,6 +625,9 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 			purpose := "application"
 			if i == stepStorageDSN {
 				purpose = "storage"
+			}
+			if i == stepAPIToken {
+				purpose = "planetscale-token"
 			}
 			ref, err := saveInitConnection(cmd.Runtime, m.fields[stepName].value, m.fields[stepEnvironment].value, purpose, dsn)
 			if err != nil {
@@ -610,4 +658,12 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 	g.Profile = m.fields[stepProfile].value
 	cmd.ReuseSchema = cmd.ReuseSchema || reuse
 	return nil
+}
+
+// Suggestions are hints until accepted; edits remain real values on backtracking.
+func (m *initWizard) showFieldSuggestion() {
+	if suggestion := m.suggestions[m.step]; suggestion != "" && !m.editedFields[m.step] {
+		m.input.SetValue("")
+		m.input.Placeholder = suggestion
+	}
 }

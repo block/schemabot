@@ -620,10 +620,13 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	m.input.SetValue("acme")
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, stepAPIToken, m.step)
-	require.Contains(t, m.View(), `Token: "tok-name"`)
-	require.Contains(t, m.View(), "TOKEN_ID:TOKEN_SECRET")
-	require.Contains(t, m.View(), "planetscale-service-token")
+	require.Contains(t, m.View(), "Paste a service token")
+	require.Contains(t, m.View(), "Enter token ID and secret")
+	require.Contains(t, m.View(), "New service token")
+	require.Contains(t, m.View(), "write_branch_vschema")
+	require.NotContains(t, m.View(), "github.com")
 	require.NotContains(t, m.View(), "tok-secret")
+	wizardKey(m, tea.KeyEnter) // choose the detected token
 	var checked localsetup.Target
 	m.checkAPI = func(_ context.Context, target localsetup.Target) error { checked = target; return nil }
 	result := m.checkConnection()().(initConnectionMsg)
