@@ -36,6 +36,7 @@ func TestPullSchemaLoadsLiveVitessSchema(t *testing.T) {
 			org: {Databases: map[string]localscale.ContainerDatabaseConfig{
 				database: {Keyspaces: []localscale.ContainerKeyspaceConfig{
 					{Name: "commerce", Shards: 1},
+					{Name: "empty", Shards: 1},
 					{Name: "commerce_sharded", Shards: 2},
 				}},
 			}},
@@ -82,6 +83,10 @@ func TestPullSchemaLoadsLiveVitessSchema(t *testing.T) {
 	assert.Equal(t, database, resp.Database)
 	assert.Equal(t, storage.DatabaseTypeVitess, resp.Type)
 	assert.Equal(t, int32(2), resp.TableCount)
+	require.Contains(t, resp.Namespaces, "empty")
+	require.NotNil(t, resp.Namespaces["empty"])
+	assert.Empty(t, resp.Namespaces["empty"].Tables)
+	assert.JSONEq(t, "{}", resp.Namespaces["empty"].Artifacts["vschema.json"])
 	require.Contains(t, resp.Namespaces, "commerce")
 	require.Contains(t, resp.Namespaces, "commerce_sharded")
 	assert.Contains(t, resp.Namespaces["commerce"].Tables["settings"], "CREATE TABLE `settings`")
