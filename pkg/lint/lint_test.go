@@ -143,6 +143,30 @@ func TestLintSchema_InvalidSQL(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// A schema file that declares two tables has both of them linted: the
+// `orders` table with an INT primary key and the `events` table with a latin1
+// charset each report their own finding against their own table, rather than
+// the file producing no findings at all.
+func TestLintSchema_MultipleCreateTablesInOneFile(t *testing.T) {
+	linter := New()
+
+	results, err := linter.LintSchema(map[string]string{
+		"tables.sql": "CREATE TABLE `orders` (`id` int NOT NULL, PRIMARY KEY (`id`)) " +
+			"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n" +
+			"CREATE TABLE `events` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) " +
+			"ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
+	})
+	require.NoError(t, err)
+
+	byTable := make(map[string][]string)
+	for _, r := range results {
+		byTable[r.Table] = append(byTable[r.Table], r.Linter)
+	}
+	assert.Equal(t, []string{"primary_key"}, byTable["orders"], "results: %+v", results)
+	assert.Equal(t, []string{"allow_charset"}, byTable["events"], "results: %+v", results)
+	assert.Len(t, byTable, 2, "results: %+v", results)
+}
+
 func TestPlanChangesConcurrent(t *testing.T) {
 	current := []table.TableSchema{{
 		Name:   "users",
