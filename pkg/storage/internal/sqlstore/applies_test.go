@@ -2247,6 +2247,75 @@ func TestApplyStore_UpdateDerivedStateStampsStartedAt(t *testing.T) {
 	assert.WithinDuration(t, startedAt, *preserved.StartedAt, time.Second, "started_at must be preserved, not rewound")
 }
 
+// TestApplyStore_UpdateDerivedStateOperationLeasePreservesStartedAt verifies
+// that the projection written under an operation lease stamps started_at only
+// while it is still NULL, exactly as the apply-lease and unguarded paths do: a
+// later projection from the same driver must not rewind the recorded start.
+func TestApplyStore_UpdateDerivedStateOperationLeasePreservesStartedAt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_started_stamp", 906, state.Apply.Running, "staging")
+	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
+	stampOperationLease(t, opID, "driver", "op-token")
+	opLeaseCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID: apply.ID, OperationID: opID, Owner: "driver", Token: "op-token",
+	})
+
+	startedAt := time.Now().Truncate(time.Second)
+	swapped, err := store.Applies().UpdateDerivedState(opLeaseCtx, apply.ID, state.Apply.Running, state.Apply.Running, "", &startedAt, nil)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	stamped, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stamped.StartedAt)
+	assert.WithinDuration(t, startedAt, *stamped.StartedAt, time.Second)
+
+	later := startedAt.Add(time.Hour)
+	swapped, err = store.Applies().UpdateDerivedState(opLeaseCtx, apply.ID, state.Apply.Running, state.Apply.Running, "", &later, nil)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	preserved, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, preserved.StartedAt)
+	assert.WithinDuration(t, startedAt, *preserved.StartedAt, time.Second, "an operation-leased projection must not rewind started_at")
+}
+
+// TestApplyStore_UpdateDerivedStateOperationLeaseForeignOperationFailsClosed
+// verifies that an operation lease authorizes the projection only for the apply
+// its operation row belongs to. A lease that names the target apply but holds a
+// current token on an operation of a different apply must fail closed and
+// leave the target's state untouched.
+func TestApplyStore_UpdateDerivedStateOperationLeaseForeignOperationFailsClosed(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	targetLock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	target := createTestApplyWithStateAndEnv(t, store, targetLock, "apply_op_foreign_target", 907, state.Apply.Running, "staging")
+	otherLock := createTestLock(t, store, "otherdb", storage.DatabaseTypeMySQL)
+	other := createTestApplyWithStateAndEnv(t, store, otherLock, "apply_op_foreign_other", 908, state.Apply.Running, "staging")
+	foreignOpID := createApplyOperationForLeaseTest(t, store, other.ID, "primary")
+	stampOperationLease(t, foreignOpID, "driver", "op-token")
+
+	foreignCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID: target.ID, OperationID: foreignOpID, Owner: "driver", Token: "op-token",
+	})
+	swapped, err := store.Applies().UpdateDerivedState(foreignCtx, target.ID, state.Apply.Running, state.Apply.Failed, "foreign", nil, nil)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.False(t, swapped)
+
+	persisted, err := store.Applies().Get(ctx, target.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, persisted.State, "an operation of another apply must not write the target's projection")
+	assert.Empty(t, persisted.ErrorMessage)
+	untouched, err := store.Applies().Get(ctx, other.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, untouched.State, "the operation's own apply is not the write target either")
+}
+
 // TestApplyStore_UpdateRejectsOperationLeaseOnlyContext verifies that a drive
 // holding only an operation lease cannot write the parent applies row directly:
 // the parent is owned by the projection. A single-operation drive carries the

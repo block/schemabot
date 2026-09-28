@@ -40,10 +40,11 @@ func TestEngine_ReleaseCancelledArtifacts_RejectsIncompleteRequests(t *testing.T
 			wantErr: "database is required",
 		},
 		{
-			// An empty table list would still reclaim the schema-level
-			// artifacts, so it is refused rather than run as the no-op it
-			// resembles: it would discard the schema's shared checkpoint and
-			// release its deferred cutover for no named table.
+			// An empty table list is refused rather than run as the no-op it
+			// resembles. Nothing derives from no tables, so the only artifacts
+			// left in scope are the schema-scoped pair, and a release that
+			// reached them would be deciding the fate of the schema's shared
+			// checkpoint and deferred cutover gate on behalf of no named table.
 			name: "no tables",
 			req: &engine.ReleaseArtifactsRequest{
 				Database:    "shop",
@@ -79,12 +80,10 @@ func TestArtifactNames_MatchSpiritNaming(t *testing.T) {
 		utils.OldTableName(longTable),
 	}, data)
 
-	metadata := metadataArtifacts(tables)
+	metadata := perTableMetadataArtifacts(tables)
 	assert.Equal(t, []string{
 		utils.CheckpointTableName("orders"),
 		utils.CheckpointTableName(longTable),
-		sharedCheckpointTable,
-		deferredCutoverSentinelTable,
 	}, metadata)
 
 	for _, name := range append(data, metadata...) {
@@ -93,15 +92,31 @@ func TestArtifactNames_MatchSpiritNaming(t *testing.T) {
 	}
 }
 
-// The two schema-level artifacts belong to the schema change rather than to any
-// one table, so they are named whatever tables it touched. They are also the
-// only artifacts a schema change other than the cancelled one can own, which is
-// why a release refuses an empty table list rather than reclaiming them alone.
-func TestMetadataArtifacts_AlwaysIncludesSchemaLevelTables(t *testing.T) {
+// The split between the two artifact classes is what the guard is built on: an
+// artifact derived from a table the request names belongs to the cancelled
+// schema change and nothing else, while the schema-scoped pair belongs to
+// whichever schema change in the schema owns it. Every name must sit on exactly
+// one side of that line, and `isSchemaScopedArtifact` must agree with the list,
+// or a shared artifact reaches the reclaim path as if it were a derived one.
+func TestArtifactClasses_SeparateDerivedFromSchemaScoped(t *testing.T) {
+	assert.Empty(t, dataBearingArtifacts(nil))
+	assert.Empty(t, perTableMetadataArtifacts(nil))
+
 	assert.Equal(t,
 		[]string{sharedCheckpointTable, deferredCutoverSentinelTable},
-		metadataArtifacts(nil))
-	assert.Empty(t, dataBearingArtifacts(nil))
+		schemaScopedArtifacts())
+	for _, name := range schemaScopedArtifacts() {
+		assert.True(t, isSchemaScopedArtifact(name),
+			"schema-scoped artifact %q must be recognised as one", name)
+	}
+
+	for _, table := range []string{"orders", "_orders", strings.Repeat("a", 70)} {
+		derived := append(dataBearingArtifacts([]string{table}), perTableMetadataArtifacts([]string{table})...)
+		for _, name := range derived {
+			assert.False(t, isSchemaScopedArtifact(name),
+				"artifact %q derived from %q must not be treated as schema-scoped", name, table)
+		}
+	}
 }
 
 // The shapes the release guard recognises must be the shapes Spirit's naming

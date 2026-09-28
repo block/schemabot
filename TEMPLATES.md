@@ -3155,6 +3155,24 @@ If the plan finds changes, apply `staging` and wait for the SchemaBot check to s
 </details>
 
 <details>
+<summary><a name="apply-blocked-prior-env-check-on-another-commit"></a><strong>Apply Blocked: Prior Env Check On Another Commit</strong></summary>
+
+
+## ⛔ Apply Blocked
+
+The `staging` check for this PR was recorded on commit `0123456`, but this apply read the schema at commit `abcdef1`.
+
+SchemaBot only accepts a `staging` result recorded on the commit being applied. Re-check `staging` on the PR head with:
+```
+schemabot plan -e staging
+```
+
+If the plan finds changes, apply `staging` and wait for the SchemaBot check to succeed. Then retry this apply.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-prior-env-check-read-error"></a><strong>Apply Blocked: Prior Env Check Read Error</strong></summary>
 
 

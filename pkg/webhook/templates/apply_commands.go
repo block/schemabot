@@ -729,6 +729,26 @@ func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 	return offerSupportChannel(sb.String())
 }
 
+// RenderApplyBlockedByStalePriorEnvCheck renders a comment when apply is
+// blocked because the prior environment's stored check state was recorded on a
+// commit other than the one this apply read its schema from. A result for
+// another commit does not verify what the PR would apply now, so the prior
+// environment has to be re-checked on the PR head; retrying the later apply
+// alone does not help unless that check lands first. The comment names both
+// commits without ranking them: the head may have moved while the command ran,
+// so headSHA is not always the newer of the two.
+func RenderApplyBlockedByStalePriorEnvCheck(priorEnv, checkSHA, headSHA string) string {
+	var sb strings.Builder
+
+	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
+	fmt.Fprintf(&sb, "The `%s` check for this PR was recorded on commit `%s`, but this apply read the schema at commit `%s`.\n\n", priorEnv, shortSHA(checkSHA), shortSHA(headSHA))
+	fmt.Fprintf(&sb, "SchemaBot only accepts a `%s` result recorded on the commit being applied. Re-check `%s` on the PR head with:\n", priorEnv, priorEnv)
+	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
+	fmt.Fprintf(&sb, "If the plan finds changes, apply `%s` and wait for the SchemaBot check to succeed. Then retry this apply.\n", priorEnv)
+
+	return offerSupportChannel(sb.String())
+}
+
 // RenderApplyBlockedByUntrustedPriorEnvCheck renders a comment when apply is
 // blocked because the prior environment's check exists on the PR head but was
 // created only by GitHub Apps this deployment does not trust. Re-running plan

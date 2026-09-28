@@ -88,3 +88,19 @@ func TestClaimableApplyStates_AreRegisteredActiveStates(t *testing.T) {
 			s, canonical)
 	}
 }
+
+// TestTerminalApplyStates_MatchRegistry keeps the storage layer's terminal
+// list equal to the registry's. The claim gates and the one-active-apply check
+// match stored strings against this list in SQL, so a state the registry marks
+// terminal but the list omits would read as live work and reserve its target
+// forever, and a state the list names but the registry does not would release a
+// target a driver still holds.
+func TestTerminalApplyStates_MatchRegistry(t *testing.T) {
+	var registryTerminal []string
+	for _, field := range reflect.ValueOf(state.Apply).Fields() {
+		if state.IsTerminalApplyState(field.String()) {
+			registryTerminal = append(registryTerminal, field.String())
+		}
+	}
+	assert.ElementsMatch(t, registryTerminal, terminalApplyStates())
+}

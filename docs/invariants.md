@@ -240,7 +240,8 @@ logged and the drive continues. An error reading something safety-gating ends th
 and leaves the row claimable for another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
-the drive loop (`pkg/api/operator.go`) and the remote progress error limit
+the drive loop (`pkg/api/operator.go`), the pre-start task re-read in the sequential drive
+(`pkg/tern/local_apply_sequential.go`) and the remote progress error limit
 (`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -530,7 +531,8 @@ Work from an older head SHA never satisfies branch protection for a newer head, 
 while an apply is mutating the database never becomes the merge-gating source of truth.
 *Enforced:* the commit stamp each check row carries and the guard refusing a write whose commit is
 no longer the head (`pkg/webhook/check_records.go`); stale-webhook and mid-apply plan guards
-(`pkg/webhook/plan.go`). MG-11 is the other direction: making sure a real outcome does reach the
+(`pkg/webhook/plan.go`); the promotion gate, which accepts a prior environment's result only when
+it was recorded on the PR head (`pkg/webhook/check_prior_env.go`). MG-11 is the other direction: making sure a real outcome does reach the
 gating commit.
 
 ### MG-5: Apply-owned check rows are released only by their owner
@@ -573,8 +575,13 @@ interface (`pkg/storage/storage.go`, `pkg/storage/internal/sqlstore/checks.go`,
 A later commit that removes the schema change must not make the aggregate pass by cleanup alone:
 the check stays blocked (`schema_removed_after_apply_started`) until the apply settles and an
 operator reconciles the target. Closing and reopening the PR does not wash this state away.
-*Enforced:* stale-cleanup guards (`pkg/webhook/check_records.go`); close and reopen handlers
-release nothing they cannot read (`pkg/webhook/pull_request.go`).
+*Enforced:* stale-check cleanup and the plan that settles the rows a database left under an old
+type, both of which block a row a started apply owns instead of clearing it (`cleanupStaleChecks`
+and `settleChecksReplacedByNewType` in `pkg/webhook/pull_request.go`, the latter called from
+`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
+`pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
+while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
+close and reopen handlers release nothing they cannot read (`pkg/webhook/pull_request.go`).
 
 ### MG-7: A completed rollback never shows green
 
@@ -792,9 +799,9 @@ Failing closed decides the verdict, not when it is recorded. A fail-closed polic
 claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
 the failure: the apply stays `running_degraded` until that sibling settles and only then takes
 the `failed` verdict. A sibling that is merely pending holds nothing, since the same policy is what
-stops it from ever starting. Recording the verdict over live work would release the reservation on
-the parent's whole target set (OW-5) while a driver is mid-change on one of those targets, and
-would take `stop` and `cancel` away from the operator who still has work to stop.
+stops it from ever starting. Recording the verdict over live work would take `stop` and `cancel`
+away from the operator who still has work to stop. The target reservation survives it, since OW-5
+holds a rollout's targets while any of its operations is in progress.
 
 Settled rather than terminal is what decides whether a sibling still holds its deployment, under
 every policy and not only the fail-closed ones. The two differ by one state: a `stopped` sibling is
@@ -886,7 +893,10 @@ Two applies in the same database and environment may therefore run at once when 
 deployment sets are disjoint, which is the point, while the same target can never be driven
 twice. The reservation covers the parent's whole target set until the parent settles, including
 deployments whose own operation already finished under `on_failure: continue`, because the apply
-rather than the operation is the unit of reconciliation.
+rather than the operation is the unit of reconciliation. A parent that has recorded a terminal
+verdict keeps the whole set reserved while any of its operations is still in progress, since a
+drive can still reopen it (ST-1). An operation is in progress from the moment a driver starts it
+until it reaches a terminal state, and one awaiting a retry only while a driver is retrying it.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
@@ -895,14 +905,12 @@ session, which OW-9 covers. It does not depend on a user-facing database lock be
 API callers and `--no-lock` flows are equally bound.
 
 The rollout verdict correction in ST-1 is the one exception: it writes the parent row without
-re-running the check. The check reads the parent's state, not its operations', so a parent whose
-`failed` verdict was recorded too early reserves none of its deployments while one of its
-operations is still running there. Nothing else excludes a second apply in that window: the
-operation lease guards only the operation's own row, and the advisory lock is held only for the
-deciding transaction. The window closes when a drive holding a lease re-derives the parent. No
-periodic pass does that for a terminal parent, so the window can last for the rest of that
-operation's run. *Enforced:* the exclusivity check in the storage
-apply create and activate paths, under the apply target lock
+re-running the check. It lands from a drive, and the drive's operation is in progress until the
+drive records its result, so the rollout's targets stay reserved up to that point. A second apply
+admitted after that result and before the correction lands is recorded active beside the reopened
+rollout. *Enforced:* the exclusivity check in the storage apply create and activate paths, over
+active parents and over terminal parents with an operation in progress
+(`checkNoActiveApplyForTargets`, `checkNoInProgressRolloutForTargets`), under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
 
 ### OW-6: There is one way to claim work
@@ -993,6 +1001,36 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
 `releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
 `pkg/storage/internal/sqlstore/reaper.go`).
+
+### OW-10: Only drivers and elected reapers write to the target database
+
+OW-8 governs SchemaBot's own rows. The same two writer classes govern the databases SchemaBot
+changes: a target is written by the driver holding the claim on the apply that write belongs to, or
+by an elected reaper acting for an apply no driver is coming back for. A component that concludes
+such a write is needed while holding neither records a durable request and leaves the write to a
+driver (CO-1).
+
+The asymmetry that OW-8 rests on is sharper here. A wrong row is repairable by the next writer that
+holds the lease; a dropped table is not, and nothing about the target afterwards records who decided
+to drop it. So the exclusion a destructive target write depends on is a mechanism the caller holds
+for as long as the write runs, never a property it observed before starting. An observation is true
+only of the instant it was made, and the interval between that instant and the write's last
+statement is exactly where a second writer arrives. A contract for such a write therefore names the
+mechanism the caller must hold, because a contract that names the property invites a caller to
+satisfy it with a read.
+
+Those mechanisms are SchemaBot's, and they bind SchemaBot's applies. A schema change run against the
+same target from outside SchemaBot holds none of them and is visible to none of them. Where a
+destructive write could reach an object such a change may own, the write is declined and the object
+reported as retained, for an operator to reclaim once they know the target is idle. Declining costs
+disk; guessing costs another writer's work, and the registry cannot promise the first writer class
+above while any write is deciding ownership by inference.
+
+*Enforced:* the claim every drive runs under (OW-1); the apply-target lock held across a destructive
+target write, which excludes SchemaBot's applies and says so (`WithExclusiveTarget`,
+`pkg/storage/internal/sqlstore/applies.go`); and the engine-side guard that retains rather than
+reclaims what a schema change SchemaBot did not start could own
+(`pkg/engine/spirit/cancelled_artifacts.go`).
 
 ## Control operations (CO)
 
@@ -1343,7 +1381,8 @@ under all of them.
 A loader returning zero rows because of an error is never conflated with an apply that genuinely
 owns zero rows: the first blocks and surfaces, only the second may complete as a no-op. *Breaks if
 violated:* completion reports success for DDL that never ran. *Enforced:* separated error and
-empty handling on recovery load paths (`pkg/api/operator.go`).
+empty handling on recovery load paths (`pkg/api/operator.go`) and on the pre-start task re-read in
+the sequential drive (`pkg/tern/local_apply_sequential.go`).
 
 ### RC-4: Self-healing needs proof
 
@@ -1427,14 +1466,15 @@ operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
 Whether the engine will refuse a statement, or route it to direct execution (a MySQL and Spirit
-execution mode), is recorded on the plan using the engine's own checks rather than a
+execution mode), is recorded on the plan or stops plan creation using the engine's own checks rather than a
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
 direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
 estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege and size gates in `pkg/engine/postgres/postgres.go`); the whole-plan
+privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS comparison refusals
+in `pkg/engine/postgres/row_security.go` that abort plan creation); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying
