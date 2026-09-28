@@ -478,20 +478,20 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	if err != nil {
 		return nil, dsnParseError(err)
 	}
-	// Sessions default to timezone=UTC so server-side now() evaluates in UTC
+	// Sessions use timezone=UTC so server-side now() evaluates in UTC
 	// regardless of the server's TimeZone setting. Storage compares plain
 	// timestamp columns against now() in lease-expiry and staleness
 	// predicates, so a non-UTC session would skew those comparisons; the values
 	// written into those columns are held to UTC on the client side by
-	// utcTimestampCodec. An explicit timezone wins: GUC names are case-insensitive on the server,
-	// and pgx preserves DSN key case in RuntimeParams, so the check must be
-	// case-insensitive too or ?TimeZone=... would coexist with the pin in the
-	// startup packet in nondeterministic map order. PGTZ also lands in
-	// RuntimeParams at parse time (libpq env fallback semantics), so an
-	// exported PGTZ counts as an explicit setting and skips the pin.
-	if !hasRuntimeParam(cfg.RuntimeParams, "timezone") {
-		cfg.RuntimeParams["timezone"] = "UTC"
+	// utcTimestampCodec. GUC names are case-insensitive on the server, while
+	// pgx preserves their spelling, so remove every explicit spelling before
+	// adding the canonical setting.
+	for key := range cfg.RuntimeParams {
+		if strings.EqualFold(key, "timezone") {
+			delete(cfg.RuntimeParams, key)
+		}
 	}
+	cfg.RuntimeParams["timezone"] = "UTC"
 	// A verifying TLS config (sslmode=verify-full) against an RDS host with no
 	// explicit sslrootcert would fall back to the ambient system trust store,
 	// which does not carry the private Amazon RDS roots — every handshake would
@@ -558,18 +558,6 @@ func VerifiesServerCertificate(dsn string) (bool, error) {
 		return false, err
 	}
 	return verifiesServerCertificate(cfg.TLSConfig), nil
-}
-
-// hasRuntimeParam reports whether params carries key under PostgreSQL's
-// case-insensitive GUC name matching, so TimeZone and timezone are the same
-// parameter.
-func hasRuntimeParam(params map[string]string, key string) bool {
-	for k := range params {
-		if strings.EqualFold(k, key) {
-			return true
-		}
-	}
-	return false
 }
 
 // ConnectionDSN returns a PostgreSQL DSN with required transport settings

@@ -734,7 +734,7 @@ func TestPGXStdlibValueContracts(t *testing.T) {
 	// a UTC value must round-trip byte-exact, so predicates comparing stored
 	// values against server-side now() (lease expiry, retry windows) hold as
 	// long as the driver is handed UTC times. This is a raw pgx pool; the
-	// postgresconn pools storage runs on convert every timestamp parameter to
+	// postgresconn pools used by storage convert every timestamp parameter to
 	// UTC themselves.
 	assert.Equal(t, wantTime.UTC(), gotPlain.UTC(), "plain timestamp round-trips a UTC write unchanged")
 	assert.Equal(t, wantTime.Nanosecond(), gotPlain.Nanosecond(), "plain timestamp retains microsecond precision")
