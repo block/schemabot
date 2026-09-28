@@ -22,7 +22,7 @@ type Target struct {
 	DSN    string
 
 	// Database is the PlanetScale database name. Organization owns it. Token is
-	// the raw service token in name:value form, and APIURL overrides the public
+	// the raw service token in TOKEN_ID:TOKEN_SECRET form, and APIURL overrides the public
 	// PlanetScale endpoint for compatible private or emulated APIs.
 	Database     string
 	Organization string
@@ -79,12 +79,12 @@ func listPlanetScaleKeyspaces(ctx context.Context, target Target) ([]string, err
 	return names, nil
 }
 
-// A PlanetScale service token is stored as name:value in one variable, the
+// A PlanetScale service token is stored as TOKEN_ID:TOKEN_SECRET in one variable, the
 // same shape the server reads from token_secret_ref.
 func parsePlanetScaleToken(raw string) (string, string, error) {
 	name, value, ok := strings.Cut(strings.TrimSpace(raw), ":")
 	if !ok || strings.TrimSpace(name) == "" || strings.TrimSpace(value) == "" {
-		return "", "", fmt.Errorf("your PlanetScale token variable needs the name:value format of a service token")
+		return "", "", fmt.Errorf("your PlanetScale token variable needs the TOKEN_ID:TOKEN_SECRET format of a service token")
 	}
 	return strings.TrimSpace(name), strings.TrimSpace(value), nil
 }

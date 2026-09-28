@@ -53,7 +53,7 @@ func initTokenSummary(ref string) string {
 	}
 	name, value, ok := strings.Cut(raw, ":")
 	if !ok || strings.TrimSpace(name) == "" || strings.TrimSpace(value) == "" {
-		return "Use a PlanetScale service token in name:value format."
+		return "Use a PlanetScale service token in TOKEN_ID:TOKEN_SECRET format."
 	}
 	return fmt.Sprintf("Token: %q", strings.TrimSpace(name))
 }

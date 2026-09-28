@@ -37,7 +37,7 @@ type InitCmd struct {
 	Type           string       `help:"Database engine: mysql, postgres, or vitess"`
 	DSN            string       `help:"Target connection as env:VARIABLE or file:/absolute/path (credentials stay out of schema files)"`
 	Organization   string       `help:"PlanetScale organization that owns a Vitess database"`
-	APIToken       string       `name:"api-token" help:"PlanetScale service token as env:VARIABLE or file:/absolute/path holding name:value"`
+	APIToken       string       `name:"api-token" help:"PlanetScale service token as env:VARIABLE or file:/absolute/path holding TOKEN_ID:TOKEN_SECRET"`
 	APIURL         string       `name:"api-url" help:"PlanetScale-compatible API base URL; defaults to PlanetScale"`
 	Integrated     bool         `help:"Create a separate schemabot database on the application server for SchemaBot state"`
 	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE or file:/absolute/path; startup initializes SchemaBot metadata tables"`
