@@ -261,6 +261,9 @@ func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
 	_, err = onboardPullNamespaces([]string{"orders_$ENV"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must be a concrete live namespace")
+	_, err = onboardPullNamespaces([]string{"orders_{env}"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a concrete live namespace")
 }
 
 func TestRewriteOnboardNamespacesInfersEnvironmentTemplate(t *testing.T) {
@@ -274,8 +277,8 @@ func TestRewriteOnboardNamespacesInfersEnvironmentTemplate(t *testing.T) {
 		},
 	}
 	require.NoError(t, rewriteOnboardNamespaces(resp, "production", true))
-	assert.Contains(t, resp.Namespaces, "orders_$ENV")
-	assert.Contains(t, resp.Namespaces, "orders_audit_$ENV")
+	assert.Contains(t, resp.Namespaces, "orders_{env}")
+	assert.Contains(t, resp.Namespaces, "orders_audit_{env}")
 	assert.NotContains(t, resp.Namespaces, "orders_production")
 }
 
@@ -290,7 +293,7 @@ func TestRewriteOnboardNamespacesKeepsConcreteNamesByDefault(t *testing.T) {
 	}
 	require.NoError(t, rewriteOnboardNamespaces(resp, "production", false))
 	assert.Contains(t, resp.Namespaces, "orders_production")
-	assert.NotContains(t, resp.Namespaces, "orders_$ENV")
+	assert.NotContains(t, resp.Namespaces, "orders_{env}")
 }
 
 func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {

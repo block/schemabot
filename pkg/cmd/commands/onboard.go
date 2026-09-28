@@ -24,7 +24,7 @@ type OnboardCmd struct {
 	SchemaDir         string   `short:"s" required:"" help:"Schema root to write schemabot.yaml and namespace directories" name:"schema_dir"`
 	Type              string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces        []string `name:"namespace" help:"Concrete live namespace to onboard. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
-	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _$ENV directories" name:"template-env-suffix"`
+	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _{env} directories" name:"template-env-suffix"`
 	DryRun            bool     `help:"Preview files without writing them" name:"dry-run"`
 	Force             bool     `help:"Overwrite existing generated files"`
 	SkipVerify        bool     `help:"Skip plan verification after writing files" name:"skip-verify"`
@@ -167,8 +167,8 @@ func onboardPullNamespaces(namespaces []string) ([]string, error) {
 		if err := validateRelativePathPart("namespace", outputNamespace); err != nil {
 			return nil, err
 		}
-		if strings.Contains(outputNamespace, "$ENV") {
-			return nil, fmt.Errorf("namespace %q must be a concrete live namespace; use --template-env-suffix to write _$ENV directories when a live namespace ends with _<environment>", outputNamespace)
+		if schema.HasNamespaceEnvironmentPlaceholder(outputNamespace) {
+			return nil, fmt.Errorf("namespace %q must be a concrete live namespace; use --template-env-suffix to write _{env} directories when a live namespace ends with _<environment>", outputNamespace)
 		}
 		if _, ok := seen[outputNamespace]; ok {
 			return nil, fmt.Errorf("duplicate namespace %q", outputNamespace)
@@ -201,7 +201,7 @@ func onboardOutputNamespace(namespace, environment string, templateEnvSuffix boo
 	}
 	environmentSuffix := "_" + environment
 	if environment != "" && strings.HasSuffix(namespace, environmentSuffix) {
-		return strings.TrimSuffix(namespace, environmentSuffix) + "_$ENV"
+		return strings.TrimSuffix(namespace, environmentSuffix) + "_{env}"
 	}
 	return namespace
 }

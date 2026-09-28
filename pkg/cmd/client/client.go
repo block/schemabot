@@ -421,9 +421,9 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // namespace (the MySQL database name). Only one level of subdirectories is
 // supported (matching the webhook path behavior).
 //
-// The environment parameter enables $ENV substitution in namespace names.
-// If non-empty, any "$ENV" in directory names or the default namespace is
-// replaced with the environment value (e.g., "bikeshare_$ENV" → "bikeshare_staging").
+// The environment parameter enables {env} and legacy $ENV substitution in
+// namespace names. If non-empty, either token in directory names or the
+// default namespace is replaced with the environment value.
 //
 // Namespaces listed in ignoreNamespaces (schemabot.yaml ignore_namespaces) are
 // excluded from the result. The second return value lists the namespace keys

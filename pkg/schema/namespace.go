@@ -45,17 +45,17 @@ const EmptyNamespaceDeclaration = "-- This namespace is empty. Add CREATE TABLE 
 // and values are file contents. Only .sql files and vschema.json are included;
 // other files (like schemabot.yaml) are skipped.
 //
-// The environment parameter enables $ENV substitution in namespace names.
-// If environment is non-empty, any literal "$ENV" in namespace keys (from
-// directory names or defaultNamespace) is replaced with the environment value.
-// This allows a single directory like "bikeshare_$ENV/" to resolve to
+// The environment parameter enables {env} and legacy $ENV substitution in
+// namespace names. If environment is non-empty, either token in namespace keys
+// (from directory names or defaultNamespace) is replaced with the environment.
+// This allows a single directory like "bikeshare_{env}/" to resolve to
 // "bikeshare_staging" or "bikeshare_production" depending on the target.
-// If environment is empty, "$ENV" is left as-is.
+// If environment is empty, both tokens are left as-is.
 //
 // ignoreNamespaces lists namespaces to exclude from the result — schema
 // directories that exist in the repository but must not be reconciled against
 // the live database (for example a keyspace only used by local test
-// infrastructure). Entries receive the same $ENV substitution as directory
+// infrastructure). Entries receive the same substitution as directory
 // names and are matched against the post-substitution namespace keys. Layout
 // validation still sees ignored directories: a mixed flat/subdirectory layout
 // is rejected even when the subdirectories are all ignored.
@@ -68,6 +68,7 @@ const EmptyNamespaceDeclaration = "-- This namespace is empty. Add CREATE TABLE 
 // silently reconciling the namespace it was meant to exclude.
 func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string, ignoreNamespaces []string) (SchemaFiles, []string, error) {
 	result := make(SchemaFiles)
+	resolvedSources := make(map[string]string)
 	var hasFlatFile, hasNamespacedFile bool
 
 	for relativePath, content := range files {
@@ -78,7 +79,15 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 			continue
 		}
 
+		sourceNamespace := path.Dir(relativePath)
+		if sourceNamespace == "." || sourceNamespace == "" {
+			sourceNamespace = defaultNamespace
+		}
 		namespace, namespaced := NamespaceForRelativePath(relativePath, defaultNamespace, environment)
+		if previous, ok := resolvedSources[namespace]; ok && previous != sourceNamespace {
+			return nil, nil, fmt.Errorf("schema directories %q and %q both resolve to namespace %q", previous, sourceNamespace, namespace)
+		}
+		resolvedSources[namespace] = sourceNamespace
 		if !namespaced {
 			hasFlatFile = true
 		} else {
@@ -121,12 +130,29 @@ func NamespaceForRelativePath(relativePath, defaultNamespace, environment string
 		namespace = defaultNamespace
 	}
 	if environment != "" {
-		namespace = strings.ReplaceAll(namespace, "$ENV", environment)
+		namespace = ResolveNamespaceEnvironment(namespace, environment)
 	}
 	return namespace, namespaced
 }
 
-// ResolveIgnoreNamespaces applies the same $ENV substitution to
+// HasNamespaceEnvironmentPlaceholder reports whether a name contains either
+// supported namespace-directory placeholder. Pull requests use concrete names.
+func HasNamespaceEnvironmentPlaceholder(namespace string) bool {
+	return strings.Contains(namespace, "{env}") || strings.Contains(namespace, "$ENV")
+}
+
+// ResolveNamespaceEnvironment substitutes both the preferred {env} token and
+// the legacy $ENV token in a namespace name. With no environment, it leaves
+// the name unchanged.
+func ResolveNamespaceEnvironment(namespace, environment string) string {
+	if environment == "" {
+		return namespace
+	}
+	replacer := strings.NewReplacer("{env}", environment, "$ENV", environment)
+	return replacer.Replace(namespace)
+}
+
+// ResolveIgnoreNamespaces applies the same placeholder substitution to
 // ignore_namespaces entries that GroupFilesByNamespace applies to namespace
 // directory names, returning the configured entries as they will be matched
 // against namespace keys for the environment. Resolution does not check
@@ -138,10 +164,7 @@ func ResolveIgnoreNamespaces(namespaces []string, environment string) []string {
 	}
 	resolved := make([]string, len(namespaces))
 	for i, ns := range namespaces {
-		if environment != "" {
-			ns = strings.ReplaceAll(ns, "$ENV", environment)
-		}
-		resolved[i] = ns
+		resolved[i] = ResolveNamespaceEnvironment(ns, environment)
 	}
 	return resolved
 }
