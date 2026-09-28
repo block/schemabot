@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -213,9 +214,12 @@ func startSupabasePostgres(t *testing.T) (string, *sql.DB) {
 			Env:          map[string]string{"POSTGRES_PASSWORD": "schemabot_test_only", "POSTGRES_DB": "postgres"},
 			ExposedPorts: []string{"5432/tcp"},
 			Cmd:          []string{"postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"},
-			// The temporary initialization server accepts Unix sockets before
-			// Supabase's roles are ready. Wait for the final TCP listener.
-			WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(supabaseOperationDeadline),
+			// A listening port alone can precede a usable database connection.
+			// Wait for authenticated SQL over TCP, not the temporary Unix socket.
+			WaitingFor: wait.ForSQL("5432/tcp", "pgx", func(host string, port network.Port) string {
+				return (&url.URL{Scheme: "postgres", User: url.UserPassword("postgres", "schemabot_test_only"),
+					Host: net.JoinHostPort(host, port.Port()), Path: "/postgres", RawQuery: "sslmode=disable"}).String()
+			}).WithStartupTimeout(supabaseOperationDeadline),
 		},
 		Started: true,
 	})
