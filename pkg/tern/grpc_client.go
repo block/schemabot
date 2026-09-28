@@ -115,6 +115,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
@@ -259,6 +260,59 @@ const retryServiceConfig = `{
 	}]
 }`
 
+// Default per-RPC deadlines, applied only when the caller's context carries
+// none. A driver runs on a context with no deadline while a separate heartbeat
+// keeps renewing its lease, so an RPC hung on a black-holed connection would
+// hold the apply forever without a peer ever seeing a stale lease. These bounds
+// make every call return; they are generous because they are a backstop, not a
+// latency target.
+const (
+	// grpcControlRPCDeadline bounds the polling and control RPCs, which are
+	// storage reads or durable control-request writes on the data plane.
+	grpcControlRPCDeadline = 60 * time.Second
+
+	// grpcHeavyRPCDeadline bounds the RPCs that do engine or live-schema work
+	// before they return. A deadline on Apply is an ambiguous dispatch outcome
+	// that the driver recovers through the idempotency key.
+	grpcHeavyRPCDeadline = 5 * time.Minute
+
+	// grpcStorageSchemaApplyDeadline bounds a storage convergence, which the
+	// data plane runs for up to the longest budget a request may name. The
+	// margin covers the response after the convergence stops at that budget.
+	grpcStorageSchemaApplyDeadline = apitypes.MaxStorageApplyTimeout + grpcControlRPCDeadline
+)
+
+// grpcMethodDeadline returns the default deadline for a Tern unary RPC.
+func grpcMethodDeadline(fullMethod string) time.Duration {
+	switch fullMethod {
+	case ternv1.Tern_Apply_FullMethodName,
+		ternv1.Tern_Plan_FullMethodName,
+		ternv1.Tern_PlanDiff_FullMethodName,
+		ternv1.Tern_PullSchema_FullMethodName,
+		ternv1.Tern_Revert_FullMethodName,
+		ternv1.Tern_SkipRevert_FullMethodName,
+		ternv1.Tern_StorageSchemaPlan_FullMethodName:
+		return grpcHeavyRPCDeadline
+	case ternv1.Tern_StorageSchemaApply_FullMethodName:
+		return grpcStorageSchemaApplyDeadline
+	default:
+		return grpcControlRPCDeadline
+	}
+}
+
+// defaultRPCDeadlineInterceptor applies deadlineFor(method) to any unary RPC
+// whose context has no deadline. A caller that set its own deadline keeps it.
+func defaultRPCDeadlineInterceptor(deadlineFor func(fullMethod string) time.Duration) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, deadlineFor(method))
+			defer cancel()
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
 // NewGRPCClient creates a new gRPC client connected to the given address.
 //
 // The address may include a port (e.g. "tern.example.com:80"). The full
@@ -282,6 +336,7 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),
+		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(grpcMethodDeadline)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)

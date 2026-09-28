@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -275,4 +276,91 @@ func TestDeployRequestAutoCutoverRefusesWithoutBaseURL(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no PlanetScale API base URL")
+}
+
+// recordingTransport counts the requests routed through it, so a test can show
+// which HTTP client actually carried a call.
+type recordingTransport struct {
+	calls int
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.calls++
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// Both constructors carry the request timeout on the client their raw-HTTP
+// calls use, so a PlanetScale endpoint that stops answering cannot hold a
+// driver forever.
+func TestPSClientConstructorsBoundRawRequests(t *testing.T) {
+	require.NotNil(t, newPlanetScaleHTTPClient().Transport,
+		"the service-token option wraps the installed transport, so it must be non-nil")
+
+	fromDefault, err := NewPSClient("token-name", "token-value")
+	require.NoError(t, err)
+	fromBaseURL, err := NewPSClientWithBaseURL("token-name", "token-value", "https://ps.example.com")
+	require.NoError(t, err)
+
+	for name, client := range map[string]PSClient{"NewPSClient": fromDefault, "NewPSClientWithBaseURL": fromBaseURL} {
+		wrapper, ok := client.(*psClientWrapper)
+		require.True(t, ok, name)
+		require.NotNil(t, wrapper.httpClient, name)
+		assert.Equal(t, planetScaleHTTPTimeout, wrapper.httpClient.Timeout, name)
+	}
+}
+
+// A caller that passes its own HTTP client cannot displace the bounded client
+// or the service token: SDK calls still go out on the bounded client, and they
+// still authenticate.
+func TestCallerHTTPClientCannotDisplaceTheBoundOrTheToken(t *testing.T) {
+	var auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"main"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	callerTransport := &recordingTransport{}
+	client, err := NewPSClient("token-name", "token-value",
+		ps.WithBaseURL(srv.URL),
+		ps.WithHTTPClient(&http.Client{Transport: callerTransport}),
+	)
+	require.NoError(t, err)
+
+	_, err = client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+	require.NoError(t, err)
+	assert.Zero(t, callerTransport.calls, "the SDK call must use the bounded client, not the caller's")
+	assert.Equal(t, "token-name:token-value", auth)
+}
+
+// A raw-HTTP call to an endpoint that accepts the request and never answers
+// returns an error once the client's timeout fires instead of blocking the
+// driver.
+func TestRawRequestReturnsWhenTheServerHangs(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	// Cleanups run last-registered-first: release the handler before Close
+	// waits for its connection.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	wrapper := &psClientWrapper{
+		httpClient: &http.Client{Timeout: 100 * time.Millisecond},
+		baseURL:    srv.URL,
+		tokenName:  "token-name",
+		tokenValue: "token-value",
+	}
+
+	start := time.Now()
+	_, err := wrapper.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read auto_cutover for block/orders deploy request #132")
+	assert.Less(t, time.Since(start), 10*time.Second, "the call must return at the client timeout")
 }
