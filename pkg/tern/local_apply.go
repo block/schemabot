@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -162,7 +163,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		}
 
 		// Storage says non-terminal — verify with engine before blocking.
-		if c.tryResolveStaleTask(ctx, t, apply, plan.Database) {
+		if c.tryResolveStaleTask(ctx, t, apply, plan.Database, memo) {
 			continue // Task was stale; engine confirmed it's done.
 		}
 
@@ -185,10 +186,12 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 // create its apply against the one-active-apply gate.
 //
 // operationTargets caches the operation-row targets read while attributing
-// released holders, exactly as runningCopyTables caches them across one scan.
+// released holders. ownershipBlocks keeps repeated engine probes from logging
+// and counting the same ownership refusal on every retry.
 type conflictScanMemo struct {
 	resting          map[string]restingDecision
 	operationTargets map[int64]string
+	ownershipBlocks  map[string]struct{}
 }
 
 // restingDecision is what one conflict check decided about a stopped task:
@@ -204,6 +207,7 @@ func newConflictScanMemo() *conflictScanMemo {
 	return &conflictScanMemo{
 		resting:          map[string]restingDecision{},
 		operationTargets: map[int64]string{},
+		ownershipBlocks:  map[string]struct{}{},
 	}
 }
 
@@ -586,10 +590,11 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 // reports what this process ran, not the task's actual cross-process state. The
 // task's parent apply lease decides whether that memory is authoritative — a
 // fresh lease means a live driver owns the work and the task keeps blocking,
-// and a terminal report is only trusted when the last lease belongs to this
-// process (the completing process's own report).
+// and a terminal report is only trusted for a task in flight whose last lease
+// belongs to this process (the completing process's own report; see
+// terminalReportDescribesTask).
 // Returns true if the task was resolved (no longer blocking).
-func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string) bool {
+func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string, memo *conflictScanMemo) bool {
 	eng := c.getEngine()
 	if eng == nil {
 		c.logger.Error("tryResolveStaleTask: engine is nil", t.LogAttrs()...)
@@ -638,16 +643,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	// "No active schema change" just means Spirit has no runningSchemaChange,
 	// which could mean completed, never started, or crashed.
 	if result.State.IsTerminal() {
-		// A terminal report for work last leased to another process is this
-		// process's memory of an older run on the same database, not the
-		// completing driver's own report — stamping it would mark someone
-		// else's task done with state that says nothing about it. Leave the
-		// task blocking until driver stale-claim recovery settles it.
-		if apply.LeaseOwner != "" && !storage.LeaseOwnedByThisProcess(apply.LeaseOwner) {
-			c.logger.Warn("conflict check: engine reports terminal state, but the apply's last lease belongs to another process; the task keeps blocking until driver recovery settles it",
-				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner,
-					"engine_state", result.State, "engine_message", result.Message)...)
-			metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "foreign_terminal_report")
+		if !c.terminalReportDescribesTask(ctx, t, apply, result, memo) {
 			return false
 		}
 		c.logger.Info("conflict check: engine reports terminal state",
@@ -659,8 +655,9 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		return true
 	}
 
-	// The engine has no active work. For in-flight states this means the task was
-	// abandoned (e.g. a server crash) and must be failed so it stops blocking.
+	// The engine has no active work. For attributable in-flight states this means
+	// the task was abandoned (e.g. a server crash) and must be failed so it stops
+	// blocking.
 	// Resting states (Stopped, FailedRetryable) also have no active engine work,
 	// but that is expected — Spirit keeps the checkpoint until an operator resumes
 	// or retries. Failing them here would destroy resumable work and void the
@@ -670,6 +667,11 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		if !state.IsInFlightTaskState(t.State) {
 			c.logger.Debug("conflict check: leaving resting task untouched (no active engine work expected)",
 				"task_id", t.TaskIdentifier, "storage_state", t.State)
+			return false
+		}
+		if apply.LeaseOwner == "" {
+			c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "unattributed_no_active_report",
+				"conflict check: engine reports no active schema change, but the apply records no lease holder, so the report cannot be attributed to this process; the task keeps blocking until a driver settles it")
 			return false
 		}
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
@@ -682,6 +684,66 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	}
 
 	return false
+}
+
+// terminalReportDescribesTask reports whether a terminal engine report has
+// enough evidence to be stamped onto t. The engine answers from this process's
+// memory of the last schema change it ran on the database, which it keeps after
+// that work ends, so task state and lease ownership are necessary guards rather
+// than proof that a database-wide report belongs to one task:
+//
+//   - t is in flight. A task that never started (pending) or is resting
+//     (stopped, failed_retryable) has no engine work this report could be the
+//     outcome of; the report is an earlier run's, and stamping it would record
+//     work as done that never ran, or end a resumable task.
+//   - The apply's last lease belongs to this process. A lease last held by
+//     another process means that driver's work, which this process's memory
+//     says nothing about. An apply with no recorded lease holder cannot be
+//     attributed to this process either: its lease was released, or its work
+//     runs under an operation lease the apply row does not carry.
+//
+// When the engine names the tables its report covers, t must be among them:
+// this process can have run a later schema change on the same database under
+// its own lease, and that run's outcome says nothing about t. Each refusal is
+// logged and counted once per conflict scan, and the task keeps blocking until
+// the driver that owns it settles it.
+func (c *LocalClient) terminalReportDescribesTask(ctx context.Context, t *storage.Task, apply *storage.Apply, result *engine.ProgressResult, memo *conflictScanMemo) bool {
+	if !state.IsInFlightTaskState(t.State) {
+		c.logger.Debug("conflict check: engine reports terminal state, but the task is not in flight, so the report is an earlier run's; the task is left untouched",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier,
+				"engine_state", result.State, "engine_message", result.Message)...)
+		return false
+	}
+	if len(result.Tables) > 0 && !slices.ContainsFunc(result.Tables, func(tp engine.TableProgress) bool { return tp.Table == t.TableName }) {
+		c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "terminal_report_other_table",
+			"conflict check: engine reports terminal state for other tables, so the report is not this task's outcome; the task keeps blocking until a driver settles it")
+		return false
+	}
+	if apply.LeaseOwner == "" {
+		c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "unattributed_terminal_report",
+			"conflict check: engine reports terminal state, but the apply records no lease holder, so the report cannot be attributed to this process; the task keeps blocking until a driver settles it")
+		return false
+	}
+	if !storage.LeaseOwnedByThisProcess(apply.LeaseOwner) {
+		c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "foreign_terminal_report",
+			"conflict check: engine reports terminal state, but the apply's last lease belongs to another process; the task keeps blocking until driver recovery settles it")
+		return false
+	}
+	return true
+}
+
+// recordConflictOwnershipBlock logs and counts one refusal to settle t from
+// engine memory. The conflict check re-probes the same task on every retry of
+// a scan, so the memo keeps one refusal from being reported once per attempt.
+func (c *LocalClient) recordConflictOwnershipBlock(ctx context.Context, memo *conflictScanMemo, t *storage.Task, apply *storage.Apply, result *engine.ProgressResult, reason, message string) {
+	key := t.TaskIdentifier + "/" + reason
+	if _, recorded := memo.ownershipBlocks[key]; recorded {
+		return
+	}
+	memo.ownershipBlocks[key] = struct{}{}
+	c.logger.Warn(message, append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner,
+		"engine_state", result.State, "engine_message", result.Message)...)
+	metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, reason)
 }
 
 // logApplyEvent appends a log entry for an apply operation.
