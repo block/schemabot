@@ -27,8 +27,8 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	sb.WriteString("\n")
 
 	// Count changes
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	// Summary
 	if totalChanges == 0 {
@@ -53,7 +53,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	}
 
 	// Summary (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
 	// Footer
 	sb.WriteString("---\n\n")

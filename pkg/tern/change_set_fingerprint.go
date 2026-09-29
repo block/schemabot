@@ -46,13 +46,19 @@ func ChangeSetFingerprint(dialect schema.Dialect, cs ChangeSet) (string, error) 
 	// in an order neither one carries. Sorting the rendered lines is what makes
 	// the fingerprint depend on the change set's content and not on the order the
 	// engine happened to return it in.
-	lines := make([]string, 0, len(ms)+len(vschema))
+	finalize := changeSetFinalizeNamespaces(cs)
+	lines := make([]string, 0, len(ms)+len(vschema)+len(finalize))
 	for key, count := range ms {
 		lines = append(lines, "c"+fingerprintRecord(
 			key.namespace, key.shard, key.table, key.operation, key.ddl, strconv.Itoa(count)))
 	}
 	for ns := range vschema {
 		lines = append(lines, "v"+fingerprintRecord(ns))
+	}
+	// A requested finalize carries no table DDL either, and CompareChangeSets
+	// reports it as a difference, so it has to split a group the same way.
+	for ns := range finalize {
+		lines = append(lines, "f"+fingerprintRecord(ns))
 	}
 	sort.Strings(lines)
 

@@ -451,6 +451,20 @@ type SchemaChange struct {
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
 }
 
+// MetadataNeedsFinalizer is the plan change-metadata key ("true") an engine
+// sets on a namespace's change when the namespace needs its group finalizer to
+// run once every shard's DDL has landed, whether or not its VSchema changes.
+// It is the scheduling signal for the finalizer; a VSchema change schedules one
+// too, because applying the VSchema is finalizer work. Engines that finish a
+// namespace's work in its DDL never set it.
+const MetadataNeedsFinalizer = "needs_finalizer"
+
+// NeedsFinalizer reports whether the engine asked for this change's namespace
+// to be finalized after its DDL.
+func (sc SchemaChange) NeedsFinalizer() bool {
+	return sc.Metadata[MetadataNeedsFinalizer] == "true"
+}
+
 // ShardName returns the shard this change targets, trimmed of surrounding
 // whitespace. Empty when the change targets the whole namespace.
 func (sc SchemaChange) ShardName() string {

@@ -211,6 +211,19 @@ func newConflictScanMemo() *conflictScanMemo {
 	}
 }
 
+// firstOwnershipBlock records that this scan refused to settle t for reason,
+// and reports whether this is the first such refusal. The caller logs and
+// counts a refusal only the first time, so a task re-probed on every retry
+// attempt is reported once per scan.
+func (m *conflictScanMemo) firstOwnershipBlock(t *storage.Task, reason string) bool {
+	key := t.TaskIdentifier + "/" + reason
+	if _, recorded := m.ownershipBlocks[key]; recorded {
+		return false
+	}
+	m.ownershipBlocks[key] = struct{}{}
+	return true
+}
+
 // blockingTask names the active work that refuses a new apply on a database,
 // in the terms an operator needs to clear it: what is being changed, which task
 // tracks it, and the apply that owns that task.
@@ -429,6 +442,18 @@ func (c *LocalClient) settleOrphanedTask(ctx context.Context, t *storage.Task, a
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
 		return
 	}
+	op, err := c.taskOperation(ctx, t)
+	if err != nil {
+		c.logger.Warn("conflict check: orphan candidate's operation lease is unreadable; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		return
+	}
+	if op.HasFreshLease(time.Now()) {
+		c.logger.Info("conflict check: orphan candidate's operation has a live drive; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "operation_lease_owner", op.LeaseOwner)...)
+		return
+	}
+	ctx = operationLeaseAbsenceContext(ctx, t, op)
 	c.logger.Info("conflict check: settling orphaned task; its apply is terminal so no driver will ever claim the task",
 		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State, "settled_state", settledState)...)
 
@@ -588,11 +613,11 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 //
 // The engine probe answers from this process's own memory of the work: it
 // reports what this process ran, not the task's actual cross-process state. The
-// task's parent apply lease decides whether that memory is authoritative — a
-// fresh lease means a live driver owns the work and the task keeps blocking,
-// and a terminal report is only trusted for a task in flight whose last lease
-// belongs to this process (the completing process's own report; see
-// terminalReportDescribesTask).
+// task's leases decide whether that memory is authoritative — a fresh lease on
+// its parent apply or on the operation that owns it means a live driver owns
+// the work and the task keeps blocking, and a terminal report is only trusted
+// for a task in flight whose last lease belongs to this process (the
+// completing process's own report; see terminalReportDescribesTask).
 // Returns true if the task was resolved (no longer blocking).
 func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string, memo *conflictScanMemo) bool {
 	eng := c.getEngine()
@@ -607,6 +632,31 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "fresh_lease")
 		return false
 	}
+
+	// A multi-operation drive heartbeats only the operation it holds, so the
+	// parent apply's lease can read stale — or name a leftover owner — while
+	// that drive is live. The operation's own lease is what decides, read the
+	// way the claim path reads it: a fresh one means the drive owns the task,
+	// and a lease that cannot be read cannot rule that drive out.
+	op, err := c.taskOperation(ctx, t)
+	if err != nil {
+		if memo.firstOwnershipBlock(t, "operation_lease_unreadable") {
+			c.logger.Warn("conflict check: failed to read the lease of the operation that owns the task; the task keeps blocking the database",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+			metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "operation_lease_unreadable")
+		}
+		return false
+	}
+	if op.HasFreshLease(time.Now()) {
+		if memo.firstOwnershipBlock(t, "fresh_operation_lease") {
+			c.logger.Info("conflict check: a live drive holds the lease of the operation that owns the task; the task keeps blocking until that drive settles it",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_lease_owner", apply.LeaseOwner,
+					"apply_operation_id", op.ID, "operation_deployment", op.Deployment, "operation_lease_owner", op.LeaseOwner)...)
+			metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "fresh_operation_lease")
+		}
+		return false
+	}
+	settlementCtx := operationLeaseAbsenceContext(ctx, t, op)
 
 	// The raw target credentials (no namespace mapping) are correct here
 	// because per-namespace resolution only exists for MySQL, whose engine
@@ -649,9 +699,15 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		c.logger.Info("conflict check: engine reports terminal state",
 			"task_id", t.TaskIdentifier, "engine_state", result.State,
 			"engine_message", result.Message, "storage_state", t.State)
+		previous := *t
 		now := time.Now()
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, engineStateToStorage(result.State), "")
+		if err := c.persistTaskStateTransition(settlementCtx, t, 0, engineStateToStorage(result.State), ""); err != nil {
+			*t = previous
+			c.logger.Warn("conflict check: terminal task settlement lost its operation lease guard; the task keeps blocking",
+				append(t.LogAttrs(), "error", err)...)
+			return false
+		}
 		return true
 	}
 
@@ -676,10 +732,16 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		}
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
 			"task_id", t.TaskIdentifier, "storage_state", t.State, "started_at", t.StartedAt)
+		previous := *t
 		now := time.Now()
 		t.ErrorMessage = "Task abandoned: engine has no active schema change (server may have crashed)"
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, state.Task.Failed, "")
+		if err := c.persistTaskStateTransition(settlementCtx, t, 0, state.Task.Failed, ""); err != nil {
+			*t = previous
+			c.logger.Warn("conflict check: abandoned task settlement lost its operation lease guard; the task keeps blocking",
+				append(t.LogAttrs(), "error", err)...)
+			return false
+		}
 		return true
 	}
 
@@ -736,14 +798,50 @@ func (c *LocalClient) terminalReportDescribesTask(ctx context.Context, t *storag
 // engine memory. The conflict check re-probes the same task on every retry of
 // a scan, so the memo keeps one refusal from being reported once per attempt.
 func (c *LocalClient) recordConflictOwnershipBlock(ctx context.Context, memo *conflictScanMemo, t *storage.Task, apply *storage.Apply, result *engine.ProgressResult, reason, message string) {
-	key := t.TaskIdentifier + "/" + reason
-	if _, recorded := memo.ownershipBlocks[key]; recorded {
+	if !memo.firstOwnershipBlock(t, reason) {
 		return
 	}
-	memo.ownershipBlocks[key] = struct{}{}
 	c.logger.Warn(message, append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner,
 		"engine_state", result.State, "engine_message", result.Message)...)
 	metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, reason)
+}
+
+// taskOperation loads the apply_operation that owns t, whose lease decides
+// whether a live drive holds the task. A task that records no operation has no
+// operation lease to hold it: it returns nil and is left to the apply-level
+// checks. Every other unanswerable shape — no operation store, a failed read,
+// an operation row that does not exist — is an error, because the conflict
+// check must not settle a task whose drive it could not rule out.
+func (c *LocalClient) taskOperation(ctx context.Context, t *storage.Task) (*storage.ApplyOperation, error) {
+	if t.ApplyOperationID == nil {
+		c.logger.Debug("conflict check: task records no operation, so no operation lease holds it", t.LogAttrs()...)
+		return nil, nil
+	}
+	operationID := *t.ApplyOperationID
+	operations := c.storage.ApplyOperations()
+	if operations == nil {
+		return nil, fmt.Errorf("read operation %d owning task %s: apply operation store is not configured", operationID, t.TaskIdentifier)
+	}
+	op, err := operations.Get(ctx, operationID)
+	if err != nil {
+		return nil, fmt.Errorf("read operation %d owning task %s: %w", operationID, t.TaskIdentifier, err)
+	}
+	if op == nil {
+		return nil, fmt.Errorf("read operation %d owning task %s: operation row does not exist", operationID, t.TaskIdentifier)
+	}
+	if op.ApplyID != t.ApplyID {
+		return nil, fmt.Errorf("read operation %d owning task %s: operation belongs to apply %d, not apply %d", operationID, t.TaskIdentifier, op.ApplyID, t.ApplyID)
+	}
+	return op, nil
+}
+
+func operationLeaseAbsenceContext(ctx context.Context, t *storage.Task, op *storage.ApplyOperation) context.Context {
+	if op == nil {
+		return ctx
+	}
+	return storage.WithOperationLeaseAbsent(ctx, storage.OperationLeaseAbsence{
+		ApplyID: t.ApplyID, OperationID: op.ID,
+	})
 }
 
 // logApplyEvent appends a log entry for an apply operation.

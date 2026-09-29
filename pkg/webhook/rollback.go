@@ -331,6 +331,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 			nsData.VSchemaChanged = true
 			nsData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
 		}
+		nsData.Finalize = sc.NeedsFinalizer()
 		commentData.Changes = append(commentData.Changes, nsData)
 	}
 
@@ -876,5 +877,5 @@ func planHasChanges(plan *storage.Plan) bool {
 	if len(plan.FlatDDLChanges()) > 0 {
 		return true
 	}
-	return len(plan.VSchemaNamespaces()) > 0
+	return len(plan.FinalizerNamespaces()) > 0
 }

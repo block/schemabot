@@ -286,6 +286,11 @@ type KeyspaceChangeData struct {
 	VSchemaChanged bool
 	VSchemaDiff    string
 
+	// Finalize marks a keyspace the engine asked to finalize after its DDL
+	// without a VSchema document to apply. The finalize is work the apply
+	// runs, so it counts as a change like a VSchema update does.
+	Finalize bool
+
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
 	// the single Statements block — so a keyspace whose shards diverge is shown
@@ -341,8 +346,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	writeDeploymentDrift(&sb, data.DeploymentDrift)
 
 	// Count changes
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	// No changes — short-circuit with a single clean message. The
 	// ignore_namespaces disclosure still renders: a no-changes result is
@@ -430,7 +435,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	}
 
 	// Summary and options (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 	writeOptions(&sb, data)
 
 	// Footer
@@ -582,11 +587,27 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
-func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithVSchema int) {
+// countChanges counts a plan's DDL statements and its keyspace-level updates:
+// each keyspace whose VSchema changes or that the engine asks to finalize.
+func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspaceUpdates int) {
 	for _, ks := range changes {
 		totalStatements += keyspaceStatementCount(ks)
-		if ks.VSchemaChanged {
-			keyspacesWithVSchema++
+		if ks.VSchemaChanged || ks.Finalize {
+			keyspaceUpdates++
+		}
+	}
+	return
+}
+
+// countKeyspaceUpdates splits countChanges' keyspace-level updates into the
+// VSchema updates and the finalize-only keyspaces, for the summary labels.
+func countKeyspaceUpdates(changes []KeyspaceChangeData) (vschemaUpdates, finalizes int) {
+	for _, ks := range changes {
+		switch {
+		case ks.VSchemaChanged:
+			vschemaUpdates++
+		case ks.Finalize:
+			finalizes++
 		}
 	}
 	return
@@ -622,8 +643,8 @@ func keyspaceStatements(ks KeyspaceChangeData) []string {
 	return statements
 }
 
-func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithVSchema int) {
-	totalChanges := totalStatements + keyspacesWithVSchema
+func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspaceUpdates int) {
+	totalChanges := totalStatements + keyspaceUpdates
 	if totalChanges == 0 {
 		writeNoChangesDetected(sb, data)
 		sb.WriteString("\n")
@@ -633,8 +654,12 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	parts := ui.PlanSummaryParts(countStatementTypes(data.Changes, data.DatabaseType), totalStatements, true)
-	if keyspacesWithVSchema > 0 && !data.IsMySQL {
-		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
+	vschemaUpdates, finalizes := countKeyspaceUpdates(data.Changes)
+	if vschemaUpdates > 0 && !data.IsMySQL {
+		parts = append(parts, fmt.Sprintf("**%d** vschema %s", vschemaUpdates, pluralize("update", vschemaUpdates)))
+	}
+	if finalizes > 0 {
+		parts = append(parts, fmt.Sprintf("**%d** %s to finalize", finalizes, pluralize("keyspace", finalizes)))
 	}
 
 	if len(parts) > 0 {
@@ -856,7 +881,7 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 // summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
 	counts := countStatementTypes(data.Changes, data.DatabaseType)
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
 
 	parts := ui.AssemblePlanSummary(counts, totalStatements,
 		func(count int, noun, op string) string {
@@ -874,14 +899,20 @@ func SummarizeChanges(data PlanCommentData) string {
 		})
 	ddlSummary := strings.Join(parts, ", ")
 
-	if keyspacesWithVSchema > 0 && !data.IsMySQL {
-		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))
-		if ddlSummary == "" {
-			return vschemaSummary
-		}
-		return ddlSummary + " · " + vschemaSummary
+	summaries := []string{}
+	if ddlSummary != "" {
+		summaries = append(summaries, ddlSummary)
 	}
-	return ddlSummary
+	if keyspaceUpdates > 0 {
+		vschemaUpdates, finalizes := countKeyspaceUpdates(data.Changes)
+		if vschemaUpdates > 0 && !data.IsMySQL {
+			summaries = append(summaries, fmt.Sprintf("%d vschema %s", vschemaUpdates, pluralize("update", vschemaUpdates)))
+		}
+		if finalizes > 0 {
+			summaries = append(summaries, fmt.Sprintf("%d %s to finalize", finalizes, pluralize("keyspace", finalizes)))
+		}
+	}
+	return strings.Join(summaries, " · ")
 }
 
 // countStatementTypes counts CREATE, ALTER, DROP, and other statements across all
@@ -957,7 +988,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
 		hasDDLChanges := len(ks.Statements) > 0 || len(ks.Shards) > 0
-		if !hasDDLChanges && !hasVSchemaChanges {
+		if !hasDDLChanges && !hasVSchemaChanges && !ks.Finalize {
 			continue
 		}
 
@@ -978,6 +1009,10 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			}
 		}
 
+		if ks.Finalize && !hasVSchemaChanges {
+			sb.WriteString(keyspaceFinalizeNote)
+		}
+
 		if hasDDLChanges {
 			if len(ks.Shards) > 0 {
 				writeShardedPlanDDL(sb, ks.Shards, dialect, budget)
@@ -987,6 +1022,11 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 		}
 	}
 }
+
+// keyspaceFinalizeNote is the plan comment's line for a keyspace the engine
+// asked to finalize without a VSchema document to apply. What finalizing does
+// is the engine's; the comment only says that it runs and when.
+const keyspaceFinalizeNote = "_Finalized by the engine once every shard's DDL has landed._\n\n"
 
 // countPlanDDLBlocks counts the DDL sections writeKeyspaceChanges renders for
 // changes — one per unsharded keyspace with statements and one per group of
@@ -1887,8 +1927,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// environment's reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(sb, plan.DeploymentDrift)
 
-	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(plan.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	// The ignore_namespaces disclosure renders under each environment's
 	// summary (writePlanSummary) or no-changes message, because entries can
@@ -1956,7 +1996,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	}
 
 	// Summary (after DDL, matching CLI layout)
-	writePlanSummary(sb, *plan, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(sb, *plan, totalStatements, keyspaceUpdates)
 }
 
 // writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
@@ -2084,31 +2124,84 @@ func appendDatabaseFlag(command, database string) string {
 	return fmt.Sprintf("%s -d %s", command, database)
 }
 
-// MsgConfirmationPlanForOtherEnvironment rejects an apply-confirm whose -e
-// names a different environment than the pending confirmation was planned for.
-const MsgConfirmationPlanForOtherEnvironment = "The pending confirmation on this pull request was planned for `%s`, not `%s`. Nothing was applied, and the pending confirmation is preserved. Run `%s` to confirm that plan, or `%s` to plan this environment."
-
-// RenderConfirmationPlanForOtherEnvironment builds runnable recovery commands
-// with the same database scope, tenant, and option flags as the rejected
-// command, so pasting one keeps the choices the operator already made.
-func RenderConfirmationPlanForOtherEnvironment(planEnvironment, requestedEnvironment, database string, opts ApplyCommandOptions) string {
-	confirmCommand := scopedApplyCommand("schemabot apply-confirm", planEnvironment, database, opts)
-	applyCommand := scopedApplyCommand("schemabot apply", requestedEnvironment, database, opts)
-	return fmt.Sprintf(MsgConfirmationPlanForOtherEnvironment, planEnvironment, requestedEnvironment, confirmCommand, applyCommand)
+// ConfirmationRefusalData describes an apply-confirm the pending confirmation
+// cannot vouch for. RequestedEnvironment and Options come from the rejected
+// command, so the recovery commands repeat the database scope, tenant, and
+// option flags the operator already chose. PlanEnvironment is the environment
+// the pending confirmation was planned for; it is empty when no plan could be
+// loaded.
+type ConfirmationRefusalData struct {
+	RequestedBy          string
+	Database             string
+	PlanEnvironment      string
+	RequestedEnvironment string
+	Options              ApplyCommandOptions
 }
 
-// MsgConfirmationPlanUnavailable rejects an apply-confirm whose pending
-// confirmation pins no plan SchemaBot can load, so nothing attests which
-// environment the operator reviewed. The verb takes the runnable apply command
-// that plans the requested environment again.
-const MsgConfirmationPlanUnavailable = "The pending confirmation on this pull request is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed. Nothing was applied, and the pending confirmation is preserved. Run `%s` to plan this environment again, then confirm that plan."
+// RenderConfirmationPlanForOtherEnvironment refuses an apply-confirm whose -e
+// names a different environment than the pending confirmation was planned for.
+// The confirm command it offers keeps the pending confirmation. The apply
+// command it offers for the requested environment does not: it answers to the
+// environment ordering gate like any apply, and once through it releases this
+// pull request's lock, so the pinned plan is gone and the requested
+// environment is planned and applied in one step, pausing for apply-confirm
+// only when the new plan needs one. The comment states both consequences so
+// an operator who reads only the comment knows what each command costs. It is
+// a comment of its own rather than a generic error, so no length clamp can cut
+// the commands or the consequences however long the database name is.
+func RenderConfirmationPlanForOtherEnvironment(data ConfirmationRefusalData) string {
+	var sb strings.Builder
 
-// RenderConfirmationPlanUnavailable builds the missing-plan rejection with a
-// recovery command carrying the same database scope, tenant, and option flags
-// as the rejected command.
-func RenderConfirmationPlanUnavailable(requestedEnvironment, database string, opts ApplyCommandOptions) string {
-	applyCommand := scopedApplyCommand("schemabot apply", requestedEnvironment, database, opts)
-	return fmt.Sprintf(MsgConfirmationPlanUnavailable, applyCommand)
+	writeConfirmationRefusalHeader(&sb, data)
+	fmt.Fprintf(&sb, "The pending confirmation is for `%s`, not `%s`; nothing was applied.\n\n", data.PlanEnvironment, data.RequestedEnvironment)
+	fmt.Fprintf(&sb, "To confirm the `%s` plan:\n\n", data.PlanEnvironment)
+	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, data.Options))
+	fmt.Fprintf(&sb, "\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n",
+		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment)
+	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeConfirmationRefusalFooter(&sb, data)
+
+	return offerSupportChannel(sb.String())
+}
+
+// RenderConfirmationPlanUnavailable refuses an apply-confirm whose pending
+// confirmation pins no plan SchemaBot can load, so nothing attests which
+// environment the operator reviewed. The apply command it offers for the
+// requested environment answers to the environment ordering gate like any
+// apply; once through, it releases this pull request's lock, replacing the
+// unloadable pinned plan with a fresh one that is applied in the same step,
+// pausing for apply-confirm only when the new plan needs one. Like the
+// other-environment refusal, it is a comment of its own, so no length clamp
+// can cut it.
+func RenderConfirmationPlanUnavailable(data ConfirmationRefusalData) string {
+	var sb strings.Builder
+
+	writeConfirmationRefusalHeader(&sb, data)
+	sb.WriteString("The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
+	fmt.Fprintf(&sb, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n")
+	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeConfirmationRefusalFooter(&sb, data)
+
+	return offerSupportChannel(sb.String())
+}
+
+func writeConfirmationRefusalHeader(sb *strings.Builder, data ConfirmationRefusalData) {
+	writeEnvironmentTitle(sb, glyph.Refused+" Apply-confirm Refused", data.RequestedEnvironment)
+	if data.Database != "" {
+		writeDBLine(sb, data.Database)
+		sb.WriteString("\n")
+	}
+}
+
+func writeConfirmationRefusalFooter(sb *strings.Builder, data ConfirmationRefusalData) {
+	if data.RequestedBy != "" {
+		fmt.Fprintf(sb, "\n_Requested by @%s_\n", data.RequestedBy)
+	}
+}
+
+// writeCommandBlock writes one pasteable command in its own fenced block.
+func writeCommandBlock(sb *strings.Builder, command string) {
+	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
 // allPlansIdentical returns true if all environments have identical changes.
@@ -2182,7 +2275,7 @@ func capitalizeEnvNames(envs []string) string {
 // hasChanges returns true if there are any schema changes.
 func hasChanges(changes []KeyspaceChangeData) bool {
 	for _, ks := range changes {
-		if len(ks.Statements) > 0 || ks.VSchemaChanged {
+		if len(ks.Statements) > 0 || ks.VSchemaChanged || ks.Finalize {
 			return true
 		}
 	}

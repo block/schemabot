@@ -47,6 +47,21 @@ func TestRollbackExecutionErrorMessage(t *testing.T) {
 	})
 }
 
+func TestPendingRollbackApplyRefusal(t *testing.T) {
+	t.Run("loaded plan offers confirmation in its environment", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", &storage.Plan{Environment: "staging"})
+		assert.Contains(t, msg, "schemabot rollback-confirm -e staging")
+		assert.Contains(t, msg, "schemabot unlock")
+	})
+
+	t.Run("unavailable plan only offers unlock", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", nil)
+		assert.Contains(t, msg, "rollback plan that is unavailable")
+		assert.Contains(t, msg, "schemabot unlock")
+		assert.NotContains(t, msg, "rollback-confirm")
+	})
+}
+
 func TestDDLMatchesStoredPlan(t *testing.T) {
 	tests := []struct {
 		name       string
