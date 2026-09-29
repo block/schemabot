@@ -654,7 +654,8 @@ func TestEngine_Plan_NewTable(t *testing.T) {
 // creates both of them, each from its own statement, so a multi-table file
 // plans every table it declares rather than only the first.
 func TestEngine_Plan_MultipleTablesInOneFile(t *testing.T) {
-	dsn, _ := setupTestMySQL(t)
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db) // Start with clean database
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
