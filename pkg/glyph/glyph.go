@@ -51,4 +51,8 @@ const (
 
 	// Info marks neutral information that requires nothing of the operator.
 	Info = "ℹ️"
+
+	// Docs marks a pointer to the documentation page that answers the
+	// question the surface beside it raises.
+	Docs = "📖"
 )
