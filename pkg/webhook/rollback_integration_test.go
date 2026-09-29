@@ -416,22 +416,26 @@ func (s *lockRepinningApplyStore) CreateWithGroupedOperations(ctx context.Contex
 	return s.ApplyStore.CreateWithGroupedOperations(ctx, apply, groups)
 }
 
-// TestE2ERollbackConfirmRejectedWhenLockRepinnedBeforeExecute covers a
-// rollback-confirm racing a newer rollback for the same PR. The operator
-// reviews rollback plan A and confirms it; after the confirm resolves plan A
-// from the lock but before the rollback apply is stored, a second rollback
-// command re-pins the lock to plan B. The rollback runs with unsafe changes
-// allowed, so it must only run under the lock intent the operator confirmed:
-// the confirm is rejected with guidance to re-run the rollback, no rollback
-// apply is created, and the lock keeps the newer pin untouched.
-func TestE2ERollbackConfirmRejectedWhenLockRepinnedBeforeExecute(t *testing.T) {
-	dbName := "webhook_rbconfirm_repin"
-	var applies *lockRepinningApplyStore
-	var lockStore storage.LockStore
-	svc := setupE2EServiceWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
-		applies = &lockRepinningApplyStore{ApplyStore: st.Applies()}
-		lockStore = st.Locks()
-		return &lockRepinningStorage{Storage: st, applies: applies}
+// rollbackConfirmRaceFixture is a PR whose index apply has completed and whose
+// `schemabot rollback` has posted its plan and pinned the lock to it, with a
+// hook that changes the lock in the window between rollback-confirm resolving
+// that pin and the rollback apply row being written.
+type rollbackConfirmRaceFixture struct {
+	svc           *api.Service
+	h             *Handler
+	result        *planFlowResult
+	applies       *lockRepinningApplyStore
+	lockStore     storage.LockStore
+	confirmedLock *storage.Lock
+}
+
+func setupRollbackConfirmRace(t *testing.T, dbName string) *rollbackConfirmRaceFixture {
+	t.Helper()
+	f := &rollbackConfirmRaceFixture{}
+	f.svc = setupE2EServiceWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
+		f.applies = &lockRepinningApplyStore{ApplyStore: st.Applies()}
+		f.lockStore = st.Locks()
+		return &lockRepinningStorage{Storage: st, applies: f.applies}
 	})
 	ctx := t.Context()
 
@@ -447,7 +451,7 @@ func TestE2ERollbackConfirmRejectedWhenLockRepinnedBeforeExecute(t *testing.T) {
 
 	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 	prNumber := int32(1)
-	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
+	planResp, err := f.svc.ExecutePlan(ctx, api.PlanRequest{
 		Database:    dbName,
 		Environment: "staging",
 		Type:        "mysql",
@@ -459,7 +463,7 @@ func TestE2ERollbackConfirmRejectedWhenLockRepinnedBeforeExecute(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	applyResp, applyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
+	applyResp, applyID, err := f.svc.ExecuteApply(ctx, api.ApplyRequest{
 		PlanID:      planResp.PlanID,
 		Environment: "staging",
 		Options:     map[string]string{"allow_unsafe": "true"},
@@ -468,7 +472,7 @@ func TestE2ERollbackConfirmRejectedWhenLockRepinnedBeforeExecute(t *testing.T) {
 	require.True(t, applyResp.Accepted)
 
 	require.Eventually(t, func() bool {
-		a, err := svc.Storage().Applies().Get(ctx, applyID)
+		a, err := f.svc.Storage().Applies().Get(ctx, applyID)
 		return err == nil && a != nil && state.IsState(a.State, state.Apply.Completed)
 	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "initial apply should complete")
 
@@ -480,78 +484,113 @@ func TestE2ERollbackConfirmRejectedWhenLockRepinnedBeforeExecute(t *testing.T) {
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+	f.result = setupFakeGitHubForPlan(t, mux, map[string]string{
 		"users.sql": schemaWithIndex,
 	}, schemabotConfig, dbName)
 
-	h := newE2EHandler(t, svc, client)
+	f.h = newE2EHandler(t, f.svc, client)
 
-	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
+	storedApply, err := f.svc.Storage().Applies().Get(ctx, applyID)
 	require.NoError(t, err)
 	require.NotNil(t, storedApply)
 
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier),
-		isPR:    true,
-	}, nil)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
-
+	f.sendComment(t, fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier))
 	select {
-	case body := <-result.comments:
+	case body := <-f.result.comments:
 		require.Contains(t, body, "Rollback Plan")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for rollback plan comment")
 	}
 
-	confirmedLock, err := lockStore.Get(ctx, dbName, "mysql")
+	f.confirmedLock, err = f.lockStore.Get(ctx, dbName, "mysql")
 	require.NoError(t, err)
-	require.NotNil(t, confirmedLock, "the rollback command should hold the lock")
-	require.True(t, strings.HasPrefix(confirmedLock.PendingPlanID, rollbackPendingPlanPrefix),
+	require.NotNil(t, f.confirmedLock, "the rollback command should hold the lock")
+	require.True(t, strings.HasPrefix(f.confirmedLock.PendingPlanID, rollbackPendingPlanPrefix),
 		"the rollback command should pin its plan on the lock")
+	return f
+}
 
-	// A newer rollback for the same PR re-pins the lock after the confirm has
-	// resolved the plan the operator reviewed, before the apply is stored.
-	newerPin := rollbackPendingPlanPrefix + "plan_newer_rollback"
-	applies.arm(func(ctx context.Context) error {
-		return lockStore.Acquire(ctx, &storage.Lock{
-			DatabaseName:  dbName,
-			DatabaseType:  "mysql",
-			Owner:         confirmedLock.Owner,
-			Repository:    confirmedLock.Repository,
-			PullRequest:   confirmedLock.PullRequest,
-			PendingPlanID: newerPin,
-		})
-	})
-
-	req = buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot rollback-confirm -e staging",
-		isPR:    true,
-	}, nil)
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
+func (f *rollbackConfirmRaceFixture) sendComment(t *testing.T, comment string) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	f.h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil))
 	require.Equal(t, http.StatusOK, rr.Code)
+}
 
-	select {
-	case body := <-result.comments:
-		assert.Contains(t, body, msgRollbackLockIntentChanged)
-		assert.NotContains(t, body, storage.ErrLockIntentChanged.Error(), "the raw storage error must not reach the PR comment")
-	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the rollback-confirm rejection comment")
+// TestE2ERollbackConfirmRejectedWhenLockIntentChangesBeforeExecute covers a
+// rollback-confirm racing another lock command for the same PR. The operator
+// reviews rollback plan A and confirms it; after the confirm resolves plan A
+// from the lock but before the rollback apply is stored, the lock changes
+// under it: a second rollback command re-pins it to plan B, or an unlock
+// releases it. The rollback runs with unsafe changes allowed, so it must only
+// run under the lock intent the operator confirmed: the confirm is rejected
+// with guidance to re-run the rollback, no rollback apply is created, and the
+// lock is left exactly as the other command left it.
+func TestE2ERollbackConfirmRejectedWhenLockIntentChangesBeforeExecute(t *testing.T) {
+	newerPin := rollbackPendingPlanPrefix + "plan_newer_rollback"
+	tests := []struct {
+		name       string
+		dbName     string
+		changeLock func(ctx context.Context, f *rollbackConfirmRaceFixture) error
+		assertLock func(t *testing.T, f *rollbackConfirmRaceFixture, lock *storage.Lock)
+	}{
+		{
+			name:   "a newer rollback re-pins the lock",
+			dbName: "webhook_rbconfirm_repin",
+			changeLock: func(ctx context.Context, f *rollbackConfirmRaceFixture) error {
+				return f.lockStore.Acquire(ctx, &storage.Lock{
+					DatabaseName:  f.confirmedLock.DatabaseName,
+					DatabaseType:  f.confirmedLock.DatabaseType,
+					Owner:         f.confirmedLock.Owner,
+					Repository:    f.confirmedLock.Repository,
+					PullRequest:   f.confirmedLock.PullRequest,
+					PendingPlanID: newerPin,
+				})
+			},
+			assertLock: func(t *testing.T, f *rollbackConfirmRaceFixture, lock *storage.Lock) {
+				require.NotNil(t, lock, "the rejected confirm must leave the newer lock in place")
+				assert.Equal(t, f.confirmedLock.Owner, lock.Owner)
+				assert.Equal(t, newerPin, lock.PendingPlanID, "the rejected confirm must not touch the newer pin")
+			},
+		},
+		{
+			name:   "an unlock releases the lock",
+			dbName: "webhook_rbconfirm_unlock",
+			changeLock: func(ctx context.Context, f *rollbackConfirmRaceFixture) error {
+				return f.lockStore.Release(ctx, f.confirmedLock.DatabaseName, f.confirmedLock.DatabaseType, f.confirmedLock.Owner)
+			},
+			assertLock: func(t *testing.T, _ *rollbackConfirmRaceFixture, lock *storage.Lock) {
+				assert.Nil(t, lock, "the rejected confirm must not re-acquire the released lock")
+			},
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := setupRollbackConfirmRace(t, tt.dbName)
+			ctx := t.Context()
 
-	allApplies, err := svc.Storage().Applies().GetByDatabase(ctx, dbName, "mysql", "staging")
-	require.NoError(t, err)
-	for _, a := range allApplies {
-		assert.False(t, a.IsRollback(), "no rollback apply may be created once the lock stops pinning the confirmed plan (found %s)", a.ApplyIdentifier)
+			f.applies.arm(func(ctx context.Context) error { return tt.changeLock(ctx, f) })
+			f.sendComment(t, "schemabot rollback-confirm -e staging")
+
+			select {
+			case body := <-f.result.comments:
+				assert.Contains(t, body, msgRollbackLockIntentChanged)
+				assert.NotContains(t, body, storage.ErrLockIntentChanged.Error(), "the raw storage error must not reach the PR comment")
+			case <-time.After(webhookIntegrationPollDeadline):
+				t.Fatal("timed out waiting for the rollback-confirm rejection comment")
+			}
+
+			allApplies, err := f.svc.Storage().Applies().GetByDatabase(ctx, tt.dbName, "mysql", "staging")
+			require.NoError(t, err)
+			for _, a := range allApplies {
+				assert.False(t, a.IsRollback(), "no rollback apply may be created once the lock stops pinning the confirmed plan (found %s)", a.ApplyIdentifier)
+			}
+
+			lock, err := f.lockStore.Get(ctx, tt.dbName, "mysql")
+			require.NoError(t, err)
+			tt.assertLock(t, f, lock)
+		})
 	}
-
-	lock, err := lockStore.Get(ctx, dbName, "mysql")
-	require.NoError(t, err)
-	require.NotNil(t, lock, "the rejected confirm must leave the newer lock in place")
-	assert.Equal(t, confirmedLock.Owner, lock.Owner)
-	assert.Equal(t, newerPin, lock.PendingPlanID, "the rejected confirm must not touch the newer pin")
 }
 
 // checkWriteRecorder wraps the service's storage so a test can observe every
