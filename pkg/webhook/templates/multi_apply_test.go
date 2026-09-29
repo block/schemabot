@@ -717,6 +717,20 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 	})
 	assert.NotContains(t, cutover, "\n## Injected")
 	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
+
+	// The stop footer names the member whose section it closes, in prose under
+	// the command an operator is about to paste.
+	footer := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders_eu", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+			{Database: "orders_us", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+	assert.NotContains(t, footer, "\n## Injected")
+	assert.Contains(t, footer, "Stopping applies to every target in this rollout, not just `` us` ## Injected [click](https://example.invalid) ``.")
 }
 
 // stop and cancel address the apply, not one member of it, and the CLI offers no
