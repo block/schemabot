@@ -5,6 +5,7 @@ package spirit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -2368,4 +2369,74 @@ func TestEngine_Plan_TableRowEstimates(t *testing.T) {
 	require.True(t, ok, "expected a CREATE for sized_gadgets, got: %v", result.FlatDDL())
 	assert.Nil(t, created.EstimatedRows, "a table being created has no estimate")
 	assert.Nil(t, created.EstimatedBytes, "a table being created has no byte estimate")
+}
+
+// planSizeProbeFixture creates one table and returns the engine, DSN, and schema
+// files for a plan that alters it, so a test can fault the size probe.
+func planSizeProbeFixture(t *testing.T) (*Engine, string, schema.SchemaFiles) {
+	t.Helper()
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `probed_items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create table")
+	files := testSchemaFiles(map[string]string{
+		"probed_items.sql": "CREATE TABLE `probed_items` (\n" +
+			"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+			"  `label` varchar(64) DEFAULT NULL,\n" +
+			"  PRIMARY KEY (`id`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	})
+	return New(Config{}), dsn, files
+}
+
+// Table sizes are display-only plan context, so a size probe that fails still
+// yields the full plan: the ALTER is planned and simply carries no size.
+func TestEngine_Plan_SizeProbeFailureStillPlans(t *testing.T) {
+	eng, dsn, files := planSizeProbeFixture(t)
+	eng.sizeProbeFault = func(context.Context) error {
+		return errors.New("statistics unreadable")
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: files,
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "a failed size probe must not fail the plan")
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "probed_items", changes[0].Table)
+	assert.Contains(t, changes[0].DDL, "ADD COLUMN `label`")
+	assert.Nil(t, changes[0].EstimatedRows)
+	assert.Nil(t, changes[0].EstimatedBytes)
+}
+
+// The size probe runs under its own budget, never the plan's, so a probe that
+// hangs gives up after engine.TableSizeProbeTimeout and the plan goes on
+// without sizes instead of waiting out the caller's deadline.
+func TestEngine_Plan_SizeProbeIsBounded(t *testing.T) {
+	eng, dsn, files := planSizeProbeFixture(t)
+	var budget time.Duration
+	var hasDeadline bool
+	eng.sizeProbeFault = func(ctx context.Context) error {
+		var deadline time.Time
+		deadline, hasDeadline = ctx.Deadline()
+		budget = time.Until(deadline)
+		return context.DeadlineExceeded
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: files,
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "a timed-out size probe must not fail the plan")
+	require.True(t, hasDeadline, "the size probe must run under a deadline")
+	assert.LessOrEqual(t, budget, engine.TableSizeProbeTimeout)
+	assert.Positive(t, budget)
+	require.Len(t, result.FlatTableChanges(), 1)
 }
