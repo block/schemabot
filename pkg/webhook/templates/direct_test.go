@@ -91,6 +91,8 @@ func TestDirectConsentCopy_KeyedByDatabaseType(t *testing.T) {
 	mysqlHeader, mysqlFooter := directConsentCopy("mysql", true)
 	assert.Equal(t, "native MySQL DDL", mysqlHeader)
 	assert.Contains(t, mysqlFooter, "writes to each table are blocked while its statement runs")
+	assert.Contains(t, mysqlFooter, "transactions blocking a table's metadata lock are killed",
+		"MySQL direct statements kill the transactions blocking them, so confirming consents to that")
 
 	strataHeader, strataFooter := directConsentCopy("strata", false)
 	assert.Equal(t, mysqlHeader, strataHeader, "Strata shards run the same native MySQL DDL")

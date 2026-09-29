@@ -34,10 +34,24 @@ Lock acquisition is bounded too. Native DDL queues on the table's metadata
 lock behind any open transaction that has touched the table, and by default
 MySQL lets it queue essentially forever — with every query arriving after it
 queueing behind the DDL, stalling all traffic to the table. Direct statements
-run on a session with a short `lock_wait_timeout`, so a busy table fails the
-apply fast with a retryable "table is busy" error instead of stalling. The
-bound is configurable per policy via the `lock_acquisition_timeout` config field;
-the engine applies a short default when it is not set.
+run on a session with a short `lock_wait_timeout`, and they handle a blocker
+the way Spirit handles one for its own DDL: at 90% of the bound, the statement
+kills the transactions holding the table's metadata lock, found through
+`performance_schema`, and retries a bounded number of times. Two kinds of
+blocker are never killed, because killing them is unsafe: a session holding
+an explicit `LOCK TABLES`, and a transaction too large to roll back without
+harming the database. While one of those holds the lock, every attempt times
+out and the apply fails with a retryable "table is busy" error instead of
+stalling. The bound is configurable per policy via the
+`lock_acquisition_timeout` config field; the engine applies a short default
+when it is not set.
+
+The kill needs `SELECT` on `performance_schema` to find the blockers, and
+`CONNECTION_ADMIN` (or `SUPER`) to kill sessions of other users. A target
+whose SchemaBot user cannot read `performance_schema` blocks the statement at
+plan time rather than running it without the kill. A missing kill privilege
+surfaces only when a blocker is found: the kill fails, the attempts time out,
+and the apply fails as busy.
 
 ## Routing
 
@@ -186,7 +200,8 @@ requirements come with those pieces:
   negative value is a "no real estimate" sentinel, not a count (PostgreSQL's
   `pg_class.reltuples` reports `-1` for a never-analyzed table).
 - The executor must bound lock acquisition and fail fast on a busy table, the
-  way the MySQL engine bounds `lock_wait_timeout`. On PostgreSQL that is
+  way the MySQL engine bounds `lock_wait_timeout` and kills the transactions
+  that block it. On PostgreSQL that is
   `lock_timeout`, and it matters even more there: a DDL queued on a lock
   blocks new reads of the table as well as writes.
 
@@ -239,9 +254,12 @@ containing direct-execution changes never does:
 Every routing outcome increments
 `schemabot.direct_execution.statements_total` with the database and an
 `outcome` attribute: `completed`, `failed`, or `stopped` for executed
-statements; `blocked_policy_disabled`, `blocked_size_limit`, or
-`blocked_size_unknown` for statements the policy did not route. Direct
-executions are rare, operator-consented events — a spike in `failed` means
-native DDL is erroring on the target (check the apply logs for the statement
-and MySQL error), and a spike in `blocked_size_unknown` means row counts
-are unavailable (check target connectivity and `information_schema` access).
+statements; `blocked_policy_disabled`, `blocked_size_limit`,
+`blocked_size_unknown`, or `blocked_force_kill_unavailable` for statements the
+policy did not route. Direct executions are rare, operator-consented events —
+a spike in `failed` means native DDL is erroring on the target (check the
+apply logs for the statement and MySQL error), a spike in
+`blocked_size_unknown` means row counts are unavailable (check target
+connectivity and `information_schema` access), and
+`blocked_force_kill_unavailable` means the SchemaBot user cannot read
+`performance_schema` on the target (grant `SELECT` on `performance_schema.*`).

@@ -729,15 +729,25 @@ the bound — a stale estimate can never approve a large table. The bound is
 re-evaluated when the apply executes, so a table that grew past it after
 planning is blocked, not run.
 
-`lock_acquisition_timeout` bounds how long each direct statement waits to
-acquire its locks. Each engine maps it to its native session lock timeout —
-on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`. Native DDL
-queues on the table's metadata lock behind any open transaction that has
-touched the table — and by default MySQL lets it queue essentially forever,
-with all new table traffic stalling behind it. When the bound expires the
-apply fails fast with a retryable "table is busy" error instead. Lower it for
-environments where even a short stall is unacceptable; the value must be a
-whole number of seconds (at least `1s`).
+`lock_acquisition_timeout` bounds how long each attempt of a direct statement
+waits to acquire its locks. Each engine maps it to its native session lock
+timeout — on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`.
+Native DDL queues on the table's metadata lock behind any open transaction
+that has touched the table — and by default MySQL lets it queue essentially
+forever, with all new table traffic stalling behind it. On MySQL, at 90% of
+the bound the statement kills the transactions blocking the lock and retries
+a bounded number of times, as Spirit does for its own DDL. A session holding an
+explicit `LOCK TABLES`, or a transaction too large to roll back safely, is
+never killed; while one holds the lock the apply fails with a retryable
+"table is busy" error. Traffic to the table can stall for up to one bound per
+attempt, so lower it for environments where even a short stall is
+unacceptable; the value must be a whole number of seconds (at least `1s`).
+
+The kill reads `performance_schema` to find the blocking sessions, so the
+SchemaBot user needs `SELECT` on `performance_schema.*` for a statement to
+run directly; without it the statement is blocked at plan time. Killing
+another user's session also needs `CONNECTION_ADMIN` (or `SUPER`); without it
+the kill fails and a blocked apply fails as busy.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is

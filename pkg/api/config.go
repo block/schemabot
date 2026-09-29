@@ -1251,12 +1251,16 @@ type DirectExecutionConfig struct {
 	// is true.
 	MaxTableRows int64 `yaml:"max_table_rows,omitempty"`
 
-	// LockAcquisitionTimeout bounds how long each direct statement waits to
-	// acquire its locks before the apply fails with a retryable busy-table
-	// error — instead of queueing on the table's lock indefinitely while all
-	// new table traffic stalls behind the queued DDL. Each engine maps it to
-	// its native session lock timeout. A whole number of seconds (e.g.
-	// "10s"). Optional; the engine applies its default when omitted.
+	// LockAcquisitionTimeout bounds how long each attempt of a direct
+	// statement waits to acquire its locks, instead of queueing on the table's
+	// lock indefinitely while all new table traffic stalls behind the queued
+	// DDL. Each engine maps it to its native session lock timeout. On MySQL, at
+	// 90% of the bound the statement kills the transactions blocking the
+	// table's metadata lock and retries, as Spirit does for its own DDL; a
+	// blocker it does not kill (an explicit LOCK TABLES, or a transaction too
+	// large to roll back safely) fails the apply with a retryable busy-table
+	// error once the attempts run out. A whole number of seconds (e.g. "10s").
+	// Optional; the engine applies its default when omitted.
 	LockAcquisitionTimeout string `yaml:"lock_acquisition_timeout,omitempty"`
 }
 

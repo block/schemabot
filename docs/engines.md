@@ -235,8 +235,9 @@ count in the policy is what bounds that outage, since how long the table is bloc
 its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
 any open transaction that has touched it, and everything arriving after queues behind the DDL, so
 a statement that cannot take the lock quickly stalls all traffic to the table rather than just
-waiting. Direct statements run with a short lock acquisition timeout, so a busy table fails the
-apply fast instead. What the policy replaces is worse: someone running the same statement by hand
+waiting. Direct statements run with a short lock acquisition timeout and kill the transactions
+blocking the lock, as Spirit does for its own DDL; a blocker that is unsafe to kill (an explicit
+`LOCK TABLES`, or a very large transaction) fails the apply fast instead. What the policy replaces is worse: someone running the same statement by hand
 against the database, with no plan, no audit trail, and no size limit. Vitess is excluded by
 design, because raw DDL sent to vtgate would bypass the online DDL machinery that engine exists to
 use. [direct-execution.md](direct-execution.md) covers the gate in full.

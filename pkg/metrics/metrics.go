@@ -2344,12 +2344,13 @@ func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
 // completed, failed, or stopped; refused statements the policy does not route
 // directly are blocked with the reason encoded in the outcome.
 var knownDirectExecutionOutcomes = map[string]bool{
-	"completed":               true,
-	"failed":                  true,
-	"stopped":                 true,
-	"blocked_policy_disabled": true,
-	"blocked_size_limit":      true,
-	"blocked_size_unknown":    true,
+	"completed":                      true,
+	"failed":                         true,
+	"stopped":                        true,
+	"blocked_policy_disabled":        true,
+	"blocked_size_limit":             true,
+	"blocked_size_unknown":           true,
+	"blocked_force_kill_unavailable": true,
 }
 
 // RecordDirectExecution increments the counter for a statement the
@@ -2359,7 +2360,8 @@ var knownDirectExecutionOutcomes = map[string]bool{
 // in failed means native DDL is erroring on the target (check the apply logs
 // for the statement and MySQL error), and a spike in blocked_size_unknown
 // means row estimates are unavailable (check target connectivity and
-// information_schema access).
+// information_schema access). blocked_force_kill_unavailable means the target
+// user cannot read performance_schema (grant SELECT on performance_schema.*).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"
