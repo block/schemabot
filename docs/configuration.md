@@ -745,6 +745,13 @@ a binary unit, such as `100MiB` or `2GiB`. Decimal units such as `MB` are
 rejected rather than interpreted, because readers disagree on whether they
 mean 1000² or 1024² bytes.
 
+A server running a build that predates `max_table_bytes` ignores the bound
+when it arrives on a request or an apply record, and judges the statement
+under `max_table_rows` alone: never more than it allowed before the byte
+bound existed, but not the narrower policy either. Set `max_table_bytes` once
+every server that executes statements for the database runs a build that
+reads it.
+
 `lock_acquisition_timeout` bounds how long each direct statement waits to
 acquire its locks. Each engine maps it to its native session lock timeout —
 on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`. Native DDL
