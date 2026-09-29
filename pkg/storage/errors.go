@@ -66,6 +66,10 @@ var (
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
 
+	// ErrOperationLeaseActive is returned when a repair write requires an
+	// operation to remain unleased but a live drive owns it.
+	ErrOperationLeaseActive = errors.New("operation lease is active")
+
 	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
 	// apply's superseded_by marker to a different successor. The marker is
 	// write-once, so a second claimant means the takeover is ambiguous.
