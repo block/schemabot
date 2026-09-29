@@ -890,6 +890,10 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "invalid-blocking-budget",
 			cause:  fmt.Sprintf("the blocking budget for the change to %s is not a bound the engine can enforce", quotedTable(table)),
 			remedy: "correct the engine's blocking budget configuration, then re-run"}, true
+	case executor.CodeRowSecurityPlanChanged:
+		return &refusal{reason: "row-security-plan-changed",
+			cause:  fmt.Sprintf("the row security plan for %s changed after review", quotedTable(table)),
+			remedy: "re-plan and review the new SQL before applying"}, true
 	case executor.CodeRowSecurityRefused:
 		// Keep every pg-sprite outcome classified at the adapter boundary.
 		return &refusal{reason: "row-security-refused",
