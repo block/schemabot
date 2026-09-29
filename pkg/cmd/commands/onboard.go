@@ -185,6 +185,9 @@ func rewriteOnboardNamespaces(resp *apitypes.PullSchemaResponse, environment str
 	}
 	rewritten := make(map[string]*apitypes.PulledNamespace, len(resp.Namespaces))
 	for pullNamespace, pulled := range resp.Namespaces {
+		if schema.HasNamespaceEnvironmentPlaceholder(pullNamespace) {
+			return fmt.Errorf("pulled namespace %q must be a concrete live namespace; {env} and $ENV are reserved for schema directory names", pullNamespace)
+		}
 		outputNamespace := onboardOutputNamespace(pullNamespace, environment, templateEnvSuffix)
 		if _, ok := rewritten[outputNamespace]; ok {
 			return fmt.Errorf("multiple pulled namespaces resolve to output namespace %q", outputNamespace)
