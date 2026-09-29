@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -222,7 +223,26 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	// Sequential mode: one DDL per engine call. The task identifier is used as the
 	// engine resume key (ResumeState.MigrationContext) so each table's schema
 	// change is tracked independently.
-	result, err := c.applyWithEngine(ctx, c.getEngine(), sequentialEngineApplyRequest(task, options, taskCreds, logger))
+	request := sequentialEngineApplyRequest(task, options, taskCreds, logger)
+	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
+	if err != nil {
+		c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err))
+		return taskFailed
+	}
+	if needsFiles {
+		plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		if err != nil {
+			c.markTaskFailed(ctx, task, fmt.Sprintf("load desired schema for row security apply: %v", err))
+			return taskFailed
+		}
+		if plan == nil {
+			c.markTaskFailed(ctx, task, "row security apply has no stored desired schema plan")
+			return taskFailed
+		}
+		request.PlanID = plan.PlanIdentifier
+		request.SchemaFiles = plan.SchemaFiles
+	}
+	result, err := c.applyWithEngine(ctx, c.getEngine(), request)
 
 	if err != nil {
 		if c.shouldRetryEngineError(err) {
@@ -1104,4 +1124,24 @@ func adoptSequentialOutcome(apply *storage.Apply, failedTask *storage.Task, stop
 		apply.CompletedAt = &now
 	}
 	apply.UpdatedAt = now
+}
+
+// The engine owns operation grammar. Detection here only decides whether to
+// supply the stored desired schema; it never authorizes execution.
+func (c *LocalClient) taskNeedsRowSecurityFiles(task *storage.Task) (bool, error) {
+	// Other engines do not use this payload. Do not add a parser requirement
+	// to their existing apply path (including custom engines).
+	if schema.DialectForDatabaseType(c.config.Type) != schema.DialectPostgres {
+		return false, nil
+	}
+	parser, err := c.statementParser()
+	if err != nil {
+		return false, err
+	}
+	rls, ok := parser.(interface{ CanonicalRowSecurity(string) (string, error) })
+	if !ok {
+		return false, nil
+	}
+	_, err = rls.CanonicalRowSecurity(task.DDL)
+	return err == nil, nil
 }

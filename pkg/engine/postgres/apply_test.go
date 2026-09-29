@@ -3614,3 +3614,10 @@ func TestValidateOptimisticApplyRefusesMalformedSQL(t *testing.T) {
 	assert.Contains(t, logs.String(), "database=app")
 	assert.Contains(t, logs.String(), "table=widgets")
 }
+
+func TestChangedRowSecurityReviewRequiresNewPlan(t *testing.T) {
+	r := classifyRefusal(executor.ErrRowSecurityPlanChanged, "documents")
+	require.NotNil(t, r)
+	assert.Equal(t, "row-security-plan-changed", r.reason)
+	assert.Equal(t, "re-plan and review the new SQL before applying", r.remedy)
+}

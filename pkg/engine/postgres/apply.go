@@ -105,6 +105,8 @@ const (
 )
 
 type nativeApply struct {
+	rowSecurity                *pgstatement.DesiredWithRowSecurity
+	reviewedSecurity           []string
 	namespace                  string
 	table                      string
 	sql                        string
@@ -197,13 +199,17 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: native-safe increment requires exactly one planned change", req.Database)
 	}
 	tc := req.Changes[0].TableChanges[0]
+	if operation, err := pgstatement.ParseRowSecurityChange(tc.DDL); err == nil {
+		return validateRowSecurityApply(req, operation)
+	}
+
 	hasRLS, err := pgstatement.HasRowSecurityDeclaration(tc.DDL)
 	if err != nil {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
 	if hasRLS {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require an atomic apply path that SchemaBot does not provide yet", tc.Table)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
 	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
@@ -884,6 +890,10 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "invalid-blocking-budget",
 			cause:  fmt.Sprintf("the blocking budget for the change to %s is not a bound the engine can enforce", quotedTable(table)),
 			remedy: "correct the engine's blocking budget configuration, then re-run"}, true
+	case executor.CodeRowSecurityPlanChanged:
+		return &refusal{reason: "row-security-plan-changed",
+			cause:  fmt.Sprintf("the row security plan for %s changed after review", quotedTable(table)),
+			remedy: "re-plan and review the new SQL before applying"}, true
 	case executor.CodeRowSecurityRefused:
 		// Keep every pg-sprite outcome classified at the adapter boundary.
 		return &refusal{reason: "row-security-refused",
@@ -1263,6 +1273,15 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
+	if change.rowSecurity != nil {
+		_, err := executor.ExecuteReviewedRowSecurity(ctx, pool, change.namespace, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		})
+		if err != nil {
+			return fmt.Errorf("apply row security for %q.%q: %w", change.namespace, change.table, err)
+		}
+		return nil
+	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {
 		return fmt.Errorf("parse planned PostgreSQL DDL for table %q: %w", change.table, err)
