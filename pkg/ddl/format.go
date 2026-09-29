@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 
+	pgstatement "github.com/block/pg-sprite/pkg/statement"
+
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -21,31 +23,33 @@ func FormatDDL(ddl string) string {
 
 // FormatSchemaFileForDialect formats one declarative table file for source
 // control. Unlike FormatDDLForDialect, which is a best-effort display helper,
-// this function is strict: the file must describe one CREATE TABLE (optionally
-// followed by CREATE INDEX statements supported by the dialect), and a
-// single-line file must render across multiple lines with every statement
-// canonicalizing to the same SQL as its input. Existing multiline SQL is kept
-// verbatim apart from its final newline. The returned file ends with one
-// newline.
+// this function is strict: the file must match the dialect's supported
+// declarative shape, and a single-line file must render across multiple lines
+// with every statement canonicalizing to the same SQL as its input. PostgreSQL
+// files may include the supported row-security declaration after their table
+// and indexes. Existing multiline SQL is kept verbatim apart from its final
+// newline. The returned file ends with one newline.
 func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string, error) {
 	parser, err := ParserForDialect(dialect)
 	if err != nil {
 		return "", err
 	}
-	createSet, err := ParseCreateSet(parser, content)
+	statements, err := schemaFileStatements(dialect, parser, content)
 	if err != nil {
 		return "", fmt.Errorf("parse declarative schema file: %w", err)
-	}
-	if createSet.Type != StatementCreateTable {
-		return "", fmt.Errorf("declarative schema file must start with CREATE TABLE, got %s", createSet.Type)
 	}
 	trimmed := strings.TrimSpace(content)
 	if strings.Contains(trimmed, "\n") {
 		return strings.TrimRight(content, "\r\n") + "\n", nil
 	}
+	if dialect == schema.DialectPostgres {
+		if err := pgstatement.CheckNoComments(content); err != nil {
+			return "", fmt.Errorf("format PostgreSQL declarative schema file: %w", err)
+		}
+	}
 
-	formatted := make([]string, 0, len(createSet.Statements))
-	for i, stmt := range createSet.Statements {
+	formatted := make([]string, 0, len(statements))
+	for i, stmt := range statements {
 		rendered, equivalent := formatDDLForDialect(dialect, parser, stmt, i == 0)
 		if !equivalent {
 			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
@@ -56,6 +60,64 @@ func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string,
 	result := strings.Join(formatted, "\n\n") + "\n"
 	if !strings.Contains(strings.TrimSuffix(result, "\n"), "\n") {
 		return "", fmt.Errorf("format CREATE TABLE as multiline SQL")
+	}
+	after, err := schemaFileStatements(dialect, parser, result)
+	if err != nil {
+		return "", fmt.Errorf("validate formatted declarative schema file: %w", err)
+	}
+	if len(after) != len(statements) {
+		return "", fmt.Errorf("formatter changed statement count from %d to %d", len(statements), len(after))
+	}
+	for i := range statements {
+		if parser.Canonicalize(statements[i]) != parser.Canonicalize(after[i]) {
+			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
+		}
+	}
+	return result, nil
+}
+
+// schemaFileStatements validates a declarative file under the grammar that
+// consumes it and returns its statements in execution order. PostgreSQL row
+// security is a broader desired-file shape than the greenfield create sets
+// used by apply, so it must use pg-sprite's dedicated admission boundary.
+func schemaFileStatements(dialect schema.Dialect, parser StatementParser, content string) ([]string, error) {
+	if dialect == schema.DialectPostgres {
+		return postgresSchemaFileStatements(content)
+	}
+	createSet, err := ParseCreateSet(parser, content)
+	if err != nil {
+		return nil, err
+	}
+	if createSet.Type != StatementCreateTable {
+		return nil, fmt.Errorf("declarative schema file must start with CREATE TABLE, got %s", createSet.Type)
+	}
+	return createSet.Statements, nil
+}
+
+func postgresSchemaFileStatements(content string) ([]string, error) {
+	hasRowSecurity, err := pgstatement.HasRowSecurityDeclaration(content)
+	if err != nil {
+		return nil, err
+	}
+
+	var statements []pgstatement.Statement
+	if hasRowSecurity {
+		desired, err := pgstatement.ParseDesiredWithRowSecurity(content)
+		if err != nil {
+			return nil, err
+		}
+		statements = desired.Statements()
+	} else {
+		desired, err := pgstatement.ParseDesired(content)
+		if err != nil {
+			return nil, err
+		}
+		statements = desired.Statements()
+	}
+
+	result := make([]string, len(statements))
+	for i, stmt := range statements {
+		result[i] = stmt.SQL()
 	}
 	return result, nil
 }

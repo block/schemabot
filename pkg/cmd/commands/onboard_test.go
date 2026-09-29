@@ -678,6 +678,23 @@ func TestBuildOnboardWritePlanPostgres(t *testing.T) {
 	assert.Equal(t, "postgres", plan.databaseType)
 }
 
+func TestBuildOnboardWritePlanPostgresPreservesRowSecurity(t *testing.T) {
+	root := t.TempDir()
+	definition := "CREATE TABLE documents (\n  id bigint PRIMARY KEY\n);\nALTER TABLE documents ENABLE ROW LEVEL SECURITY;\nALTER TABLE documents FORCE ROW LEVEL SECURITY;\nCREATE POLICY readers ON documents FOR SELECT USING (id = 1);\nCOMMENT ON POLICY readers ON documents IS 'Read your documents';\n"
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development", TableCount: 1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {Tables: map[string]string{"documents": definition}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	contents, err := os.ReadFile(filepath.Join(root, "public", "documents.sql"))
+	require.NoError(t, err)
+	assert.Equal(t, definition, string(contents))
+}
+
 func TestBuildOnboardWritePlanEmptyNamespace(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres"} {
 		t.Run(engine, func(t *testing.T) {

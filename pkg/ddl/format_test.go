@@ -79,6 +79,31 @@ func TestFormatSchemaFileForDialectRejectsNonTableContent(t *testing.T) {
 	require.ErrorContains(t, err, "parse declarative schema file")
 }
 
+func TestFormatSchemaFileForDialectPreservesPostgresRowSecurity(t *testing.T) {
+	input := "CREATE TABLE documents (\n  id bigint PRIMARY KEY\n);\nALTER TABLE documents ENABLE ROW LEVEL SECURITY;\nCREATE POLICY readers ON documents FOR SELECT USING (id = 1);\nCOMMENT ON POLICY readers ON documents IS 'Read your documents';\n\n"
+
+	got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+	require.NoError(t, err)
+	assert.Equal(t, strings.TrimRight(input, "\r\n")+"\n", got)
+}
+
+func TestFormatSchemaFileForDialectFormatsSingleLinePostgresRowSecurity(t *testing.T) {
+	input := "CREATE TABLE documents (id bigint PRIMARY KEY); ALTER TABLE documents ENABLE ROW LEVEL SECURITY; CREATE POLICY readers ON documents FOR SELECT USING (id = 1); COMMENT ON POLICY readers ON documents IS 'Read your documents'"
+
+	got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+	require.NoError(t, err)
+	assert.Contains(t, strings.TrimSuffix(got, "\n"), "\n")
+	assert.Contains(t, got, "ALTER TABLE documents ENABLE ROW LEVEL SECURITY;")
+	assert.Contains(t, got, "CREATE POLICY readers ON documents")
+	assert.Contains(t, got, "COMMENT ON POLICY readers ON documents")
+
+	before, err := postgresSchemaFileStatements(input)
+	require.NoError(t, err)
+	after, err := postgresSchemaFileStatements(got)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
 func TestFormatDDL(t *testing.T) {
 	tests := []struct {
 		name     string
