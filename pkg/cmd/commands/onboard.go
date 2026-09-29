@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -303,7 +304,11 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			if err := validateRelativePathPart("table", tableName); err != nil {
 				return nil, err
 			}
-			files[filepath.Join(namespace, tableName+".sql")] = pulled.Tables[tableName]
+			content, err := ddl.FormatSchemaFileForDialect(schema.DialectForDatabaseType(resp.Type), pulled.Tables[tableName])
+			if err != nil {
+				return nil, fmt.Errorf("format pulled schema for namespace %s table %s: %w", namespace, tableName, err)
+			}
+			files[filepath.Join(namespace, tableName+".sql")] = content
 		}
 		if vschema := pulled.Artifacts["vschema.json"]; vschema != "" {
 			files[filepath.Join(namespace, "vschema.json")] = vschema

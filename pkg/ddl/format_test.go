@@ -1,12 +1,83 @@
 package ddl
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/schema"
 )
+
+func TestFormatSchemaFileForDialect(t *testing.T) {
+	tests := []struct {
+		name     string
+		dialect  schema.Dialect
+		input    string
+		expected string
+	}{
+		{
+			name:     "single-column MySQL table",
+			dialect:  schema.DialectMySQL,
+			input:    "CREATE TABLE `users` (`id` BIGINT NOT NULL)",
+			expected: "CREATE TABLE `users` (\n    `id` bigint NOT NULL\n);\n",
+		},
+		{
+			name:     "quoted MySQL content",
+			dialect:  schema.DialectMySQL,
+			input:    "CREATE TABLE `events` (`id` INT, `note` VARCHAR(64) DEFAULT 'Keep INT, comma')",
+			expected: "CREATE TABLE `events` (\n    `id` int,\n    `note` varchar(64) DEFAULT 'Keep INT, comma'\n);\n",
+		},
+		{
+			name:     "single-column PostgreSQL table",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE users (id bigint PRIMARY KEY)",
+			expected: "CREATE TABLE users (\n    id bigint PRIMARY KEY\n);\n",
+		},
+		{
+			name:     "existing multiline SQL is preserved",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE \"Order\" (\n  \"id\" bigint PRIMARY KEY\n);\nCREATE INDEX \"idx_id\" ON \"Order\" (\"id\");\n\n",
+			expected: "CREATE TABLE \"Order\" (\n  \"id\" bigint PRIMARY KEY\n);\nCREATE INDEX \"idx_id\" ON \"Order\" (\"id\");\n",
+		},
+		{
+			name:    "PostgreSQL table and indexes",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE TABLE users (id bigint PRIMARY KEY); CREATE INDEX users_id_idx ON users (id)",
+			expected: "CREATE TABLE users (\n    id bigint PRIMARY KEY\n);\n\n" +
+				"CREATE INDEX users_id_idx ON users USING btree (id);\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(tt.dialect, tt.input)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, got)
+			assert.Contains(t, strings.TrimSuffix(got, "\n"), "\n")
+
+			parser, err := ParserForDialect(tt.dialect)
+			require.NoError(t, err)
+			before, err := ParseCreateSet(parser, tt.input)
+			require.NoError(t, err)
+			after, err := ParseCreateSet(parser, got)
+			require.NoError(t, err)
+			require.Len(t, after.Statements, len(before.Statements))
+			for i := range before.Statements {
+				assert.Equal(t, parser.Canonicalize(before.Statements[i]), parser.Canonicalize(after.Statements[i]))
+			}
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectRejectsNonTableContent(t *testing.T) {
+	_, err := FormatSchemaFileForDialect(schema.DialectMySQL, "ALTER TABLE users ADD COLUMN email text")
+	require.ErrorContains(t, err, "must start with CREATE TABLE")
+
+	_, err = FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE")
+	require.ErrorContains(t, err, "parse declarative schema file")
+}
 
 func TestFormatDDL(t *testing.T) {
 	tests := []struct {

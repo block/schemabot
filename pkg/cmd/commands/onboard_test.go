@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -44,11 +45,31 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 
 	users, err := os.ReadFile(filepath.Join(root, "orders", "users.sql"))
 	require.NoError(t, err)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", string(users))
+	assert.Equal(t, "CREATE TABLE `users` (\n    `id` bigint NOT NULL\n);\n", string(users))
 
 	orders, err := os.ReadFile(filepath.Join(root, "orders", "orders.sql"))
 	require.NoError(t, err)
-	assert.Equal(t, "CREATE TABLE `orders` (`id` bigint NOT NULL);\n", string(orders))
+	assert.Equal(t, "CREATE TABLE `orders` (\n    `id` bigint NOT NULL\n);\n", string(orders))
+}
+
+func TestBuildOnboardWritePlanFormatsSQLWithoutChangingContent(t *testing.T) {
+	root := t.TempDir()
+	original := "CREATE TABLE `events` (`id` bigint NOT NULL, `note` varchar(64) DEFAULT 'Keep INT, comma') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"events": original}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+
+	formatted := plan.files[filepath.Join("orders", "events.sql")]
+	assert.Contains(t, strings.TrimSuffix(formatted, "\n"), "\n")
+	assert.Contains(t, formatted, "'Keep INT, comma'")
+	assert.Equal(t, ddl.Canonicalize(original), ddl.Canonicalize(formatted))
 }
 
 func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
@@ -79,7 +100,7 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 
 	users, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "users.sql"))
 	require.NoError(t, err)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", string(users))
+	assert.Equal(t, "CREATE TABLE `users` (\n    `id` bigint NOT NULL\n);\n", string(users))
 
 	vschema, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "vschema.json"))
 	require.NoError(t, err)

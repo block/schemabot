@@ -1,6 +1,7 @@
 package ddl
 
 import (
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -18,17 +19,57 @@ func FormatDDL(ddl string) string {
 	return FormatDDLForDialect(schema.DialectMySQL, ddl)
 }
 
-// layoutDDL line-breaks a canonicalized statement for readability: a CREATE
-// TABLE gets each column/index and table option on its own line, and a
-// multi-clause ALTER TABLE gets each clause on its own line. The layout is
-// plain string splitting on the statement's own text, so it applies to any
-// dialect's canonical form. Other statement types are returned unchanged.
-func layoutDDL(ddl string) string {
+// FormatSchemaFileForDialect formats one declarative table file for source
+// control. Unlike FormatDDLForDialect, which is a best-effort display helper,
+// this function is strict: the file must describe one CREATE TABLE (optionally
+// followed by CREATE INDEX statements supported by the dialect), and a
+// single-line file must render across multiple lines with every statement
+// canonicalizing to the same SQL as its input. Existing multiline SQL is kept
+// verbatim apart from its final newline. The returned file ends with one
+// newline.
+func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string, error) {
+	parser, err := ParserForDialect(dialect)
+	if err != nil {
+		return "", err
+	}
+	createSet, err := ParseCreateSet(parser, content)
+	if err != nil {
+		return "", fmt.Errorf("parse declarative schema file: %w", err)
+	}
+	if createSet.Type != StatementCreateTable {
+		return "", fmt.Errorf("declarative schema file must start with CREATE TABLE, got %s", createSet.Type)
+	}
+	trimmed := strings.TrimSpace(content)
+	if strings.Contains(trimmed, "\n") {
+		return strings.TrimRight(content, "\r\n") + "\n", nil
+	}
+
+	formatted := make([]string, 0, len(createSet.Statements))
+	for i, stmt := range createSet.Statements {
+		rendered, equivalent := formatDDLForDialect(dialect, parser, stmt, i == 0)
+		if !equivalent {
+			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
+		}
+		formatted = append(formatted, rendered)
+	}
+
+	result := strings.Join(formatted, "\n\n") + "\n"
+	if !strings.Contains(strings.TrimSuffix(result, "\n"), "\n") {
+		return "", fmt.Errorf("format CREATE TABLE as multiline SQL")
+	}
+	return result, nil
+}
+
+// layoutDDLWithOptions applies the ordinary display layout and can force even
+// a one-column CREATE TABLE onto multiple lines for checked-in schema files.
+// The layout is plain string splitting on the statement's canonical text, so
+// it applies to any dialect's canonical form. Other statements stay unchanged.
+func layoutDDLWithOptions(ddl string, multilineCreate bool) string {
 	upperDDL := strings.ToUpper(ddl)
 
 	switch {
 	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
-		return formatCreateTable(ddl)
+		return formatCreateTableWithOptions(ddl, multilineCreate)
 	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
 		clauses := splitAlterClauses(ddl)
 		if len(clauses) <= 1 {
@@ -73,19 +114,27 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 		slog.Debug("DDL display formatting has no parser for this dialect; preserving original SQL", "dialect", dialect, "error", err)
 		return raw
 	}
-	canonical := parser.Canonicalize(raw)
-	formatted := layoutDDL(canonical)
-	if dialect == schema.DialectMySQL {
-		formatted = lowercaseTypes(formatted)
-	}
-	formatted = strings.TrimRight(formatted, "; ") + ";"
-	// Keep the original SQL whenever canonical comparison cannot prove that
-	// display layout and case changes preserve quoted identifiers and values.
-	if canonical != parser.Canonicalize(formatted) {
+	formatted, equivalent := formatDDLForDialect(dialect, parser, raw, false)
+	if !equivalent {
 		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
 		return raw
 	}
 	return formatted
+}
+
+// formatDDLForDialect formats one statement and reports whether the parser can
+// prove that the result is equivalent to the input. The strict schema-file
+// formatter asks it to line-break even a one-column CREATE TABLE; display
+// callers retain their established compact form.
+func formatDDLForDialect(dialect schema.Dialect, parser StatementParser, stmt string, multilineCreate bool) (string, bool) {
+	raw := strings.TrimRight(strings.TrimSpace(stmt), ";") + ";"
+	canonical := parser.Canonicalize(raw)
+	formatted := layoutDDLWithOptions(canonical, multilineCreate)
+	if dialect == schema.DialectMySQL {
+		formatted = lowercaseTypes(formatted)
+	}
+	formatted = strings.TrimRight(formatted, "; ") + ";"
+	return formatted, canonical == parser.Canonicalize(formatted)
 }
 
 // dataTypePattern matches SQL data types that should be lowercased.
@@ -173,6 +222,10 @@ func lowercaseUnquotedTypes(ddl string) string {
 
 // formatCreateTable formats a CREATE TABLE statement with line breaks.
 func formatCreateTable(ddl string) string {
+	return formatCreateTableWithOptions(ddl, false)
+}
+
+func formatCreateTableWithOptions(ddl string, multiline bool) string {
 	// Find the opening parenthesis
 	openParen := findOpeningParen(ddl)
 	if openParen == -1 {
@@ -196,7 +249,7 @@ func formatCreateTable(ddl string) string {
 	options := strings.TrimSpace(footer[1:]) // Skip the ")"
 	options, partition := splitPartitionClause(options)
 
-	if len(parts) <= 1 {
+	if len(parts) <= 1 && !multiline {
 		// Single column — no line-break formatting for columns,
 		// but still format table options if present
 		if options != "" || partition != "" {
@@ -210,6 +263,9 @@ func formatCreateTable(ddl string) string {
 	sb.WriteString(header)
 	sb.WriteString("\n")
 	for i, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
 		sb.WriteString("    ")
 		sb.WriteString(strings.TrimSpace(part))
 		if i < len(parts)-1 {
