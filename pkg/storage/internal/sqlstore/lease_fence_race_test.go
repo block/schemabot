@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/mysql"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/storagetest"
@@ -72,6 +73,57 @@ func TestLeaseFencedWritesFailClosedAgainstConcurrentSteal(t *testing.T) {
 		clearTables(t)
 		return NewMySQL(testDB)
 	}, mysqlLockWaiter(testDB))
+}
+
+// TestLeaseFencedWritesFailClosedUnderReadCommittedMySQL runs the same race
+// scenarios on a MySQL session pinned to READ COMMITTED. The fence has to hold
+// at whatever isolation level the storage server or DSN configures: at READ
+// COMMITTED InnoDB reads an INSERT … SELECT's source rows without locks, so a
+// fence that relied on the statement shape to lock the lease row would let a
+// displaced driver's comment upsert land.
+func TestLeaseFencedWritesFailClosedUnderReadCommittedMySQL(t *testing.T) {
+	cfg, err := mysql.ParseDSN(testDSN)
+	require.NoError(t, err)
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	cfg.Params["transaction_isolation"] = "'READ-COMMITTED'"
+	readCommitted, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = readCommitted.Close() })
+	require.NoError(t, readCommitted.PingContext(t.Context()))
+
+	testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t, func(t *testing.T) *Storage {
+		t.Helper()
+		clearTables(t)
+		return NewMySQL(readCommitted)
+	}, mysqlLockWaiter(testDB))
+}
+
+// An operation lease speaks only for its own operation's tasks: a driver
+// holding a sibling operation's current lease must not write this task. The
+// mis-scoped write matches no row, and the sibling's lease is still current,
+// so Update reports no lease loss; the task row is what the test checks.
+func TestTaskStore_OperationLeaseDoesNotWriteASiblingOperationsTask(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	lock := storagetest.CreateLock(t, store, "opscope_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApplyWithTask(t, store, lock, "apply_opscope", 934)
+	owning, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", Target: "payments"})
+	require.NoError(t, err)
+	sibling, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-b", Target: "payments"})
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", sibling)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `UPDATE tasks SET apply_operation_id = ? WHERE task_identifier = ?`, owning, "task_apply_opscope")
+	require.NoError(t, err)
+	task := loadTask(t, store, "task_apply_opscope")
+
+	siblingCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: sibling, Owner: "driver-b", Token: "tok-b"})
+	task.State = state.Task.Failed
+	require.NoError(t, store.Tasks().Update(siblingCtx, task))
+	assert.Equal(t, state.Task.Pending, loadTask(t, store, task.TaskIdentifier).State, "a sibling operation's lease must not write this task")
 }
 
 // testLeaseFencedWritesFailClosedAgainstConcurrentSteal pins that a displaced

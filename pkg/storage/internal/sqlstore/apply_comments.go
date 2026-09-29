@@ -56,12 +56,13 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	// The leased applies row is the INSERT … SELECT's only source row, so the
 	// token check gates the insert and the conflict update alike: a displaced
 	// driver's statement selects nothing and writes neither. The check goes
-	// through LeaseTokenFence so it serializes against a concurrent steal
-	// instead of passing against a token the statement's snapshot still holds.
+	// through LeaseSourceFence so it serializes against a concurrent steal
+	// instead of passing against a token the statement's snapshot still holds,
+	// at whatever isolation level the storage session runs.
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id)
 		SELECT ?, ?, ?, ?, ? FROM applies a
-		WHERE a.id = ? AND `+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token")+`
+		WHERE a.id = ? AND `+s.dialect.LeaseSourceFence("applies", "a", "id", "lease_token")+`
 		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
@@ -129,7 +130,7 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 			{Column: "last_edited_at", Expr: "NOW()"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"c.apply_id = ? AND c.comment_state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		"c.apply_id = ? AND c.comment_state = ? AND "+s.dialect.LeaseSourceFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
@@ -186,7 +187,7 @@ func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commen
 			{Column: "superseded_at", Expr: "NOW()"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		"c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND "+s.dialect.LeaseSourceFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
@@ -228,7 +229,7 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 			{Column: "pending_freeze_github_comment_id", Expr: "NULL"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		"c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND "+s.dialect.LeaseSourceFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
