@@ -285,6 +285,14 @@ const (
 	// operator needs to investigate.
 	cutoverNotReadyEscalationAfter = 2 * time.Minute
 
+	// autoSkipRevertEscalationAfter is how long a failing automatic skip-revert
+	// (--skip-revert or revert window expiry) stays at Warn before the drive
+	// escalates to Error logging and records a timeline event. The engine
+	// normally accepts a skip on the first attempt or after a transient busy
+	// rejection clears within seconds; a failure persisting this long means
+	// the revert window is not closing and an operator needs to investigate.
+	autoSkipRevertEscalationAfter = 2 * time.Minute
+
 	// maxConsecutiveCutoverFailures is how many consecutive hard cutover
 	// rejections the drive tolerates before settling the apply. The drive is
 	// the sole cutover actor, so an unbounded retry would hold the database's
@@ -308,8 +316,11 @@ type atomicPollState struct {
 	// finalizes. A rejected attempt leaves it unset for the next tick to retry.
 	revertSkipped bool
 
-	// revertTriggered is set once the engine accepts an operator revert. It
-	// suppresses skip-revert attempts while progress still reports the lagging
+	// revertTriggered is set once this drive has seen that the engine accepted
+	// an operator revert, either by carrying the revert out itself or by
+	// reading the completed durable revert request. It is a shortcut over that
+	// durable record, which stays the source of truth, and suppresses
+	// skip-revert attempts while progress still reports the lagging
 	// revert-window state.
 	revertTriggered bool
 
@@ -318,6 +329,15 @@ type atomicPollState struct {
 	// retries of a rejected skip do not fill the user-visible timeline with
 	// duplicate triggers.
 	autoSkipRevertLogged bool
+
+	// autoSkipRevertFailingSince is when the engine first failed or rejected
+	// the automatic skip-revert this drive keeps retrying. Used to escalate
+	// once the failure has persisted past autoSkipRevertEscalationAfter.
+	autoSkipRevertFailingSince time.Time
+
+	// autoSkipRevertEscalated is set once the persisting skip-revert failure
+	// has been recorded on the timeline, so the escalation lands there once.
+	autoSkipRevertEscalated bool
 
 	// resumeEventLogged is set after this drive claim records the
 	// engine-resumed-from-checkpoint timeline event, so the flag the engine

@@ -27,6 +27,26 @@ func pendingControlRequest(ctx context.Context, store storage.Storage, apply *st
 	return controlReq, nil
 }
 
+// controlRequestAccepted reports whether the engine has accepted a control
+// request of the given operation for an apply: its durable request row is
+// completed. The row is completed by whichever process carried the request
+// out, whether the API's immediate attempt or a drive, so this is the answer a
+// drive that never saw the acceptance itself must read.
+func controlRequestAccepted(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (bool, error) {
+	if store == nil {
+		return false, fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	controlReq, err := controlStore.GetByOperation(ctx, apply.ID, operation)
+	if err != nil {
+		return false, fmt.Errorf("load %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
+	}
+	return controlReq != nil && controlReq.Status == storage.ControlRequestCompleted, nil
+}
+
 // completePendingControlRequests marks the pending control request of the given
 // operation completed, after verifying the apply lease still holds.
 func completePendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {

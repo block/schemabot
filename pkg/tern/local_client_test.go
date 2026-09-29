@@ -567,6 +567,7 @@ type fakeControlEngine struct {
 	applyErr                error
 	revertCount             int
 	revertErr               error
+	revertAccepted          *bool
 	skipRevertCount         int
 	skipRevertErr           error
 	skipRevertAccepted      *bool
@@ -637,6 +638,9 @@ func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*en
 	e.revertCount++
 	if e.revertErr != nil {
 		return nil, e.revertErr
+	}
+	if e.revertAccepted != nil {
+		return &engine.ControlResult{Accepted: *e.revertAccepted}, nil
 	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
@@ -887,7 +891,8 @@ func (s *errControlRequestStore) GetByOperation(context.Context, int64, storage.
 
 type testControlRequestStore struct {
 	storage.ControlRequestStore
-	requests []*storage.ApplyControlRequest
+	requests          []*storage.ApplyControlRequest
+	getByOperationErr error
 }
 
 func (s *testControlRequestStore) RequestPending(_ context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
@@ -921,6 +926,9 @@ func (s *testControlRequestStore) GetPending(_ context.Context, applyID int64, o
 }
 
 func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if s.getByOperationErr != nil {
+		return nil, s.getByOperationErr
+	}
 	for _, v := range slices.Backward(s.requests) {
 		req := v
 		if req.ApplyID == applyID && req.Operation == operation {
@@ -3669,6 +3677,35 @@ func (f *revertWindowTickFixture) eventCount(eventType, message string) int {
 	return n
 }
 
+func (f *revertWindowTickFixture) eventTypeCount(eventType string) int {
+	n := 0
+	for _, entry := range f.logs.logs {
+		if entry.EventType == eventType {
+			n++
+		}
+	}
+	return n
+}
+
+// recordControlRequest seeds the durable control request row of the given
+// operation for the apply, in the given status, as the API leaves it behind.
+func (f *revertWindowTickFixture) recordControlRequest(operation storage.ControlOperation, status storage.ControlRequestStatus) {
+	f.controlRequests.requests = append(f.controlRequests.requests, &storage.ApplyControlRequest{
+		ApplyID:     f.apply.ID,
+		Operation:   operation,
+		Status:      status,
+		RequestedBy: "operator",
+	})
+}
+
+func (f *revertWindowTickFixture) controlRequestStatus(t *testing.T, operation storage.ControlOperation) storage.ControlRequestStatus {
+	t.Helper()
+	req, err := f.controlRequests.GetByOperation(t.Context(), f.apply.ID, operation)
+	require.NoError(t, err)
+	require.NotNil(t, req)
+	return req.Status
+}
+
 // The drive closes a revert window on its own when the window expires or when
 // the apply was started with --skip-revert. When the engine rejects that skip,
 // the window is still open: the apply keeps showing its revert window rather
@@ -3732,42 +3769,222 @@ func TestHandleAtomicProgressTickHonorsQueuedRevertWhileAutoSkipRevertFails(t *t
 	require.Equal(t, 1, f.eng.skipRevertCount)
 	require.False(t, f.ps.revertSkipped)
 
-	f.controlRequests.requests = append(f.controlRequests.requests, &storage.ApplyControlRequest{
-		ApplyID:     f.apply.ID,
-		Operation:   storage.ControlOperationRevert,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: "operator",
-	})
+	f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestPending)
 	assert.False(t, f.tick(t))
 
 	assert.Equal(t, 1, f.eng.revertCount, "the queued revert reaches the engine")
 	assert.Equal(t, 1, f.eng.skipRevertCount, "a revert this tick takes precedence over retrying the skip")
-	resolved, err := f.controlRequests.GetByOperation(t.Context(), f.apply.ID, storage.ControlOperationRevert)
-	require.NoError(t, err)
-	require.NotNil(t, resolved)
-	assert.Equal(t, storage.ControlRequestCompleted, resolved.Status, "the carried-out revert resolves its request")
+	assert.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationRevert), "the carried-out revert resolves its request")
 	assert.Nil(t, f.applies.stored.RevertSkippedAt, "the window was reverted, never skipped")
 
 	assert.False(t, f.tick(t))
 	assert.Equal(t, 1, f.eng.skipRevertCount, "a lagging revert-window state cannot trigger a skip after revert")
 }
 
+// An engine can answer a skip-revert with a result it did not accept rather
+// than an error. On both automatic paths that answer leaves the window open
+// exactly like an error does: nothing is recorded as skipped and the next tick
+// retries.
 func TestHandleAtomicProgressTickRetriesUnacceptedAutoSkipRevert(t *testing.T) {
-	f := newRevertWindowTickFixture(storage.ApplyOptions{SkipRevert: true})
+	for _, tc := range []struct {
+		name        string
+		options     storage.ApplyOptions
+		skipMessage string
+	}{
+		{name: "revert window expired", skipMessage: "Revert window expired, skip-revert triggered"},
+		{name: "skip-revert option", options: storage.ApplyOptions{SkipRevert: true}, skipMessage: "Skip-revert triggered (--skip-revert)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(tc.options)
+			accepted := false
+			f.eng.skipRevertAccepted = &accepted
+
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 1, f.eng.skipRevertCount)
+			assert.False(t, f.ps.revertSkipped, "an unaccepted skip must not be recorded as done")
+			assert.Equal(t, state.Apply.RevertWindow, f.apply.State)
+			assert.Nil(t, f.applies.stored.RevertSkippedAt)
+			assert.Zero(t, f.eventCount(storage.LogEventSkipRevertTriggered, tc.skipMessage))
+
+			accepted = true
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 2, f.eng.skipRevertCount, "the next tick retries the unaccepted skip")
+			assert.True(t, f.ps.revertSkipped)
+			assert.NotNil(t, f.applies.stored.RevertSkippedAt)
+			assert.Equal(t, 1, f.eventCount(storage.LogEventSkipRevertTriggered, tc.skipMessage))
+		})
+	}
+}
+
+// An operator's queued skip-revert the engine answers without accepting is not
+// carried out: the request stays pending for the next tick to retry, nothing is
+// recorded as skipped, and only the accepted retry completes the request.
+func TestHandleAtomicProgressTickRetriesUnacceptedQueuedSkipRevert(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.ps.stateEnteredAt = time.Now() // the window is still open, so only the queued request skips
+	f.recordControlRequest(storage.ControlOperationSkipRevert, storage.ControlRequestPending)
 	accepted := false
 	f.eng.skipRevertAccepted = &accepted
 
 	assert.False(t, f.tick(t))
 	assert.Equal(t, 1, f.eng.skipRevertCount)
+	assert.Equal(t, storage.ControlRequestPending, f.controlRequestStatus(t, storage.ControlOperationSkipRevert), "an unaccepted skip leaves the request for the next tick")
 	assert.False(t, f.ps.revertSkipped)
 	assert.Nil(t, f.applies.stored.RevertSkippedAt)
-	assert.Zero(t, f.eventCount(storage.LogEventSkipRevertTriggered, "Skip-revert triggered (--skip-revert)"))
+	assert.Equal(t, state.Apply.RevertWindow, f.apply.State)
 
 	accepted = true
 	assert.False(t, f.tick(t))
-	assert.Equal(t, 2, f.eng.skipRevertCount)
+	assert.Equal(t, 2, f.eng.skipRevertCount, "the next tick retries the unaccepted skip")
+	assert.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationSkipRevert))
 	assert.True(t, f.ps.revertSkipped)
 	assert.NotNil(t, f.applies.stored.RevertSkippedAt)
+}
+
+// An operator's queued revert the engine answers without accepting is not a
+// revert: the request stays pending for the next tick to retry and the window
+// is not treated as reverted, so a later accepted attempt still completes it.
+func TestHandleAtomicProgressTickRetriesUnacceptedQueuedRevert(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.ps.stateEnteredAt = time.Now() // the window is still open, so no expiry skip competes with the revert
+	f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestPending)
+	accepted := false
+	f.eng.revertAccepted = &accepted
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.revertCount)
+	assert.Equal(t, storage.ControlRequestPending, f.controlRequestStatus(t, storage.ControlOperationRevert), "an unaccepted revert leaves the request for the next tick")
+	assert.False(t, f.ps.revertTriggered, "an unaccepted revert must not fence the window as reverted")
+	assert.Zero(t, f.eventCount(storage.LogEventRevertTriggered, "Revert triggered by user (operator)"))
+
+	accepted = true
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.eng.revertCount, "the next tick retries the unaccepted revert")
+	assert.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationRevert))
+	assert.True(t, f.ps.revertTriggered)
+}
+
+// Most reverts are carried out by the API, which completes the durable revert
+// request itself; the drive only sees progress still reporting the revert
+// window. Every path that could skip that window — the --skip-revert option,
+// the window's expiry, and an operator's queued skip-revert — reads the
+// completed revert request and sends nothing to the engine, so the skip cannot
+// race a revert the drive never saw accepted.
+func TestHandleAtomicProgressTickSendsNoSkipAfterAPIAcceptedRevert(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		options   storage.ApplyOptions
+		queueSkip bool
+	}{
+		{name: "revert window expired"},
+		{name: "skip-revert option", options: storage.ApplyOptions{SkipRevert: true}},
+		{name: "queued skip-revert", queueSkip: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(tc.options)
+			f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestCompleted)
+			if tc.queueSkip {
+				f.recordControlRequest(storage.ControlOperationSkipRevert, storage.ControlRequestPending)
+			}
+
+			assert.False(t, f.tick(t), "the drive keeps polling until the engine reports the revert")
+			assert.Zero(t, f.eng.skipRevertCount, "no skip may follow an accepted revert")
+			assert.Zero(t, f.eng.revertCount, "the completed request is not re-sent")
+			assert.True(t, f.ps.revertTriggered, "the drive adopts the durable acceptance")
+			assert.False(t, f.ps.revertSkipped)
+			assert.Nil(t, f.applies.stored.RevertSkippedAt)
+			assert.Equal(t, state.Apply.RevertWindow, f.apply.State)
+			assert.Zero(t, f.eventTypeCount(storage.LogEventSkipRevertTriggered))
+			if tc.queueSkip {
+				assert.Equal(t, storage.ControlRequestPending, f.controlRequestStatus(t, storage.ControlOperationSkipRevert),
+					"the skip request is left for the terminal settlement to resolve")
+			}
+
+			assert.False(t, f.tick(t))
+			assert.Zero(t, f.eng.skipRevertCount, "later ticks stay fenced")
+		})
+	}
+}
+
+// A drive that carries out a queued revert and then loses its lease hands the
+// apply to a fresh drive with no in-memory state. The fresh drive reads the
+// completed revert request and does not skip the still-reported window.
+func TestHandleAtomicProgressTickFreshDriveSendsNoSkipAfterAcceptedRevert(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestPending)
+
+	assert.False(t, f.tick(t))
+	require.Equal(t, 1, f.eng.revertCount)
+	require.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationRevert))
+	require.Zero(t, f.eng.skipRevertCount)
+
+	f.ps = &atomicPollState{
+		lastProgressLog: time.Now(),
+		lastTaskState:   f.ps.lastTaskState,
+		stateEnteredAt:  f.ps.stateEnteredAt,
+		revertSkipped:   f.applies.stored.RevertSkippedAt != nil,
+	}
+	assert.False(t, f.tick(t))
+	assert.Zero(t, f.eng.skipRevertCount, "the fresh drive must not skip a window that was reverted before it claimed the apply")
+	assert.Equal(t, 1, f.eng.revertCount, "the completed request is not re-sent")
+	assert.True(t, f.ps.revertTriggered)
+}
+
+// When storage cannot say whether a revert was accepted, the drive sends no
+// skip that tick rather than guessing; the next tick asks again and skips once
+// storage answers.
+func TestHandleAtomicProgressTickSendsNoSkipWhileRevertAcceptanceIsUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		options storage.ApplyOptions
+	}{
+		{name: "revert window expired"},
+		{name: "skip-revert option", options: storage.ApplyOptions{SkipRevert: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(tc.options)
+			f.controlRequests.getByOperationErr = errors.New("storage unavailable")
+
+			assert.False(t, f.tick(t))
+			assert.Zero(t, f.eng.skipRevertCount, "an unknown revert outcome fails closed")
+			assert.False(t, f.ps.revertTriggered)
+			assert.False(t, f.ps.revertSkipped)
+
+			f.controlRequests.getByOperationErr = nil
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 1, f.eng.skipRevertCount, "the next tick asks storage again and skips")
+			assert.True(t, f.ps.revertSkipped)
+		})
+	}
+}
+
+// A skip the engine keeps failing is retried at every progress tick. The first
+// failures are routine and stay at Warn; once the failure has outlived the
+// escalation window the apply timeline records it once and the retries keep
+// going, and an accepted skip still closes the window.
+func TestHandleAtomicProgressTickEscalatesPersistentAutoSkipRevertFailure(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.eng.skipRevertErr = errors.New("deploy request is busy")
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.skipRevertCount)
+	assert.False(t, f.ps.autoSkipRevertFailingSince.IsZero(), "the first failure starts the escalation clock")
+	assert.Zero(t, f.eventTypeCount(storage.LogEventError), "a recent failure is not escalated")
+
+	f.ps.autoSkipRevertFailingSince = time.Now().Add(-autoSkipRevertEscalationAfter)
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.eng.skipRevertCount, "the drive keeps retrying past the escalation window")
+	assert.Equal(t, 1, f.eventTypeCount(storage.LogEventError), "the persisting failure lands on the timeline")
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 3, f.eng.skipRevertCount)
+	assert.Equal(t, 1, f.eventTypeCount(storage.LogEventError), "the timeline records the escalation once")
+
+	f.eng.skipRevertErr = nil
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 4, f.eng.skipRevertCount)
+	assert.True(t, f.ps.revertSkipped, "an accepted skip after escalation still closes the window")
+	assert.Equal(t, 1, f.eventCount(storage.LogEventSkipRevertTriggered, "Revert window expired, skip-revert triggered"))
 }
 
 func TestHandleAtomicProgressTickPersistsMetadataOnceAndStopsAfterLeaseLoss(t *testing.T) {
