@@ -847,6 +847,12 @@ func PreviewCommentInvalidCmd() string {
 	return RenderInvalidCommand()
 }
 
+// PreviewCommentRepositoryNotRegistered renders the reply to a command for an
+// environment this instance serves, on a repository it has not registered.
+func PreviewCommentRepositoryNotRegistered() string {
+	return RenderRepositoryNotRegistered("production")
+}
+
 // =============================================================================
 // Apply Command Previews
 // =============================================================================

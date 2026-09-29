@@ -25,6 +25,7 @@ func previewCommentErrorsOutput() {
 		{"AUTO-PLAN: GENERIC ERROR", webhooktemplates.PreviewCommentErrorGenericAutoPlan},
 		{"MISSING -e FLAG", webhooktemplates.PreviewCommentMissingEnv},
 		{"INVALID COMMAND", webhooktemplates.PreviewCommentInvalidCmd},
+		{"REPOSITORY NOT REGISTERED", webhooktemplates.PreviewCommentRepositoryNotRegistered},
 	}
 
 	for i, s := range sections {
@@ -105,6 +106,7 @@ func previewCommentAllOutput() {
 		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
+		{"REPOSITORY NOT REGISTERED", func() { fmt.Print(webhooktemplates.PreviewCommentRepositoryNotRegistered()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"APPLY ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
 		{"APPLY COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCompleted()) }},
@@ -221,6 +223,7 @@ func previewCommentPlanAllOutput() {
 		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
+		{"REPOSITORY NOT REGISTERED", func() { fmt.Print(webhooktemplates.PreviewCommentRepositoryNotRegistered()) }},
 	}
 	printSections(sections)
 }

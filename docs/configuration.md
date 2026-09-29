@@ -1297,10 +1297,19 @@ tern_deployments:
 
 When a SchemaBot command or auto-plan event reaches the allowlist check from an
 unlisted repository:
-- SchemaBot logs a warning and ignores the event without posting a PR comment
-  because the repository is outside this SchemaBot instance's ownership.
+- SchemaBot logs a warning and does no work there: no auto-plan, plan, apply,
+  or other command runs, because the repository is outside this SchemaBot
+  instance's ownership.
 - SchemaBot increments `schemabot.webhook.unregistered_repository_ignored_total`
   so operators can detect unexpected webhook delivery or missing configuration.
+- An instance that answers unscoped commands (`respond_to_unscoped`, and no
+  `tenant`) still replies to a comment command no other instance would answer:
+  `help`, an unrecognized command, a missing, malformed, or unknown `-e`, and
+  a command for an environment it serves, which gets a Repository Not
+  Registered reply. A command for another instance's environment, a `plan`
+  without `-e`, a command that takes no `-e`, and any `--tenant` command get
+  no reply. This covers a repository that only a sibling instance has
+  registered, where that sibling is silenced by `respond_to_unscoped: false`.
 
 If `repos` is not configured or empty, all repositories are allowed.
 
@@ -1657,7 +1666,11 @@ invalid-environment comment listing the configured environments. The
 rejection follows the `respond_to_unscoped` policy so exactly one instance
 responds, and is acknowledged with an eyes reaction. Because
 `environment_order` doubles as the fleet-wide environment roster for this
-routing decision, keep it complete on every instance.
+routing decision, keep it complete on every instance. The instance that
+answers unscoped commands also answers them on a repository only a peer has
+registered, as long as its own App is installed there (see the `repos`
+allowlist above), so a repository served by a single silenced instance still
+gets these replies.
 
 ### Environment-local gRPC targets
 

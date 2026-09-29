@@ -419,6 +419,15 @@ func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 // Returns the handler and a channel that receives posted comment bodies.
 func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 	t.Helper()
+	return newTestHandlerWithConfig(t, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{},
+	})
+}
+
+// newTestHandlerWithConfig is newTestHandler with the server configuration
+// supplied by the caller.
+func newTestHandlerWithConfig(t *testing.T, config *api.ServerConfig) (*Handler, chan string, chan string) {
+	t.Helper()
 	client, mux := setupGitHubServer(t)
 
 	comments := make(chan string, 10)
@@ -448,9 +457,7 @@ func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	factory := &fakeClientFactory{client: installClient}
-	service := api.New(&emptyStorage{}, &api.ServerConfig{
-		Repos: map[string]api.RepoConfig{},
-	}, nil, testLogger())
+	service := api.New(&emptyStorage{}, config, nil, testLogger())
 
 	h := &Handler{
 		service:   service,

@@ -2145,6 +2145,21 @@ That command wasn't recognized. Available commands:
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="repository-not-registered"></a><strong>Repository Not Registered</strong></summary>
+
+
+## ⚠️ Repository Not Registered
+
+**Environment**: `production`
+
+This SchemaBot instance serves `production`, but this repository has no entry under `repos` in its server configuration, so it cannot plan or apply schema changes here.
+
+Ask a SchemaBot operator to register this repository and its databases for `production`.
+<!-- schemabot:offer-support-channel -->
 </details>
 
 ### CLI Output
