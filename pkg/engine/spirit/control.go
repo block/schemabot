@@ -194,7 +194,17 @@ func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningSchemaCh
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("connect to database %s to clean up cancelled schema change artifacts: %w", rm.database, err)
 	}
-	if _, err := e.releaseArtifacts(ctx, db, rm.database, rm.tables); err != nil {
+	result, err := e.releaseArtifacts(ctx, db, rm.database, rm.tables)
+	if err != nil {
+		// The error alone reads as nothing reclaimed, but the copy may already
+		// be in quarantine, so say where it went before failing the cancel.
+		e.schemaChangeLogger(rm).Warn("cancelled schema change artifact release failed part-way",
+			"database", rm.database,
+			"tables", rm.tables,
+			"preserved", result.Preserved,
+			"discarded", result.Discarded,
+			"retained", result.Retained,
+			"error", err)
 		return err
 	}
 	return nil

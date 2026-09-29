@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -52,6 +53,15 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 
 		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskHandover {
+			return
+		}
+		if action == taskAbort {
+			return
+		}
+		if action == taskMissing {
+			// A fresh drive has no operator projection to refuse, so exiting
+			// without a verdict is the whole fail-closed behaviour here; the
+			// operator's resume of the still-active apply reports the cause.
 			return
 		}
 		if action == taskStopped {
@@ -111,9 +121,10 @@ const (
 	taskContinue taskAction = iota // Task completed successfully, proceed to next
 	taskFailed                     // Task failed, stop processing
 	taskStopped                    // Task/apply was stopped by user, stop processing
-	taskSkip                       // Task should be skipped (error fetching state)
+	taskSkip                       // Task is already terminal in storage; move on to the next
 	taskAbort                      // Current owner should exit without changing final state
 	taskHandover                   // This drive's context was cancelled; the apply stays active for another driver to claim
+	taskMissing                    // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
 )
 
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
@@ -125,16 +136,27 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 			"task_id", task.TaskIdentifier, "table", task.TableName)
 		return taskHandover
 	}
+	// The re-read decides whether this task's DDL runs, so a read that cannot
+	// answer ends the drive attempt without finalizing: skipping the task would
+	// let finalization record the apply completed with this task's DDL never run.
+	// A storage error leaves the apply active for a later drive to re-read the
+	// task and run it. A missing row is reported as undriveable, because the rows
+	// that remain would otherwise derive a verdict this task never earned.
 	freshTask, err := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 	if err != nil {
-		logger.Error("failed to fetch task state",
+		if ctx.Err() != nil {
+			logger.Info("drive context cancelled before task start; handing the apply back for another driver to claim",
+				"task_id", task.TaskIdentifier, "table", task.TableName)
+			return taskHandover
+		}
+		logger.Error("re-reading task state before start failed; current apply owner will exit for operator retry",
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-		return taskSkip
+		return taskAbort
 	}
 	if freshTask == nil {
-		logger.Error("task not found",
+		logger.Error("task row not found when re-reading it before start; the apply is undriveable and stays claimable until the row is restored or an operator intervenes",
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State)
-		return taskSkip
+		return taskMissing
 	}
 	if freshTask.State == state.Task.Stopped {
 		logger.Info("task was stopped by user, skipping", "task_id", task.TaskIdentifier, "table", task.TableName)
@@ -201,7 +223,26 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	// Sequential mode: one DDL per engine call. The task identifier is used as the
 	// engine resume key (ResumeState.MigrationContext) so each table's schema
 	// change is tracked independently.
-	result, err := c.applyWithEngine(ctx, c.getEngine(), sequentialEngineApplyRequest(task, options, taskCreds, logger))
+	request := sequentialEngineApplyRequest(task, options, taskCreds, logger)
+	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
+	if err != nil {
+		c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err))
+		return taskFailed
+	}
+	if needsFiles {
+		plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		if err != nil {
+			c.markTaskFailed(ctx, task, fmt.Sprintf("load desired schema for row security apply: %v", err))
+			return taskFailed
+		}
+		if plan == nil {
+			c.markTaskFailed(ctx, task, "row security apply has no stored desired schema plan")
+			return taskFailed
+		}
+		request.PlanID = plan.PlanIdentifier
+		request.SchemaFiles = plan.SchemaFiles
+	}
+	result, err := c.applyWithEngine(ctx, c.getEngine(), request)
 
 	if err != nil {
 		if c.shouldRetryEngineError(err) {
@@ -264,6 +305,14 @@ const (
 	// operator needs to investigate.
 	cutoverNotReadyEscalationAfter = 2 * time.Minute
 
+	// autoSkipRevertEscalationAfter is how long a failing automatic skip-revert
+	// (--skip-revert or revert window expiry) stays at Warn before the drive
+	// escalates to Error logging and records a timeline event. The engine
+	// normally accepts a skip on the first attempt or after a transient busy
+	// rejection clears within seconds; a failure persisting this long means
+	// the revert window is not closing and an operator needs to investigate.
+	autoSkipRevertEscalationAfter = 2 * time.Minute
+
 	// maxConsecutiveCutoverFailures is how many consecutive hard cutover
 	// rejections the drive tolerates before settling the apply. The drive is
 	// the sole cutover actor, so an unbounded retry would hold the database's
@@ -282,8 +331,33 @@ type atomicPollState struct {
 	// used for timeout enforcement on deferred cutover and revert window.
 	stateEnteredAt time.Time
 
-	// revertSkipped is set after SkipRevert is called to prevent repeated calls.
+	// revertSkipped is set once the engine accepts SkipRevert, so the drive
+	// stops re-attempting it and surfaces skipping_revert while the engine
+	// finalizes. A rejected attempt leaves it unset for the next tick to retry.
 	revertSkipped bool
+
+	// revertTriggered is set once this drive has seen that the engine accepted
+	// an operator revert, either by carrying the revert out itself or by
+	// reading the completed durable revert request. It is a shortcut over that
+	// durable record, which stays the source of truth, and suppresses
+	// skip-revert attempts while progress still reports the lagging
+	// revert-window state.
+	revertTriggered bool
+
+	// autoSkipRevertLogged is set after the drive records the automatic
+	// skip-revert trigger event (--skip-revert or revert window expiry), so
+	// retries of a rejected skip do not fill the user-visible timeline with
+	// duplicate triggers.
+	autoSkipRevertLogged bool
+
+	// autoSkipRevertFailingSince is when the engine first failed or rejected
+	// the automatic skip-revert this drive keeps retrying. Used to escalate
+	// once the failure has persisted past autoSkipRevertEscalationAfter.
+	autoSkipRevertFailingSince time.Time
+
+	// autoSkipRevertEscalated is set once the persisting skip-revert failure
+	// has been recorded on the timeline, so the escalation lands there once.
+	autoSkipRevertEscalated bool
 
 	// resumeEventLogged is set after this drive claim records the
 	// engine-resumed-from-checkpoint timeline event, so the flag the engine
@@ -1083,4 +1157,24 @@ func adoptSequentialOutcome(apply *storage.Apply, failedTask *storage.Task, stop
 		apply.CompletedAt = &now
 	}
 	apply.UpdatedAt = now
+}
+
+// The engine owns operation grammar. Detection here only decides whether to
+// supply the stored desired schema; it never authorizes execution.
+func (c *LocalClient) taskNeedsRowSecurityFiles(task *storage.Task) (bool, error) {
+	// Other engines do not use this payload. Do not add a parser requirement
+	// to their existing apply path (including custom engines).
+	if schema.DialectForDatabaseType(c.config.Type) != schema.DialectPostgres {
+		return false, nil
+	}
+	parser, err := c.statementParser()
+	if err != nil {
+		return false, err
+	}
+	rls, ok := parser.(interface{ CanonicalRowSecurity(string) (string, error) })
+	if !ok {
+		return false, nil
+	}
+	_, err = rls.CanonicalRowSecurity(task.DDL)
+	return err == nil, nil
 }

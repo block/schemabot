@@ -169,14 +169,14 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	sb.WriteString("\n")
 
 	// Count and show changes
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	if totalChanges > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
@@ -229,12 +229,12 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
 
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	if totalStatements+keyspacesWithVSchema > 0 {
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	if totalStatements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
@@ -723,6 +723,26 @@ func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "SchemaBot could not find a completed `%s` check for this PR.\n\n", priorEnv)
 	fmt.Fprintf(&sb, "SchemaBot must verify `%s` before applying a later environment. Create the missing `%s` status with:\n", priorEnv, priorEnv)
+	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
+	fmt.Fprintf(&sb, "If the plan finds changes, apply `%s` and wait for the SchemaBot check to succeed. Then retry this apply.\n", priorEnv)
+
+	return offerSupportChannel(sb.String())
+}
+
+// RenderApplyBlockedByStalePriorEnvCheck renders a comment when apply is
+// blocked because the prior environment's stored check state was recorded on a
+// commit other than the one this apply read its schema from. A result for
+// another commit does not verify what the PR would apply now, so the prior
+// environment has to be re-checked on the PR head; retrying the later apply
+// alone does not help unless that check lands first. The comment names both
+// commits without ranking them: the head may have moved while the command ran,
+// so headSHA is not always the newer of the two.
+func RenderApplyBlockedByStalePriorEnvCheck(priorEnv, checkSHA, headSHA string) string {
+	var sb strings.Builder
+
+	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
+	fmt.Fprintf(&sb, "The `%s` check for this PR was recorded on commit `%s`, but this apply read the schema at commit `%s`.\n\n", priorEnv, shortSHA(checkSHA), shortSHA(headSHA))
+	fmt.Fprintf(&sb, "SchemaBot only accepts a `%s` result recorded on the commit being applied. Re-check `%s` on the PR head with:\n", priorEnv, priorEnv)
 	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
 	fmt.Fprintf(&sb, "If the plan finds changes, apply `%s` and wait for the SchemaBot check to succeed. Then retry this apply.\n", priorEnv)
 

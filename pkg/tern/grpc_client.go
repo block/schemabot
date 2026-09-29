@@ -115,6 +115,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
@@ -259,6 +260,59 @@ const retryServiceConfig = `{
 	}]
 }`
 
+// Default per-RPC deadlines, applied only when the caller's context carries
+// none. A driver runs on a context with no deadline while a separate heartbeat
+// keeps renewing its lease, so an RPC hung on a black-holed connection would
+// hold the apply forever without a peer ever seeing a stale lease. These bounds
+// make every call return; they are generous because they are a backstop, not a
+// latency target.
+const (
+	// grpcControlRPCDeadline bounds the polling and control RPCs, which are
+	// storage reads or durable control-request writes on the data plane.
+	grpcControlRPCDeadline = 60 * time.Second
+
+	// grpcHeavyRPCDeadline bounds the RPCs that do engine or live-schema work
+	// before they return. A deadline on Apply is an ambiguous dispatch outcome
+	// that the driver recovers through the idempotency key.
+	grpcHeavyRPCDeadline = 5 * time.Minute
+
+	// grpcStorageSchemaApplyDeadline bounds a storage convergence, which the
+	// data plane runs for up to the longest budget a request may name. The
+	// margin covers the response after the convergence stops at that budget.
+	grpcStorageSchemaApplyDeadline = apitypes.MaxStorageApplyTimeout + grpcControlRPCDeadline
+)
+
+// grpcMethodDeadline returns the default deadline for a Tern unary RPC.
+func grpcMethodDeadline(fullMethod string) time.Duration {
+	switch fullMethod {
+	case ternv1.Tern_Apply_FullMethodName,
+		ternv1.Tern_Plan_FullMethodName,
+		ternv1.Tern_PlanDiff_FullMethodName,
+		ternv1.Tern_PullSchema_FullMethodName,
+		ternv1.Tern_Revert_FullMethodName,
+		ternv1.Tern_SkipRevert_FullMethodName,
+		ternv1.Tern_StorageSchemaPlan_FullMethodName:
+		return grpcHeavyRPCDeadline
+	case ternv1.Tern_StorageSchemaApply_FullMethodName:
+		return grpcStorageSchemaApplyDeadline
+	default:
+		return grpcControlRPCDeadline
+	}
+}
+
+// defaultRPCDeadlineInterceptor applies deadlineFor(method) to any unary RPC
+// whose context has no deadline. A caller that set its own deadline keeps it.
+func defaultRPCDeadlineInterceptor(deadlineFor func(fullMethod string) time.Duration) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, deadlineFor(method))
+			defer cancel()
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
 // NewGRPCClient creates a new gRPC client connected to the given address.
 //
 // The address may include a port (e.g. "tern.example.com:80"). The full
@@ -282,6 +336,7 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),
+		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(grpcMethodDeadline)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)
@@ -685,6 +740,10 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
+	preCutoverState, err := preCutoverStateForRestore(ctx, c.storage, apply)
+	if err != nil {
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
@@ -693,7 +752,25 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 		Caller:      controlReq.RequestedBy,
 	})
+	// Each branch where the data plane did not take the cutover restores the
+	// pre-cutover state before failing the request; if the restore write fails,
+	// the request stays pending so the next drive re-sends the cutover rather
+	// than leaving the apply wedged. A call with no answer restores nothing,
+	// since the swap may already be under way.
 	if err != nil {
+		if isAmbiguousRemoteCallError(err) {
+			// The data plane records a cutover durably on receipt and answers a
+			// re-sent one as already pending, so a call that ended without an
+			// answer leaves the request pending for the next drive to re-send.
+			// Failing it would tell the operator the cutover did not take
+			// effect while the swap may already be under way.
+			logger.WarnContext(ctx, "remote cutover call ended without an answer; the cutover request stays pending and the next drive re-sends it",
+				append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "remote_apply_id", remoteID, "error", err)...)
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: outcome unknown, request left pending: %w", apply.ApplyIdentifier, remoteID, err)
+		}
+		if restoreErr := restoreApplyStateAfterUnacceptedCutover(ctx, c.storage, apply, preCutoverState, logger); restoreErr != nil {
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; %w", apply.ApplyIdentifier, remoteID, err, restoreErr)
+		}
 		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); failErr != nil {
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, remoteID, err, failErr)
@@ -704,6 +781,9 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	}
 	if resp == nil {
 		errorMessage := "the data plane returned neither a response nor an error"
+		if err := restoreApplyStateAfterUnacceptedCutover(ctx, c.storage, apply, preCutoverState, logger); err != nil {
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s: %w", apply.ApplyIdentifier, remoteID, errorMessage, err)
+		}
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
@@ -713,6 +793,9 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	}
 	if !resp.Accepted {
 		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
+		if err := restoreApplyStateAfterUnacceptedCutover(ctx, c.storage, apply, preCutoverState, logger); err != nil {
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s: %w", apply.ApplyIdentifier, remoteID, errorMessage, err)
+		}
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
@@ -2346,16 +2429,42 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 	if plan == nil {
 		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
-	// Fail closed if the operation's scope carries no VSchema artifact,
-	// mirroring the local finalizer drive.
+	// Fail closed if the operation's scope carries neither a VSchema artifact
+	// nor a finalize request, mirroring the local finalizer drive.
 	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 	namespaces := []string{namespace}
 	if namespace == "" {
-		namespaces = plan.VSchemaNamespaces()
+		namespaces = plan.FinalizerNamespaces()
 	}
 	return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, namespaces, groupFinalizerDispatchKind)
+}
+
+// finalizerDispatchMetadata is the metadata a namespace's VSchema-typed
+// dispatch change carries: its persisted VSchema change-metadata, plus
+// needs_finalizer when the engine asked to finalize it. A finalize-only
+// namespace carries needs_finalizer alone, which is how the data plane tells
+// it from a VSchema change (see LocalClient.namespacesFromApplyRequest). A
+// namespace with a VSchema artifact always says its VSchema changed, even when
+// its persisted metadata does not, so adding the finalizer marker can never
+// turn a VSchema change into a finalize-only dispatch that skips the artifact.
+func finalizerDispatchMetadata(nsData *storage.NamespacePlanData) map[string]string {
+	if nsData == nil {
+		return nil
+	}
+	meta := storage.VSchemaPlanMetadata(nsData.Metadata)
+	if !nsData.Finalize {
+		return meta
+	}
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	if nsData.ChangesVSchema() {
+		meta[storage.PlanMetadataVSchemaChanged] = "true"
+	}
+	meta[engine.MetadataNeedsFinalizer] = "true"
+	return meta
 }
 
 // dispatchRemoteVSchemaOnly dispatches the given namespaces' VSchema to the data
@@ -2393,11 +2502,9 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		for _, namespace := range namespaces {
 			// Carry the namespace's persisted VSchema change-metadata so a
 			// deployment materializing the plan from this dispatch runs the
-			// same apply-time safety gates as one reading its own stored plan.
-			var meta map[string]string
-			if nsData := plan.Namespaces[namespace]; nsData != nil {
-				meta = storage.VSchemaPlanMetadata(nsData.Metadata)
-			}
+			// same apply-time safety gates as one reading its own stored plan,
+			// and the finalize request so it finalizes what this plan does.
+			meta := finalizerDispatchMetadata(plan.Namespaces[namespace])
 			changes = append(changes, &ternv1.TableChange{
 				Namespace:  namespace,
 				TableName:  "VSchema: " + namespace,
@@ -2423,7 +2530,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
-			if isAmbiguousRemoteApplyDispatchError(err) {
+			if isAmbiguousRemoteCallError(err) {
 				return fmt.Errorf("%s apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", kind, op.ID, apply.ApplyIdentifier, err)
 			}
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
@@ -3260,7 +3367,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
-		if isAmbiguousRemoteApplyDispatchError(err) {
+		if isAmbiguousRemoteCallError(err) {
 			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
 		}
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
@@ -3332,7 +3439,9 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
 }
 
-func isAmbiguousRemoteApplyDispatchError(err error) bool {
+// isAmbiguousRemoteCallError reports whether a remote call ended without an
+// answer, so the data plane may or may not have acted on it.
+func isAmbiguousRemoteCallError(err error) bool {
 	return errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		status.Code(err) == codes.Canceled ||
@@ -3346,7 +3455,7 @@ func isRetryableRemoteApplyError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if isAmbiguousRemoteApplyDispatchError(err) {
+	if isAmbiguousRemoteCallError(err) {
 		return false
 	}
 

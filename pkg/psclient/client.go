@@ -10,9 +10,37 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/go-cleanhttp"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 )
+
+// planetScaleHTTPTimeout bounds every PlanetScale API request, the raw-HTTP
+// endpoints the SDK does not cover included, so a driver can never block
+// forever on a hung API call. It is generous because deploy request creation and branch schema
+// diffs can legitimately take minutes.
+const planetScaleHTTPTimeout = 5 * time.Minute
+
+// newPlanetScaleHTTPClient returns the SDK's default HTTP client with the
+// request timeout set. Its Transport is non-nil, which ps.WithServiceToken
+// requires: that option wraps the installed transport in an auth RoundTripper.
+func newPlanetScaleHTTPClient() *http.Client {
+	client := cleanhttp.DefaultClient()
+	client.Timeout = planetScaleHTTPTimeout
+	return client
+}
+
+// boundedClientOptions applies the caller's options first and then installs the
+// bounded HTTP client and the service token, so no caller option can displace
+// either. WithHTTPClient must precede WithServiceToken because the token option
+// wraps whichever client is installed at that point.
+func boundedClientOptions(tokenName, tokenValue string, opts []ps.ClientOption) []ps.ClientOption {
+	return append(append([]ps.ClientOption{}, opts...),
+		ps.WithHTTPClient(newPlanetScaleHTTPClient()),
+		ps.WithServiceToken(tokenName, tokenValue),
+	)
+}
 
 // PSClient defines the interface for PlanetScale API operations.
 // The engine flow is: create branch → get credentials → MySQL-connect to
@@ -60,7 +88,8 @@ type PSClient interface {
 // psClientWrapper wraps the real PlanetScale client to implement PSClient.
 type psClientWrapper struct {
 	client     *ps.Client
-	baseURL    string // for endpoints not in the SDK
+	httpClient *http.Client // for endpoints not in the SDK
+	baseURL    string       // for endpoints not in the SDK
 	tokenName  string
 	tokenValue string
 }
@@ -121,13 +150,14 @@ func (e *APIError) summary() string {
 // NewPSClient creates a new PSClient using the real PlanetScale API.
 // Use NewPSClientWithBaseURL for endpoints not yet in the SDK (throttle).
 func NewPSClient(tokenName, tokenValue string, opts ...ps.ClientOption) (PSClient, error) {
-	allOpts := append([]ps.ClientOption{ps.WithServiceToken(tokenName, tokenValue)}, opts...)
+	allOpts := boundedClientOptions(tokenName, tokenValue, opts)
 	client, err := ps.NewClient(allOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return &psClientWrapper{
 		client:     client,
+		httpClient: newPlanetScaleHTTPClient(),
 		baseURL:    "https://api.planetscale.com",
 		tokenName:  tokenName,
 		tokenValue: tokenValue,
@@ -141,13 +171,14 @@ func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string) (PSClient, er
 	if baseURL != "" {
 		opts = append(opts, ps.WithBaseURL(baseURL))
 	}
-	allOpts := append([]ps.ClientOption{ps.WithServiceToken(tokenName, tokenValue)}, opts...)
+	allOpts := boundedClientOptions(tokenName, tokenValue, opts)
 	client, err := ps.NewClient(allOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return &psClientWrapper{
 		client:     client,
+		httpClient: newPlanetScaleHTTPClient(),
 		baseURL:    baseURL,
 		tokenName:  tokenName,
 		tokenValue: tokenValue,
@@ -304,7 +335,7 @@ func (w *psClientWrapper) doRawJSON(ctx context.Context, method, path string, bo
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", w.tokenName+":"+w.tokenValue)
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := w.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("send %s %s request: %w", method, path, err)
 	}

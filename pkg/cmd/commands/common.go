@@ -546,10 +546,20 @@ func printWatchInstructions(applyID, database, environment string) {
 	}
 }
 
+// applyChangeCounts tallies the apply's tasks by change type for the
+// completion summary. Index builds and drops are counted in their own buckets,
+// matching the plan summary, so an apply made only of index tasks does not
+// complete with an empty summary and an index task is never reported as a
+// table alteration. Every task lands in some bucket: a change type outside the
+// named ones — including an empty one — counts as other DDL, so the summary
+// never omits work the apply ran.
 type applyChangeCounts struct {
 	created        int
 	altered        int
 	dropped        int
+	indexesCreated int
+	indexesDropped int
+	other          int
 	vschemaUpdates int
 }
 
@@ -577,8 +587,14 @@ func (c *applyChangeCounts) add(changeType string) {
 		c.altered++
 	case "DROP", "CHANGE_TYPE_DROP":
 		c.dropped++
+	case "CREATE_INDEX", "CHANGE_TYPE_CREATE_INDEX":
+		c.indexesCreated++
+	case "DROP_INDEX", "CHANGE_TYPE_DROP_INDEX":
+		c.indexesDropped++
 	case "VSCHEMA", "VSCHEMA_UPDATE", "CHANGE_TYPE_VSCHEMA":
 		c.vschemaUpdates++
+	default:
+		c.other++
 	}
 }
 
@@ -592,6 +608,15 @@ func (c applyChangeCounts) summary() string {
 	}
 	if c.dropped > 0 {
 		parts = append(parts, fmt.Sprintf("%d dropped", c.dropped))
+	}
+	if c.indexesCreated > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s created", c.indexesCreated, ui.PluralizeNoun("index", c.indexesCreated)))
+	}
+	if c.indexesDropped > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s dropped", c.indexesDropped, ui.PluralizeNoun("index", c.indexesDropped)))
+	}
+	if c.other > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", c.other, ui.PluralizeNoun("statement", c.other)))
 	}
 	if c.vschemaUpdates > 0 {
 		word := "updates"

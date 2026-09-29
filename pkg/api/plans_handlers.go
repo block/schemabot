@@ -177,6 +177,9 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 		if nsData.ChangesVSchema() {
 			summary.VSchemaChangeCount++
 		}
+		if nsData.Finalize {
+			summary.FinalizeCount++
+		}
 		for _, change := range nsData.Tables {
 			if summary.ChangeCounts == nil {
 				summary.ChangeCounts = map[string]int{}
@@ -240,6 +243,15 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 			// rendered diff, so the namespace is flagged as carrying VSchema
 			// work without one.
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
+		}
+		if nsData.Finalize {
+			// The stored finalize request is reported under the key the
+			// engine planned it with, so a stored finalize-only plan still
+			// reads as having changes.
+			if change.Metadata == nil {
+				change.Metadata = map[string]string{}
+			}
+			change.Metadata[apitypes.NeedsFinalizerMetadataKey] = "true"
 		}
 		for _, table := range nsData.Tables {
 			tc := tableChangeResponseFromStorage(table)

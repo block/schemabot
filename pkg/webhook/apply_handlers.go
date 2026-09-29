@@ -170,7 +170,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
 	// Environment ordering enforcement: prior server-configured environments must be clean before applying.
-	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, prInfo.HeadSHA, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command prior environment gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -223,15 +223,58 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 		}
 
-		// Stale lock from this PR (no active applies) — release it so we can re-plan.
-		// Use owner-scoped Release: ownership can change between the Get above
-		// and this Release (e.g. an unrelated `schemabot unlock` clears the lock
-		// and another PR acquires it). ErrLockNotFound / ErrLockNotOwned are
-		// expected and silently no-op'd — the loop below will reacquire if free.
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-			h.logger.Error("failed to release stale lock",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", relErr)
+		// A rollback this PR is still waiting to confirm holds the lock. Planning
+		// on would replace its pin and leave rollback-confirm nothing to confirm,
+		// so the apply is refused until the operator confirms or cancels it.
+		if isSamePRRollbackLock(existingLock, lockOwner) {
+			rollbackPlan, awaiting, rbErr := h.rollbackAwaitsConfirmation(ctx, existingLock)
+			if rbErr != nil {
+				h.logger.Error("apply rejected: cannot tell whether the rollback pinned by this PR's lock has run; the lock stays in place",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", existingLock.PendingPlanID, "error", rbErr)
+				if !result.SuppressRetryComments {
+					h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+						"SchemaBot could not check this PR's pending rollback. The apply was rejected; retry the command, and see server logs if it persists.")
+				}
+				return true, fmt.Errorf("apply command check pending rollback %s#%d: %w", repo, pr, rbErr)
+			}
+			if awaiting {
+				h.logger.Info("apply rejected: lock is pinned to a rollback awaiting confirmation",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", existingLock.PendingPlanID)
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					pendingRollbackApplyRefusal(database, rollbackPlan))
+				return false, nil
+			}
+			h.logger.Info("rollback pinned by this PR's lock has already run; releasing the stale lock to re-plan",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", existingLock.PendingPlanID)
+		}
+
+		// Release only the intent inspected above. A concurrent command can
+		// replace the pin while this apply is deciding whether it is stale, and
+		// that newer intent must remain held, so the apply stops here rather
+		// than planning on and pinning its own plan over it.
+		released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(
+			ctx, database, dbType, lockOwner, existingLock.PendingPlanID,
+		)
+		if relErr != nil {
+			h.logger.Error("apply rejected: failed to release stale lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"observed_pending_plan_id", existingLock.PendingPlanID, "error", relErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not release this PR's stale lock. The apply was rejected; retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command release stale lock %s#%d: %w", repo, pr, relErr)
+		}
+		if !released {
+			h.logger.Info("apply rejected: stale lock intent changed before release; keeping the current lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"observed_pending_plan_id", existingLock.PendingPlanID)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				applyLockIntentChangedRefusal(database))
+			return false, nil
 		}
 	}
 
@@ -368,6 +411,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// DisclosedCopyDiscard records whether that plan's comment tells the operator
 	// a copy is destroyed, so the apply can later tell a discard they agreed to
 	// from one that appeared after they were asked.
+	//
+	// The apply saw no lock of its own before planning: either none was held or
+	// it released this PR's stale one above. The acquire is conditional on that
+	// still being so, because a rollback or another apply on this PR can pin the
+	// lock while this one plans, and the pin it holds must not be replaced by a
+	// plan the operator never saw alongside it.
 	lock := &storage.Lock{
 		DatabaseName:         database,
 		DatabaseType:         dbType,
@@ -377,13 +426,23 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		PendingPlanID:        planResp.PlanID,
 		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
 	}
-	if err := h.service.Storage().Locks().Acquire(ctx, lock); err != nil {
+	if err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, lock, ""); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
 			// Another owner won the lock between the pre-check above and this
 			// acquire: the same answer the pre-check gives, so it is terminal.
 			h.logger.Info("apply blocked by lock conflict at acquire",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+			return false, nil
+		}
+		if errors.Is(err, storage.ErrLockIntentChanged) {
+			// This PR pinned another intent while the apply was planning. The
+			// pin stays; a retry sees it and answers for it.
+			h.logger.Info("apply rejected: this PR's lock was pinned to another plan while the apply was planning",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				applyLockIntentChangedRefusal(database))
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
@@ -577,7 +636,10 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     should re-drive; the same window may succeed on a later attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (silent fan-out skip, no pending confirmation, gate blocks, lock conflict,
-//     stale-schema/base/plan rejection, or a hand-off to executeApply, which
+//     a pending confirmation with no loadable plan, a pending confirmation
+//     planned for another environment, a prior environment that is no longer
+//     clean at confirm time, stale-schema/base/plan rejection, or a hand-off
+//     to executeApply, which
 //     may itself fail before dispatching). A schema-request failure is terminal
 //     only when handleSchemaRequestError recognizes it as a user-facing
 //     rejection; an unexpected failure there (for example a transient GitHub
@@ -730,7 +792,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// A same-PR rollback lock uses the same owner string but is confirmed via
 	// rollback-confirm, never here. Reject it before the freshness checks so no
 	// rejection path below can release it.
-	if existingLock.Owner == lockOwner && strings.HasPrefix(existingLock.PendingPlanID, rollbackPendingPlanPrefix) {
+	if isSamePRRollbackLock(existingLock, lockOwner) {
 		h.logger.Info("apply-confirm rejected: lock belongs to rollback plan", "repo", repo, "pr", pr,
 			"database", database, "environment", environment, "pending_plan_id", existingLock.PendingPlanID)
 		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
@@ -810,17 +872,56 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		}
 		return true, fmt.Errorf("apply-confirm command load confirmation plan %s#%d: %w", repo, pr, planLoadErr)
 	}
+	if storedPlan == nil {
+		h.logger.Warn("apply-confirm rejected: pending confirmation has no loadable plan",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
+		h.postComment(repo, pr, installationID, templates.RenderConfirmationPlanUnavailable(templates.ConfirmationRefusalData{
+			RequestedBy:          requestedBy,
+			Database:             databaseName,
+			RequestedEnvironment: environment,
+			Options:              applyCommandOptionsOf(result),
+		}))
+		return false, nil
+	}
+	// The pending confirmation authorizes the environment it was planned for
+	// and nothing else: confirming it into another environment would dispatch
+	// there with no plan comment, no disclosure, and no ordering gate for that
+	// environment. The lock is kept, so the operator can still confirm the
+	// environment the plan was made for.
+	if confirmationPlanTargetsOtherEnvironment(storedPlan, environment) {
+		h.logger.Warn("apply-confirm rejected: pending confirmation was planned for another environment",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_environment", storedPlan.Environment,
+			"pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
+		h.postComment(repo, pr, installationID, templates.RenderConfirmationPlanForOtherEnvironment(templates.ConfirmationRefusalData{
+			RequestedBy:          requestedBy,
+			Database:             databaseName,
+			PlanEnvironment:      storedPlan.Environment,
+			RequestedEnvironment: environment,
+			Options:              applyCommandOptionsOf(result),
+		}))
+		return false, nil
+	}
+	// Environment mismatch wins over stale-plan rejection because this outcome
+	// preserves the reviewed intent; stale-plan rejection releases it.
 	if rejected := h.assertPlanStillCurrent(ctx, repo, pr, installationID, storedPlan, confirmPRInfo.HeadSHA, environment, requestedBy); rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, existingLock.PendingPlanID, "stale-plan rejection")
 		return false, nil
 	}
 
-	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
-	if existingLock.DisclosedCopyDiscard && !disclosedCopyDiscard {
-		h.logger.Info("copy-discard disclosure not applied to this confirm: it was shown for another environment",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"environment", environment, "pending_plan_id", existingLock.PendingPlanID)
+	// Re-check environment ordering at confirm time, as the review and checks
+	// gates are: a prior environment can stop being clean between the plan and
+	// its confirmation without the PR HEAD moving. A block keeps the pending
+	// confirmation pinned, since the plan itself is not known to be wrong.
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, confirmPRInfo.HeadSHA, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command prior environment gate %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
+		h.logger.Info("apply-confirm blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
+		return false, nil
 	}
+
+	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
@@ -830,8 +931,8 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 // pending confirmation was earned for the apply about to run. The lock carries
 // no environment dimension, so a disclosure the operator was shown confirming
 // one environment must not disarm the copy gate in another: the pinned plan
-// names the environment they actually saw. A confirmation with no loadable plan
-// counts as no disclosure, so the apply asks rather than assuming consent.
+// names the environment they actually saw. A missing plan never counts as
+// consent, though apply-confirm rejects that state before reaching this helper.
 func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
 	if !lock.DisclosedCopyDiscard {
 		return false
@@ -840,6 +941,84 @@ func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, enviro
 		return false
 	}
 	return plan.Environment == environment
+}
+
+// isSamePRRollbackLock reports whether this PR holds the lock for a rollback
+// plan. A rollback lock carries the same owner string as the PR's apply lock,
+// so only its pending plan tells the two intents apart; the apply commands must
+// never confirm, replace, or release it as if it were their own.
+func isSamePRRollbackLock(lock *storage.Lock, lockOwner string) bool {
+	return lock.Owner == lockOwner && strings.HasPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix)
+}
+
+// rollbackAwaitsConfirmation reports whether the rollback plan a same-PR
+// rollback lock pins has not run yet, returning the plan when it loads. Only an
+// apply created from that plan proves the rollback ran, after which the lock is
+// stale and a new apply may take it over. A pin whose plan cannot be found
+// proves nothing, so it counts as still awaiting confirmation and the lock
+// stays until an operator confirms or unlocks it.
+func (h *Handler) rollbackAwaitsConfirmation(ctx context.Context, lock *storage.Lock) (*storage.Plan, bool, error) {
+	planID, ok := rollbackPlanIDFromLock(lock)
+	if !ok {
+		h.logger.Warn("rollback lock pins no plan identifier; treating the rollback as awaiting confirmation",
+			"database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"lock_owner", lock.Owner, "pending_plan_id", lock.PendingPlanID)
+		return nil, true, nil
+	}
+	plan, err := h.service.Storage().Plans().Get(ctx, planID)
+	if err != nil {
+		return nil, false, fmt.Errorf("load rollback plan %s pinned by lock %s/%s: %w", planID, lock.DatabaseName, lock.DatabaseType, err)
+	}
+	if plan == nil {
+		h.logger.Warn("rollback lock pins a plan that no longer exists; treating the rollback as awaiting confirmation",
+			"database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"lock_owner", lock.Owner, "pending_plan_id", lock.PendingPlanID)
+		return nil, true, nil
+	}
+	apply, err := h.service.Storage().Applies().GetByPlan(ctx, plan.ID)
+	if err != nil {
+		return nil, false, fmt.Errorf("load apply for rollback plan %s pinned by lock %s/%s: %w", planID, lock.DatabaseName, lock.DatabaseType, err)
+	}
+	return plan, apply == nil, nil
+}
+
+// pendingRollbackApplyRefusal tells the operator why a same-PR apply was
+// refused while a rollback awaits confirmation, and how to settle the rollback
+// first. The rollback's environment is named when its plan loaded.
+func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) string {
+	if rollbackPlan == nil {
+		return fmt.Sprintf("The lock this PR holds on `%s` belongs to a rollback plan that is unavailable, and a new apply would discard it. "+
+			"Use `schemabot unlock` to cancel it, then retry the apply.", database)
+	}
+	confirm := "schemabot rollback-confirm"
+	if rollbackPlan.Environment != "" {
+		confirm += " -e " + rollbackPlan.Environment
+	}
+	return fmt.Sprintf("The lock this PR holds on `%s` belongs to a rollback plan that has not been confirmed, and a new apply would discard it. "+
+		"Use `%s` to execute the rollback, or `schemabot unlock` to cancel it, then retry the apply.", database, confirm)
+}
+
+// applyLockIntentChangedRefusal tells the operator that another command on the
+// same PR pinned the lock while this apply was checking or planning against it.
+// The apply leaves that pin in place; a retry finds it and reports which
+// command holds the lock and how to settle it.
+func applyLockIntentChangedRefusal(database string) string {
+	return fmt.Sprintf("Another SchemaBot command on this PR changed the lock on `%s` while this apply was running, "+
+		"so the apply was rejected to keep that command's lock in place. Retry the apply; "+
+		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database)
+}
+
+// applyCommandOptionsOf carries the option flags the operator typed on a
+// rejected apply-confirm into the recovery command the rejection recommends.
+// apply-confirm reads its options from the confirm comment alone, so a hint
+// that dropped them would run with defaults the operator did not choose.
+func applyCommandOptionsOf(result CommandResult) templates.ApplyCommandOptions {
+	return templates.ApplyCommandOptions{
+		Tenant:       result.Tenant,
+		AllowUnsafe:  result.AllowUnsafe,
+		DeferCutover: result.DeferCutover,
+		SkipRevert:   result.SkipRevert,
+	}
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command. It is

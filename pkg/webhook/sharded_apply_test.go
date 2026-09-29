@@ -146,7 +146,7 @@ func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.
 func TestBuildShardedApplyData_DivergentGroupsByTable(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
 	mk := func(id int64, key string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "ks/-40/mutes"),
@@ -201,7 +201,7 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "ks/-40/mutes", state.ApplyOperation.Completed),
@@ -209,7 +209,7 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 		mk(3, "ks/group_finalizer", state.ApplyOperation.Running),
 	}
 
-	data := buildShardedApplyData(apply, ops, false, nil, map[string]string{"ks": "+ vindex hash"}, "")
+	data := buildShardedApplyData(apply, ops, false, nil, &shardedFinalizerPlan{vschemaDiffs: map[string]string{"ks": "+ vindex hash"}}, "")
 
 	require.Len(t, data.VSchemaChanges, 1)
 	assert.Equal(t, "ks", data.VSchemaChanges[0].Namespace)
@@ -221,6 +221,43 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 	data = buildShardedApplyData(apply, ops, false, nil, nil, "")
 	require.Len(t, data.VSchemaChanges, 1)
 	assert.Empty(t, data.VSchemaChanges[0].Diff, "a stored plan without diffs renders the status-only entry")
+}
+
+// A sharded apply adds refunds to commerce, whose engine asked to finalize the
+// keyspace once the table exists, with no VSchema change in the plan. The
+// finalizer renders in the Finalize section with its own status, not as a
+// VSchema change the plan never carried, and it is not counted as a change.
+// payments, which does change its VSchema, still renders as one.
+func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "shop", Environment: "staging", State: state.Apply.Running}
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "commerce/-80/refunds", state.ApplyOperation.Completed),
+		mk(2, "commerce/80-/refunds", state.ApplyOperation.Completed),
+		mk(3, "commerce/group_finalizer", state.ApplyOperation.Running),
+		mk(4, "payments/group_finalizer", state.ApplyOperation.Pending),
+	}
+	finalizers := &shardedFinalizerPlan{finalizeOnly: map[string]bool{"commerce": true}}
+
+	data := buildShardedApplyData(apply, ops, false, nil, finalizers, "")
+
+	assert.Equal(t, []templates.ShardedFinalize{{Keyspace: "commerce", Status: "applying"}}, data.Finalizes)
+	require.Len(t, data.VSchemaChanges, 1)
+	assert.Equal(t, "payments", data.VSchemaChanges[0].Namespace)
+	body := templates.RenderShardedApplyComment(data)
+	assert.Contains(t, body, "### Finalize\n\n**`commerce`**: Finalizing...\n")
+	assert.Contains(t, body, "### VSchema\n\n**`payments`**: Pending\n")
+	assert.NotContains(t, body, "**`commerce`**: Applying")
+
+	apply.State = state.Apply.Completed
+	for _, op := range ops {
+		op.State = state.ApplyOperation.Completed
+	}
+	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, finalizers, ""))
+	assert.Contains(t, summary, "### Finalize\n\n**`commerce`**: Finalized\n")
+	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
 }
 
 // A finalizer whose rollout ended without running it must not read as
@@ -274,11 +311,12 @@ func (s *stubPlanStore) GetByID(_ context.Context, _ int64) (*storage.Plan, erro
 
 // The sharded comment's VSchema diffs come from the stored plan: the resolver
 // reads each namespace's persisted diff so the comment shows the change the
-// operator approved at plan time. Degraded storage (a load error or a missing
-// plan row) and older stored plans without diffs must render the comment
-// without diffs rather than blocking it, and an apply with no finalizer
+// operator approved at plan time, and the namespaces finalized without a
+// VSchema change. Degraded storage (a load error or a missing plan row) must
+// render the comment without either rather than blocking it, older stored
+// plans without diffs contribute none, and an apply with no finalizer
 // operation must not read storage at all.
-func TestResolveShardedVSchemaDiffs(t *testing.T) {
+func TestResolveShardedFinalizerPlan(t *testing.T) {
 	shardOp := &storage.ApplyOperation{OperationKey: "ks/-40/mutes"}
 	finalizerOp := &storage.ApplyOperation{OperationKey: "ks/group_finalizer"}
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: 7}
@@ -287,21 +325,30 @@ func TestResolveShardedVSchemaDiffs(t *testing.T) {
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
 		"ks":    {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDiff: "+ vindex hash"}},
 		"other": {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true"}},
+		"both": {
+			Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{}}`},
+			Finalize:  true,
+		},
+		"pay": {Finalize: true},
 	}}
-	diffs := resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
-	assert.Equal(t, map[string]string{"ks": "+ vindex hash"}, diffs,
+	finalizers := resolveShardedFinalizerPlan(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+	require.NotNil(t, finalizers)
+	assert.Equal(t, map[string]string{"ks": "+ vindex hash"}, finalizers.vschemaDiffs,
 		"only namespaces with a persisted diff contribute")
+	assert.Equal(t, map[string]bool{"pay": true}, finalizers.finalizeOnly,
+		"only a namespace finalized without a VSchema change is finalize-only")
 
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{err: errors.New("storage down")}, apply, ops),
+	assert.Nil(t, resolveShardedFinalizerPlan(t.Context(), &stubPlanStorage{err: errors.New("storage down")}, apply, ops),
 		"a plan load failure degrades to no diffs")
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{}, apply, ops),
+	assert.Nil(t, resolveShardedFinalizerPlan(t.Context(), &stubPlanStorage{}, apply, ops),
 		"a missing plan row degrades to no diffs")
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), &stubPlanStorage{plan: &storage.Plan{}}, apply, ops),
-		"a stored plan without diff metadata degrades to no diffs")
+	empty := resolveShardedFinalizerPlan(t.Context(), &stubPlanStorage{plan: &storage.Plan{}}, apply, ops)
+	assert.Empty(t, empty.vschemaDiff("ks"), "a stored plan without diff metadata contributes no diffs")
 
 	// No finalizer operation → nothing to attach a diff to; the nil Storage
 	// would panic on any read, proving the resolver does not touch storage.
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), nil, apply, []*storage.ApplyOperation{shardOp}))
+	assert.Nil(t, resolveShardedFinalizerPlan(t.Context(), nil, apply, []*storage.ApplyOperation{shardOp}))
 
 	// A shape that is not the sharded layout — here a two-deployment apply —
 	// discards the diffs downstream, so the resolver must not pay the
@@ -310,7 +357,7 @@ func TestResolveShardedVSchemaDiffs(t *testing.T) {
 		{OperationKey: "ks/-40/mutes", Deployment: "cake"},
 		{OperationKey: "ks/group_finalizer", Deployment: "ski"},
 	}
-	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), nil, apply, multiDeployment))
+	assert.Nil(t, resolveShardedFinalizerPlan(t.Context(), nil, apply, multiDeployment))
 }
 
 // The stored-plan diff must reach a real PR comment through the production
@@ -320,7 +367,7 @@ func TestResolveShardedVSchemaDiffs(t *testing.T) {
 func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running, PlanID: 7}
 	mk := func(id int64, key string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{mk(1, "ks/-40/mutes"), mk(2, "ks/80-/mutes"), mk(3, "ks/group_finalizer")}
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
@@ -328,7 +375,7 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	}}
 
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveVSchemaDiffs(apply, ops), "")
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveFinalizerPlan(apply, ops), "")
 
 	assert.Contains(t, body, "### VSchema")
 	assert.Contains(t, body, "```diff\n+ vindex hash\n```",
@@ -341,7 +388,7 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 // but an apply-level error, when present, wins.
 func TestBuildShardedApplyData_FailedFinalizerErrorFallsBack(t *testing.T) {
 	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "ks/-40/mutes", state.ApplyOperation.Completed, ""),
@@ -413,7 +460,7 @@ func TestBuildShardedApplyData_FirstFailedFinalizerErrorWins(t *testing.T) {
 func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Running, Caller: "morgo"}
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "contacts/-/entries", state.ApplyOperation.Completed),
@@ -445,7 +492,7 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 // plain shard name under its keyspace heading.
 func TestBuildShardedApplyData_MultiKeyspaceQualifiesOrderingLabels(t *testing.T) {
 	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "contacts/-/entries", state.ApplyOperation.Failed, "boom"),
@@ -510,7 +557,7 @@ func TestFormatApplySummaryComment_ShardedVSchemaSection(t *testing.T) {
 		State: state.Apply.Completed, Caller: "morgo",
 	}
 	mk := func(id int64, key string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "cdb_resolute_sharded/-40/mutes"),
@@ -563,7 +610,7 @@ func TestFormatApplySummaryComment_ShardedApplyLevelErrorSurfaced(t *testing.T) 
 // operation state instead, so early dispatch waves still render.
 func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "cdb_resolute_sharded/-40/mutes", state.ApplyOperation.Completed),
@@ -611,7 +658,7 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 // reporting shards) instead of copied rows inflating the numerator alone.
 func TestBuildShardedApplyData_CopiedRowsWithoutTotalNotAggregated(t *testing.T) {
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "cdb_resolute_sharded/-40/mutes", state.ApplyOperation.Running),
@@ -642,7 +689,7 @@ func TestBuildShardedApplyData_CopiedRowsWithoutTotalNotAggregated(t *testing.T)
 // with another keyspace's.
 func TestBuildShardedApplyData_TableAggregateAndOrder(t *testing.T) {
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "contacts_sharded/-40/entries", state.ApplyOperation.Completed),
@@ -671,7 +718,7 @@ func TestBuildShardedApplyData_TableAggregateAndOrder(t *testing.T) {
 // state, so a mid-rollout table never reads as complete.
 func TestBuildShardedApplyData_PendingOutranksRevertWindow(t *testing.T) {
 	mk := func(id int64, key, opState string) *storage.ApplyOperation {
-		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
 	}
 	ops := []*storage.ApplyOperation{
 		mk(1, "contacts_sharded/-40/entries", state.ApplyOperation.RevertWindow),

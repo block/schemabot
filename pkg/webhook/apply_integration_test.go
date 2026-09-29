@@ -816,18 +816,10 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 	// Seed a check record (simulating a prior plan that created the check run)
 	seedCheck(t, svc, dbName, "staging", "action_required")
 
-	// Acquire a lock from this PR (simulating a prior `apply` command)
-	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
-		DatabaseName: dbName,
-		DatabaseType: "mysql",
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		Owner:        "octocat/hello-world#1",
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
-	})
+	// The prior `apply` left the lock pinned to the staging plan it posted;
+	// apply-confirm verifies the environment against that plan. Plan
+	// identifiers are unique across the shared test storage.
+	seedPendingConfirmation(t, svc, dbName, "plan-pending-"+dbName, "staging")
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1113,15 +1105,10 @@ func TestE2EApplyConfirmNoChanges(t *testing.T) {
 	seedTargetTable(t, dbName,
 		"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 
-	// Acquire a lock from this PR (simulating a prior `apply` command)
-	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
-		DatabaseName: dbName,
-		DatabaseType: "mysql",
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		Owner:        "octocat/hello-world#1",
-	})
-	require.NoError(t, err)
+	// The prior `apply` left the lock pinned to the staging plan it posted;
+	// apply-confirm verifies the environment against that plan. Plan
+	// identifiers are unique across the shared test storage.
+	seedPendingConfirmation(t, svc, dbName, "plan-pending-"+dbName, "staging")
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1486,6 +1473,72 @@ func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
+}
+
+// TestE2EApplyProductionBlockedWhenStagingSuccessIsForEarlierCommit covers a
+// production apply sent right after a push: staging's stored check state still
+// records a success from the PR's previous commit, and the staging plan for
+// the new head has not landed. The staging success says nothing about the new
+// commit, so production must be blocked with guidance to re-check staging on
+// the latest commit, and no apply may start.
+func TestE2EApplyProductionBlockedWhenStagingSuccessIsForEarlierCommit(t *testing.T) {
+	dbName := "webhook_staging_ok_earlier_commit"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
+
+	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "fedcba9876543210",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   1,
+		Status:       "completed",
+		Conclusion:   "success",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+	h.priorEnvCheckMaxAttempts = 1
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply Blocked")
+		assert.Contains(t, body, "The `staging` check for this PR was recorded on commit `fedcba9`, but this apply read the schema at commit `abc123`.")
+		assert.Contains(t, body, "schemabot plan -e staging")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for earlier-commit blocked comment")
+	}
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, a := range applies {
+		assert.NotEqual(t, dbName, a.Database, "no production apply may start on a staging success from an earlier commit")
+	}
 }
 
 // TestE2EApplyNoOpUnblocksPriorEnvironmentGate verifies that a no-op apply
@@ -3006,7 +3059,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	// Case 1: production blocked when sandbox is action_required
 	seedCheck(t, svc, dbName, "sandbox", "action_required")
 
-	blocked, err := h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+	blocked, err := h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1, "abc123",
 		dbName, "mysql", "production", envs, 1, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "production should be blocked when sandbox is action_required")
@@ -3022,7 +3075,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	seedCheck(t, svc, dbName, "sandbox", "success")
 	seedCheck(t, svc, dbName, "staging", "action_required")
 
-	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1, "abc123",
 		dbName, "mysql", "production", envs, 1, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "production should be blocked when staging is action_required")
@@ -3037,7 +3090,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	// Case 3: production allowed when both sandbox and staging are success
 	seedCheck(t, svc, dbName, "staging", "success")
 
-	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1, "abc123",
 		dbName, "mysql", "production", envs, 1, false)
 	require.NoError(t, err)
 	assert.False(t, blocked, "production should not be blocked when all prior envs are success")
@@ -3045,13 +3098,13 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	// Case 4: staging only requires sandbox (not production)
 	seedCheck(t, svc, dbName, "sandbox", "action_required")
 
-	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1, "abc123",
 		dbName, "mysql", "staging", envs, 1, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "staging should be blocked when sandbox is action_required")
 
 	// Case 5: sandbox (first env) is never blocked
-	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1, "abc123",
 		dbName, "mysql", "sandbox", envs, 1, false)
 	require.NoError(t, err)
 	assert.False(t, blocked, "sandbox (first env) should never be blocked")

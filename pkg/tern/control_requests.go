@@ -27,6 +27,26 @@ func pendingControlRequest(ctx context.Context, store storage.Storage, apply *st
 	return controlReq, nil
 }
 
+// controlRequestAccepted reports whether the engine has accepted a control
+// request of the given operation for an apply: its durable request row is
+// completed. The row is completed by whichever process carried the request
+// out, whether the API's immediate attempt or a drive, so this is the answer a
+// drive that never saw the acceptance itself must read.
+func controlRequestAccepted(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (bool, error) {
+	if store == nil {
+		return false, fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	controlReq, err := controlStore.GetByOperation(ctx, apply.ID, operation)
+	if err != nil {
+		return false, fmt.Errorf("load %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
+	}
+	return controlReq != nil && controlReq.Status == storage.ControlRequestCompleted, nil
+}
+
 // completePendingControlRequests marks the pending control request of the given
 // operation completed, after verifying the apply lease still holds.
 func completePendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
@@ -273,6 +293,92 @@ func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.St
 		*apply = previous
 		return fmt.Errorf("mark apply %s cutting over for pending cutover request: %w", apply.ApplyIdentifier, err)
 	}
+	return nil
+}
+
+// preCutoverStateForRestore names the state a cutover the data plane does not
+// accept returns the apply to. The drive that first sends a cutover reads it
+// off the apply before marking it cutting_over. A drive that re-sends a request
+// an earlier drive left pending — its call went unanswered, or its restore
+// write failed — finds the apply already marked, so the state before the mark
+// is derived from the stored tasks: the control plane never marks a task
+// cutting_over for a request, and the task rows follow the data plane's
+// progress, so their derived apply state is what the apply would hold had it
+// never been marked.
+//
+// A derivation that is not itself a state a cutover can be requested from —
+// tasks already cutting over on the data plane, a terminal state, or no task
+// rows — names cutting_over, and the restore then writes nothing: those are
+// states the progress sync settles on its own.
+func preCutoverStateForRestore(ctx context.Context, store storage.Storage, apply *storage.Apply) (string, error) {
+	if !state.IsState(apply.State, state.Apply.CuttingOver) {
+		return apply.State, nil
+	}
+	if store == nil {
+		return "", fmt.Errorf("storage is not available")
+	}
+	taskStore := store.Tasks()
+	if taskStore == nil {
+		return "", fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("load tasks for apply %s before re-sending cutover: %w", apply.ApplyIdentifier, err)
+	}
+	derived := state.DeriveApplyState(taskStates(tasks))
+	if state.IsState(derived, state.Apply.WaitingForCutover) || state.IsRunningApplyState(derived) {
+		return derived, nil
+	}
+	return state.Apply.CuttingOver, nil
+}
+
+// restoreApplyStateAfterUnacceptedCutover returns the apply to the state it held
+// before markApplyCuttingOverForControlRequest, for a cutover the data plane
+// did not accept: the call failed, came back empty, or was refused. A stored
+// cutting_over with no cutover behind it wedges the apply: the progress sync
+// never moves stored state backward, so it keeps cutting_over over the
+// data plane's waiting_for_cutover, and a fresh cutover command is answered as
+// already in progress without recording a request, so nothing sends the
+// cutover again.
+//
+// A failed call has an unknown outcome: the data plane may have started the
+// cutover before the answer was lost. Restoring is still safe, because every
+// state such a cutover reports next (cutting_over, revert_window, or a
+// terminal state) outranks the restored state, so the progress sync adopts it.
+//
+// A drive whose mark stayed in memory (see suppressParentApplyWrites) writes
+// nothing here either. On a failed write the in-memory apply keeps the stored
+// cutting_over and the caller must leave the cutover request pending: the next
+// drive re-sends it, and derives the state to restore from the stored tasks
+// (see preCutoverStateForRestore) should the data plane refuse again.
+func restoreApplyStateAfterUnacceptedCutover(ctx context.Context, store storage.Storage, apply *storage.Apply, preCutoverState string, logger *slog.Logger) error {
+	if state.IsState(apply.State, preCutoverState) {
+		logger.InfoContext(ctx, "cutover was not accepted; apply state is left as stored, the progress sync settles it from the data plane's report",
+			apply.MutableLogAttrs()...)
+		return nil
+	}
+	if suppressParentApplyWrites(ctx) {
+		apply.State = preCutoverState
+		logger.InfoContext(ctx, "cutover was not accepted under operation lease; parent apply state was never written, restored in memory only",
+			apply.MutableLogAttrs()...)
+		return nil
+	}
+	if store == nil {
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: storage is not available", apply.ApplyIdentifier, preCutoverState)
+	}
+	applyStore := store.Applies()
+	if applyStore == nil {
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: apply store is not available", apply.ApplyIdentifier, preCutoverState)
+	}
+	marked := *apply
+	apply.State = preCutoverState
+	apply.UpdatedAt = time.Now()
+	if err := applyStore.Update(ctx, apply); err != nil {
+		*apply = marked
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: %w", apply.ApplyIdentifier, preCutoverState, err)
+	}
+	logger.InfoContext(ctx, "restored apply state after the data plane did not accept the cutover",
+		append(apply.MutableLogAttrs(), "marked_state", marked.State)...)
 	return nil
 }
 

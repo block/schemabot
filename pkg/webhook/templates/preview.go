@@ -1016,6 +1016,30 @@ func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
 }
 
+// PreviewCommentConfirmationPlanForOtherEnvironment renders a sample refusal
+// of an apply-confirm that named a different environment than the pending
+// confirmation was planned for.
+func PreviewCommentConfirmationPlanForOtherEnvironment() string {
+	return RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		PlanEnvironment:      "staging",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
+}
+
+// PreviewCommentConfirmationPlanUnavailable renders a sample refusal of an
+// apply-confirm whose pending confirmation pins no plan that can be loaded.
+func PreviewCommentConfirmationPlanUnavailable() string {
+	return RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
+}
+
 // PreviewCommentBaseSchemaFreshnessRejected renders a sample path-scoped base
 // freshness rejection for a PR that must merge or rebase before applying.
 func PreviewCommentBaseSchemaFreshnessRejected() string {
@@ -1136,6 +1160,13 @@ func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
 // a prior environment with no completed SchemaBot check on the PR.
 func PreviewCommentApplyBlockedByMissingPriorEnvCheck() string {
 	return RenderApplyBlockedByMissingPriorEnvCheck("staging")
+}
+
+// PreviewCommentApplyBlockedByStalePriorEnvCheck renders a sample block for a
+// prior environment whose stored check state names a commit other than the one
+// the apply read its schema from.
+func PreviewCommentApplyBlockedByStalePriorEnvCheck() string {
+	return RenderApplyBlockedByStalePriorEnvCheck("staging", previewStaleSHA, previewHeadSHA)
 }
 
 // PreviewCommentApplyBlockedByUntrustedPriorEnvCheck renders a sample block
@@ -1516,7 +1547,9 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 }
 
 // PreviewCommentPostgresPlan renders a sample PostgreSQL plan comment whose
-// statements are classified and formatted under the PostgreSQL grammar.
+// statements are classified and formatted under the PostgreSQL grammar. The
+// standalone index build on an existing table is named as an index to create
+// in the plan summary.
 func PreviewCommentPostgresPlan() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -1532,6 +1565,7 @@ func PreviewCommentPostgresPlan() string {
 				Statements: []string{
 					"CREATE TABLE sessions (id uuid PRIMARY KEY, user_id bigint NOT NULL, payload jsonb, created_at timestamptz NOT NULL DEFAULT now())",
 					"ALTER TABLE users ADD COLUMN last_seen_at timestamptz, ADD COLUMN preferences jsonb",
+					"CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)",
 				},
 			},
 		},
@@ -2775,8 +2809,8 @@ func PreviewCommentSummaryFailedEngineLogsMultiDeployment() string {
 	}
 	return RenderFailureLogs([]LogGroupData{
 		{Label: "apply logs", Entries: sampleRemoteFailureLogEntries("users", mysqlerr.ReasonFromText("(errno 1265)"))},
-		{Label: "engine logs: shard-a, target: cluster-a", Entries: shardA},
-		{Label: "engine logs: shard-b, target: cluster-b", Entries: shardB},
+		{Label: "engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001", Entries: shardA},
+		{Label: "engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002", Entries: shardB},
 	}, GitHubIssueCommentMaxChars)
 }
 

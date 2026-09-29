@@ -987,10 +987,34 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     sustained rate means new applies are repeatedly dispatched against a
 //     target that already has actively driven work — check who is submitting
 //     the duplicates.
+//   - "fresh_operation_lease": a live drive holds the lease of the operation
+//     that owns the task, even though the apply's own lease reads stale, so
+//     the local engine probe was skipped and the live drive stays
+//     authoritative. Read it the same way as "fresh_lease".
+//   - "operation_lease_unreadable": the lease of the operation that owns the
+//     task could not be read, so a live drive could not be ruled out and the
+//     task kept blocking. Any sustained rate is a storage problem, not a
+//     workload one.
 //   - "foreign_terminal_report": the lease is stale and this process's engine
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
 //     investigate if the same task repeats here without converging.
+//   - "unattributed_terminal_report": this process's engine memory reports
+//     terminal for an in-flight task, but the apply records no lease holder
+//     (its lease was released, or its work runs under an operation lease), so
+//     the report cannot be attributed to this process and was refused. The
+//     driver that claims the apply or its operation settles the task;
+//     investigate if the same task repeats here without converging.
+//   - "terminal_report_other_table": this process's engine memory reports
+//     terminal for tables that do not include the in-flight task's, so the
+//     report is a later run's on the same database and was refused. The driver
+//     that owns the task settles it; investigate if the same task repeats here
+//     without converging.
+//   - "unattributed_no_active_report": this process's engine memory reports no
+//     active work for an in-flight task, but the apply records no lease holder,
+//     so the report cannot distinguish abandoned work from work driven under an
+//     operation lease. The task remains blocking until its driver or the elected
+//     reaper settles it.
 //   - "pending_control_request": a stopped task's apply carries an operator
 //     command a driver has not delivered yet, so the task still holds its
 //     database. A sustained rate means commands are queued but not being

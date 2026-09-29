@@ -142,6 +142,9 @@ func RunLocal(ctx context.Context, config api.ServerConfig, local LocalOptions, 
 	select {
 	case <-ctx.Done():
 		o.logger.Info("local runtime shutting down")
+		// In-flight drives run until Close; new claims stop now, so the HTTP
+		// drain below cannot hand a freshly started engine straight to Close.
+		srv.svc.StopClaiming()
 		return nil
 	case err := <-serveErr:
 		if errors.Is(err, http.ErrServerClosed) {

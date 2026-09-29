@@ -18,8 +18,15 @@ var (
 	// ErrLockNotOwned is returned when attempting to release a lock not owned by caller.
 	ErrLockNotOwned = errors.New("lock not owned by caller")
 
-	// ErrLockIntentChanged is returned when an apply's captured lock owner or
-	// pending plan no longer matches at durable apply creation time.
+	// ErrLockReplaced is returned when a release pinned to one lock row finds
+	// the lock key held by a different row: the lock the caller checked was
+	// released and a new one acquired in its place.
+	ErrLockReplaced = errors.New("lock was replaced by a new lock")
+
+	// ErrLockIntentChanged is returned when the lock's pending plan is no longer
+	// the one a caller observed: an apply's captured lock owner or pending plan
+	// no longer matches at durable apply creation time, or a conditional acquire
+	// finds the same owner's lock pinned to another intent.
 	ErrLockIntentChanged = errors.New("lock intent changed")
 
 	// ErrCheckNotFound is returned when a check does not exist.
@@ -50,9 +57,20 @@ var (
 	// the state through their own conditional writes and never return it.
 	ErrApplyReopenRefused = errors.New("refused to reopen a finished apply")
 
+	// ErrApplyOutcomeSettled is returned when a general apply update would
+	// replace a settled outcome (completed, failed, cancelled, reverted) with a
+	// different one. The settled row records what happened on the database, so
+	// a later writer, such as a cancel that arrives after the apply completed,
+	// learns the outcome already landed instead of overwriting it.
+	ErrApplyOutcomeSettled = errors.New("apply outcome already settled")
+
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
+
+	// ErrOperationLeaseActive is returned when a repair write requires an
+	// operation to remain unleased but a live drive owns it.
+	ErrOperationLeaseActive = errors.New("operation lease is active")
 
 	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
 	// apply's superseded_by marker to a different successor. The marker is

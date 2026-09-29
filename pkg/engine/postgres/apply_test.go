@@ -2427,6 +2427,9 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// DDL onto its own result, so the apply waits for an operator to
 		// read the catalog instead.
 		executor.CodeBlockingOutcomeUnknown: "a retry replays a statement that may have committed",
+		// Keep the outcome vocabulary total. pg-sprite requires catalog inspection
+		// before retrying an unknown commit outcome.
+		executor.CodeRowSecurityOutcomeUnknown: "inspect the catalog before deciding whether to retry",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
@@ -3590,4 +3593,31 @@ func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "open pg-sprite apply pool")
 	assert.Contains(t, err.Error(), "read CA bundle")
+}
+
+// Malformed SQL must retain the operator-facing refusal, not expose parser internals.
+func TestValidateOptimisticApplyRefusesMalformedSQL(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets", DDL: "ALTER TABLE public.widgets ADD COLUMN",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+	_, err := validateOptimisticApply(req)
+	require.EqualError(t, err, `apply PostgreSQL table "widgets": planned DDL is not one statement or a valid greenfield create set`)
+	assert.Contains(t, logs.String(), "syntax error")
+	assert.Contains(t, logs.String(), "database=app")
+	assert.Contains(t, logs.String(), "table=widgets")
+}
+
+func TestChangedRowSecurityReviewRequiresNewPlan(t *testing.T) {
+	r := classifyRefusal(executor.ErrRowSecurityPlanChanged, "documents")
+	require.NotNil(t, r)
+	assert.Equal(t, "row-security-plan-changed", r.reason)
+	assert.Equal(t, "re-plan and review the new SQL before applying", r.remedy)
 }

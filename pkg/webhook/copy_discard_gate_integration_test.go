@@ -296,14 +296,18 @@ func TestE2EDeferCutoverConfirmRechecksAgainstTheJoinedBatch(t *testing.T) {
 	const dbName = "webhook_copy_grouped_recheck"
 	f := setupGroupedDiscardGate(t, dbName)
 
+	// The operator is confirming a staging plan that told them nothing about
+	// a copy; plan identifiers are unique across the shared test storage.
+	noCopyPlanID := "plan-disclosing-no-copy-" + dbName
 	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName:  dbName,
 		DatabaseType:  "mysql",
 		Repository:    "octocat/hello-world",
 		PullRequest:   1,
 		Owner:         "octocat/hello-world#1",
-		PendingPlanID: "plan-disclosing-no-copy",
+		PendingPlanID: noCopyPlanID,
 	}))
+	seedConfirmationPlan(t, f.svc, dbName, noCopyPlanID, "staging")
 
 	rr := httptest.NewRecorder()
 	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
@@ -518,15 +522,18 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 	const dbName = "webhook_copy_discard_recheck"
 	f := setupDiscardGate(t, dbName)
 
-	// The operator is confirming a comment that told them nothing about a copy.
+	// The operator is confirming a staging plan that told them nothing about
+	// a copy; plan identifiers are unique across the shared test storage.
+	noCopyPlanID := "plan-disclosing-no-copy-" + dbName
 	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName:  dbName,
 		DatabaseType:  "mysql",
 		Repository:    "octocat/hello-world",
 		PullRequest:   1,
 		Owner:         "octocat/hello-world#1",
-		PendingPlanID: "plan-disclosing-no-copy",
+		PendingPlanID: noCopyPlanID,
 	}))
+	seedConfirmationPlan(t, f.svc, dbName, noCopyPlanID, "staging")
 
 	rr := httptest.NewRecorder()
 	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
@@ -553,7 +560,7 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 	// posted, and records that this one discloses the discard — without that the
 	// next confirm would load the comment that disclosed nothing and stop again.
 	lock := f.requireLockEventually(t, func(l *storage.Lock) bool {
-		return l.DisclosedCopyDiscard && l.PendingPlanID != "plan-disclosing-no-copy"
+		return l.DisclosedCopyDiscard && l.PendingPlanID != noCopyPlanID
 	}, "the stop must re-pin the confirmation onto the plan it just disclosed")
 	plan, err := f.svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
 	require.NoError(t, err)
@@ -685,14 +692,18 @@ func TestE2EApplyConfirmRecordsNoConsentWhenTheDisclosureCannotBePosted(t *testi
 	f := setupDiscardGate(t, dbName)
 	f.result.FailCommentPost.Store(true)
 
+	// The operator is confirming a staging plan that told them nothing about
+	// a copy; plan identifiers are unique across the shared test storage.
+	noCopyPlanID := "plan-disclosing-no-copy-" + dbName
 	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName:  dbName,
 		DatabaseType:  "mysql",
 		Repository:    "octocat/hello-world",
 		PullRequest:   1,
 		Owner:         "octocat/hello-world#1",
-		PendingPlanID: "plan-disclosing-no-copy",
+		PendingPlanID: noCopyPlanID,
 	}))
+	seedConfirmationPlan(t, f.svc, dbName, noCopyPlanID, "staging")
 
 	rr := httptest.NewRecorder()
 	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
@@ -716,7 +727,7 @@ func TestE2EApplyConfirmRecordsNoConsentWhenTheDisclosureCannotBePosted(t *testi
 		if err != nil || lock == nil {
 			return false
 		}
-		return lock.DisclosedCopyDiscard || lock.PendingPlanID != "plan-disclosing-no-copy"
+		return lock.DisclosedCopyDiscard || lock.PendingPlanID != noCopyPlanID
 	}, 2*time.Second, 100*time.Millisecond,
 		"a disclosure that never reached the operator must record no consent")
 

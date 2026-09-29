@@ -261,10 +261,17 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
 		{"APPLY BLOCKED: SCHEMA STALE (NEW COMMITS)", func() { fmt.Print(webhooktemplates.PreviewCommentStaleSchemaRejected()) }},
 		{"APPLY BLOCKED: CONFIRMED PLAN STALE", func() { fmt.Print(webhooktemplates.PreviewCommentStalePlanRejected()) }},
+		{"APPLY-CONFIRM REFUSED: PLAN IS FOR ANOTHER ENVIRONMENT", func() {
+			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanForOtherEnvironment())
+		}},
+		{"APPLY-CONFIRM REFUSED: PLAN CANNOT BE LOADED", func() {
+			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanUnavailable())
+		}},
 		{"APPLY BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
 		{"APPLY BLOCKED: PRIOR ENV CHECK MISSING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByMissingPriorEnvCheck()) }},
+		{"APPLY BLOCKED: PRIOR ENV CHECK ON ANOTHER COMMIT", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByStalePriorEnvCheck()) }},
 		{"APPLY BLOCKED: PRIOR ENV CHECK READ ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvCheckError()) }},
 		{"APPLY BLOCKED: PRIOR ENV CHECK UNTRUSTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUntrustedPriorEnvCheck()) }},
 		{"APPLY BLOCKED: ENVIRONMENT NOT IN PROMOTION ORDER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUnlistedEnvironment()) }},
@@ -384,6 +391,7 @@ func previewCommentShardedAllOutput() {
 		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
 		{"APPLY ACROSS MULTIPLE KEYSPACES", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyMultiKeyspace()) }},
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
+		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
 		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}
@@ -396,6 +404,7 @@ func previewCLIPlanAllOutput() {
 		fn   func()
 	}{
 		{"PLAN (MYSQL)", previewPlanOutput},
+		{"PLAN (POSTGRES)", previewPostgresPlanOutput},
 		{"PLAN (NO CHANGES)", previewPlanNoChangesOutput},
 		{"PLAN (VITESS)", previewVitessPlanOutput},
 		{"MULTI-ENV PLAN (IDENTICAL)", previewMultiEnvPlanOutput},

@@ -83,6 +83,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
+	s.claimingStopped = false
 	s.operatorMu.Unlock()
 
 	// Seed both occupancy gauges before any driver claims so the pool's
@@ -155,6 +156,34 @@ func (s *Service) logAbandonedDrives() {
 	}
 }
 
+// StopClaiming closes the operator's claim gate without ending its drives. Idle
+// drivers return and the reaper passes stop, so this process claims no new
+// apply from here on, while every drive already in flight keeps running, and
+// its lease renewed, until StopOperator brings it down and hands its claim back.
+//
+// A process that has been told to shut down calls this at the signal, ahead of
+// the listener drains that run before StopOperator. Without it an idle driver
+// on the terminating process can claim a pending apply during those drains and
+// start its engine, only for StopOperator to halt it seconds later and hand it
+// to a peer, which restarts the schema change from its checkpoint. Safe to call
+// multiple times, and StopOperator calls it first.
+func (s *Service) StopClaiming() {
+	s.operatorMu.Lock()
+	defer s.operatorMu.Unlock()
+	s.stopClaimingLocked()
+}
+
+// stopClaimingLocked closes the claim gate at most once per StartOperator. The
+// caller holds operatorMu.
+func (s *Service) stopClaimingLocked() {
+	if s.stopRecovery == nil || s.claimingStopped {
+		return
+	}
+	s.claimingStopped = true
+	close(s.stopRecovery)
+	s.logger.Info("operator stopped claiming new applies; in-flight drives continue until the operator stops")
+}
+
 // StopOperator stops the background operator and waits for all drivers to
 // finish, up to driverDrainTimeout. Safe to call multiple times.
 //
@@ -173,16 +202,15 @@ func (s *Service) StopOperator() {
 		s.operatorMu.Unlock()
 		return
 	}
-	stop := s.stopRecovery
+	// Stop claiming first, so no driver picks up new work while the in-flight
+	// drives are being brought down. The gate may already be closed by
+	// StopClaiming at the shutdown signal.
+	s.stopClaimingLocked()
 	cancel := s.cancelRecovery
 	s.stopRecovery = nil
 	s.cancelRecovery = nil
 	s.operatorWake = nil
 	s.operatorMu.Unlock()
-
-	// Stop claiming first, so no driver picks up new work while the in-flight
-	// drives are being brought down.
-	close(stop)
 
 	// From here on a drive that returns leaves its claim registered. A drive
 	// already past its stop-channel check can still take a claim after this
@@ -1203,6 +1231,13 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		s.failOperationWithoutTasks(operationLeaseCtx, operationLeaseCtx, driverID, op, failApply)
 		return
 	}
+	if !resumed && errors.Is(resumeErr, tern.ErrApplyTaskRowMissing) {
+		// The drive failed closed: a task it loaded has no row, so the rows that
+		// remain would derive a verdict the vanished task never earned. Leave
+		// the operation row as found and claimable; resumeClaimedApply already
+		// logged and counted the cause.
+		return
+	}
 
 	// Persist the operation row from its OWN tasks — even when the drive returned
 	// an error. Unlike the single-op path, a multi-op drive has no
@@ -2188,6 +2223,20 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			logger.Error("operator: apply owns task rows the drive did not load; refusing task-less completion and leaving the apply claimable",
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_tasks_not_loaded")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrApplyTaskRowMissing) {
+			// Fail-closed: a task the drive loaded has no row when re-read before
+			// it starts, so the rows that remain cannot stand in for the apply's
+			// verdict. The drive wrote no verdict; the apply stays claimable and
+			// each re-claim fails here, so the stuck work stays visible on this
+			// counter until the row is restored or an operator intervenes.
+			logger.Error("operator: apply task row vanished before its drive; refusing to derive a verdict from the remaining tasks and leaving the apply claimable",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_task_row_missing")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}

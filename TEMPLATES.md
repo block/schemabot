@@ -971,7 +971,11 @@ ALTER TABLE users
     ADD COLUMN preferences jsonb;
 ```
 
-📋 **Plan**: **1** table to create, **1** table to alter
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
+```
+
+📋 **Plan**: **1** table to create, **1** table to alter, **1** index to create
 
 
 ---
@@ -2343,6 +2347,41 @@ Options: ⏸️ Defer Cutover
 </details>
 
 <details>
+<summary><a name="plan-postgres"></a><strong>Plan (Postgres)</strong></summary>
+
+```
+
+╭─────────────────────────────────────────────╮
+│  PostgreSQL Schema Change Plan              │
+│                                             │
+│  Database: testapp                          │
+│  Environment: staging                       │
+│  Schema name: testapp                       │
+╰─────────────────────────────────────────────╯
+
+     + sessions
+       CREATE TABLE sessions (
+           id uuid PRIMARY KEY,
+           user_id bigint NOT NULL,
+           payload jsonb,
+           created_at timestamptz NOT NULL DEFAULT now()
+       );
+
+     ~ users
+       ALTER TABLE users
+           ADD COLUMN last_seen_at timestamptz,
+           ADD COLUMN preferences jsonb;
+
+     ~ orders
+       CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
+
+📋 Plan: 1 table to create, 1 table to alter, 1 index to create
+
+
+```
+</details>
+
+<details>
 <summary><a name="plan-no-changes"></a><strong>Plan (No Changes)</strong></summary>
 
 ```
@@ -3197,6 +3236,54 @@ _Requested by @jackjackbits_
 </details>
 
 <details>
+<summary><a name="applyconfirm-refused-plan-is-for-another-environment"></a><strong>Apply-confirm Refused: Plan Is For Another Environment</strong></summary>
+
+
+## ⛔ Apply-confirm Refused — Production
+
+**Database**: `testapp`
+
+The pending confirmation is for `staging`, not `production`; nothing was applied.
+
+To confirm the `staging` plan:
+
+```
+schemabot apply-confirm -e staging -d testapp --defer-cutover
+```
+
+To apply `production` instead, dropping the pending `staging` confirmation and planning and applying `production` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:
+
+```
+schemabot apply -e production -d testapp --defer-cutover
+```
+
+_Requested by @jackjackbits_
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="applyconfirm-refused-plan-cannot-be-loaded"></a><strong>Apply-confirm Refused: Plan Cannot Be Loaded</strong></summary>
+
+
+## ⛔ Apply-confirm Refused — Production
+
+**Database**: `testapp`
+
+The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.
+
+To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:
+
+```
+schemabot apply -e production -d testapp --defer-cutover
+```
+
+_Requested by @jackjackbits_
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
 
 
@@ -3257,6 +3344,24 @@ schemabot apply -e production
 SchemaBot could not find a completed `staging` check for this PR.
 
 SchemaBot must verify `staging` before applying a later environment. Create the missing `staging` status with:
+```
+schemabot plan -e staging
+```
+
+If the plan finds changes, apply `staging` and wait for the SchemaBot check to succeed. Then retry this apply.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-prior-env-check-on-another-commit"></a><strong>Apply Blocked: Prior Env Check On Another Commit</strong></summary>
+
+
+## ⛔ Apply Blocked
+
+The `staging` check for this PR was recorded on commit `0123456`, but this apply read the schema at commit `abcdef1`.
+
+SchemaBot only accepts a `staging` result recorded on the commit being applied. Re-check `staging` on the PR head with:
 ```
 schemabot plan -e staging
 ```
@@ -6117,7 +6222,7 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 
 
 ```
@@ -8007,14 +8112,14 @@ _No details available yet._
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
 2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
 
-== engine logs: shard-a, target: cluster-a ==
+== engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001 ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
 2026-03-15 14:24:00 UTC [INF] [users] copy progress: 12.4% 181812/1466232 rows, eta 21m
 2026-03-15 14:27:00 UTC [INF] [users] copy progress: 30.0% 439870/1466232 rows, eta 14m
 2026-03-15 14:27:40 UTC [WRN] [users] unsafe warning 1265: Data truncated for column 'nickname' at row 1
 2026-03-15 14:27:41 UTC [ERR] [users] aborting: the copy would change values that are already in the table
 
-== engine logs: shard-b, target: cluster-b ==
+== engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002 ==
 2026-03-15 14:22:30 UTC [INF] [users] copy starting: 1192044 rows estimated, 4 threads
 2026-03-15 14:27:00 UTC [INF] [users] copy complete: 1192044 rows
 2026-03-15 14:28:00 UTC [INF] [users] cutover complete
@@ -8350,6 +8455,31 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
    }
  }
 ```
+
+
+</details>
+
+<details>
+<summary><a name="summary-keyspace-finalized"></a><strong>Summary: Keyspace Finalized</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+> Applied successfully — your schema change is live!
+
+**Shards**: 2 completed
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ✅ Complete (2 shards)
+
+### Finalize
+
+**`cdb_resolute_sharded`**: Finalized
 
 
 </details>

@@ -42,8 +42,11 @@ import (
 // subset of environments. For prior environments owned by this instance, local
 // storage is checked. For prior environments owned by another instance, the
 // GitHub Checks API is queried for the per-environment aggregate check run.
+// Either way, only a result recorded on the PR's current head commit satisfies
+// the gate: headSHA is the head the caller read, and stored check state for
+// any other commit does not count for it.
 func (h *Handler) checkPriorEnvironments(
-	ctx context.Context, repo string, pr int,
+	ctx context.Context, repo string, pr int, headSHA string,
 	database, dbType, environment string,
 	environments []string,
 	installationID int64,
@@ -92,7 +95,7 @@ func (h *Handler) checkPriorEnvironments(
 
 		if config.IsEnvironmentAllowed(priorEnv) {
 			// This instance owns the prior environment — check local database
-			blocked, err := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID, suppressRetryComments)
+			blocked, err := h.checkPriorEnvViaLocal(ctx, repo, pr, headSHA, database, dbType, environment, priorEnv, installationID, suppressRetryComments)
 			if err != nil {
 				return false, err
 			}
@@ -154,16 +157,34 @@ func (h *Handler) promotionCheckNameForRepo(repo string) string {
 // checkPriorEnvViaLocal checks the prior environment status using the local
 // database. A storage read failure stops the command (fail closed) and is
 // returned as an error rather than a block.
+//
+// The stored check state is one row per target, not one per commit, so a
+// success recorded on an earlier commit is still in the row after a push. The
+// gate only accepts a success whose commit is headSHA, the PR's current head:
+// a row for any other commit blocks, since the prior environment has not been
+// verified against what would now be applied.
 func (h *Handler) checkPriorEnvViaLocal(
-	ctx context.Context, repo string, pr int,
+	ctx context.Context, repo string, pr int, headSHA string,
 	database, dbType, environment, priorEnv string,
 	installationID int64,
 	suppressRetryComments bool,
 ) (blocked bool, err error) {
-	check, err := h.waitForLocalPriorEnvCheck(ctx, repo, pr, database, dbType, environment, priorEnv)
+	if headSHA == "" {
+		h.logger.Error("PR head commit is unknown, cannot verify prior environment check, stopping apply",
+			"repo", repo, "pr", pr,
+			"database", database, "database_type", dbType,
+			"environment", environment, "prior_environment", priorEnv)
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID,
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "resolve the PR head commit"))
+		}
+		return false, fmt.Errorf("prior environment gate for %s: PR %s#%d head commit is empty", priorEnv, repo, pr)
+	}
+
+	check, err := h.waitForLocalPriorEnvCheck(ctx, repo, pr, headSHA, database, dbType, environment, priorEnv)
 	if err != nil {
 		h.logger.Error("failed to look up prior environment check",
-			"repo", repo, "pr", pr,
+			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
 			"error", err)
@@ -176,7 +197,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 
 	if check == nil {
 		h.logger.Warn("prior environment check is missing, blocking apply",
-			"repo", repo, "pr", pr,
+			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
 			"attempts", h.priorEnvCheckMaxAttemptCount())
@@ -185,23 +206,42 @@ func (h *Handler) checkPriorEnvViaLocal(
 		return true, nil
 	}
 
+	// Every branch below except the first blocks; the order decides the
+	// guidance. A running check is reported as running whichever commit it
+	// names, since its row is about to change anyway and the operator's next
+	// step is to wait. A completed row is then held to the head: one recorded
+	// on another commit asks for a re-check on the head, whatever it concluded,
+	// because its outcome says nothing about the commit being applied. Only a
+	// completed non-success row on the head reports that outcome as the reason.
 	switch {
-	case check.Conclusion == checkConclusionSuccess:
-		h.logger.Debug("prior environment check passed, allowing apply",
-			"repo", repo, "pr", pr,
+	case check.Conclusion == checkConclusionSuccess && storedPriorEnvCheckIsForHead(check, headSHA):
+		h.logger.Debug("prior environment check passed on the PR head commit, allowing apply",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
-			"check_status", check.Status, "check_conclusion", check.Conclusion)
+			"check_id", check.ID, "check_status", check.Status, "check_conclusion", check.Conclusion)
 		return false, nil
 	case check.Status == checkStatusInProgress:
 		h.logger.Warn("prior environment check is still in progress after retries, blocking apply",
-			"repo", repo, "pr", pr,
+			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
+			"check_id", check.ID, "check_head_sha", check.HeadSHA,
 			"check_status", check.Status, "check_conclusion", check.Conclusion,
 			"attempts", h.priorEnvCheckMaxAttemptCount())
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
+		return true, nil
+	case !storedPriorEnvCheckIsForHead(check, headSHA):
+		h.logger.Warn("prior environment check was recorded on a commit other than the PR head, blocking apply",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", database, "database_type", dbType,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_id", check.ID, "check_head_sha", check.HeadSHA,
+			"check_status", check.Status, "check_conclusion", check.Conclusion,
+			"attempts", h.priorEnvCheckMaxAttemptCount())
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByStalePriorEnvCheck(priorEnv, check.HeadSHA, headSHA))
 		return true, nil
 	default:
 		status := "has pending changes"
@@ -217,11 +257,13 @@ func (h *Handler) checkPriorEnvViaLocal(
 }
 
 func (h *Handler) waitForLocalPriorEnvCheck(
-	ctx context.Context, repo string, pr int,
+	ctx context.Context, repo string, pr int, headSHA string,
 	database, dbType, environment, priorEnv string,
 ) (*storage.Check, error) {
 	// A later-environment apply can race a prior-environment plan/apply webhook
-	// that has not persisted its check state yet. Retry briefly, then preserve
+	// that has not persisted its check state yet — including the plan a push
+	// triggers for the new head, which runs asynchronously and leaves the row
+	// naming the previous commit until it lands. Retry briefly, then preserve
 	// the fail-closed behavior if the prior environment still cannot be proven
 	// safe.
 	attempts := h.priorEnvCheckMaxAttemptCount()
@@ -230,15 +272,16 @@ func (h *Handler) waitForLocalPriorEnvCheck(
 		if err != nil {
 			return nil, err
 		}
-		if !shouldRetryStoredPriorEnvCheck(check) || attempt == attempts {
+		if !shouldRetryStoredPriorEnvCheck(check, headSHA) || attempt == attempts {
 			return check, nil
 		}
 
 		h.logger.Debug("prior environment check state not ready, retrying",
-			"repo", repo, "pr", pr,
+			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
 			"check_status", storedPriorEnvCheckStatus(check),
+			"check_head_sha", storedPriorEnvCheckHeadSHA(check),
 			"attempt", attempt, "max_attempts", attempts)
 		if err := h.waitBeforePriorEnvCheckRetry(ctx); err != nil {
 			return nil, err
@@ -248,8 +291,24 @@ func (h *Handler) waitForLocalPriorEnvCheck(
 	return nil, nil
 }
 
-func shouldRetryStoredPriorEnvCheck(check *storage.Check) bool {
-	return check == nil || check.Status == checkStatusInProgress
+// shouldRetryStoredPriorEnvCheck reports whether the stored check state may
+// still be about to change into an answer for headSHA: it is missing, still
+// running, or names a commit other than the PR head.
+func shouldRetryStoredPriorEnvCheck(check *storage.Check, headSHA string) bool {
+	if check == nil {
+		return true
+	}
+	if check.Status == checkStatusInProgress {
+		return true
+	}
+	return !storedPriorEnvCheckIsForHead(check, headSHA)
+}
+
+// storedPriorEnvCheckIsForHead reports whether the stored check state was
+// recorded on headSHA. A result for any other commit says nothing about what
+// the PR would apply now.
+func storedPriorEnvCheckIsForHead(check *storage.Check, headSHA string) bool {
+	return headSHA != "" && check.HeadSHA == headSHA
 }
 
 func storedPriorEnvCheckStatus(check *storage.Check) string {
@@ -257,6 +316,13 @@ func storedPriorEnvCheckStatus(check *storage.Check) string {
 		return "missing"
 	}
 	return check.Status
+}
+
+func storedPriorEnvCheckHeadSHA(check *storage.Check) string {
+	if check == nil {
+		return ""
+	}
+	return check.HeadSHA
 }
 
 // checkPriorEnvViaGitHub checks the prior environment status by querying the

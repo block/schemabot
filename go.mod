@@ -10,8 +10,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.5
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
 	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6
-	github.com/block/pg-sprite v0.3.3
-	github.com/block/spirit v0.17.1-0.20260922210801-ca2b6507dda6
+	github.com/block/pg-sprite v0.3.4-0.20260929034750-8fee9dab1a62
+	github.com/block/spirit v0.17.1-0.20260928203749-476f41d59932
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -24,6 +24,7 @@ require (
 	github.com/google/go-github/v86 v86.0.0
 	github.com/google/uuid v1.6.0
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0
+	github.com/hashicorp/go-cleanhttp v0.5.2
 	github.com/hmarr/codeowners v1.2.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/moby/moby/api v1.54.2
@@ -158,7 +159,6 @@ require (
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
 	github.com/hashicorp/consul/api v1.34.1 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
-	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-metrics v0.5.4 // indirect

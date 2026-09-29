@@ -333,10 +333,12 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		// The verdict is decided, but the apply is not over. A fail-closed
 		// policy only refuses new claims; it cancels nothing, so a sibling
 		// that a driver already started keeps writing to its target. Recording
-		// the terminal verdict over it would release the reservation on the
-		// parent's whole target set (OW-5) while one of those targets is
-		// mid-change, and would take stop and cancel away from the operator who
-		// still has live work to stop. Hold the apply until that work settles.
+		// the terminal verdict over it would take stop and cancel away from the
+		// operator who still has live work to stop. It would also release the
+		// reservation on the parent's target set (OW-5) over a sibling that
+		// storage does not count as in progress: one an operator stopped, or
+		// one awaiting a retry that no driver is working. Hold the apply until
+		// that work settles.
 		// A sibling still pending holds nothing: the same policy is what stops
 		// it from ever starting. A sibling an operator stopped still holds its
 		// target, because it can be started again.

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -711,7 +712,9 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
 }
 
-// Interactive throttle hints use the same labeled terminal links as CLI lists.
+// Interactive throttle hints point at the throttle reference the way a PR
+// comment's docs line does: the docs glyph, a readable label, and the page's
+// short path as the hyperlink text.
 func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
 	enableHyperlinks(t)
 	output := FormatThrottleReference([]TableProgress{{
@@ -719,7 +722,8 @@ func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true, ThrottleReason: "commit-latency 120ms >= 100ms",
 	}})
-	assert.Contains(t, output, "Docs: "+ui.Link("Throttle reference", ui.ThrottleDocURL))
+	assert.Contains(t, output, glyph.Docs+" Docs: "+ANSIBlue+ui.Link("docs/throttle.md", ui.ThrottleDocURL)+ANSIReset)
+	assert.NotContains(t, output, ANSIDim, "the docs line is not dimmed")
 }
 
 func TestFormatTableProgress_InstantDDL(t *testing.T) {

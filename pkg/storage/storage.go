@@ -138,9 +138,25 @@ type LockStore interface {
 	// If the same owner already holds the lock, this is a no-op (idempotent).
 	Acquire(ctx context.Context, lock *Lock) error
 
+	// AcquireIfPendingPlanID acquires like Acquire, but only while the lock is
+	// in the state the caller observed: free when observedPendingPlanID is
+	// empty, or held by the same owner with observedPendingPlanID as its
+	// pending plan. Any other same-owner state returns ErrLockIntentChanged and
+	// leaves the stored pending plan alone, so a command that planned against
+	// one intent can never overwrite an intent another command pinned since.
+	AcquireIfPendingPlanID(ctx context.Context, lock *Lock, observedPendingPlanID string) error
+
 	// Release releases a lock. Only succeeds if caller is the owner.
 	// Returns ErrLockNotOwned if the lock is not owned by the caller.
 	Release(ctx context.Context, database, dbType, owner string) error
+
+	// ReleaseByID releases the lock only while the row with the given ID still
+	// holds it under the given owner, so a caller that authorized the release
+	// against that row's recorded acquirer can never delete a newer lock. It
+	// returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
+	// different row holds the lock, and ErrLockNotOwned when the row is held
+	// under another owner.
+	ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error
 
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
@@ -629,10 +645,12 @@ type ApplyStore interface {
 	// and environment.
 	// Returns ErrApplyReopenRefused when the write would reopen a finished
 	// apply: an active state over a terminal row, or stopped over a settled
-	// one, since a stopped apply can be claimed to resume. Every other terminal
-	// write is allowed, including cancelling a stopped apply and same-state
-	// refreshes. Returns ErrApplyNotFound when a guarded write matches no row
-	// because the apply does not exist.
+	// one, since a stopped apply can be claimed to resume. Returns
+	// ErrApplyOutcomeSettled when the write would replace a settled outcome
+	// with a different one. Every other terminal write is allowed, including
+	// cancelling a stopped apply and same-state refreshes. Returns
+	// ErrApplyNotFound when a guarded write matches no row because the apply
+	// does not exist.
 	Update(ctx context.Context, apply *Apply) error
 
 	// UpdateDerivedState compare-and-swaps the rollout-projected applies.state.
@@ -819,6 +837,35 @@ type ApplyStore interface {
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error
+
+	// WithExclusiveTarget runs fn while holding the apply target's advisory
+	// lock, having first refused to run it at all if another active apply owns
+	// that target.
+	//
+	// It is for work that touches the target database rather than storage, and
+	// that would destroy another apply's live work if it ran alongside one —
+	// reclaiming what a cancelled schema change left on the target, say, where
+	// the leftovers are named after the target's own tables and so are
+	// indistinguishable from a running apply's. What fn is given is the lock,
+	// held for its whole run, rather than a fact about the target read once at
+	// the start: the lock is what keeps the next apply out while fn works,
+	// where a read would only ever have been true of the instant it happened.
+	// Task rows are not a substitute for either, because they see only one
+	// deployment's work and fail toward "nothing is running", the wrong
+	// direction for a destructive one.
+	//
+	// The lock keeps SchemaBot's own applies off the target. It says nothing
+	// about a schema change run against the same schema from outside
+	// SchemaBot, which takes no lock here and leaves no active apply for the
+	// re-check to find. Work under fn that could destroy such a change's
+	// artifacts needs a guard of its own; this is not it.
+	//
+	// Returns ErrActiveApplyExists without running fn when another active apply
+	// owns the target, so the caller can report the skip rather than proceed.
+	//
+	// The lock is held for as long as fn runs, so fn must be bounded: every
+	// apply competing for this target waits behind it.
+	WithExclusiveTarget(ctx context.Context, apply *Apply, fn func(context.Context) error) error
 
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
 	// retry budget or recovery freshness window to permanent failed, settling

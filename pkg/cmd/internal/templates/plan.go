@@ -112,6 +112,9 @@ type NamespaceChange struct {
 	Changes        []DDLChange
 	VSchemaChanged bool
 	VSchemaDiff    string
+	// Finalize marks a namespace the engine asked to finalize after its DDL
+	// without a VSchema document to apply.
+	Finalize bool
 }
 
 // WriteNamespaceChanges writes per-namespace DDL and VSchema sections.
@@ -136,13 +139,13 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 	}
 	var groups []nsGroup
 	for _, ns := range namespaces {
-		if len(ns.Changes) == 0 && !ns.VSchemaChanged {
+		if len(ns.Changes) == 0 && !ns.VSchemaChanged && !ns.Finalize {
 			continue
 		}
 		// Try to merge with previous group if DDL is identical
-		if len(groups) > 0 && !ns.VSchemaChanged {
+		if len(groups) > 0 && !ns.VSchemaChanged && !ns.Finalize {
 			prev := &groups[len(groups)-1]
-			if !prev.namespaces[0].VSchemaChanged && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
+			if !prev.namespaces[0].VSchemaChanged && !prev.namespaces[0].Finalize && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
 				prev.namespaces = append(prev.namespaces, ns)
 				continue
 			}
@@ -177,6 +180,9 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, indentContent))
 						fmt.Println()
 					}
+				}
+				if ns.Finalize && (!ns.VSchemaChanged || isMySQL) {
+					fmt.Println(indentTable + "~ Finalized by the engine once every shard's DDL has landed")
 				}
 				if len(ns.Changes) > 0 {
 					WriteSQLChanges(ns.Changes, dialect)
@@ -348,6 +354,13 @@ type VSchemaChange struct {
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
 func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
+	WritePlanSummaryWithKeyspaceUpdates(ddlChanges, vschemaChanges, 0)
+}
+
+// WritePlanSummaryWithKeyspaceUpdates writes a single plan summary line
+// including VSchema changes and the keyspaces the engine asked to finalize
+// without a VSchema change.
+func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
 	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
@@ -356,6 +369,13 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 		}
 		parts = append(parts, fmt.Sprintf("%d %s", len(vschemaChanges), word))
 	}
+	if finalizes > 0 {
+		word := "keyspace"
+		if finalizes > 1 {
+			word = "keyspaces"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s to finalize", finalizes, word))
+	}
 
 	if len(parts) > 0 {
 		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
@@ -363,11 +383,11 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 	}
 }
 
-// ddlSummaryParts builds the create/alter/drop clauses of the plan summary.
-// Statements outside those buckets (indexes, types, extensions, comments)
-// still run, so a mixed plan names them alongside the table counts, and a plan
-// made only of them reports its raw statement total so it never reads as "no
-// changes".
+// ddlSummaryParts builds the table and index clauses of the plan summary.
+// Index builds and drops on existing tables are named in their own clauses.
+// Statements outside every bucket (types, extensions, comments) still run, so
+// a mixed plan names them alongside the counted clauses, and a plan made only
+// of them reports its raw statement total so it never reads as "no changes".
 func ddlSummaryParts(changes []DDLChange) []string {
 	var counts ui.PlanCounts
 	for _, c := range changes {

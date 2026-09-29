@@ -369,7 +369,11 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 // resumeApplySequential processes resumed tasks one at a time in sequence.
 // This preserves the sequential behavior of the original apply when --defer-cutover
 // was NOT used. Each task gets its own eng.Apply + pollTaskToCompletion cycle.
-func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+// It returns ErrApplyTaskRowMissing when a task loaded for this resume no
+// longer has a row, so the operator refuses to derive an operation verdict from
+// the rows that remain; every other early exit leaves the apply claimable and
+// returns nil.
+func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) error {
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
@@ -392,7 +396,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
-			return
+			return nil
 		} else if standDown {
 			stoppedByUser = true
 			break
@@ -400,7 +404,13 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskHandover {
-			return
+			return nil
+		}
+		if action == taskAbort {
+			return nil
+		}
+		if action == taskMissing {
+			return fmt.Errorf("apply %s task %s: %w", apply.ApplyIdentifier, task.TaskIdentifier, ErrApplyTaskRowMissing)
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -447,7 +457,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier)); err != nil {
 				logger.Error("resume aborting: persisting a raced-cutover task settlement failed; the apply stays active for a later drive to redo the settlement",
 					"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-				return
+				return nil
 			}
 			continue
 		} else if _, landed, err := c.verifyReplannedTaskDDL(task, replanned, tasks); err != nil {
@@ -473,7 +483,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				fmt.Sprintf("Task %s already completed (its statement landed before its outcome was recorded)", task.TaskIdentifier)); err != nil {
 				logger.Error("resume aborting: persisting a landed-statement task settlement failed; the apply stays active for a later drive to redo the settlement",
 					append(task.LogAttrs(), "error", err)...)
-				return
+				return nil
 			}
 			continue
 		}
@@ -490,7 +500,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			break
 		}
 		if action == taskAbort || action == taskHandover {
-			return
+			return nil
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -501,6 +511,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	// Update apply state based on task outcomes
 	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
 	logger.Info("sequential resume finished", "state", apply.State)
+	return nil
 }
 
 // shardTableKey identifies a table change within a specific (namespace, shard).
@@ -1771,7 +1782,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("resolve credentials for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 
-	c.logger.Info("driving group_finalizer VSchema apply",
+	work := finalizerWork(changes)
+	c.logger.Info("driving group_finalizer",
+		"work", work,
 		"apply_id", apply.ApplyIdentifier,
 		"apply_operation_id", op.ID,
 		"deployment", op.Deployment,
@@ -1831,10 +1844,10 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		OnStateChange: persistResume,
 	})
 	if err != nil {
-		return failClosed(fmt.Errorf("apply VSchema for group_finalizer (apply %s): %w", apply.ApplyIdentifier, err))
+		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 	}
 	if result == nil || !result.Accepted {
-		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s was not accepted", apply.ApplyIdentifier))
+		return failClosed(fmt.Errorf("group_finalizer %s for apply %s was not accepted", work, apply.ApplyIdentifier))
 	}
 
 	// A nil resume state means the engine has no in-flight work to track: the
@@ -1846,46 +1859,82 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		persistResume(result.ResumeState)
 		finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, result.ResumeState, persistResume)
 		if err != nil {
-			return failClosed(fmt.Errorf("await group_finalizer VSchema apply (apply %s): %w", apply.ApplyIdentifier, err))
+			return failClosed(fmt.Errorf("await group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 		}
 		if !finalizerVSchemaApplied(finalState) {
-			return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s ended in non-success state %q", apply.ApplyIdentifier, finalState))
+			return failClosed(fmt.Errorf("group_finalizer %s for apply %s ended in non-success state %q", work, apply.ApplyIdentifier, finalState))
 		}
 	}
 	if err := c.storage.ApplyOperations().MarkCompleted(ctx, op.ID); err != nil {
 		return fmt.Errorf("mark group_finalizer apply_operation %d completed (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
-	c.logger.Info("group_finalizer VSchema apply completed",
-		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
+	c.logger.Info("group_finalizer completed",
+		"work", work, "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
 	return nil
 }
 
-// finalizerVSchemaChanges reconstructs the VSchema change(s) a group_finalizer
-// applies, from the plan. A namespace-scoped finalizer (operation key
-// "<ns>/group_finalizer", from a sharded fan-out) applies that one namespace's
-// VSchema. A finalizer with no namespace in its key (a non-sharded VSchema-only
-// apply on an externally-authoritative engine) applies every VSchema-changed
-// namespace in the plan, because that engine deploys the whole branch in one
-// operation.
+// finalizerVSchemaChanges reconstructs the change(s) a group_finalizer applies,
+// from the plan. A namespace-scoped finalizer (operation key
+// "<ns>/group_finalizer", from a sharded fan-out) finalizes that one namespace.
+// A finalizer with no namespace in its key (a finalizer-only apply) finalizes
+// every namespace in the plan that needs it, because an externally-authoritative
+// engine deploys the whole branch in one operation.
+//
+// Each change says what the finalizer is for: vschema_changed when the
+// namespace's VSchema document changes, and needs_finalizer when the engine
+// asked to finalize the namespace. A namespace the engine asked to finalize
+// whose VSchema is unchanged carries only needs_finalizer, so the engine
+// finalizes it without being told to apply a VSchema it does not have.
 func finalizerVSchemaChanges(plan *storage.Plan, namespace string) ([]engine.SchemaChange, error) {
-	vschemaChange := func(ns string) engine.SchemaChange {
-		return engine.SchemaChange{Namespace: ns, Metadata: map[string]string{"vschema_changed": "true"}}
+	finalizerChange := func(ns string) engine.SchemaChange {
+		nsData := plan.Namespaces[ns]
+		metadata := map[string]string{}
+		if nsData.ChangesVSchema() {
+			metadata[storage.PlanMetadataVSchemaChanged] = "true"
+		}
+		if nsData.Finalize {
+			metadata[engine.MetadataNeedsFinalizer] = "true"
+		}
+		return engine.SchemaChange{Namespace: ns, Metadata: metadata}
 	}
 	if namespace != "" {
-		if !plan.Namespaces[namespace].ChangesVSchema() {
-			return nil, fmt.Errorf("plan %d has no VSchema artifact for namespace %q", plan.ID, namespace)
+		if !plan.Namespaces[namespace].NeedsFinalizer() {
+			return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for namespace %q", plan.ID, namespace)
 		}
-		return []engine.SchemaChange{vschemaChange(namespace)}, nil
+		return []engine.SchemaChange{finalizerChange(namespace)}, nil
 	}
-	namespaces := plan.VSchemaNamespaces()
+	namespaces := plan.FinalizerNamespaces()
 	if len(namespaces) == 0 {
-		return nil, fmt.Errorf("plan %d has no VSchema artifact for a deployment-scoped finalizer", plan.ID)
+		return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for a deployment-scoped finalizer", plan.ID)
 	}
 	changes := make([]engine.SchemaChange, 0, len(namespaces))
 	for _, ns := range namespaces {
-		changes = append(changes, vschemaChange(ns))
+		changes = append(changes, finalizerChange(ns))
 	}
 	return changes, nil
+}
+
+// finalizerWork names what a group_finalizer's changes ask the engine to do,
+// for its logs and errors: apply a changed VSchema, finalize a namespace whose
+// VSchema is unchanged, or both across namespaces. Triage then looks for a
+// VSchema document only when there is one.
+func finalizerWork(changes []engine.SchemaChange) string {
+	var vschema, finalizeOnly bool
+	for _, change := range changes {
+		if change.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+			vschema = true
+		} else {
+			finalizeOnly = true
+		}
+	}
+	switch {
+	case vschema && finalizeOnly:
+		return "VSchema apply and finalize"
+	case vschema:
+		return "VSchema apply"
+	default:
+		return "finalize"
+	}
 }
 
 // finalizerVSchemaApplied reports whether an engine progress state means the
@@ -2278,7 +2327,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
-		c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options)
+		if err := c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options); err != nil {
+			return err
+		}
 	}
 
 	return ctx.Err()

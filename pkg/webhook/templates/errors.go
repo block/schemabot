@@ -141,7 +141,7 @@ func (d SchemaErrorData) Attribution() string {
 // working config carries it: without one the comment states a requirement and
 // leaves the reader to guess the rest of the file (UX-4).
 func (d SchemaErrorData) SchemaConfigDocs() string {
-	return "📖 **Docs:** [Setting up `schemabot.yaml`](" + ui.SchemaConfigDocURL + ")"
+	return glyph.Docs + " **Docs:** [Setting up `schemabot.yaml`](" + ui.SchemaConfigDocURL + ")"
 }
 
 const databaseNotFoundTemplate = "## " + glyph.Attention + ` Database Not Found

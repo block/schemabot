@@ -158,11 +158,40 @@ type Lock struct {
 	// rather than assuming consent.
 	DisclosedCopyDiscard bool
 
+	// Acquirer records the verified caller that created this lock row, for
+	// deciding whose operator grant the lock falls under. Owner cannot answer
+	// that: it is a caller-supplied match token, readable by anyone who can
+	// list locks.
+	//
+	// Nil when nobody verified was behind the acquire: locks taken server-side
+	// (a PR's apply), locks acquired on a deployment with no scoped operator
+	// grants configured, and rows written before this was recorded. Readers
+	// must treat nil as "shares a grant with nobody", never as "shares a grant
+	// with everybody".
+	//
+	// Only the insert that creates the row writes it. A same-owner re-acquire
+	// leaves it untouched, so for a given lock ID the recorded acquirer never
+	// changes.
+	Acquirer *LockAcquirer
+
 	// CreatedAt is when the lock was acquired.
 	CreatedAt time.Time
 
 	// UpdatedAt is when the lock was last updated.
 	UpdatedAt time.Time
+}
+
+// LockAcquirer is the verified caller behind a lock acquire.
+type LockAcquirer struct {
+	// Subject is the caller's verified identity from the auth layer, never
+	// a client-supplied string.
+	Subject string
+
+	// OperatorGroups are the configured operator groups of the locked database
+	// the caller was a member of when they acquired the lock, by their
+	// configured names, sorted. Empty when the caller held none of them (for
+	// example a deployment admin acting through a write group alone).
+	OperatorGroups []string
 }
 
 // Check terminology:
@@ -512,6 +541,14 @@ type NamespacePlanData struct {
 	// Plan.IgnoreTables reads their union. A re-plan that rebuilds only some
 	// of the plan's namespaces therefore still withholds all of them.
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
+
+	// Finalize records that the engine asked for this namespace's group
+	// finalizer to run once every shard's DDL has landed, independent of a
+	// VSchema change (engine.MetadataNeedsFinalizer). It is a typed field
+	// rather than a Metadata key because Metadata is the VSchema safety gate's
+	// record: a namespace carrying Metadata without a VSchema document is one
+	// the gate treats as divergent and fails closed on.
+	Finalize bool `json:"finalize,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
@@ -520,6 +557,16 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 		return false
 	}
 	return n.Artifacts[VSchemaArtifactName] != ""
+}
+
+// NeedsFinalizer reports whether an apply of this namespace ends with a group
+// finalizer: its VSchema changes, which only the finalizer applies, or the
+// engine asked for one.
+func (n *NamespacePlanData) NeedsFinalizer() bool {
+	if n == nil {
+		return false
+	}
+	return n.ChangesVSchema() || n.Finalize
 }
 
 // ShardPlan records per-shard membership and drift captured at plan time for a
@@ -697,6 +744,41 @@ func (p *Plan) VSchemaNamespaces() []string {
 	var namespaces []string
 	for namespace, nsData := range p.Namespaces {
 		if nsData.ChangesVSchema() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// FinalizerNamespaces returns, in sorted order, every namespace in the plan
+// whose apply ends with a group finalizer (see NamespacePlanData.NeedsFinalizer).
+// It is the set the finalizer is scheduled and driven from; VSchemaNamespaces
+// is the subset whose finalizer applies a VSchema document.
+func (p *Plan) FinalizerNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData.NeedsFinalizer() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// EngineFinalizedNamespaces returns, in sorted order, every namespace the
+// engine asked to finalize (NamespacePlanData.Finalize), whether or not its
+// VSchema also changes.
+func (p *Plan) EngineFinalizedNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData != nil && nsData.Finalize {
 			namespaces = append(namespaces, namespace)
 		}
 	}
@@ -1159,6 +1241,19 @@ func (op *ApplyOperation) IsTasklessVSchemaOnlyWork(plan *Plan) bool {
 		return false
 	}
 	return plan.IsVSchemaOnly()
+}
+
+// HasFreshLease reports whether a driver holds this apply_operation's lease
+// with a heartbeat newer than ApplyLeaseStaleAfter according to the supplied
+// clock. A drive heartbeats its operation row, so the row's last write is the
+// liveness signal. Under a multi-operation drive this
+// is the only live lease — the parent apply row's heartbeat can be stale, or
+// carry a leftover owner, while the operation's drive is running.
+func (op *ApplyOperation) HasFreshLease(now time.Time) bool {
+	if op == nil || op.LeaseOwner == "" {
+		return false
+	}
+	return now.Sub(op.UpdatedAt) < ApplyLeaseStaleAfter
 }
 
 // Lease returns the ownership token for this apply_operation.

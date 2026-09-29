@@ -17,7 +17,6 @@ import (
 	"unicode"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
-	"github.com/block/pg-sprite/pkg/diffplan"
 	"github.com/block/pg-sprite/pkg/executor"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
@@ -263,22 +262,30 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
+		if err := refuseTableDeclaredTwice(namespace, ns.Files); err != nil {
+			return nil, err
+		}
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
-			desired, err := pgstatement.ParseDesired(ns.Files[filename])
+			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("parse desired PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
-			desiredTables[desired.Table()] = true
-			report, err := diffplan.Plan(ctx, pool, diffplan.Request{Schema: namespace, Desired: desired})
+			if handled {
+				desiredTables[table] = true
+				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
+				continue
+			}
+			report, table, err := planPostgresDefinition(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("diff PostgreSQL table %q in namespace %q from file %q: %w", desired.Table(), namespace, filename, err)
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
+			desiredTables[table] = true
 			changes, tiers, unrecognized, err := tableChanges(report, parser)
 			if err != nil {
-				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", table, namespace, err)
 			}
 			for _, vocabulary := range unrecognized {
 				// The plan renders a blocked placeholder for the statement,
@@ -288,17 +295,17 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				slog.Warn("PostgreSQL planner returned vocabulary SchemaBot does not recognize; the plan blocks the statement with a placeholder verdict",
 					"database", req.Database,
 					"namespace", namespace,
-					"table", desired.Table(),
+					"table", table,
 					"vocabulary", vocabulary.kind,
 					"value", vocabulary.value)
 			}
 			changes, err = blockMissingPrivileges(ctx, pool, req.Database, report, changes, tiers, tableOwner)
 			if err != nil {
-				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", table, namespace, err)
 			}
 			changes, err = blockOversizedTable(ctx, pool, req.Database, report, changes, tableSizeLimit)
 			if err != nil {
-				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", table, namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
@@ -338,6 +345,28 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	result.NoChanges = len(result.Changes) == 0
 	result.PlanID = engine.NewPlanID()
 	return result, nil
+}
+
+// refuseTableDeclaredTwice fails the plan when two schema files in one
+// namespace declare the same table. Each file is diffed against the live table
+// on its own, so a table declared twice would get two contradictory diffs,
+// each dropping what only the other file declares; there is no single desired
+// definition to review. The error names the table and both files so the
+// operator knows which one to remove. It runs before any file is planned.
+func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
+	declaredBy := make(map[string]string, len(files))
+	for _, filename := range sortedKeys(files) {
+		table, err := desiredTableName(files[filename])
+		if err != nil {
+			return fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+		}
+		if first, declared := declaredBy[table]; declared {
+			return fmt.Errorf("plan PostgreSQL namespace %q: table %q is declared by both schema files %q and %q. Declare each table in exactly one schema file",
+				namespace, table, first, filename)
+		}
+		declaredBy[table] = filename
+	}
+	return nil
 }
 
 // captureOriginalFiles renders the live namespace as the plan's rollback

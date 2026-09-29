@@ -425,6 +425,25 @@ func TestMySQLDialectLeaseTokenFence(t *testing.T) {
 		MySQLDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
 }
 
+// The source fence guards an INSERT … SELECT, whose source rows MySQL reads
+// without locks under READ COMMITTED, so MySQL locks the row through a
+// correlated FOR SHARE subquery; PostgreSQL renders the same fence it uses for
+// joined rows. Both consume the single token placeholder.
+func TestMySQLDialectLeaseSourceFence(t *testing.T) {
+	assert.Equal(t,
+		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR SHARE)",
+		MySQLDialect{}.LeaseSourceFence("applies", "a", "id", "lease_token"))
+}
+
+func TestPostgresDialectLeaseSourceFence(t *testing.T) {
+	assert.Equal(t,
+		PostgresDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		PostgresDialect{}.LeaseSourceFence("applies", "a", "id", "lease_token"))
+	assert.Equal(t,
+		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)",
+		PostgresDialect{}.LeaseSourceFence("applies", "a", "id", "lease_token"))
+}
+
 func TestPostgresDialectLeaseTokenFence(t *testing.T) {
 	assert.Equal(t,
 		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)",
