@@ -23,8 +23,10 @@ var (
 	// released and a new one acquired in its place.
 	ErrLockReplaced = errors.New("lock was replaced by a new lock")
 
-	// ErrLockIntentChanged is returned when an apply's captured lock owner or
-	// pending plan no longer matches at durable apply creation time.
+	// ErrLockIntentChanged is returned when the lock's pending plan is no longer
+	// the one a caller observed: an apply's captured lock owner or pending plan
+	// no longer matches at durable apply creation time, or a conditional acquire
+	// finds the same owner's lock pinned to another intent.
 	ErrLockIntentChanged = errors.New("lock intent changed")
 
 	// ErrCheckNotFound is returned when a check does not exist.

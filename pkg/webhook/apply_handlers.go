@@ -253,17 +253,28 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 
 		// Release only the intent inspected above. A concurrent command can
 		// replace the pin while this apply is deciding whether it is stale, and
-		// that newer intent must remain held.
+		// that newer intent must remain held, so the apply stops here rather
+		// than planning on and pinning its own plan over it.
 		released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(
 			ctx, database, dbType, lockOwner, existingLock.PendingPlanID,
 		)
 		if relErr != nil {
-			h.logger.Error("failed to release stale lock",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", relErr)
-		} else if !released {
-			h.logger.Info("stale lock intent changed before release; keeping the current lock",
+			h.logger.Error("apply rejected: failed to release stale lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"observed_pending_plan_id", existingLock.PendingPlanID, "error", relErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not release this PR's stale lock. The apply was rejected; retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command release stale lock %s#%d: %w", repo, pr, relErr)
+		}
+		if !released {
+			h.logger.Info("apply rejected: stale lock intent changed before release; keeping the current lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"observed_pending_plan_id", existingLock.PendingPlanID)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				applyLockIntentChangedRefusal(database))
+			return false, nil
 		}
 	}
 
@@ -400,6 +411,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// DisclosedCopyDiscard records whether that plan's comment tells the operator
 	// a copy is destroyed, so the apply can later tell a discard they agreed to
 	// from one that appeared after they were asked.
+	//
+	// The apply saw no lock of its own before planning: either none was held or
+	// it released this PR's stale one above. The acquire is conditional on that
+	// still being so, because a rollback or another apply on this PR can pin the
+	// lock while this one plans, and the pin it holds must not be replaced by a
+	// plan the operator never saw alongside it.
 	lock := &storage.Lock{
 		DatabaseName:         database,
 		DatabaseType:         dbType,
@@ -409,13 +426,23 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		PendingPlanID:        planResp.PlanID,
 		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
 	}
-	if err := h.service.Storage().Locks().Acquire(ctx, lock); err != nil {
+	if err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, lock, ""); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
 			// Another owner won the lock between the pre-check above and this
 			// acquire: the same answer the pre-check gives, so it is terminal.
 			h.logger.Info("apply blocked by lock conflict at acquire",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+			return false, nil
+		}
+		if errors.Is(err, storage.ErrLockIntentChanged) {
+			// This PR pinned another intent while the apply was planning. The
+			// pin stays; a retry sees it and answers for it.
+			h.logger.Info("apply rejected: this PR's lock was pinned to another plan while the apply was planning",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				applyLockIntentChangedRefusal(database))
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
@@ -960,6 +987,16 @@ func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) st
 	}
 	return fmt.Sprintf("The lock this PR holds on `%s` belongs to a rollback plan that has not been confirmed, and a new apply would discard it. "+
 		"Use `%s` to execute the rollback, or `schemabot unlock` to cancel it, then retry the apply.", database, confirm)
+}
+
+// applyLockIntentChangedRefusal tells the operator that another command on the
+// same PR pinned the lock while this apply was checking or planning against it.
+// The apply leaves that pin in place; a retry finds it and reports which
+// command holds the lock and how to settle it.
+func applyLockIntentChangedRefusal(database string) string {
+	return fmt.Sprintf("Another SchemaBot command on this PR changed the lock on `%s` while this apply was running, "+
+		"so the apply was rejected to keep that command's lock in place. Retry the apply; "+
+		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database)
 }
 
 // applyCommandOptionsOf carries the option flags the operator typed on a

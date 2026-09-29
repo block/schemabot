@@ -258,16 +258,7 @@ const rollbackTestSchemaWithIndex = "CREATE TABLE `users` (\n  `id` bigint unsig
 func seedCompletedIndexApply(t *testing.T, svc *api.Service, dbName string) int64 {
 	t.Helper()
 	ctx := t.Context()
-
-	cfg, err := mysql.ParseDSN(e2eTargetDSN)
-	require.NoError(t, err)
-	cfg.DBName = dbName
-	cfg.MultiStatements = true
-	db, err := sql.Open("block-mysql", cfg.FormatDSN())
-	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
+	createRollbackTestUsersTable(t, dbName)
 
 	prNumber := int32(1)
 	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
@@ -458,6 +449,251 @@ func TestE2EApplyKeepsPendingRollbackLock(t *testing.T) {
 		return err == nil && lock != nil && lock.PendingPlanID != "" &&
 			!strings.HasPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix)
 	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "an apply after the rollback ran should take the stale lock over for its own plan")
+}
+
+// createRollbackTestUsersTable creates the users table without its index on
+// the target database, so a plan against rollbackTestSchemaWithIndex has an
+// index to add.
+func createRollbackTestUsersTable(t *testing.T, dbName string) {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = dbName
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+}
+
+// rollbackPinMoment names the step of an apply's lock handling at which a
+// concurrent same-PR rollback pins its plan on the lock.
+type rollbackPinMoment int
+
+const (
+	// pinDuringStaleRelease pins the rollback as the apply releases the stale
+	// lock it inspected.
+	pinDuringStaleRelease rollbackPinMoment = iota
+	// pinDuringPlanning pins the rollback while the apply plans, before it
+	// acquires the lock for its own plan.
+	pinDuringPlanning
+)
+
+// concurrentRollbackStorage wraps the service's storage so a test can slip a
+// same-PR rollback's lock pin in between the steps of an apply's lock handling,
+// the interleaving a `schemabot rollback` racing a `schemabot apply` on the
+// same PR produces.
+type concurrentRollbackStorage struct {
+	storage.Storage
+	locks *concurrentRollbackLocks
+}
+
+func (s *concurrentRollbackStorage) Locks() storage.LockStore { return s.locks }
+
+type concurrentRollbackLocks struct {
+	storage.LockStore
+	pin    *storage.Lock
+	moment rollbackPinMoment
+
+	once   sync.Once
+	pinErr error
+}
+
+func (l *concurrentRollbackLocks) pinRollback(ctx context.Context) {
+	l.once.Do(func() {
+		l.pinErr = l.Acquire(ctx, l.pin)
+	})
+}
+
+func (l *concurrentRollbackLocks) ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error) {
+	if l.moment == pinDuringStaleRelease {
+		l.pinRollback(ctx)
+	}
+	return l.LockStore.ReleaseIfPendingPlanID(ctx, database, dbType, owner, pendingPlanID)
+}
+
+func (l *concurrentRollbackLocks) AcquireIfPendingPlanID(ctx context.Context, lock *storage.Lock, observedPendingPlanID string) error {
+	if l.moment == pinDuringPlanning {
+		l.pinRollback(ctx)
+	}
+	return l.LockStore.AcquireIfPendingPlanID(ctx, lock, observedPendingPlanID)
+}
+
+// A same-PR `schemabot rollback` pins its plan on the lock while a same-PR
+// `schemabot apply -e staging` is running, at either point the apply touches
+// the lock: as it releases a stale apply lock it inspected, or as it acquires
+// the lock for the plan it just built. In both the apply is refused with a
+// reply saying the lock changed under it, and the rollback's pin stays in
+// place so rollback-confirm still has it to execute.
+func TestE2EApplyKeepsConcurrentRollbackPin(t *testing.T) {
+	tests := []struct {
+		name      string
+		dbName    string
+		moment    rollbackPinMoment
+		staleLock bool
+		// wantPlans is how many plans the apply builds before it is refused:
+		// none when the refusal comes at the stale release, one when it comes
+		// at the acquire after planning.
+		wantPlans int
+	}{
+		{
+			name:      "rollback pins during the stale release",
+			dbName:    "webhook_apply_rb_race_release",
+			moment:    pinDuringStaleRelease,
+			staleLock: true,
+			wantPlans: 0,
+		},
+		{
+			name:      "rollback pins during planning",
+			dbName:    "webhook_apply_rb_race_plan",
+			moment:    pinDuringPlanning,
+			wantPlans: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			locks := &concurrentRollbackLocks{
+				moment: tt.moment,
+				pin: &storage.Lock{
+					DatabaseName: tt.dbName, DatabaseType: "mysql", Owner: "octocat/hello-world#1",
+					Repository: "octocat/hello-world", PullRequest: 1,
+					PendingPlanID: rollbackPendingPlanPrefix + "plan_concurrent",
+				},
+			}
+			svc := setupE2EServiceWithStorage(t, tt.dbName, func(st storage.Storage) storage.Storage {
+				locks.LockStore = st.Locks()
+				return &concurrentRollbackStorage{Storage: st, locks: locks}
+			})
+			ctx := t.Context()
+			createRollbackTestUsersTable(t, tt.dbName)
+
+			if tt.staleLock {
+				// An apply lock this PR left behind, pinned to a plan that has run.
+				require.NoError(t, svc.Storage().Locks().Acquire(ctx, &storage.Lock{
+					DatabaseName: tt.dbName, DatabaseType: "mysql", Owner: "octocat/hello-world#1",
+					Repository: "octocat/hello-world", PullRequest: 1, PendingPlanID: "plan_stale",
+				}))
+			}
+
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			result := setupFakeGitHubForPlan(t, mux, map[string]string{
+				"users.sql": rollbackTestSchemaWithIndex,
+			}, fmt.Sprintf("database: %s\ntype: mysql\n", tt.dbName), tt.dbName)
+			h := newE2EHandler(t, svc, client)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e staging", isPR: true}, nil))
+			require.Equal(t, http.StatusOK, rr.Code)
+
+			refusal := awaitCommentContaining(t, result, "changed the lock on")
+			assert.Contains(t, refusal, "`"+tt.dbName+"`")
+			assert.Contains(t, refusal, "Retry the apply")
+			require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
+
+			lock, err := svc.Storage().Locks().Get(ctx, tt.dbName, "mysql")
+			require.NoError(t, err)
+			require.NotNil(t, lock, "the refused apply must not release the rollback's lock")
+			assert.Equal(t, locks.pin.PendingPlanID, lock.PendingPlanID, "the concurrent rollback's pin must survive the apply")
+			requireNoApplies(t, svc, tt.dbName)
+
+			plans, err := svc.Storage().Plans().GetByPR(ctx, "octocat/hello-world", 1)
+			require.NoError(t, err)
+			plans = slices.DeleteFunc(plans, func(p *storage.Plan) bool { return p.Database != tt.dbName })
+			assert.Len(t, plans, tt.wantPlans, "the apply should be refused at the step the rollback pinned during")
+		})
+	}
+}
+
+// failingPlanGetStorage wraps the service's storage so a test can make loading
+// one plan fail, as a storage outage during that read would.
+type failingPlanGetStorage struct {
+	storage.Storage
+	plans *failingPlanGetStore
+}
+
+func (s *failingPlanGetStorage) Plans() storage.PlanStore { return s.plans }
+
+type failingPlanGetStore struct {
+	storage.PlanStore
+
+	mu     sync.Mutex
+	failID string
+}
+
+func (s *failingPlanGetStore) failFor(planIdentifier string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failID = planIdentifier
+}
+
+func (s *failingPlanGetStore) Get(ctx context.Context, planIdentifier string) (*storage.Plan, error) {
+	s.mu.Lock()
+	failID := s.failID
+	s.mu.Unlock()
+	if failID != "" && planIdentifier == failID {
+		return nil, fmt.Errorf("load plan %s: storage unavailable", planIdentifier)
+	}
+	return s.PlanStore.Get(ctx, planIdentifier)
+}
+
+// An operator runs `schemabot rollback` on a PR and, before confirming it,
+// a same-PR `schemabot apply -e staging` arrives while storage cannot load the
+// rollback plan the lock pins. The apply cannot tell whether the rollback has
+// run, so it is rejected with a retry prompt and leaves the lock pinned to the
+// rollback rather than treating a read it never completed as proof either way.
+func TestE2EApplyRejectedWhenPendingRollbackPlanUnreadable(t *testing.T) {
+	dbName := "webhook_apply_rb_unreadable"
+	plans := &failingPlanGetStore{}
+	svc := setupE2EServiceWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
+		plans.PlanStore = st.Plans()
+		return &failingPlanGetStorage{Storage: st, plans: plans}
+	})
+	ctx := t.Context()
+	applyID := seedCompletedIndexApply(t, svc, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": rollbackTestSchemaWithIndex,
+	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
+	h := newE2EHandler(t, svc, client)
+
+	sendComment := func(comment string) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	sendComment(fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier))
+	awaitCommentContaining(t, result, "Rollback Plan")
+
+	rollbackLock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, rollbackLock)
+	rollbackPlanID, ok := rollbackPlanIDFromLock(rollbackLock)
+	require.True(t, ok, "rollback should pin its plan on the lock")
+	plans.failFor(rollbackPlanID)
+
+	sendComment("schemabot apply -e staging")
+	refusal := awaitCommentContaining(t, result, "pending rollback. The apply was rejected")
+	assert.Contains(t, refusal, "SchemaBot could not check this PR")
+	assert.Contains(t, refusal, "retry the command")
+
+	lock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "a rejected apply must not release the rollback's lock")
+	assert.Equal(t, rollbackLock.PendingPlanID, lock.PendingPlanID, "a rejected apply must leave the lock pinned to the rollback plan")
 }
 
 // checkWriteRecorder wraps the service's storage so a test can observe every
