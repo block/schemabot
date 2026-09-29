@@ -611,6 +611,21 @@ func TestDescribeOnboardPlanChangesNamesFinalizeOnlyKeyspace(t *testing.T) {
 	assert.Equal(t, []string{"payments: engine finalize requested"}, lines)
 }
 
+// A keyspace whose only VSchema work is generated from its DDL is named by the
+// finalize that writes it, the same way the plan shows it.
+func TestDescribeOnboardPlanChangesNamesGeneratedVSchemaChangeAsAFinalize(t *testing.T) {
+	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "payments", Metadata: map[string]string{
+				apitypes.VSchemaChangedMetadataKey:       "true",
+				apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+				apitypes.NeedsFinalizerMetadataKey:       "true",
+			}},
+		},
+	})
+	assert.Equal(t, []string{"payments: engine finalize requested"}, lines)
+}
+
 // A leftover schema file for a table that no longer exists in the target is
 // the classic cause of a failed onboarding verification: the pull rewrites
 // every table in the namespace but never deletes strays, so the stale file

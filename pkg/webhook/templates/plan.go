@@ -346,9 +346,9 @@ type KeyspaceChangeData struct {
 	VSchemaChanged bool
 	VSchemaDiff    string
 
-	// Finalize marks a keyspace the engine asked to finalize after its DDL
-	// without a VSchema document to apply. The finalize is work the apply
-	// runs, so it counts as a change like a VSchema update does.
+	// Finalize marks a keyspace the engine asked to finalize after its DDL.
+	// Without a VSchema change to show, the finalize is the keyspace's own
+	// line and count, since it is work the apply runs.
 	Finalize bool
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
@@ -1142,7 +1142,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 }
 
 // keyspaceFinalizeNote is the plan comment's line for a keyspace the engine
-// asked to finalize without a VSchema document to apply. What finalizing does
+// asked to finalize without a VSchema change to show. What finalizing does
 // is the engine's; the comment only says that it runs and when.
 const keyspaceFinalizeNote = "_Finalized by the engine once every shard's DDL has landed._\n\n"
 

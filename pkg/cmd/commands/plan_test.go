@@ -798,3 +798,21 @@ func TestWritePlanHeaderPostgres(t *testing.T) {
 		assert.NotContains(t, output, "MySQL Schema Change Plan")
 	}
 }
+
+// Two environments plan the same table create in keyspace payments. In one the
+// engine generated the VSchema change from the DDL, and the plan shows only the
+// finalize; in the other the VSchema change has no diff and no marker, and the
+// plan shows a VSchema change. They render differently, so they are not
+// deduplicated into one section.
+func TestPlanFingerprint_GeneratedVSchemaChangeDiffersFromAVSchemaChange(t *testing.T) {
+	mk := func(metadata map[string]string) *apitypes.PlanResponse {
+		plan := planWithTables(&apitypes.TableChangeResponse{DDL: "CREATE TABLE refunds (id BIGINT PRIMARY KEY)", ChangeType: "CREATE", TableName: "refunds"})
+		plan.Changes[0].Namespace = "payments"
+		plan.Changes[0].Metadata = metadata
+		return plan
+	}
+	generated := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.VSchemaGeneratedOnlyMetadataKey: "true", apitypes.NeedsFinalizerMetadataKey: "true"})
+	unmarked := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.NeedsFinalizerMetadataKey: "true"})
+
+	assert.NotEqual(t, planFingerprint(generated), planFingerprint(unmarked))
+}

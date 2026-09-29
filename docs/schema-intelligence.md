@@ -938,9 +938,11 @@ History records executions. Plans describe what was proposed.
 Each summary carries the plan ID, database, database type, environment, and
 creation time, plus a count of changes by operation and how many were unsafe
 or blocked. Namespace-level work is counted separately:
-`vschema_change_count` is how many namespaces change their VSchema, and
+`vschema_change_count` is how many namespaces show a VSchema change, and
 `finalize_count` is how many namespaces the engine asked to finalize once
-their DDL lands. A plan with no changes omits every count; a plan whose only
+their DDL lands. A namespace whose VSchema change the engine generates
+entirely from the plan's DDL has nothing to review, so it counts under
+`finalize_count` alone. A plan with no changes omits every count; a plan whose only
 work is a finalize carries `finalize_count` alone, and `list-plans` renders
 it as `1 finalize` rather than `no changes`. The repository, PR, and
 head SHA it was planned from appear when the plan came from a PR (an ad-hoc
@@ -977,7 +979,10 @@ finalizer to run once its DDL lands (for Strata, registering tables and
 seeding sequences), independently of any VSchema change. The finalizer runs
 as its own `group_finalizer` operation of the apply, so a namespace can carry
 the marker with no table changes at all, and such a plan still has work to
-apply.
+apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
+engine generates the namespace's whole VSchema change from the plan's DDL, so
+there is no VSchema diff to review; plans show such a namespace as its
+finalize.
 
 <details>
 <summary>Stored plan whose only work is a finalize</summary>

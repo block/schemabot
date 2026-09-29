@@ -174,7 +174,7 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 		if nsData == nil {
 			continue
 		}
-		if nsData.ChangesVSchema() {
+		if nsData.ShowsVSchemaChange() {
 			summary.VSchemaChangeCount++
 		}
 		if nsData.Finalize {
@@ -243,6 +243,11 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 			// rendered diff, so the namespace is flagged as carrying VSchema
 			// work without one.
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
+			if !nsData.ShowsVSchemaChange() {
+				// Carried so the stored plan renders the namespace the way
+				// the live plan did: as its finalize alone.
+				change.Metadata[apitypes.VSchemaGeneratedOnlyMetadataKey] = "true"
+			}
 		}
 		if nsData.Finalize {
 			// The stored finalize request is reported under the key the

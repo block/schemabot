@@ -230,7 +230,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// Collect VSchema changes from metadata, and the namespaces the engine
 	// asked to finalize: a finalize is work the apply runs, so a plan made only
 	// of finalizes must not read as "no changes". finalizeOnly holds those with
-	// no VSchema change, which the summary counts on their own.
+	// no VSchema change to show, which the summary counts on their own.
 	var vschemaChanges []templates.VSchemaChange
 	finalize := map[string]bool{}
 	finalizeOnly := map[string]bool{}
@@ -238,7 +238,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		if sc.NeedsFinalizer() {
 			finalize[sc.Namespace] = true
 		}
-		if sc.HasVSchemaChange() {
+		if sc.ShowsVSchemaChange() {
 			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
 				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
@@ -389,7 +389,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	}
 	var vschemas, finalizes []string
 	for _, sc := range result.Changes {
-		if sc.HasVSchemaChange() {
+		if sc.ShowsVSchemaChange() {
 			vschemas = append(vschemas, sc.Namespace+":"+sc.Metadata[apitypes.VSchemaDiffMetadataKey])
 		}
 		if sc.NeedsFinalizer() {

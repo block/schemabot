@@ -98,3 +98,27 @@ func TestWritePlanBody_FinalizeLineShowsForAVSchemaChangingKeyspace(t *testing.T
 	assert.Contains(t, out, "1 VSchema change", "%s", out)
 	assert.NotContains(t, out, "to finalize", "%s", out)
 }
+
+// A Strata keyspace adds a table, and its engine generates the table's VSchema
+// entry from the DDL, so there is no VSchema diff to review. The CLI shows and
+// counts the keyspace as a finalize, as the PR plan comment does (UX-6).
+func TestWritePlanBody_GeneratedVSchemaChangeCountsAsAFinalize(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Database: "commerce",
+		Engine:   "strata",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "payments",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "refunds", ChangeType: "create", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+			Metadata: map[string]string{
+				apitypes.VSchemaChangedMetadataKey:       "true",
+				apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+				apitypes.NeedsFinalizerMetadataKey:       "true",
+			},
+		}},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Contains(t, out, "~ Finalized by the engine once every shard's DDL has landed", "%s", out)
+	assert.Contains(t, out, "1 table to create, 1 keyspace to finalize", "%s", out)
+	assert.NotContains(t, out, "VSchema", "%s", out)
+}

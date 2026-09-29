@@ -43,3 +43,21 @@ func TestRollbackPlanListsFinalizeOnlyKeyspaces(t *testing.T) {
 
 	assert.Contains(t, preview, "The following changes will be applied to rollback:\n\n  commerce: VSchema update\n  payments: finalized by the engine once every shard's DDL has landed\n")
 }
+
+// A rollback that drops a table updates its keyspace's VSchema entries from
+// the DDL alone, so the confirmation lists the keyspace as finalized after its
+// DDL, not as a VSchema update.
+func TestRollbackPlanListsGeneratedVSchemaChangeAsAFinalize(t *testing.T) {
+	plan := &apitypes.PlanResponse{Database: "shop", DatabaseType: "vitess", Environment: "staging", Changes: []*apitypes.SchemaChangeResponse{
+		{Namespace: "payments", Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey:       "true",
+			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+			apitypes.NeedsFinalizerMetadataKey:       "true",
+		}},
+	}}
+
+	preview := ansi.Strip(captureStdout(t, func() { WriteRollbackPlan(plan, "apply-example-85") }))
+
+	assert.Contains(t, preview, "  payments: finalized by the engine once every shard's DDL has landed\n")
+	assert.NotContains(t, preview, "VSchema update")
+}
