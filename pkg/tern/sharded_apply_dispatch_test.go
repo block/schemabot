@@ -195,7 +195,7 @@ func TestFinalizerDispatchScope(t *testing.T) {
 		}
 		_, err := finalizerDispatchScope(twoPlan, []string{"ks_a"}, []string{"group_finalizer"})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "must cover the plan's full VSchema set")
+		assert.Contains(t, err.Error(), "must cover the plan's full finalizer set")
 	})
 	t.Run("full VSchema set is deployment-scoped", func(t *testing.T) {
 		multiPlan := &storage.Plan{
@@ -222,7 +222,7 @@ func TestFinalizerDispatchScope(t *testing.T) {
 		}
 		_, err := finalizerDispatchScope(multiPlan, []string{"ks_a", "ks_b"}, nil)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "must cover the plan's full VSchema set")
+		assert.Contains(t, err.Error(), "must cover the plan's full finalizer set")
 	})
 	t.Run("no namespaces fails closed", func(t *testing.T) {
 		_, err := finalizerDispatchScope(plan, nil, nil)
@@ -232,6 +232,6 @@ func TestFinalizerDispatchScope(t *testing.T) {
 	t.Run("namespace without a VSchema artifact fails closed", func(t *testing.T) {
 		_, err := finalizerDispatchScope(plan, []string{"ks_b"}, nil)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "no VSchema artifact")
+		assert.Contains(t, err.Error(), "neither a VSchema artifact nor a finalize request")
 	})
 }

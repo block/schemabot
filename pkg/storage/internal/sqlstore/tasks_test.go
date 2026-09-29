@@ -97,6 +97,68 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, reloaded.State)
 }
 
+// An operation lease absence guard is the conflict check's settlement write: it
+// holds no lease of its own and lands only while no drive holds the task's
+// operation. A heartbeated operation lease refuses the write and leaves the row
+// untouched; once the lease has aged past the reclaim window the write lands.
+func TestTaskStore_OperationLeaseAbsenceGuardsUpdate(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_task_opabsence", 1)
+
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, opID, "driver", "op-token")
+
+	now := time.Now()
+	taskID, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier:   "task_opabsence_users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		PlanID:           apply.PlanID,
+		Database:         apply.Database,
+		DatabaseType:     apply.DatabaseType,
+		Engine:           storage.EngineSpirit,
+		Environment:      apply.Environment,
+		State:            state.Task.Running,
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
+		DDLAction:        "ALTER",
+		Options:          []byte("{}"),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ID = taskID
+	guarded := storage.WithOperationLeaseAbsent(ctx, storage.OperationLeaseAbsence{ApplyID: apply.ID, OperationID: opID})
+
+	task.State = state.Task.Failed
+	require.ErrorIs(t, store.Tasks().Update(guarded, task), storage.ErrOperationLeaseActive,
+		"a drive heartbeating the operation keeps the task")
+	reloaded, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Running, reloaded.State)
+
+	_, err = testDB.ExecContext(ctx,
+		`UPDATE apply_operations SET updated_at = DATE_SUB(NOW(), INTERVAL ? SECOND) WHERE id = ?`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tasks().Update(guarded, task), "a stale operation lease no longer holds the task")
+	reloaded, err = store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
+}
+
 // CountByApplyID reports every task row an apply owns — unsharded drive rows
 // and shard-tagged rows alike, with no operation-key filtering — and never
 // another apply's rows. It is the predicate a drive uses to distinguish a
