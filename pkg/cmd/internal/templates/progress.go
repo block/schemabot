@@ -764,9 +764,18 @@ func FormatThrottleReference(tables []TableProgress) string {
 		if !state.IsState(table.Status, state.Task.Running, state.Task.Checksumming) {
 			continue
 		}
-		return fmt.Sprintf("  %sDocs: %s%s\n\n", ANSIDim, ui.Link("Throttle reference", ui.ThrottleDocURL), ANSIReset)
+		return "  " + DocsLine(ui.ThrottleDocURL) + "\n\n"
 	}
 	return ""
+}
+
+// DocsLine points a terminal surface at one documentation page, the way a PR
+// comment's docs line does: the docs glyph and label at full weight, then the
+// page's short reference in link blue as the hyperlink text. Where hyperlinks
+// are unavailable the full URL takes the reference's place, so the line reads
+// the same and the address is never lost.
+func DocsLine(url string) string {
+	return glyph.Docs + " Docs: " + ANSIBlue + ui.Link(ui.DocRef(url), url) + ANSIReset
 }
 
 // writeThrottleTooltip explains the header's "(throttled)" annotation with the
