@@ -85,7 +85,7 @@ func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, cl
 // silent (the leader owns the required check), a leader whose expected
 // participant paths are touched routes through the aggregate fold (which
 // fails closed until every expected participant reports), and otherwise
-// passing aggregates are posted on the current head. A comment reports the
+// aggregates are verified and posted on the current head. A comment reports the
 // outcome to the user who ran the command. A closed PR is rejected with an
 // explicit error instead: its close-time cleanup owns the stored check state.
 func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, files []ghclient.PRFile, requestedBy string) error {
@@ -97,7 +97,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	// its stored check state, and recreating Check Runs here would resurrect
 	// rows that cleanup is authoritative over. Participants stay silent as on
 	// open PRs; otherwise the user gets an explicit error instead of a
-	// "refreshed as passing" comment on a PR that can never merge.
+	// check-refresh comment on a PR that can never merge.
 	if prInfo.IsClosed() {
 		if h.isAggregateParticipant(repo) {
 			h.logger.Info("aggregate participant staying silent on plan for closed PR with no managed schema changes",
@@ -135,7 +135,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 		return nil
 	}
 
-	h.logger.Info("plan found no managed schema changes; refreshing passing aggregate checks",
+	h.logger.Info("plan found no managed schema changes; refreshing aggregate checks",
 		"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
 	h.postPassingAggregates(ctx, client, repo, pr, headSHA)
 	h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{

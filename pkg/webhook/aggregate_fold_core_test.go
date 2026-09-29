@@ -61,6 +61,7 @@ func (s *foldStorage) Checks() storage.CheckStore {
 func newFoldHandler(t *testing.T, cfg *api.ServerConfig, checks storage.CheckStore) (*Handler, *http.ServeMux, *ghclient.InstallationClient) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
+	registerExistingRepository(t, mux)
 	// Resolve the App slug so a participant Check Run read that finds no run
 	// classifies as a clean "not reported" (retriable, no error) rather than an
 	// ownership-unverifiable read error — letting a test exercise the genuine

@@ -745,6 +745,68 @@ func TestSchemaPathsChangedSinceMergeBaseUsesRootTreeSHA(t *testing.T) {
 	assert.False(t, changed, "different commit SHAs with the same root tree are unchanged")
 }
 
+func TestLegacyPathChangesSinceAnchorReportsIntermediatePathCommits(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	paths := map[string]string{"service/db/changes/001.sql": "schema-blob"}
+	registerLegacyTrees(t, mux, paths, paths)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/anchor...base", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			Status:       new("ahead"),
+			TotalCommits: new(2),
+			Commits: []*gh.RepositoryCommit{
+				{SHA: new("commit-a")},
+				{SHA: new("commit-b")},
+			},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "base", r.URL.Query().Get("sha"))
+		assert.Equal(t, "service/db/changes", r.URL.Query().Get("path"))
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.RepositoryCommit{
+			{SHA: new("commit-b"), Commit: &gh.Commit{Message: new("add orders index\n\nbody")}},
+			// The first commit outside anchor..base proves the path-filtered
+			// history has crossed the anchor and bounds the scan.
+			{SHA: new("older-commit"), Commit: &gh.Commit{Message: new("old change")}},
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	changes, err := ic.LegacyPathChangesSinceAnchor(t.Context(), "octocat/hello-world", "anchor", "base", []string{"service/db/changes"})
+
+	require.NoError(t, err)
+	assert.Equal(t, []LegacyPathChange{{
+		Commit: "commit-b", Path: "service/db/changes", Title: "add orders index",
+	}}, changes)
+}
+
+func TestLegacyPathChangesSinceAnchorAcceptsUnchangedAnchor(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	paths := map[string]string{"service/db/changes/001.sql": "schema-blob"}
+	registerLegacyTrees(t, mux, paths, paths)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/anchor...anchor", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("identical")}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	changes, err := ic.LegacyPathChangesSinceAnchor(t.Context(), "octocat/hello-world", "anchor", "anchor", []string{"service/db/changes"})
+
+	require.NoError(t, err)
+	assert.Empty(t, changes)
+}
+
+func TestLegacyPathChangesSinceAnchorRejectsRewrittenHistory(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/anchor...base", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("diverged")}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.LegacyPathChangesSinceAnchor(t.Context(), "octocat/hello-world", "anchor", "base", []string{"service/db/changes"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not an ancestor")
+}
+
 func setupRateLimitedTestGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 	t.Helper()
 

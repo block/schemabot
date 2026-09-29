@@ -193,6 +193,7 @@ func TestE2ELeaderPassesOnTrustedSuccessfulParticipant(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 

@@ -55,6 +55,7 @@ func TestE2EParticipantCommentNudgeRefoldsAggregate(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, nudgeLeaderConfig())
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -194,6 +195,7 @@ func TestE2EParticipantCommentNudgeFailClosedThroughRollback(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, nudgeLeaderConfig())
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 

@@ -217,6 +217,51 @@ loads the changed config directly, plans the current schema files for each
 configured environment, and publishes the normal aggregate check for the
 discovered database.
 
+When replacing a legacy schema change workflow, opt into legacy verification by
+adding this optional metadata to the config:
+
+```yaml
+legacy_baseline:
+  version: 1
+  base_commit: 0123456789abcdef0123456789abcdef01234567
+  legacy_paths:
+    - service/db/changes
+```
+
+Configs without `legacy_baseline` use normal SchemaBot checks. Existing databases
+need no metadata backfill.
+
+Onboarding verification is part of the existing `SchemaBot` or
+`SchemaBot (<environment>)` aggregate Check Runs. No additional required check
+is needed. Before publishing a passing PR aggregate, SchemaBot discovers configs
+at the pinned PR head and verifies every supplied `legacy_baseline`. It does not
+compare configs against the base branch. The metadata must be valid, the anchor
+must be an ancestor of the current base, and each recorded path must exist at the
+anchor, even when the path has since been retired.
+
+Each path still present on the current base branch must have no commits touching
+it after the anchor. A path absent from that base is treated as retired and
+skipped; verification continues for the other paths. Deleting legacy files in
+the PR does not bypass verification because existence is checked on the base,
+normally `main`. After that deletion merges, `legacy_baseline` can remain without
+a cleanup PR. Renaming a path on the base also retires its old name; update the
+recorded paths when moving legacy files. An inconclusive path lookup blocks the
+aggregate and schedules a bounded retry.
+
+Plans, apply completion, and no-schema updates cannot publish success without
+this opted-in verification. Aggregate participants leave this repository-wide verification to
+their leader.
+
+SchemaBot re-reads the PR head, base branch name, and actual base branch tip
+before publishing success. A changed base or unavailable read blocks the
+aggregate and schedules a bounded retry. Rerun the existing aggregate check to
+retry after correcting an invalid baseline. Live convergence remains part of the
+environment result: the production plan must be freshly empty before merge.
+
+This is a pre-merge check at publication time. Require branches to be up to date
+before merging to cover base changes after publication. Merge-group checks do
+not re-evaluate onboarding against queued changes.
+
 On the happy path, where the live database already matches the declarative
 schema files (for PostgreSQL, that also means no live table is left
 undeclared — see [Blocked plans](postgresql.md#blocked-plans)), the

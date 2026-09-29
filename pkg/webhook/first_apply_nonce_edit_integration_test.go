@@ -54,7 +54,7 @@ func TestE2EFirstApplyToBlankDatabaseThroughNonceEdit(t *testing.T) {
 
 		body := requireNextComment(t, result, "no schema files changed comment")
 		assert.Contains(t, body, "No Schema Files Changed")
-		assert.Contains(t, body, "refreshed as passing")
+		assert.Contains(t, body, "requested a check refresh")
 		assert.Contains(t, body, "no database was compared against its schema directory")
 		assert.Contains(t, body, "`# nonce`")
 		assert.NotContains(t, body, "CREATE TABLE")

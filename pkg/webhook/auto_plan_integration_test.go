@@ -1090,6 +1090,7 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
+	registerExistingRepository(t, mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
