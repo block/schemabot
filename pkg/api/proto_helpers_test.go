@@ -127,6 +127,34 @@ func TestProtoChangesToNamespacesPreservesBlockedVerdict(t *testing.T) {
 		`stored plan plan-x contains a blocked change for table "users": `+reason)
 }
 
+// A remote data plane plans a Strata keyspace, payments, whose only work is a
+// finalize its engine asked for, next to commerce, which changes its VSchema.
+// The plan stored from that gRPC response records the finalize request on
+// payments, so the apply still schedules its group finalizer, and gives
+// commerce the VSchema artifact without inventing a finalize for it.
+func TestProtoChangesToNamespacesRecordsFinalizeRequest(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{
+		{Namespace: "payments", Metadata: map[string]string{engine.MetadataNeedsFinalizer: "true", storage.PlanMetadataVSchemaChanged: "false"}},
+		{Namespace: "commerce", Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true"}},
+	}, map[string]*ternv1.SchemaFiles{
+		"commerce": {Files: map[string]string{storage.VSchemaArtifactName: `{"tables":{"orders":{}}}`}},
+	})
+	require.NoError(t, err)
+
+	payments := namespaces["payments"]
+	require.NotNil(t, payments)
+	assert.True(t, payments.Finalize)
+	assert.False(t, payments.ChangesVSchema())
+	assert.True(t, payments.NeedsFinalizer())
+	commerce := namespaces["commerce"]
+	require.NotNil(t, commerce)
+	assert.False(t, commerce.Finalize)
+	assert.True(t, commerce.ChangesVSchema())
+
+	plan := &storage.Plan{Namespaces: namespaces}
+	assert.Equal(t, []string{"commerce", "payments"}, plan.FinalizerNamespaces())
+}
+
 func TestProtoShardPlansToStoragePreservesUnsafeMetadata(t *testing.T) {
 	shards, err := protoShardPlansToStorage([]*ternv1.ShardPlan{{
 		Namespace: "testapp",

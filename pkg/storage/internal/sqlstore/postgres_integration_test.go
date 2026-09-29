@@ -1239,3 +1239,59 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		"a task that never started is cancelled, not failed")
 	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-settled"))
 }
+
+// The conflict check settles an abandoned task only while no drive holds the
+// task's operation, and the guard that decides that is rendered SQL PostgreSQL
+// has to execute: a live operation lease refuses the write, and a lease that
+// has aged past the reclaim window admits it.
+func TestPostgresTaskUpdateHonorsOperationLeaseAbsence(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_task_absence")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	store := postgresHarness{db: db, dsn: dsn}.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options)
+		VALUES ('apply-absence', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}')
+		RETURNING id`, state.Apply.Running).Scan(&applyID))
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options)
+		VALUES ('task-absence', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'events', 'ALTER TABLE events ADD COLUMN c int', 'ALTER', '{}')`,
+		applyID, opID, state.Task.Running)
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	guarded := storage.WithOperationLeaseAbsent(t.Context(), storage.OperationLeaseAbsence{ApplyID: applyID, OperationID: opID})
+
+	task.State = state.Task.Failed
+	require.ErrorIs(t, store.Tasks().Update(guarded, task), storage.ErrOperationLeaseActive,
+		"a drive heartbeating the operation keeps the task")
+	reloaded, err := store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Running, reloaded.State)
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tasks().Update(guarded, task), "a stale operation lease no longer holds the task")
+	reloaded, err = store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
+}

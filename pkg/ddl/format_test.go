@@ -82,12 +82,15 @@ func TestFormatDDL(t *testing.T) {
 				");",
 		},
 		{
-			// A literal holding a backslash character canonicalizes to a form
-			// the parser reads back differently, so the round-trip guard keeps
-			// the raw input. Display only; the applied DDL is never this string.
-			name:     "literal containing a backslash character falls back to the raw input",
-			input:    "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c')",
-			expected: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c');",
+			// A literal holding a backslash character keeps its escape in the
+			// canonical form, so the parser reads the same value back and the
+			// statement formats with the comma still inside the literal.
+			name:  "literal containing a backslash character keeps its escape and formats",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` varchar(10) DEFAULT 'a\\\\b, c'\n" +
+				");",
 		},
 		{
 			name:  "CREATE TABLE with indexes formatted",

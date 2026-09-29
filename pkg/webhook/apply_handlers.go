@@ -817,8 +817,12 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		h.logger.Warn("apply-confirm rejected: pending confirmation has no loadable plan",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
-			templates.RenderConfirmationPlanUnavailable(environment, databaseName, applyCommandOptionsOf(result)))
+		h.postComment(repo, pr, installationID, templates.RenderConfirmationPlanUnavailable(templates.ConfirmationRefusalData{
+			RequestedBy:          requestedBy,
+			Database:             databaseName,
+			RequestedEnvironment: environment,
+			Options:              applyCommandOptionsOf(result),
+		}))
 		return false, nil
 	}
 	// The pending confirmation authorizes the environment it was planned for
@@ -831,8 +835,13 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "plan_environment", storedPlan.Environment,
 			"pending_plan_id", existingLock.PendingPlanID, "requested_by", requestedBy)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
-			templates.RenderConfirmationPlanForOtherEnvironment(storedPlan.Environment, environment, databaseName, applyCommandOptionsOf(result)))
+		h.postComment(repo, pr, installationID, templates.RenderConfirmationPlanForOtherEnvironment(templates.ConfirmationRefusalData{
+			RequestedBy:          requestedBy,
+			Database:             databaseName,
+			PlanEnvironment:      storedPlan.Environment,
+			RequestedEnvironment: environment,
+			Options:              applyCommandOptionsOf(result),
+		}))
 		return false, nil
 	}
 	// Environment mismatch wins over stale-plan rejection because this outcome

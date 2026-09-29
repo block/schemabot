@@ -236,6 +236,28 @@ func TestPlanFingerprint_VSchemaOnlyPlans(t *testing.T) {
 	assert.NotEqual(t, fp1, fpOther, "plans with differing VSchema diffs must not dedupe")
 }
 
+// Two environments whose plans differ only in which keyspaces the engine asks
+// to finalize do different work, so they are rendered separately rather than
+// collapsed into one plan. A plan that only finalizes is not a clean one.
+func TestPlanFingerprint_FinalizeRequests(t *testing.T) {
+	finalizing := func(namespaces ...string) *apitypes.PlanResponse {
+		plan := &apitypes.PlanResponse{}
+		for _, ns := range namespaces {
+			plan.Changes = append(plan.Changes, &apitypes.SchemaChangeResponse{
+				Namespace: ns,
+				Metadata:  map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"},
+			})
+		}
+		return plan
+	}
+
+	payments := planFingerprint(finalizing("payments"))
+	assert.NotEqual(t, "no-changes", payments, "a finalize-only plan carries work and must not fingerprint as no-changes")
+	assert.Equal(t, payments, planFingerprint(finalizing("payments")), "identical finalize-only plans must dedupe")
+	assert.Equal(t, planFingerprint(finalizing("ledger", "payments")), planFingerprint(finalizing("payments", "ledger")), "order is not work")
+	assert.NotEqual(t, payments, planFingerprint(finalizing("ledger")), "plans finalizing different keyspaces must not dedupe")
+}
+
 func TestPlanFingerprint_NoChanges(t *testing.T) {
 	plan := &apitypes.PlanResponse{}
 

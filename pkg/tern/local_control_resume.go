@@ -1782,7 +1782,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("resolve credentials for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 
-	c.logger.Info("driving group_finalizer VSchema apply",
+	work := finalizerWork(changes)
+	c.logger.Info("driving group_finalizer",
+		"work", work,
 		"apply_id", apply.ApplyIdentifier,
 		"apply_operation_id", op.ID,
 		"deployment", op.Deployment,
@@ -1842,10 +1844,10 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		OnStateChange: persistResume,
 	})
 	if err != nil {
-		return failClosed(fmt.Errorf("apply VSchema for group_finalizer (apply %s): %w", apply.ApplyIdentifier, err))
+		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 	}
 	if result == nil || !result.Accepted {
-		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s was not accepted", apply.ApplyIdentifier))
+		return failClosed(fmt.Errorf("group_finalizer %s for apply %s was not accepted", work, apply.ApplyIdentifier))
 	}
 
 	// A nil resume state means the engine has no in-flight work to track: the
@@ -1857,46 +1859,82 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		persistResume(result.ResumeState)
 		finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, result.ResumeState, persistResume)
 		if err != nil {
-			return failClosed(fmt.Errorf("await group_finalizer VSchema apply (apply %s): %w", apply.ApplyIdentifier, err))
+			return failClosed(fmt.Errorf("await group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 		}
 		if !finalizerVSchemaApplied(finalState) {
-			return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s ended in non-success state %q", apply.ApplyIdentifier, finalState))
+			return failClosed(fmt.Errorf("group_finalizer %s for apply %s ended in non-success state %q", work, apply.ApplyIdentifier, finalState))
 		}
 	}
 	if err := c.storage.ApplyOperations().MarkCompleted(ctx, op.ID); err != nil {
 		return fmt.Errorf("mark group_finalizer apply_operation %d completed (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
-	c.logger.Info("group_finalizer VSchema apply completed",
-		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
+	c.logger.Info("group_finalizer completed",
+		"work", work, "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
 	return nil
 }
 
-// finalizerVSchemaChanges reconstructs the VSchema change(s) a group_finalizer
-// applies, from the plan. A namespace-scoped finalizer (operation key
-// "<ns>/group_finalizer", from a sharded fan-out) applies that one namespace's
-// VSchema. A finalizer with no namespace in its key (a non-sharded VSchema-only
-// apply on an externally-authoritative engine) applies every VSchema-changed
-// namespace in the plan, because that engine deploys the whole branch in one
-// operation.
+// finalizerVSchemaChanges reconstructs the change(s) a group_finalizer applies,
+// from the plan. A namespace-scoped finalizer (operation key
+// "<ns>/group_finalizer", from a sharded fan-out) finalizes that one namespace.
+// A finalizer with no namespace in its key (a finalizer-only apply) finalizes
+// every namespace in the plan that needs it, because an externally-authoritative
+// engine deploys the whole branch in one operation.
+//
+// Each change says what the finalizer is for: vschema_changed when the
+// namespace's VSchema document changes, and needs_finalizer when the engine
+// asked to finalize the namespace. A namespace the engine asked to finalize
+// whose VSchema is unchanged carries only needs_finalizer, so the engine
+// finalizes it without being told to apply a VSchema it does not have.
 func finalizerVSchemaChanges(plan *storage.Plan, namespace string) ([]engine.SchemaChange, error) {
-	vschemaChange := func(ns string) engine.SchemaChange {
-		return engine.SchemaChange{Namespace: ns, Metadata: map[string]string{"vschema_changed": "true"}}
+	finalizerChange := func(ns string) engine.SchemaChange {
+		nsData := plan.Namespaces[ns]
+		metadata := map[string]string{}
+		if nsData.ChangesVSchema() {
+			metadata[storage.PlanMetadataVSchemaChanged] = "true"
+		}
+		if nsData.Finalize {
+			metadata[engine.MetadataNeedsFinalizer] = "true"
+		}
+		return engine.SchemaChange{Namespace: ns, Metadata: metadata}
 	}
 	if namespace != "" {
-		if !plan.Namespaces[namespace].ChangesVSchema() {
-			return nil, fmt.Errorf("plan %d has no VSchema artifact for namespace %q", plan.ID, namespace)
+		if !plan.Namespaces[namespace].NeedsFinalizer() {
+			return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for namespace %q", plan.ID, namespace)
 		}
-		return []engine.SchemaChange{vschemaChange(namespace)}, nil
+		return []engine.SchemaChange{finalizerChange(namespace)}, nil
 	}
-	namespaces := plan.VSchemaNamespaces()
+	namespaces := plan.FinalizerNamespaces()
 	if len(namespaces) == 0 {
-		return nil, fmt.Errorf("plan %d has no VSchema artifact for a deployment-scoped finalizer", plan.ID)
+		return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for a deployment-scoped finalizer", plan.ID)
 	}
 	changes := make([]engine.SchemaChange, 0, len(namespaces))
 	for _, ns := range namespaces {
-		changes = append(changes, vschemaChange(ns))
+		changes = append(changes, finalizerChange(ns))
 	}
 	return changes, nil
+}
+
+// finalizerWork names what a group_finalizer's changes ask the engine to do,
+// for its logs and errors: apply a changed VSchema, finalize a namespace whose
+// VSchema is unchanged, or both across namespaces. Triage then looks for a
+// VSchema document only when there is one.
+func finalizerWork(changes []engine.SchemaChange) string {
+	var vschema, finalizeOnly bool
+	for _, change := range changes {
+		if change.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+			vschema = true
+		} else {
+			finalizeOnly = true
+		}
+	}
+	switch {
+	case vschema && finalizeOnly:
+		return "VSchema apply and finalize"
+	case vschema:
+		return "VSchema apply"
+	default:
+		return "finalize"
+	}
 }
 
 // finalizerVSchemaApplied reports whether an engine progress state means the

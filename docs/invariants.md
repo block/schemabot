@@ -938,7 +938,8 @@ can reach, leaving the row untouched for an instance that can drive it. A claim 
 proceed releases its lease immediately rather than holding the row idle until the staleness window
 expires. And an instance never trusts its own in-memory engine state to answer questions about
 work it does not own. *Enforced:* scope checks and token-guarded claim release in the drive path
-(`pkg/api/operator.go`).
+(`pkg/api/operator.go`) and operation lease checks before conflict resolution
+(`pkg/tern/local_apply.go`, `pkg/storage/internal/sqlstore/tasks.go`).
 
 ### OW-8: Only drivers and elected reapers write apply and task rows
 
@@ -1390,7 +1391,7 @@ the sequential drive (`pkg/tern/local_apply_sequential.go`).
 Automatic cleanup acts only where the record provably carries no engine work, as with a `pending`
 task, which has no checkpoint by construction. Anything uncertain keeps blocking for an operator.
 *Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`,
-`pkg/engine/postgres/apply.go`).
+`pkg/engine/postgres/apply.go`, `pkg/tern/local_apply.go`).
 
 ### RC-5: A terminal summary is never lost, and never silently duplicated
 

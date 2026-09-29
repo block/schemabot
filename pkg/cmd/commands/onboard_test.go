@@ -445,6 +445,18 @@ func TestDescribeOnboardPlanChangesIncludesVSchemaAndClampsDDL(t *testing.T) {
 	assert.Equal(t, "orders: vschema change", lines[1])
 }
 
+// Onboarding verification fails when the pulled files still plan work. A
+// keyspace whose only work is the engine's finalize is named as such, so the
+// failure never lists nothing under "still produce schema changes".
+func TestDescribeOnboardPlanChangesNamesFinalizeOnlyKeyspace(t *testing.T) {
+	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "payments", Metadata: map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"}},
+		},
+	})
+	assert.Equal(t, []string{"payments: engine finalize requested"}, lines)
+}
+
 // A leftover schema file for a table that no longer exists in the target is
 // the classic cause of a failed onboarding verification: the pull rewrites
 // every table in the namespace but never deletes strays, so the stale file

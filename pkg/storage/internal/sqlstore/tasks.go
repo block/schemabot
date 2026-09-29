@@ -144,17 +144,25 @@ const (
 	taskGuardOperation
 	// taskGuardApply checks the token on the task's parent applies row.
 	taskGuardApply
+	// taskGuardOperationAbsent holds no lease: it admits the write only while
+	// no drive holds a fresh lease on the task's operation, read through
+	// unleasedOperationGate so a repair write and the reapers agree on what
+	// "unleased" means.
+	taskGuardOperationAbsent
 )
 
 // taskUpdateStatement renders Update's statement for guard. The lease token
-// lives on a different row from the task, so the guarded renderings join that
-// row and check it through LeaseTokenFence; the unguarded rendering is a
-// portable single-table UPDATE. Every rendering binds the SET placeholders,
-// then the task ID, then the guard's own: the operation ID and token for an
-// operation lease, the token for an apply lease. Every rendering also stamps
-// updated_at, the task's drive liveness signal the stranded-task sweeps read;
-// stamping it is the application's job on every dialect.
+// lives on a different row from the task, so the leased renderings join that
+// row and check it through LeaseTokenFence; the unguarded and absence-guarded
+// renderings are portable single-table UPDATEs. Every rendering binds the SET
+// placeholders, then the task ID, then the guard's own: the operation ID and
+// token for an operation lease, the token for an apply lease, the apply ID and
+// operation ID for an absence guard. Every rendering also stamps updated_at,
+// the task's drive liveness signal the stranded-task sweeps read; stamping it
+// is the application's job on every dialect.
 func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
+	// Clip so the append copies rather than writing the updated_at stamp into
+	// spare capacity behind the shared package-level slice.
 	assignments := append(slices.Clip(taskUpdateAssignments), JoinedUpdateAssignment{Column: "updated_at", Expr: "NOW()"})
 	switch guard {
 	case taskGuardOperation:
@@ -169,12 +177,16 @@ func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
 			assignments,
 			"t.id = ? AND "+d.LeaseTokenFence("applies", "a", "id", "lease_token"),
 		)
-	case taskGuardNone:
+	case taskGuardNone, taskGuardOperationAbsent:
 		sets := make([]string, len(assignments))
 		for i, assignment := range assignments {
 			sets[i] = assignment.Column + " = " + assignment.Expr
 		}
-		return "UPDATE tasks SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+		statement := "UPDATE tasks SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+		if guard == taskGuardOperationAbsent {
+			statement += " AND apply_id = ? AND apply_operation_id = ? AND " + unleasedOperationGate(d)
+		}
+		return statement
 	default:
 		panic(fmt.Sprintf("sqlstore: unknown task lease guard %d", guard))
 	}
@@ -186,7 +198,10 @@ func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
 // takes precedence over the parent apply lease so the operator can move to
 // operation-scoped writes while callers that have not adopted operation leases
 // keep falling back to the apply lease. An operation lease scopes the write to
-// the task's own operation; the apply lease scopes it to the parent apply.
+// the task's own operation; the apply lease scopes it to the parent apply. An
+// operation lease absence guard takes precedence over both: it is the repair
+// write of a caller that holds no lease and must land only while no drive holds
+// the task's operation, and it fails with ErrOperationLeaseActive when one does.
 //
 // A token check that did not lock the lease row would read it from the
 // statement's snapshot: a driver displaced by a steal that had not yet
@@ -205,7 +220,14 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 
 	guard := taskGuardNone
 	var verifyLeaseStillOwned func() error
-	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+	if absence, ok := storage.OperationLeaseAbsenceFromContext(ctx); ok {
+		if absence.ApplyID != task.ApplyID || task.ApplyOperationID == nil || *task.ApplyOperationID != absence.OperationID {
+			return fmt.Errorf("invalid operation lease absence guard for task %d: %w", task.ID, storage.ErrOperationLeaseActive)
+		}
+		guard = taskGuardOperationAbsent
+		args = append(args, absence.ApplyID, absence.OperationID)
+		verifyLeaseStillOwned = func() error { return storage.ErrOperationLeaseActive }
+	} else if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
 		}

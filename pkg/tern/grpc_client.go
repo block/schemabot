@@ -740,6 +740,10 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
+	preCutoverState, err := preCutoverStateForRestore(ctx, c.storage, apply)
+	if err != nil {
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
@@ -748,6 +752,11 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 		Caller:      controlReq.RequestedBy,
 	})
+	// Each branch where the data plane did not take the cutover restores the
+	// pre-cutover state before failing the request; if the restore write fails,
+	// the request stays pending so the next drive re-sends the cutover rather
+	// than leaving the apply wedged. A call with no answer restores nothing,
+	// since the swap may already be under way.
 	if err != nil {
 		if isAmbiguousRemoteCallError(err) {
 			// The data plane records a cutover durably on receipt and answers a
@@ -759,6 +768,9 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 				append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "remote_apply_id", remoteID, "error", err)...)
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: outcome unknown, request left pending: %w", apply.ApplyIdentifier, remoteID, err)
 		}
+		if restoreErr := restoreApplyStateAfterUnacceptedCutover(ctx, c.storage, apply, preCutoverState, logger); restoreErr != nil {
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; %w", apply.ApplyIdentifier, remoteID, err, restoreErr)
+		}
 		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); failErr != nil {
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, remoteID, err, failErr)
@@ -769,6 +781,9 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	}
 	if resp == nil {
 		errorMessage := "the data plane returned neither a response nor an error"
+		if err := restoreApplyStateAfterUnacceptedCutover(ctx, c.storage, apply, preCutoverState, logger); err != nil {
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s: %w", apply.ApplyIdentifier, remoteID, errorMessage, err)
+		}
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
@@ -778,6 +793,9 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	}
 	if !resp.Accepted {
 		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
+		if err := restoreApplyStateAfterUnacceptedCutover(ctx, c.storage, apply, preCutoverState, logger); err != nil {
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s: %w", apply.ApplyIdentifier, remoteID, errorMessage, err)
+		}
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
@@ -2411,16 +2429,42 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 	if plan == nil {
 		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
-	// Fail closed if the operation's scope carries no VSchema artifact,
-	// mirroring the local finalizer drive.
+	// Fail closed if the operation's scope carries neither a VSchema artifact
+	// nor a finalize request, mirroring the local finalizer drive.
 	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 	namespaces := []string{namespace}
 	if namespace == "" {
-		namespaces = plan.VSchemaNamespaces()
+		namespaces = plan.FinalizerNamespaces()
 	}
 	return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, namespaces, groupFinalizerDispatchKind)
+}
+
+// finalizerDispatchMetadata is the metadata a namespace's VSchema-typed
+// dispatch change carries: its persisted VSchema change-metadata, plus
+// needs_finalizer when the engine asked to finalize it. A finalize-only
+// namespace carries needs_finalizer alone, which is how the data plane tells
+// it from a VSchema change (see LocalClient.namespacesFromApplyRequest). A
+// namespace with a VSchema artifact always says its VSchema changed, even when
+// its persisted metadata does not, so adding the finalizer marker can never
+// turn a VSchema change into a finalize-only dispatch that skips the artifact.
+func finalizerDispatchMetadata(nsData *storage.NamespacePlanData) map[string]string {
+	if nsData == nil {
+		return nil
+	}
+	meta := storage.VSchemaPlanMetadata(nsData.Metadata)
+	if !nsData.Finalize {
+		return meta
+	}
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	if nsData.ChangesVSchema() {
+		meta[storage.PlanMetadataVSchemaChanged] = "true"
+	}
+	meta[engine.MetadataNeedsFinalizer] = "true"
+	return meta
 }
 
 // dispatchRemoteVSchemaOnly dispatches the given namespaces' VSchema to the data
@@ -2458,11 +2502,9 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		for _, namespace := range namespaces {
 			// Carry the namespace's persisted VSchema change-metadata so a
 			// deployment materializing the plan from this dispatch runs the
-			// same apply-time safety gates as one reading its own stored plan.
-			var meta map[string]string
-			if nsData := plan.Namespaces[namespace]; nsData != nil {
-				meta = storage.VSchemaPlanMetadata(nsData.Metadata)
-			}
+			// same apply-time safety gates as one reading its own stored plan,
+			// and the finalize request so it finalizes what this plan does.
+			meta := finalizerDispatchMetadata(plan.Namespaces[namespace])
 			changes = append(changes, &ternv1.TableChange{
 				Namespace:  namespace,
 				TableName:  "VSchema: " + namespace,
