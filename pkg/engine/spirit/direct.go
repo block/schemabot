@@ -167,8 +167,9 @@ const blockedSizeUnknownReason = "; direct execution is enabled but the table's 
 // blockedForceKillUnavailableReason is the mode-reason suffix when SchemaBot
 // cannot read the performance_schema lock tables it uses to find the sessions
 // blocking a direct statement's metadata lock. The cause itself, typically a
-// missing SELECT grant, stays in the server log.
-const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot cannot read the performance_schema lock tables it uses to end sessions blocking the statement"
+// missing SELECT grant, stays in the server log; the reason names the grant
+// that fixes it and the fresh plan that picks the grant up.
+const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot cannot read the performance_schema lock tables it uses to end sessions blocking the statement: grant its database user SELECT on performance_schema, then plan again"
 
 // resolveRefusedMode decides whether the policy routes a refused statement to
 // direct execution. Every uncertainty blocks: policy disabled, a size gate
@@ -636,7 +637,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 				// deployment's own configuration, so this sentence is safe to
 				// show on the pull request that asked for the change.
 				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
-					"Table %q is busy: the change could not acquire the metadata lock in %d attempts of %ds each. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely. Retry when those have finished.",
+					"Table %q is busy: the change could not acquire the metadata lock in %d attempts of %ds each. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely, and it cannot kill another user's session unless its database user has CONNECTION_ADMIN. Retry when those sessions have finished, or grant CONNECTION_ADMIN if the server log shows the kill was refused.",
 					ds.table, forceExecConfig.MaxRetries, lockWaitSeconds))
 				return false
 			}

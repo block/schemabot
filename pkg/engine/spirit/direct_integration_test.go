@@ -644,7 +644,9 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 	assert.Contains(t, errorMessage, `Table "direct_locked" is busy`)
 	assert.Contains(t, errorMessage, fmt.Sprintf("attempts of %ds each", lockWaitSeconds))
 	assert.Contains(t, errorMessage, "not a session holding an explicit LOCK TABLES")
-	assert.Contains(t, errorMessage, "Retry when those have finished")
+	assert.Contains(t, errorMessage, "unless its database user has CONNECTION_ADMIN",
+		"a kill refused for lack of privilege lands on this same message, so it names that remedy too")
+	assert.Contains(t, errorMessage, "Retry when those sessions have finished")
 	assert.NotContains(t, errorMessage, "Lock wait timeout exceeded",
 		"the driver's own words are for the server log, not the pull request")
 
@@ -671,8 +673,13 @@ func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 	const user, password = "direct_nokill", "direct_nokill_pw"
 	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE USER '%s'@'%%' IDENTIFIED BY '%s'", user, password))
 	require.NoError(t, err, "create a user without performance_schema access")
+	// The test context is cancelled before cleanup runs, so the drop gets its
+	// own bounded context that outlives it.
+	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
-		_, err := db.ExecContext(t.Context(), fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", user))
+		ctx, cancel := context.WithTimeout(cleanupCtx, 10*time.Second)
+		defer cancel()
+		_, err := db.ExecContext(ctx, fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", user))
 		assert.NoError(t, err, "drop user %s", user)
 	})
 	_, err = db.ExecContext(t.Context(), fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%%'", sqlescape.EscapeIdentifier(database), user))
