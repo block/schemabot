@@ -56,6 +56,10 @@ routes statements Spirit explicitly refuses. Enabling it does not make ordinary
 index additions skip the online copy, and an unexpected engine error is not
 permission to retry the statement directly.
 
+A refusal must be available during planning to qualify for this fallback.
+The [primary-key collation check](#changing-a-primary-keys-collation) runs later,
+so that check alone does not let SchemaBot offer direct execution for a collation change.
+
 ### Enable it with a table-size limit
 
 Direct execution is disabled by default. To allow it for small tables, add this
@@ -219,6 +223,32 @@ Spirit preserves binlog event order for these keys rather than relying on in-mem
 The database decides which strings identify the same row, and checksums verify the copied data.
 For the replay optimization and its key-type limits, see Spirit's
 [change row map](https://github.com/block/spirit#change-row-map).
+
+### Changing a primary key's collation
+
+**Collation controls ordering as well as equality.** Spirit copies and verifies rows in
+primary-key ranges. Changing a key column's collation can make the same range select different
+rows in the original and replacement tables, even when every key remains unique.
+
+For example, both tables contain `a`, `B`, `c`, and `D`. The predicate
+`id >= 'B' AND id < 'D'` selects:
+
+| Primary-key collation | Rows in the range |
+|---|---|
+| `utf8mb4_0900_ai_ci` | `B`, `c` |
+| `utf8mb4_bin` | `B` |
+
+Checking for duplicate values under the new collation does not establish that the online
+copy is safe. The range boundaries must describe the same rows on both sides.
+
+[Spirit's collation safeguard](https://github.com/block/spirit/pull/1284) rejects these changes
+after setting up the replacement table, before copying. SchemaBot currently pins a Spirit
+version that predates that safeguard. On older versions, the change can
+reach copying and fail verification; do not treat a checksum failure as permission to bypass it.
+
+The safeguard also does not report a refusal during statement planning, which SchemaBot needs
+to offer [direct execution](#when-a-change-needs-direct-execution). Enabling that policy or
+raising its row limit alone does not make this change eligible.
 
 ### What the lint finding means
 
