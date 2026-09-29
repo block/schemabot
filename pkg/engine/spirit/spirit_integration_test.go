@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -647,6 +648,37 @@ func TestEngine_Plan_NewTable(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected CREATE TABLE statement, got: %v", result.FlatDDL())
+}
+
+// One schema file declares two tables against an empty database. The plan
+// creates both of them, each from its own statement, so a multi-table file
+// plans every table it declares rather than only the first.
+func TestEngine_Plan_MultipleTablesInOneFile(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"tables.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`));\n" +
+				"CREATE TABLE `events` (`id` bigint NOT NULL, PRIMARY KEY (`id`));\n",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges)
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 2, "DDL: %v", result.FlatDDL())
+	planned := make(map[string]string, len(changes))
+	for _, tc := range changes {
+		assert.Equal(t, ddl.StatementCreateTable, tc.Operation, "DDL: %s", tc.DDL)
+		planned[tc.Table] = tc.DDL
+	}
+	assert.Contains(t, planned["orders"], "CREATE TABLE `orders`")
+	assert.Contains(t, planned["events"], "CREATE TABLE `events`")
 }
 
 func TestEngine_Plan_LintViolationMapping(t *testing.T) {
