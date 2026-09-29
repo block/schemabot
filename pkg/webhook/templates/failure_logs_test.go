@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -316,41 +315,17 @@ func TestRenderFailureLogsSanitizesTheLevel(t *testing.T) {
 }
 
 // A hostile heading shares the fence with the lines it introduces, so it is
-// sanitized and clamped like any other text in it.
+// sanitized like any other text in it, and a long one renders whole.
 func TestRenderFailureLogsSanitizesGroupHeadings(t *testing.T) {
 	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	long := "engine logs: payments-production-us-west-2, target: " + strings.Repeat("portfolios-", 8) + "001"
 	rendered := RenderFailureLogs([]LogGroupData{
 		{Label: "engine logs: region-a\n```\n**bold**", Entries: []LogEntryData{{CreatedAt: at, Level: "info", Message: "one"}}},
-		{Label: strings.Repeat("z", 400), Entries: []LogEntryData{{CreatedAt: at, Level: "info", Message: "two"}}},
+		{Label: long, Entries: []LogEntryData{{CreatedAt: at, Level: "info", Message: "two"}}},
 	}, GitHubIssueCommentMaxChars)
 
 	assert.Equal(t, 2, strings.Count(rendered, "```"))
-	assert.NotContains(t, rendered, strings.Repeat("z", MaxGroupLabelChars+1))
-}
-
-// A heading exists to tell two accounts apart, so the clamp that keeps it
-// inside the budget must not be the thing that makes them identical. Names
-// that identify a deployment or a target share long prefixes and differ at
-// the tail, so the middle goes rather than the end.
-func TestElideMiddleKeepsTheEndThatDistinguishes(t *testing.T) {
-	const max = MaxGroupLabelPartChars
-	third := ElideMiddle("payments-production-shard-003", max)
-	fourth := ElideMiddle("payments-production-shard-004", max)
-
-	assert.LessOrEqual(t, len(third), max)
-	assert.LessOrEqual(t, len(fourth), max)
-	assert.NotEqual(t, third, fourth, "two targets that differ only at the tail must not clamp to one name")
-	assert.True(t, strings.HasSuffix(third, "003"))
-	assert.True(t, strings.HasSuffix(fourth, "004"))
-	assert.Equal(t, "shard-a", ElideMiddle("shard-a", max), "a name that fits is left alone")
-
-	for _, name := range []string{"ααααααααααααα", "shard-ααααα-003", strings.Repeat("é", 40)} {
-		for budget := 1; budget <= max; budget++ {
-			elided := ElideMiddle(name, budget)
-			assert.LessOrEqual(t, len(elided), budget, "%q at %d", name, budget)
-			assert.True(t, utf8.ValidString(elided), "a clamp never splits a rune: %q at %d", name, budget)
-		}
-	}
+	assert.Contains(t, rendered, "\n== "+long+" ==\n")
 }
 
 // The section must never exceed the room it was given, whatever shape the
@@ -388,4 +363,33 @@ func TestRenderFailureLogsNeverExceedsItsBudget(t *testing.T) {
 			}
 		}
 	}
+}
+
+// FoldGroups is the fold's plan, and RenderFailureLogs renders that plan and
+// nothing else: the summary sentence above the fold is written against it, so
+// a group the plan leaves out must not appear in the rendering, and a group it
+// keeps must. A heading that outgrows a tight budget is how a whole account
+// falls out, so that is the case pinned here.
+func TestFoldGroupsIsWhatRenderFailureLogsRenders(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	longLabel := "engine logs: " + strings.Repeat("d", 255) + ", target: " + strings.Repeat("t", 255)
+	groups := []LogGroupData{
+		{Label: "apply logs", Entries: []LogEntryData{{CreatedAt: at, Level: "error", Message: "Apply failed"}}},
+		{Label: longLabel, Entries: []LogEntryData{{CreatedAt: at, Level: "warn", Message: "[orders] unsafe warning 1265"}}},
+	}
+
+	tight := FoldGroups(groups, MinFailureLogsSectionChars)
+	require.Len(t, tight, 1, "the heading alone outgrows the room, so the engine's account falls out")
+	assert.Equal(t, "apply logs", tight[0].Label)
+	rendered := RenderFailureLogs(groups, MinFailureLogsSectionChars)
+	assert.NotContains(t, rendered, "engine logs:")
+	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
+
+	roomy := FoldGroups(groups, GitHubIssueCommentMaxChars)
+	require.Len(t, roomy, 2)
+	assert.Equal(t, longLabel, roomy[1].Label)
+	assert.Contains(t, RenderFailureLogs(groups, GitHubIssueCommentMaxChars), "== "+longLabel+" ==")
+
+	assert.Nil(t, FoldGroups(groups, MinFailureLogsSectionChars-1), "no room for a fold plans no groups")
+	assert.Nil(t, FoldGroups([]LogGroupData{{Label: longLabel}}, GitHubIssueCommentMaxChars), "a group without lines is not planned")
 }

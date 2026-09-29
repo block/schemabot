@@ -2715,8 +2715,8 @@ func PreviewCommentSummaryFailedEngineLogsMultiDeployment() string {
 	}
 	return RenderFailureLogs([]LogGroupData{
 		{Label: "apply logs", Entries: sampleRemoteFailureLogEntries("users", mysqlerr.ReasonFromText("(errno 1265)"))},
-		{Label: "engine logs: shard-a, target: cluster-a", Entries: shardA},
-		{Label: "engine logs: shard-b, target: cluster-b", Entries: shardB},
+		{Label: "engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001", Entries: shardA},
+		{Label: "engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002", Entries: shardB},
 	}, GitHubIssueCommentMaxChars)
 }
 

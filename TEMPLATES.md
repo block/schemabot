@@ -7961,14 +7961,14 @@ _No details available yet._
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
 2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
 
-== engine logs: shard-a, target: cluster-a ==
+== engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001 ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
 2026-03-15 14:24:00 UTC [INF] [users] copy progress: 12.4% 181812/1466232 rows, eta 21m
 2026-03-15 14:27:00 UTC [INF] [users] copy progress: 30.0% 439870/1466232 rows, eta 14m
 2026-03-15 14:27:40 UTC [WRN] [users] unsafe warning 1265: Data truncated for column 'nickname' at row 1
 2026-03-15 14:27:41 UTC [ERR] [users] aborting: the copy would change values that are already in the table
 
-== engine logs: shard-b, target: cluster-b ==
+== engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002 ==
 2026-03-15 14:22:30 UTC [INF] [users] copy starting: 1192044 rows estimated, 4 threads
 2026-03-15 14:27:00 UTC [INF] [users] copy complete: 1192044 rows
 2026-03-15 14:28:00 UTC [INF] [users] cutover complete
