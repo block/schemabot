@@ -217,12 +217,33 @@ func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWithoutAnEngineGroup(t *
 	apply := failureLogsTestApply()
 	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
 	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
+	noEngineAccount := map[string]EngineLogReader{
+		"no reader wired": nil,
+		"reader answers with no source": func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+			return nil, nil
+		},
+		"reader answers with a source that has no lines": func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+			return []api.EngineLogSource{{Deployment: "region-a"}}, nil
+		},
+	}
 
-	rendered := summaryWithFailureLogs(t.Context(), stor, nil, failureLogsTestLogger(), apply,
-		func(apply *storage.Apply) string { return "Error: " + apply.ErrorMessage + "\n" })
+	for name, engineLogs := range noEngineAccount {
+		t.Run(name, func(t *testing.T) {
+			logger := &capturingLogger{}
 
-	assert.Contains(t, rendered, "Error: "+mysqlerr.Generic+" (error 1265)")
-	assert.NotContains(t, rendered, "in the logs below")
+			rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, logger, apply,
+				func(apply *storage.Apply) string { return "Error: " + apply.ErrorMessage + "\n" })
+
+			assert.Contains(t, rendered, "Error: "+mysqlerr.Generic+" (error 1265)")
+			assert.NotContains(t, rendered, "in the logs below")
+			assert.Contains(t, rendered, "Apply failed", "the apply's own account still renders")
+			// The comment is nowhere near its size limit, so nothing about
+			// this path is a size-limit condition an operator should hear
+			// about.
+			assert.Empty(t, logger.warns)
+			assert.Empty(t, logger.errors)
+		})
+	}
 }
 
 // A reason SchemaBot chose from the target's error code already says what an
@@ -351,4 +372,52 @@ func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWhenTheBudgetDropsTheEng
 	assert.Contains(t, rendered, "Apply failed", "the apply's own account still renders")
 	assert.NotContains(t, rendered, engineLogGroupLabel(deployment, target))
 	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
+}
+
+// The sentence that names the server logs is decided against the room the
+// pointed sentence would have left, and the fold renders against that same
+// room. The shorter sentence leaves slightly more, and a fold rendered in the
+// larger room could keep the engine's account the decision found no room
+// for, carrying the engine's lines under a sentence that says they are
+// elsewhere. Here the engine heading's cost falls exactly in that gap.
+func TestSummaryWithFailureLogsRendersTheFoldItDecidedTheSentenceAgainst(t *testing.T) {
+	apply := failureLogsTestApply()
+	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
+	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
+	deployment := strings.Repeat("d", 120)
+	target := strings.Repeat("t", 120)
+	sources := engineLogSource(deployment, "[orders] unsafe warning 1265: Data truncated")
+	sources[0].Target = target
+	engineLogs := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+		return sources, nil
+	}
+
+	// Find the least room in which the fold carries the engine's account,
+	// and leave the pointed sentence one character less than that. The
+	// original sentence is shorter, so the room it leaves is past that
+	// threshold and would carry the account.
+	groups := failureLogGroups(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply)
+	threshold := templates.MinFailureLogsSectionChars
+	for !carriesEngineAccount(templates.FoldGroups(groups, threshold)) {
+		threshold++
+	}
+	require.Greater(t, threshold, templates.MinFailureLogsSectionChars, "the headings must cost more than the section floor for the gap to exist")
+	pointedRoom := threshold - 1
+	pointedMessage := mysqlerr.GenericRenderedLogs + " (error 1265)"
+	pad := strings.Repeat("x", templates.GitHubIssueCommentMaxChars-templates.CommentChromeHeadroom-pointedRoom-len(pointedMessage))
+	renderBody := func(apply *storage.Apply) string {
+		return pad + apply.ErrorMessage
+	}
+	require.True(t, carriesEngineAccount(templates.FoldGroups(groups, pointedRoom+len(pointedMessage)-len(apply.ErrorMessage))),
+		"the room the original sentence leaves would carry the engine's account")
+	logger := &capturingLogger{}
+
+	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, logger, apply, renderBody)
+
+	assert.Contains(t, rendered, mysqlerr.Generic+" (error 1265)")
+	assert.NotContains(t, rendered, "in the logs below")
+	assert.NotContains(t, rendered, engineLogGroupLabel(deployment, target), "the fold sheds the account the sentence was decided without")
+	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
+	assert.Len(t, logger.warns, 1)
+	assert.Empty(t, logger.errors)
 }

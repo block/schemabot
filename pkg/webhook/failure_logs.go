@@ -111,27 +111,45 @@ func summaryWithFailureLogs(ctx context.Context, stor storage.Storage, engineLog
 		return body
 	}
 	groups := failureLogGroups(ctx, stor, engineLogs, logger, apply)
-	if pointed := applyPointingAtRenderedLogs(apply); pointed != apply {
-		pointedBody := renderBody(pointed)
-		pointedRoom := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - len(pointedBody)
-		// The pointed sentence is longer than the one it replaces, so a body
-		// that only just cleared the check above can fail it now, and the
-		// room it leaves is what the fold is planned against. The sentence
-		// stands only when the fold it promises will carry the engine's
-		// account: with no room for a fold, or with room for the apply's own
-		// account alone, "the logs below" would send the reader to lines that
-		// are not there, so the original sentence stands instead — it names
-		// the server logs, which do have the reason.
-		switch {
-		case pointedRoom < templates.MinFailureLogsSectionChars:
-			logger.Error("pointing the failure summary at the rendered logs leaves no room for them under the GitHub comment size limit; keeping the reason that names the server logs",
-				append(apply.LogAttrs(), "summary_chars", len(pointedBody))...)
-		case !carriesEngineAccount(templates.FoldGroups(groups, pointedRoom)):
-			logger.Warn("the recent-logs section has no room for an engine's account under the GitHub comment size limit; keeping the reason that names the server logs",
-				append(apply.LogAttrs(), "summary_chars", len(pointedBody), "log_groups", len(groups))...)
-		default:
-			body, available = pointedBody, pointedRoom
-		}
+	pointed := applyPointingAtRenderedLogs(apply)
+	if pointed == apply {
+		return body + templates.RenderFailureLogs(groups, available)
+	}
+	if !carriesEngineAccount(groups) {
+		// No data plane contributed a line: the apply ran in this process,
+		// no reader is configured, or the read failed or came back empty.
+		// The fold then holds the same log the server writes, so the
+		// sentence that names the server logs is the right one and there is
+		// no budget decision to make.
+		logger.Debug("no engine account was loaded for the failed apply; keeping the reason that names the server logs",
+			append(apply.LogAttrs(), "log_groups", len(groups))...)
+		return body + templates.RenderFailureLogs(groups, available)
+	}
+	pointedBody := renderBody(pointed)
+	pointedRoom := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - len(pointedBody)
+	// The pointed sentence is longer than the one it replaces, so a body
+	// that only just cleared the check above can fail it now, and the
+	// room it leaves is what the fold is planned against. The sentence
+	// stands only when the fold it promises will carry the engine's
+	// account: with no room for a fold, or with room for the apply's own
+	// account alone, "the logs below" would send the reader to lines that
+	// are not there, so the original sentence stands instead — it names
+	// the server logs, which do have the reason.
+	switch {
+	case pointedRoom < templates.MinFailureLogsSectionChars:
+		logger.Error("pointing the failure summary at the rendered logs leaves no room for them under the GitHub comment size limit; keeping the reason that names the server logs",
+			append(apply.LogAttrs(), "summary_chars", len(pointedBody))...)
+	case !carriesEngineAccount(templates.FoldGroups(groups, pointedRoom)):
+		logger.Warn("the recent-logs section has no room for an engine's account under the GitHub comment size limit; keeping the reason that names the server logs",
+			append(apply.LogAttrs(), "summary_chars", len(pointedBody), "log_groups", len(groups))...)
+		// The fold renders against the room it was planned for. The
+		// shorter sentence leaves a little more, but a fold planned in the
+		// smaller room and rendered in the larger one could keep the
+		// account the plan shed, and then carry the engine's lines under a
+		// sentence that says they are elsewhere.
+		available = pointedRoom
+	default:
+		body, available = pointedBody, pointedRoom
 	}
 	return body + templates.RenderFailureLogs(groups, available)
 }
@@ -153,14 +171,16 @@ func applyPointingAtRenderedLogs(apply *storage.Apply) *storage.Apply {
 	return &rendered
 }
 
-// carriesEngineAccount reports whether any group came from a data plane, which
-// is what makes "the logs below" true: an apply driven in this process has one
-// group, and it is the same log the server writes. It is asked about the
-// groups the fold will render, not the groups that were loaded: a fold short
-// of room keeps the apply's own account and sheds the engine's after it.
+// carriesEngineAccount reports whether any group with a line to show came
+// from a data plane, which is what makes "the logs below" true: an apply
+// driven in this process has one group, and it is the same log the server
+// writes, and a data plane that answered with no lines adds nothing the
+// reader could be sent to. Asked about the groups the fold will render rather
+// than the groups that were loaded, it also reports a fold short of room,
+// which keeps the apply's own account and sheds the engine's after it.
 func carriesEngineAccount(groups []templates.LogGroupData) bool {
 	for _, group := range groups {
-		if strings.HasPrefix(group.Label, engineLogGroupLabelPrefix) {
+		if len(group.Entries) > 0 && strings.HasPrefix(group.Label, engineLogGroupLabelPrefix) {
 			return true
 		}
 	}
