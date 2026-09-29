@@ -1014,6 +1014,9 @@ func recoveryResumesFromCheckpoint(databaseType string) bool {
 // When the apply cannot be reloaded or the outcome write fails, it returns an
 // error with the stored apply still active: the drive exits, and the claim
 // that picks the apply up next finalizes it and settles its requests then.
+// A drive whose context was cancelled hands the apply back with nil instead:
+// its storage failures describe the cancellation, not the outcome, and the
+// caller reads its own context to learn why the drive stopped.
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) error {
 	now := time.Now()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
@@ -1038,6 +1041,9 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		return nil
 	}
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
+		if c.driveCancelled(ctx, apply, "before reloading the apply for sequential finalization") {
+			return nil
+		}
 		return fmt.Errorf("reload apply %s (database %s) before sequential finalization: %w", apply.ApplyIdentifier, apply.Database, err)
 	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
 		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
@@ -1059,6 +1065,9 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	}
 	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		if c.driveCancelled(ctx, apply, "while persisting the sequential outcome") {
+			return nil
+		}
 		// The stored apply is still active, so nothing that answers for its
 		// outcome may run: a pending control request completed here would
 		// resolve an operator's command against an apply storage still reports

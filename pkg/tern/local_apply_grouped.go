@@ -603,6 +603,13 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // Each table copies and cuts over independently.
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
+//
+// It returns an error only when the drive settled the apply's outcome but could
+// not record it, so the caller knows the stored apply is still active and no
+// side effect of the outcome has run. A drive context that ends — an operator's
+// stop cancelling the drive, a lost lease, the operator shutting down — is a
+// hand-back rather than a failure: the poll returns nil and the caller reads
+// its own context to learn why it stopped.
 func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) error {
 	eng := c.getEngine()
 	ticker := time.NewTicker(c.taskPollInterval())
@@ -623,7 +630,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		case <-ctx.Done():
 			c.logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				apply.IdentityLogAttrs()...)
-			return ctx.Err()
+			return nil
 		case <-ticker.C:
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
 				return ps.terminalErr
@@ -1078,6 +1085,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ensureApplyFailureMessage(apply, tasks)
 		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 		if err != nil {
+			// A cancelled drive is why the write failed, so the error describes
+			// the driver and not the outcome; the drive hands the apply back.
+			if c.driveCancelled(ctx, apply, "while persisting the apply's settled state") {
+				return true
+			}
 			// The stored apply is still active, so nothing that answers for its
 			// outcome may run: completing a pending control request here would
 			// resolve an operator's command against an apply storage still
