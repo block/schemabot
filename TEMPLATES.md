@@ -1642,7 +1642,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 **target `primary/testapp_3`**
 
-✅ **No schema changes detected**
+No schema changes detected
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1701,7 +1701,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 **target `primary/testapp_1`**
 
-✅ **No schema changes detected**
+No schema changes detected
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -8226,7 +8226,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 **shard `-40`**
 
-✅ **No schema changes detected**
+No schema changes detected
 
 📋 **Plan**: **1** table to alter
 

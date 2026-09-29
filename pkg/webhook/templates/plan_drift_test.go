@@ -371,13 +371,13 @@ func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) 
 	assert.Contains(t, out, "**target `primary/testapp_2`**")
 	assert.Contains(t, out, "ADD COLUMN `email`")
 	// Staging is genuinely converged, so its own section keeps the green line.
-	// Production, which still has work, carries it only under the target
-	// already there, and still summarizes the plan the others run.
+	// Production still has work, so it carries no ✅ at all: the target already
+	// there says so plainly, and the plan the others run is still summarized.
 	staging, production, found := strings.Cut(out, "Production")
 	require.True(t, found, out)
 	assert.Contains(t, staging, "✅ **No schema changes detected**")
-	assert.Contains(t, production, "**target `primary/testapp_1`**\n\n✅ **No schema changes detected**")
-	assert.Equal(t, 1, strings.Count(production, "✅ **No schema changes detected**"))
+	assert.Contains(t, production, "**target `primary/testapp_1`**\n\nNo schema changes detected\n\n")
+	assert.NotContains(t, production, "✅")
 	assert.Contains(t, production, "📋 **Plan**: ")
 
 	// With every environment's rollout converged, the all-clear is correct and
@@ -483,7 +483,7 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 	t.Run("some targets are already there", func(t *testing.T) {
 		out := render(group(1, "a", "c"), group(0, "b"))
 		assert.Contains(t, out, "Targets diverge — what applies where:\n\n**targets `a`, `c`**\n\n```sql\n")
-		assert.Contains(t, out, "**target `b`**\n\n✅ **No schema changes detected**")
+		assert.Contains(t, out, "**target `b`**\n\nNo schema changes detected\n\n")
 		assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	})
 	t.Run("targets need different changes", func(t *testing.T) {
@@ -496,7 +496,7 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 	t.Run("a wide group collapses its names", func(t *testing.T) {
 		out := render(group(1, "a", "b", "c", "d", "e", "f", "g", "h", "i"), group(0, "j"))
 		assert.Contains(t, out, "<details>\n<summary><b>9 of 10 targets</b></summary>\n\n`a`, `b`, `c`, `d`, `e`, `f`, `g`, `h`, `i`\n\n</details>")
-		assert.Contains(t, out, "**target `j`**\n\n✅ **No schema changes detected**")
+		assert.Contains(t, out, "**target `j`**\n\nNo schema changes detected\n\n")
 	})
 }
 
@@ -525,8 +525,8 @@ func TestRenderPlanComment_VSchemaOnlyPlanIsNotAlreadyApplied(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Equal(t, 1, strings.Count(out, "✅ **No schema changes detected**"), "only the target with nothing to run is already applied")
-	assert.Contains(t, out, "**target `primary/testapp_2`**\n\n✅ **No schema changes detected**")
+	assert.NotContains(t, out, "✅", "a rollout with work left is not all clear")
+	assert.Contains(t, out, "**target `primary/testapp_2`**\n\nNo schema changes detected\n\n")
 	assert.Contains(t, out, "📋 **Plan**: **1** vschema update")
 }
 
@@ -608,8 +608,8 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Equal(t, 1, strings.Count(out, "✅ **No schema changes detected**"), "the no-op is said only of the target already there")
-	assert.Contains(t, out, "**target `primary/testapp_1`**\n\n✅ **No schema changes detected**")
+	assert.NotContains(t, out, "✅", "a rollout with work left is not all clear")
+	assert.Contains(t, out, "**target `primary/testapp_1`**\n\nNo schema changes detected\n\n")
 	assert.Less(t, strings.Index(out, "**targets `primary/testapp_2`, `primary/testapp_3`**"), strings.Index(out, "**target `primary/testapp_1`**"),
 		"the targets with work read first")
 	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
@@ -723,7 +723,7 @@ func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 		"ADD COLUMN `email`",
 		"**target `primary/testapp_4`**",
 		"ADD INDEX `idx_email`",
-		"**target `primary/testapp_3`**\n\n✅ **No schema changes detected**",
+		"**target `primary/testapp_3`**\n\nNo schema changes detected\n\n",
 		"📋 **Plan**: **1** table to alter",
 	} {
 		positions[want] = strings.Index(out, want)
@@ -761,7 +761,7 @@ func TestRenderMultiEnvPlanComment_EachTargetPlanRendersUnderItsTargets(t *testi
 	assert.GreaterOrEqual(t, otherHeader, 0)
 	assert.Greater(t, details, otherHeader, "the two-statement plan folds under its own targets")
 	assert.Less(t, details, strings.Index(production, "ADD INDEX `idx_email`"))
-	assert.Contains(t, production, "**target `primary/testapp_3`**\n\n✅ **No schema changes detected**")
+	assert.Contains(t, production, "**target `primary/testapp_3`**\n\nNo schema changes detected\n\n")
 	assert.Equal(t, 1, strings.Count(production, "📋 **Plan**: "), "the plans are summarized once, together")
 }
 

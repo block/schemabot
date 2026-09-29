@@ -948,9 +948,16 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 	}
 }
 
-// noChangesDetected is the line that closes a comment with nothing to apply. A
-// shard or target group with nothing to apply carries it under its heading.
+// noChangesDetected is the line that closes a comment with nothing to apply.
+// Its ✅ says the whole plan is done, so it is never written while any shard or
+// target still has work.
 const noChangesDetected = "✅ **No schema changes detected**"
+
+// groupNoChanges is written under a shard or target group with nothing to
+// apply. Such a group only renders beside a group that still has work, so it
+// carries no ✅ and no emphasis: the rollout is not done, and the groups that
+// have work are what the reader needs to find.
+const groupNoChanges = "No schema changes detected"
 
 // changingTargetCount counts the rollout's members whose own plan runs work.
 //
@@ -1226,7 +1233,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dial
 		// A satisfied group already matches the desired schema; say so instead
 		// of rendering an empty code block.
 		if g.Satisfied {
-			sb.WriteString(noChangesDetected + "\n\n")
+			sb.WriteString(groupNoChanges + "\n\n")
 			continue
 		}
 		writePlanDDLBlocks(sb, g.Statements, dialect, budget)
@@ -1592,7 +1599,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 	for _, g := range plans {
 		writeGroupHeading(sb, targetNoun, g.Members, len(drift.Deployments))
 		if g.Empty() {
-			sb.WriteString(noChangesDetected + "\n\n")
+			sb.WriteString(groupNoChanges + "\n\n")
 			continue
 		}
 		group := data
