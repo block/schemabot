@@ -385,12 +385,13 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 	})
 
 	t.Run("multi-statement DDL is rejected", func(t *testing.T) {
-		// The parser rejects multi-statement input, so a destructive trailing
-		// statement cannot hide behind the classification of the first one and
-		// mask drift. It must fail closed instead.
+		// The only multi-statement shape drift admits is a greenfield create
+		// set, so a script of two ALTERs is refused at its first statement: a
+		// destructive trailing statement cannot hide behind the classification
+		// of the first one and mask drift. It must fail closed instead.
 		_, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255); ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "parsed as 2 statements")
+		assert.Contains(t, err.Error(), "statement 1 is ALTER TABLE; a multi-statement DDL script must start with CREATE TABLE")
 	})
 
 	t.Run("DML is rejected", func(t *testing.T) {

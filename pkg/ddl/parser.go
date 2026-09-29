@@ -152,11 +152,9 @@ func (s CreateSet) StatementType(i int) StatementType {
 // CREATE INDEX statements on that same table.
 //
 // Multi-statement create sets are currently a PostgreSQL-parser capability.
-// The MySQL parser's Split reports one entry per statement, but each entry
-// that Spirit does not rewrite carries the whole script's text rather than
-// that statement alone, so the entries cannot be classified one at a time;
-// Classify rejects the first entry as multi-statement input and the script is
-// refused with that cause.
+// The MySQL parser classifies CREATE INDEX as ALTER TABLE, so a MySQL script
+// of a CREATE TABLE followed by CREATE INDEX statements is refused at its
+// second statement with that cause.
 func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
 	statements, err := p.Split(script)
 	if err != nil {
