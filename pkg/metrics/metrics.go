@@ -987,6 +987,14 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     sustained rate means new applies are repeatedly dispatched against a
 //     target that already has actively driven work — check who is submitting
 //     the duplicates.
+//   - "fresh_operation_lease": a live drive holds the lease of the operation
+//     that owns the task, even though the apply's own lease reads stale, so
+//     the local engine probe was skipped and the live drive stays
+//     authoritative. Read it the same way as "fresh_lease".
+//   - "operation_lease_unreadable": the lease of the operation that owns the
+//     task could not be read, so a live drive could not be ruled out and the
+//     task kept blocking. Any sustained rate is a storage problem, not a
+//     workload one.
 //   - "foreign_terminal_report": the lease is stale and this process's engine
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
