@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -44,11 +45,123 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 
 	users, err := os.ReadFile(filepath.Join(root, "orders", "users.sql"))
 	require.NoError(t, err)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", string(users))
+	assert.Equal(t, "CREATE TABLE `users` (\n    `id` bigint NOT NULL\n);\n", string(users))
 
 	orders, err := os.ReadFile(filepath.Join(root, "orders", "orders.sql"))
 	require.NoError(t, err)
-	assert.Equal(t, "CREATE TABLE `orders` (`id` bigint NOT NULL);\n", string(orders))
+	assert.Equal(t, "CREATE TABLE `orders` (\n    `id` bigint NOT NULL\n);\n", string(orders))
+}
+
+func TestBuildOnboardWritePlanFormatsSQLWithoutChangingContent(t *testing.T) {
+	root := t.TempDir()
+	original := "CREATE TABLE `events` (`id` bigint NOT NULL, `note` varchar(64) DEFAULT 'Keep INT, comma') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"events": original}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+
+	formatted := plan.files[filepath.Join("orders", "events.sql")]
+	assert.Contains(t, strings.TrimSuffix(formatted, "\n"), "\n")
+	assert.Contains(t, formatted, "'Keep INT, comma'")
+	assert.Equal(t, ddl.Canonicalize(original), ddl.Canonicalize(formatted))
+}
+
+// Supported MySQL-family targets keep uncommon table options while writing every
+// table across multiple lines.
+func TestBuildOnboardWritePlanPreservesMySQLTableOptions(t *testing.T) {
+	for _, databaseType := range []string{"mysql", "vitess"} {
+		t.Run(databaseType, func(t *testing.T) {
+			root := t.TempDir()
+			plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database: "app", Type: databaseType, TableCount: 2,
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"app": {Tables: map[string]string{
+						"plain":     "CREATE TABLE plain (id int)",
+						"encrypted": "CREATE TABLE encrypted (id int) ENGINE=InnoDB ENCRYPTION='Y'",
+					}},
+				},
+			}, client.PlanExclusions{})
+			require.NoError(t, err)
+			require.NoError(t, plan.write())
+			for _, table := range []string{"plain", "encrypted"} {
+				content, err := os.ReadFile(filepath.Join(root, "app", table+".sql"))
+				require.NoError(t, err)
+				assert.Contains(t, string(content), "\n    `id` int\n)")
+				if table == "encrypted" {
+					assert.Contains(t, string(content), "ENCRYPTION = 'Y'")
+				}
+			}
+		})
+	}
+}
+
+// Formatting refusals name the affected table and prevent a partial plan or
+// filesystem changes, even when an earlier table could be formatted.
+func TestBuildOnboardWritePlanRefusesLossyFormatting(t *testing.T) {
+	for _, databaseType := range []string{"mysql", "vitess"} {
+		for _, suffix := range []string{"/* keep me */", "STATS_PERSISTENT=0", "PACK_KEYS=1"} {
+			t.Run(databaseType+"/"+suffix, func(t *testing.T) {
+				root := t.TempDir()
+				plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+					Database: "app", Type: databaseType, TableCount: 2,
+					Namespaces: map[string]*apitypes.PulledNamespace{
+						"app": {Tables: map[string]string{
+							"a": "CREATE TABLE a (id int)",
+							"b": "CREATE TABLE b (id int) " + suffix,
+						}},
+					},
+				}, client.PlanExclusions{})
+				require.ErrorContains(t, err, "namespace app table b")
+				assert.Nil(t, plan)
+				entries, err := os.ReadDir(root)
+				require.NoError(t, err)
+				assert.Empty(t, entries)
+			})
+		}
+	}
+}
+
+// All table-formatting failures are reported in namespace/table order, while
+// both existing files and successfully formatted tables remain unwritten.
+func TestBuildOnboardWritePlanReportsAllFormattingFailures(t *testing.T) {
+	root := t.TempDir()
+	existing := filepath.Join(root, "schemabot.yaml")
+	require.NoError(t, os.WriteFile(existing, []byte("database: existing\n"), 0o644))
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "mysql", Environment: "staging", TableCount: 4,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"z": {Tables: map[string]string{"c": "CREATE TABLE c (id int) PACK_KEYS=1"}},
+			"a": {Tables: map[string]string{
+				"good": "CREATE TABLE good (id int)",
+				"b":    "CREATE TABLE b (id int) STATS_PERSISTENT=0",
+				"a":    "CREATE TABLE a (id int) /* keep me */",
+			}},
+		},
+	}, client.PlanExclusions{})
+	require.Error(t, err)
+	assert.Nil(t, plan)
+	lines := strings.Split(err.Error(), "\n")
+	require.GreaterOrEqual(t, len(lines), 6)
+	assert.Equal(t, "onboarding refused; no files were written:", lines[0])
+	assert.Contains(t, lines[1], "namespace a table a: cannot preserve MySQL comments")
+	assert.Contains(t, lines[2], "namespace a table b: cannot prove statement 1 preserved its SQL")
+	assert.Contains(t, lines[3], "namespace z table c: cannot prove statement 1 preserved its SQL")
+	assert.Contains(t, err.Error(), "pull with -o json")
+	assert.Contains(t, err.Error(), "plan against the source environment and require no schema changes")
+	assert.Contains(t, err.Error(), "onboard pulls the source again")
+	content, err := os.ReadFile(existing)
+	require.NoError(t, err)
+	assert.Equal(t, "database: existing\n", string(content))
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "schemabot.yaml", entries[0].Name())
 }
 
 func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
@@ -79,7 +192,7 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 
 	users, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "users.sql"))
 	require.NoError(t, err)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", string(users))
+	assert.Equal(t, "CREATE TABLE `users` (\n    `id` bigint NOT NULL\n);\n", string(users))
 
 	vschema, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "vschema.json"))
 	require.NoError(t, err)
@@ -655,6 +768,23 @@ func TestBuildOnboardWritePlanPostgres(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ddl, string(contents))
 	assert.Equal(t, "postgres", plan.databaseType)
+}
+
+func TestBuildOnboardWritePlanPostgresPreservesRowSecurity(t *testing.T) {
+	root := t.TempDir()
+	definition := "CREATE TABLE documents (\n  id bigint PRIMARY KEY\n);\nALTER TABLE documents ENABLE ROW LEVEL SECURITY;\nALTER TABLE documents FORCE ROW LEVEL SECURITY;\nCREATE POLICY readers ON documents FOR SELECT USING (id = 1);\nCOMMENT ON POLICY readers ON documents IS 'Read your documents';\n"
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development", TableCount: 1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {Tables: map[string]string{"documents": definition}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	contents, err := os.ReadFile(filepath.Join(root, "public", "documents.sql"))
+	require.NoError(t, err)
+	assert.Equal(t, definition, string(contents))
 }
 
 func TestBuildOnboardWritePlanEmptyNamespace(t *testing.T) {
