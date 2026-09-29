@@ -367,13 +367,17 @@ func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWhenTheBudgetDropsTheEng
 		return pad + apply.ErrorMessage
 	}
 
-	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply, renderBody)
+	logger := &capturingLogger{}
+
+	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, logger, apply, renderBody)
 
 	assert.Contains(t, rendered, mysqlerr.Generic+" (error 1265)")
 	assert.NotContains(t, rendered, "in the logs below", "the summary never promises an account the fold left out")
 	assert.Contains(t, rendered, "Apply failed", "the apply's own account still renders")
 	assert.NotContains(t, rendered, engineLogGroupLabel(deployment, target))
 	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
+	assert.Len(t, logger.warns, 1, "a fold that sheds a loaded account warns once")
+	assert.Empty(t, logger.errors)
 }
 
 // The sentence is chosen against the room the pointed one would leave, and
@@ -424,6 +428,6 @@ func TestSummaryWithFailureLogsKeepsTheEngineLinesThatFitUnderTheServerLogsSente
 	// after the timestamp and level; the account is present, not whole.
 	assert.Contains(t, rendered, "2026-07-12 16:32:01 UTC [WRN]")
 	assert.NotContains(t, rendered, "source omitted")
-	assert.Len(t, logger.warns, 1)
+	assert.Empty(t, logger.warns, "the fold kept the engine's account, so no account was dropped")
 	assert.Empty(t, logger.errors)
 }

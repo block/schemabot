@@ -88,11 +88,14 @@ type summaryBodyRenderer func(apply *storage.Apply) string
 // under GitHub's comment size cap is what the fold may spend: a large summary
 // shrinks the fold, and one that leaves no meaningful room drops it, so
 // appending never pushes the comment over the limit and blocks the summary
-// from posting. When the fold turns out to carry the engine's own account, the
-// body is rendered a second time against a reason that points at it: an error
-// SchemaBot has no account of otherwise tells the reader to go and read a
-// server log, while the line that explains the failure is a click away in the
-// same comment.
+// from posting. An error SchemaBot has no account of tells the reader to go
+// and read a server log, and when the engine's own account is a click away in
+// the same comment the body is rendered a second time against a reason that
+// points at it instead. That sentence is chosen against the room it would
+// itself leave: it is longer, and it stands only when the fold in that room
+// carries the engine's account. Otherwise the sentence naming the server logs
+// stands, over whatever the fold in its room holds — engine lines included,
+// since naming the server logs does not deny the lines below.
 //
 // Each load runs under its own short deadline, detached from the caller's
 // cancellation, so the fold is decided by storage and data-plane health alone.
@@ -143,8 +146,17 @@ func summaryWithFailureLogs(ctx context.Context, stor storage.Storage, engineLog
 		logger.Error("pointing the failure summary at the rendered logs leaves no room for them under the GitHub comment size limit; keeping the reason that names the server logs",
 			append(apply.LogAttrs(), "summary_chars", len(pointedBody))...)
 	case !carriesEngineAccount(templates.FoldGroups(groups, pointedRoom)):
-		logger.Warn("pointing the failure summary at the rendered logs leaves no room for the engine's account under the GitHub comment size limit; keeping the reason that names the server logs",
-			append(apply.LogAttrs(), "summary_chars", len(pointedBody), "log_groups", len(groups))...)
+		// Whether the fold posted carries the engine's lines depends on the
+		// original sentence's room, which is wider by the length the
+		// pointed sentence adds. Only a fold that sheds them is a dropped
+		// account an operator should hear about.
+		if carriesEngineAccount(templates.FoldGroups(groups, available)) {
+			logger.Debug("pointing the failure summary at the rendered logs would cost the fold the engine's account under the GitHub comment size limit; keeping the reason that names the server logs, with the engine's lines rendered beneath it",
+				append(apply.LogAttrs(), "summary_chars", len(pointedBody), "log_groups", len(groups))...)
+		} else {
+			logger.Warn("the recent-logs section has no room for the engine's account under the GitHub comment size limit; keeping the reason that names the server logs",
+				append(apply.LogAttrs(), "summary_chars", len(body), "log_groups", len(groups))...)
+		}
 	default:
 		body, available = pointedBody, pointedRoom
 	}
@@ -172,9 +184,11 @@ func applyPointingAtRenderedLogs(apply *storage.Apply) *storage.Apply {
 // from a data plane, which is what makes "the logs below" true: an apply
 // driven in this process has one group, and it is the same log the server
 // writes, and a data plane that answered with no lines adds nothing the
-// reader could be sent to. Asked about the groups the fold will render rather
-// than the groups that were loaded, it also reports a fold short of room,
-// which keeps the apply's own account and sheds the engine's after it.
+// reader could be sent to. Asked about the groups a fold of a given room would
+// render rather than the groups that were loaded, it also reports a fold short
+// of room, which keeps the apply's own account and sheds the engine's after
+// it. The answer chooses the summary's sentence; what the fold renders is
+// decided by the room the chosen sentence leaves.
 func carriesEngineAccount(groups []templates.LogGroupData) bool {
 	for _, group := range groups {
 		if len(group.Entries) > 0 && strings.HasPrefix(group.Label, engineLogGroupLabelPrefix) {
