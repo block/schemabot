@@ -922,6 +922,30 @@ func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
 }
 
+// PreviewCommentConfirmationPlanForOtherEnvironment renders a sample refusal
+// of an apply-confirm that named a different environment than the pending
+// confirmation was planned for.
+func PreviewCommentConfirmationPlanForOtherEnvironment() string {
+	return RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		PlanEnvironment:      "staging",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
+}
+
+// PreviewCommentConfirmationPlanUnavailable renders a sample refusal of an
+// apply-confirm whose pending confirmation pins no plan that can be loaded.
+func PreviewCommentConfirmationPlanUnavailable() string {
+	return RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
+}
+
 // PreviewCommentBaseSchemaFreshnessRejected renders a sample path-scoped base
 // freshness rejection for a PR that must merge or rebase before applying.
 func PreviewCommentBaseSchemaFreshnessRejected() string {

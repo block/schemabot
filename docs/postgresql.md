@@ -75,17 +75,35 @@ ordinary table and index definitions; no extra flag is needed. A disabled table
 with policies still exports those policies and an explicit `DISABLE` setting.
 
 A pulled RLS definition can be checked back into its namespace directory and
-planned. An unchanged definition produces no changes. Changes to settings,
-policies, or the table shape in an RLS declaration currently refuse planning;
-SchemaBot does not turn the review into executable SQL. Direct RLS apply requests
-are also refused. Creating a new table with an RLS declaration is not supported
-yet. Atomic RLS apply is a separate follow-up.
+planned. An unchanged definition produces no changes. Changes to policies,
+policy comments, or RLS settings become one reviewed operation per table.
+The existing unsafe-change consent gate applies because these changes affect
+who can access rows. No additional RLS flag is needed.
+
+At execution, pg-sprite locks the table, regenerates the ordered SQL, and checks it against the reviewed operation before executing any of it.
+The entire policy replacement commits in one transaction, including settings
+and comments. A mismatch refuses execution and requires a new plan. This binds
+the SQL to execute, not every prior policy predicate: if concurrent edits still
+produce exactly the reviewed SQL, that SQL remains authorized.
+
+RLS drift comparison retains the physical schema qualifier. Dispatching a reviewed
+RLS operation to a differently named physical schema requires a fresh plan and
+review on that target; ordinary table namespace mapping does not authorize this
+RLS remapping. The executor still verifies the exact ordered SQL under its lock.
+
+Unchanged RLS definitions use a catalog comparison without an exclusive target lock
+or an ownership requirement. Planning a change and executing it take a bounded
+exclusive table lock. Keep policy
+updates small and expect a busy table to refuse rather than wait indefinitely.
+Creating a new table with an RLS declaration and combining structural changes
+with managed RLS remain unsupported. Direct RLS apply requests without the
+stored desired schema files are refused.
 
 Existing table-only files remain supported on tables with live RLS. They manage
 columns and indexes without changing policies or RLS settings; older rollback
 baselines keep this behavior too. Omitting RLS clauses does **not** disable RLS
-or drop policies. Explicit RLS declarations use the stricter comparison above,
-which currently refuses mixed structural and RLS changes. A no-change result
+or drop policies. Explicit RLS declarations use the atomic path above,
+which refuses mixed structural and RLS changes. A no-change result
 for a table-only file says nothing about whether its access policies match.
 
 New plans for a namespace containing RLS tables remain rollback-incapable until
@@ -110,8 +128,9 @@ CREATE POLICY "readers" ON "documents"
 ```
 
 Planning this file against that same live definition returns `NoChanges: true`.
-Editing the policy to `USING (true)` instead returns a row security comparison
-refusal, with no executable plan or live changes.
+Editing the policy to `USING (true)` produces an unsafe policy replacement
+for review. Applying it broadens access to every row allowed by the remaining
+policies and grants; review that access change before consenting.
 
 RLS comparison and rendering use pg-sprite's validated model. Policy roles and
 qualified helper functions must already exist. Unsupported policy dependencies
@@ -122,8 +141,9 @@ does not judge whether a policy grants the right access.
 ## Supported changes
 
 The apply path normally executes a plan one statement at a time. Each statement
-runs as its own task and its own PostgreSQL transaction. The exception is a
-greenfield create set: its table and indexes run as one task through a
+runs as its own task and its own PostgreSQL transaction. An RLS replacement
+runs as one task and one atomic transaction, as described above. A second
+exception is a greenfield create set: its table and indexes run as one task through a
 pg-sprite sequence, with each sequence step in its own bounded transaction. A
 failed set leaves its committed prefix on the target, and the next plan
 reconciles that live catalog. Every statement must satisfy all of these
@@ -734,8 +754,8 @@ A passing refusal case proves rejection, not support for applying that change.
 
 This is a small adapter suite, not a claim of hosted Supabase support. It does
 not exercise Supavisor, the Data API, Auth service, Realtime, or hosted TLS.
-SchemaBot can pull and compare RLS declarations, but does not yet execute changes
-to them. The RLS test also calls the native apply path directly and checks visibility with the image's `authenticated` role and
+The Supabase fixture test covers pull and comparison; the separate atomic RLS
+integration tests cover policy replacement. The fixture RLS test also calls the native apply path directly and checks visibility with the image's `authenticated` role and
 bootstrap `auth.uid()` function. It does not test the full plan-to-apply workflow
 for an RLS table or HTTP authentication.
 
