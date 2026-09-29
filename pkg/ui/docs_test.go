@@ -56,3 +56,20 @@ func headingAnchors(doc string) []string {
 	}
 	return anchors
 }
+
+func TestDocRef(t *testing.T) {
+	tests := map[string]struct {
+		url  string
+		want string
+	}{
+		"docs page":       {ThrottleDocURL, "docs/throttle.md"},
+		"anchor dropped":  {DocsBaseURL + "schema-config.md#layout", "docs/schema-config.md"},
+		"outside docs":    {"https://example.com/guide", "https://example.com/guide"},
+		"no shorter form": {"https://github.com/block/schemabot", "https://github.com/block/schemabot"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DocRef(tc.url))
+		})
+	}
+}

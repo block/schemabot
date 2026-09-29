@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -107,13 +108,107 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 	return scanTask(row)
 }
 
+// taskUpdateAssignments is the SET list Update writes from the caller's task.
+// Each column binds one placeholder, in this order, ahead of the WHERE clause's
+// placeholders; taskUpdateStatement appends the updated_at stamp.
+var taskUpdateAssignments = []JoinedUpdateAssignment{
+	{Column: "state", Expr: "?"},
+	{Column: "error_message", Expr: "?"},
+	{Column: "options", Expr: "?"},
+	{Column: "attempt", Expr: "?"},
+	{Column: "rows_copied", Expr: "?"},
+	{Column: "rows_total", Expr: "?"},
+	{Column: "progress_percent", Expr: "?"},
+	{Column: "eta_seconds", Expr: "?"},
+	{Column: "checksum_rows_checked", Expr: "?"},
+	{Column: "checksum_rows_total", Expr: "?"},
+	{Column: "throttled", Expr: "?"},
+	{Column: "throttle_reason", Expr: "?"},
+	{Column: "execution_mode", Expr: "?"},
+	{Column: "mode_reason", Expr: "?"},
+	{Column: "cutover_attempts", Expr: "?"},
+	{Column: "is_instant", Expr: "?"},
+	{Column: "engine_migration_id", Expr: "?"},
+	{Column: "ddl", Expr: "?"},
+	{Column: "started_at", Expr: "?"},
+	{Column: "completed_at", Expr: "?"},
+}
+
+// taskLeaseGuard selects the lease check Update's statement carries.
+type taskLeaseGuard int
+
+const (
+	// taskGuardNone writes without a lease check: no lease is on the context.
+	taskGuardNone taskLeaseGuard = iota
+	// taskGuardOperation checks the token on the task's own apply_operations row.
+	taskGuardOperation
+	// taskGuardApply checks the token on the task's parent applies row.
+	taskGuardApply
+	// taskGuardOperationAbsent holds no lease: it admits the write only while
+	// no drive holds a fresh lease on the task's operation, read through
+	// unleasedOperationGate so a repair write and the reapers agree on what
+	// "unleased" means.
+	taskGuardOperationAbsent
+)
+
+// taskUpdateStatement renders Update's statement for guard. The lease token
+// lives on a different row from the task, so the leased renderings join that
+// row and check it through LeaseTokenFence; the unguarded and absence-guarded
+// renderings are portable single-table UPDATEs. Every rendering binds the SET
+// placeholders, then the task ID, then the guard's own: the operation ID and
+// token for an operation lease, the token for an apply lease, the apply ID and
+// operation ID for an absence guard. Every rendering also stamps updated_at,
+// the task's drive liveness signal the stranded-task sweeps read; stamping it
+// is the application's job on every dialect.
+func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
+	// Clip so the append copies rather than writing the updated_at stamp into
+	// spare capacity behind the shared package-level slice.
+	assignments := append(slices.Clip(taskUpdateAssignments), JoinedUpdateAssignment{Column: "updated_at", Expr: "NOW()"})
+	switch guard {
+	case taskGuardOperation:
+		return d.JoinedUpdate(
+			"tasks", "t", "apply_operations", "ao", "ao.id = t.apply_operation_id",
+			assignments,
+			"t.id = ? AND ao.id = ? AND "+d.LeaseTokenFence("apply_operations", "ao", "id", "lease_token"),
+		)
+	case taskGuardApply:
+		return d.JoinedUpdate(
+			"tasks", "t", "applies", "a", "a.id = t.apply_id",
+			assignments,
+			"t.id = ? AND "+d.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
+	case taskGuardNone, taskGuardOperationAbsent:
+		sets := make([]string, len(assignments))
+		for i, assignment := range assignments {
+			sets[i] = assignment.Column + " = " + assignment.Expr
+		}
+		statement := "UPDATE tasks SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+		if guard == taskGuardOperationAbsent {
+			statement += " AND apply_id = ? AND apply_operation_id = ? AND " + unleasedOperationGate(d)
+		}
+		return statement
+	default:
+		panic(fmt.Sprintf("sqlstore: unknown task lease guard %d", guard))
+	}
+}
+
 // Update updates an existing task.
 //
 // The write is guarded by whichever lease is on the context: an operation lease
 // takes precedence over the parent apply lease so the operator can move to
 // operation-scoped writes while callers that have not adopted operation leases
 // keep falling back to the apply lease. An operation lease scopes the write to
-// the task's own operation; the apply lease scopes it to the parent apply.
+// the task's own operation; the apply lease scopes it to the parent apply. An
+// operation lease absence guard takes precedence over both: it is the repair
+// write of a caller that holds no lease and must land only while no drive holds
+// the task's operation, and it fails with ErrOperationLeaseActive when one does.
+//
+// A token check that did not lock the lease row would read it from the
+// statement's snapshot: a driver displaced by a steal that had not yet
+// committed would pass against the token the steal was replacing, and its write
+// would land after the new driver took over. The fence taskUpdateStatement
+// renders instead waits out the steal and fails, or wins the row lock and holds
+// the steal off until the task write commits.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
@@ -123,57 +218,33 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		task.ID,
 	}
 
-	leasePredicate := ""
+	guard := taskGuardNone
 	var verifyLeaseStillOwned func() error
-	if guard, ok := storage.OperationLeaseAbsenceFromContext(ctx); ok {
-		if guard.ApplyID != task.ApplyID || task.ApplyOperationID == nil || *task.ApplyOperationID != guard.OperationID {
+	if absence, ok := storage.OperationLeaseAbsenceFromContext(ctx); ok {
+		if absence.ApplyID != task.ApplyID || task.ApplyOperationID == nil || *task.ApplyOperationID != absence.OperationID {
 			return fmt.Errorf("invalid operation lease absence guard for task %d: %w", task.ID, storage.ErrOperationLeaseActive)
 		}
-		freshLeaseAfter := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-			LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-		leasePredicate = `
-			AND tasks.apply_id = ? AND tasks.apply_operation_id = ?
-			AND NOT EXISTS (
-				SELECT 1 FROM apply_operations ao
-				WHERE ao.id = ? AND ao.apply_id = ? AND ao.lease_owner <> ''
-					AND ao.updated_at >= ` + freshLeaseAfter + `
-			)`
-		args = append(args, guard.ApplyID, guard.OperationID, guard.OperationID, guard.ApplyID)
+		guard = taskGuardOperationAbsent
+		args = append(args, absence.ApplyID, absence.OperationID)
 		verifyLeaseStillOwned = func() error { return storage.ErrOperationLeaseActive }
 	} else if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
 		}
-		leasePredicate = `
-			AND tasks.apply_operation_id = ?
-			AND EXISTS (
-				SELECT 1 FROM apply_operations ao
-				WHERE ao.id = ? AND ao.lease_token = ?
-			)`
-		args = append(args, opLease.OperationID, opLease.OperationID, opLease.Token)
+		guard = taskGuardOperation
+		args = append(args, opLease.OperationID, opLease.Token)
 		verifyLeaseStillOwned = func() error { return ensureOperationLeaseStillOwned(ctx, s.db, opLease) }
 	} else if lease, hasLease, err := applyLeaseFromContext(ctx, task.ApplyID); err != nil {
 		return err
 	} else if hasLease {
-		leasePredicate = `
-			AND EXISTS (
-				SELECT 1 FROM applies a
-				WHERE a.id = tasks.apply_id AND a.lease_token = ?
-			)`
+		guard = taskGuardApply
 		args = append(args, lease.Token)
 		verifyLeaseStillOwned = func() error { return ensureApplyLeaseStillOwned(ctx, s.db, lease) }
 	}
 
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE tasks SET
-			state = ?, error_message = ?, options = ?, attempt = ?,
-			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?, checksum_rows_checked = ?, checksum_rows_total = ?, throttled = ?, throttle_reason = ?, execution_mode = ?, mode_reason = ?, cutover_attempts = ?,
-			is_instant = ?, engine_migration_id = ?, ddl = ?,
-			started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?`+leasePredicate+`
-	`, args...)
+	result, err := s.db.ExecContext(ctx, taskUpdateStatement(s.dialect, guard), args...)
 	if err != nil {
-		return err
+		return fmt.Errorf("update task %d (%s): %w", task.ID, task.TaskIdentifier, err)
 	}
 	if verifyLeaseStillOwned == nil {
 		return nil

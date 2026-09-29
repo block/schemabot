@@ -63,6 +63,13 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
 	t.Run("ApplyCommentProgressAuthorityStaleTakeover", func(t *testing.T) { testPostgresApplyCommentProgressAuthorityStaleTakeover(t, h) })
 	t.Run("ApplyUpdateRefusesReopenAcrossSnapshotRace", func(t *testing.T) { testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t, h) })
+	t.Run("LeaseFencedWritesFailClosedAgainstConcurrentSteal", func(t *testing.T) {
+		testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db))
+	})
 }
 
 // reopenRaceDeadline bounds each wait in the snapshot race: the update reaching
