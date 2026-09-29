@@ -102,3 +102,47 @@ func TestEngineAtomicRowSecurityRefusesLatePolicyAddition(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT count(*) FROM pg_policy WHERE polrelid='public.documents'::regclass").Scan(&policies))
 	assert.Equal(t, 2, policies)
 }
+
+func TestEnginePlanRefusesDuplicateRowSecurityDeclarations(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_duplicates")
+	_, err := db.ExecContext(t.Context(), `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+ `)
+	require.NoError(t, err)
+	const changed = `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 2);
+ `
+	const unchanged = `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
+ `
+	const tableOnly = `CREATE TABLE documents (id bigint PRIMARY KEY);`
+	for _, tt := range []struct{ name, first, second string }{
+		{"two changed RLS files", changed, changed},
+		{"RLS then table only", changed, tableOnly},
+		{"table only then RLS", tableOnly, changed},
+		{"two unchanged RLS files", unchanged, unchanged},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := New().Plan(t.Context(), &engine.PlanRequest{
+				Database: "rls_duplicates", Credentials: &engine.Credentials{DSN: dsn},
+				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+					"a.sql": tt.first, "b.sql": tt.second,
+				}}},
+			})
+			require.ErrorContains(t, err, `table "documents" in namespace "public" is declared in both "a.sql" and "b.sql"`)
+			require.Nil(t, result, "a duplicate declaration must never publish an unsafe or no-change plan")
+		})
+	}
+	var predicate string
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+  SELECT pg_get_expr(polqual, polrelid) FROM pg_policy
+  WHERE polrelid='public.documents'::regclass AND polname='readers'
+ `).Scan(&predicate))
+	assert.Equal(t, "(id = 1)", predicate)
+}

@@ -265,12 +265,17 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
+		declaredBy := make(map[string]string, len(files))
 		for _, filename := range files {
 			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
 				return nil, fmt.Errorf("plan PostgreSQL row security in %q/%q: %w", namespace, filename, err)
 			}
 			if handled {
+				if first, exists := declaredBy[table]; exists {
+					return nil, fmt.Errorf("PostgreSQL table %q in namespace %q is declared in both %q and %q", table, namespace, first, filename)
+				}
+				declaredBy[table] = filename
 				desiredTables[table] = true
 				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
 				continue
@@ -279,6 +284,10 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if err != nil {
 				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
+			if first, exists := declaredBy[table]; exists {
+				return nil, fmt.Errorf("PostgreSQL table %q in namespace %q is declared in both %q and %q", table, namespace, first, filename)
+			}
+			declaredBy[table] = filename
 			desiredTables[table] = true
 			changes, tiers, unrecognized, err := tableChanges(report, parser)
 			if err != nil {
