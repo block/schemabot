@@ -1194,6 +1194,9 @@ func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 		"missing bound":  {Enabled: true},
 		"zero bound":     {Enabled: true, MaxTableRows: 0},
 		"negative bound": {Enabled: true, MaxTableRows: -1},
+		// The byte bound only narrows the row bound's approval, so it cannot
+		// stand in for the row bound.
+		"byte bound alone": {Enabled: true, MaxTableBytes: "100MiB"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := ServerConfig{
@@ -1349,11 +1352,91 @@ func TestServerConfig_ValidateRejectsBadDirectExecutionLockAcquisitionTimeout(t 
 	}
 }
 
+// A malformed max_table_bytes is a startup config error, even while the policy
+// is disabled, so it never surfaces for the first time when someone enables
+// direct execution. The value must be a positive whole number with a binary
+// unit: a decimal unit such as MB is rejected rather than guessed at, because
+// readers disagree on whether it means 1000² or 1024² bytes.
+func TestServerConfig_ValidateRejectsBadDirectExecutionMaxTableBytes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		maxTableBytes string
+		enabled       bool
+		wantErr       string
+	}{
+		"no unit":                  {"104857600", true, "must be a whole number followed by a unit"},
+		"decimal unit":             {"100MB", true, `unit "MB" is not one of B, KiB, MiB, GiB, TiB`},
+		"lowercase binary unit":    {"100mib", true, `unit "mib" is not one of B, KiB, MiB, GiB, TiB`},
+		"fractional":               {"1.5GiB", true, "must be a whole number followed by a unit"},
+		"negative":                 {"-100MiB", true, "must be a whole number followed by a unit"},
+		"zero":                     {"0MiB", true, "must be positive"},
+		"overflow":                 {"9999999999TiB", true, "overflows a 64-bit byte count"},
+		"not a size":               {"lots", true, "must be a whole number followed by a unit"},
+		"malformed while disabled": {"100MB", false, `unit "MB" is not one of B, KiB, MiB, GiB, TiB`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			direct := &DirectExecutionConfig{Enabled: tc.enabled, MaxTableBytes: tc.maxTableBytes}
+			if tc.enabled {
+				direct.MaxTableRows = 175000
+			}
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution: max_table_bytes "`+tc.maxTableBytes+`"`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// max_table_bytes accepts a whole number with any binary unit, with or
+// without a space, and resolves to bytes on the policy the rest of the system
+// carries.
+func TestDirectExecutionConfig_PolicyResolvesMaxTableBytes(t *testing.T) {
+	for raw, want := range map[string]int64{
+		"104857600B": 104857600,
+		"512KiB":     512 << 10,
+		"100MiB":     100 << 20,
+		"100 MiB":    100 << 20,
+		"2GiB":       2 << 30,
+		"1TiB":       1 << 40,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			direct := &DirectExecutionConfig{Enabled: true, MaxTableRows: 175000, MaxTableBytes: raw}
+			require.NoError(t, direct.Validate("test"))
+			policy, err := direct.Policy()
+			require.NoError(t, err)
+			assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 175000, MaxTableBytes: want}, policy)
+		})
+	}
+
+	t.Run("unset", func(t *testing.T) {
+		policy, err := (&DirectExecutionConfig{Enabled: true, MaxTableRows: 175000}).Policy()
+		require.NoError(t, err)
+		assert.Zero(t, policy.MaxTableBytes, "no byte bound leaves the row bound as the only size gate")
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		policy, err := (&DirectExecutionConfig{Enabled: false, MaxTableBytes: "100MiB"}).Policy()
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy, "an opt-out carries no bounds")
+	})
+}
+
 // A well-formed direct_execution policy on a MySQL database validates, and a
 // disabled block (even without a bound) is accepted as the fail-closed default.
 func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 	for name, direct := range map[string]*DirectExecutionConfig{
 		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
+		"enabled with byte bound":   {Enabled: true, MaxTableRows: 500000, MaxTableBytes: "100MiB"},
 		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
 		"disabled":                  {Enabled: false},
 	} {
@@ -1433,7 +1516,7 @@ func TestServerConfig_ValidateAcceptsServerDirectExecutionAlongsideOtherEngines(
 // including one a data plane resolves per request with no registration of its
 // own, and reaches no engine that cannot honor it.
 func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
-	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}
+	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, MaxTableBytes: "100MiB", LockAcquisitionTimeout: "10s"}
 	cfg := ServerConfig{DirectExecution: serverPolicy}
 
 	t.Run("registered mysql database", func(t *testing.T) {
@@ -1454,6 +1537,7 @@ func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
 		assert.Equal(t, map[string]string{
 			engine.MetadataDirectExecution:                              "true",
 			engine.MetadataDirectExecutionMaxTableRows:                  "10000",
+			engine.MetadataDirectExecutionMaxTableBytes:                 "104857600",
 			engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds: "10",
 		}, metadata)
 	})

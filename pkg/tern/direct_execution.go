@@ -24,6 +24,7 @@ func DirectExecutionPolicyProto(policy *storage.DirectExecutionPolicy) *ternv1.D
 	return &ternv1.DirectExecutionPolicy{
 		Enabled:                       policy.Enabled,
 		MaxTableRows:                  policy.MaxTableRows,
+		MaxTableBytes:                 policy.MaxTableBytes,
 		LockAcquisitionTimeoutSeconds: policy.LockAcquisitionTimeoutSeconds,
 	}
 }
@@ -37,6 +38,7 @@ func DirectExecutionPolicyFromProto(policy *ternv1.DirectExecutionPolicy) *stora
 	return &storage.DirectExecutionPolicy{
 		Enabled:                       policy.GetEnabled(),
 		MaxTableRows:                  policy.GetMaxTableRows(),
+		MaxTableBytes:                 policy.GetMaxTableBytes(),
 		LockAcquisitionTimeoutSeconds: policy.GetLockAcquisitionTimeoutSeconds(),
 	}
 }

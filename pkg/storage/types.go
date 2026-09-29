@@ -1318,8 +1318,11 @@ type ApplyOptions struct {
 // metadata keys is what enforces them, including refusing an enabled policy
 // that carries no row bound.
 type DirectExecutionPolicy struct {
-	Enabled                       bool  `json:"enabled"`
-	MaxTableRows                  int64 `json:"max_table_rows,omitempty"`
+	Enabled      bool  `json:"enabled"`
+	MaxTableRows int64 `json:"max_table_rows,omitempty"`
+	// MaxTableBytes is the optional bound on the table's data plus index
+	// footprint, in bytes. Zero states no byte bound.
+	MaxTableBytes                 int64 `json:"max_table_bytes,omitempty"`
 	LockAcquisitionTimeoutSeconds int64 `json:"lock_acquisition_timeout_seconds,omitempty"`
 }
 
@@ -1333,7 +1336,12 @@ func (p *DirectExecutionPolicy) EngineMetadata() map[string]string {
 	if p == nil {
 		return nil
 	}
-	return engine.DirectExecutionMetadata(p.Enabled, p.MaxTableRows, p.LockAcquisitionTimeoutSeconds)
+	return engine.DirectExecutionMetadata(engine.DirectExecutionSettings{
+		Enabled:                       p.Enabled,
+		MaxTableRows:                  p.MaxTableRows,
+		MaxTableBytes:                 p.MaxTableBytes,
+		LockAcquisitionTimeoutSeconds: p.LockAcquisitionTimeoutSeconds,
+	})
 }
 
 // ControlOperation identifies a user-requested control operation.
@@ -1505,10 +1513,13 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 // distinct from one that states the policy disabled: the first defers to the
 // executing server's configuration, the second overrides it.
 //
-// A malformed number reads as zero rather than failing here. The engine
-// refuses an enabled policy whose row bound is not positive, so a garbled
-// bound blocks the statement instead of widening it — the one direction this
-// is allowed to fail in.
+// A malformed number does not fail here; it reads as a value the engine
+// refuses, so a garbled bound blocks the statement instead of widening it —
+// the one direction this is allowed to fail in. A garbled row bound reads as
+// zero, which the engine refuses because the row bound is required. The byte
+// bound is optional, so zero would mean "no byte bound" and silently drop it;
+// a byte bound that is present but not a positive integer reads as -1
+// instead, which renders back onto the metadata and the engine refuses.
 func directExecutionPolicyFromMap(options map[string]string) *DirectExecutionPolicy {
 	raw, ok := options[engine.MetadataDirectExecution]
 	if !ok {
@@ -1519,8 +1530,23 @@ func directExecutionPolicyFromMap(options map[string]string) *DirectExecutionPol
 	return &DirectExecutionPolicy{
 		Enabled:                       raw == "true",
 		MaxTableRows:                  maxRows,
+		MaxTableBytes:                 storedByteBound(options),
 		LockAcquisitionTimeoutSeconds: lockWait,
 	}
+}
+
+// storedByteBound reads the optional byte bound back out of an options map:
+// zero when absent, -1 when present but not a positive integer.
+func storedByteBound(options map[string]string) int64 {
+	raw, ok := options[engine.MetadataDirectExecutionMaxTableBytes]
+	if !ok {
+		return 0
+	}
+	maxBytes, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || maxBytes <= 0 {
+		return -1
+	}
+	return maxBytes
 }
 
 // GroupsEngineExecution reports whether an apply against databaseType hands the

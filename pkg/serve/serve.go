@@ -1300,7 +1300,7 @@ func serverEngineMetadata(config *api.ServerConfig, resolved map[string]string, 
 			metadata[key] = value
 		}
 	}
-	// The direct execution keys are one policy, not three independent
+	// The direct execution keys are one policy, not independent
 	// defaults: a resolved target that states any of them states the whole
 	// policy, and the server-wide one does not apply. Merging key by key
 	// would let a target enable direct execution while taking its row bound
@@ -1314,11 +1314,7 @@ func serverEngineMetadata(config *api.ServerConfig, resolved map[string]string, 
 // hasDirectExecutionPolicy reports whether resolved target metadata already
 // states a direct execution policy of its own.
 func hasDirectExecutionPolicy(metadata map[string]string) bool {
-	for _, key := range []string{
-		engine.MetadataDirectExecution,
-		engine.MetadataDirectExecutionMaxTableRows,
-		engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
-	} {
+	for _, key := range engine.DirectExecutionKeys() {
 		if _, ok := metadata[key]; ok {
 			return true
 		}

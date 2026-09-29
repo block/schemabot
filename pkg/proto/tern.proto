@@ -497,8 +497,9 @@ message PlanRequest {
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
-// to run verbatim as native DDL, bounded by the target table's size. Engines
-// that do not implement direct execution ignore it.
+// to run verbatim as native DDL, bounded by the target table's size in rows
+// and, optionally, in bytes. Engines that do not implement direct execution
+// ignore it.
 message DirectExecutionPolicy {
   // Whether refused statements may run directly at all.
   bool enabled = 1;
@@ -510,6 +511,11 @@ message DirectExecutionPolicy {
   // How long each direct statement waits to acquire its locks before failing
   // with a retryable busy-table error. Zero leaves the engine's own default.
   int64 lock_acquisition_timeout_seconds = 3;
+  // An optional second size bound: the target table's data plus index
+  // footprint, in bytes. When non-zero a refused statement runs directly only
+  // when the table is within both bounds; zero states no byte bound. A
+  // negative value is an unusable bound, which the engine refuses.
+  int64 max_table_bytes = 4;
 }
 
 // TableChange represents a DDL change to a table.

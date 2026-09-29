@@ -229,9 +229,12 @@ func TestDirectExecutionPolicyRoundTripsThroughTheWire(t *testing.T) {
 	resolved := &storage.DirectExecutionPolicy{
 		Enabled:                       true,
 		MaxTableRows:                  10000,
+		MaxTableBytes:                 100 << 20,
 		LockAcquisitionTimeoutSeconds: 5,
 	}
-	assert.Equal(t, resolved, DirectExecutionPolicyFromProto(DirectExecutionPolicyProto(resolved)))
+	wire := DirectExecutionPolicyProto(resolved)
+	assert.Equal(t, int64(100<<20), wire.GetMaxTableBytes())
+	assert.Equal(t, resolved, DirectExecutionPolicyFromProto(wire))
 	assert.Nil(t, DirectExecutionPolicyProto(nil))
 	assert.Nil(t, DirectExecutionPolicyFromProto(nil))
 }

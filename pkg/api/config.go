@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -1204,8 +1205,8 @@ type EnvironmentConfig struct {
 
 	// DirectExecution configures direct execution of ALTER statements that the
 	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
-	// When enabled, a refused statement whose table's estimated row count is
-	// within max_table_rows runs verbatim as native MySQL DDL: synchronous,
+	// When enabled, a refused statement whose table is within max_table_rows
+	// (and max_table_bytes, when set) runs verbatim as native MySQL DDL: synchronous,
 	// blocking writes to the table while it runs, and not revertible. Only
 	// valid for MySQL databases: setting this block on any other database
 	// type fails config validation, even when disabled, so a policy that can
@@ -1251,6 +1252,16 @@ type DirectExecutionConfig struct {
 	// is true.
 	MaxTableRows int64 `yaml:"max_table_rows,omitempty"`
 
+	// MaxTableBytes is an optional second size bound, on the target table's
+	// data plus index footprint as information_schema reports it: a whole
+	// number followed by a binary unit (e.g. "100MiB"). When set, a refused
+	// statement runs directly only when the table is within both bounds. It
+	// narrows max_table_rows rather than replacing it: the byte figure is a
+	// statistics estimate with no cheap exact corroboration, so it can block a
+	// statement but never approve one on its own, and the row bound stays
+	// required because its exact bounded count is what approves.
+	MaxTableBytes string `yaml:"max_table_bytes,omitempty"`
+
 	// LockAcquisitionTimeout bounds how long each direct statement waits to
 	// acquire its locks before the apply fails with a retryable busy-table
 	// error — instead of queueing on the table's lock indefinitely while all
@@ -1262,15 +1273,18 @@ type DirectExecutionConfig struct {
 
 // Validate ensures a configured direct execution policy is well-formed.
 // Enabling direct execution requires a positive max_table_rows bound so the
-// size gate can never be accidentally unbounded. The lock timeout is checked
-// even while the policy is disabled, so a malformed value fails at startup
-// rather than the first time someone enables the policy.
+// size gate can never be accidentally unbounded. The byte bound and the lock
+// timeout are checked even while the policy is disabled, so a malformed value
+// fails at startup rather than the first time someone enables the policy.
 func (c *DirectExecutionConfig) Validate(context string) error {
 	if c == nil {
 		return nil
 	}
 	if c.Enabled && c.MaxTableRows <= 0 {
-		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required)", context, c.MaxTableRows)
+		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required; max_table_bytes narrows it but does not replace it)", context, c.MaxTableRows)
+	}
+	if _, err := c.maxTableBytes(); err != nil {
+		return fmt.Errorf("%s direct_execution: %w", context, err)
 	}
 	if _, err := c.lockAcquisitionTimeoutSeconds(); err != nil {
 		return fmt.Errorf("%s direct_execution: %w", context, err)
@@ -1309,6 +1323,10 @@ func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error)
 	if !c.Enabled {
 		return &storage.DirectExecutionPolicy{Enabled: false}, nil
 	}
+	maxBytes, err := c.maxTableBytes()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution max_table_bytes: %w", err)
+	}
 	lockWaitSeconds, err := c.lockAcquisitionTimeoutSeconds()
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct_execution lock_acquisition_timeout: %w", err)
@@ -1316,8 +1334,62 @@ func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error)
 	return &storage.DirectExecutionPolicy{
 		Enabled:                       true,
 		MaxTableRows:                  c.MaxTableRows,
+		MaxTableBytes:                 maxBytes,
 		LockAcquisitionTimeoutSeconds: lockWaitSeconds,
 	}, nil
+}
+
+// maxTableBytes parses the configured byte bound. Returns (0, nil) when the
+// field is unset, leaving the row bound as the only size gate.
+func (c *DirectExecutionConfig) maxTableBytes() (int64, error) {
+	if c.MaxTableBytes == "" {
+		return 0, nil
+	}
+	n, err := parseBinaryByteSize(c.MaxTableBytes)
+	if err != nil {
+		return 0, fmt.Errorf("max_table_bytes %q: %w", c.MaxTableBytes, err)
+	}
+	return n, nil
+}
+
+// binaryByteUnits are the units a configured byte size may be written in.
+// Only binary units are accepted: "MB" means 1000² bytes to some readers and
+// 1024² to others, and a safety bound must not depend on which one the
+// author had in mind.
+var binaryByteUnits = map[string]int64{
+	"B":   1,
+	"KiB": 1 << 10,
+	"MiB": 1 << 20,
+	"GiB": 1 << 30,
+	"TiB": 1 << 40,
+}
+
+// byteSizePattern matches a whole number followed by a unit, optionally
+// separated by one space: "100MiB", "100 MiB".
+var byteSizePattern = regexp.MustCompile(`^([0-9]+) ?([A-Za-z]+)$`)
+
+// parseBinaryByteSize parses a positive byte size written as a whole number
+// and a binary unit (B, KiB, MiB, GiB, TiB) into bytes.
+func parseBinaryByteSize(raw string) (int64, error) {
+	m := byteSizePattern.FindStringSubmatch(raw)
+	if m == nil {
+		return 0, errors.New("must be a whole number followed by a unit, e.g. 100MiB")
+	}
+	multiplier, ok := binaryByteUnits[m[2]]
+	if !ok {
+		return 0, fmt.Errorf("unit %q is not one of B, KiB, MiB, GiB, TiB (decimal units such as MB are ambiguous and not accepted)", m[2])
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse number: %w", err)
+	}
+	if n <= 0 {
+		return 0, errors.New("must be positive")
+	}
+	if n > math.MaxInt64/multiplier {
+		return 0, errors.New("overflows a 64-bit byte count")
+	}
+	return n * multiplier, nil
 }
 
 // lockAcquisitionTimeoutSeconds parses the configured lock acquisition
@@ -3462,7 +3534,8 @@ func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
 
 // validateDirectExecution ensures a configured direct execution policy is
 // well-formed. Enabling direct execution requires a positive max_table_rows
-// bound so the size gate can never be accidentally unbounded, and the policy
+// bound so the size gate can never be accidentally unbounded (an optional
+// max_table_bytes narrows it but cannot replace it), and the policy
 // is rejected on non-MySQL databases where it has no effect — a config that
 // looks like it grants direct execution must never be silently ignored.
 func (c EnvironmentConfig) validateDirectExecution(context, databaseType string) error {

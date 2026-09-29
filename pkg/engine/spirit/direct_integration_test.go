@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // directPolicyMetadata is the engine metadata an enabled direct execution
@@ -26,6 +27,56 @@ func directPolicyMetadata(maxTableRows int64) map[string]string {
 		"direct_execution":                "true",
 		"direct_execution_max_table_rows": fmt.Sprintf("%d", maxTableRows),
 	}
+}
+
+// directPolicyMetadataWithBytes is directPolicyMetadata with the optional byte
+// bound set as well.
+func directPolicyMetadataWithBytes(maxTableRows, maxTableBytes int64) map[string]string {
+	md := directPolicyMetadata(maxTableRows)
+	md["direct_execution_max_table_bytes"] = fmt.Sprintf("%d", maxTableBytes)
+	return md
+}
+
+// createSeededPKTable creates a table with a single-column primary key and a
+// secondary index, seeds it with the given number of rows, and refreshes its
+// statistics so information_schema reports its size.
+func createSeededPKTable(t *testing.T, db *sql.DB, table string, rows int) {
+	t.Helper()
+	dropTablesOnCleanup(t, db, table)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `"+table+"` (\n"+
+		"  id INT NOT NULL AUTO_INCREMENT,\n"+
+		"  tenant_id INT NOT NULL,\n"+
+		"  note VARCHAR(255) NOT NULL DEFAULT '',\n"+
+		"  PRIMARY KEY (id),\n"+
+		"  KEY idx_note (note)\n"+
+		")")
+	require.NoError(t, err, "create %s", table)
+	if rows > 0 {
+		var inserts strings.Builder
+		inserts.WriteString("INSERT INTO `" + table + "` (tenant_id, note) VALUES ")
+		for i := range rows {
+			if i > 0 {
+				inserts.WriteString(",")
+			}
+			fmt.Fprintf(&inserts, "(1, '%s')", strings.Repeat("n", 200))
+		}
+		_, err = db.ExecContext(t.Context(), inserts.String())
+		require.NoError(t, err, "seed %s", table)
+	}
+	_, err = db.ExecContext(t.Context(), "ANALYZE TABLE `"+table+"`")
+	require.NoError(t, err, "analyze %s", table)
+}
+
+// pkReshapeSchema is the declared schema that widens createSeededPKTable's
+// primary key, a reshape the engine refuses.
+func pkReshapeSchema(table string) string {
+	return "CREATE TABLE `" + table + "` (\n" +
+		"  id INT NOT NULL AUTO_INCREMENT,\n" +
+		"  tenant_id INT NOT NULL,\n" +
+		"  note VARCHAR(255) NOT NULL DEFAULT '',\n" +
+		"  PRIMARY KEY (id, tenant_id),\n" +
+		"  KEY idx_note (note)\n" +
+		")"
 }
 
 // dropTablesOnCleanup drops the named tables when the test finishes, using a
@@ -210,14 +261,14 @@ func TestResolveRefusedMode_UnreachableTargetBlocks(t *testing.T) {
 	decision := eng.resolveRefusedMode(ctx, target, policy, "absent", "users", "dropping primary key is not supported")
 	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
 	assert.Contains(t, decision.modeReason, "dropping primary key is not supported")
-	assert.Contains(t, decision.modeReason, "row count is unavailable")
+	assert.Contains(t, decision.modeReason, "size is unavailable")
 }
 
 // The size gate fails closed on every input it cannot measure: a table
-// missing from information_schema, and a view — which information_schema
-// lists with a NULL row count — both resolve to errors instead of a zero
-// count that would slip under any bound.
-func TestEstimatedTableRows_FailClosedInputs(t *testing.T) {
+// missing from information_schema, and a view — which is not a base table and
+// has no size statistics — both resolve to errors instead of a zero size that
+// would slip under any bound, whether or not the policy sets a byte bound.
+func TestMeasureTableSize_FailClosedInputs(t *testing.T) {
 	_, db := setupTestMySQL(t)
 	dropTablesOnCleanup(t, db, "size_gate_base")
 
@@ -235,17 +286,183 @@ func TestEstimatedTableRows_FailClosedInputs(t *testing.T) {
 		assert.NoError(t, err, "drop view size_gate_view")
 	})
 
-	t.Run("missing table", func(t *testing.T) {
-		_, err := estimatedTableRows(t.Context(), db, "testdb", "size_gate_absent")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not found in information_schema")
-	})
+	policies := map[string]directPolicy{
+		"row bound only":      {Enabled: true, MaxTableRows: 1000},
+		"row and byte bounds": {Enabled: true, MaxTableRows: 1000, MaxTableBytes: 100 << 20},
+	}
+	for name, policy := range policies {
+		t.Run(name+"/missing table", func(t *testing.T) {
+			_, err := measureTableSize(t.Context(), db, "testdb", "size_gate_absent", policy)
+			require.Error(t, err)
+			assert.Equal(t, "table `testdb`.`size_gate_absent` not found in information_schema", err.Error())
+		})
+		t.Run(name+"/view has no statistics", func(t *testing.T) {
+			_, err := measureTableSize(t.Context(), db, "testdb", "size_gate_view", policy)
+			require.Error(t, err)
+			assert.Equal(t, "table `testdb`.`size_gate_view` not found in information_schema", err.Error())
+		})
+	}
+}
 
-	t.Run("view has no row count", func(t *testing.T) {
-		_, err := estimatedTableRows(t.Context(), db, "testdb", "size_gate_view")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "is unavailable")
+// One statistics read returns every figure the size gate and the plan's size
+// display need, for several tables at once: the row estimate and the data and
+// index footprints. A table that is not a base table, or does not exist, is
+// absent from the result rather than reported as zero.
+func TestReadTableStatistics(t *testing.T) {
+	_, db := setupTestMySQL(t)
+	createSeededPKTable(t, db, "stats_small", 0)
+	createSeededPKTable(t, db, "stats_seeded", 2000)
+
+	stats, err := readTableStatistics(t.Context(), db, "testdb", []string{"stats_small", "stats_seeded", "stats_absent"})
+	require.NoError(t, err)
+	require.Len(t, stats, 2, "only the two base tables that exist are reported")
+
+	small, seeded := stats["stats_small"], stats["stats_seeded"]
+	for name, s := range map[string]tableStatistics{"stats_small": small, "stats_seeded": seeded} {
+		assert.True(t, s.rows.Valid, "%s TABLE_ROWS", name)
+		assert.True(t, s.dataBytes.Valid, "%s DATA_LENGTH", name)
+		assert.True(t, s.indexBytes.Valid, "%s INDEX_LENGTH", name)
+		assert.Positive(t, s.dataBytes.Int64, "%s: even an empty InnoDB table allocates a clustered-index page", name)
+		assert.Positive(t, s.indexBytes.Int64, "%s: the secondary index allocates a page", name)
+	}
+	// TABLE_ROWS is an estimate; allow statistics slop around the seeded count.
+	assert.InDelta(t, 2000, float64(seeded.rows.Int64), 500)
+	assert.Greater(t, seeded.dataBytes.Int64, small.dataBytes.Int64, "seeded rows grow the clustered index")
+	assert.Greater(t, seeded.indexBytes.Int64, small.indexBytes.Int64, "seeded rows grow the secondary index")
+
+	empty, err := readTableStatistics(t.Context(), db, "testdb", nil)
+	require.NoError(t, err)
+	assert.Empty(t, empty, "no tables means no query and no statistics")
+}
+
+// With a byte bound set alongside the row bound, a table within both still
+// resolves to the direct verdict, and the reason reports the measured data
+// and index size next to the row count so the operator sees how large the
+// table the native rebuild touches is.
+func TestEngine_Plan_DirectVerdictWithinByteBound(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	createSeededPKTable(t, db, "direct_bytes_ok", 500)
+
+	stats, err := readTableStatistics(t.Context(), db, "testdb", []string{"direct_bytes_ok"})
+	require.NoError(t, err)
+	measured := stats["direct_bytes_ok"].dataBytes.Int64 + stats["direct_bytes_ok"].indexBytes.Int64
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{"direct_bytes_ok.sql": pkReshapeSchema("direct_bytes_ok")}),
+		Credentials: &engine.Credentials{
+			DSN:      dsn,
+			Metadata: directPolicyMetadataWithBytes(100000, 100<<20),
+		},
 	})
+	require.NoError(t, err, "Plan()")
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, engine.ExecutionModeDirect, changes[0].ExecutionMode, "a table within both bounds resolves to direct")
+	assert.Contains(t, changes[0].ModeReason, "dropping primary key is not supported")
+	assert.Contains(t, changes[0].ModeReason, "; runs as native MySQL DDL on a table with ~500 rows and "+
+		ui.FormatApproxBytes(measured)+" of data and indexes")
+}
+
+// A table within the row bound but above the byte bound is blocked: the two
+// bounds combine, and a table must be within both to run directly. The
+// reason names only the configured byte limit, never the measured size, so
+// two tables of different sizes (or the same table on different shards)
+// render one identical reason and collapse into one row in the PR summary.
+func TestEngine_Plan_DirectBlockedAboveByteBound(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	createSeededPKTable(t, db, "direct_bytes_empty", 0)
+	createSeededPKTable(t, db, "direct_bytes_big", 2000)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"direct_bytes_empty.sql": pkReshapeSchema("direct_bytes_empty"),
+			"direct_bytes_big.sql":   pkReshapeSchema("direct_bytes_big"),
+		}),
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+			// The row bound admits both tables; only the byte bound blocks.
+			Metadata: directPolicyMetadataWithBytes(100000, 1<<10),
+		},
+	})
+	require.NoError(t, err, "Plan()")
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 2)
+	const wantSuffix = "; direct execution is enabled but the table is above the configured limit of 1.0 KiB of data and indexes"
+	for _, change := range changes {
+		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode, "%s is above the byte bound", change.Table)
+		assert.Contains(t, change.ModeReason, "dropping primary key is not supported", change.Table)
+		assert.True(t, strings.HasSuffix(change.ModeReason, wantSuffix), "%s reason %q names only the configured limit", change.Table, change.ModeReason)
+	}
+	assert.Equal(t, changes[0].ModeReason, changes[1].ModeReason, "tables of different sizes render one identical reason")
+}
+
+// An apply re-evaluates the byte bound at routing time, so a table that is
+// above it when the apply runs fails before anything executes and is never
+// rebuilt natively, even though its row count is within the row bound.
+func TestEngine_ExecuteAlterPhase_AboveByteBoundFailsFast(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	createSeededPKTable(t, db, "direct_bytes_grew", 2000)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"direct_bytes_grew"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database,
+		[]string{"ALTER TABLE `direct_bytes_grew` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"}, false,
+		directPolicy{Enabled: true, MaxTableRows: 100000, MaxTableBytes: 1 << 10})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	errorMessage := eng.runningSchemaChange.errorMessage
+	eng.mu.Unlock()
+
+	assert.Equal(t, engine.StateFailed, finalState)
+	assert.Contains(t, errorMessage, "above the configured limit of 1.0 KiB of data and indexes")
+	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_bytes_grew"), "the target is untouched")
+}
+
+// A policy with a byte bound blocks a table whose size cannot be measured,
+// exactly as the row bound does: the byte bound never turns an unmeasured
+// table into an approval.
+func TestEngine_ResolveRefusedMode_UnknownSizeBlockedWithByteBound(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
+	defer target.close()
+
+	decision := eng.resolveRefusedMode(t.Context(), target,
+		directPolicy{Enabled: true, MaxTableRows: 100000, MaxTableBytes: 100 << 20},
+		database, "direct_bytes_missing", "dropping primary key is not supported")
+	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
+	assert.Equal(t, "blocked_size_unknown", decision.outcome)
+	assert.Equal(t, "dropping primary key is not supported; direct execution is enabled but the table's size is unavailable", decision.modeReason)
 }
 
 // The exact bounded count confirms a direct verdict without trusting the
@@ -644,7 +861,7 @@ func TestEngine_ResolveRefusedMode_UnknownSizeBlocked(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
 	assert.Equal(t, "blocked_size_unknown", decision.outcome)
 	assert.Contains(t, decision.modeReason, "dropping primary key is not supported")
-	assert.Contains(t, decision.modeReason, "row count is unavailable")
+	assert.Contains(t, decision.modeReason, "size is unavailable")
 }
 
 // An engine that plans a schema change itself and drives this engine against

@@ -1470,8 +1470,9 @@ operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/
 Whether the engine will refuse a statement, or route it to direct execution (a MySQL and Spirit
 execution mode), is recorded on the plan or stops plan creation using the engine's own checks rather than a
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
-direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
-estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
+direct execution's table-size bounds, a table whose size cannot be measured is blocked, and a size
+estimate, whether of rows or bytes, is trusted only in the blocking direction: an estimate alone
+never approves. The verdict
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the

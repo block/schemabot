@@ -1280,8 +1280,9 @@ func (x *PlanRequest) GetDirectExecution() *DirectExecutionPolicy {
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
-// to run verbatim as native DDL, bounded by the target table's size. Engines
-// that do not implement direct execution ignore it.
+// to run verbatim as native DDL, bounded by the target table's size in rows
+// and, optionally, in bytes. Engines that do not implement direct execution
+// ignore it.
 type DirectExecutionPolicy struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Whether refused statements may run directly at all.
@@ -1294,8 +1295,13 @@ type DirectExecutionPolicy struct {
 	// How long each direct statement waits to acquire its locks before failing
 	// with a retryable busy-table error. Zero leaves the engine's own default.
 	LockAcquisitionTimeoutSeconds int64 `protobuf:"varint,3,opt,name=lock_acquisition_timeout_seconds,json=lockAcquisitionTimeoutSeconds,proto3" json:"lock_acquisition_timeout_seconds,omitempty"`
-	unknownFields                 protoimpl.UnknownFields
-	sizeCache                     protoimpl.SizeCache
+	// An optional second size bound: the target table's data plus index
+	// footprint, in bytes. When non-zero a refused statement runs directly only
+	// when the table is within both bounds; zero states no byte bound. A
+	// negative value is an unusable bound, which the engine refuses.
+	MaxTableBytes int64 `protobuf:"varint,4,opt,name=max_table_bytes,json=maxTableBytes,proto3" json:"max_table_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DirectExecutionPolicy) Reset() {
@@ -1345,6 +1351,13 @@ func (x *DirectExecutionPolicy) GetMaxTableRows() int64 {
 func (x *DirectExecutionPolicy) GetLockAcquisitionTimeoutSeconds() int64 {
 	if x != nil {
 		return x.LockAcquisitionTimeoutSeconds
+	}
+	return 0
+}
+
+func (x *DirectExecutionPolicy) GetMaxTableBytes() int64 {
+	if x != nil {
+		return x.MaxTableBytes
 	}
 	return 0
 }
@@ -4761,11 +4774,12 @@ const file_tern_proto_rawDesc = "" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
-	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xa0\x01\n" +
+	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xc8\x01\n" +
 	"\x15DirectExecutionPolicy\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12$\n" +
 	"\x0emax_table_rows\x18\x02 \x01(\x03R\fmaxTableRows\x12G\n" +
-	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\"\x99\x03\n" +
+	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\x12&\n" +
+	"\x0fmax_table_bytes\x18\x04 \x01(\x03R\rmaxTableBytes\"\x99\x03\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +

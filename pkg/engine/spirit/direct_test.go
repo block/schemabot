@@ -1,6 +1,7 @@
 package spirit
 
 import (
+	"database/sql"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,6 +73,21 @@ func TestDirectPolicyFromMetadata_Enabled(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(5), policy.LockAcquisitionTimeoutSeconds)
 	assert.Equal(t, int64(5), policy.lockAcquisitionTimeoutSeconds())
+	assert.Zero(t, policy.MaxTableBytes, "a policy without the byte key sets no byte bound")
+}
+
+// The byte bound is an optional second bound carried alongside the row bound:
+// set, both resolve onto the policy.
+func TestDirectPolicyFromMetadata_ByteBound(t *testing.T) {
+	policy, err := directPolicyFromMetadata(map[string]string{
+		"direct_execution":                 "true",
+		"direct_execution_max_table_rows":  "175000",
+		"direct_execution_max_table_bytes": "104857600",
+	})
+	require.NoError(t, err)
+	assert.True(t, policy.Enabled)
+	assert.Equal(t, int64(175000), policy.MaxTableRows)
+	assert.Equal(t, int64(104857600), policy.MaxTableBytes)
 }
 
 // A malformed policy is a hard error, never a silent fallback to disabled:
@@ -97,6 +113,22 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 		"negative bound": {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "-5"},
 			wantErr: "must be positive",
+		},
+		"byte bound without row bound": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_bytes": "104857600"},
+			wantErr: "direct_execution_max_table_rows is not set",
+		},
+		"non-numeric byte bound": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "100MiB"},
+			wantErr: `parse direct_execution_max_table_bytes metadata value "100MiB"`,
+		},
+		"zero byte bound": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "0"},
+			wantErr: "direct_execution_max_table_bytes must be positive",
+		},
+		"negative byte bound": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "-1"},
+			wantErr: "direct_execution_max_table_bytes must be positive",
 		},
 		"unrecognized enable value": {
 			md:      map[string]string{"direct_execution": "yes"},
@@ -166,4 +198,25 @@ func TestExecutionVerdicts_NonAlterNeedsNoTarget(t *testing.T) {
 		assert.Empty(t, change.ModeReason, change.DDL)
 	}
 	assert.Nil(t, verdicts.target.db, "no statement needed the target")
+}
+
+// The size gate compares only figures information_schema actually reported:
+// a NULL or negative statistic is unavailable, never a zero that would slip
+// under any bound. Zero itself is a real figure, as for an empty table.
+func TestUsableStatistic(t *testing.T) {
+	v, err := usableStatistic(sql.NullInt64{Int64: 45_800_000, Valid: true}, "DATA_LENGTH", "shop", "orders")
+	require.NoError(t, err)
+	assert.Equal(t, int64(45_800_000), v)
+
+	v, err = usableStatistic(sql.NullInt64{Int64: 0, Valid: true}, "INDEX_LENGTH", "shop", "orders")
+	require.NoError(t, err)
+	assert.Zero(t, v)
+
+	_, err = usableStatistic(sql.NullInt64{}, "DATA_LENGTH", "shop", "orders")
+	require.Error(t, err)
+	assert.Equal(t, "DATA_LENGTH for `shop`.`orders` is unavailable", err.Error())
+
+	_, err = usableStatistic(sql.NullInt64{Int64: -1, Valid: true}, "INDEX_LENGTH", "shop", "orders")
+	require.Error(t, err)
+	assert.Equal(t, "INDEX_LENGTH for `shop`.`orders` is negative (-1), treating it as unavailable", err.Error())
 }

@@ -545,12 +545,14 @@ func TestApplyOptionsCarryTheAdmittedDirectExecutionPolicy(t *testing.T) {
 	admitted := ApplyOptions{DirectExecution: &DirectExecutionPolicy{
 		Enabled:                       true,
 		MaxTableRows:                  10000,
+		MaxTableBytes:                 100 << 20,
 		LockAcquisitionTimeoutSeconds: 5,
 	}}
 
 	options := admitted.Map()
 	assert.Equal(t, "true", options[engine.MetadataDirectExecution])
 	assert.Equal(t, "10000", options[engine.MetadataDirectExecutionMaxTableRows])
+	assert.Equal(t, "104857600", options[engine.MetadataDirectExecutionMaxTableBytes])
 	assert.Equal(t, "5", options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds])
 	assert.Equal(t, admitted.DirectExecution, ApplyOptionsFromMap(options).DirectExecution)
 
@@ -561,6 +563,7 @@ func TestApplyOptionsCarryTheAdmittedDirectExecutionPolicy(t *testing.T) {
 	disabledOptions := disabled.Map()
 	assert.Equal(t, "false", disabledOptions[engine.MetadataDirectExecution])
 	assert.NotContains(t, disabledOptions, engine.MetadataDirectExecutionMaxTableRows)
+	assert.NotContains(t, disabledOptions, engine.MetadataDirectExecutionMaxTableBytes)
 	assert.Equal(t, disabled.DirectExecution, ApplyOptionsFromMap(disabledOptions).DirectExecution)
 
 	// Saying nothing is its own state: the executing server's configuration
@@ -582,7 +585,45 @@ func TestDirectExecutionPolicyEngineMetadata(t *testing.T) {
 		engine.MetadataDirectExecution:             "true",
 		engine.MetadataDirectExecutionMaxTableRows: "10000",
 	}, (&DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000}).EngineMetadata(),
-		"an unset lock bound leaves the engine's own default in effect")
+		"an unset lock bound leaves the engine's own default in effect, and an unset byte bound states none")
+	assert.Equal(t, map[string]string{
+		engine.MetadataDirectExecution:              "true",
+		engine.MetadataDirectExecutionMaxTableRows:  "10000",
+		engine.MetadataDirectExecutionMaxTableBytes: "104857600",
+	}, (&DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, MaxTableBytes: 100 << 20}).EngineMetadata())
+}
+
+// A stored byte bound that cannot be read back never disappears from the
+// policy: the byte bound is optional, so reading a garbled one as zero would
+// silently widen the apply's policy to the row bound alone. It reads as -1
+// instead, which renders back onto the engine metadata for the engine to
+// refuse, so the apply blocks rather than running under a wider grant than it
+// was admitted with.
+func TestApplyOptionsFromMapKeepsAnUnreadableByteBound(t *testing.T) {
+	for name, raw := range map[string]string{
+		"not a number": "100MiB",
+		"zero":         "0",
+		"negative":     "-5",
+		"empty":        "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			policy := ApplyOptionsFromMap(map[string]string{
+				engine.MetadataDirectExecution:              "true",
+				engine.MetadataDirectExecutionMaxTableRows:  "10000",
+				engine.MetadataDirectExecutionMaxTableBytes: raw,
+			}).DirectExecution
+			require.NotNil(t, policy)
+			assert.Equal(t, int64(-1), policy.MaxTableBytes)
+			assert.Equal(t, "-1", policy.EngineMetadata()[engine.MetadataDirectExecutionMaxTableBytes])
+		})
+	}
+
+	policy := ApplyOptionsFromMap(map[string]string{
+		engine.MetadataDirectExecution:             "true",
+		engine.MetadataDirectExecutionMaxTableRows: "10000",
+	}).DirectExecution
+	require.NotNil(t, policy)
+	assert.Zero(t, policy.MaxTableBytes, "an apply admitted without a byte bound reads back without one")
 }
 
 // Component state is recognised by its key namespace alone, so a repository
