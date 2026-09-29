@@ -136,7 +136,7 @@ func NamespaceForRelativePath(relativePath, defaultNamespace, environment string
 }
 
 // HasNamespaceEnvironmentPlaceholder reports whether a name contains either
-// supported namespace-directory placeholder. Pull requests use concrete names.
+// supported namespace-directory placeholder. Schema pull requests require concrete names.
 func HasNamespaceEnvironmentPlaceholder(namespace string) bool {
 	return strings.Contains(namespace, "{env}") || strings.Contains(namespace, "$ENV")
 }
