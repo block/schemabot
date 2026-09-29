@@ -146,6 +146,82 @@ func PreviewCommentPlanColumnOnlyAlter() string {
 	})
 }
 
+// previewManyTableSizes is the table set PreviewCommentPlanManyTables indexes:
+// a spread of sizes from tens of rows to hundreds of millions, in plan
+// (alphabetical) order, with two tables whose size probe returned nothing.
+var previewManyTableSizes = []struct {
+	table string
+	rows  int64
+	bytes int64
+}{
+	{"accounts", 1_240_000, 610_000_000},
+	{"addresses", 3_900_000, 1_450_000_000},
+	{"api_keys", 18_400, 6_100_000},
+	{"audit_events", 412_000_000, 186_000_000_000},
+	{"carts", 9_800_000, 3_200_000_000},
+	{"categories", 2_100, 1_600_000},
+	{"coupons", 88_000, 41_000_000},
+	{"customers", 6_700_000, 2_900_000_000},
+	{"disputes", 240_000, 150_000_000},
+	{"feature_flags", 310, 180_000},
+	{"fulfillments", 27_000_000, 11_800_000_000},
+	{"inventory", 14_500_000, 5_300_000_000},
+	{"invoices", 31_000_000, 17_400_000_000},
+	{"ledger_entries", 268_000_000, 121_000_000_000},
+	{"line_items", 144_000_000, 58_000_000_000},
+	{"locations", 9_400, 4_200_000},
+	{"notifications", 96_000_000, 44_000_000_000},
+	{"order_events", 0, 0},
+	{"orders", 52_000_000, 26_500_000_000},
+	{"payment_methods", 7_300_000, 2_600_000_000},
+	{"payments", 49_000_000, 23_100_000_000},
+	{"payouts", 1_800_000, 820_000_000},
+	{"prices", 620_000, 210_000_000},
+	{"products", 2_340_000, 1_130_000_000},
+	{"refunds", 3_100_000, 1_300_000_000},
+	{"reviews", 11_200_000, 6_900_000_000},
+	{"sessions", 0, 0},
+	{"settlements", 4_600_000, 2_100_000_000},
+	{"shipments", 25_000_000, 10_900_000_000},
+	{"subscriptions", 890_000, 470_000_000},
+	{"tax_rates", 5_600, 2_300_000},
+	{"transfers", 16_000_000, 7_700_000_000},
+	{"users", 8_200_000, 3_600_000_000},
+	{"webhooks", 1_100_000, 540_000_000},
+}
+
+// PreviewCommentPlanManyTables renders a plan that adds a tenant index to every
+// table in the schema, so the size section carries more tables than it lists
+// inline: the count and the largest tables stay visible and the rest fold.
+func PreviewCommentPlanManyTables() string {
+	statements := make([]string, 0, len(previewManyTableSizes))
+	sizes := make([]TableSizeData, 0, len(previewManyTableSizes))
+	for _, t := range previewManyTableSizes {
+		statements = append(statements, "ALTER TABLE `"+t.table+"` ADD INDEX `idx_tenant_id` (`tenant_id`);")
+		size := TableSizeData{Table: t.table}
+		if t.rows > 0 {
+			size.EstimatedRows = previewRows(t.rows)
+			size.EstimatedBytes = previewRows(t.bytes)
+		}
+		sizes = append(sizes, size)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: statements,
+			TableSizes: sizes,
+		}},
+	})
+}
+
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {

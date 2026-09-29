@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -128,4 +129,112 @@ func TestRenderPlanComment_NoTableSizesOmitsSection(t *testing.T) {
 	out := RenderPlanComment(tableSizePlanData(nil))
 
 	assert.False(t, strings.Contains(out, "Table sizes"), "a plan without size data renders no size section")
+}
+
+// sizedTables returns one sized table per name, each with the given bytes and
+// ten rows per byte unit so rows and bytes rank the same way.
+func sizedTables(bytesByTable map[string]int64, order []string) []TableSizeData {
+	sizes := make([]TableSizeData, 0, len(order))
+	for _, name := range order {
+		b, ok := bytesByTable[name]
+		if !ok {
+			sizes = append(sizes, TableSizeData{Table: name})
+			continue
+		}
+		sizes = append(sizes, TableSizeData{Table: name, EstimatedRows: previewRows(b * 10), EstimatedBytes: previewRows(b)})
+	}
+	return sizes
+}
+
+// Up to the inline limit every table is listed in plan order, with no fold.
+func TestRenderPlanComment_TableSizesAtInlineLimitStayInPlanOrder(t *testing.T) {
+	order := []string{"t01", "t02", "t03", "t04", "t05", "t06", "t07", "t08", "t09", "t10"}
+	bytes := map[string]int64{}
+	for i, name := range order {
+		bytes[name] = int64(i+1) * 1_000_000
+	}
+	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
+
+	assert.Contains(t, out, "📊 **Table sizes**:\n- `t01`: ~10M rows · ~1 MB\n- `t02`:")
+	assert.Contains(t, out, "- `t10`: ~100M rows · ~10 MB\n\n")
+	assert.NotContains(t, out, "<details>\n<summary>", "a plan at the inline limit does not fold its sizes")
+	assert.Less(t, strings.Index(out, "`t01`"), strings.Index(out, "`t10`"), "inline sizes keep plan order")
+}
+
+// A plan that changes more tables than the inline limit leads with the count,
+// shows the largest tables, and folds the rest largest first. A table whose
+// size probe failed is counted in the visible heading and listed last.
+func TestRenderPlanComment_TableSizesOverInlineLimitFoldLargestFirst(t *testing.T) {
+	order := []string{"accounts", "audit_events", "carts", "coupons", "events_raw", "invoices", "ledger", "orders", "payments", "sessions", "users", "webhooks"}
+	bytes := map[string]int64{
+		"accounts":     6_000_000,
+		"audit_events": 90_000_000,
+		"carts":        3_000_000,
+		"coupons":      1_000_000,
+		"invoices":     40_000_000,
+		"ledger":       80_000_000,
+		"orders":       50_000_000,
+		"payments":     60_000_000,
+		"users":        20_000_000,
+		"webhooks":     2_000_000,
+	}
+	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
+
+	want := "📊 **Table sizes** (12 tables, largest first; 2 without a size estimate):\n" +
+		"- `audit_events`: ~900M rows · ~90 MB\n" +
+		"- `ledger`: ~800M rows · ~80 MB\n" +
+		"- `payments`: ~600M rows · ~60 MB\n" +
+		"- `orders`: ~500M rows · ~50 MB\n" +
+		"- `invoices`: ~400M rows · ~40 MB\n" +
+		"\n<details>\n<summary>7 more tables</summary>\n\n" +
+		"- `users`: ~200M rows · ~20 MB\n" +
+		"- `accounts`: ~60M rows · ~6 MB\n" +
+		"- `carts`: ~30M rows · ~3 MB\n" +
+		"- `webhooks`: ~20M rows · ~2 MB\n" +
+		"- `coupons`: ~10M rows · ~1 MB\n" +
+		"- `events_raw`: size estimate unavailable\n" +
+		"- `sessions`: size estimate unavailable\n" +
+		"\n</details>\n\n"
+	assert.Contains(t, out, want)
+}
+
+// When every table has an estimate the folded heading carries only the count.
+func TestRenderPlanComment_TableSizesFoldedHeadingOmitsZeroUnavailable(t *testing.T) {
+	order := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"}
+	bytes := map[string]int64{}
+	for i, name := range order {
+		bytes[name] = int64(i+1) * 1_000_000
+	}
+	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
+
+	assert.Contains(t, out, "📊 **Table sizes** (11 tables, largest first):\n- `k`:")
+	assert.Contains(t, out, "<summary>6 more tables</summary>")
+}
+
+// The fold ranks tables with bytes by bytes, then tables reporting rows alone
+// by rows, then tables with no estimate: rows and bytes are never compared
+// with each other, so the order is the same whatever order the plan listed
+// the tables in.
+func TestCompareTableSizesLargestFirst(t *testing.T) {
+	bigBytes := TableSizeData{Table: "big_bytes", EstimatedRows: previewRows(100), EstimatedBytes: previewRows(10_000)}
+	smallBytes := TableSizeData{Table: "small_bytes", EstimatedRows: previewRows(5_000), EstimatedBytes: previewRows(10)}
+	bytesOnly := TableSizeData{Table: "bytes_only", EstimatedBytes: previewRows(500)}
+	manyRows := TableSizeData{Table: "many_rows", EstimatedRows: previewRows(9_000)}
+	fewRows := TableSizeData{Table: "few_rows", EstimatedRows: previewRows(3)}
+	unknown := TableSizeData{Table: "unknown"}
+
+	want := []string{"big_bytes", "bytes_only", "small_bytes", "many_rows", "few_rows", "unknown"}
+	inputs := [][]TableSizeData{
+		{unknown, fewRows, manyRows, smallBytes, bytesOnly, bigBytes},
+		{manyRows, smallBytes, unknown, bigBytes, fewRows, bytesOnly},
+	}
+	for _, in := range inputs {
+		sorted := slices.Clone(in)
+		slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
+		got := make([]string, 0, len(sorted))
+		for _, ts := range sorted {
+			got = append(got, ts.Table)
+		}
+		assert.Equal(t, want, got)
+	}
 }

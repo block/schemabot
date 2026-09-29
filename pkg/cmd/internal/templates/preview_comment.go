@@ -45,6 +45,7 @@ func previewCommentAllOutput() {
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"PLAN COMMENT (COLUMN-ONLY ALTER, NO TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter()) }},
+		{"PLAN COMMENT (MANY TABLES, FOLDED TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyTables()) }},
 		{"PLAN COMMENT (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"PLAN COMMENT (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"PLAN COMMENT (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
@@ -163,6 +164,7 @@ func previewCommentPlanAllOutput() {
 	}{
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"MYSQL PLAN (COLUMN-ONLY ALTER, NO TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter()) }},
+		{"MYSQL PLAN (MANY TABLES, FOLDED TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyTables()) }},
 		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"MYSQL PLAN (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},

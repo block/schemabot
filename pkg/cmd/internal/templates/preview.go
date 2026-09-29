@@ -122,6 +122,7 @@ const (
 	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with ignored live tables disclosed
 	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
 	PreviewCommentPlanColumnOnlyAlter          PreviewType = "comment_plan_column_only_alter"          // Plan whose alter is metadata-only, so no table-size section renders
+	PreviewCommentPlanManyTables               PreviewType = "comment_plan_many_tables"                // Plan touching more tables than the size section lists inline
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanBlockedPostgres          PreviewType = "comment_plan_blocked_postgres"           // PostgreSQL plan with a refused statement carrying two independent causes
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)

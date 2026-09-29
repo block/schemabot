@@ -142,6 +142,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables())
 	case PreviewCommentPlanColumnOnlyAlter:
 		fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter())
+	case PreviewCommentPlanManyTables:
+		fmt.Print(webhooktemplates.PreviewCommentPlanManyTables())
 	case PreviewCommentPlanBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentPlanBlocked())
 	case PreviewCommentPlanBlockedPostgres:

@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"cmp"
 	"fmt"
 	"html"
 	"log/slog"
@@ -1236,6 +1237,23 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 	return count
 }
 
+// tableSizesInlineLimit caps how many tables the size section lists one per
+// line. A plan that changes many tables would otherwise stand a wall of sizes
+// above the summary it introduces, so beyond the limit the section leads with
+// the count and the largest tables and folds the rest into a collapsed block.
+const tableSizesInlineLimit = 10
+
+// tableSizesLargestShown is how many tables stay visible when the section is
+// folded: the largest, since they bound how long the apply runs.
+const tableSizesLargestShown = 5
+
+// tableSizeEntry is one line of the size section: the table's display name,
+// qualified with its keyspace when the plan spans several, and its sizes.
+type tableSizeEntry struct {
+	name string
+	size TableSizeData
+}
+
 // writeTableSizesSection renders the plan's table-size info section: one line
 // per table the plan will copy, rebuild, or scan (the comment builder
 // attaches sizes only to statements whose cost scales with table size),
@@ -1244,27 +1262,112 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 // their keyspace when the plan spans more than one keyspace with sizes, so a
 // shared table name stays unambiguous.
 func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
+	entries := tableSizeEntries(data.Changes)
+	if len(entries) == 0 {
+		return
+	}
+	if len(entries) <= tableSizesInlineLimit {
+		sb.WriteString("📊 **Table sizes**:\n")
+		writeTableSizeLines(sb, entries)
+		sb.WriteString("\n")
+		return
+	}
+	writeFoldedTableSizes(sb, entries)
+}
+
+// tableSizeEntries flattens every keyspace's sized tables into section lines,
+// in plan order.
+func tableSizeEntries(changes []KeyspaceChangeData) []tableSizeEntry {
 	keyspacesWithSizes := 0
-	for _, ks := range data.Changes {
+	for _, ks := range changes {
 		if len(ks.TableSizes) > 0 {
 			keyspacesWithSizes++
 		}
 	}
-	if keyspacesWithSizes == 0 {
-		return
-	}
 	qualify := keyspacesWithSizes > 1
-	sb.WriteString("📊 **Table sizes**:\n")
-	for _, ks := range data.Changes {
+	var entries []tableSizeEntry
+	for _, ks := range changes {
 		for _, ts := range ks.TableSizes {
 			name := ts.Table
 			if qualify {
 				name = ks.Keyspace + "." + ts.Table
 			}
-			fmt.Fprintf(sb, "- `%s`: %s\n", name, formatTableSize(ts))
+			entries = append(entries, tableSizeEntry{name: name, size: ts})
 		}
 	}
-	sb.WriteString("\n")
+	return entries
+}
+
+// writeFoldedTableSizes renders the size section for a plan with more tables
+// than tableSizesInlineLimit. The visible heading carries the table count and,
+// when any table has no estimate, how many: a size probe that failed on a large
+// table must stay visible even though its line is folded. The largest tables
+// follow, then the rest in a collapsed block, all ordered largest first.
+func writeFoldedTableSizes(sb *strings.Builder, entries []tableSizeEntry) {
+	sorted := slices.Clone(entries)
+	slices.SortStableFunc(sorted, func(a, b tableSizeEntry) int { return compareTableSizesLargestFirst(a.size, b.size) })
+
+	unavailable := 0
+	for _, e := range sorted {
+		if !hasSizeEstimate(e.size) {
+			unavailable++
+		}
+	}
+	heading := fmt.Sprintf("%d tables, largest first", len(sorted))
+	if unavailable > 0 {
+		heading += fmt.Sprintf("; %d without a size estimate", unavailable)
+	}
+	fmt.Fprintf(sb, "📊 **Table sizes** (%s):\n", heading)
+	writeTableSizeLines(sb, sorted[:tableSizesLargestShown])
+
+	rest := sorted[tableSizesLargestShown:]
+	fmt.Fprintf(sb, "\n<details>\n<summary>%d more %s</summary>\n\n", len(rest), pluralize("table", len(rest)))
+	writeTableSizeLines(sb, rest)
+	sb.WriteString("\n</details>\n\n")
+}
+
+func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
+	for _, e := range entries {
+		fmt.Fprintf(sb, "- `%s`: %s\n", e.name, formatTableSize(e.size))
+	}
+}
+
+func hasSizeEstimate(ts TableSizeData) bool {
+	return ts.EstimatedRows != nil || ts.EstimatedBytes != nil
+}
+
+// compareTableSizesLargestFirst orders two tables for the folded size section.
+// Tables that report bytes come first, ranked by bytes, since bytes are the
+// footprint every engine that reports a size can supply. Tables that report
+// rows alone follow, ranked by rows: rows and bytes are not comparable, so
+// the two never rank against each other. A table with no estimate sorts after
+// every table with one: its size is unknown, not small, and the heading
+// already counts it.
+func compareTableSizesLargestFirst(a, b TableSizeData) int {
+	if c := cmp.Compare(tableSizeRankTier(a), tableSizeRankTier(b)); c != 0 {
+		return c
+	}
+	switch {
+	case a.EstimatedBytes != nil:
+		return cmp.Compare(*b.EstimatedBytes, *a.EstimatedBytes)
+	case a.EstimatedRows != nil:
+		return cmp.Compare(*b.EstimatedRows, *a.EstimatedRows)
+	default:
+		return 0
+	}
+}
+
+// tableSizeRankTier groups a table by the estimate it can be ranked on:
+// bytes, rows alone, or none.
+func tableSizeRankTier(ts TableSizeData) int {
+	switch {
+	case ts.EstimatedBytes != nil:
+		return 0
+	case ts.EstimatedRows != nil:
+		return 1
+	default:
+		return 2
+	}
 }
 
 // formatTableSize renders one table's size clause: the estimated rows and
