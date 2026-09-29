@@ -558,6 +558,12 @@ func TestCanonicalDDLForDrift_RowSecurity(t *testing.T) {
  `
 	canonical, err := canonicalDDLForDrift(parser, reviewed)
 	require.NoError(t, err)
+	same, err := canonicalDDLForDrift(parser, `
+ drop policy "readers" on "staging"."documents";
+ create policy "readers" on "staging"."documents" for select to public using (owner_id=auth.uid());
+ `)
+	require.NoError(t, err)
+	assert.Equal(t, canonical, same)
 	mapped, err := canonicalDDLForDrift(parser, `
  DROP POLICY readers ON production.documents;
  CREATE POLICY readers ON production.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());

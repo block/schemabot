@@ -1277,7 +1277,10 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		_, err := executor.ExecuteReviewedRowSecurity(ctx, pool, change.namespace, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
 			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 		})
-		return err
+		if err != nil {
+			return fmt.Errorf("apply row security for %q.%q: %w", change.namespace, change.table, err)
+		}
+		return nil
 	}
 	statements, err := postgresCreateSetStatements(change.sql)
 	if err != nil {

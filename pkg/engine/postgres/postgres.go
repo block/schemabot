@@ -269,7 +269,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		for _, filename := range files {
 			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("plan PostgreSQL row security in %q/%q: %w", namespace, filename, err)
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
 			if handled {
 				if first, exists := declaredBy[table]; exists {

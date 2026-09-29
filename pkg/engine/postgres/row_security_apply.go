@@ -2,10 +2,12 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/executor"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -27,6 +29,25 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 	if err != nil {
 		return "", nil, true, err
 	}
+	// Equality is a catalog comparison, not execution authority. Avoid taking
+	// an exclusive target lock or requiring table ownership for unchanged files.
+	live, err := schemadiff.Introspect(ctx, pool, namespace, desired.Table())
+	if errors.Is(err, schemadiff.ErrTableNotFound) {
+		return desired.Table(), nil, true, fmt.Errorf("creating table %q.%q with managed row security is not supported: %w", namespace, desired.Table(), schemadiff.ErrUnsupportedChange)
+	}
+	if err != nil {
+		return desired.Table(), nil, true, err
+	}
+	wanted, err := schemadiff.IntrospectDesiredWithRowSecurity(ctx, pool, desired)
+	if err != nil {
+		return desired.Table(), nil, true, err
+	}
+	if _, err := schemadiff.DiffWithRowSecurity(namespace, live, wanted); err == nil {
+		return desired.Table(), nil, true, nil
+	} else if !errors.Is(err, schemadiff.ErrUnsupportedChange) {
+		return desired.Table(), nil, true, err
+	}
+	// A delta still needs the executor's locked admission and fresh comparison.
 	preview, err := executor.PreviewRowSecurity(ctx, pool, namespace, desired, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	})
@@ -47,7 +68,7 @@ func validateRowSecurityApply(req *engine.ApplyRequest, operation statement.RowS
 	tc := req.Changes[0].TableChanges[0]
 	namespace := req.Changes[0].Namespace
 	if operation.Schema() != namespace || operation.Table() != tc.Table {
-		return nativeApply{}, fmt.Errorf("row security operation target differs from the apply target")
+		return nativeApply{}, fmt.Errorf("row security operation target differs: SQL targets %q.%q, apply targets %q.%q", operation.Schema(), operation.Table(), namespace, tc.Table)
 	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("row security changes do not support deferred cutover")

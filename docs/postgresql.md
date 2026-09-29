@@ -91,7 +91,9 @@ RLS operation to a differently named physical schema requires a fresh plan and
 review on that target; ordinary table namespace mapping does not authorize this
 RLS remapping. The executor still verifies the exact ordered SQL under its lock.
 
-Both planning and execution take a bounded exclusive table lock. Keep policy
+Unchanged RLS definitions use a catalog comparison without an exclusive target lock
+or an ownership requirement. Planning a change and executing it take a bounded
+exclusive table lock. Keep policy
 updates small and expect a busy table to refuse rather than wait indefinitely.
 Creating a new table with an RLS declaration and combining structural changes
 with managed RLS remain unsupported. Direct RLS apply requests without the

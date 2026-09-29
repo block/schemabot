@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -72,7 +72,20 @@ func TestEngineRowSecurityRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, result.Changes, 1)
 		require.Len(t, result.Changes[0].TableChanges, 1)
-		assert.True(t, result.Changes[0].TableChanges[0].IsUnsafe)
+		change := result.Changes[0].TableChanges[0]
+		assert.True(t, change.IsUnsafe)
+		assert.Equal(t, ddl.StatementAlterTable, change.Operation)
+		assert.Equal(t, "Row security changes alter who can access rows; review the complete policy and settings replacement", change.UnsafeReason)
+		operation, err := statement.ParseRowSecurityChange(change.DDL)
+		require.NoError(t, err)
+		require.Equal(t, []string{
+			`DROP POLICY "readers" ON "public"."documents"`,
+			`ALTER TABLE "public"."documents" ENABLE ROW LEVEL SECURITY`,
+			`ALTER TABLE "public"."documents" FORCE ROW LEVEL SECURITY`,
+			`CREATE POLICY "readers" ON "public"."documents"
+    AS PERMISSIVE FOR SELECT TO PUBLIC
+    USING (true)`,
+		}, operation.Statements())
 
 	})
 
@@ -216,7 +229,8 @@ func TestEngineRowSecurityMissingTableRefuses(t *testing.T) {
    CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
   `}}},
 	})
-	require.ErrorIs(t, err, executor.ErrTableNotFound)
+	require.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
+	require.ErrorContains(t, err, "creating table")
 	assert.Nil(t, result)
 	var absent bool
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT to_regclass('public.documents') IS NULL").Scan(&absent))
