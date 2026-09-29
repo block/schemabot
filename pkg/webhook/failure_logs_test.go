@@ -303,6 +303,8 @@ func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWhenTheFoldWouldNotFit(t
 	assert.Contains(t, rendered, mysqlerr.Generic+" (error 1265)")
 	assert.NotContains(t, rendered, "in the logs below", "the summary never promises a fold it does not carry")
 	assert.Contains(t, rendered, "<details>", "the fold the original body had room for still renders")
+	assert.Contains(t, rendered, "== engine logs: region-a ==", "the engine's lines render under the sentence that names the server logs")
+	assert.Contains(t, rendered, "[orders] unsafe warning 1265: Data truncated")
 }
 
 // Rendering the summary body twice must not read storage twice. A failed
@@ -374,13 +376,14 @@ func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWhenTheBudgetDropsTheEng
 	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
 }
 
-// The sentence that names the server logs is decided against the room the
-// pointed sentence would have left, and the fold renders against that same
-// room. The shorter sentence leaves slightly more, and a fold rendered in the
-// larger room could keep the engine's account the decision found no room
-// for, carrying the engine's lines under a sentence that says they are
-// elsewhere. Here the engine heading's cost falls exactly in that gap.
-func TestSummaryWithFailureLogsRendersTheFoldItDecidedTheSentenceAgainst(t *testing.T) {
+// The sentence is chosen against the room the pointed one would leave, and
+// the fold renders in the room the chosen sentence does leave. The pointed
+// sentence is longer, so there is a narrow band of room where it would shed
+// the engine's account and the original sentence would not. The original
+// stands there, and the engine's lines render under it anyway: naming the
+// server logs does not deny the lines below, and dropping lines that fit would
+// cost an operator without server access the one line with the reason.
+func TestSummaryWithFailureLogsKeepsTheEngineLinesThatFitUnderTheServerLogsSentence(t *testing.T) {
 	apply := failureLogsTestApply()
 	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
 	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
@@ -415,9 +418,12 @@ func TestSummaryWithFailureLogsRendersTheFoldItDecidedTheSentenceAgainst(t *test
 	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, logger, apply, renderBody)
 
 	assert.Contains(t, rendered, mysqlerr.Generic+" (error 1265)")
-	assert.NotContains(t, rendered, "in the logs below")
-	assert.NotContains(t, rendered, engineLogGroupLabel(deployment, target), "the fold sheds the account the sentence was decided without")
-	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
+	assert.NotContains(t, rendered, "in the logs below", "the sentence is chosen against the room it would leave")
+	assert.Contains(t, rendered, "== "+engineLogGroupLabel(deployment, target)+" ==", "the fold keeps the account the original sentence's room holds")
+	// At the threshold the engine's share is the floor, so its line is cut
+	// after the timestamp and level; the account is present, not whole.
+	assert.Contains(t, rendered, "2026-07-12 16:32:01 UTC [WRN]")
+	assert.NotContains(t, rendered, "source omitted")
 	assert.Len(t, logger.warns, 1)
 	assert.Empty(t, logger.errors)
 }

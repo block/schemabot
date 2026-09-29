@@ -127,27 +127,24 @@ func summaryWithFailureLogs(ctx context.Context, stor storage.Storage, engineLog
 	}
 	pointedBody := renderBody(pointed)
 	pointedRoom := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - len(pointedBody)
-	// The pointed sentence is longer than the one it replaces, so a body
-	// that only just cleared the check above can fail it now, and the
-	// room it leaves is what the fold is planned against. The sentence
-	// stands only when the fold it promises will carry the engine's
-	// account: with no room for a fold, or with room for the apply's own
-	// account alone, "the logs below" would send the reader to lines that
-	// are not there, so the original sentence stands instead — it names
-	// the server logs, which do have the reason.
+	// The sentence is chosen first, against the room it would leave, and
+	// the fold then renders in the room the chosen sentence does leave. The
+	// pointed sentence is longer than the one it replaces, so a body that
+	// only just cleared the check above can fail it now. It stands only
+	// when the fold it promises will carry the engine's account: with no
+	// room for a fold, or with room for the apply's own account alone, "the
+	// logs below" would send the reader to lines that are not there, so the
+	// original sentence stands instead — it names the server logs, which do
+	// have the reason. Engine lines the original sentence's room holds still
+	// render under it: naming the server logs does not deny the lines below,
+	// and for an operator without server access they are the reason.
 	switch {
 	case pointedRoom < templates.MinFailureLogsSectionChars:
 		logger.Error("pointing the failure summary at the rendered logs leaves no room for them under the GitHub comment size limit; keeping the reason that names the server logs",
 			append(apply.LogAttrs(), "summary_chars", len(pointedBody))...)
 	case !carriesEngineAccount(templates.FoldGroups(groups, pointedRoom)):
-		logger.Warn("the recent-logs section has no room for an engine's account under the GitHub comment size limit; keeping the reason that names the server logs",
+		logger.Warn("pointing the failure summary at the rendered logs leaves no room for the engine's account under the GitHub comment size limit; keeping the reason that names the server logs",
 			append(apply.LogAttrs(), "summary_chars", len(pointedBody), "log_groups", len(groups))...)
-		// The fold renders against the room it was planned for. The
-		// shorter sentence leaves a little more, but a fold planned in the
-		// smaller room and rendered in the larger one could keep the
-		// account the plan shed, and then carry the engine's lines under a
-		// sentence that says they are elsewhere.
-		available = pointedRoom
 	default:
 		body, available = pointedBody, pointedRoom
 	}
