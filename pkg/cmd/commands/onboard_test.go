@@ -1,8 +1,12 @@
 package commands
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -261,6 +265,9 @@ func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
 	_, err = onboardPullNamespaces([]string{"orders_$ENV"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must be a concrete live namespace")
+	_, err = onboardPullNamespaces([]string{"orders_{env}"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a concrete live namespace")
 }
 
 func TestRewriteOnboardNamespacesInfersEnvironmentTemplate(t *testing.T) {
@@ -274,8 +281,8 @@ func TestRewriteOnboardNamespacesInfersEnvironmentTemplate(t *testing.T) {
 		},
 	}
 	require.NoError(t, rewriteOnboardNamespaces(resp, "production", true))
-	assert.Contains(t, resp.Namespaces, "orders_$ENV")
-	assert.Contains(t, resp.Namespaces, "orders_audit_$ENV")
+	assert.Contains(t, resp.Namespaces, "orders_{env}")
+	assert.Contains(t, resp.Namespaces, "orders_audit_{env}")
 	assert.NotContains(t, resp.Namespaces, "orders_production")
 }
 
@@ -290,7 +297,41 @@ func TestRewriteOnboardNamespacesKeepsConcreteNamesByDefault(t *testing.T) {
 	}
 	require.NoError(t, rewriteOnboardNamespaces(resp, "production", false))
 	assert.Contains(t, resp.Namespaces, "orders_production")
-	assert.NotContains(t, resp.Namespaces, "orders_$ENV")
+	assert.NotContains(t, resp.Namespaces, "orders_{env}")
+}
+
+func TestOnboardRejectsDiscoveredNamespacePlaceholders(t *testing.T) {
+	for _, namespace := range []string{"orders_{env}", "orders_$ENV"} {
+		for _, templateEnvSuffix := range []bool{false, true} {
+			t.Run(namespace+"/template="+strconv.FormatBool(templateEnvSuffix), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					require.Equal(t, http.MethodPost, r.Method)
+					assert.Equal(t, "/api/pull", r.URL.Path)
+					w.Header().Set("Content-Type", "application/json")
+					require.NoError(t, json.NewEncoder(w).Encode(&apitypes.PullSchemaResponse{
+						Database:    "orders",
+						Type:        "mysql",
+						Environment: "production",
+						Namespaces: map[string]*apitypes.PulledNamespace{
+							namespace: {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+						},
+					}))
+				}))
+				t.Cleanup(server.Close)
+
+				root := t.TempDir()
+				cmd := &OnboardCmd{
+					Database: "orders", Environment: "production", SchemaDir: root,
+					TemplateEnvSuffix: templateEnvSuffix, SkipVerify: true,
+				}
+				err := cmd.Run(&Globals{Endpoint: server.URL})
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "must be a concrete live namespace")
+				assert.Contains(t, err.Error(), namespace)
+				assert.NoFileExists(t, filepath.Join(root, "schemabot.yaml"))
+			})
+		}
+	}
 }
 
 func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {

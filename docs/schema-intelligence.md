@@ -100,6 +100,9 @@ and environment from the inventory. The response groups `CREATE TABLE`
 statements by namespace: a schema on MySQL or PostgreSQL, a keyspace on Vitess.
 Use `--namespace` (API: `namespaces`) to select namespaces; omit it to discover
 the non-reserved namespaces.
+Supply concrete live namespace names when selecting them. `{env}` and `$ENV`
+are schema-directory placeholders, so both are rejected in `--namespace` and
+`POST /api/pull` `namespaces` arguments.
 
 ```sh
 schemabot pull -d shop -e production

@@ -53,6 +53,7 @@ func TestPullNamespaces(t *testing.T) {
 		{name: "path traversal rejected", dialect: schema.DialectMySQL, namespaces: []string{"a..b"}, wantErr: "single path component"},
 		{name: "path separator rejected", dialect: schema.DialectMySQL, namespaces: []string{`a/b`}, wantErr: "single path component"},
 		{name: "unresolved env placeholder rejected", dialect: schema.DialectMySQL, namespaces: []string{"orders_$ENV"}, wantErr: "$ENV"},
+		{name: "unresolved brace env placeholder rejected", dialect: schema.DialectMySQL, namespaces: []string{"orders_{env}"}, wantErr: "{env}"},
 		{name: "duplicate namespace rejected", dialect: schema.DialectMySQL, namespaces: []string{"orders", "orders"}, wantErr: "duplicate"},
 	}
 

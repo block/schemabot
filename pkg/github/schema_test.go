@@ -31,6 +31,7 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 		{name: "removed file nested below a namespace", files: []PRFile{{Filename: "schema/payments/archive/backfill.sql", Status: "removed"}}},
 		{name: "outside schema root", files: []PRFile{{Filename: "other/removed/orders.sql", Status: "removed"}}},
 		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}},
+		{name: "ignored brace namespace", ignored: []string{"removed_{env}"}, environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}},
 		{name: "flat file", files: []PRFile{{Filename: "schema/orders.sql", Status: "removed"}}},
 		{name: "renamed out of its namespace", files: []PRFile{{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
 		{name: "renamed within its namespace", files: []PRFile{{Filename: "schema/surviving/orders_v2.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
@@ -38,6 +39,7 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 		{name: "renamed without a previous path", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "renamed"}}},
 		{name: "renamed to a non-schema file", files: []PRFile{{Filename: "schema/removed/orders.txt", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
 		{name: "environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
+		{name: "brace environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
 	}
 
 	for _, tt := range tests {
@@ -46,6 +48,18 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 			assert.Equal(t, tt.want, emptiedPRNamespaces(grouped, tt.ignored, vacated, "schema", tt.environment))
 		})
 	}
+}
+
+func TestGroupFilesByNamespace_BraceEnvironment(t *testing.T) {
+	files := []GitHubFile{
+		{Path: "schema/orders_{env}/users.sql", Name: "users.sql", Content: "CREATE TABLE users (id bigint);"},
+		{Path: "schema/fixtures_{env}/widgets.sql", Name: "widgets.sql", Content: "CREATE TABLE widgets (id bigint);"},
+	}
+	grouped, ignored, err := groupFilesByNamespace(files, "schema", "staging", []string{"fixtures_{env}"})
+	require.NoError(t, err)
+	assert.Contains(t, grouped, "orders_staging")
+	assert.NotContains(t, grouped, "fixtures_staging")
+	assert.Equal(t, []string{"fixtures_staging"}, ignored)
 }
 
 // TestVacatedSchemaFilesReportsDeletionsOfTheVacatedPath pins the shape the
