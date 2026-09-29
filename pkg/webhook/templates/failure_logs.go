@@ -92,14 +92,7 @@ type LogGroupData struct {
 // of pushing the comment over the limit. Returns "" when no group carried a
 // line or there is no meaningful room, so the summary renders unchanged.
 func RenderFailureLogs(groups []LogGroupData, available int) string {
-	groups = groupsWithEntries(groups)
-	if len(groups) == 0 {
-		return ""
-	}
-	if available < MinFailureLogsSectionChars {
-		return ""
-	}
-	groups, headings, budget, droppedGroups := groupsWithinBudget(groups, available)
+	groups, headings, budget, droppedGroups := planFold(groups, available)
 	if len(groups) == 0 {
 		return ""
 	}
@@ -141,6 +134,28 @@ func RenderFailureLogs(groups []LogGroupData, available int) string {
 	}
 	section += "```text\n" + strings.Join(blocks, groupSeparator) + "\n```\n\n</details>\n"
 	return section
+}
+
+// FoldGroups returns the groups a fold given available characters carries, in
+// order. RenderFailureLogs renders exactly these, so a caller that has to know
+// what the fold will hold before it is rendered — the summary sentence that
+// sends the reader to the logs below — asks here rather than re-deriving the
+// budget, and the two cannot disagree.
+func FoldGroups(groups []LogGroupData, available int) []LogGroupData {
+	kept, _, _, _ := planFold(groups, available)
+	return kept
+}
+
+// planFold decides what a fold given available characters renders: the groups
+// that carried a line, as many of them as the room gives a renderable share,
+// with their headings, the budget left for lines, and how many groups fell
+// out. Too little room for any fold at all plans nothing.
+func planFold(groups []LogGroupData, available int) (kept []LogGroupData, headings []string, budget int, dropped int) {
+	groups = groupsWithEntries(groups)
+	if len(groups) == 0 || available < MinFailureLogsSectionChars {
+		return nil, nil, 0, 0
+	}
+	return groupsWithinBudget(groups, available)
 }
 
 // groupsWithinBudget decides how many groups the fold can carry and what the

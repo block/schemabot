@@ -319,3 +319,36 @@ func TestSummaryCommentFromOpsReadsEachSectionOnce(t *testing.T) {
 	assert.NotContains(t, body, "see the server logs for the reason")
 	assert.Contains(t, body, "== engine logs: region-a ==")
 }
+
+// The fold keeps the apply's own account first and sheds the engine's when the
+// room left under the comment cap cannot hold both, and a long deployment and
+// target name is what makes a heading outgrow a tight budget. The summary then
+// keeps naming the server logs: "the logs below" would send the reader to an
+// account the fold had to leave out, and the fold says an account was omitted.
+func TestSummaryWithFailureLogsKeepsTheServerLogsPointerWhenTheBudgetDropsTheEngineAccount(t *testing.T) {
+	apply := failureLogsTestApply()
+	apply.ErrorMessage = mysqlerr.Generic + " (error 1265)"
+	stor := failureLogsTestStorage(&storage.ApplyLog{ApplyID: apply.ID, Level: "error", Message: "Apply failed", OldState: "running", NewState: "failed"})
+	deployment := strings.Repeat("d", 255)
+	target := strings.Repeat("t", 255)
+	engineLogs := func(context.Context, *storage.Apply, int) ([]api.EngineLogSource, error) {
+		sources := engineLogSource(deployment, "[orders] unsafe warning 1265: Data truncated")
+		sources[0].Target = target
+		return sources, nil
+	}
+	// The body leaves the fold more than the minimum room, both before and
+	// after the pointing rewrite, but less than the engine heading costs.
+	room := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - templates.MinFailureLogsSectionChars - len(mysqlerr.GenericRenderedLogs)
+	pad := strings.Repeat("x", room-len(apply.ErrorMessage))
+	renderBody := func(apply *storage.Apply) string {
+		return pad + apply.ErrorMessage
+	}
+
+	rendered := summaryWithFailureLogs(t.Context(), stor, engineLogs, failureLogsTestLogger(), apply, renderBody)
+
+	assert.Contains(t, rendered, mysqlerr.Generic+" (error 1265)")
+	assert.NotContains(t, rendered, "in the logs below", "the summary never promises an account the fold left out")
+	assert.Contains(t, rendered, "Apply failed", "the apply's own account still renders")
+	assert.NotContains(t, rendered, engineLogGroupLabel(deployment, target))
+	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
+}

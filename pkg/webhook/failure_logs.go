@@ -34,10 +34,12 @@ const failureLogsLoadTimeout = 2 * time.Second
 const engineLogsLoadTimeout = 3 * time.Second
 
 // failureLogsLogger is what the failure-logs sections need from a logger:
-// Error for the loads that failed and Debug for the ones that were never
-// wired or had nothing to read.
+// Error for the loads that failed, Warn for a fold that had to shed an account
+// it was loaded, and Debug for the loads that were never wired or had nothing
+// to read.
 type failureLogsLogger interface {
 	Debug(msg string, args ...any)
+	Warn(msg string, args ...any)
 	Error(msg string, args ...any)
 }
 
@@ -109,34 +111,39 @@ func summaryWithFailureLogs(ctx context.Context, stor storage.Storage, engineLog
 		return body
 	}
 	groups := failureLogGroups(ctx, stor, engineLogs, logger, apply)
-	if pointed := applyPointingAtRenderedLogs(apply, groups); pointed != apply {
+	if pointed := applyPointingAtRenderedLogs(apply); pointed != apply {
 		pointedBody := renderBody(pointed)
 		pointedRoom := templates.GitHubIssueCommentMaxChars - templates.CommentChromeHeadroom - len(pointedBody)
 		// The pointed sentence is longer than the one it replaces, so a body
-		// that only just cleared the check above can fail it now. Keeping the
-		// pointed body then would promise an account in the logs below and
-		// post no fold at all, so the original sentence stands instead — it
-		// names the server logs, which do have the reason.
-		if pointedRoom < templates.MinFailureLogsSectionChars {
+		// that only just cleared the check above can fail it now, and the
+		// room it leaves is what the fold is planned against. The sentence
+		// stands only when the fold it promises will carry the engine's
+		// account: with no room for a fold, or with room for the apply's own
+		// account alone, "the logs below" would send the reader to lines that
+		// are not there, so the original sentence stands instead — it names
+		// the server logs, which do have the reason.
+		switch {
+		case pointedRoom < templates.MinFailureLogsSectionChars:
 			logger.Error("pointing the failure summary at the rendered logs leaves no room for them under the GitHub comment size limit; keeping the reason that names the server logs",
 				append(apply.LogAttrs(), "summary_chars", len(pointedBody))...)
-		} else {
+		case !carriesEngineAccount(templates.FoldGroups(groups, pointedRoom)):
+			logger.Warn("the recent-logs section has no room for an engine's account under the GitHub comment size limit; keeping the reason that names the server logs",
+				append(apply.LogAttrs(), "summary_chars", len(pointedBody), "log_groups", len(groups))...)
+		default:
 			body, available = pointedBody, pointedRoom
 		}
 	}
 	return body + templates.RenderFailureLogs(groups, available)
 }
 
-// applyPointingAtRenderedLogs returns the apply as the summary should render
-// it. When the fold will carry the engine's own account and the apply's error
-// is the sentence that sends an operator to the server logs, the summary says
-// so about the logs in front of them instead. The apply itself is never
+// applyPointingAtRenderedLogs returns the apply as the summary renders it when
+// the fold carries the engine's own account: an error that is the sentence
+// sending an operator to the server logs says so about the logs in front of
+// them instead. Whether the fold does carry that account is the caller's to
+// check, against the groups the fold has room for. The apply itself is never
 // changed: the stored error is the record of what the target reported, and
 // this is one surface's rendering of it.
-func applyPointingAtRenderedLogs(apply *storage.Apply, groups []templates.LogGroupData) *storage.Apply {
-	if !carriesEngineAccount(groups) {
-		return apply
-	}
+func applyPointingAtRenderedLogs(apply *storage.Apply) *storage.Apply {
 	pointed := mysqlerr.PointToRenderedLogs(apply.ErrorMessage)
 	if pointed == apply.ErrorMessage {
 		return apply
@@ -148,7 +155,9 @@ func applyPointingAtRenderedLogs(apply *storage.Apply, groups []templates.LogGro
 
 // carriesEngineAccount reports whether any group came from a data plane, which
 // is what makes "the logs below" true: an apply driven in this process has one
-// group, and it is the same log the server writes.
+// group, and it is the same log the server writes. It is asked about the
+// groups the fold will render, not the groups that were loaded: a fold short
+// of room keeps the apply's own account and sheds the engine's after it.
 func carriesEngineAccount(groups []templates.LogGroupData) bool {
 	for _, group := range groups {
 		if strings.HasPrefix(group.Label, engineLogGroupLabelPrefix) {

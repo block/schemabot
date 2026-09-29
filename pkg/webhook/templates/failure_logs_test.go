@@ -364,3 +364,32 @@ func TestRenderFailureLogsNeverExceedsItsBudget(t *testing.T) {
 		}
 	}
 }
+
+// FoldGroups is the fold's plan, and RenderFailureLogs renders that plan and
+// nothing else: the summary sentence above the fold is written against it, so
+// a group the plan leaves out must not appear in the rendering, and a group it
+// keeps must. A heading that outgrows a tight budget is how a whole account
+// falls out, so that is the case pinned here.
+func TestFoldGroupsIsWhatRenderFailureLogsRenders(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	longLabel := "engine logs: " + strings.Repeat("d", 255) + ", target: " + strings.Repeat("t", 255)
+	groups := []LogGroupData{
+		{Label: "apply logs", Entries: []LogEntryData{{CreatedAt: at, Level: "error", Message: "Apply failed"}}},
+		{Label: longLabel, Entries: []LogEntryData{{CreatedAt: at, Level: "warn", Message: "[orders] unsafe warning 1265"}}},
+	}
+
+	tight := FoldGroups(groups, MinFailureLogsSectionChars)
+	require.Len(t, tight, 1, "the heading alone outgrows the room, so the engine's account falls out")
+	assert.Equal(t, "apply logs", tight[0].Label)
+	rendered := RenderFailureLogs(groups, MinFailureLogsSectionChars)
+	assert.NotContains(t, rendered, "engine logs:")
+	assert.Contains(t, rendered, "1 source omitted to fit the comment size limit")
+
+	roomy := FoldGroups(groups, GitHubIssueCommentMaxChars)
+	require.Len(t, roomy, 2)
+	assert.Equal(t, longLabel, roomy[1].Label)
+	assert.Contains(t, RenderFailureLogs(groups, GitHubIssueCommentMaxChars), "== "+longLabel+" ==")
+
+	assert.Nil(t, FoldGroups(groups, MinFailureLogsSectionChars-1), "no room for a fold plans no groups")
+	assert.Nil(t, FoldGroups([]LogGroupData{{Label: longLabel}}, GitHubIssueCommentMaxChars), "a group without lines is not planned")
+}
