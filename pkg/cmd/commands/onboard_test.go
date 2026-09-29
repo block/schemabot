@@ -72,6 +72,61 @@ func TestBuildOnboardWritePlanFormatsSQLWithoutChangingContent(t *testing.T) {
 	assert.Equal(t, ddl.Canonicalize(original), ddl.Canonicalize(formatted))
 }
 
+// Supported MySQL-family targets keep uncommon table options while writing every
+// table across multiple lines.
+func TestBuildOnboardWritePlanPreservesMySQLTableOptions(t *testing.T) {
+	for _, databaseType := range []string{"mysql", "vitess"} {
+		t.Run(databaseType, func(t *testing.T) {
+			root := t.TempDir()
+			plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+				Database: "app", Type: databaseType, TableCount: 2,
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"app": {Tables: map[string]string{
+						"plain":     "CREATE TABLE plain (id int)",
+						"encrypted": "CREATE TABLE encrypted (id int) ENGINE=InnoDB ENCRYPTION='Y'",
+					}},
+				},
+			}, client.PlanExclusions{})
+			require.NoError(t, err)
+			require.NoError(t, plan.write())
+			for _, table := range []string{"plain", "encrypted"} {
+				content, err := os.ReadFile(filepath.Join(root, "app", table+".sql"))
+				require.NoError(t, err)
+				assert.Contains(t, string(content), "\n    `id` int\n)")
+				if table == "encrypted" {
+					assert.Contains(t, string(content), "ENCRYPTION = 'Y'")
+				}
+			}
+		})
+	}
+}
+
+// Formatting refusals name the affected table and prevent a partial plan or
+// filesystem changes, even when an earlier table could be formatted.
+func TestBuildOnboardWritePlanRefusesLossyFormatting(t *testing.T) {
+	for _, databaseType := range []string{"mysql", "vitess"} {
+		for _, suffix := range []string{"/* keep me */", "STATS_PERSISTENT=0", "PACK_KEYS=1"} {
+			t.Run(databaseType+"/"+suffix, func(t *testing.T) {
+				root := t.TempDir()
+				plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+					Database: "app", Type: databaseType, TableCount: 2,
+					Namespaces: map[string]*apitypes.PulledNamespace{
+						"app": {Tables: map[string]string{
+							"a": "CREATE TABLE a (id int)",
+							"b": "CREATE TABLE b (id int) " + suffix,
+						}},
+					},
+				}, client.PlanExclusions{})
+				require.ErrorContains(t, err, "namespace app table b")
+				assert.Nil(t, plan)
+				entries, err := os.ReadDir(root)
+				require.NoError(t, err)
+				assert.Empty(t, entries)
+			})
+		}
+	}
+}
+
 func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 	root := t.TempDir()
 	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{

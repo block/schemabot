@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"unicode"
 
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
@@ -28,7 +29,10 @@ func FormatDDL(ddl string) string {
 // with every statement canonicalizing to the same SQL as its input. PostgreSQL
 // files may include the supported row-security declaration after their table
 // and indexes. Existing multiline SQL is kept verbatim apart from its final
-// newline. The returned file ends with one newline.
+// newline. Single-line SQL with comments is refused when reformatting cannot
+// preserve them, including MySQL executable comments. MySQL canonical forms
+// containing comments are also refused: they can flag discarded option values.
+// The returned file ends with one newline.
 func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string, error) {
 	parser, err := ParserForDialect(dialect)
 	if err != nil {
@@ -47,9 +51,18 @@ func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string,
 			return "", fmt.Errorf("format PostgreSQL declarative schema file: %w", err)
 		}
 	}
+	if dialect == schema.DialectMySQL && containsMySQLComment(content, true) {
+		return "", fmt.Errorf("cannot preserve MySQL comments while formatting; format the schema file across multiple lines manually")
+	}
 
 	formatted := make([]string, 0, len(statements))
 	for i, stmt := range statements {
+		// Canonical equality cannot prove preservation when Restore emits a
+		// comment in place of an option's original value. Do not write that
+		// canonical form, even if reparsing it would compare equal.
+		if dialect == schema.DialectMySQL && containsMySQLComment(parser.Canonicalize(stmt), false) {
+			return "", fmt.Errorf("cannot prove statement %d preserved its SQL: canonical SQL contains comments; format the schema file across multiple lines manually", i+1)
+		}
 		rendered, equivalent := formatDDLForDialect(dialect, parser, stmt, i == 0)
 		if !equivalent {
 			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
@@ -74,6 +87,43 @@ func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string,
 		}
 	}
 	return result, nil
+}
+
+// containsMySQLComment checks for comment openers outside quoted content. It
+// is only a content-loss guard; the dialect parser still validates the SQL.
+// Source literals allow backslash escapes, while Restore uses doubled quotes
+// and literal backslashes. Backtick identifiers only use doubled backticks.
+func containsMySQLComment(sql string, backslashEscapes bool) bool {
+	var quote byte
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if quote != 0 {
+			if backslashEscapes && quote != '`' && c == '\\' {
+				i++
+				continue
+			}
+			if c == quote {
+				if i+1 < len(sql) && sql[i+1] == quote {
+					i++
+				} else {
+					quote = 0
+				}
+			}
+			continue
+		}
+		if isQuote(c) {
+			quote = c
+			continue
+		}
+		if c == '#' || strings.HasPrefix(sql[i:], "/*") {
+			return true
+		}
+		// Unlike PostgreSQL, MySQL requires whitespace/control after --.
+		if strings.HasPrefix(sql[i:], "--") && (i+2 == len(sql) || sql[i+2] <= ' ' || unicode.IsSpace(rune(sql[i+2]))) {
+			return true
+		}
+	}
+	return false
 }
 
 // schemaFileStatements validates a declarative file under the grammar that
@@ -335,8 +385,14 @@ func formatCreateTableWithOptions(ddl string, multiline bool) string {
 		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString(")")
-	sb.WriteString(formatFooter(options, partition))
+	if multiline {
+		// Source files need all table options, including those the display
+		// formatter does not recognize. Keep the canonical suffix intact.
+		sb.WriteString(footer)
+	} else {
+		sb.WriteString(")")
+		sb.WriteString(formatFooter(options, partition))
+	}
 
 	return sb.String()
 }

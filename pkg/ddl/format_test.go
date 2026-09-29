@@ -79,6 +79,98 @@ func TestFormatSchemaFileForDialectRejectsNonTableContent(t *testing.T) {
 	require.ErrorContains(t, err, "parse declarative schema file")
 }
 
+func TestFormatSchemaFileForDialectRefusesCommentLoss(t *testing.T) {
+	for _, input := range []string{
+		"CREATE TABLE t (id int /* keep me */)",
+		"CREATE TABLE t (id int) /* keep me */",
+		"CREATE TABLE t (id int); -- keep me",
+		"CREATE TABLE t (id int); # keep me",
+		"CREATE TABLE t (id int); --",
+		"CREATE TABLE t (id int); --\tkeep me",
+		"CREATE TABLE t (id int); --\xA0keep me",
+		"CREATE TABLE t (id int) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */",
+		"CREATE TABLE t (id int) /*+ keep me */",
+		`CREATE TABLE t (note varchar(64) DEFAULT 'escaped\' quote') /* keep me */`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+			require.ErrorContains(t, err, "comments")
+			assert.Empty(t, got)
+		})
+	}
+
+	got, err := FormatSchemaFileForDialect(schema.DialectPostgres, "CREATE TABLE t (id bigint PRIMARY KEY /* keep me */)")
+	require.ErrorContains(t, err, "format PostgreSQL declarative schema file")
+	assert.Empty(t, got)
+}
+
+func TestFormatSchemaFileForDialectPreservesMySQLQuotedCommentMarkers(t *testing.T) {
+	for _, input := range []string{
+		"CREATE TABLE `/* -- # */` (`id` int) COMMENT='/* -- # */'",
+		`CREATE TABLE t (note varchar(64) DEFAULT 'it''s /* -- # */')`,
+		`CREATE TABLE t (note varchar(64) DEFAULT 'it\'s /* -- # */')`,
+		`CREATE TABLE t (note varchar(64) DEFAULT "it's /* -- # */")`,
+		"CREATE TABLE `a``/* -- # */` (`id` int)",
+		"CREATE TABLE t (id int DEFAULT (1--2))",
+		`CREATE TABLE t (note varchar(64) DEFAULT 'path\\') COMMENT='/* keep me */'`,
+		"CREATE TABLE t (id int) COMMENT='/* TableOptionStatsPersistent is not supported */'",
+	} {
+		t.Run(input, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+			require.NoError(t, err)
+			assert.Contains(t, strings.TrimSuffix(got, "\n"), "\n")
+			assert.Equal(t, Canonicalize(input), Canonicalize(got))
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
+	for _, option := range []string{
+		"ENCRYPTION = 'Y'",
+		"MAX_ROWS = 1000",
+		"STATS_SAMPLE_PAGES = 32",
+		"SECONDARY_ENGINE = NULL",
+		"CHECKSUM = 1",
+		"DELAY_KEY_WRITE = 1",
+		"MIN_ROWS = 10",
+		"STATS_AUTO_RECALC = 0",
+	} {
+		t.Run(option, func(t *testing.T) {
+			input := "CREATE TABLE t (id int) ENGINE=InnoDB " + option + " COMMENT='Keep INT, comma' PARTITION BY HASH (id) PARTITIONS 4"
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+			require.NoError(t, err)
+			assert.Contains(t, got, "\n    `id` int\n)")
+			assert.Contains(t, got, option)
+			assert.Contains(t, got, "COMMENT = 'Keep INT, comma'")
+			assert.Contains(t, got, "PARTITION BY HASH")
+			assert.Equal(t, Canonicalize(input), Canonicalize(got))
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectRefusesLossyMySQLCanonicalization(t *testing.T) {
+	for _, option := range []string{"STATS_PERSISTENT=0", "STATS_PERSISTENT=1", "PACK_KEYS=0", "PACK_KEYS=1"} {
+		t.Run(option, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE t (id int) ENGINE=InnoDB "+option)
+			require.ErrorContains(t, err, "canonical SQL contains comments")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPreservesMultilineMySQL(t *testing.T) {
+	input := "CREATE TABLE t (\n  id int /* keep me */\n) ENGINE=InnoDB STATS_PERSISTENT=0 PACK_KEYS=1\n/*!50100 PARTITION BY HASH (id) PARTITIONS 4 */;\n"
+	got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+	require.NoError(t, err)
+	assert.Equal(t, input, got)
+}
+
+func TestFormatSchemaFileForDialectRefusesUnformattableTable(t *testing.T) {
+	got, err := FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE t LIKE other_table")
+	require.Error(t, err)
+	assert.Empty(t, got)
+}
+
 func TestFormatSchemaFileForDialectPreservesPostgresRowSecurity(t *testing.T) {
 	input := "CREATE TABLE documents (\n  id bigint PRIMARY KEY\n);\nALTER TABLE documents ENABLE ROW LEVEL SECURITY;\nCREATE POLICY readers ON documents FOR SELECT USING (id = 1);\nCOMMENT ON POLICY readers ON documents IS 'Read your documents';\n\n"
 
