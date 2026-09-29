@@ -653,6 +653,17 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					if settleErr == nil {
 						return action
 					}
+					if errors.Is(settleErr, storage.ErrApplyLeaseLost) {
+						// The target answered; only the settlement write was
+						// refused, because a peer now holds the lease. That
+						// peer settles the task, so this driver exits rather
+						// than counting the refusal as a failed verification
+						// and going on to rest and finalize an apply it no
+						// longer owns.
+						c.logger.Warn("settling lost engine work was refused because the drive's lease was lost; this driver exits and starts no further task",
+							append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "error", settleErr)...)
+						return taskAbort
+					}
 					// Neither the engine nor the target has answered what
 					// happened to the work, so count the failed verification
 					// against the same bounded error budget as a failed poll —

@@ -2259,12 +2259,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	retryableApplyError := apply.ErrorMessage
 	if err := c.prepareRetryableTasksForResume(ctx, apply, activeTasks); err != nil {
-		apply.State = state.Apply.FailedRetryable
+		// Nothing has written the apply row yet, so it still records the
+		// retryable pause it was claimed in; only the in-memory error message
+		// was cleared for the retry, and it is put back to match the row.
 		apply.ErrorMessage = retryableApplyError
-		if updateErr := c.storage.Applies().Update(ctx, apply); updateErr != nil {
-			return fmt.Errorf("restore retryable apply %s after task requeue failed (%w): %w", apply.ApplyIdentifier, err, updateErr)
-		}
-		logger.Warn("could not requeue retryable tasks for the retry; the apply was restored retryable for the next claim",
+		logger.Warn("could not requeue retryable tasks for the retry; the apply stays retryable for the next claim",
 			append(apply.MutableLogAttrs(), "error", err)...)
 		return err
 	}
