@@ -86,6 +86,11 @@ and comments. A mismatch refuses execution and requires a new plan. This binds
 the SQL to execute, not every prior policy predicate: if concurrent edits still
 produce exactly the reviewed SQL, that SQL remains authorized.
 
+RLS drift comparison retains the physical schema qualifier. Dispatching a reviewed
+RLS operation to a differently named physical schema requires a fresh plan and
+review on that target; ordinary table namespace mapping does not authorize this
+RLS remapping. The executor still verifies the exact ordered SQL under its lock.
+
 Both planning and execution take a bounded exclusive table lock. Keep policy
 updates small and expect a busy table to refuse rather than wait indefinitely.
 Creating a new table with an RLS declaration and combining structural changes

@@ -405,6 +405,8 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	}
 	// An atomic operation is compared as one ordered sequence. Its engine owns
 	// grammar admission; ordinary statement and create-set parsing remain strict.
+	// RLS retains its physical target: a dispatch does not prove the source
+	// deployment’s namespace mapping, so it cannot authorize schema erasure.
 	if rls, ok := p.(interface{ CanonicalRowSecurity(string) (string, error) }); ok {
 		if canonical, err := rls.CanonicalRowSecurity(raw); err == nil {
 			return canonical, nil

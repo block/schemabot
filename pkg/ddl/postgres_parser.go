@@ -695,10 +695,11 @@ func restoreDropColumnKeyword(stmt *pgproto.Node, canonical string) string {
 
 // CanonicalRowSecurity delegates PostgreSQL operation grammar to pg-sprite.
 // Ordinary statement classification stays separate from atomic RLS operations.
+// Keep the physical target in the key; SQL alone cannot prove namespace mapping.
 func (postgresStatementParser) CanonicalRowSecurity(sql string) (string, error) {
 	change, err := pgstatement.ParseRowSecurityChange(sql)
 	if err != nil {
 		return "", err
 	}
-	return change.CanonicalSQLForNamespace()
+	return change.CanonicalSQL(), nil
 }

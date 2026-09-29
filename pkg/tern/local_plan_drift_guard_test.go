@@ -563,7 +563,7 @@ func TestCanonicalDDLForDrift_RowSecurity(t *testing.T) {
  CREATE POLICY readers ON production.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
  `)
 	require.NoError(t, err)
-	assert.Equal(t, canonical, mapped, "namespace identity is carried separately by the drift key")
+	assert.NotEqual(t, canonical, mapped, "RLS review retains its physical target; a different schema needs a fresh review")
 	for _, tt := range []struct{ name, sql string }{
 		{"order", `
  CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
