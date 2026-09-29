@@ -384,6 +384,40 @@ func TestPlanShardTableSizesKeepBytesWithoutRows(t *testing.T) {
 	assert.Nil(t, protoChange.LargestShardRows)
 }
 
+// A negative row estimate is a sentinel for "no real estimate", not a count, so
+// a shard reporting one omits the namespace row total as a missing estimate
+// would, instead of subtracting from the sum.
+func TestPlanShardTableSizesTreatNegativeRowsAsMissing(t *testing.T) {
+	store := &fakePlanStore{
+		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
+		createID: 15,
+	}
+	result := &engine.PlanResult{
+		PlanID: "plan_negative_rows",
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: alterUsersEmailWithRows(100)},
+			{Namespace: "resolute", Shard: engine.Shard{Name: "80-"}, TableChanges: alterUsersEmailWithRows(-1)},
+		},
+	}
+	c := shardPlanTestClient(t, store, result)
+
+	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	stored := store.created.Namespaces["resolute"].Tables[0]
+	assert.Equal(t, 2, stored.ShardCount)
+	assert.Nil(t, stored.EstimatedRows)
+	assert.Nil(t, stored.LargestShardRows)
+	assert.Nil(t, stored.EstimatedBytes, "the helper derives a negative byte estimate too")
+
+	protoChange := resp.Changes[0].TableChanges[0]
+	assert.Equal(t, int32(2), protoChange.ShardCount)
+	assert.Nil(t, protoChange.EstimatedRows)
+	assert.Nil(t, protoChange.LargestShardRows)
+	assert.Nil(t, protoChange.EstimatedBytes)
+}
+
 // An engine that aggregates a sharded target itself emits unsharded changes;
 // its own size values pass through the namespace view untouched.
 func TestPlanUnshardedTableSizesPassThrough(t *testing.T) {

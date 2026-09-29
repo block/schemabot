@@ -1,8 +1,6 @@
 package tern
 
 import (
-	"strings"
-
 	"github.com/block/schemabot/pkg/engine"
 )
 
@@ -71,12 +69,14 @@ func (a *tableSizeAccumulator) sizes() (shardCount int, estimatedRows, largestSh
 func (c *LocalClient) aggregateShardTableSizes(changes []engine.SchemaChange) map[string]map[string]*tableSizeAccumulator {
 	agg := make(map[string]map[string]*tableSizeAccumulator)
 	for _, sc := range changes {
-		shard := strings.TrimSpace(sc.Shard.Name)
-		if shard == "" {
+		// The same predicate the namespace view's dedup uses, so the entry that
+		// receives an aggregate is the one this fold was computed for.
+		if !sc.Sharded() {
 			// Unsharded change: nothing to fold, the engine's own per-table
 			// size values are already namespace-level.
 			continue
 		}
+		shard := sc.ShardName()
 		ns := c.planNamespace(sc.Namespace)
 		byTable := agg[ns]
 		if byTable == nil {
@@ -94,17 +94,31 @@ func (c *LocalClient) aggregateShardTableSizes(changes []engine.SchemaChange) ma
 			}
 			a.seenShards[shard] = true
 			a.shardCount++
-			if tc.EstimatedRows == nil {
+			switch {
+			case tc.EstimatedRows == nil:
+				c.logger.Debug("shard reports no row estimate; the table's row total will be omitted",
+					"namespace", ns, "shard", shard, "table", tc.Table)
 				a.missingRows = true
-			} else {
+			case *tc.EstimatedRows < 0:
+				c.logger.Warn("shard reports a negative row estimate; the table's row total will be omitted",
+					"namespace", ns, "shard", shard, "table", tc.Table, "estimated_rows", *tc.EstimatedRows)
+				a.missingRows = true
+			default:
 				a.sum += *tc.EstimatedRows
 				if *tc.EstimatedRows > a.largest {
 					a.largest = *tc.EstimatedRows
 				}
 			}
-			if tc.EstimatedBytes == nil {
+			switch {
+			case tc.EstimatedBytes == nil:
+				c.logger.Debug("shard reports no byte estimate; the table's byte total will be omitted",
+					"namespace", ns, "shard", shard, "table", tc.Table)
 				a.missingBytes = true
-			} else {
+			case *tc.EstimatedBytes < 0:
+				c.logger.Warn("shard reports a negative byte estimate; the table's byte total will be omitted",
+					"namespace", ns, "shard", shard, "table", tc.Table, "estimated_bytes", *tc.EstimatedBytes)
+				a.missingBytes = true
+			default:
 				a.bytesSum += *tc.EstimatedBytes
 			}
 		}
