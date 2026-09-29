@@ -70,10 +70,12 @@ func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string,
 		formatted = append(formatted, rendered)
 	}
 
-	result := strings.Join(formatted, "\n\n") + "\n"
-	if !strings.Contains(strings.TrimSuffix(result, "\n"), "\n") {
-		return "", fmt.Errorf("format CREATE TABLE as multiline SQL")
+	// Admission guarantees a CREATE TABLE first. Separators between later
+	// statements must not stand in for line breaks inside the table itself.
+	if !strings.Contains(formatted[0], "\n") {
+		return "", fmt.Errorf("formatter produced a single-line CREATE TABLE")
 	}
+	result := strings.Join(formatted, "\n\n") + "\n"
 	after, err := schemaFileStatements(dialect, parser, result)
 	if err != nil {
 		return "", fmt.Errorf("validate formatted declarative schema file: %w", err)
@@ -150,6 +152,8 @@ func postgresSchemaFileStatements(content string) ([]string, error) {
 		return nil, err
 	}
 
+	// Both desired-schema parsers require a table and return it first, even
+	// when an index precedes the table in the source file.
 	var statements []pgstatement.Statement
 	if hasRowSecurity {
 		desired, err := pgstatement.ParseDesiredWithRowSecurity(content)

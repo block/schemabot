@@ -253,6 +253,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	// because the entries it preserves name tables the pull just returned.
 	ignored := engine.NewIgnoredTables(exclusions.Tables)
 	var withheldGroups []*apitypes.ExemptTablesResponse
+	var formatErrors []error
 
 	for _, namespace := range namespaces {
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
@@ -306,13 +307,23 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			}
 			content, err := ddl.FormatSchemaFileForDialect(schema.DialectForDatabaseType(resp.Type), pulled.Tables[tableName])
 			if err != nil {
-				return nil, fmt.Errorf("format pulled schema for namespace %s table %s: %w", namespace, tableName, err)
+				formatErrors = append(formatErrors, fmt.Errorf("format pulled schema for namespace %s table %s: %w", namespace, tableName, err))
+			} else {
+				files[filepath.Join(namespace, tableName+".sql")] = content
 			}
-			files[filepath.Join(namespace, tableName+".sql")] = content
 		}
 		if vschema := pulled.Artifacts["vschema.json"]; vschema != "" {
 			files[filepath.Join(namespace, "vschema.json")] = vschema
 		}
+	}
+
+	if len(formatErrors) > 0 {
+		return nil, fmt.Errorf("onboarding refused; no files were written:\n%w\n\n"+
+			"To recover, use pull with -o json and the same database, environment, connection, and namespace flags to retrieve the original SQL. "+
+			"Create the schema root manually, preserving every managed table, schema option, comment, and namespace artifact; format the SQL across multiple lines. "+
+			"Then run plan against the source environment and require no schema changes. "+
+			"See docs/cli.md#recovering-from-onboarding-formatting-errors. "+
+			"Editing local files and rerunning onboard will not help: onboard pulls the source again", errors.Join(formatErrors...))
 	}
 
 	return &onboardWritePlan{

@@ -127,6 +127,43 @@ func TestBuildOnboardWritePlanRefusesLossyFormatting(t *testing.T) {
 	}
 }
 
+// All table-formatting failures are reported in namespace/table order, while
+// both existing files and successfully formatted tables remain unwritten.
+func TestBuildOnboardWritePlanReportsAllFormattingFailures(t *testing.T) {
+	root := t.TempDir()
+	existing := filepath.Join(root, "schemabot.yaml")
+	require.NoError(t, os.WriteFile(existing, []byte("database: existing\n"), 0o644))
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "mysql", Environment: "staging", TableCount: 4,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"z": {Tables: map[string]string{"c": "CREATE TABLE c (id int) PACK_KEYS=1"}},
+			"a": {Tables: map[string]string{
+				"good": "CREATE TABLE good (id int)",
+				"b":    "CREATE TABLE b (id int) STATS_PERSISTENT=0",
+				"a":    "CREATE TABLE a (id int) /* keep me */",
+			}},
+		},
+	}, client.PlanExclusions{})
+	require.Error(t, err)
+	assert.Nil(t, plan)
+	lines := strings.Split(err.Error(), "\n")
+	require.GreaterOrEqual(t, len(lines), 6)
+	assert.Equal(t, "onboarding refused; no files were written:", lines[0])
+	assert.Contains(t, lines[1], "namespace a table a: cannot preserve MySQL comments")
+	assert.Contains(t, lines[2], "namespace a table b: cannot prove statement 1 preserved its SQL")
+	assert.Contains(t, lines[3], "namespace z table c: cannot prove statement 1 preserved its SQL")
+	assert.Contains(t, err.Error(), "pull with -o json")
+	assert.Contains(t, err.Error(), "plan against the source environment and require no schema changes")
+	assert.Contains(t, err.Error(), "onboard pulls the source again")
+	content, err := os.ReadFile(existing)
+	require.NoError(t, err)
+	assert.Equal(t, "database: existing\n", string(content))
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "schemabot.yaml", entries[0].Name())
+}
+
 func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 	root := t.TempDir()
 	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{

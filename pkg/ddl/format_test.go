@@ -79,6 +79,48 @@ func TestFormatSchemaFileForDialectRejectsNonTableContent(t *testing.T) {
 	require.ErrorContains(t, err, "parse declarative schema file")
 }
 
+func TestFormatSchemaFileForDialectRequiresMultilineTable(t *testing.T) {
+	// UNLOGGED tables pass desired-schema admission but have no multiline
+	// layout. An index separator cannot satisfy the table's layout contract.
+	for _, suffix := range []string{"", "; CREATE INDEX t_id ON t (id)"} {
+		t.Run(suffix, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectPostgres, "CREATE UNLOGGED TABLE t (id bigint)"+suffix)
+			require.EqualError(t, err, "formatter produced a single-line CREATE TABLE")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPostgresRequiresTable(t *testing.T) {
+	for _, input := range []string{
+		"CREATE INDEX t_id ON t (id)",
+		"ALTER TABLE t ENABLE ROW LEVEL SECURITY; CREATE POLICY readers ON t USING (true)",
+	} {
+		t.Run(input, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+			require.ErrorContains(t, err, "parse declarative schema file")
+			require.ErrorContains(t, err, "CREATE TABLE")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPostgresOrdersTableFirst(t *testing.T) {
+	for _, suffix := range []string{"", "; ALTER TABLE t ENABLE ROW LEVEL SECURITY; CREATE POLICY readers ON t USING (true)"} {
+		t.Run(suffix, func(t *testing.T) {
+			input := "CREATE INDEX t_id ON t (id); CREATE TABLE t (id bigint)" + suffix
+			got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+			require.NoError(t, err)
+			assert.True(t, strings.HasPrefix(got, "CREATE TABLE t (\n    id bigint\n);\n\nCREATE INDEX t_id ON t USING btree (id);\n"), got)
+			before, err := postgresSchemaFileStatements(input)
+			require.NoError(t, err)
+			after, err := postgresSchemaFileStatements(got)
+			require.NoError(t, err)
+			assert.Equal(t, before, after)
+		})
+	}
+}
+
 func TestFormatSchemaFileForDialectRefusesCommentLoss(t *testing.T) {
 	for _, input := range []string{
 		"CREATE TABLE t (id int /* keep me */)",
