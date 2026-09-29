@@ -591,39 +591,66 @@ func TestDirectExecutionPolicyEngineMetadata(t *testing.T) {
 		engine.MetadataDirectExecutionMaxTableRows:  "10000",
 		engine.MetadataDirectExecutionMaxTableBytes: "104857600",
 	}, (&DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, MaxTableBytes: 100 << 20}).EngineMetadata())
+	assert.Equal(t, map[string]string{
+		engine.MetadataDirectExecution:              "true",
+		engine.MetadataDirectExecutionMaxTableBytes: "104857600",
+	}, (&DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20}).EngineMetadata(),
+		"a byte bound alone is a complete policy, and an unset row bound states none")
+	assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "true"},
+		(&DirectExecutionPolicy{Enabled: true}).EngineMetadata(),
+		"an enabled policy with no bound renders no bound, which the engine refuses")
 }
 
-// A stored byte bound that cannot be read back never disappears from the
-// policy: the byte bound is optional, so reading a garbled one as zero would
-// silently widen the apply's policy to the row bound alone. It reads as -1
-// instead, which renders back onto the engine metadata for the engine to
-// refuse, so the apply blocks rather than running under a wider grant than it
-// was admitted with.
-func TestApplyOptionsFromMapKeepsAnUnreadableByteBound(t *testing.T) {
-	for name, raw := range map[string]string{
-		"not a number": "100MiB",
-		"zero":         "0",
-		"negative":     "-5",
-		"empty":        "",
-	} {
-		t.Run(name, func(t *testing.T) {
+// A stored size bound that cannot be read back never disappears from the
+// policy. Both bounds are optional, so reading a garbled one as zero would
+// silently run the apply under a different policy from the one it was
+// admitted with. It reads as -1 instead, which renders back onto the engine
+// metadata for the engine to refuse, so the apply blocks.
+func TestApplyOptionsFromMapKeepsAnUnreadableSizeBound(t *testing.T) {
+	bounds := map[string]struct {
+		key   string
+		other string
+		read  func(*DirectExecutionPolicy) int64
+	}{
+		"row bound": {
+			key:   engine.MetadataDirectExecutionMaxTableRows,
+			other: engine.MetadataDirectExecutionMaxTableBytes,
+			read:  func(p *DirectExecutionPolicy) int64 { return p.MaxTableRows },
+		},
+		"byte bound": {
+			key:   engine.MetadataDirectExecutionMaxTableBytes,
+			other: engine.MetadataDirectExecutionMaxTableRows,
+			read:  func(p *DirectExecutionPolicy) int64 { return p.MaxTableBytes },
+		},
+	}
+	for boundName, bound := range bounds {
+		for name, raw := range map[string]string{
+			"not a number": "100MiB",
+			"zero":         "0",
+			"negative":     "-5",
+			"empty":        "",
+		} {
+			t.Run(boundName+"/"+name, func(t *testing.T) {
+				policy := ApplyOptionsFromMap(map[string]string{
+					engine.MetadataDirectExecution: "true",
+					bound.other:                    "10000",
+					bound.key:                      raw,
+				}).DirectExecution
+				require.NotNil(t, policy)
+				assert.Equal(t, int64(-1), bound.read(policy))
+				assert.Equal(t, "-1", policy.EngineMetadata()[bound.key])
+			})
+		}
+		t.Run(boundName+"/absent", func(t *testing.T) {
 			policy := ApplyOptionsFromMap(map[string]string{
-				engine.MetadataDirectExecution:              "true",
-				engine.MetadataDirectExecutionMaxTableRows:  "10000",
-				engine.MetadataDirectExecutionMaxTableBytes: raw,
+				engine.MetadataDirectExecution: "true",
+				bound.other:                    "10000",
 			}).DirectExecution
 			require.NotNil(t, policy)
-			assert.Equal(t, int64(-1), policy.MaxTableBytes)
-			assert.Equal(t, "-1", policy.EngineMetadata()[engine.MetadataDirectExecutionMaxTableBytes])
+			assert.Zero(t, bound.read(policy), "an apply admitted without this bound reads back without one")
+			assert.NotContains(t, policy.EngineMetadata(), bound.key)
 		})
 	}
-
-	policy := ApplyOptionsFromMap(map[string]string{
-		engine.MetadataDirectExecution:             "true",
-		engine.MetadataDirectExecutionMaxTableRows: "10000",
-	}).DirectExecution
-	require.NotNil(t, policy)
-	assert.Zero(t, policy.MaxTableBytes, "an apply admitted without a byte bound reads back without one")
 }
 
 // Component state is recognised by its key namespace alone, so a repository

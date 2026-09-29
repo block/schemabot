@@ -3,7 +3,7 @@
 // permits it. The policy arrives as engine metadata, the plan-time verdict
 // and the apply-time routing evaluate the same predicate, and everything
 // fails closed — a refused statement never runs directly unless the policy
-// is enabled and the table's measured size is within every configured bound.
+// is enabled and the table's measured size is within a configured bound.
 package spirit
 
 import (
@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/mysql"
@@ -32,10 +33,13 @@ import (
 // directPolicy is the resolved direct execution policy for a target database.
 // The zero value is the fail-closed default: refused statements are blocked.
 type directPolicy struct {
-	Enabled      bool
+	Enabled bool
+	// MaxTableRows is the optional bound on the table's row count. Zero means
+	// the policy sets no row bound.
 	MaxTableRows int64
 	// MaxTableBytes is the optional bound on the table's data plus index
-	// footprint. Zero means the policy sets no byte bound.
+	// footprint. Zero means the policy sets no byte bound. An enabled policy
+	// sets at least one of the two.
 	MaxTableBytes int64
 	// LockAcquisitionTimeoutSeconds bounds each direct statement's lock acquisition.
 	// Zero means the policy did not set one; read the effective value through
@@ -69,31 +73,18 @@ func directPolicyFromMetadata(md map[string]string) (directPolicy, error) {
 	if !enabled {
 		return directPolicy{}, nil
 	}
-	raw := md[engine.MetadataDirectExecutionMaxTableRows]
-	if raw == "" {
-		return directPolicy{}, fmt.Errorf("%s is enabled but %s is not set: the row bound is required so direct execution fails closed on large tables", engine.MetadataDirectExecution, engine.MetadataDirectExecutionMaxTableRows)
-	}
-	maxRows, err := strconv.ParseInt(raw, 10, 64)
+	maxRows, err := sizeBoundFromMetadata(md, engine.MetadataDirectExecutionMaxTableRows)
 	if err != nil {
-		return directPolicy{}, fmt.Errorf("parse %s metadata value %q: %w", engine.MetadataDirectExecutionMaxTableRows, raw, err)
+		return directPolicy{}, err
 	}
-	if maxRows <= 0 {
-		return directPolicy{}, fmt.Errorf("%s must be positive, got %d", engine.MetadataDirectExecutionMaxTableRows, maxRows)
+	maxBytes, err := sizeBoundFromMetadata(md, engine.MetadataDirectExecutionMaxTableBytes)
+	if err != nil {
+		return directPolicy{}, err
 	}
-	policy := directPolicy{Enabled: true, MaxTableRows: maxRows}
-	// Presence, not a non-empty value, states a byte bound: a key present with
-	// an empty value is a malformed bound, and reading it as absent would widen
-	// the grant to the row bound alone.
-	if raw, ok := md[engine.MetadataDirectExecutionMaxTableBytes]; ok {
-		maxBytes, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return directPolicy{}, fmt.Errorf("parse %s metadata value %q: %w", engine.MetadataDirectExecutionMaxTableBytes, raw, err)
-		}
-		if maxBytes <= 0 {
-			return directPolicy{}, fmt.Errorf("%s must be positive, got %d", engine.MetadataDirectExecutionMaxTableBytes, maxBytes)
-		}
-		policy.MaxTableBytes = maxBytes
+	if maxRows == 0 && maxBytes == 0 {
+		return directPolicy{}, fmt.Errorf("%s is enabled but neither %s nor %s is set: a size bound is required so direct execution fails closed on large tables", engine.MetadataDirectExecution, engine.MetadataDirectExecutionMaxTableRows, engine.MetadataDirectExecutionMaxTableBytes)
 	}
+	policy := directPolicy{Enabled: true, MaxTableRows: maxRows, MaxTableBytes: maxBytes}
 	if raw := md[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds]; raw != "" {
 		lockWait, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
@@ -107,11 +98,31 @@ func directPolicyFromMetadata(md map[string]string) (directPolicy, error) {
 	return policy, nil
 }
 
+// sizeBoundFromMetadata parses one optional size bound: zero when the key is
+// absent, an error when it is present but not a positive integer. Presence,
+// not a non-empty value, states a bound: a key present with an empty value is
+// a malformed bound, and reading it as absent would silently change the grant.
+func sizeBoundFromMetadata(md map[string]string, key string) (int64, error) {
+	raw, ok := md[key]
+	if !ok {
+		return 0, nil
+	}
+	bound, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s metadata value %q: %w", key, raw, err)
+	}
+	if bound <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %d", key, bound)
+	}
+	return bound, nil
+}
+
 // measuredTableSize is the size gate's reading of a table's statistics. Both
 // figures are InnoDB statistics estimates, which is why the gate trusts them
 // only to block.
 type measuredTableSize struct {
-	// estimatedRows is TABLE_ROWS.
+	// estimatedRows is TABLE_ROWS, read only when the policy sets a row
+	// bound; zero otherwise.
 	estimatedRows int64
 	// bytes is DATA_LENGTH + INDEX_LENGTH, read only when the policy sets a
 	// byte bound; zero otherwise.
@@ -120,11 +131,11 @@ type measuredTableSize struct {
 
 // measureTableSize reads the table's statistics for the size gate in one
 // query (see readTableStatistics for why it runs uncached on a dedicated
-// connection). The row estimate is always required. The byte figure is
-// required only when the policy sets a byte bound, so a policy without one
-// judges a table exactly as it would without the byte bound existing. A
-// figure the gate needs that is missing, NULL, or negative is an error, and
-// the caller blocks on it: unknown size is never assumed small.
+// connection). Each figure is read only when the policy sets the bound it is
+// compared against, so a policy judges a table exactly as it would without
+// the other bound existing. A figure the gate needs that is missing, NULL, or
+// negative is an error, and the caller blocks on it: unknown size is never
+// assumed small.
 func measureTableSize(ctx context.Context, db *sql.DB, schema, tableName string, policy directPolicy) (measuredTableSize, error) {
 	all, err := readTableStatistics(ctx, db, schema, []string{tableName})
 	if err != nil {
@@ -134,11 +145,14 @@ func measureTableSize(ctx context.Context, db *sql.DB, schema, tableName string,
 	if !ok {
 		return measuredTableSize{}, fmt.Errorf("table `%s`.`%s` not found in information_schema", schema, tableName)
 	}
-	rows, err := usableStatistic(stats.rows, "TABLE_ROWS", schema, tableName)
-	if err != nil {
-		return measuredTableSize{}, err
+	var size measuredTableSize
+	if policy.MaxTableRows > 0 {
+		rows, err := usableStatistic(stats.rows, "TABLE_ROWS", schema, tableName)
+		if err != nil {
+			return measuredTableSize{}, err
+		}
+		size.estimatedRows = rows
 	}
-	size := measuredTableSize{estimatedRows: rows}
 	if policy.MaxTableBytes > 0 {
 		dataBytes, err := usableStatistic(stats.dataBytes, "DATA_LENGTH", schema, tableName)
 		if err != nil {
@@ -189,7 +203,7 @@ type refusedModeDecision struct {
 	mode       string // engine.ExecutionModeDirect or engine.ExecutionModeBlocked
 	modeReason string // operator-facing reason, including table-size context
 	outcome    string // metric outcome label when the decision blocks
-	rows       int64  // measured rows when the size gate ran: exact for a direct verdict, the estimate when the estimate alone blocked
+	rows       int64  // measured rows when the policy sets a row bound: exact when the row bound approved, the estimate otherwise
 	bytes      int64  // estimated data plus index bytes when the policy sets a byte bound
 }
 
@@ -200,21 +214,27 @@ type refusedModeDecision struct {
 const blockedSizeUnknownReason = "; direct execution is enabled but the table's size is unavailable"
 
 // resolveRefusedMode decides whether the policy routes a refused statement to
-// direct execution. Every uncertainty blocks: policy disabled, a size gate
-// that cannot be evaluated, or a table above any configured bound. The size
-// gate runs in two steps — the statistics estimates first, then an exact
-// bounded row count — because the estimates can lag reality in both
-// directions, so they are trusted to block but never to approve on their own.
+// direct execution. The table runs directly when it is within any size bound
+// the policy sets; with both bounds set, either one approves it. Everything
+// else blocks: policy disabled, a size gate that cannot be evaluated, or a
+// table above every configured bound.
 //
-// When the policy sets a byte bound, the table must be within both bounds.
-// The byte figure, DATA_LENGTH + INDEX_LENGTH, counts the pages InnoDB's
-// persistent statistics last saw allocated, so like the row estimate it can
-// undercount a table that just grew. Nothing cheap measures it exactly, so it
-// only ever blocks: approval still rests on the exact bounded row count, which
-// is why the row bound stays required alongside it. A byte bound therefore
-// narrows the policy a row bound alone would grant and never widens it.
+// The two bounds are not equally strong. The row bound runs in two steps,
+// the TABLE_ROWS estimate first and then an exact bounded row count, because
+// the estimate can lag reality in both directions: it is trusted to block,
+// and approval rests on the exact count. The byte figure, DATA_LENGTH +
+// INDEX_LENGTH, counts the pages InnoDB's persistent statistics last saw
+// allocated, and nothing cheap measures it exactly, so the byte bound approves
+// on that estimate alone. A table that grew since its statistics were last
+// sampled can therefore pass the byte bound while above it; an operator who
+// wants only the corroborated gate sets the row bound alone.
 //
-// An above-bound reason names only the configured limit, not the measured
+// Every figure a configured bound needs is read, and every configured bound
+// is evaluated, before the verdict: a figure that cannot be read blocks even
+// when the other bound would have approved, so an uncertain measurement is
+// never outvoted.
+//
+// An above-bound reason names only the configured limits, not the measured
 // size, so identical verdicts on different shards collapse into one row in
 // PR-facing summaries.
 //
@@ -230,17 +250,18 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 			outcome:    "blocked_policy_disabled",
 		}
 	}
+	blockedSizeUnknown := refusedModeDecision{
+		mode:       engine.ExecutionModeBlocked,
+		modeReason: refusalReason + blockedSizeUnknownReason,
+		outcome:    "blocked_size_unknown",
+	}
 	db, err := target.get(ctx)
 	if err != nil {
 		// Fail closed: without a connection there is no size gate, and an
 		// unmeasured table must never rebuild natively.
 		e.logger.Warn("direct execution blocked: cannot connect to target for the size gate",
 			"database", database, "table", tableName, "error", err)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + blockedSizeUnknownReason,
-			outcome:    "blocked_size_unknown",
-		}
+		return blockedSizeUnknown
 	}
 	size, err := measureTableSize(ctx, db, database, tableName, policy)
 	if err != nil {
@@ -248,66 +269,101 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 		// rebuild natively — block it and surface why in the mode reason.
 		e.logger.Warn("direct execution blocked: table size statistics unavailable",
 			"database", database, "table", tableName, "error", err)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + blockedSizeUnknownReason,
-			outcome:    "blocked_size_unknown",
+		return blockedSizeUnknown
+	}
+	verdict := sizeVerdict{rows: size.estimatedRows, bytes: size.bytes}
+	if policy.MaxTableRows > 0 {
+		if size.estimatedRows > policy.MaxTableRows {
+			e.logger.Info("direct execution row bound not met: estimated row count above the policy bound",
+				"database", database, "table", tableName, "estimated_rows", size.estimatedRows, "max_table_rows", policy.MaxTableRows)
+		} else {
+			count, err := exactRowCountWithin(ctx, db, database, tableName, policy.MaxTableRows)
+			if err != nil {
+				e.logger.Warn("direct execution blocked: exact row count unavailable",
+					"database", database, "table", tableName, "error", err)
+				return blockedSizeUnknown
+			}
+			if count > policy.MaxTableRows {
+				e.logger.Info("direct execution row bound not met: exact row count above the policy bound despite a smaller estimate",
+					"database", database, "table", tableName, "estimated_rows", size.estimatedRows, "max_table_rows", policy.MaxTableRows)
+			} else {
+				verdict.rowsWithin = true
+				verdict.rows = count
+			}
 		}
 	}
-	aboveRowBoundReason := fmt.Sprintf("%s; direct execution is enabled but the table is above the configured limit of %s rows",
-		refusalReason, ui.FormatNumber(policy.MaxTableRows))
-	if size.estimatedRows > policy.MaxTableRows {
-		e.logger.Info("direct execution blocked: estimated row count above the policy bound",
-			"database", database, "table", tableName, "estimated_rows", size.estimatedRows, "max_table_rows", policy.MaxTableRows)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: aboveRowBoundReason,
-			outcome:    "blocked_size_limit",
-			rows:       size.estimatedRows,
-		}
-	}
-	if policy.MaxTableBytes > 0 && size.bytes > policy.MaxTableBytes {
-		e.logger.Info("direct execution blocked: estimated data and index size above the policy bound",
-			"database", database, "table", tableName, "estimated_bytes", size.bytes, "max_table_bytes", policy.MaxTableBytes,
-			"estimated_rows", size.estimatedRows)
-		return refusedModeDecision{
-			mode: engine.ExecutionModeBlocked,
-			modeReason: fmt.Sprintf("%s; direct execution is enabled but the table is above the configured limit of %s of data and indexes",
-				refusalReason, ui.FormatBytesBinary(policy.MaxTableBytes)),
-			outcome: "blocked_size_limit",
-			rows:    size.estimatedRows,
-			bytes:   size.bytes,
-		}
-	}
-	count, err := exactRowCountWithin(ctx, db, database, tableName, policy.MaxTableRows)
-	if err != nil {
-		e.logger.Warn("direct execution blocked: exact row count unavailable",
-			"database", database, "table", tableName, "error", err)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: refusalReason + blockedSizeUnknownReason,
-			outcome:    "blocked_size_unknown",
-		}
-	}
-	if count > policy.MaxTableRows {
-		e.logger.Info("direct execution blocked: exact row count above the policy bound despite a smaller estimate",
-			"database", database, "table", tableName, "estimated_rows", size.estimatedRows, "max_table_rows", policy.MaxTableRows)
-		return refusedModeDecision{
-			mode:       engine.ExecutionModeBlocked,
-			modeReason: aboveRowBoundReason,
-			outcome:    "blocked_size_limit",
-		}
-	}
-	directReason := fmt.Sprintf("%s; runs as native MySQL DDL on a table with ~%s rows", refusalReason, ui.FormatNumber(count))
 	if policy.MaxTableBytes > 0 {
-		directReason += fmt.Sprintf(" and %s of data and indexes", ui.FormatApproxBytes(size.bytes))
+		if size.bytes > policy.MaxTableBytes {
+			e.logger.Info("direct execution byte bound not met: estimated data and index size above the policy bound",
+				"database", database, "table", tableName, "estimated_bytes", size.bytes, "max_table_bytes", policy.MaxTableBytes)
+		} else {
+			verdict.bytesWithin = true
+		}
+	}
+	if !verdict.rowsWithin && !verdict.bytesWithin {
+		return refusedModeDecision{
+			mode:       engine.ExecutionModeBlocked,
+			modeReason: refusalReason + "; direct execution is enabled but the table is above " + configuredLimits(policy),
+			outcome:    "blocked_size_limit",
+			rows:       verdict.rows,
+			bytes:      verdict.bytes,
+		}
 	}
 	return refusedModeDecision{
 		mode:       engine.ExecutionModeDirect,
-		modeReason: directReason,
-		rows:       count,
-		bytes:      size.bytes,
+		modeReason: refusalReason + directSizeReason(policy, verdict),
+		rows:       verdict.rows,
+		bytes:      verdict.bytes,
 	}
+}
+
+// sizeVerdict is the size gate's result for each bound the policy sets.
+type sizeVerdict struct {
+	rowsWithin  bool
+	bytesWithin bool
+	rows        int64 // exact count when rowsWithin, the estimate otherwise
+	bytes       int64 // the data plus index estimate
+}
+
+// rowLimit and byteLimit render a configured bound as a mode reason names it.
+func rowLimit(maxRows int64) string   { return ui.FormatNumber(maxRows) + " rows" }
+func byteLimit(maxBytes int64) string { return ui.FormatBytesBinary(maxBytes) + " of data and indexes" }
+
+// configuredLimits names every bound the policy sets, for the reason a table
+// above all of them is blocked.
+func configuredLimits(policy directPolicy) string {
+	switch {
+	case policy.MaxTableRows > 0 && policy.MaxTableBytes > 0:
+		return "the configured limits of " + rowLimit(policy.MaxTableRows) + " and " + byteLimit(policy.MaxTableBytes)
+	case policy.MaxTableBytes > 0:
+		return "the configured limit of " + byteLimit(policy.MaxTableBytes)
+	default:
+		return "the configured limit of " + rowLimit(policy.MaxTableRows)
+	}
+}
+
+// directSizeReason is the mode-reason suffix for a direct verdict. It states
+// the measured size for each bound that approved the table. When the policy
+// sets both bounds and only one approved, it also names that limit, so the
+// operator reading the plan sees which bound let a table through that the
+// other would have blocked.
+func directSizeReason(policy directPolicy, v sizeVerdict) string {
+	var measured []string
+	if v.rowsWithin {
+		measured = append(measured, "~"+ui.FormatNumber(v.rows)+" rows")
+	}
+	if v.bytesWithin {
+		measured = append(measured, ui.FormatApproxBytes(v.bytes)+" of data and indexes")
+	}
+	reason := "; runs as native MySQL DDL on a table with " + strings.Join(measured, " and ")
+	bothConfigured := policy.MaxTableRows > 0 && policy.MaxTableBytes > 0
+	switch {
+	case bothConfigured && v.rowsWithin && !v.bytesWithin:
+		reason += ", within the configured limit of " + rowLimit(policy.MaxTableRows)
+	case bothConfigured && v.bytesWithin && !v.rowsWithin:
+		reason += ", within the configured limit of " + byteLimit(policy.MaxTableBytes)
+	}
+	return reason
 }
 
 // Lifecycle states for a direct-routed statement's TableProgress entries.

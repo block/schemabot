@@ -1206,7 +1206,7 @@ type EnvironmentConfig struct {
 	// DirectExecution configures direct execution of ALTER statements that the
 	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
 	// When enabled, a refused statement whose table is within max_table_rows
-	// (and max_table_bytes, when set) runs verbatim as native MySQL DDL: synchronous,
+	// or max_table_bytes runs verbatim as native MySQL DDL: synchronous,
 	// blocking writes to the table while it runs, and not revertible. Only
 	// valid for MySQL databases: setting this block on any other database
 	// type fails config validation, even when disabled, so a policy that can
@@ -1245,21 +1245,21 @@ type DirectExecutionConfig struct {
 	// Enabled turns on direct execution for this environment.
 	Enabled bool `yaml:"enabled"`
 
-	// MaxTableRows is the fail-closed size bound: a refused statement runs
-	// directly only when the target table's estimated row count is at or
-	// below this bound. Statements on larger tables — or tables whose size
-	// cannot be determined — are blocked. Required (positive) when Enabled
-	// is true.
+	// MaxTableRows bounds direct execution by the target table's row count:
+	// a table whose estimated row count, confirmed by an exact bounded count,
+	// is at or below this bound qualifies. Zero sets no row bound.
 	MaxTableRows int64 `yaml:"max_table_rows,omitempty"`
 
-	// MaxTableBytes is an optional second size bound, on the target table's
-	// data plus index footprint as information_schema reports it: a whole
-	// number followed by a binary unit (e.g. "100MiB"). When set, a refused
-	// statement runs directly only when the table is within both bounds. It
-	// narrows max_table_rows rather than replacing it: the byte figure is a
-	// statistics estimate with no cheap exact corroboration, so it can block a
-	// statement but never approve one on its own, and the row bound stays
-	// required because its exact bounded count is what approves.
+	// MaxTableBytes bounds direct execution by the target table's data plus
+	// index footprint as information_schema reports it: a whole number
+	// followed by a binary unit (e.g. "100MiB"). A table whose estimated
+	// footprint is at or below this bound qualifies. The figure is a
+	// statistics estimate with no exact corroboration, so this bound can
+	// approve a table that grew since its statistics were last sampled.
+	//
+	// Enabled requires at least one of the two bounds. With both set, a
+	// refused statement runs directly when the table is within either one;
+	// a table whose size cannot be determined is blocked.
 	MaxTableBytes string `yaml:"max_table_bytes,omitempty"`
 
 	// LockAcquisitionTimeout bounds how long each direct statement waits to
@@ -1272,19 +1272,24 @@ type DirectExecutionConfig struct {
 }
 
 // Validate ensures a configured direct execution policy is well-formed.
-// Enabling direct execution requires a positive max_table_rows bound so the
-// size gate can never be accidentally unbounded. The byte bound and the lock
-// timeout are checked even while the policy is disabled, so a malformed value
-// fails at startup rather than the first time someone enables the policy.
+// Enabling direct execution requires max_table_rows, max_table_bytes, or both,
+// so the size gate can never be accidentally unbounded. Every bound and the
+// lock timeout are checked even while the policy is disabled, so a malformed
+// value fails at startup rather than the first time someone enables the
+// policy.
 func (c *DirectExecutionConfig) Validate(context string) error {
 	if c == nil {
 		return nil
 	}
-	if c.Enabled && c.MaxTableRows <= 0 {
-		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required; max_table_bytes narrows it but does not replace it)", context, c.MaxTableRows)
+	if c.MaxTableRows < 0 {
+		return fmt.Errorf("%s direct_execution: max_table_rows is %d (must be positive, or omitted to set no row bound)", context, c.MaxTableRows)
 	}
-	if _, err := c.maxTableBytes(); err != nil {
+	maxBytes, err := c.maxTableBytes()
+	if err != nil {
 		return fmt.Errorf("%s direct_execution: %w", context, err)
+	}
+	if c.Enabled && c.MaxTableRows == 0 && maxBytes == 0 {
+		return fmt.Errorf("%s enables direct_execution without a size bound (set max_table_rows, max_table_bytes, or both)", context)
 	}
 	if _, err := c.lockAcquisitionTimeoutSeconds(); err != nil {
 		return fmt.Errorf("%s direct_execution: %w", context, err)
@@ -3533,9 +3538,9 @@ func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
 }
 
 // validateDirectExecution ensures a configured direct execution policy is
-// well-formed. Enabling direct execution requires a positive max_table_rows
-// bound so the size gate can never be accidentally unbounded (an optional
-// max_table_bytes narrows it but cannot replace it), and the policy
+// well-formed. Enabling direct execution requires max_table_rows,
+// max_table_bytes, or both, so the size gate can never be accidentally
+// unbounded, and the policy
 // is rejected on non-MySQL databases where it has no effect — a config that
 // looks like it grants direct execution must never be silently ignored.
 func (c EnvironmentConfig) validateDirectExecution(context, databaseType string) error {

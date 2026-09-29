@@ -50,13 +50,13 @@ force, and the plan records a per-table execution-mode verdict:
 engine refuses statement (e.g. primary-key reshape)
         │ direct_execution policy in force for this database/environment?
         ├─ absent or disabled ───────────────────► blocked
-        ├─ table size unavailable ───────────────► blocked
-        ├─ estimated rows > max_table_rows ──────► blocked
-        ├─ estimated bytes > max_table_bytes ────► blocked
-        ├─ exact row count > max_table_rows ─────► blocked
-        └─ within every bound ───────────────────► direct: statement runs verbatim
-                                                   as native MySQL DDL, with its own
-                                                   progress entry and outcome metric
+        ├─ a size figure a set bound needs is
+        │  unavailable, or the exact count fails ► blocked
+        ├─ above every bound the policy sets ────► blocked
+        └─ within any bound the policy sets ─────► direct: statement runs verbatim
+             max_table_rows: estimate, then        as native MySQL DDL, with its own
+               exact bounded row count             progress entry and outcome metric
+             max_table_bytes: estimate
 ```
 
 The same predicate is re-evaluated at apply time before anything runs, so a
@@ -131,12 +131,12 @@ did.
 
 ## The size bound
 
-`max_table_rows` is the blast-radius cap, and `max_table_bytes` optionally
-tightens it. How long writes stay blocked during native DDL is roughly
-proportional to table size, so the bounds express "only run this on tables
-small enough that the write outage is acceptable" — and the operator enabling
-the policy decides what that means for the fleet, or for one environment that
-overrides it.
+`max_table_rows` and `max_table_bytes` are the blast-radius caps. A policy
+sets one or both, and a table within any bound it sets runs directly. How long
+writes stay blocked during native DDL is roughly proportional to table size,
+so the bounds express "only run this on tables small enough that the write
+outage is acceptable" — and the operator enabling the policy decides what that
+means for the fleet, or for one environment that overrides it.
 
 The bounds travel with the grant. An override states its own bounds rather
 than inheriting them, because a policy assembled from two sources can enable
@@ -144,7 +144,7 @@ direct execution in one place under a bound written in another — and the
 bounds are the only thing standing between a refused statement and an
 unbounded write outage.
 
-The gate runs in two steps. The first reads `information_schema` `TABLE_ROWS`,
+The row bound runs in two steps. The first reads `information_schema` `TABLE_ROWS`,
 the InnoDB optimizer's sampled estimate, with statistics caching disabled
 (`information_schema_stats_expiry = 0`) so it sees current statistics rather
 than a cached value up to a day old. That estimate is trusted only to
@@ -167,27 +167,41 @@ about 154,000 rows (`TABLE_ROWS` estimate about 164,000) held 20.6 MiB of data
 and 23.1 MiB of indexes, 43.7 MiB in all: within a `100MiB` bound, and within
 a row bound of 175,000.
 
-When the byte bound is set, a table must be within both bounds, so adding one
-can only narrow what the row bound alone would allow. The byte figure is not
-a measurement. InnoDB computes it from the page counts its persistent
-statistics last recorded, so it lags a table that just grew, like
-`TABLE_ROWS`. Unlike the row estimate, nothing cheap corroborates it: an
-exact byte count would mean reading the table. So the gate applies the rule
-it applies to the row estimate, trusting the byte figure only to **block**. A
-statement is approved only by the exact bounded row count, and that is why
-the byte bound narrows `max_table_rows` rather than replacing it, and why
-`max_table_rows` stays required. A NULL or negative `DATA_LENGTH` or
-`INDEX_LENGTH` blocks, the same as an unknown row estimate. A policy without a
-byte bound does not read or require those columns.
+The byte bound can be set alone or beside `max_table_rows`. With both set,
+either one approves: a table runs directly when it is within the row bound
+**or** within the byte bound. For example, with `max_table_rows: 175000` and
+`max_table_bytes: 100MiB`, a table of 150,000 wide rows holding 2.1 GiB runs
+directly because it is within the row bound, and a table of 400,000 narrow
+rows holding 60 MiB runs directly because it is within the byte bound. Only a
+table above both is blocked.
 
-The mode reasons follow the row bound's shape. A table above the byte bound
-is blocked with a reason naming only the configured limit ("above the
-configured limit of 100.0 MiB of data and indexes"), so the same verdict on
-tables or shards of different sizes renders as one entry. A direct verdict
-reports the measured size next to the row count ("on a table with ~154,331
-rows and ~45.8 MB of data and indexes"). The limit is shown in binary units,
-matching how it is configured, and the measurement is shown as an
-approximate decimal figure, matching how plan output shows table sizes.
+The two bounds are not equally strong. The byte figure is not a measurement.
+InnoDB computes it from the page counts its persistent statistics last
+recorded, so it lags a table that just grew, like `TABLE_ROWS`. Unlike the
+row estimate, nothing cheap corroborates it: an exact byte count would mean
+reading the table. So the byte bound approves on the estimate alone, and a
+table that grew since its statistics were last sampled can pass it while
+above it. An operator who wants only the corroborated gate sets
+`max_table_rows` alone.
+
+A NULL or negative `DATA_LENGTH` or `INDEX_LENGTH` blocks, the same as an
+unknown row estimate. Every figure a configured bound needs is read, and a
+figure that cannot be read, or an exact count that fails, blocks the
+statement even when the other bound would have approved it. A policy without
+a byte bound does not read or require those columns, and a policy without a
+row bound does not read `TABLE_ROWS` or run the count.
+
+The mode reasons follow the row bound's shape. A table above every bound is
+blocked with a reason naming only the configured limits ("above the
+configured limits of 175,000 rows and 100.0 MiB of data and indexes"), so the
+same verdict on tables or shards of different sizes renders as one entry. A
+direct verdict reports the measured size for each bound that approved it
+("on a table with ~154,331 rows and ~45.8 MB of data and indexes"). When both
+bounds are set and only one approved, the reason names that limit ("on a
+table with ~150,000 rows, within the configured limit of 175,000 rows"), so
+the reviewer sees which bound let the table through. The limit is shown in
+binary units, matching how it is configured, and the measurement is shown as
+an approximate decimal figure, matching how plan output shows table sizes.
 
 ## Engine compatibility
 
@@ -277,8 +291,9 @@ Every routing outcome increments
 `outcome` attribute: `completed`, `failed`, or `stopped` for executed
 statements; `blocked_policy_disabled`, `blocked_size_limit`, or
 `blocked_size_unknown` for statements the policy did not route.
-`blocked_size_limit` covers both bounds; the server log line for the verdict
-says which bound blocked and carries the measured estimate. Direct
+`blocked_size_limit` means the table is above every bound the policy sets;
+the server log lines for the verdict say which bounds were not met and carry
+the measured estimates. Direct
 executions are rare, operator-consented events — a spike in `failed` means
 native DDL is erroring on the target (check the apply logs for the statement
 and MySQL error), and a spike in `blocked_size_unknown` means table size

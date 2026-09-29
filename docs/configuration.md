@@ -668,8 +668,8 @@ MySQL database the server drives:
 ```yaml
 direct_execution:
   enabled: true           # default: false
-  max_table_rows: 100000  # required (positive) when enabled
-  max_table_bytes: 100MiB # optional; data + indexes; binary unit (B, KiB, MiB, GiB, TiB)
+  max_table_rows: 100000  # set this, max_table_bytes, or both when enabled
+  max_table_bytes: 100MiB # data + indexes; binary unit (B, KiB, MiB, GiB, TiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
 
@@ -720,37 +720,44 @@ rollback runs after the change it reverses, and withdrawing the grant in
 between would otherwise refuse the statement that undoes a change it allowed.
 
 A direct statement is synchronous, blocks writes to the table while it runs,
-and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
-bound. A refused statement runs directly only when the table's size is within
-the bound; larger tables, and tables whose size cannot be determined, stay
-blocked. The size gate trusts the InnoDB optimizer's estimate
-(`information_schema` `TABLE_ROWS`) only to block, and corroborates a verdict
-for direct execution with an exact row count whose scan is capped just past
-the bound — a stale estimate can never approve a large table. The bound is
-re-evaluated when the apply executes, so a table that grew past it after
-planning is blocked, not run.
+and cannot be reverted — the size bounds are the fail-closed blast-radius
+cap. An enabled policy sets `max_table_rows`, `max_table_bytes`, or both, and
+a refused statement runs directly when the table is within any bound the
+policy sets. A table above every bound, or whose size cannot be determined,
+stays blocked. The bounds are re-evaluated when the apply executes, so a table
+that grew past them after planning is blocked, not run.
 
-`max_table_bytes` adds a second bound on the table's footprint, data plus
-indexes (`information_schema` `DATA_LENGTH + INDEX_LENGTH`). How long a native
+`max_table_rows` bounds the row count. The size gate trusts the InnoDB
+optimizer's estimate (`information_schema` `TABLE_ROWS`) only to block, and
+corroborates a verdict for direct execution with an exact row count whose scan
+is capped just past the bound — a stale estimate can never approve a large
+table through the row bound.
+
+`max_table_bytes` bounds the table's footprint, data plus indexes
+(`information_schema` `DATA_LENGTH + INDEX_LENGTH`). How long a native
 rebuild blocks writes tracks how much it copies more closely than how many
 rows there are, so a table of a few wide rows and one of many narrow rows are
-judged by what the rebuild actually moves. When it is set, a table must be
-within both bounds to run directly. It narrows `max_table_rows` rather than
-replacing it: the byte figure is an InnoDB statistics estimate that, like
-`TABLE_ROWS`, can undercount a table that just grew, and there is no cheap
-exact measure to corroborate it, so it can block a statement but never
-approve one. Approval still rests on the exact bounded row count, which is
-why `max_table_rows` stays required. The value is a whole number followed by
-a binary unit, such as `100MiB` or `2GiB`. Decimal units such as `MB` are
+judged by what the rebuild actually moves. The byte figure is an InnoDB
+statistics estimate that, like `TABLE_ROWS`, can undercount a table that just
+grew, and there is no cheap exact measure to corroborate it, so the byte bound
+approves on the estimate alone. Set `max_table_rows` alone when only the
+corroborated gate is acceptable. The value is a whole number followed by a
+binary unit, such as `100MiB` or `2GiB`. Decimal units such as `MB` are
 rejected rather than interpreted, because readers disagree on whether they
 mean 1000² or 1024² bytes.
 
-A server running a build that predates `max_table_bytes` ignores the bound
-when it arrives on a request or an apply record, and judges the statement
-under `max_table_rows` alone: never more than it allowed before the byte
-bound existed, but not the narrower policy either. Set `max_table_bytes` once
-every server that executes statements for the database runs a build that
-reads it.
+With both bounds set, either one approves: with `max_table_rows: 175000` and
+`max_table_bytes: 100MiB`, a table of 150,000 rows holding 2.1 GiB runs
+directly through the row bound, and a table of 400,000 rows holding 60 MiB
+runs directly through the byte bound.
+
+A server running a build that predates `max_table_bytes` ignores the byte
+bound when it arrives on a request or an apply record. With both bounds set,
+it judges the statement under `max_table_rows` alone, which never runs a
+table the full policy would block. With only `max_table_bytes` set, it rejects
+the policy as missing its row bound, and its plans and applies for the
+database fail until it is upgraded. Set `max_table_bytes` once every server that executes statements for
+the database runs a build that reads it.
 
 `lock_acquisition_timeout` bounds how long each direct statement waits to
 acquire its locks. Each engine maps it to its native session lock timeout —
@@ -764,11 +771,11 @@ whole number of seconds (at least `1s`).
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
-enabled without a positive `max_table_rows` (a `max_table_bytes` does not
-stand in for it), when `max_table_bytes` is malformed (not a positive whole
-number with a binary unit), or when `lock_acquisition_timeout` is malformed
-(not a duration, under a second, or not whole seconds). `max_table_bytes` and
-`lock_acquisition_timeout` are checked even on a disabled policy. A per-database policy that can never take effect is never
+enabled with neither `max_table_rows` nor `max_table_bytes`, when
+`max_table_rows` is negative, when `max_table_bytes` is malformed (not a
+positive whole number with a binary unit), or when `lock_acquisition_timeout`
+is malformed (not a duration, under a second, or not whole seconds). The size
+bounds and `lock_acquisition_timeout` are checked even on a disabled policy. A per-database policy that can never take effect is never
 silently carried in config.
 
 The server-wide policy is held to the same shape rules but is not rejected

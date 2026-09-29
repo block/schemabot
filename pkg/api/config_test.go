@@ -1187,16 +1187,12 @@ func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.
 	}
 }
 
-// Enabling direct_execution without a positive max_table_rows bound is a
-// startup config error: the size gate must never be accidentally unbounded.
+// Enabling direct_execution without a size bound is a startup config error:
+// the size gate must never be accidentally unbounded.
 func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 	for name, direct := range map[string]*DirectExecutionConfig{
-		"missing bound":  {Enabled: true},
-		"zero bound":     {Enabled: true, MaxTableRows: 0},
-		"negative bound": {Enabled: true, MaxTableRows: -1},
-		// The byte bound only narrows the row bound's approval, so it cannot
-		// stand in for the row bound.
-		"byte bound alone": {Enabled: true, MaxTableBytes: "100MiB"},
+		"missing bound": {Enabled: true},
+		"zero bound":    {Enabled: true, MaxTableRows: 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := ServerConfig{
@@ -1212,8 +1208,34 @@ func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 
 			err := cfg.Validate()
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution`)
-			assert.Contains(t, err.Error(), "a positive bound is required")
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution without a size bound (set max_table_rows, max_table_bytes, or both)`)
+		})
+	}
+}
+
+// A negative row bound is malformed whether or not the policy is enabled,
+// and a byte bound beside it does not excuse it.
+func TestServerConfig_ValidateRejectsNegativeDirectExecutionRowBound(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled":                  {Enabled: true, MaxTableRows: -1},
+		"enabled with bytes":       {Enabled: true, MaxTableRows: -1, MaxTableBytes: "100MiB"},
+		"malformed while disabled": {MaxTableRows: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution: max_table_rows is -1 (must be positive, or omitted to set no row bound)`)
 		})
 	}
 }
@@ -1436,7 +1458,8 @@ func TestDirectExecutionConfig_PolicyResolvesMaxTableBytes(t *testing.T) {
 func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 	for name, direct := range map[string]*DirectExecutionConfig{
 		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
-		"enabled with byte bound":   {Enabled: true, MaxTableRows: 500000, MaxTableBytes: "100MiB"},
+		"enabled with both bounds":  {Enabled: true, MaxTableRows: 500000, MaxTableBytes: "100MiB"},
+		"enabled with byte bound":   {Enabled: true, MaxTableBytes: "100MiB"},
 		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
 		"disabled":                  {Enabled: false},
 	} {
@@ -1458,15 +1481,15 @@ func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 }
 
 // The server-wide policy is held to the same shape rules as a per-database
-// block: enabling it without a row bound, or with a lock timeout that cannot
+// block: enabling it without a size bound, or with a lock timeout that cannot
 // be applied with second granularity, fails startup.
 func TestServerConfig_ValidateRejectsMalformedServerDirectExecution(t *testing.T) {
 	for name, tc := range map[string]struct {
 		direct  *DirectExecutionConfig
 		wantErr string
 	}{
-		"enabled without bound":    {&DirectExecutionConfig{Enabled: true}, "a positive bound is required"},
-		"negative bound":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: -1}, "a positive bound is required"},
+		"enabled without bound":    {&DirectExecutionConfig{Enabled: true}, "enables direct_execution without a size bound"},
+		"negative bound":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: -1}, "max_table_rows is -1 (must be positive"},
 		"sub-second lock timeout":  {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
 		"malformed while disabled": {&DirectExecutionConfig{LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
 	} {

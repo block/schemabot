@@ -497,24 +497,25 @@ message PlanRequest {
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
-// to run verbatim as native DDL, bounded by the target table's size in rows
-// and, optionally, in bytes. Engines that do not implement direct execution
+// to run verbatim as native DDL, bounded by the target table's size in rows,
+// in bytes, or both. Engines that do not implement direct execution
 // ignore it.
 message DirectExecutionPolicy {
   // Whether refused statements may run directly at all.
   bool enabled = 1;
-  // The fail-closed size bound: a refused statement runs directly only when
-  // the target table is at or below this row count. Required (positive) when
-  // enabled — a grant carrying no bound is refused, never treated as
-  // unbounded — and a table whose size cannot be measured is blocked.
+  // A size bound on the target table's row count; zero states no row bound.
+  // An enabled policy carries this bound, max_table_bytes, or both — a grant
+  // carrying no bound is refused, never treated as unbounded — and a table
+  // whose size cannot be measured is blocked. A negative value is an unusable
+  // bound, which the engine refuses.
   int64 max_table_rows = 2;
   // How long each direct statement waits to acquire its locks before failing
   // with a retryable busy-table error. Zero leaves the engine's own default.
   int64 lock_acquisition_timeout_seconds = 3;
-  // An optional second size bound: the target table's data plus index
-  // footprint, in bytes. When non-zero a refused statement runs directly only
-  // when the table is within both bounds; zero states no byte bound. A
-  // negative value is an unusable bound, which the engine refuses.
+  // A size bound on the target table's data plus index footprint, in bytes;
+  // zero states no byte bound. A refused statement runs directly when the
+  // table is within any bound the policy sets. A negative value is an
+  // unusable bound, which the engine refuses.
   int64 max_table_bytes = 4;
 }
 

@@ -687,17 +687,17 @@ const (
 	MetadataDirectExecution = "direct_execution"
 
 	// MetadataDirectExecutionMaxTableRows bounds direct execution by the
-	// target table's row count. Required (a positive integer) when direct
-	// execution is enabled, so a native table rebuild can never run
-	// unbounded: above the bound — or when the size cannot be determined —
-	// the statement stays blocked.
+	// target table's row count. Optional, but an enabled policy must carry
+	// this bound, the byte bound, or both, so a native table rebuild can
+	// never run unbounded. When present it must be a positive integer.
 	MetadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
 
-	// MetadataDirectExecutionMaxTableBytes further bounds direct execution by
-	// the target table's on-disk footprint, data plus indexes, in bytes.
-	// Optional; when present it must be a positive integer, and a statement
-	// runs directly only when the table is within both this bound and the row
-	// bound. Absent leaves the row bound as the only size gate.
+	// MetadataDirectExecutionMaxTableBytes bounds direct execution by the
+	// target table's on-disk footprint, data plus indexes, in bytes. Optional;
+	// when present it must be a positive integer. A statement runs directly
+	// when the table is within any bound the policy sets: with both bounds
+	// set, either one approves it. A table whose size cannot be determined
+	// stays blocked.
 	MetadataDirectExecutionMaxTableBytes = "direct_execution_max_table_bytes"
 
 	// MetadataDirectExecutionLockAcquisitionTimeoutSeconds bounds, in whole
@@ -731,19 +731,18 @@ type DirectExecutionSettings struct {
 // overlays its own grant onto the opt-out. A lock timeout of zero renders
 // nothing, leaving the engine's own default in effect.
 //
-// The row bound always renders on an enabled policy, so an engine reading it
-// refuses a non-positive one instead of never seeing it. The byte bound is
-// optional and renders whenever it is non-zero, negative included: a surface
-// that could not read a stored byte bound records it as negative, and the
-// engine must see that value to refuse it, where omitting it would quietly
-// drop a bound the policy was admitted under.
+// Both size bounds are optional, and each renders whenever it is non-zero,
+// negative included: a surface that could not read a stored bound records it
+// as negative, and the engine must see that value to refuse it, where omitting
+// it would quietly change the policy the apply was admitted under. An enabled
+// policy with neither bound renders neither key, and the engine refuses it.
 func DirectExecutionMetadata(s DirectExecutionSettings) map[string]string {
 	if !s.Enabled {
 		return map[string]string{MetadataDirectExecution: "false"}
 	}
-	md := map[string]string{
-		MetadataDirectExecution:             "true",
-		MetadataDirectExecutionMaxTableRows: strconv.FormatInt(s.MaxTableRows, 10),
+	md := map[string]string{MetadataDirectExecution: "true"}
+	if s.MaxTableRows != 0 {
+		md[MetadataDirectExecutionMaxTableRows] = strconv.FormatInt(s.MaxTableRows, 10)
 	}
 	if s.MaxTableBytes != 0 {
 		md[MetadataDirectExecutionMaxTableBytes] = strconv.FormatInt(s.MaxTableBytes, 10)

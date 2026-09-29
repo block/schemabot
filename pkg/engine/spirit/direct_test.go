@@ -90,6 +90,16 @@ func TestDirectPolicyFromMetadata_ByteBound(t *testing.T) {
 	assert.Equal(t, int64(104857600), policy.MaxTableBytes)
 }
 
+// Either size bound is a complete policy on its own.
+func TestDirectPolicyFromMetadata_ByteBoundAlone(t *testing.T) {
+	policy, err := directPolicyFromMetadata(map[string]string{
+		"direct_execution":                 "true",
+		"direct_execution_max_table_bytes": "104857600",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, directPolicy{Enabled: true, MaxTableBytes: 104857600}, policy)
+}
+
 // A malformed policy is a hard error, never a silent fallback to disabled:
 // enabling without a bound, a non-numeric or non-positive bound, and an
 // unrecognized enable value are all rejected with the offending key named.
@@ -100,7 +110,7 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 	}{
 		"enabled without bound": {
 			md:      map[string]string{"direct_execution": "true"},
-			wantErr: "direct_execution_max_table_rows is not set",
+			wantErr: "neither direct_execution_max_table_rows nor direct_execution_max_table_bytes is set",
 		},
 		"non-numeric bound": {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "lots"},
@@ -114,9 +124,13 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "-5"},
 			wantErr: "must be positive",
 		},
-		"byte bound without row bound": {
-			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_bytes": "104857600"},
-			wantErr: "direct_execution_max_table_rows is not set",
+		"empty row bound": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "", "direct_execution_max_table_bytes": "104857600"},
+			wantErr: `parse direct_execution_max_table_rows metadata value ""`,
+		},
+		"negative row bound beside a byte bound": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "-1", "direct_execution_max_table_bytes": "104857600"},
+			wantErr: "direct_execution_max_table_rows must be positive",
 		},
 		"non-numeric byte bound": {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "100MiB"},
@@ -175,7 +189,7 @@ func TestNewExecutionVerdicts_RejectsBadInput(t *testing.T) {
 
 	_, err = eng.NewExecutionVerdicts(&engine.Credentials{DSN: unreachable, Metadata: map[string]string{"direct_execution": "true"}})
 	require.ErrorContains(t, err, `execution verdicts for database "orders_db"`)
-	require.ErrorContains(t, err, "direct_execution_max_table_rows is not set")
+	require.ErrorContains(t, err, "neither direct_execution_max_table_rows nor direct_execution_max_table_bytes is set")
 }
 
 // The engine never refuses a CREATE TABLE or DROP TABLE, so either is left on
