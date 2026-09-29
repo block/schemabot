@@ -170,6 +170,16 @@ This SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases
 
 Check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves, or ask a SchemaBot operator to configure the database.`
 
+const databaseNotRegisteredTemplate = "## " + glyph.Attention + ` Database Not Registered
+
+**Database**: {{.DatabaseNameCode}} | **Schema directory**: {{.SchemaPathCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
+
+{{.Attribution}}
+
+No SchemaBot deployment on this repository manages this ` + "`schemabot.yaml`" + `: this SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases`" + ` in its server configuration, and the schema directory is outside every directory the other deployments manage. A ` + "`schemabot.yaml`" + ` declaring {{.DatabaseDeclarationCode}} is not enough on its own: the database also has to be registered on a SchemaBot server.
+
+If {{.DatabaseNameCode}} is new to SchemaBot, ask a SchemaBot operator to onboard it with {{.SchemaPathCode}} as its schema directory. If it is already onboarded, move the ` + "`schemabot.yaml`" + ` and its schema files under the schema directory registered for it.`
+
 const databaseRepoNotAllowedTemplate = "## " + glyph.Attention + ` Database Not Available to This Repository
 
 **Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
@@ -307,17 +317,18 @@ const genericErrorTemplate = "## " + glyph.Failed + ` {{.CommandName}} Failed
 
 // Compiled templates.
 var (
-	tmplDatabaseNotFound     = template.Must(template.New("databaseNotFound").Parse(databaseNotFoundTemplate))
-	tmplDatabaseNotConfig    = template.Must(template.New("databaseNotConfigured").Parse(databaseNotConfiguredTemplate))
-	tmplRepoTreeTruncated    = template.Must(template.New("repositoryTreeTruncated").Parse(repositoryTreeTruncatedTemplate))
-	tmplDatabaseRepoDenied   = template.Must(template.New("databaseRepoNotAllowed").Parse(databaseRepoNotAllowedTemplate))
-	tmplInvalidConfig        = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
-	tmplNoConfigNoDatabase   = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
-	tmplNoConfigWithDatabase = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
-	tmplConfigNotAuthorized  = template.Must(template.New("configOutsideAllowedDirs").Parse(configOutsideAllowedDirsTemplate))
-	tmplUnmanagedNotice      = template.Must(template.New("unmanagedSchemaConfigsNotice").Parse(unmanagedSchemaConfigsNoticeTemplate))
-	tmplMultipleConfigs      = template.Must(template.New("multipleConfigs").Parse(multipleConfigsTemplate))
-	tmplGenericError         = template.Must(template.New("genericError").Parse(genericErrorTemplate))
+	tmplDatabaseNotFound      = template.Must(template.New("databaseNotFound").Parse(databaseNotFoundTemplate))
+	tmplDatabaseNotConfig     = template.Must(template.New("databaseNotConfigured").Parse(databaseNotConfiguredTemplate))
+	tmplDatabaseNotRegistered = template.Must(template.New("databaseNotRegistered").Parse(databaseNotRegisteredTemplate))
+	tmplRepoTreeTruncated     = template.Must(template.New("repositoryTreeTruncated").Parse(repositoryTreeTruncatedTemplate))
+	tmplDatabaseRepoDenied    = template.Must(template.New("databaseRepoNotAllowed").Parse(databaseRepoNotAllowedTemplate))
+	tmplInvalidConfig         = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
+	tmplNoConfigNoDatabase    = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
+	tmplNoConfigWithDatabase  = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
+	tmplConfigNotAuthorized   = template.Must(template.New("configOutsideAllowedDirs").Parse(configOutsideAllowedDirsTemplate))
+	tmplUnmanagedNotice       = template.Must(template.New("unmanagedSchemaConfigsNotice").Parse(unmanagedSchemaConfigsNoticeTemplate))
+	tmplMultipleConfigs       = template.Must(template.New("multipleConfigs").Parse(multipleConfigsTemplate))
+	tmplGenericError          = template.Must(template.New("genericError").Parse(genericErrorTemplate))
 )
 
 // RenderDatabaseNotFound renders the "database not found" error comment. When
@@ -334,6 +345,16 @@ func RenderDatabaseNotFound(data SchemaErrorData) string {
 // schemabot.yaml, and the remedy is server-side.
 func RenderDatabaseNotConfigured(data SchemaErrorData) string {
 	return offerSupportChannel(renderTemplate(tmplDatabaseNotConfig, data))
+}
+
+// RenderDatabaseNotRegistered renders the error shown when the aggregate
+// leader finds a schemabot.yaml that no SchemaBot deployment on the repository
+// manages: its database is not in the leader's registry and its schema
+// directory is under no expected participant's paths. It is distinct from
+// Database Not Configured, which speaks for one instance; this one speaks for
+// the fleet, so the remedy is to onboard the database or move the config.
+func RenderDatabaseNotRegistered(data SchemaErrorData) string {
+	return offerSupportChannel(renderTemplate(tmplDatabaseNotRegistered, data))
 }
 
 // RenderRepositoryTreeTruncated renders the error shown when GitHub truncated

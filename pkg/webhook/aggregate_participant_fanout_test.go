@@ -42,6 +42,16 @@ func TestSilentDiscoveryFailureOnUnscopedFanOut(t *testing.T) {
 		"a participant silently skips an unowned unscoped command")
 	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", notOwned),
 		"a leader silently skips schema it doesn't own (gates on the participant instead)")
+	unmanagedDir := &schemaConfigOutsideAllowedDirsError{Database: "orders", SchemaPath: "payments/schema"}
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", unmanagedDir),
+		"a leader answers for a config under no participant's directory: nobody else will")
+	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", unmanagedDir),
+		"a participant cannot see the fleet, so it defers even for a directory it knows nothing about")
+	unmanaged := &schemaManagedByNoDeploymentError{Database: "orders", SchemaPath: "payments/schema"}
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", unmanaged),
+		"schema no deployment manages is never an ownership signal")
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", unmanaged),
+		"schema no deployment manages is never an ownership signal")
 	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "tenant-b", notOwned),
 		"a -t-scoped command named a deployment, so the error still surfaces")
 	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/plain-repo", "", notOwned),

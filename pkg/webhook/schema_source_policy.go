@@ -36,6 +36,11 @@ func (h *Handler) silentDiscoveryFailureOnUnscopedFanOut(repo, tenant string, er
 // that does own it handles the command. Posting "config not authorized" or
 // "database not configured" from every non-owning deployment would be exactly
 // the noise fan-out removes.
+//
+// The silence rests on some other deployment answering. The leader can tell
+// when none will: a config outside its own allowed_dirs whose directory no
+// expected participant manages either is misplaced for the whole fleet, so
+// the leader reports it rather than leaving the command unanswered.
 func (h *Handler) silentUnownedSchemaOnAggregateFanOut(repo string, err error) bool {
 	config, ok := h.serverConfig()
 	if !ok {
@@ -44,7 +49,43 @@ func (h *Handler) silentUnownedSchemaOnAggregateFanOut(repo string, err error) b
 	if config.AggregateRoleForRepo(repo) == "" {
 		return false
 	}
-	return isSchemaUnownedByDeploymentError(err)
+	if !isSchemaUnownedByDeploymentError(err) {
+		return false
+	}
+	var outsideAllowedDirs *schemaConfigOutsideAllowedDirsError
+	if errors.As(err, &outsideAllowedDirs) {
+		return h.schemaManagedByAnotherDeployment(config, repo, outsideAllowedDirs.SchemaPath)
+	}
+	return true
+}
+
+// schemaManagedByNoDeployment reports whether a schema config this deployment
+// does not manage is managed by no deployment on repo at all. Only the
+// aggregate leader can tell, and it can when the config's directory is under
+// no expected participant's paths and its database is not in the leader's own
+// registry: every deployment would leave the config to an owner that does not
+// exist, so the leader is the one to speak for it. A leader that resolves
+// databases dynamically (TargetResolver) has no registry to consult for the
+// database half, so it never makes the claim; its misplaced configs surface
+// through the allowed_dirs class instead.
+func (h *Handler) schemaManagedByNoDeployment(config *api.ServerConfig, repo, database, schemaPath string) bool {
+	if config.TargetResolver.Enabled() {
+		return false
+	}
+	return !h.schemaManagedByAnotherDeployment(config, repo, schemaPath) && config.Database(database) == nil
+}
+
+// schemaManagedByAnotherDeployment reports whether a schema config this
+// deployment does not manage can belong to a sibling deployment on repo. A
+// participant sees only its own slice of the fleet, so for it the answer is
+// always yes. The leader's expected-tenant set names every participant's path
+// prefixes, so on the leader the answer is yes only when one of them covers
+// the config's schema directory.
+func (h *Handler) schemaManagedByAnotherDeployment(config *api.ServerConfig, repo, schemaPath string) bool {
+	if !config.IsAggregateLeaderForRepo(repo) {
+		return true
+	}
+	return config.ExpectedTenantManagesSchemaPath(repo, schemaPath)
 }
 
 // silentUnresolvedDatabaseOnParticipantFanOut reports whether a database
@@ -165,17 +206,45 @@ func (e *schemaConfigOutsideAllowedDirsError) Error() string {
 	return fmt.Sprintf("schema config for database %q at %q is outside server allowed_dirs", e.Database, e.SchemaPath)
 }
 
+// schemaManagedByNoDeploymentError reports a discovered schema config that no
+// SchemaBot deployment on the repository manages: its database has no entry in
+// this deployment's registry, and its schema directory is under no path prefix
+// an expected participant manages. Only the aggregate leader can establish
+// this, since only the leader's expected-tenant set spans the fleet, and it is
+// never an ownership signal for fan-out silencing: nobody else will answer.
+type schemaManagedByNoDeploymentError struct {
+	Database     string
+	DatabaseType string
+	SchemaPath   string
+}
+
+func (e *schemaManagedByNoDeploymentError) Error() string {
+	return fmt.Sprintf("schema config for database %q at %q is managed by no SchemaBot deployment on this repository", e.Database, e.SchemaPath)
+}
+
 // unownedSchemaConfigError describes why a discovered schema config is not
 // this deployment's to process, matching the error class to the ownership
-// contract that dropped it. When the repo has a directory allowlist, the
-// config was outside it. In open mode (no allowlist for the repo) the only
-// drop reason is the database registry, so the database is reported as not
-// configured — an allowed_dirs remediation would be misleading on a repo that
-// has no allowlist to amend. Both classes count as unowned for unscoped
-// fan-out silencing (isSchemaUnownedByDeploymentError); the distinction only
+// contract that dropped it. On the aggregate leader, a config whose directory
+// no expected participant manages and whose database the leader has not
+// registered is managed by no deployment at all, and is reported as such so
+// the command is answered by the one deployment that can tell. Otherwise, when
+// the repo has a directory allowlist, the config was outside it. In open mode
+// (no allowlist for the repo) the only drop reason is the database registry,
+// so the database is reported as not configured — an allowed_dirs remediation
+// would be misleading on a repo that has no allowlist to amend. The latter two
+// classes count as unowned for unscoped fan-out silencing
+// (isSchemaUnownedByDeploymentError); the distinction between them only
 // changes what a -t/-d-scoped command reports.
 func (h *Handler) unownedSchemaConfigError(repo, database, databaseType, schemaPath string) error {
-	if config, ok := h.serverConfig(); ok && !config.RepoHasSchemaDirAllowlist(repo) {
+	config, ok := h.serverConfig()
+	if ok && h.schemaManagedByNoDeployment(config, repo, database, schemaPath) {
+		return &schemaManagedByNoDeploymentError{
+			Database:     database,
+			DatabaseType: databaseType,
+			SchemaPath:   schemaPath,
+		}
+	}
+	if ok && !config.RepoHasSchemaDirAllowlist(repo) {
 		return &api.DatabaseNotConfiguredError{Database: database}
 	}
 	return &schemaConfigOutsideAllowedDirsError{
@@ -324,7 +393,7 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 		h.logger.Info("unscoped command discovered only schema configs this deployment does not manage",
 			"repo", repo, "pr", pr, "source", source,
 			"discovered_configs", len(configs))
-		return nil, "", h.unownedDiscoveredConfigError(repo, configs[0].Config, configs[0].SchemaDir)
+		return nil, "", h.unownedDiscoveredConfigsError(repo, configs)
 	}
 	// The directory allowlist is only half the ownership contract: on repos
 	// partitioned by database registry rather than allowed_dirs, a config for
@@ -343,6 +412,26 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 		return nil, "", &api.DatabaseNotConfiguredError{Database: managed[0].Config.Database}
 	}
 	return ghclient.SingleDiscoveredConfig(registered)
+}
+
+// unownedDiscoveredConfigsError picks the error to report when discovery found
+// only configs this deployment does not manage. On an unscoped fan-out most of
+// them are silently left to their owners, so a config no deployment manages
+// must not hide behind one a sibling does: the first config whose error this
+// deployment would answer rather than defer is reported, and when every one
+// defers the first config stands for the set.
+func (h *Handler) unownedDiscoveredConfigsError(repo string, configs []ghclient.DiscoveredConfig) error {
+	first := h.unownedDiscoveredConfigError(repo, configs[0].Config, configs[0].SchemaDir)
+	if !h.silentUnownedSchemaOnAggregateFanOut(repo, first) {
+		return first
+	}
+	for _, cfg := range configs[1:] {
+		err := h.unownedDiscoveredConfigError(repo, cfg.Config, cfg.SchemaDir)
+		if !h.silentUnownedSchemaOnAggregateFanOut(repo, err) {
+			return err
+		}
+	}
+	return first
 }
 
 // registeredDiscoveredConfigs narrows discovered configs to the ones whose

@@ -1691,7 +1691,9 @@ corrected into something executable, especially one carrying `--allow-unsafe`. E
 receives a response, and silence only ever means another instance owns the reply or the comment
 issues no command: a line that opens with the product name but reads as a sentence about it, not a
 command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
-unowned-command policy (`pkg/webhook/commands.go`).
+unowned-command policy (`pkg/webhook/commands.go`), and the fan-out silence predicates
+(`pkg/webhook/schema_source_policy.go`), under which the aggregate leader answers for schema no
+deployment manages.
 
 ### AZ-6: Local hosting preserves its boundaries
 

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
@@ -644,17 +645,26 @@ func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.Inst
 // a schema change nothing will ever apply. On an aggregate-role repo (leader
 // or participant) a dropped config is routine cross-deployment fan-out — the
 // owning deployment plans it and posts its own comment and check — so the
-// notice stays a log line there.
+// notice stays a log line there, except for the configs the leader can tell
+// no deployment manages: those would otherwise be as invisible as on a
+// single-deployment repo, so the leader notices exactly them.
 func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) {
 	dropped := droppedDiscoveredConfigs(discovered, managed)
 	if len(dropped) == 0 {
 		return
 	}
 	if config, ok := h.serverConfig(); ok && config.AggregateRoleForRepo(repo) != "" {
-		h.logger.Info("unmanaged schema configs in PR left to their owning deployments on aggregate repo",
+		unmanaged := h.configsManagedByNoDeployment(config, repo, dropped)
+		if len(unmanaged) == 0 {
+			h.logger.Info("unmanaged schema configs in PR left to their owning deployments on aggregate repo",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+				"unmanaged_configs", len(dropped))
+			return
+		}
+		h.logger.Info("schema configs in PR are managed by no deployment on this aggregate repo; noticing them as the leader",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
-			"unmanaged_configs", len(dropped))
-		return
+			"unmanaged_configs", len(unmanaged), "deferred_configs", len(dropped)-len(unmanaged))
+		dropped = unmanaged
 	}
 	// Match the plan-comment cadence: a synchronize push that changed no
 	// schema inputs re-verifies checks without re-posting comments, and the
@@ -673,6 +683,19 @@ func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installa
 		})
 	}
 	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(notice))
+}
+
+// configsManagedByNoDeployment narrows dropped configs to the ones no
+// deployment on repo manages (schemaManagedByNoDeployment). Only the aggregate
+// leader can establish that, so on any other deployment the result is empty.
+func (h *Handler) configsManagedByNoDeployment(config *api.ServerConfig, repo string, dropped []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
+	var unmanaged []ghclient.DiscoveredConfig
+	for _, cfg := range dropped {
+		if h.schemaManagedByNoDeployment(config, repo, cfg.Config.Database, cfg.SchemaDir) {
+			unmanaged = append(unmanaged, cfg)
+		}
+	}
+	return unmanaged
 }
 
 // droppedDiscoveredConfigs returns the discovered configs the managed filter

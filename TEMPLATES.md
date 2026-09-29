@@ -2521,6 +2521,23 @@ Check that the database name, from `-d` or from `schemabot.yaml`, matches one th
 </details>
 
 <details>
+<summary><a name="database-not-registered"></a><strong>Database Not Registered</strong></summary>
+
+
+## ⚠️ Database Not Registered
+
+**Database**: `payments` | **Schema directory**: `services/payments/schema` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+No SchemaBot deployment on this repository manages this `schemabot.yaml`: this SchemaBot instance has no `payments` entry under `databases` in its server configuration, and the schema directory is outside every directory the other deployments manage. A `schemabot.yaml` declaring `database: payments` is not enough on its own: the database also has to be registered on a SchemaBot server.
+
+If `payments` is new to SchemaBot, ask a SchemaBot operator to onboard it with `services/payments/schema` as its schema directory. If it is already onboarded, move the `schemabot.yaml` and its schema files under the schema directory registered for it.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="database-not-available-to-this-repository"></a><strong>Database Not Available To This Repository</strong></summary>
 
 

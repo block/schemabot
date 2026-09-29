@@ -65,6 +65,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
 			return
 		}
+		// Answering the failure is acting on the command: the deployment that
+		// posts the answer is the one that acknowledges.
+		if !ackedEarly {
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err, false)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
@@ -288,6 +293,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
 				return
 			}
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
@@ -298,6 +304,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
 				return
 			}
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, unownedErr, false)
 			return
 		}
@@ -310,6 +317,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 					"repo", repo, "pr", pr, "error", findErr)
 				return
 			}
+			// Answering the failure is acting on the command: the deployment
+			// that posts the answer is the one that acknowledges.
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
@@ -695,6 +705,19 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "multiple_configs")
 		data.AvailableDatabases = templates.FormatAvailableDatabases(err.Error())
 		h.postComment(repo, pr, installationID, templates.RenderMultipleConfigs(data))
+		return true
+	}
+
+	var unmanagedErr *schemaManagedByNoDeploymentError
+	if errors.As(err, &unmanagedErr) {
+		data.DatabaseName = unmanagedErr.Database
+		data.SchemaPath = unmanagedErr.SchemaPath
+		h.logger.Warn("schema request: no SchemaBot deployment on this repository manages the schema config",
+			"repo", repo, "pr", pr, "environment", environment,
+			"database", data.DatabaseName, "database_type", unmanagedErr.DatabaseType,
+			"schema_path", data.SchemaPath, "action", commandName, "error", err)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, data.DatabaseName, environment, "database_not_registered")
+		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotRegistered(data))
 		return true
 	}
 

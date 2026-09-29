@@ -1102,6 +1102,20 @@ func PreviewCommentErrorDatabaseNotConfigured() string {
 	})
 }
 
+// PreviewCommentErrorDatabaseNotRegistered renders the error comment the
+// aggregate leader posts for a schemabot.yaml no SchemaBot deployment on the
+// repository manages.
+func PreviewCommentErrorDatabaseNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		SchemaPath:   "services/payments/schema",
+		CommandName:  action.Plan,
+	})
+}
+
 // PreviewCommentErrorDatabaseRepoNotAllowed renders the error comment for a
 // command naming a database the SchemaBot server configures for other
 // repositories only.

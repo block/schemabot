@@ -104,6 +104,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
+		// Answering the failure is acting on the command: the deployment that
+		// posts the answer is the one that acknowledges.
+		if !ackedEarly {
+			h.acknowledgeCommandActPoint(repo, pr, installationID, result)
+		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err, result.SuppressRetryComments) {
 			return false, nil
 		}
@@ -1401,6 +1406,12 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		// a database not in this deployment's registry — means there is nothing
 		// for this deployment to unlock: same outcome as no config at all.
 		if isSchemaUnownedByDeploymentError(err) {
+			return "", unlockRejection(ghclient.ErrNoConfig)
+		}
+		// Schema no deployment manages was never locked by any of them, so
+		// there is nothing to unlock here either.
+		var unmanaged *schemaManagedByNoDeploymentError
+		if errors.As(err, &unmanaged) {
 			return "", unlockRejection(ghclient.ErrNoConfig)
 		}
 		// A repo with no config, or only malformed ones, is a deterministic

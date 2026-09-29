@@ -63,7 +63,7 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 	// An unscoped fan-out apply-confirm for a database this deployment does not
 	// own is a deliberate silent no-op, not a failure.
 	t.Run("unowned unscoped fan-out is terminal and silent", func(t *testing.T) {
-		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
 		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
@@ -71,6 +71,23 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a non-owning fan-out skip is the command's terminal answer, not a retryable failure")
 		assert.Empty(t, comments, "the terminal skip must stay silent")
+	})
+
+	// The aggregate leader answers for schema no deployment manages, and that
+	// answer is as terminal as the silent skip: the same config will always be
+	// unmanaged until an operator registers the database, so re-driving would
+	// only re-post the comment.
+	t.Run("leader answer for unmanaged schema is terminal", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "the leader's fleet-wide answer is the command's terminal answer, not a retryable failure")
+		body := requireComment(t, comments, "database-not-registered answer")
+		assert.Contains(t, body, "Database Not Registered")
+		assert.Contains(t, body, "`orders`")
 	})
 
 	// A schema-request rejection (database not configured on this server) posts
