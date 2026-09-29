@@ -10,6 +10,36 @@ import (
 	"github.com/block/schemabot/pkg/psclient"
 )
 
+// planTableSizes is the display-only size context a PlanetScale plan attaches
+// to its table changes: each keyspace's shard count and, where attributable,
+// each table's storage bytes. Either map may be nil when its lookup failed.
+type planTableSizes struct {
+	shardCounts map[string]int
+	tableBytes  map[string]int64
+}
+
+// fetchPlanTableSizes reads the plan's size context from the PlanetScale API.
+// Sizes are display-only, so this has no error return: a failed or slow lookup
+// logs and yields no sizes, and the plan (and any apply that re-plans) goes on
+// exactly as it would without them. Both API calls share one
+// TableSizeProbeTimeout budget, so the size context can never add more than
+// that budget to a plan however the API misbehaves.
+func (e *Engine) fetchPlanTableSizes(ctx context.Context, client psclient.PSClient, org, database, branch string) planTableSizes {
+	probeCtx, cancelProbe := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
+	defer cancelProbe()
+
+	shardCounts, err := e.fetchKeyspaceShardCounts(probeCtx, client, org, database, branch)
+	if err != nil {
+		e.logger.Warn("keyspace shard counts unavailable; the plan will omit shard counts and table byte estimates",
+			"organization", org, "database", database, "branch", branch, "error", err)
+		return planTableSizes{}
+	}
+	return planTableSizes{
+		shardCounts: shardCounts,
+		tableBytes:  e.fetchBranchTableBytes(probeCtx, client, org, database, branch, shardCounts),
+	}
+}
+
 // fetchKeyspaceShardCounts returns each keyspace on the branch, keyed by
 // keyspace name, with its shard count. An unsharded keyspace maps to zero:
 // the API reports it as one shard, but a shard count is only meaningful for a
@@ -31,8 +61,10 @@ func (e *Engine) fetchKeyspaceShardCounts(ctx context.Context, client psclient.P
 	counts := make(map[string]int, len(keyspaces))
 	for _, ks := range keyspaces {
 		if ks == nil {
-			// Defensive skip: the SDK should not return nil entries, and a nil
-			// keyspace carries no name to key by.
+			// The SDK should not return nil entries, and a nil keyspace carries
+			// no name to key by.
+			e.logger.Warn("keyspace listing returned a nil keyspace; skipping it for shard counts",
+				"organization", org, "database", database, "branch", branch)
 			continue
 		}
 		if !ks.Sharded {
@@ -56,17 +88,15 @@ func (e *Engine) fetchKeyspaceShardCounts(ctx context.Context, client psclient.P
 // keyspace lookup failed) is treated the same way, since uniqueness cannot be
 // established without it.
 //
-// Best effort and budget-bound: sizes are display-only, so a slow or failed
-// metrics read logs and the plan proceeds without byte estimates.
+// Best effort: sizes are display-only, so a slow or failed metrics read logs
+// and the plan proceeds without byte estimates. The caller bounds ctx.
 func (e *Engine) fetchBranchTableBytes(ctx context.Context, client psclient.PSClient, org, database, branch string, shardCounts map[string]int) map[string]int64 {
 	if len(shardCounts) != 1 {
 		e.logger.Info("branch table metrics skipped; table byte estimates need a single-keyspace branch to attribute",
 			"organization", org, "database", database, "branch", branch, "keyspaces", len(shardCounts))
 		return nil
 	}
-	metricsCtx, cancelMetrics := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
-	defer cancelMetrics()
-	tableBytes, err := client.BranchTableMetrics(metricsCtx, org, database, branch)
+	tableBytes, err := client.BranchTableMetrics(ctx, org, database, branch)
 	if err != nil {
 		e.logger.Warn("branch table metrics unavailable; the plan will omit table byte estimates",
 			"organization", org, "database", database, "branch", branch, "error", err)

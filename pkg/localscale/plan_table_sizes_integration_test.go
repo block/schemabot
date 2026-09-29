@@ -21,13 +21,55 @@ import (
 )
 
 // A PlanetScale plan decorates each keyspace's table changes with display-only
-// size context: the shard count the change spans and, from the branch table
-// metrics API, the table's storage bytes. Operators read these figures on the
-// PR to judge how long a change will run, so a change to an existing table
-// must carry the exact byte figure the metrics endpoint reports and the
-// keyspace's real shard count — while row counts stay absent, because the
-// metrics endpoint reports bytes only.
+// size context from the branch table metrics API. Operators read these figures
+// on the PR to judge how long a change will run, so on a single-keyspace
+// branch, where the endpoint's bare table names are attributable, a change to
+// an existing table must carry the exact byte figure the endpoint reports —
+// while row counts stay absent, because the endpoint reports bytes only.
 func TestPlanAttachesTableSizesFromBranchMetrics(t *testing.T) {
+	ctx := t.Context()
+	const (
+		database = singleKeyspaceDB
+		keyspace = "testkeyspace"
+		table    = "plan_size_items"
+	)
+	require.NoError(t, testContainer.SeedVSchema(ctx, testOrg, database, keyspace, []byte(`{"sharded": false}`)))
+	require.NoError(t, testContainer.SeedDDL(ctx, testOrg, database, keyspace,
+		"CREATE TABLE IF NOT EXISTS `"+table+"` (`id` bigint NOT NULL PRIMARY KEY, `name` varchar(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"))
+
+	eng := planetscale.NewWithClient(planTestLogger(),
+		func(_, _ string) (psclient.PSClient, error) { return testClient, nil })
+
+	result, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database:    database,
+		Credentials: planCredentials(),
+		SchemaFiles: desiredSchemaWithProbeColumn(t, ctx, database, keyspace, table),
+	})
+	require.NoError(t, err, "plan")
+	require.False(t, result.NoChanges, "the probe column must produce a change")
+
+	change := findTableChange(t, result, keyspace, table)
+	assert.Zero(t, change.ShardCount, "an unsharded keyspace renders no shard count")
+
+	// The byte figure on the change must be exactly what the branch table
+	// metrics endpoint reports for the table, proving the plan read the
+	// endpoint rather than inventing a value.
+	metrics, err := testClient.BranchTableMetrics(ctx, testOrg, database, "main")
+	require.NoError(t, err, "read branch table metrics")
+	require.Contains(t, metrics, table, "metrics must cover the seeded table")
+	assert.Positive(t, metrics[table], "an InnoDB table reports a non-zero footprint")
+	require.NotNil(t, change.EstimatedBytes, "a change to an existing table must carry its byte estimate")
+	assert.Equal(t, metrics[table], *change.EstimatedBytes)
+
+	assert.Nil(t, change.EstimatedRows, "the metrics endpoint reports bytes only; row counts stay absent on PlanetScale")
+	assert.Nil(t, change.LargestShardRows, "the metrics endpoint has no per-shard breakdown")
+}
+
+// On a branch with several keyspaces the metrics endpoint's bare table names
+// cannot be attributed to the keyspace that owns them, so the plan carries the
+// keyspace's real shard count and withholds the byte estimate rather than
+// risk showing another keyspace's table size.
+func TestPlanWithholdsTableBytesOnMultiKeyspaceBranch(t *testing.T) {
 	ctx := t.Context()
 	const keyspace = "testapp_sharded"
 
@@ -37,28 +79,14 @@ func TestPlanAttachesTableSizesFromBranchMetrics(t *testing.T) {
 	result, err := eng.Plan(ctx, &engine.PlanRequest{
 		Database:    testDB,
 		Credentials: planCredentials(),
-		SchemaFiles: desiredSchemaWithProbeColumn(t, ctx, keyspace, "users"),
+		SchemaFiles: desiredSchemaWithProbeColumn(t, ctx, testDB, keyspace, "users"),
 	})
 	require.NoError(t, err, "plan")
 	require.False(t, result.NoChanges, "the probe column must produce a change")
 
 	change := findTableChange(t, result, keyspace, "users")
 	assert.Equal(t, 2, change.ShardCount, "testapp_sharded spans two shards")
-
-	// The byte figure on the change must be exactly what the branch table
-	// metrics endpoint reports for the table, proving the plan read the
-	// endpoint rather than inventing a value.
-	metrics, err := testClient.BranchTableMetrics(ctx, testOrg, testDB, "main")
-	require.NoError(t, err, "read branch table metrics")
-	for _, tbl := range []string{"users", "orders", "products"} {
-		require.Contains(t, metrics, tbl, "metrics must cover seeded table %s", tbl)
-		assert.Positive(t, metrics[tbl], "seeded table %s must report a non-zero footprint", tbl)
-	}
-	require.NotNil(t, change.EstimatedBytes, "a change to an existing table must carry its byte estimate")
-	assert.Equal(t, metrics["users"], *change.EstimatedBytes)
-
-	assert.Nil(t, change.EstimatedRows, "the metrics endpoint reports bytes only; row counts stay absent on PlanetScale")
-	assert.Nil(t, change.LargestShardRows, "the metrics endpoint has no per-shard breakdown")
+	assert.Nil(t, change.EstimatedBytes, "bytes are withheld when the branch has more than one keyspace")
 }
 
 // Table sizes are display-only plan context, so a missing or failing metrics
@@ -77,7 +105,7 @@ func TestPlanSucceedsWithoutBranchTableMetrics(t *testing.T) {
 	result, err := eng.Plan(ctx, &engine.PlanRequest{
 		Database:    testDB,
 		Credentials: planCredentials(),
-		SchemaFiles: desiredSchemaWithProbeColumn(t, ctx, keyspace, "users"),
+		SchemaFiles: desiredSchemaWithProbeColumn(t, ctx, testDB, keyspace, "users"),
 	})
 	require.NoError(t, err, "plan must succeed with the metrics endpoint failing")
 	require.False(t, result.NoChanges, "the probe column must produce a change")
@@ -87,6 +115,46 @@ func TestPlanSucceedsWithoutBranchTableMetrics(t *testing.T) {
 	assert.Nil(t, change.EstimatedBytes, "no byte estimate without the metrics endpoint")
 	assert.Nil(t, change.EstimatedRows, "row counts stay absent on PlanetScale")
 }
+
+// A failing keyspace listing leaves the plan without any size context, and
+// still never fails it: the change is planned exactly as it would be with the
+// API healthy, carrying no shard count and no byte estimate.
+func TestPlanSucceedsWithoutKeyspaceListing(t *testing.T) {
+	ctx := t.Context()
+	const keyspace = "testapp_sharded"
+
+	eng := planetscale.NewWithClient(planTestLogger(),
+		func(_, _ string) (psclient.PSClient, error) {
+			return keyspaceListingUnavailableClient{testClient}, nil
+		})
+
+	result, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database:    testDB,
+		Credentials: planCredentials(),
+		SchemaFiles: desiredSchemaWithProbeColumn(t, ctx, testDB, keyspace, "users"),
+	})
+	require.NoError(t, err, "plan must succeed with the keyspace listing failing")
+	require.False(t, result.NoChanges, "the probe column must produce a change")
+
+	change := findTableChange(t, result, keyspace, "users")
+	assert.Contains(t, change.DDL, "ADD COLUMN `plan_size_probe_col`", "the planned change is unaffected by the missing size context")
+	assert.Zero(t, change.ShardCount, "no shard count without the keyspace listing")
+	assert.Nil(t, change.EstimatedBytes, "no byte estimate without the keyspace listing")
+}
+
+// keyspaceListingUnavailableClient serves every PlanetScale API call from the
+// real LocalScale-backed client except the keyspace listing, which fails.
+type keyspaceListingUnavailableClient struct {
+	psclient.PSClient
+}
+
+func (c keyspaceListingUnavailableClient) ListKeyspaces(_ context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
+	return nil, fmt.Errorf("keyspace listing unavailable for %s/%s branch %s", req.Organization, req.Database, req.Branch)
+}
+
+// singleKeyspaceDB is the shared container's database with exactly one
+// keyspace, the only topology on which branch table bytes are attributable.
+const singleKeyspaceDB = "approvaldb"
 
 // metricsUnavailableClient serves every PlanetScale API call from the real
 // LocalScale-backed client except the branch table metrics endpoint, which
@@ -122,11 +190,11 @@ func planCredentials() *engine.Credentials {
 // one column to the named table, so the plan diffs to exactly one ALTER on an
 // existing, seeded table regardless of what earlier tests changed on the
 // shared container.
-func desiredSchemaWithProbeColumn(t *testing.T, ctx context.Context, keyspace, tableName string) schema.SchemaFiles {
+func desiredSchemaWithProbeColumn(t *testing.T, ctx context.Context, database, keyspace, tableName string) schema.SchemaFiles {
 	t.Helper()
 	current, err := testClient.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
 		Organization: testOrg,
-		Database:     testDB,
+		Database:     database,
 		Branch:       "main",
 		Keyspace:     keyspace,
 	})

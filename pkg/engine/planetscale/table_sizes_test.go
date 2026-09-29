@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -160,4 +161,76 @@ func TestAttachTableSizesSkipsTablesAbsentFromMetrics(t *testing.T) {
 	assert.Equal(t, 2, changes[0].ShardCount)
 	assert.Nil(t, changes[1].EstimatedBytes)
 	assert.Equal(t, 2, changes[1].ShardCount)
+}
+
+// sizeProbeClient fakes the two API calls behind a plan's size context,
+// recording each call's deadline so a test can check the budget they share.
+type sizeProbeClient struct {
+	psclient.PSClient
+	keyspaces    []*ps.Keyspace
+	keyspacesErr error
+	metrics      map[string]int64
+	metricsErr   error
+
+	keyspacesDeadline time.Time
+	metricsDeadline   time.Time
+	metricsCalled     bool
+}
+
+func (c *sizeProbeClient) ListKeyspaces(ctx context.Context, _ *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
+	c.keyspacesDeadline, _ = ctx.Deadline()
+	return c.keyspaces, c.keyspacesErr
+}
+
+func (c *sizeProbeClient) BranchTableMetrics(ctx context.Context, _, _, _ string) (map[string]int64, error) {
+	c.metricsCalled = true
+	c.metricsDeadline, _ = ctx.Deadline()
+	return c.metrics, c.metricsErr
+}
+
+// A plan's size context is display-only, so no PlanetScale API failure can
+// reach the plan as an error: a failed keyspace listing yields no sizes at all
+// (without calling the metrics endpoint, whose bytes it could not attribute),
+// and a failed metrics read keeps the shard counts and drops only the bytes.
+// Both calls run under one TableSizeProbeTimeout budget, so a slow API adds at
+// most that budget to the plan, not one budget per call.
+func TestFetchPlanTableSizes(t *testing.T) {
+	singleKeyspace := []*ps.Keyspace{{Name: "commerce", Shards: 4, Sharded: true}}
+
+	t.Run("keyspace listing failure yields no sizes", func(t *testing.T) {
+		client := &sizeProbeClient{keyspacesErr: errors.New("api unavailable"), metrics: map[string]int64{"orders": 1}}
+		e := New(slog.Default())
+
+		sizes := e.fetchPlanTableSizes(t.Context(), client, "org", "db", "main")
+
+		assert.Nil(t, sizes.shardCounts)
+		assert.Nil(t, sizes.tableBytes)
+		assert.False(t, client.metricsCalled, "bytes cannot be attributed without the keyspace listing")
+	})
+
+	t.Run("metrics failure keeps shard counts", func(t *testing.T) {
+		client := &sizeProbeClient{keyspaces: singleKeyspace, metricsErr: errors.New("api unavailable")}
+		e := New(slog.Default())
+
+		sizes := e.fetchPlanTableSizes(t.Context(), client, "org", "db", "main")
+
+		assert.Equal(t, map[string]int{"commerce": 4}, sizes.shardCounts)
+		assert.Nil(t, sizes.tableBytes)
+		assert.True(t, client.metricsCalled)
+	})
+
+	t.Run("both calls share one probe budget", func(t *testing.T) {
+		client := &sizeProbeClient{keyspaces: singleKeyspace, metrics: map[string]int64{"orders": 2_048}}
+		e := New(slog.Default())
+
+		started := time.Now()
+		sizes := e.fetchPlanTableSizes(t.Context(), client, "org", "db", "main")
+
+		assert.Equal(t, map[string]int64{"orders": 2_048}, sizes.tableBytes)
+		require.False(t, client.keyspacesDeadline.IsZero(), "the keyspace listing must run under a deadline")
+		assert.Equal(t, client.keyspacesDeadline, client.metricsDeadline, "both calls must share one deadline")
+		// The deadline is set just after started, so it may exceed started +
+		// budget by the time the call took, and by no more.
+		assert.WithinDuration(t, started.Add(engine.TableSizeProbeTimeout), client.keyspacesDeadline, time.Since(started))
+	})
 }
