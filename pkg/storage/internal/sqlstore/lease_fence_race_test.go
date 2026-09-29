@@ -241,8 +241,17 @@ func testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t *testing.T, newStor
 // that returns before the steal commits never waited on the lease row, so its
 // token check was decided against its snapshot rather than the steal, and the
 // test fails outright.
+//
+// The steal transaction and the blocked write each hold one of the store's
+// connections for the whole race, and the lock probe needs a third when it
+// shares the pool, so the store's pool must lend at least three; a smaller cap
+// would park the write or the probe in the pool's queue, where the write never
+// reaches the lease row and the race would time out for the wrong reason.
 func writeDuringUncommittedSteal(t *testing.T, store *Storage, waiting lockWaiter, fragment string, write func() error, steal string, stealArgs ...any) error {
 	t.Helper()
+	if limit := store.db.pool.Stats().MaxOpenConnections; limit != 0 && limit < 3 {
+		require.FailNow(t, "the store's pool cannot hold the steal transaction, the blocked write, and the lock probe at once", "MaxOpenConnections = %d", limit)
+	}
 	stealTx, err := store.db.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {
