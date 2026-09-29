@@ -3085,6 +3085,54 @@ _Requested by @jackjackbits_
 </details>
 
 <details>
+<summary><a name="applyconfirm-refused-plan-is-for-another-environment"></a><strong>Apply-confirm Refused: Plan Is For Another Environment</strong></summary>
+
+
+## ⛔ Apply-confirm Refused — Production
+
+**Database**: `testapp`
+
+The pending confirmation is for `staging`, not `production`; nothing was applied.
+
+To confirm the `staging` plan:
+
+```
+schemabot apply-confirm -e staging -d testapp --defer-cutover
+```
+
+To apply `production` instead, dropping the pending `staging` confirmation and planning and applying `production` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:
+
+```
+schemabot apply -e production -d testapp --defer-cutover
+```
+
+_Requested by @jackjackbits_
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="applyconfirm-refused-plan-cannot-be-loaded"></a><strong>Apply-confirm Refused: Plan Cannot Be Loaded</strong></summary>
+
+
+## ⛔ Apply-confirm Refused — Production
+
+**Database**: `testapp`
+
+The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.
+
+To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:
+
+```
+schemabot apply -e production -d testapp --defer-cutover
+```
+
+_Requested by @jackjackbits_
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
 
 
@@ -8256,6 +8304,31 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
    }
  }
 ```
+
+
+</details>
+
+<details>
+<summary><a name="summary-keyspace-finalized"></a><strong>Summary: Keyspace Finalized</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+> Applied successfully — your schema change is live!
+
+**Shards**: 2 completed
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ✅ Complete (2 shards)
+
+### Finalize
+
+**`cdb_resolute_sharded`**: Finalized
 
 
 </details>

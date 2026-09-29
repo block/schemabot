@@ -47,6 +47,13 @@ type ChangeSetDiff struct {
 	// UnexpectedVSchema are namespaces the candidate changes the vschema for that
 	// the baseline does not.
 	UnexpectedVSchema []string
+	// MissingFinalize are namespaces the baseline's engine asks to finalize
+	// that the candidate's does not.
+	MissingFinalize []string
+	// UnexpectedFinalize are namespaces the candidate's engine asks to finalize
+	// that the baseline's does not. A candidate that mirrors the baseline would
+	// skip that finalize, so it is drift like any other unexpected change.
+	UnexpectedFinalize []string
 }
 
 // Empty reports whether the candidate matches the baseline exactly.
@@ -54,11 +61,14 @@ func (d ChangeSetDiff) Empty() bool {
 	return len(d.MissingFromCandidate) == 0 &&
 		len(d.UnexpectedInCandidate) == 0 &&
 		len(d.MissingVSchema) == 0 &&
-		len(d.UnexpectedVSchema) == 0
+		len(d.UnexpectedVSchema) == 0 &&
+		len(d.MissingFinalize) == 0 &&
+		len(d.UnexpectedFinalize) == 0
 }
 
 // CompareChangeSets reports how candidate differs from baseline, comparing table
-// DDL by canonicalized form and vschema by per-namespace parity. The dialect
+// DDL by canonicalized form, and vschema and engine-requested finalizes by
+// per-namespace parity. The dialect
 // selects the grammar both change sets are classified and canonicalized with,
 // so a PostgreSQL deployment's DDL is never judged by the MySQL parser; both
 // sides of a comparison are always the same dialect, since comparing DDL
@@ -106,11 +116,25 @@ func CompareChangeSets(dialect schema.Dialect, baseline, candidate ChangeSet) (C
 		}
 	}
 
+	diff.MissingFinalize, diff.UnexpectedFinalize = namespaceSetDifference(changeSetFinalizeNamespaces(candidate), changeSetFinalizeNamespaces(baseline))
+
 	sortDiffItems(diff.MissingFromCandidate)
 	sortDiffItems(diff.UnexpectedInCandidate)
 	sort.Strings(diff.MissingVSchema)
 	sort.Strings(diff.UnexpectedVSchema)
 	return diff, nil
+}
+
+// changeSetFinalizeNamespaces returns the namespaces a change set's engine asks
+// to finalize.
+func changeSetFinalizeNamespaces(cs ChangeSet) map[string]bool {
+	out := map[string]bool{}
+	for _, sc := range cs.Changes {
+		if sc != nil && sc.Metadata[apitypes.NeedsFinalizerMetadataKey] == "true" {
+			out[sc.Namespace] = true
+		}
+	}
+	return out
 }
 
 // changeSetMultiset builds the table DDL multiset and the set of vschema-changed
@@ -233,9 +257,10 @@ func (cs ChangeSet) AuthoritativeTableChanges() []*ternv1.TableChange {
 }
 
 // HasWork reports whether applying the change set would change anything: a
-// table change in any representation, or a namespace whose VSchema changes. It
-// reads either VSchema signal a plan can carry, so a change set that says it
-// changes a VSchema in only one of the two ways still counts as work.
+// table change in any representation, a namespace whose VSchema changes, or a
+// namespace the engine asks to finalize. It reads either VSchema signal a plan
+// can carry, so a change set that says it changes a VSchema in only one of the
+// two ways still counts as work.
 func (cs ChangeSet) HasWork() bool {
 	if len(cs.AuthoritativeTableChanges()) > 0 {
 		return true
@@ -245,6 +270,9 @@ func (cs ChangeSet) HasWork() bool {
 			continue
 		}
 		if sc.Metadata[apitypes.VSchemaChangedMetadataKey] == "true" || sc.Metadata[apitypes.VSchemaDiffMetadataKey] != "" {
+			return true
+		}
+		if sc.Metadata[apitypes.NeedsFinalizerMetadataKey] == "true" {
 			return true
 		}
 	}

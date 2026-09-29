@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -166,6 +167,78 @@ func TestLocalClient_VSchemaOnlyPlanDispatchCreatesGroupFinalizer(t *testing.T) 
 	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Empty(t, tasks, "a VSchema-only plan produces no task rows")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, ops[0].OperationKind)
+	assert.Equal(t, "ks_sharded/group_finalizer", ops[0].OperationKey)
+	assert.Equal(t, state.ApplyOperation.Pending, ops[0].State)
+}
+
+// A plan whose only work is a finalize its engine asked for carries no table
+// DDL and no VSchema document. Its dispatch is VSchema-typed and marked
+// needs_finalizer, and the data plane creates the same task-less
+// group_finalizer a VSchema-only plan gets, without demanding a vschema.json
+// the plan never had.
+func TestLocalClient_FinalizeOnlyPlanDispatchCreatesGroupFinalizer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-finalize-only-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"ks_sharded": {Finalize: true},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Environment: localClientTestEnvironment,
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace:  "ks_sharded",
+			TableName:  "VSchema: ks_sharded",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+			Metadata:   map[string]string{engine.MetadataNeedsFinalizer: "true"},
+		}},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, "finalize-only dispatch was not accepted: %s", resp.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Empty(t, tasks, "a finalize-only plan produces no task rows")
 
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
@@ -382,5 +455,5 @@ func TestLocalClient_VSchemaOnlyDispatchWithoutArtifactFailsClosed(t *testing.T)
 		}},
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no VSchema artifact")
+	assert.Contains(t, err.Error(), "neither a VSchema artifact nor a finalize request")
 }

@@ -330,6 +330,7 @@ func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespaceP
 			Artifacts:             nsData.Artifacts,
 			Metadata:              nsData.Metadata,
 			IgnoreTables:          nsData.IgnoreTables,
+			Finalize:              nsData.Finalize,
 		}
 	}
 	for _, shard := range sortedShardPlans(plan.Shards) {

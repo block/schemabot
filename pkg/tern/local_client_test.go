@@ -499,6 +499,7 @@ type exactProgressTaskStore struct {
 	tasks     []*storage.Task
 	shardRows []*storage.Task
 	err       error
+	updateErr func(context.Context, *storage.Task) error
 }
 
 func (s *exactProgressTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
@@ -521,7 +522,10 @@ func (s *exactProgressTaskStore) GetByDatabase(context.Context, string) ([]*stor
 	return s.tasks, s.err
 }
 
-func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
+func (s *exactProgressTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if s.updateErr != nil {
+		return s.updateErr(ctx, task)
+	}
 	return s.err
 }
 
