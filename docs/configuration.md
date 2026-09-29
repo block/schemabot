@@ -1302,14 +1302,16 @@ unlisted repository:
   instance's ownership.
 - SchemaBot increments `schemabot.webhook.unregistered_repository_ignored_total`
   so operators can detect unexpected webhook delivery or missing configuration.
-- An instance that answers unscoped commands (`respond_to_unscoped`, and no
-  `tenant`) still replies to a comment command no other instance would answer:
-  `help`, an unrecognized command, a missing, malformed, or unknown `-e`, and
-  a command for an environment it serves, which gets a Repository Not
-  Registered reply. A command for another instance's environment, a `plan`
-  without `-e`, a command that takes no `-e`, and any `--tenant` command get
-  no reply. This covers a repository that only a sibling instance has
-  registered, where that sibling is silenced by `respond_to_unscoped: false`.
+- An instance with `respond_to_unscoped: true` set explicitly, and no
+  `tenant`, still replies to the comment commands whose answer does not
+  depend on who registered the repository: `help`, an unrecognized command,
+  and a missing, malformed, or unknown `-e`. Every other command gets no
+  reply from it, including one for an environment it serves, because it
+  cannot see which repositories its siblings registered. This covers a
+  repository that only a sibling instance has registered, where that sibling
+  is silenced by `respond_to_unscoped: false`. Leaving the flag unset keeps an
+  instance silent on repositories outside its `repos`, so instances that
+  split repositories by their allowlists do not answer on each other's.
 
 If `repos` is not configured or empty, all repositories are allowed.
 
@@ -1578,6 +1580,7 @@ storage:
 
 allowed_environments:
   - production
+respond_to_unscoped: true  # answers help and invalid commands for the fleet
 
 databases:
   payments:
@@ -1666,11 +1669,12 @@ invalid-environment comment listing the configured environments. The
 rejection follows the `respond_to_unscoped` policy so exactly one instance
 responds, and is acknowledged with an eyes reaction. Because
 `environment_order` doubles as the fleet-wide environment roster for this
-routing decision, keep it complete on every instance. The instance that
-answers unscoped commands also answers them on a repository only a peer has
+routing decision, keep it complete on every instance. Set
+`respond_to_unscoped: true` explicitly on the instance that answers unscoped
+commands, so it also answers them on a repository only a peer has
 registered, as long as its own App is installed there (see the `repos`
-allowlist above), so a repository served by a single silenced instance still
-gets these replies.
+allowlist above). A repository served by a single silenced instance then
+still gets these replies.
 
 ### Environment-local gRPC targets
 

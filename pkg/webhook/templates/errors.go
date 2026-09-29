@@ -461,20 +461,6 @@ func RenderInvalidEnv(action string, available []string) string {
 **Usage**: `+"`schemabot %s -e <environment> [flags]`", availableLine, action))
 }
 
-// RenderRepositoryNotRegistered generates the reply to a command for an
-// environment this instance serves, on a repository missing from its repos
-// configuration. The environment name is normalized for markdown display.
-func RenderRepositoryNotRegistered(environment string) string {
-	env := inlineCode(environment)
-	return offerSupportChannel(fmt.Sprintf("## "+glyph.Attention+` Repository Not Registered
-
-**Environment**: %s
-
-This SchemaBot instance serves %s, but this repository has no entry under `+"`repos`"+` in its server configuration, so it cannot plan or apply schema changes here.
-
-Ask a SchemaBot operator to register this repository and its databases for %s.`, env, env, env))
-}
-
 // inlineCodeList renders each value as a code span, ready to join into a
 // comma-separated list.
 func inlineCodeList(values []string) []string {

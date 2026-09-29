@@ -3279,6 +3279,15 @@ func (c *ServerConfig) ShouldRespondToUnscoped() bool {
 	return *c.RespondToUnscoped
 }
 
+// IsExplicitUnscopedResponder reports whether respond_to_unscoped is set to
+// true in the configuration rather than left unset. Leaving it unset keeps a
+// deployment answering unscoped commands on its own repositories; only an
+// operator who named this deployment as the fleet's responder lets it answer
+// beyond them.
+func (c *ServerConfig) IsExplicitUnscopedResponder() bool {
+	return c != nil && c.RespondToUnscoped != nil && *c.RespondToUnscoped
+}
+
 // ShouldRequirePassingChecks returns whether apply should be blocked when
 // non-SchemaBot PR checks are not passing. Defaults to true when not configured.
 func (c *ServerConfig) ShouldRequirePassingChecks() bool {

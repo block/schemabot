@@ -5534,3 +5534,16 @@ func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
 		assert.Nil(t, policy)
 	})
 }
+
+// Only a respond_to_unscoped set to true names a deployment the fleet's
+// explicit unscoped responder; leaving it unset keeps the answer-by-default
+// behavior on the deployment's own repositories without reaching past them.
+func TestServerConfig_IsExplicitUnscopedResponder(t *testing.T) {
+	responder, silenced := true, false
+	var nilConfig *ServerConfig
+	assert.False(t, nilConfig.IsExplicitUnscopedResponder())
+	assert.False(t, (&ServerConfig{}).IsExplicitUnscopedResponder())
+	assert.True(t, (&ServerConfig{}).ShouldRespondToUnscoped(), "unset still answers on the deployment's own repositories")
+	assert.False(t, (&ServerConfig{RespondToUnscoped: &silenced}).IsExplicitUnscopedResponder())
+	assert.True(t, (&ServerConfig{RespondToUnscoped: &responder}).IsExplicitUnscopedResponder())
+}

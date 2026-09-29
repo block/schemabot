@@ -181,11 +181,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			"pr", pr,
 			"installation_id", installationID,
 			"requested_by", requestedBy)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "issue_comment", payload.Action, repo)
 		if message, replied := h.replyOnUnregisteredRepo(repo, pr, installationID, deliveryID, result); replied {
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
 			return
 		}
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "issue_comment", payload.Action, repo)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",
 		})
