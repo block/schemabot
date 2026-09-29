@@ -73,7 +73,9 @@ func SetAuthToken(token string) {
 // followed, as net/http follows it, but without the token; once a chain has
 // left the origin it stays unauthenticated, as net/http's own stripping of
 // sensitive headers does. An authenticated request redirected from https to
-// plaintext http is refused rather than followed.
+// plaintext http is refused rather than followed. A redirect whose chain the
+// base transport did not record in full is treated as having left the origin,
+// since the token's origin cannot be established from what remains.
 type bearerTransport struct {
 	base   http.RoundTripper
 	token  string
@@ -84,17 +86,20 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.origin != "" && req.URL.Scheme+"://"+req.URL.Host != t.origin {
 		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
 	}
-	chain := redirectChain(req)
+	chain, complete := redirectChain(req)
+	if !complete {
+		slog.Warn("not forwarding authorization to a redirect whose origin cannot be established; the request continues unauthenticated",
+			"redirect", req.URL.Scheme+"://"+req.URL.Host)
+		return t.base.RoundTrip(withoutAuthorization(req))
+	}
 	first := chain[0]
 	if t.isAuthenticated(first) && downgradesFromHTTPS(chain) {
 		return nil, fmt.Errorf("%w: %s redirected to %s://%s", ErrInsecureTokenTransport, requestOrigin(first.URL), req.URL.Scheme, req.URL.Host)
 	}
 	if !stayedOnFirstOrigin(chain) {
-		redirected := req.Clone(req.Context())
-		redirected.Header.Del("Authorization")
 		slog.Warn("not forwarding authorization to a redirect on another origin; the request continues unauthenticated",
 			"origin", requestOrigin(first.URL), "redirect", req.URL.Scheme+"://"+req.URL.Host)
-		return t.base.RoundTrip(redirected)
+		return t.base.RoundTrip(withoutAuthorization(req))
 	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
 		if err := GuardInsecureToken(req.URL); err != nil {
@@ -113,16 +118,34 @@ func (t *bearerTransport) isAuthenticated(first *http.Request) bool {
 	return t.token != "" || first.Header.Get("Authorization") != ""
 }
 
+// withoutAuthorization returns a copy of req with no Authorization header.
+// RoundTrip must not mutate the caller's request, so the header is removed
+// from a clone.
+func withoutAuthorization(req *http.Request) *http.Request {
+	stripped := req.Clone(req.Context())
+	stripped.Header.Del("Authorization")
+	return stripped
+}
+
 // redirectChain returns the requests net/http sent to arrive at req, oldest
-// first and ending with req itself. A request that is not a redirect is a chain
-// of one.
-func redirectChain(req *http.Request) []*http.Request {
-	chain := []*http.Request{req}
-	for hop := req; hop.Response != nil && hop.Response.Request != nil; hop = hop.Response.Request {
+// first and ending with req itself, and whether that chain is complete. A
+// request that is not a redirect is a complete chain of one.
+//
+// net/http links each redirected request to the response that caused it, and
+// the response to the request that produced it. A base RoundTripper that omits
+// that second link leaves the earlier hops unknowable, so the chain is reported
+// incomplete rather than presenting the hop it stopped at as the first request.
+func redirectChain(req *http.Request) (chain []*http.Request, complete bool) {
+	chain = []*http.Request{req}
+	for hop := req; hop.Response != nil; hop = hop.Response.Request {
+		if hop.Response.Request == nil {
+			slices.Reverse(chain)
+			return chain, false
+		}
 		chain = append(chain, hop.Response.Request)
 	}
 	slices.Reverse(chain)
-	return chain
+	return chain, true
 }
 
 // stayedOnFirstOrigin reports whether every hop in a redirect chain targets the

@@ -311,6 +311,46 @@ func TestAuthTokenWithheldAfterChainLeavesOrigin(t *testing.T) {
 	assert.Empty(t, gotAuth)
 }
 
+// dropsResponseRequest is a RoundTripper that, unlike http.Transport, does not
+// record which request produced each response, so a redirected request cannot
+// be traced back to the request the command sent.
+type dropsResponseRequest struct{ base http.RoundTripper }
+
+func (d dropsResponseRequest) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := d.base.RoundTrip(req)
+	if resp != nil {
+		resp.Request = nil
+	}
+	return resp, err
+}
+
+// When the base transport leaves the redirect chain untraceable, the transport
+// cannot tell a same-origin redirect from a cross-origin one, so it withholds
+// the token from both rather than let the redirect target pass for the origin
+// the token was issued for.
+func TestAuthTokenWithheldWhenRedirectProvenanceIsUnknown(t *testing.T) {
+	var otherAuth string
+	other := captureAuthServer(t, &otherAuth)
+	crossOrigin := redirectServer(t, httptest.NewServer, func() string { return other.URL })
+
+	var homeAuth string
+	home := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/status" {
+			http.Redirect(w, r, "/api/v2/status", http.StatusTemporaryRedirect)
+			return
+		}
+		homeAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(home.Close)
+
+	client := tokenClient(dropsResponseRequest{http.DefaultTransport}, "tok-abc123")
+	require.NoError(t, getThrough(t, client, crossOrigin.URL+"/api/status"))
+	assert.Empty(t, otherAuth, "the token never reaches a server the chain cannot be traced to")
+
+	require.NoError(t, getThrough(t, client, home.URL+"/api/status"))
+	assert.Empty(t, homeAuth, "an untraceable same-origin redirect is treated as having left the origin")
+}
+
 // An authenticated request to an https SchemaBot server that redirects to
 // plaintext http is refused before the plaintext request is sent, and the
 // refusal names the security reason rather than a connection failure.
