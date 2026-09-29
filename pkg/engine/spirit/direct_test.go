@@ -122,6 +122,10 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "100MiB"},
 			wantErr: `parse direct_execution_max_table_bytes metadata value "100MiB"`,
 		},
+		"empty byte bound": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": ""},
+			wantErr: `parse direct_execution_max_table_bytes metadata value ""`,
+		},
 		"zero byte bound": {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "0"},
 			wantErr: "direct_execution_max_table_bytes must be positive",

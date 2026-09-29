@@ -81,7 +81,10 @@ func directPolicyFromMetadata(md map[string]string) (directPolicy, error) {
 		return directPolicy{}, fmt.Errorf("%s must be positive, got %d", engine.MetadataDirectExecutionMaxTableRows, maxRows)
 	}
 	policy := directPolicy{Enabled: true, MaxTableRows: maxRows}
-	if raw := md[engine.MetadataDirectExecutionMaxTableBytes]; raw != "" {
+	// Presence, not a non-empty value, states a byte bound: a key present with
+	// an empty value is a malformed bound, and reading it as absent would widen
+	// the grant to the row bound alone.
+	if raw, ok := md[engine.MetadataDirectExecutionMaxTableBytes]; ok {
 		maxBytes, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
 			return directPolicy{}, fmt.Errorf("parse %s metadata value %q: %w", engine.MetadataDirectExecutionMaxTableBytes, raw, err)
