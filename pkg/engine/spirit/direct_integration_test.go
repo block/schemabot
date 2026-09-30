@@ -642,7 +642,7 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 
 	assert.Equal(t, engine.StateFailed, state)
 	assert.Contains(t, errorMessage, `Table "direct_locked" is busy`)
-	assert.Contains(t, errorMessage, fmt.Sprintf("attempts of %ds each", lockWaitSeconds))
+	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts.", lockWaitSeconds, directMaxAttempts))
 	assert.Contains(t, errorMessage, "not a session holding an explicit LOCK TABLES")
 	assert.Contains(t, errorMessage, "unless its database user has CONNECTION_ADMIN",
 		"a kill refused for lack of privilege lands on this same message, so it names that remedy too")

@@ -735,12 +735,13 @@ timeout — on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`.
 Native DDL queues on the table's metadata lock behind any open transaction
 that has touched the table — and by default MySQL lets it queue essentially
 forever, with all new table traffic stalling behind it. On MySQL, at 90% of
-the bound the statement kills the transactions blocking the lock and retries
-a bounded number of times, as Spirit does for its own DDL. A session holding an
+the bound the statement kills the transactions blocking the lock and tries
+again, up to 3 attempts, as Spirit does for its own DDL. A session holding an
 explicit `LOCK TABLES`, or a transaction too large to roll back safely, is
 never killed; while one holds the lock the apply fails with a retryable
 "table is busy" error. Traffic to the table can stall for up to one bound per
-attempt, so lower it for environments where even a short stall is
+attempt, and between attempts the statement waits up to 30 seconds for killed
+sessions to roll back. Lower it for environments where even a short stall is
 unacceptable; the value must be a whole number of seconds (at least `1s`).
 
 The kill reads `performance_schema` to find the blocking sessions, so the

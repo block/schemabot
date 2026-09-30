@@ -413,6 +413,16 @@ func (v *ExecutionVerdicts) record(ctx context.Context, change *engine.TableChan
 // "table is busy" error once the attempts run out.
 const defaultDirectLockAcquisitionTimeoutSeconds = 10
 
+// directMaxAttempts is how many times a direct statement tries to take its
+// lock before the apply fails as busy.
+const directMaxAttempts = 3
+
+// directExecutionPoolSize caps the pool direct statements run on: one
+// connection runs the statement, and the others serve the kill's
+// performance_schema reads and KILLs while it waits. At one, the kill would
+// wait on the statement's own connection and never run.
+const directExecutionPoolSize = 3
+
 // erLockWaitTimeout is MySQL error 1205 (ER_LOCK_WAIT_TIMEOUT), returned when
 // a statement gives up waiting for a lock. For direct DDL this is almost
 // always the table's metadata lock, held by an open transaction that has
@@ -542,8 +552,8 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 // dbconn.ForceExec takes the statement's connection from the pool itself, so
 // the bound has to be a property of the pool rather than a SET on one
 // connection. The same pool serves the kill's performance_schema reads and
-// KILLs on other connections while the statement waits, so it must never be
-// capped at a single connection.
+// KILLs on other connections while the statement waits, so it is capped at
+// directExecutionPoolSize rather than one.
 func openDirectExecutionDB(ctx context.Context, dsn string, lockWaitSeconds int64) (*sql.DB, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
@@ -559,6 +569,7 @@ func openDirectExecutionDB(ctx context.Context, dsn string, lockWaitSeconds int6
 	if err != nil {
 		return nil, fmt.Errorf("open target database: %w", err)
 	}
+	db.SetMaxOpenConns(directExecutionPoolSize)
 	// The ping opens the first connection, which is where MySQL accepts or
 	// rejects the session lock bound.
 	if err := db.PingContext(ctx); err != nil {
@@ -569,12 +580,13 @@ func openDirectExecutionDB(ctx context.Context, dsn string, lockWaitSeconds int6
 }
 
 // directForceExecConfig is the dbconn configuration direct statements run
-// under: Spirit's defaults for the kill (at 90% of the lock wait, then a retry,
-// up to MaxRetries attempts), with both lock waits taken from the policy.
+// under: Spirit's kill at 90% of the lock wait, both lock waits taken from the
+// policy, and directMaxAttempts attempts.
 func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
 	cfg := dbconn.NewDBConfig()
 	cfg.LockWaitTimeout = int(lockWaitSeconds)
 	cfg.InnodbLockWaitTimeout = int(lockWaitSeconds)
+	cfg.MaxRetries = directMaxAttempts
 	return cfg
 }
 
@@ -637,8 +649,8 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 				// deployment's own configuration, so this sentence is safe to
 				// show on the pull request that asked for the change.
 				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
-					"Table %q is busy: the change could not acquire the metadata lock in %d attempts of %ds each. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely, and it cannot kill another user's session unless its database user has CONNECTION_ADMIN. Retry when those sessions have finished, or grant CONNECTION_ADMIN if the server log shows the kill was refused.",
-					ds.table, forceExecConfig.MaxRetries, lockWaitSeconds))
+					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely, and it cannot kill another user's session unless its database user has CONNECTION_ADMIN. Retry when those sessions have finished, or grant CONNECTION_ADMIN if the server log shows the kill was refused.",
+					ds.table, lockWaitSeconds, forceExecConfig.MaxRetries))
 				return false
 			}
 			logger.Error("direct execution failed",
