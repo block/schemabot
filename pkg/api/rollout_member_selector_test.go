@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -628,7 +629,10 @@ func (c *memberDiffClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) 
 // for example after an apply narrowed to the primary landed it there alone, or
 // a member that could not be diffed, turns the plan into an error naming that
 // member. A plan with changes, a narrowed plan, and a plan of a single-target
-// environment are returned as they are, without diffing anyone else.
+// environment carry no such error. Beside that check, a plan of the whole
+// rollout plans every member and reports the rollout's work from each
+// member's own plan, while a plan of a single-target environment is the
+// primary's plan alone and diffs no one else.
 func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.T) {
 	withChanges := &ternv1.PlanResponse{PlanId: "plan-changes", Changes: []*ternv1.SchemaChange{{
 		Namespace: "payments",
@@ -646,36 +650,62 @@ func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.
 		diffErrs   map[string]error
 		wantDiffed []string
 		wantErrors []string
+		// wantMembers is the rollout's member count, or 0 when the plan
+		// carries no rollout.
+		wantMembers        int
+		wantRolloutChanges bool
+		wantUnplanned      []string
 	}{
 		{
-			name:       "rollout-wide plan with every member converged",
-			config:     narrowingServerConfig(),
-			database:   "payments",
-			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged"},
-			wantDiffed: []string{"payments-002", "payments-003"},
+			name:        "rollout-wide plan with every member converged",
+			config:      narrowingServerConfig(),
+			database:    "payments",
+			planResp:    &ternv1.PlanResponse{PlanId: "plan-converged", Engine: ternv1.Engine_ENGINE_SPIRIT},
+			wantDiffed:  []string{"payments-002", "payments-003"},
+			wantMembers: 3,
 		},
 		{
 			name:       "rollout-wide plan with a converged primary and a member that still needs the change",
 			config:     narrowingServerConfig(),
 			database:   "payments",
-			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged"},
+			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged", Engine: ternv1.Engine_ENGINE_SPIRIT},
 			diffs:      map[string]*ternv1.PlanDiffResponse{"payments-003": alterUsersDiff("ALTER TABLE `users` ADD COLUMN `region` varchar(16)")},
 			wantDiffed: []string{"payments-002", "payments-003"},
 			wantErrors: []string{"rollout primary " + DefaultDeployment + "/payments-001 is at the desired schema, but 1 other rollout members still need changes: payments-003. " +
 				"The rollout is not up to date; plan and apply each of them with its target"},
+			wantMembers:        3,
+			wantRolloutChanges: true,
 		},
 		{
 			name:       "rollout-wide plan with a converged primary and a member that could not be diffed",
 			config:     narrowingServerConfig(),
 			database:   "payments",
-			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged"},
+			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged", Engine: ternv1.Engine_ENGINE_SPIRIT},
 			diffErrs:   map[string]error{"payments-002": errors.New("dial tcp 10.0.0.7:3306: connection refused")},
 			wantDiffed: []string{"payments-002", "payments-003"},
 			wantErrors: []string{"rollout primary " + DefaultDeployment + "/payments-001 is at the desired schema, but 1 other rollout members could not be planned: payments-002. " +
 				"The rollout is not reported as up to date until each of them is planned; see the server logs for why"},
+			wantMembers:   3,
+			wantUnplanned: []string{DefaultDeployment + "/payments-002"},
 		},
-		{name: "rollout-wide plan with changes", config: narrowingServerConfig(), database: "payments", planResp: withChanges},
-		{name: "narrowed plan with no changes", config: narrowingServerConfig(), database: "payments", target: "payments-001", planResp: &ternv1.PlanResponse{PlanId: "plan-narrowed"}},
+		{
+			name:               "rollout-wide plan with changes",
+			config:             narrowingServerConfig(),
+			database:           "payments",
+			planResp:           withChanges,
+			wantDiffed:         []string{"payments-002", "payments-003"},
+			wantMembers:        3,
+			wantRolloutChanges: true,
+		},
+		{
+			name:        "narrowed plan with no changes",
+			config:      narrowingServerConfig(),
+			database:    "payments",
+			target:      "payments-001",
+			planResp:    &ternv1.PlanResponse{PlanId: "plan-narrowed", Engine: ternv1.Engine_ENGINE_SPIRIT},
+			wantDiffed:  []string{"payments-002", "payments-003"},
+			wantMembers: 3,
+		},
 		{name: "single-target environment", config: singleTargetServerConfig(), database: "orders", planResp: &ternv1.PlanResponse{PlanId: "plan-orders"}},
 	}
 	for _, tc := range cases {
@@ -705,8 +735,24 @@ func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.
 			}
 			assert.NotContains(t, w.Body.String(), "10.0.0.7", "a member's diff error stays in the server logs")
 			client.mu.Lock()
-			defer client.mu.Unlock()
-			assert.ElementsMatch(t, tc.wantDiffed, client.diffed, "only the members other than the primary are diffed, and only when the primary is converged")
+			diffed := slices.Clone(client.diffed)
+			client.mu.Unlock()
+			slices.Sort(diffed)
+			assert.Equal(t, tc.wantDiffed, slices.Compact(diffed), "only the members other than the primary are diffed")
+
+			if tc.wantMembers == 0 {
+				assert.Nil(t, resp.Rollout, "a single-target environment has no other member to plan")
+				return
+			}
+			require.NotNil(t, resp.Rollout)
+			assert.Equal(t, tc.wantMembers, resp.Rollout.Members)
+			assert.Equal(t, tc.wantRolloutChanges, resp.RolloutHasChanges(), "the rollout's work is read from every member's plan")
+			var unplanned []string
+			for _, a := range resp.Rollout.Attention {
+				assert.Equal(t, apitypes.PlanMemberUnplanned, a.Reason, "member %s", a.Member)
+				unplanned = append(unplanned, a.Member)
+			}
+			assert.Equal(t, tc.wantUnplanned, unplanned)
 		})
 	}
 }

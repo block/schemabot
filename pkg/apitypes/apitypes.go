@@ -804,6 +804,107 @@ type PlanResponse struct {
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// Rollout describes the plan of every member of the rollout when the
+	// environment fans out to more than one: the members grouped by the plan
+	// each runs, and the members that need attention before an apply can run
+	// on them. Nil when the environment has a single member. The top-level
+	// Changes and Shards are the primary member's plan.
+	Rollout *PlanRolloutResponse `json:"rollout,omitempty"`
+}
+
+// PlanRolloutResponse is the plan of every member of a rollout.
+type PlanRolloutResponse struct {
+	// Members is how many members the rollout has.
+	Members int `json:"members"`
+	// Independent is true when each member was planned against its own live
+	// schema, so members are expected to differ. False means every member is
+	// expected to run the primary's plan.
+	Independent bool `json:"independent,omitempty"`
+	// Groups holds one entry per distinct plan, naming the members that run
+	// it, with the primary's group first.
+	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
+	// Attention lists the members an apply cannot run on as planned: a member
+	// that could not be planned, or one that diverged from the plan it is
+	// expected to mirror.
+	Attention []*PlanMemberAttentionResponse `json:"attention,omitempty"`
+}
+
+// PlanMemberGroupResponse is the rollout members that run one plan.
+type PlanMemberGroupResponse struct {
+	// Members are the members' operator-facing names, in rollout order.
+	Members []string `json:"members"`
+	// Primary is true for the group holding the rollout's primary member,
+	// whose plan is the response's own.
+	Primary bool                    `json:"primary,omitempty"`
+	Changes []*SchemaChangeResponse `json:"changes"`
+	Shards  []*ShardPlanResponse    `json:"shards,omitempty"`
+}
+
+// PlanMemberAttentionResponse is a rollout member an apply cannot run on as
+// planned, and why.
+type PlanMemberAttentionResponse struct {
+	Member string `json:"member"`
+	// Reason is PlanMemberDiverged or PlanMemberUnplanned.
+	Reason string `json:"reason"`
+	// Detail is a short, sanitized description of the reason.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Rollout member attention reasons.
+const (
+	PlanMemberDiverged  = "diverged"
+	PlanMemberUnplanned = "unplanned"
+)
+
+// MemberPlans returns the plan of each group of rollout members, in the
+// order of Rollout.Groups, or the response itself when it covers one member.
+// Each group's plan carries the response's identity and engine with the
+// group's own changes; lint results and errors describe the schema files and
+// stay on the response.
+func (r *PlanResponse) MemberPlans() []*PlanResponse {
+	if r == nil {
+		return nil
+	}
+	if r.Rollout == nil || len(r.Rollout.Groups) == 0 {
+		return []*PlanResponse{r}
+	}
+	plans := make([]*PlanResponse, 0, len(r.Rollout.Groups))
+	for _, g := range r.Rollout.Groups {
+		plans = append(plans, &PlanResponse{
+			PlanID:       r.PlanID,
+			Database:     r.Database,
+			DatabaseType: r.DatabaseType,
+			Environment:  r.Environment,
+			Engine:       r.Engine,
+			Changes:      g.Changes,
+			Shards:       g.Shards,
+		})
+	}
+	return plans
+}
+
+// RolloutHasChanges reports whether an apply of the rollout would run work on
+// any member, not only the primary.
+func (r *PlanResponse) RolloutHasChanges() bool {
+	return slices.ContainsFunc(r.MemberPlans(), (*PlanResponse).HasChanges)
+}
+
+// RolloutUnsafeChanges returns the unsafe changes of every plan in the
+// rollout, each once however many groups of members run it.
+func (r *PlanResponse) RolloutUnsafeChanges() []UnsafeChange {
+	var result []UnsafeChange
+	seen := make(map[string]bool)
+	for _, plan := range r.MemberPlans() {
+		for _, c := range plan.UnsafeChanges() {
+			key := c.Table + "\x00" + c.Reason
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			result = append(result, c)
+		}
+	}
+	return result
 }
 
 // ExemptTablesResponse describes live tables in one namespace that no schema

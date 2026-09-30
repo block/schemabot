@@ -118,8 +118,17 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return fmt.Errorf("plan has errors")
 	}
 
-	// Check if there are any changes (DDL or VSchema)
-	if !planResult.HasChanges() {
+	// An apply runs on every member of a rollout, and one the server could
+	// not plan has no plan to run, so the apply is refused before it starts.
+	if rollout := planResult.Rollout; rollout != nil && len(rollout.Attention) > 0 {
+		if cmd.Output != OutputFormatJSON {
+			templates.WriteRolloutAttention(templates.RolloutNoun(rollout), rollout.Attention)
+		}
+		return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one listed above, then apply again", len(rollout.Attention), rollout.Members)
+	}
+
+	// Check if there are any changes (DDL or VSchema) on any rollout member
+	if !planResult.RolloutHasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")
 		writeNarrowedTo(planResult)
 		// Apply returns here without rendering a plan body, so this is the one
@@ -143,7 +152,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Check for unsafe changes
-	if len(planResult.UnsafeChanges()) > 0 && !cmd.AllowUnsafe {
+	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target)
 	}
 
@@ -177,7 +186,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Show unsafe warning if --allow-unsafe was used
 	if cmd.AllowUnsafe {
-		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges(), templates.UnsafeConsentAllowFlag)
+		templates.WriteUnsafeWarningAllowed(planResult.RolloutUnsafeChanges(), templates.UnsafeConsentAllowFlag)
 	}
 
 	// Show options if any flags are set
@@ -521,7 +530,7 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 	writeNarrowedTo(planResult)
 
 	// Then show the unsafe changes warning
-	unsafeChanges := planResult.UnsafeChanges()
+	unsafeChanges := planResult.RolloutUnsafeChanges()
 	retry := fmt.Sprintf("apply -s %s -e %s", schemaDir, environment)
 	if target != "" {
 		retry += " --target " + target

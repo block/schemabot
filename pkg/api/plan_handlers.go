@@ -600,7 +600,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	planProto, resp, err := s.ExecutePlanProto(r.Context(), req)
+	primaryPlan, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
@@ -631,11 +631,21 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.refuseUpToDateForUnconvergedMembers(r.Context(), req, planProto, resp); err != nil {
+	if err := s.refuseUpToDateForUnconvergedMembers(r.Context(), req, primaryPlan, resp); err != nil {
 		s.logger.Error("plan failed: the other rollout members could not be planned to check the plan's coverage", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
+
+	// An apply of a rollout runs on every member, so the plan an operator
+	// reviews before it describes every member, not only the primary.
+	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
+	if err != nil {
+		s.logger.Error("plan failed: rollout members could not be planned", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		return
+	}
+	resp.Rollout = rollout
 
 	s.writeJSON(w, http.StatusOK, resp)
 }

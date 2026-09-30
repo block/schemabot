@@ -193,10 +193,10 @@ func TestResolveApplyMembers_MissingMemberPlanFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), "no stored plan for rollout member eu/testapp-002")
 }
 
-// Member plans are only written by a pull request review, so a CLI apply against
-// a multi-target environment has none and fails closed rather than running the
-// primary's DDL against every target.
-func TestResolveApplyMembers_PlanWithoutPullRequestReviewFailsClosed(t *testing.T) {
+// A plan made outside a pull request plans its members the same way, and an
+// apply from one whose round stored no member plan fails closed rather than
+// running the primary's DDL against every target.
+func TestResolveApplyMembers_CLIPlanWithoutMemberPlansFailsClosed(t *testing.T) {
 	plan := primaryPlanRow("testapp-001")
 	plan.HeadSHA = ""
 	plans := &listingPlanStore{}
@@ -204,7 +204,8 @@ func TestResolveApplyMembers_PlanWithoutPullRequestReviewFailsClosed(t *testing.
 
 	_, err := svc.resolveApplyMembers(t.Context(), plan, "production", targetsFor(t, svc))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "was not produced by a pull request review")
+	assert.Contains(t, err.Error(), "no stored plan for rollout member eu/testapp-002")
+	assert.Contains(t, err.Error(), "plan the environment again")
 }
 
 // An environment respelled as mirrored after its review still applies what was

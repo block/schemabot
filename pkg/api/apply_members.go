@@ -99,13 +99,6 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 		}
 		memberPlan, ok := memberPlans[target.MemberID()]
 		if !ok {
-			if plan.HeadSHA == "" {
-				// Member plans are only ever written by a pull request review, so
-				// an apply from a plan that had none is unplannable by
-				// construction rather than by a missed round.
-				return nil, fmt.Errorf("apply for %s/%s has no stored plan for rollout member %s, and its plan %s was not produced by a pull request review; plan from a pull request so every target is planned",
-					plan.Database, environment, target.MemberID(), plan.PlanIdentifier)
-			}
 			return nil, fmt.Errorf("apply for %s/%s has no stored plan for rollout member %s in the reviewed round (plan %s); plan the environment again so every target is planned before applying",
 				plan.Database, environment, target.MemberID(), plan.PlanIdentifier)
 		}

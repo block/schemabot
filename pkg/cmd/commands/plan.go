@@ -186,7 +186,10 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 
 	// Check if staging and production have identical plans
 	bothConfigured := stagingResult != nil && productionResult != nil
+	// A rollout's plan names its members, so it never reads as another
+	// environment's plan.
 	plansIdentical := bothConfigured && stagingHasChanges && productionHasChanges &&
+		stagingResult.Rollout == nil && productionResult.Rollout == nil &&
 		planFingerprint(stagingResult) == planFingerprint(productionResult)
 
 	// Header box (title + database only, environment shown below)
@@ -238,7 +241,60 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteErrors(result.Errors)
 		return
 	}
+	if result.Rollout != nil {
+		writeRolloutPlanBody(result, isApply)
+		return
+	}
+	writeChangesBody(result, isApply)
+}
 
+// writeRolloutPlanBody writes the plan of every member of a rollout the way
+// the PR comment does: the members that need attention first, then one
+// heading per distinct plan naming the members that run it, with that plan's
+// changes under it. Groups with work lead; a group already at the desired
+// schema says so in place of DDL. Lint results and exempt tables describe the
+// schema files and the primary's live schema, so they are written once, after
+// every group.
+func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
+	rollout := result.Rollout
+	noun := templates.RolloutNoun(rollout)
+	templates.WriteRolloutAttention(noun, rollout.Attention)
+	if len(rollout.Groups) > 1 {
+		templates.WriteRolloutDivergence(noun)
+	}
+	plans := result.MemberPlans()
+	order := make([]int, len(rollout.Groups))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		return compareWorkFirst(plans[a].HasChanges(), plans[b].HasChanges())
+	})
+	for _, i := range order {
+		templates.WriteRolloutGroupHeading(noun, rollout.Groups[i].Members, rollout.Members)
+		writeChangesBody(plans[i], isApply)
+	}
+	if lint := result.LintNonErrors(); len(lint) > 0 {
+		templates.WriteLintViolations(lint)
+	}
+	templates.WriteExemptTables(result.ExemptTables)
+}
+
+// compareWorkFirst orders a plan with work ahead of one without.
+func compareWorkFirst(aHasWork, bHasWork bool) int {
+	switch {
+	case aHasWork == bHasWork:
+		return 0
+	case aHasWork:
+		return -1
+	default:
+		return 1
+	}
+}
+
+// writeChangesBody writes one plan's changes, unsafe warnings, lint, and
+// summary.
+func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	// Collect VSchema changes from metadata, and the namespaces the engine
 	// asked to finalize: a finalize is work the apply runs, so a plan made only
 	// of finalizes must not read as "no changes". finalizeOnly holds those with
@@ -360,9 +416,10 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	templates.WriteExemptTables(result.ExemptTables)
 }
 
-// hasResultChanges returns true if the result has schema changes (DDL or VSchema).
+// hasResultChanges returns true if the result has schema changes (DDL or
+// VSchema) on any member of its rollout.
 func hasResultChanges(result *apitypes.PlanResponse) bool {
-	return result != nil && result.HasChanges()
+	return result != nil && result.RolloutHasChanges()
 }
 
 // sortEnvironments sorts environments with staging first, production second, then alphabetically.

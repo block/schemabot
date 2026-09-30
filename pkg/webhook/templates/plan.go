@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -1745,16 +1746,13 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 // for one.
 const shardNamesInlineLimit = 8
 
-// planGroupNoun is what the members of a plan group are called: the shards of a
-// keyspace, or the targets of a rollout. Both render through the same group
-// headings, so a rollout whose targets need different work reads the way a
-// keyspace whose shards do.
-type planGroupNoun struct{ singular, plural string }
-
+// A plan group's members render through the same group headings whatever
+// they are called, so a rollout whose targets need different work reads the
+// way a keyspace whose shards do.
 var (
-	shardNoun      = planGroupNoun{singular: "shard", plural: "shards"}
-	targetNoun     = planGroupNoun{singular: "target", plural: "targets"}
-	deploymentNoun = planGroupNoun{singular: "deployment", plural: "deployments"}
+	shardNoun      = presentation.ShardNoun
+	targetNoun     = presentation.TargetNoun
+	deploymentNoun = presentation.DeploymentNoun
 )
 
 // planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`"
@@ -1767,15 +1765,15 @@ func planShardList(shards []string, totalShards int) string {
 	return planGroupList(shardNoun, shards, totalShards)
 }
 
-func planGroupList(noun planGroupNoun, members []string, total int) string {
+func planGroupList(noun presentation.Noun, members []string, total int) string {
 	if len(members) > shardNamesInlineLimit {
-		return groupCoveragePhrase(noun, len(members), total)
+		return presentation.CoveragePhrase(noun, len(members), total)
 	}
 	quoted := inlineCodeList(members)
 	if len(quoted) == 1 {
-		return noun.singular + " " + quoted[0]
+		return noun.Singular + " " + quoted[0]
 	}
-	return noun.plural + " " + strings.Join(quoted, ", ")
+	return noun.Plural + " " + strings.Join(quoted, ", ")
 }
 
 // shardCoveragePhrase states how much of a keyspace a shard group covers:
@@ -1783,17 +1781,7 @@ func planGroupList(noun planGroupNoun, members []string, total int) string {
 // a subset, or a bare count when the keyspace total is unknown — a subset
 // must never read like whole-keyspace coverage.
 func shardCoveragePhrase(count, totalShards int) string {
-	return groupCoveragePhrase(shardNoun, count, totalShards)
-}
-
-func groupCoveragePhrase(noun planGroupNoun, count, total int) string {
-	if count == total {
-		return fmt.Sprintf("all %d %s", count, noun.plural)
-	}
-	if total > 0 {
-		return fmt.Sprintf("%d of %d %s", count, total, noun.plural)
-	}
-	return fmt.Sprintf("%d %s", count, noun.plural)
+	return presentation.CoveragePhrase(shardNoun, count, totalShards)
 }
 
 // writeShardGroupHeading writes a shard group's bold heading above its DDL
@@ -1806,13 +1794,13 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 	writeGroupHeading(sb, shardNoun, shards, totalShards)
 }
 
-func writeGroupHeading(sb *strings.Builder, noun planGroupNoun, members []string, total int) {
+func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []string, total int) {
 	if len(members) <= shardNamesInlineLimit {
 		fmt.Fprintf(sb, "**%s**\n\n", planGroupList(noun, members, total))
 		return
 	}
 	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
-		groupCoveragePhrase(noun, len(members), total), strings.Join(inlineCodeList(members), ", "))
+		presentation.CoveragePhrase(noun, len(members), total), strings.Join(inlineCodeList(members), ", "))
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
@@ -1952,9 +1940,9 @@ func driftMemberNeedsAttention(d DeploymentDriftEntry) bool {
 // is classified under the same contract, so they share one outcome.
 func quietMembersSummary(drift *DeploymentDriftData, count int) string {
 	if drift.Independent {
-		return fmt.Sprintf("%s ✅ planned against their own schemas", groupCoveragePhrase(targetNoun, count, len(drift.Deployments)))
+		return fmt.Sprintf("%s ✅ planned against their own schemas", presentation.CoveragePhrase(targetNoun, count, len(drift.Deployments)))
 	}
-	return fmt.Sprintf("%s ✅ match the reviewed plan", groupCoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
+	return fmt.Sprintf("%s ✅ match the reviewed plan", presentation.CoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
 }
 
 func anyDeploymentBlocked(deployments []DeploymentDriftEntry) bool {
