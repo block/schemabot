@@ -584,14 +584,68 @@ func TestRenderPlanComment_DriftContainsHostileMemberNames(t *testing.T) {
 // targets are not, must not read as a no-op. The reviewed plan is empty, but a
 // reviewer who reads "no schema changes detected" merges believing the fleet
 // holds this schema, so the comment shows the plan the other targets still run
-// and the reviewed target as already applied. It offers no apply command: a PR
-// apply runs from the reviewed plan, and an empty one does not run the others.
+// and the reviewed target as already applied. It offers the apply command,
+// which runs each target's own plan, so the other targets can converge.
 func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
+	data := convergedPrimaryPlanData()
+
+	out := RenderPlanComment(data)
+	assert.NotContains(t, out, "✅", "a rollout with work left is not all clear")
+	assert.Contains(t, out, "**target `primary/testapp_1`**\n\nNo schema changes detected\n\n")
+	assert.Less(t, strings.Index(out, "**targets `primary/testapp_2`, `primary/testapp_3`**"), strings.Index(out, "**target `primary/testapp_1`**"),
+		"the targets with work read first")
+	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
+	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e production\n```\n",
+		"the other targets converge through the apply, which runs each target's own plan")
+}
+
+// The apply on a rollout whose reviewed target is already converged pauses for
+// confirmation: the reader confirms against the other targets' plans on this
+// comment, and the cause says the reviewed target runs nothing.
+func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T) {
+	data := convergedPrimaryPlanData()
+	data.IsLocked = true
+	data.LockOwner = "pr:octocat/testapp#7"
+	data.PendingManualConfirmation = true
+	data.PausedApplyCause = &PausedApplyCauseData{
+		Heading: "The reviewed target already has this schema",
+		Remedy:  "Nothing has run. Confirming runs each target's own plan shown above; a target already at the desired schema runs nothing.",
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "⚠️ **The reviewed target already has this schema**\n\nNothing has run.")
+	assert.Contains(t, out, "**Confirmation required** — review the plan above, then confirm manually:\n```\nschemabot apply-confirm -e production\n```\n")
+	assert.NotContains(t, out, "**Applying automatically**")
+	assert.NotContains(t, out, "No changes to apply")
+}
+
+// A multi-environment plan offers the apply for an environment whose reviewed
+// target is converged but whose other targets still have work, and not for an
+// environment where every target is converged.
+func TestRenderMultiEnvPlanComment_OffersApplyForPendingTargets(t *testing.T) {
+	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
+	pending := convergedPrimaryPlanData()
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &pending},
+	})
+	assert.Contains(t, out, "▶️ **To apply** these changes, comment:\n```\nschemabot apply -e production\n```\n")
+	assert.NotContains(t, out, "schemabot apply -e staging")
+}
+
+// convergedPrimaryPlanData is a production plan whose reviewed target,
+// primary/testapp_1, already has the schema, while primary/testapp_2 and
+// primary/testapp_3 still need a column added.
+func convergedPrimaryPlanData() PlanCommentData {
 	alter := []KeyspaceChangeData{{
 		Keyspace:   "testapp",
 		Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
 	}}
-	data := PlanCommentData{
+	return PlanCommentData{
 		Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
 		DeploymentDrift: &DeploymentDriftData{
 			Computed: true, Clean: true, Independent: true,
@@ -606,15 +660,6 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 			},
 		},
 	}
-
-	out := RenderPlanComment(data)
-	assert.NotContains(t, out, "✅", "a rollout with work left is not all clear")
-	assert.Contains(t, out, "**target `primary/testapp_1`**\n\nNo schema changes detected\n\n")
-	assert.Less(t, strings.Index(out, "**targets `primary/testapp_2`, `primary/testapp_3`**"), strings.Index(out, "**target `primary/testapp_1`**"),
-		"the targets with work read first")
-	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
-	assert.NotContains(t, out, "schemabot apply", "an empty reviewed plan cannot apply the other targets' plans")
 }
 
 // A rollout where every target is already at the desired schema is a no-op, and

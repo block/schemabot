@@ -352,12 +352,30 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// regular plan comment (no lock, no confirm footer). An empty primary plan
 	// speaks only for the primary where members hold schemas of their own, so
 	// the other members are planned first and their work, if any, answers.
-	if !planResp.HasChanges() {
-		rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
-		if rolloutStillPending(rollout) {
-			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
-			return false, nil
-		}
+	//
+	// When other targets still have work, the apply runs their own plans. It
+	// always stops for apply-confirm: the one-step gates below read only the
+	// reviewed plan, which is empty, so the operator confirms against the
+	// comment that renders every target's plan instead.
+	rollout := reviewDriftOutcome{state: driftNotEvaluated}
+	var rolloutPreview *templates.DeploymentDriftData
+	reviewedTargetConverged := !planResp.HasChanges()
+	if reviewedTargetConverged {
+		rollout, rolloutPreview = h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+	}
+	switch {
+	case !reviewedTargetConverged:
+		h.logger.Debug("apply: the reviewed target has changes of its own; the rollout round is not consulted before locking",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
+	case rolloutRunsMemberWork(rollout, rolloutPreview):
+		h.logger.Info("apply: the reviewed target is already at the desired schema; other targets' own plans will run once confirmed",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "targets_pending", rollout.work.pending, "targets", rollout.work.members,
+			"pending_targets", rollout.work.names)
+	case rolloutStillPending(rollout):
+		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
+		return false, nil
+	default:
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 		commentData.ScopedDatabase = result.Database
 		commentData.DeploymentDrift = rolloutPreview
@@ -467,6 +485,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	commentData.DeferCutover = result.DeferCutover
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
+	commentData.DeploymentDrift = rolloutPreview
 
 	// Re-evaluate the checks gate against the freshness-checked HEAD before
 	// executing. The early gate at the top of applyCommandCore ran against
@@ -487,6 +506,14 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	} else if blocked {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate block")
 		return false, nil
+	}
+
+	// Only other targets have work, so the apply runs their own plans, and it
+	// never does so in one step: the gates that let an apply proceed
+	// automatically read only the reviewed plan, which is empty here. The
+	// operator confirms against this comment, which renders every target's plan.
+	if reviewedTargetConverged {
+		return h.pauseForMemberWorkConfirmation(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, rollout, commentData)
 	}
 
 	// Direct-execution changes never run without explicit confirmation: the

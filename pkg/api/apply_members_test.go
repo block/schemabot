@@ -542,3 +542,92 @@ func TestBuildApplyOperationGroups_ApplyWithNoWorkStaysPending(t *testing.T) {
 		})
 	}
 }
+
+// An apply created from a reviewed plan with no work runs each other member's
+// own plan. The members that already hold the schema are settled at creation
+// and the one that needs the column is driven from its own DDL.
+func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.T) {
+	member := memberPlanWithChange(storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	})
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{member}})
+
+	_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production"}, nil, "apply-converged-primary")
+	require.NoError(t, err)
+
+	applies, ok := svc.storage.Applies().(*capturingApplyStore)
+	require.True(t, ok)
+	require.Len(t, applies.operations, 2)
+	byTarget := map[string]*storage.ApplyOperation{}
+	for _, op := range applies.operations {
+		byTarget[op.Target] = op
+	}
+	assert.Equal(t, state.ApplyOperation.Completed, byTarget["testapp-001"].State, "the reviewed target already holds the schema")
+	assert.Equal(t, state.ApplyOperation.Pending, byTarget["testapp-002"].State)
+
+	tasks := applies.taskStore.tasks
+	require.Len(t, tasks, 1, "only the member that needs the column gets work")
+	assert.Equal(t, "users", tasks[0].TableName)
+	assert.Contains(t, tasks[0].DDL, "ADD COLUMN `email`")
+}
+
+// An apply created from a reviewed plan with no work gives every member one work
+// operation, so member work that needs another shape is refused rather than
+// settled as done. So is direct-execution DDL, whose consent is given against
+// a disclosure the empty reviewed plan does not carry.
+func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *testing.T) {
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+	for _, tc := range []struct {
+		name   string
+		member func() *storage.Plan
+		want   string
+	}{
+		{
+			name: "per-shard changes",
+			member: func() *storage.Plan {
+				plan := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+				plan.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "testapp", Changes: []storage.TableChange{alter}}}
+				return plan
+			},
+			want: "carries per-shard changes",
+		},
+		{
+			name: "finalizer",
+			member: func() *storage.Plan {
+				plan := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+				plan.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Finalize: true}}
+				return plan
+			},
+			want: "finalizes namespaces [testapp]",
+		},
+		{
+			name: "direct execution",
+			member: func() *storage.Plan {
+				direct := alter
+				direct.ExecutionMode = "direct"
+				return memberPlanWithChange(direct)
+			},
+			want: "runs table \"users\" as direct-execution DDL",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{tc.member()}})
+
+			_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production"}, nil, "apply-converged-primary")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+			assert.Contains(t, err.Error(), tc.want)
+			applies, ok := svc.storage.Applies().(*capturingApplyStore)
+			require.True(t, ok)
+			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
+		})
+	}
+}

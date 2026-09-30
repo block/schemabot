@@ -27,6 +27,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -111,15 +112,18 @@ func requireNoApplies(t *testing.T, svc *api.Service, dbName string) {
 // Two targets planned against schemas of their own, where the reviewed primary
 // (eu) already has the column the PR adds and us does not. The plan check must
 // not pass on the primary's empty plan: it records the pending work on us. The
-// apply command must neither report "no changes" nor run us's statements, which
-// the comment never showed; it refuses, names the target still behind, and
-// leaves the check pending.
-func TestE2EConvergedPrimaryWithPendingTargetBlocksCheckAndApply(t *testing.T) {
+// apply command neither reports "no changes" nor runs anything yet: it pauses
+// for confirmation on a comment that shows us's own plan, with the check still
+// pending. Confirming runs us's own plan and settles eu, which has nothing to do.
+func TestE2EConvergedPrimaryWithPendingTargetAppliesAfterConfirmation(t *testing.T) {
 	dbName := "webhook_rollout_pending"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersWithEmailSchema},
 		{name: "us", liveSchema: usersBaseSchema},
 	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
 
 	runRolloutCommand(t, svc, dbName, "schemabot plan -e "+driftEnv)
 
@@ -130,16 +134,51 @@ func TestE2EConvergedPrimaryWithPendingTargetBlocksCheckAndApply(t *testing.T) {
 	assert.Empty(t, check.BlockingReason, "independent targets differing is not drift")
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "1 of 2 targets need this change")
+	body := awaitCommentContaining(t, apply, "Confirmation required")
 	assert.Contains(t, body, "The reviewed target already has this schema")
-	assert.Contains(t, body, "us", "the refusal names the target still behind")
-	assert.Contains(t, body, "nothing was applied")
+	assert.Contains(t, body, "ADD COLUMN `email`", "the comment shows the plan us would run")
+	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
 	assert.NotContains(t, body, "No schema changes detected")
 
 	requireNoApplies(t, svc, dbName)
 	check = rolloutCheck(t, svc, dbName)
-	assert.Equal(t, "action_required", check.Conclusion, "the refused apply leaves the check pending")
+	assert.Equal(t, "action_required", check.Conclusion, "the paused apply leaves the check pending")
 	assert.True(t, check.HasChanges)
+
+	runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+
+	var created *storage.Apply
+	require.Eventually(t, func() bool {
+		applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+		if err != nil {
+			return false
+		}
+		for _, a := range applies {
+			if a.Database == dbName {
+				created = a
+				return true
+			}
+		}
+		return false
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "the confirmation creates an apply")
+
+	operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
+	require.NoError(t, err)
+	byDeployment := map[string]*storage.ApplyOperation{}
+	for _, op := range operations {
+		byDeployment[op.Deployment] = op
+	}
+	require.Contains(t, byDeployment, "eu")
+	require.Contains(t, byDeployment, "us")
+	assert.Equal(t, state.ApplyOperation.Completed, byDeployment["eu"].State, "eu already has the column, so it runs nothing")
+
+	tasks, err := svc.Storage().Tasks().GetByApplyID(t.Context(), created.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1, "only us runs a statement")
+	require.NotNil(t, tasks[0].ApplyOperationID)
+	assert.Equal(t, byDeployment["us"].ID, *tasks[0].ApplyOperationID)
+	assert.Equal(t, "users", tasks[0].TableName)
+	assert.Contains(t, tasks[0].DDL, "ADD COLUMN `email`")
 }
 
 // The same rollout, planned automatically when the PR opens. The primary's own
@@ -208,8 +247,9 @@ func TestE2EConvergedRolloutApplyReportsNoChanges(t *testing.T) {
 // An operator confirms a plan in which the reviewed primary (eu) still needed
 // the change, and by the time they confirm eu has converged while us has not.
 // The confirm's re-plan of eu is empty, and apply-confirm must answer from the
-// whole rollout rather than that empty plan: it refuses, runs nothing on us,
-// releases the pending confirmation, and leaves the check pending.
+// whole rollout rather than that empty plan. The confirmed comment showed eu's
+// plan alone, never us's, so it refuses, runs nothing on us, releases the
+// pending confirmation, and leaves the check pending.
 func TestE2EApplyConfirmOnConvergedPrimaryWithPendingTargetRefuses(t *testing.T) {
 	dbName := "webhook_rollout_confirm"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
@@ -280,8 +320,9 @@ func (s *planResultFailingCheckStore) UpsertPlanResult(context.Context, *storage
 // carries a passing check from before. When storing the check record fails, a
 // command that finds us still needs the change must not leave that stale pass
 // as the PR's check: it publishes a failing check from the rollout round. A plan
-// scoped to one environment, a plan across every environment, and a refused
-// apply each store the record on a path of their own, so all three are covered.
+// scoped to one environment, a plan across every environment, and an apply
+// paused for confirmation each store the record on a path of their own, so all
+// three are covered.
 func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 	rollout := []deploymentSpec{
 		{name: "eu", liveSchema: usersWithEmailSchema},

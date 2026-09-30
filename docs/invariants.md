@@ -1482,7 +1482,9 @@ write-blocking DDL with no cutover to defer, require the operator to confirm the
 consequences disclosed to them. The re-plan that runs just before execution re-checks that
 verdict, so a plan that changed after the confirmation stops rather than running something the
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
+`pkg/webhook/apply_gating.go`), including the re-check that other rollout members' work is what the
+confirmation was given against (`confirmationCoversMemberWork` in
+`pkg/webhook/apply_member_work.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 

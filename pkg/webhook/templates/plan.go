@@ -418,7 +418,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(&sb, data.DeploymentDrift, data.Changes)
-	targetPlans := rendersTargetPlans(data.DeploymentDrift)
+	targetPlans := RendersTargetPlans(data.DeploymentDrift)
 	summary := data
 	if targetPlans {
 		writeTargetPlans(&sb, data, budget, false)
@@ -436,14 +436,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// genuinely unchanged one.
 	//
 	// A reviewed target with nothing to run while other targets still have work
-	// summarizes their plans instead, without the apply footer: a PR apply runs
-	// from the reviewed plan, and an empty one does not run the other targets'
-	// plans.
-	if totalChanges == 0 {
-		if targetPlans {
-			writePlanSummary(&sb, summary, summaryStatements, summaryKeyspaceUpdates)
-			return appendAgentHint(sb.String(), data.AgentHint)
-		}
+	// is not a no-op: the comment goes on to summarize their plans and offer the
+	// apply, which runs each of those targets' own plans.
+	if totalChanges == 0 && !targetPlans {
 		writeNoChangesDetected(&sb, data)
 		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
@@ -1439,7 +1434,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// targets that run it, with any change a target will refuse disclosed
 		// under that plan, which says everything this line and the per-target
 		// list would.
-		if rendersTargetPlans(drift) {
+		if RendersTargetPlans(drift) {
 			return
 		}
 		// Independent members were deliberately never compared to each other, so
@@ -1579,14 +1574,14 @@ func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeDa
 	return true
 }
 
-// rendersTargetPlans reports whether the comment renders the rollout's plans one
+// RendersTargetPlans reports whether the comment renders the rollout's plans one
 // group of targets at a time instead of the reviewed plan alone: a clean
 // rollout of independent targets in which some target still has work.
 //
 // Each such target applies its own plan, so the reviewed plan describes only
 // the targets that share it. Rendering it alone would leave a reviewer to
 // approve statements the comment never showed.
-func rendersTargetPlans(drift *DeploymentDriftData) bool {
+func RendersTargetPlans(drift *DeploymentDriftData) bool {
 	return drift != nil && drift.Computed && drift.Clean && drift.Independent && changingTargetCount(drift) > 0
 }
 
@@ -1660,7 +1655,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 // carries keeps the plan-wide section: a refused change is never left unsaid
 // because the two sources disagree.
 func targetPlansDiscloseBlocked(data PlanCommentData) bool {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return false
 	}
 	for _, g := range data.DeploymentDrift.Plans {
@@ -1726,7 +1721,7 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 // countCommentDDLBlocks counts the DDL sections a plan's comment renders: the
 // reviewed plan's, or every target plan's when the rollout renders them.
 func countCommentDDLBlocks(data PlanCommentData) int {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return countPlanDDLBlocks(data.Changes)
 	}
 	count := 0
@@ -2360,7 +2355,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(sb, plan.DeploymentDrift, plan.Changes)
-	targetPlans := rendersTargetPlans(plan.DeploymentDrift)
+	targetPlans := RendersTargetPlans(plan.DeploymentDrift)
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
@@ -2470,7 +2465,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
 			envsWithErrors = append(envsWithErrors, env)
-		} else if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
+		} else if plan, ok := data.Plans[env]; ok && plan != nil && environmentHasWork(plan) {
 			envsWithChanges = append(envsWithChanges, env)
 		}
 	}
@@ -2730,6 +2725,13 @@ func capitalizeEnvNames(envs []string) string {
 		caps[i] = capitalizeFirst(env)
 	}
 	return strings.Join(caps, " & ")
+}
+
+// environmentHasWork reports whether an environment's plan section offers an
+// apply: its reviewed plan has changes, or its reviewed target is already at the
+// desired schema while the section renders other targets' plans that do.
+func environmentHasWork(plan *PlanCommentData) bool {
+	return hasChanges(plan.Changes) || RendersTargetPlans(plan.DeploymentDrift)
 }
 
 // hasChanges returns true if there are any schema changes.
