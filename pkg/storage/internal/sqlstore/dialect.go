@@ -59,6 +59,13 @@ type Dialect interface {
 	// whose default column collation folds case or accents must force a binary
 	// comparison rather than inherit the column's collation.
 	BinaryEquals(column string) string
+	// BinaryCollation returns expression under a collation that compares
+	// byte-for-byte, so an equality between two such expressions holds only
+	// for identical bytes. Case-significant values such as operation keys,
+	// whose namespace and table components may differ only by case or accent,
+	// are compared through it where both sides are expressions rather than a
+	// bound placeholder (see BinaryEquals).
+	BinaryCollation(expression string) string
 	// JoinedUpdate returns an UPDATE that changes target rows selected through a
 	// join. Aliases qualify join and predicate expressions, while assignments to
 	// target columns must be unqualified so the statement is valid across
@@ -271,6 +278,13 @@ func (MySQLDialect) IndexHint(index string) string {
 // differently-spelled opaque values would match.
 func (MySQLDialect) BinaryEquals(column string) string {
 	return column + " COLLATE utf8mb4_0900_bin = ?"
+}
+
+// BinaryCollation applies the binary collation, for the same reason as
+// BinaryEquals: under the table default utf8mb4_0900_ai_ci, values that differ
+// only by case or accent compare equal.
+func (MySQLDialect) BinaryCollation(expression string) string {
+	return "(" + expression + ") COLLATE utf8mb4_0900_bin"
 }
 
 // JoinedUpdate builds a MySQL multi-table UPDATE statement.
@@ -496,6 +510,12 @@ func (PostgresDialect) IndexHint(string) string { return "" }
 // already compare equality byte-for-byte.
 func (PostgresDialect) BinaryEquals(column string) string {
 	return column + " = ?"
+}
+
+// BinaryCollation returns expression unchanged: PostgreSQL's deterministic
+// collations already compare equality byte-for-byte.
+func (PostgresDialect) BinaryCollation(expression string) string {
+	return expression
 }
 
 // JoinedUpdate builds a PostgreSQL UPDATE … FROM statement. The join condition

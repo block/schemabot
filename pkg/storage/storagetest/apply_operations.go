@@ -815,6 +815,201 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 	})
 
+	// FindNextApplyOperation_FinalizerScopedToItsNamespace verifies that a
+	// namespace's finalizer waits for, and is orphaned by, its own namespace's
+	// work only. Target orders-001 of a targets list runs ns_0 and ns_1 under
+	// rolling and continue. When one namespace's shard fails and the other's
+	// completes, the surviving namespace's finalizer starts, orders-002 waits
+	// for it to complete, and the failed namespace's finalizer never starts.
+	// A single-target apply keys the same rows without the target, and its
+	// surviving finalizer starts the same way.
+	t.Run("FindNextApplyOperation_FinalizerScopedToItsNamespace", func(t *testing.T) {
+		for _, shape := range []struct {
+			name        string
+			targetsList bool
+		}{
+			{name: "targets_list", targetsList: true},
+			{name: "single_target"},
+		} {
+			for _, failing := range []string{"ns_0", "ns_1"} {
+				t.Run(shape.name+"/"+failing+"_fails", func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+					lock := CreateLock(t, store, "operation_finalizer_scope_db", storage.DatabaseTypeVitess)
+					apply := CreateApply(t, store, lock, "apply_operation_finalizer_scope", 923)
+					insert := func(target, scopedKey, kind string) int64 {
+						t.Helper()
+						key := scopedKey
+						if shape.targetsList {
+							key = storage.TargetOperationKey(target, scopedKey)
+						}
+						id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+							ApplyID: apply.ID, Deployment: "orders", Target: target, OperationKey: key, OperationKind: kind,
+							CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureContinue,
+						})
+						require.NoError(t, err)
+						return id
+					}
+					work := map[string]int64{}
+					finalizers := map[string]int64{}
+					for _, namespace := range []string{"ns_0", "ns_1"} {
+						work[namespace] = insert("orders-001", storage.ShardOperationKey(namespace, "-80", "orders"), storage.ApplyOperationKindWork)
+					}
+					for _, namespace := range []string{"ns_0", "ns_1"} {
+						finalizers[namespace] = insert("orders-001", namespace+storage.OperationKeyDelimiter+state.GroupFinalizerKeySegment, storage.ApplyOperationKindGroupFinalizer)
+					}
+					var laterTarget int64
+					if shape.targetsList {
+						laterTarget = insert("orders-002", storage.ShardOperationKey("ns_0", "-80", "orders"), storage.ApplyOperationKindWork)
+					}
+					succeeding := "ns_1"
+					if failing == "ns_1" {
+						succeeding = "ns_0"
+					}
+
+					for _, want := range []int64{work["ns_0"], work["ns_1"]} {
+						claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+						require.NoError(t, err)
+						require.NotNil(t, claimed)
+						require.Equal(t, want, claimed.ID)
+					}
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, work[failing], "duplicate key name 'idx_orders_source'"))
+					require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, work[succeeding]))
+
+					finalizer, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					require.NoError(t, err)
+					require.NotNil(t, finalizer, "%s's finalizer starts: its own work completed", succeeding)
+					assert.Equal(t, finalizers[succeeding], finalizer.ID, "%s's failure neither blocks nor orphans %s's finalizer", failing, succeeding)
+
+					held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+					require.NoError(t, err)
+					assert.Nil(t, held, "nothing else starts while %s's finalizer runs: %s's finalizer is dead and orders-002 waits under rolling", succeeding, failing)
+
+					require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, finalizer.ID))
+					next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+					require.NoError(t, err)
+					if !shape.targetsList {
+						assert.Nil(t, next, "%s's finalizer never starts: its own work failed", failing)
+						return
+					}
+					require.NotNil(t, next, "orders-002 starts once orders-001's owed finalization completed")
+					assert.Equal(t, laterTarget, next.ID)
+					idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-d")
+					require.NoError(t, err)
+					assert.Nil(t, idle, "%s's finalizer never starts: its own work failed", failing)
+				})
+			}
+		}
+	})
+
+	// CutoverBlocker_OwedFinalizerOfAnotherNamespaceHoldsTheTurn verifies that
+	// another namespace's failure does not orphan a finalizer that is still
+	// owed. Target orders-001 of a targets list runs ns_0 and ns_1 under
+	// parallel and continue, and orders-002 is parked at the cutover. When one
+	// namespace's shard fails and the other's completes, the surviving
+	// namespace's finalizer has not run yet, so it holds orders-002's turn to
+	// cut over, while the failed namespace's finalizer, which will never start,
+	// does not.
+	t.Run("CutoverBlocker_OwedFinalizerOfAnotherNamespaceHoldsTheTurn", func(t *testing.T) {
+		for _, failing := range []string{"ns_0", "ns_1"} {
+			t.Run(failing+"_fails", func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "cutover_owed_finalizer_db", storage.DatabaseTypeVitess)
+				apply := CreateApply(t, store, lock, "apply_cutover_owed_finalizer", 924)
+				insert := func(target, scopedKey, kind string) int64 {
+					t.Helper()
+					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: "orders", Target: target,
+						OperationKey: storage.TargetOperationKey(target, scopedKey), OperationKind: kind,
+						CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue,
+					})
+					require.NoError(t, err)
+					return id
+				}
+				work := map[string]int64{}
+				finalizers := map[string]int64{}
+				for _, namespace := range []string{"ns_0", "ns_1"} {
+					work[namespace] = insert("orders-001", storage.ShardOperationKey(namespace, "-80", "orders"), storage.ApplyOperationKindWork)
+				}
+				for _, namespace := range []string{"ns_0", "ns_1"} {
+					finalizers[namespace] = insert("orders-001", namespace+storage.OperationKeyDelimiter+state.GroupFinalizerKeySegment, storage.ApplyOperationKindGroupFinalizer)
+				}
+				laterTarget := insert("orders-002", storage.ShardOperationKey("ns_0", "-80", "orders"), storage.ApplyOperationKindWork)
+				succeeding := "ns_1"
+				if failing == "ns_1" {
+					succeeding = "ns_0"
+				}
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, work[failing], "duplicate key name 'idx_orders_source'"))
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, work[succeeding]))
+				require.NoError(t, store.ApplyOperations().UpdateState(ctx, laterTarget, state.ApplyOperation.WaitingForCutover))
+
+				blocker, err := store.ApplyOperations().CutoverBlocker(ctx, laterTarget)
+				require.NoError(t, err)
+				require.NotNil(t, blocker, "orders-001 still owes %s's finalization", succeeding)
+				assert.Equal(t, finalizers[succeeding], blocker.ID, "%s's pending finalizer holds orders-002's cutover", succeeding)
+				held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+				require.NoError(t, err)
+				assert.Nil(t, held, "orders-002 does not cut over while %s's finalizer is owed", succeeding)
+
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, finalizers[succeeding]))
+				blocker, err = store.ApplyOperations().CutoverBlocker(ctx, laterTarget)
+				require.NoError(t, err)
+				assert.Nil(t, blocker, "%s's finalizer, orphaned by its own failed work, does not hold the turn", failing)
+			})
+		}
+	})
+
+	// Finalizer_ScopeComparesByteForByte verifies that a finalizer's scope
+	// matches work keys byte-for-byte on every dialect, as
+	// state.FinalizerFinalizesWork does, even where the storage collation
+	// folds case and accents. Target orders-001 of a targets list has two
+	// namespaces whose names differ only by case (or accent): one has shard
+	// work, and the other has only a VSchema change, so only a finalizer.
+	// When the shard fails, the other namespace's finalizer is still owed: it
+	// holds orders-002's cutover turn, and it starts, because it neither waits
+	// for nor is orphaned by work in a different namespace.
+	t.Run("Finalizer_ScopeComparesByteForByte", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, workNamespace, finalizerNamespace string
+		}{
+			{name: "case", workNamespace: "Orders", finalizerNamespace: "orders"},
+			{name: "accent", workNamespace: "café", finalizerNamespace: "cafe"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "finalizer_scope_bytes_db", storage.DatabaseTypeVitess)
+				apply := CreateApply(t, store, lock, "apply_finalizer_scope_bytes", 925)
+				insert := func(target, scopedKey, kind string) int64 {
+					t.Helper()
+					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: "orders", Target: target,
+						OperationKey: storage.TargetOperationKey(target, scopedKey), OperationKind: kind,
+						CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue,
+					})
+					require.NoError(t, err)
+					return id
+				}
+				work := insert("orders-001", storage.ShardOperationKey(tc.workNamespace, "-80", "orders"), storage.ApplyOperationKindWork)
+				finalizer := insert("orders-001", tc.finalizerNamespace+storage.OperationKeyDelimiter+state.GroupFinalizerKeySegment, storage.ApplyOperationKindGroupFinalizer)
+				laterTarget := insert("orders-002", storage.ShardOperationKey("ns_0", "-80", "orders"), storage.ApplyOperationKindWork)
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, work, "duplicate key name 'idx_orders_source'"))
+				require.NoError(t, store.ApplyOperations().UpdateState(ctx, laterTarget, state.ApplyOperation.WaitingForCutover))
+
+				blocker, err := store.ApplyOperations().CutoverBlocker(ctx, laterTarget)
+				require.NoError(t, err)
+				require.NotNil(t, blocker, "%s's failed work does not orphan %s's finalizer", tc.workNamespace, tc.finalizerNamespace)
+				assert.Equal(t, finalizer, blocker.ID, "%s's owed finalizer holds orders-002's cutover", tc.finalizerNamespace)
+
+				claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, claimed, "%s's finalizer does not wait for %s's work", tc.finalizerNamespace, tc.workNamespace)
+				assert.Equal(t, finalizer, claimed.ID)
+			})
+		}
+	})
+
 	// FindNextApplyOperation_BarrierHoldsLaterCopyBehindUnsettledFinalizer
 	// verifies which earlier finalizer states count as at the barrier. Both
 	// shards of payments-001 have completed. While payments-001's finalizer is
