@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"container/list"
 	"context"
 	"log/slog"
 	"sort"
@@ -303,16 +304,26 @@ const finalizerPlanCacheLimit = 1024
 // decides whether a Strata apply's comments take the single-deployment layout,
 // and one cache is shared by every comment render in the process (each
 // driver's observer, the aggregate terminal observer, and the summary repair),
-// so a failed read in a later render cannot switch the comments back to the
-// shard layout that earlier renders did not use. A nil cache reads storage on
-// every call.
+// so within a process a failed read in a later render cannot switch the
+// comments back to the shard layout that earlier renders did not use. A full
+// cache evicts the plan rendered longest ago, so an apply still in flight,
+// which renders on every progress tick, keeps its entry. A nil cache reads
+// storage on every call.
 type finalizerPlanCache struct {
-	mu     sync.Mutex
-	byPlan map[int64]*shardedFinalizerPlan
+	mu sync.Mutex
+	// recent orders the cached plans from most to least recently rendered.
+	recent *list.List
+	byPlan map[int64]*list.Element
+}
+
+// finalizerPlanCacheEntry is one cached plan in finalizerPlanCache.recent.
+type finalizerPlanCacheEntry struct {
+	planID int64
+	plan   *shardedFinalizerPlan
 }
 
 func newFinalizerPlanCache() *finalizerPlanCache {
-	return &finalizerPlanCache{byPlan: make(map[int64]*shardedFinalizerPlan)}
+	return &finalizerPlanCache{recent: list.New(), byPlan: make(map[int64]*list.Element)}
 }
 
 // resolve returns the cached finalizer view of the apply's stored plan, or
@@ -323,24 +334,48 @@ func (c *finalizerPlanCache) resolve(ctx context.Context, stor storage.Storage, 
 	if c == nil || !needsShardedFinalizerPlan(apply, ops) {
 		return resolveShardedFinalizerPlan(ctx, stor, apply, ops)
 	}
-	c.mu.Lock()
-	cached := c.byPlan[apply.PlanID]
-	c.mu.Unlock()
-	if cached != nil {
+	if cached := c.lookup(apply.PlanID); cached != nil {
 		return cached
 	}
 	plan := resolveShardedFinalizerPlan(ctx, stor, apply, ops)
 	if plan == nil {
 		return nil
 	}
+	return c.store(apply, plan)
+}
+
+// lookup returns the cached plan for planID, marking it the most recently
+// rendered, or nil when it is not cached.
+func (c *finalizerPlanCache) lookup(planID int64) *shardedFinalizerPlan {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.byPlan) >= finalizerPlanCacheLimit {
-		slog.Debug("finalizer plan cache is full; clearing it before caching this apply's plan",
-			append(apply.LogAttrs(), "cached_plans", len(c.byPlan))...)
-		clear(c.byPlan)
+	el, ok := c.byPlan[planID]
+	if !ok {
+		return nil
 	}
-	c.byPlan[apply.PlanID] = plan
+	c.recent.MoveToFront(el)
+	return el.Value.(*finalizerPlanCacheEntry).plan
+}
+
+// store caches a plan read for the apply and returns the cached plan: the one
+// passed in, or the one a concurrent render stored first. When the cache is
+// over its limit it evicts the plan rendered longest ago.
+func (c *finalizerPlanCache) store(apply *storage.Apply, plan *shardedFinalizerPlan) *shardedFinalizerPlan {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.byPlan[apply.PlanID]; ok {
+		c.recent.MoveToFront(el)
+		return el.Value.(*finalizerPlanCacheEntry).plan
+	}
+	c.byPlan[apply.PlanID] = c.recent.PushFront(&finalizerPlanCacheEntry{planID: apply.PlanID, plan: plan})
+	if c.recent.Len() > finalizerPlanCacheLimit {
+		oldest := c.recent.Back()
+		evicted := oldest.Value.(*finalizerPlanCacheEntry).planID
+		c.recent.Remove(oldest)
+		delete(c.byPlan, evicted)
+		slog.Debug("finalizer plan cache is full; evicted the plan rendered longest ago",
+			append(apply.LogAttrs(), "evicted_plan_id", evicted)...)
+	}
 	return plan
 }
 

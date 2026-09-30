@@ -3,8 +3,14 @@ package webhook
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -922,18 +928,94 @@ func TestFinalizerPlanCacheIsSharedAcrossObservers(t *testing.T) {
 	assert.Nil(t, separate.resolveFinalizerPlan(apply, ops), "an observer given no cache starts with its own")
 }
 
-// A full finalizer plan cache is cleared before it takes another plan, so a
-// long-lived process holds a bounded number of plans.
-func TestFinalizerPlanCacheStaysBounded(t *testing.T) {
+// A full finalizer plan cache evicts the plan rendered longest ago, so an apply
+// still in flight keeps its plan while a newer apply's plan is added.
+func TestFinalizerPlanCacheEvictsThePlanRenderedLongestAgo(t *testing.T) {
 	cache := newFinalizerPlanCache()
-	for id := int64(1); id <= finalizerPlanCacheLimit; id++ {
-		cache.byPlan[id] = &shardedFinalizerPlan{}
-	}
-	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: finalizerPlanCacheLimit + 1}
 	ops := []*storage.ApplyOperation{{OperationKey: "shop_001/-/orders"}, {OperationKey: "shop_001/group_finalizer"}}
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {Finalize: true}}}
+	readable := &stubPlanStorage{plan: plan}
+	failing := &stubPlanStorage{err: errors.New("storage down")}
+	applyFor := func(planID int64) *storage.Apply {
+		return &storage.Apply{ApplyIdentifier: fmt.Sprintf("apply-%d", planID), PlanID: planID}
+	}
 
-	require.NotNil(t, cache.resolve(t.Context(), &stubPlanStorage{plan: plan}, apply, ops))
-	assert.Len(t, cache.byPlan, 1)
-	assert.Contains(t, cache.byPlan, apply.PlanID)
+	for id := int64(1); id <= finalizerPlanCacheLimit; id++ {
+		require.NotNil(t, cache.resolve(t.Context(), readable, applyFor(id), ops))
+	}
+	inFlight := cache.resolve(t.Context(), failing, applyFor(1), ops)
+	require.NotNil(t, inFlight, "the first plan is still cached")
+
+	require.NotNil(t, cache.resolve(t.Context(), readable, applyFor(finalizerPlanCacheLimit+1), ops))
+	assert.Equal(t, finalizerPlanCacheLimit, cache.recent.Len())
+	assert.Len(t, cache.byPlan, finalizerPlanCacheLimit)
+	assert.Same(t, inFlight, cache.resolve(t.Context(), failing, applyFor(1), ops), "a plan rendered recently stays cached")
+	assert.Nil(t, cache.resolve(t.Context(), failing, applyFor(2), ops), "the plan rendered longest ago is evicted")
+	assert.NotNil(t, cache.resolve(t.Context(), failing, applyFor(finalizerPlanCacheLimit+1), ops), "the newest plan is cached")
+}
+
+// Every comment observer the package builds shares its handler's finalizer
+// plan cache, and only the cache reads the stored plan for a comment. An
+// observer config that omits the cache gets a private one, so its renders
+// would forget the plan the others read and could switch an apply's comments
+// between layouts; a direct plan read would bypass the cache the same way.
+//
+// The observer configs and plan reads are found by parsing the package rather
+// than listed here, so one added later is held to the same rule.
+func TestCommentRendersShareTheFinalizerPlanCache(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+
+	fset := token.NewFileSet()
+	configs, reads := 0, 0
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fset, path, nil, 0)
+		require.NoError(t, parseErr, path)
+
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			inCache := isFinalizerPlanCacheMethod(fn)
+			ast.Inspect(fn, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.CompositeLit:
+					if ident, ok := n.Type.(*ast.Ident); ok && ident.Name == "CommentObserverConfig" {
+						configs++
+						assert.True(t, litSetsField(n, "finalizerPlans"),
+							"%s builds a CommentObserverConfig without finalizerPlans; its observer would not share the handler's finalizer plan cache",
+							fset.Position(n.Pos()))
+					}
+				case *ast.CallExpr:
+					if ident, ok := n.Fun.(*ast.Ident); ok && ident.Name == "resolveShardedFinalizerPlan" {
+						reads++
+						assert.True(t, inCache,
+							"%s reads the stored finalizer plan directly; read it through finalizerPlanCache.resolve so every render shares the result",
+							fset.Position(n.Pos()))
+					}
+				}
+				return true
+			})
+		}
+	}
+	require.NotZero(t, configs, "found no CommentObserverConfig literals to check")
+	require.NotZero(t, reads, "found no finalizer plan reads to check")
+}
+
+// isFinalizerPlanCacheMethod reports whether fn is a method on
+// *finalizerPlanCache.
+func isFinalizerPlanCacheMethod(fn *ast.FuncDecl) bool {
+	if fn.Recv == nil || len(fn.Recv.List) != 1 {
+		return false
+	}
+	star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := star.X.(*ast.Ident)
+	return ok && ident.Name == "finalizerPlanCache"
 }
