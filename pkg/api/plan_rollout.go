@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -95,9 +96,10 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 // an apply cannot run on as planned.
 //
 // Members are grouped on the plan fingerprint, which two members share exactly
-// when their plans are the same work. A member that errored has no fingerprint
-// and no plan, and a mirrored member that diverged would still run the
-// primary's plan, so neither joins a group: each is listed for attention.
+// when their plans are the same work, together with the execution verdict each
+// change runs under (see planGroupKey). A member that errored has no
+// fingerprint and no plan, and a mirrored member that diverged would still run
+// the primary's plan, so neither joins a group: each is listed for attention.
 func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 	members := make([]routing.ExecutionTarget, len(rollup.Entries))
 	for i, e := range rollup.Entries {
@@ -124,11 +126,12 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 			continue
 		case DeploymentMatch, DeploymentPlanned:
 		}
-		group, ok := byPlan[e.PlanFingerprint]
+		key := planGroupKey(e)
+		group, ok := byPlan[key]
 		if !ok {
 			plan := planResponseFromProto(&ternv1.PlanResponse{Changes: e.ChangeSet.Changes, Shards: e.ChangeSet.Shards})
 			group = &apitypes.PlanMemberGroupResponse{Primary: i == 0, Changes: plan.Changes, Shards: plan.Shards}
-			byPlan[e.PlanFingerprint] = group
+			byPlan[key] = group
 			resp.Groups = append(resp.Groups, group)
 		}
 		group.Members = append(group.Members, names[i])
@@ -147,4 +150,33 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 		}
 	})
 	return resp
+}
+
+// planGroupKey is what two members share when one group describes both: the
+// same work, and the same execution verdict on every change. The fingerprint
+// alone is the work, and the direct execution policy judges each target's own
+// table, so two members can plan the same DDL while one runs it as native DDL
+// that blocks writes and the other through the engine. A group's changes carry
+// its first member's verdicts, so members whose verdicts differ are kept apart
+// rather than shown under verdicts that are not theirs. A verdict's reason is
+// not part of the key: it carries the member's own measurements, which differ
+// between members that run the same statement the same way.
+func planGroupKey(e DeploymentRollupEntry) string {
+	var verdicts []string
+	record := func(namespace, shard string, changes []*ternv1.TableChange) {
+		for _, tc := range changes {
+			if tc.GetExecutionMode() == "" {
+				continue
+			}
+			verdicts = append(verdicts, strings.Join([]string{namespace, shard, tc.GetTableName(), tc.GetExecutionMode()}, "\x00"))
+		}
+	}
+	for _, sc := range e.ChangeSet.Changes {
+		record(sc.GetNamespace(), "", sc.GetTableChanges())
+	}
+	for _, sp := range e.ChangeSet.Shards {
+		record(sp.GetNamespace(), sp.GetShard(), sp.GetChanges())
+	}
+	slices.Sort(verdicts)
+	return e.PlanFingerprint + "\x1e" + strings.Join(verdicts, "\x1e")
 }

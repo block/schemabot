@@ -121,6 +121,39 @@ func TestWritePlanBody_SixtyFourTargetRolloutSplitStatesCoverage(t *testing.T) {
 	assert.Contains(t, out, "prod/payments-041, prod/payments-042,")
 }
 
+// Two targets can run the same ALTER differently: the direct execution policy
+// judges each target's own table, so a small one runs it as native DDL that
+// blocks writes while a large one runs it through Spirit. Each group discloses
+// its own verdict, so the write-blocking statement is named under the target
+// that runs it and under no other.
+func TestWritePlanBody_RolloutDisclosesDirectExecutionUnderTheTargetThatRunsIt(t *testing.T) {
+	direct := addColumnTo("region")
+	direct[0].TableChanges[0].ExecutionMode = "direct"
+	direct[0].TableChanges[0].ModeReason = "table is 12 MiB, within the direct execution bound"
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     2,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: []string{"prod/payments-001"}, Primary: true, Changes: addColumnTo("region")},
+				{Members: []string{"prod/payments-002"}, Changes: direct},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	const notice = "Direct execution: runs as native MySQL DDL, not through Spirit, and blocks writes to the table while it runs:"
+	assert.Equal(t, 1, strings.Count(out, notice), "only the target that runs it natively discloses it:\n%s", out)
+	assertBefore(t, out, "▸ target prod/payments-002", notice)
+	assert.Contains(t, out, "1. orders: table is 12 MiB, within the direct execution bound", "%s", out)
+	first, _, found := strings.Cut(out, "▸ target prod/payments-002")
+	require.True(t, found)
+	assert.NotContains(t, first, notice, "the target running it through Spirit carries no disclosure")
+}
+
 // A member the server could not plan is named ahead of the plans, since no
 // plan below covers it and an apply will be refused until it is planned.
 func TestWritePlanBody_RolloutNamesUnplannedMembersFirst(t *testing.T) {

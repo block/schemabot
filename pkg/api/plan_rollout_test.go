@@ -63,6 +63,37 @@ func TestPlanRollout_MatchingTargetsShareAGroup(t *testing.T) {
 	assert.Equal(t, []string{"eu/testapp-001", "eu/testapp-002"}, rollout.Groups[0].Members)
 }
 
+// Targets that plan the same DDL but run it under different execution verdicts
+// are separate groups: the direct execution policy judges each target's own
+// table, and a group's changes carry one verdict for every member it names, so
+// a target whose change runs as write-blocking native DDL is never shown under
+// a target whose change runs through the engine.
+func TestPlanRollout_SameDDLUnderDifferentExecutionModesSplitsGroups(t *testing.T) {
+	ddl := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	direct := alterUsersDiff(ddl)
+	direct.Changes[0].TableChanges[0].ExecutionMode = "direct"
+	direct.Changes[0].TableChanges[0].ModeReason = "table is 12 MiB, within the direct execution bound"
+	svc := multiTargetService(t, &mockTernClient{planDiffResp: direct}, &recordingPlanStore{})
+
+	rollout, err := svc.planRollout(t.Context(), planDiffReq(t), reviewedUsersPlan(ddl),
+		&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
+	require.NoError(t, err)
+	require.NotNil(t, rollout)
+	require.Len(t, rollout.Groups, 2, "the same DDL under different verdicts is two groups")
+
+	assert.Equal(t, []string{"eu/testapp-001"}, rollout.Groups[0].Members)
+	require.Len(t, rollout.Groups[0].Changes, 1)
+	require.Len(t, rollout.Groups[0].Changes[0].TableChanges, 1)
+	assert.Empty(t, rollout.Groups[0].Changes[0].TableChanges[0].ExecutionMode)
+
+	assert.Equal(t, []string{"eu/testapp-002"}, rollout.Groups[1].Members)
+	require.Len(t, rollout.Groups[1].Changes, 1)
+	require.Len(t, rollout.Groups[1].Changes[0].TableChanges, 1)
+	tc := rollout.Groups[1].Changes[0].TableChanges[0]
+	assert.Equal(t, "direct", tc.ExecutionMode)
+	assert.Equal(t, "table is 12 MiB, within the direct execution bound", tc.ModeReason)
+}
+
 // A target that could not be planned joins no group: it is listed for
 // attention with a fixed detail, because the raw error can carry hostnames and
 // dial failures that do not belong in a response.

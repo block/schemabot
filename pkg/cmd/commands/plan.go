@@ -17,6 +17,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -386,6 +387,11 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database, schema.DialectForDatabaseType(result.DatabaseType))
 	}
 
+	// A direct-execution change runs as native DDL that blocks writes to its
+	// table for as long as it runs, so it is disclosed under the plan that runs
+	// it, with the reason the policy routed it there.
+	templates.WriteChangeNotice(glyph.Attention, "Direct execution: runs as native MySQL DDL, not through Spirit, and blocks writes to the table while it runs:", directChangeNotices(result))
+
 	// Check for unsafe changes and show with ⚠️ (attention — the changes await consent)
 	// Skip in apply context — apply shows its own 🚨 warning via WriteUnsafeWarningAllowed
 	unsafeChanges := result.UnsafeChanges()
@@ -414,6 +420,23 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WritePlanSummary(allChanges)
 	}
 	templates.WriteExemptTables(result.ExemptTables)
+}
+
+// directChangeNotices lists the plan's direct-execution changes one per table
+// and reason, so a statement that runs the same way on every shard is named
+// once.
+func directChangeNotices(result *apitypes.PlanResponse) []templates.UnsafeChange {
+	var notices []templates.UnsafeChange
+	seen := make(map[string]bool)
+	for _, tc := range result.DirectChanges() {
+		key := tc.TableName + "\x00" + tc.ModeReason
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		notices = append(notices, templates.UnsafeChange{Table: tc.TableName, Reason: tc.ModeReason, ChangeType: tc.ChangeType})
+	}
+	return notices
 }
 
 // hasResultChanges returns true if the result has schema changes (DDL or
