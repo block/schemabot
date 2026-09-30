@@ -578,10 +578,11 @@ func (s *applyOperationStore) ApplyIdentifierForRemoteApply(ctx context.Context,
 // It refuses empty IDs so callers do not convert a missing remote field into an
 // apparent successful correlation.
 //
-// The write is atomic with the deployment's one-remote-apply invariant: in one
-// transaction it locks the apply's operation rows, verifies the operation's
-// deployment records no remote apply id other than the one being stored, and
-// only then writes. Sibling operations of one deployment persist concurrently
+// The write is atomic with the rollout member's one-remote-apply invariant: in
+// one transaction it locks the apply's operation rows, verifies the operation's
+// member (its deployment, and its target where the deployment addresses
+// several) records no remote apply id other than the one being stored, and
+// only then writes. Sibling operations of one member persist concurrently
 // across the driver pool, so a check outside the writing transaction cannot
 // stop two of them from each seeing "no id recorded yet" and committing
 // divergent ids. Divergence — among the siblings themselves or between the
@@ -615,12 +616,12 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, opera
 	if current == nil {
 		return fmt.Errorf("apply_operation %d does not belong to apply %d: %w", operationID, applyID, storage.ErrApplyOperationNotFound)
 	}
-	sharedID, err := storage.DeploymentRemoteApplyID(ops, current.Deployment)
+	sharedID, err := storage.MemberRemoteApplyID(ops, current)
 	if err != nil {
 		return fmt.Errorf("refusing to store remote apply id %q for apply_operation %d: %w: %w", externalID, operationID, err, storage.ErrRemoteApplyDeploymentIDConflict)
 	}
 	if sharedID != "" && sharedID != externalID {
-		return fmt.Errorf("deployment %q of apply %d already correlates to remote apply %q; refusing to store %q for apply_operation %d: %w", current.Deployment, applyID, sharedID, externalID, operationID, storage.ErrRemoteApplyDeploymentIDConflict)
+		return fmt.Errorf("deployment %q (target %q) of apply %d already correlates to remote apply %q; refusing to store %q for apply_operation %d: %w", current.Deployment, current.Target, applyID, sharedID, externalID, operationID, storage.ErrRemoteApplyDeploymentIDConflict)
 	}
 
 	args := append([]any{externalID, operationID}, guard.args()...)

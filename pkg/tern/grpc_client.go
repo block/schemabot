@@ -1745,11 +1745,20 @@ type applyTaskScope struct {
 	tasklessOperation bool
 
 	// deploymentOperationKeys is the full operation-key set of the claimed
-	// operation's deployment, captured from the parent's operation rows at claim
-	// load. Deployment-keyed dispatches send it as the generation manifest so
-	// the data plane knows the whole generation from the first dispatch. Empty
-	// for whole-apply scopes.
+	// operation's rollout member (see memberTarget), captured from the parent's
+	// operation rows at claim load. Deployment-keyed dispatches send it as the
+	// generation manifest so the data plane knows the whole generation from the
+	// first dispatch. Empty for whole-apply scopes.
 	deploymentOperationKeys []string
+
+	// memberTarget is the claimed operation's target when its deployment
+	// addresses more than one target, and empty otherwise. A data-plane apply
+	// drives one target, so each target of such a deployment is its own rollout
+	// member with its own remote apply: the target joins the idempotency key,
+	// narrows the generation manifest to its own operations, and travels on the
+	// dispatch so the data plane qualifies the operation key it derives exactly
+	// as the planner qualified the stored one.
+	memberTarget string
 }
 
 func wholeApplyTaskScope() applyTaskScope {
@@ -1855,6 +1864,20 @@ func (s applyTaskScope) generationOperationKeys() []string {
 	return s.deploymentOperationKeys
 }
 
+// stampMemberTarget names the dispatch's rollout member target on the request,
+// so the data plane derives the same target-qualified operation key the
+// planner stored. A scope with no member target leaves the request untouched,
+// keeping every single-target dispatch byte-for-byte what it was.
+func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
+	if s.memberTarget == "" {
+		return
+	}
+	if req.Options == nil {
+		req.Options = make(map[string]string)
+	}
+	req.Options[dispatchMemberTargetOption] = s.memberTarget
+}
+
 // dispatchState returns the state that governs the dispatch / ambiguity
 // decision. A multi-operation drive keys on the claimed operation's state: the
 // parent apply may already be running because a sibling deployment is active
@@ -1893,17 +1916,25 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		return applyTaskScope{}, fmt.Errorf("list operations for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	found := false
-	deploymentOperationKeys := make([]string, 0, len(ops))
 	for _, op := range ops {
 		if op.ID == applyOperationID {
 			found = true
 		}
-		if op.Deployment == operation.Deployment {
-			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
-		}
 	}
 	if !found {
 		return applyTaskScope{}, fmt.Errorf("apply_operation %d is not part of apply %s operation set", applyOperationID, apply.ApplyIdentifier)
+	}
+	memberTarget := ""
+	if storage.DeploymentAddressesSeveralTargets(ops, operation.Deployment) {
+		if operation.Target == "" {
+			return applyTaskScope{}, fmt.Errorf("apply_operation %d of apply %s names no target, but its deployment %q addresses several; refusing to dispatch work whose rollout member is unknown", applyOperationID, apply.ApplyIdentifier, operation.Deployment)
+		}
+		memberTarget = operation.Target
+	}
+	members := storage.RolloutMemberOperations(ops, operation)
+	deploymentOperationKeys := make([]string, 0, len(members))
+	for _, op := range members {
+		deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 	}
 	slices.Sort(deploymentOperationKeys)
 	return applyTaskScope{
@@ -1912,6 +1943,7 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		multiOperation:          len(ops) > 1,
 		operationLeaseOnly:      operationLeaseOnly(ctx),
 		deploymentOperationKeys: deploymentOperationKeys,
+		memberTarget:            memberTarget,
 	}, nil
 }
 
@@ -1954,6 +1986,12 @@ func operationLeaseOnly(ctx context.Context) bool {
 // completion gate would hold it open forever. An operation-scoped key gives
 // each retried operation its own remote apply that completes on its own work.
 //
+// A deployment that addresses several targets keys each target separately: a
+// data-plane apply drives one target, so a shared key would replay one target's
+// remote apply as its sibling's. The target is added only there, so every
+// other shape keeps the key it has always had and an apply in flight across an
+// upgrade re-dispatches under the key it first used.
+//
 // Whole-apply drives key on the parent apply alone and rotate on its attempt.
 // The tuple is hashed so the stored key stays within the column width and is
 // free of delimiter collisions between variable-length identifiers.
@@ -1963,7 +2001,11 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 		apply.ApplyIdentifier,
 	}
 	if scope.usesOperationRemoteResume() {
-		parts = append(parts, "deployment", scope.operation.Deployment, strconv.Itoa(scope.operation.Attempt))
+		parts = append(parts, "deployment", scope.operation.Deployment)
+		if scope.memberTarget != "" {
+			parts = append(parts, "target", scope.memberTarget)
+		}
+		parts = append(parts, strconv.Itoa(scope.operation.Attempt))
 		if scope.operation.Attempt > 0 {
 			parts = append(parts, "operation", scope.operation.OperationKey)
 		}
@@ -2006,10 +2048,11 @@ func verifyDispatchOperationKeyEcho(plan *storage.Plan, req *ternv1.ApplyRequest
 // write it to the claimed operation's external_id and never touch the parent
 // external_id, refusing to overwrite a different existing id so one deployment
 // can't clobber another deployment's remote apply id. Because deployment-keyed
-// dispatch attaches every sibling operation into the deployment's one
-// data-plane apply, all operations of a deployment must record the same remote
-// apply id — an id that disagrees with the deployment's recorded id is refused
-// fail-closed rather than giving one deployment two remote applies.
+// dispatch attaches every sibling operation into its rollout member's one
+// data-plane apply, all operations of a member (a deployment, or one target of
+// a deployment that addresses several) must record the same remote apply id —
+// an id that disagrees with the member's recorded id is refused fail-closed
+// rather than giving one member two remote applies.
 func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID, remoteOperationID string) error {
 	if remoteID == "" {
 		return fmt.Errorf("refusing to persist empty remote apply id for apply %s", apply.ApplyIdentifier)
@@ -2086,8 +2129,9 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 // remote apply id the deployment's sibling operations already recorded and
 // fails closed on any disagreement — either among the siblings themselves
 // (the planes diverged before this dispatch) or between the siblings and the
-// id this dispatch returned. Sibling deployments of the same apply are
-// exempt: they own their own remote applies.
+// id this dispatch returned. Other rollout members of the same apply — sibling
+// deployments, and sibling targets of a deployment that addresses several —
+// are exempt: they own their own remote applies.
 //
 // This read is unlocked, so it exists for precise triage logging on the
 // common divergence shapes; the authoritative check is the store's, which
@@ -2098,14 +2142,19 @@ func (c *GRPCClient) guardDeploymentRemoteApplyID(ctx context.Context, apply *st
 	if err != nil {
 		return fmt.Errorf("list operations of apply %s before storing remote apply id for deployment %q: %w", apply.ApplyIdentifier, current.Deployment, err)
 	}
-	peers := make([]*storage.ApplyOperation, 0, len(siblings))
-	for _, sib := range siblings {
+	// The member is resolved over every operation of the apply: whether the
+	// deployment addresses several targets is a property of the whole set, and
+	// deciding it without this operation's own row could fold a sibling target
+	// back into this one's member.
+	members := storage.RolloutMemberOperations(siblings, current)
+	peers := make([]*storage.ApplyOperation, 0, len(members))
+	for _, sib := range members {
 		if sib.ID == current.ID {
 			continue
 		}
 		peers = append(peers, sib)
 	}
-	sharedID, err := storage.DeploymentRemoteApplyID(peers, current.Deployment)
+	sharedID, err := storage.MemberRemoteApplyID(peers, current)
 	if err != nil {
 		c.applyLogger(apply).ErrorContext(ctx, "deployment's operations already record more than one remote apply id; refusing to store another until the planes agree",
 			append(apply.MutableLogAttrs(),
@@ -2564,6 +2613,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			IgnoreTables:            plan.IgnoreTables(),
 			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
 		}
+		scope.stampMemberTarget(req)
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
 			if isAmbiguousRemoteCallError(err) {
@@ -3401,6 +3451,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		// reached the control plane from anywhere else cannot grant one.
 		DirectExecution: DirectExecutionPolicyProto(driveOptions.DirectExecution),
 	}
+	scope.stampMemberTarget(req)
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		if isAmbiguousRemoteCallError(err) {
