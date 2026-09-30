@@ -131,6 +131,207 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
 	})
 
+	// insertTargetMembers inserts one work operation per target of a single
+	// deployment, the shape an environment-level targets list resolves to, and
+	// returns their IDs in list order.
+	insertTargetMembers := func(t *testing.T, store storage.Storage, applyID int64, cutoverPolicy, onFailure string, targets ...string) []int64 {
+		t.Helper()
+		ids := make([]int64, len(targets))
+		for i, target := range targets {
+			id, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+				ApplyID: applyID, Deployment: "payments-a", Target: target,
+				OperationKey:  storage.TargetOperationKey(target, ""),
+				OperationKind: storage.ApplyOperationKindWork,
+				CutoverPolicy: cutoverPolicy, OnFailure: onFailure,
+			})
+			require.NoError(t, err)
+			ids[i] = id
+		}
+		return ids
+	}
+
+	// FindNextApplyOperation_RollingOrdersTargetsOfOneDeployment verifies that
+	// the targets of one deployment are rollout members in their own right. A
+	// rolling rollout over payments-001..003 starts one target at a time, in
+	// list order, even though every target shares the deployment.
+	t.Run("FindNextApplyOperation_RollingOrdersTargetsOfOneDeployment", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_target_rolling_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_target_rolling", 910)
+		ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyRolling, storage.OnFailureHalt,
+			"payments-001", "payments-002", "payments-003")
+
+		for i, id := range ids {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "target %d is next in order", i+1)
+			assert.Equal(t, id, claimed.ID)
+			assert.Equal(t, fmt.Sprintf("payments-00%d", i+1), claimed.Target)
+
+			blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+			require.NoError(t, err)
+			assert.Nil(t, blocked, "no later target starts while payments-00%d is still running", i+1)
+
+			require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, id))
+		}
+	})
+
+	// FindNextApplyOperation_OnFailureGatesLaterTargets verifies that on_failure
+	// governs the targets of one deployment. When payments-001 fails, halt and
+	// pause keep payments-002 and payments-003 from starting, an operator's
+	// release lets a paused rollout go on to payments-002, and continue goes on
+	// to it without one.
+	t.Run("FindNextApplyOperation_OnFailureGatesLaterTargets", func(t *testing.T) {
+		for _, tc := range []struct {
+			name          string
+			onFailure     string
+			release       bool
+			laterAdmitted bool
+		}{
+			{name: "halt", onFailure: storage.OnFailureHalt},
+			{name: "pause", onFailure: storage.OnFailurePause},
+			{name: "pause_released", onFailure: storage.OnFailurePause, release: true, laterAdmitted: true},
+			{name: "continue", onFailure: storage.OnFailureContinue, laterAdmitted: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_target_failure_"+tc.name, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_target_failure_"+tc.name, 911)
+				ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyRolling, tc.onFailure,
+					"payments-001", "payments-002", "payments-003")
+
+				first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, first)
+				require.Equal(t, ids[0], first.ID)
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "duplicate key name 'idx_orders_source'"))
+
+				if tc.release {
+					_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+						ApplyID:     apply.ID,
+						Operation:   storage.ControlOperationRelease,
+						Status:      storage.ControlRequestPending,
+						RequestedBy: "operator-a",
+						Metadata:    []byte(`{}`),
+					})
+					require.NoError(t, err)
+				}
+
+				next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				if !tc.laterAdmitted {
+					assert.Nil(t, next, "on_failure %s keeps every later target from starting after payments-001 failed", tc.onFailure)
+					return
+				}
+				require.NotNil(t, next, "%s goes on to payments-002 after payments-001 failed", tc.name)
+				assert.Equal(t, ids[1], next.ID)
+				assert.Equal(t, "payments-002", next.Target)
+
+				afterNext, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+				require.NoError(t, err)
+				assert.Nil(t, afterNext, "payments-003 still waits for payments-002 under rolling")
+			})
+		}
+	})
+
+	// FindNextApplyOperation_ParallelStartsTargetsUpToCapAndCutsOverInOrder
+	// verifies a parallel rollout over the targets of one deployment. Copies
+	// start without waiting on earlier targets, bounded by the per-apply driver
+	// cap, so a third target queues until a slot frees. Cutover stays one target
+	// at a time in list order: payments-003 parked at the barrier does not cut
+	// over while payments-002, earlier in the list, is still parked.
+	t.Run("FindNextApplyOperation_ParallelStartsTargetsUpToCapAndCutsOverInOrder", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_target_parallel_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_target_parallel", 912)
+		targets := make([]string, storage.DefaultMaxDriversPerApply+1)
+		for i := range targets {
+			targets[i] = fmt.Sprintf("payments-00%d", i+1)
+		}
+		ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyParallel, storage.OnFailureHalt, targets...)
+
+		for i := range storage.DefaultMaxDriversPerApply {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "parallel starts %s while earlier targets still copy", targets[i])
+			assert.Equal(t, ids[i], claimed.ID)
+		}
+		capped, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, capped, "the last target queues behind the per-apply driver cap")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0]))
+		last := len(ids) - 1
+		queued, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, queued, "a freed driver slot starts the queued target")
+		assert.Equal(t, ids[last], queued.ID)
+
+		for _, id := range ids[1:] {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.WaitingForCutover))
+		}
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, cutover)
+		assert.Equal(t, ids[1], cutover.ID, "the earliest parked target cuts over first")
+
+		held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, held, "a later target does not cut over while an earlier one is mid-cutover")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[1]))
+		next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, next)
+		assert.Equal(t, ids[last], next.ID)
+	})
+
+	// FindNextApplyOperation_RollingKeepsOneTargetsShardsTogether verifies that
+	// ordering by member leaves one member's own work unordered. Under rolling,
+	// both shards of payments-001 start together, and payments-002's shards wait
+	// until both have completed.
+	t.Run("FindNextApplyOperation_RollingKeepsOneTargetsShardsTogether", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_target_shards_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_target_shards", 913)
+		ids := map[string][]int64{}
+		for _, target := range []string{"payments-001", "payments-002"} {
+			for _, shard := range []string{"-80", "80-"} {
+				id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+					ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+					OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shard, "orders")),
+					OperationKind: storage.ApplyOperationKindWork,
+					CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+				})
+				require.NoError(t, err)
+				ids[target] = append(ids[target], id)
+			}
+		}
+
+		for _, want := range ids["payments-001"] {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a target's shards start together")
+			assert.Equal(t, want, claimed.ID)
+		}
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids["payments-001"][0]))
+		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, blocked, "payments-002 waits for every shard of payments-001")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids["payments-001"][1]))
+		for _, want := range ids["payments-002"] {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			assert.Equal(t, want, claimed.ID)
+		}
+	})
+
 	// FindNextApplyOperation_CapsDriversPerApply verifies that one wide fan-out
 	// cannot take the whole driver pool. A sharded apply with more claimable
 	// shards than the cap allows occupies exactly the cap's worth of drivers, so

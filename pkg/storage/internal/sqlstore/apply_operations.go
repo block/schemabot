@@ -767,6 +767,22 @@ const releasedFailureExemptionSQL = `NOT (
 	)
 )`
 
+// earlierRolloutMemberSQL matches an earlier sibling that belongs to a
+// different rollout member than the candidate row. A rollout member is a
+// (deployment, target) pair: a deployments map gives each member its own
+// deployment, and a targets list gives each member its own target within one
+// deployment. Operations of the same member — one target's per-shard,
+// per-namespace work and its finalizers — share both columns, so they never
+// gate each other and drive in parallel. Every operation row stamps its
+// member's target at creation, and a row with no target (a single-target
+// shape) shares the empty value with its siblings, so the target half only
+// ever separates rows that name different targets. The fragment references
+// the apply_operations and earlier aliases and takes no placeholders.
+const earlierRolloutMemberSQL = `(
+	earlier.deployment <> apply_operations.deployment
+	OR earlier.target <> apply_operations.target
+)`
+
 // freshLeaseCountSQL counts the operation leases the candidate row's parent
 // apply already holds: sibling operations in an active state, owned by some
 // driver, whose heartbeat is still inside the staleness window. It is the
@@ -850,12 +866,13 @@ func releasedFailureExemptionArgs() []any {
 // rows are never claimed.
 //
 // Sibling ordering: a pending row's claimability is gated only on its earlier
-// siblings in an EARLIER deployment (rows of the same apply with a different
-// deployment and a lower created_at, id) along deployment_order — the order
-// materialized by the apply-create dual-write into row insertion order. Work
-// rows in the SAME deployment (the per-shard, per-namespace fan-out of a
-// sharded apply) do not gate each other, so a deployment's shard work drives
-// in parallel; the group_finalizer clause below still holds each namespace's
+// siblings in an EARLIER rollout member (rows of the same apply with a
+// different deployment or target and a lower created_at, id, see
+// earlierRolloutMemberSQL) along the resolved member order — deployment_order,
+// then each deployment's targets list, materialized by the apply-create
+// dual-write into row insertion order. Work rows of the SAME member (the
+// per-shard, per-namespace fan-out of a sharded target) do not gate each
+// other, so a member's shard work drives in parallel; the group_finalizer clause below still holds each namespace's
 // finalizer until that namespace's work siblings complete — and a namespace
 // whose only change is its VSchema (no shard work siblings) has its finalizer
 // claimable immediately, since there is no incomplete sibling to wait on. The
@@ -896,7 +913,7 @@ func releasedFailureExemptionArgs() []any {
 //
 // The gate applies only to starting a pending row; an already-active row
 // re-leasing a stale heartbeat is recovering work it already started, so it
-// is never re-gated. A single-operation apply has no earlier-deployment
+// is never re-gated. A single-operation apply has no earlier-member
 // sibling, so the gate is a no-op for it regardless of policy.
 //
 // Mirrors ApplyStore.ClaimApplyByID: SELECT ... FOR UPDATE SKIP LOCKED to
@@ -1138,7 +1155,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// no-task pending apply be claimed. Operation-level pending claimability is
 	// instead deployment-order-gated (the clause below), so a pending operation
 	// is already claimable the moment it is legal to start — once every
-	// earlier-deployment sibling has completed. A parent start request must not
+	// earlier-member sibling has completed. A parent start request must not
 	// relax that gate: adding an ungated pending-start clause would let a later
 	// deployment be claimed out of order while an earlier one is still
 	// non-completed, and
@@ -1166,7 +1183,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							SELECT 1
 							FROM apply_operations AS earlier
 							WHERE earlier.apply_id = apply_operations.apply_id
-								AND earlier.deployment <> apply_operations.deployment
+								AND `+earlierRolloutMemberSQL+`
 								AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 								AND (
 									(
