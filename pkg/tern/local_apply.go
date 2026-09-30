@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -990,17 +991,19 @@ func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Tas
 }
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic
-// doesn't crash the entire process. On panic, all tasks and the apply are marked failed.
-func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func() error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			errMsg := fmt.Sprintf("panic in apply goroutine: %v", r)
-			c.logger.Error(errMsg, apply.LogAttrs()...)
-			c.failApplyWithTasks(ctx, apply, tasks, errMsg)
-			err = fmt.Errorf("%s", errMsg)
-		}
-	}()
-	return fn()
+// doesn't crash the entire process. On panic, all tasks and the apply are marked
+// failed and the panic surfaces as a *panicsafe.Error, so the operator routes it
+// through its drive-panic handling (AV-5) rather than treating it as a transient
+// drive failure it should retry.
+func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func() error) error {
+	recovered, err := panicsafe.Catch(fn)
+	if recovered != nil {
+		errMsg := fmt.Sprintf("panic in apply goroutine: %v", recovered.Value)
+		c.logger.Error(errMsg, apply.LogAttrs()...)
+		c.failApplyWithTasks(ctx, apply, tasks, errMsg)
+		return recovered
+	}
+	return err
 }
 
 // groupedApplyMode classifies the grouped-apply strategy for a drive, for logs
@@ -1086,10 +1089,7 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 	}
 
 	return c.runWithRecovery(ctx, apply, tasks, func() error {
-		if err := c.executeApplySequential(ctx, apply, tasks, plan, options); err != nil {
-			return fmt.Errorf("execute sequential apply %s: %w", apply.ApplyIdentifier, err)
-		}
-		return nil
+		return c.executeApplySequential(ctx, apply, tasks, plan, options)
 	})
 }
 

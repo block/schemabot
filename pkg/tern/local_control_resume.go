@@ -418,6 +418,10 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			stoppedByUser = true
 			break
 		}
+		if action == taskAlreadyFailed {
+			failedTask = task
+			break
+		}
 		if action == taskSkip {
 			continue
 		}
@@ -1243,9 +1247,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		// A previous drive can have settled every task and exited before it
 		// recorded the apply's outcome, leaving requests the outcome moots
 		// pending. Settle them before the summary posts.
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-			return fmt.Errorf("settle pending control requests for grouped resume apply %s %s after final schema check: %w", apply.ApplyIdentifier, terminalState, err)
-		}
+		c.settleRequestsForStoredOutcome(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply)
 		c.notifyTerminalObserver(apply, allTasks)
 		return nil
 	}
@@ -2246,9 +2248,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		// recorded the apply's outcome, leaving requests the outcome moots
 		// pending. Settle them before the summary posts, since nothing later
 		// re-claims a completed apply to do it.
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-			return fmt.Errorf("settle pending control requests for resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
-		}
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}

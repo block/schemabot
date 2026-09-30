@@ -606,7 +606,10 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 //
 // It returns an error only when the drive settled the apply's outcome but could
 // not record it, so the caller knows the stored apply is still active and no
-// side effect of the outcome has run. A drive context that ends — an operator's
+// side effect of the outcome has run. Once the outcome is stored the poll
+// returns nil whatever happens to the side effects: a failed request
+// settlement is logged and left for the operator's post-drive settlement, and
+// the summary still posts. A drive context that ends — an operator's
 // stop cancelling the drive, a lost lease, the operator shutting down — is a
 // hand-back rather than a failure: the poll returns nil and the caller reads
 // its own context to learn why it stopped.
@@ -1109,12 +1112,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				"expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-			logger.Warn("failed to settle pending control requests after terminal progress reconciliation; current apply owner will exit for operator retry",
-				"error", err)
-			ps.terminalErr = fmt.Errorf("settle terminal requests for apply %s: %w", apply.ApplyIdentifier, err)
-			return true
-		}
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		switch {
 		case retryableFailure:
