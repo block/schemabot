@@ -190,12 +190,20 @@ func usableStatistic(v sql.NullInt64, column, schema, tableName string) (int64, 
 // bound stays cheap no matter how wrong the optimizer's estimate is; a return
 // value of limit+1 means "more than limit rows", not a total.
 func exactRowCountWithin(ctx context.Context, db *sql.DB, schema, tableName string, limit int64) (int64, error) {
-	query := fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM `%s`.`%s` LIMIT %d) bounded", schema, tableName, limit+1)
+	query := boundedRowCountQuery(schema, tableName, limit)
 	var count int64
 	if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count rows of `%s`.`%s` (bounded at %d): %w", schema, tableName, limit+1, err)
 	}
 	return count, nil
+}
+
+// boundedRowCountQuery builds the capped row-count query exactRowCountWithin
+// runs. Schema and table are escaped as identifiers, so a name containing a
+// backtick is counted as the table it names rather than altering the query.
+func boundedRowCountQuery(schema, tableName string, limit int64) string {
+	return fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s.%s LIMIT %d) bounded",
+		sqlescape.EscapeIdentifier(schema), sqlescape.EscapeIdentifier(tableName), limit+1)
 }
 
 // refusedModeDecision is how a statement the engine refuses will execute

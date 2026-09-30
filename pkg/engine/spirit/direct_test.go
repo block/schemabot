@@ -228,3 +228,15 @@ func TestUsableStatistic(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, "INDEX_LENGTH for `shop`.`orders` is negative (-1), treating it as unavailable", err.Error())
 }
+
+// The bounded row count caps its scan at one row past the policy bound and
+// escapes schema and table as identifiers, so a name containing a backtick
+// still counts the table it names instead of changing the statement.
+func TestBoundedRowCountQuery(t *testing.T) {
+	assert.Equal(t,
+		"SELECT COUNT(*) FROM (SELECT 1 FROM `shop`.`orders` LIMIT 1001) bounded",
+		boundedRowCountQuery("shop", "orders", 1000))
+	assert.Equal(t,
+		"SELECT COUNT(*) FROM (SELECT 1 FROM `sh``op`.`ord``ers` LIMIT 11) bounded",
+		boundedRowCountQuery("sh`op", "ord`ers", 10))
+}
