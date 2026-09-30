@@ -1845,10 +1845,19 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
 	}
 
+	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
+		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+
 	// An operator's pending cancel or stop decides whether this finalizer may
-	// start at all. It is consulted before the operation is marked started and
-	// before anything reaches the engine, the same way a work operation's drive
-	// consumes pending commands before it resumes its tasks.
+	// hand its VSchema to the engine at all, the same way a work operation's
+	// drive consumes pending commands before it resumes its tasks. The read is
+	// the drive's last storage access before the engine call, after the start
+	// is durable, so every command committed before the engine is reached is
+	// seen here. A command committed after it arrives while the finalizer is
+	// already handing its work to the engine: that is the in-flight case, and
+	// the apply's terminal settlement resolves it as outrun rather than
+	// dropping it.
 	if standDown, err := c.finalizerStandsDownForPendingControl(ctx, apply, op, namespace, resumeState != nil); standDown || err != nil {
 		return err
 	}
@@ -1862,10 +1871,6 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		"namespace_count", len(changes),
 		"database", apply.Database,
 	)
-	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
-		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
-	}
-
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
 		Database:      apply.Database,
 		PlanID:        plan.PlanIdentifier,
@@ -1909,11 +1914,15 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 
 // finalizerStandsDownForPendingControl answers an operator's pending cancel or
 // stop for a group_finalizer before the finalizer hands anything to the engine.
-// Cancel is consulted first because it is the stronger intent. A finalizer that
-// has not started settles its own operation row: cancelled for a cancel, and
-// for a stop the state the database type's stop settles to (stopped, or
-// cancelled where a stop cannot pause). The drive then stands down without
-// applying the VSchema.
+// Cancel is consulted first, in the order every drive consumes the two
+// (processPendingCancelOrStopControlRequest): a cancel is not forward progress
+// but an escalation of a pending stop, and the finalizer must settle the way
+// the apply's other operations do, since a finalizer left stopped under a
+// cancelled rollout would be resumable into publishing a VSchema for shard work
+// the operator threw away. A finalizer whose work has not reached the engine
+// settles its own operation row: cancelled for a cancel, and for a stop the
+// state the database type's stop settles to (stopped, or cancelled where a stop
+// cannot pause). The drive then stands down without applying the VSchema.
 //
 // The request itself stays pending. A finalizer owns only its own row, while
 // the command belongs to the whole apply: sibling operations still have to

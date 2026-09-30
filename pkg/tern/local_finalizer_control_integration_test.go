@@ -65,11 +65,29 @@ type finalizerControlFixture struct {
 
 const finalizerControlDDL = "ALTER TABLE `orders` ADD COLUMN `region` VARCHAR(32)"
 
-// newFinalizerControlFixture seeds the rollout with the ns_0 finalizer in
+// finalizerControlOptions varies the rollout a finalizer control test seeds.
+type finalizerControlOptions struct {
+	// databaseType is the rollout's database type; empty means Strata.
+	databaseType string
+	// wrapStorage, when set, wraps the storage the client under test drives
+	// through, so a test can interleave a concurrent writer with the drive.
+	wrapStorage func(storage.Storage) storage.Storage
+}
+
+// newFinalizerControlFixture seeds a Strata rollout with the ns_0 finalizer in
 // finalizerState, and returns a context carrying that finalizer's operation
 // lease alone.
 func newFinalizerControlFixture(t *testing.T, finalizerState string) *finalizerControlFixture {
 	t.Helper()
+	return newFinalizerControlFixtureWith(t, finalizerState, finalizerControlOptions{})
+}
+
+func newFinalizerControlFixtureWith(t *testing.T, finalizerState string, opts finalizerControlOptions) *finalizerControlFixture {
+	t.Helper()
+	databaseType := opts.databaseType
+	if databaseType == "" {
+		databaseType = storage.DatabaseTypeStrata
+	}
 	_, dsn := setupMySQLContainer(t)
 	setupStorageSchema(t, dsn)
 	cleanupTasks(t, dsn)
@@ -77,19 +95,23 @@ func newFinalizerControlFixture(t *testing.T, finalizerState string) *finalizerC
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	t.Cleanup(func() { utils.CloseAndLog(stor) })
+	clientStor := stor
+	if opts.wrapStorage != nil {
+		clientStor = opts.wrapStorage(stor)
+	}
 
 	eng := &finalizerControlEngine{}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	client, err := NewLocalClient(LocalConfig{
 		Database:  "orders",
-		Type:      storage.DatabaseTypeStrata,
+		Type:      databaseType,
 		TargetDSN: dsn,
 		EngineFactories: map[string]EngineFactory{
-			storage.DatabaseTypeStrata: func(LocalConfig, *slog.Logger) (engine.Engine, error) {
+			databaseType: func(LocalConfig, *slog.Logger) (engine.Engine, error) {
 				return eng, nil
 			},
 		},
-	}, stor, logger)
+	}, clientStor, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(client) })
 
@@ -106,7 +128,7 @@ func newFinalizerControlFixture(t *testing.T, finalizerState string) *finalizerC
 	plan := &storage.Plan{
 		PlanIdentifier: fmt.Sprintf("plan-finalizer-control-%d", now.UnixNano()),
 		Database:       "orders",
-		DatabaseType:   storage.DatabaseTypeStrata,
+		DatabaseType:   databaseType,
 		Deployment:     "orders",
 		Environment:    localClientTestEnvironment,
 		CreatedAt:      now,
@@ -122,7 +144,7 @@ func newFinalizerControlFixture(t *testing.T, finalizerState string) *finalizerC
 		ApplyIdentifier: fmt.Sprintf("apply-finalizer-control-%d", now.UnixNano()),
 		PlanID:          planID,
 		Database:        "orders",
-		DatabaseType:    storage.DatabaseTypeStrata,
+		DatabaseType:    databaseType,
 		Deployment:      "orders",
 		Environment:     localClientTestEnvironment,
 		State:           state.Apply.Running,
@@ -305,4 +327,106 @@ func TestLocalClient_InFlightFinalizerWithPendingCancelReattachesToEngineWork(t 
 	assert.Equal(t, "deploy-ns-0", applies[0].ResumeState.MigrationContext)
 	assert.Equal(t, state.ApplyOperation.Completed, f.finalizerState(t))
 	f.requireRequestPending(t, storage.ControlOperationCancel)
+}
+
+// On a database type whose stop cannot pause, a stop that lands before ns_0's
+// finalizer reaches the engine settles the finalizer cancelled, the single
+// stop-terminality outcome for that type, rather than a resumable stopped row
+// a later start could never honor.
+func TestLocalClient_FinalizerWithPendingStopSettlesCancelledWhereStopCannotPause(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{
+		databaseType: storage.DatabaseTypeVitess,
+	})
+	f.requestPending(t, storage.ControlOperationStop)
+
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
+
+	assert.Empty(t, f.eng.applies(), "a finalizer must not start while a stop is pending")
+	assert.Equal(t, state.ApplyOperation.Cancelled, f.finalizerState(t))
+	f.requireRequestPending(t, storage.ControlOperationStop)
+	f.requireParentUntouched(t)
+}
+
+// cancelOnStartStorage commits an operator's cancel at the moment the drive
+// marks its operation started, the latest a command can land before the
+// finalizer reaches the engine.
+type cancelOnStartStorage struct {
+	storage.Storage
+	apply *storage.Apply
+}
+
+func (s *cancelOnStartStorage) ApplyOperations() storage.ApplyOperationStore {
+	return &cancelOnStartOperations{ApplyOperationStore: s.Storage.ApplyOperations(), parent: s}
+}
+
+type cancelOnStartOperations struct {
+	storage.ApplyOperationStore
+	parent *cancelOnStartStorage
+}
+
+func (o *cancelOnStartOperations) MarkStarted(ctx context.Context, id int64) error {
+	_, alreadyPending, err := o.parent.Storage.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     o.parent.apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	if err != nil {
+		return fmt.Errorf("record concurrent cancel for apply %s: %w", o.parent.apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		return fmt.Errorf("concurrent cancel for apply %s was already pending", o.parent.apply.ApplyIdentifier)
+	}
+	return o.ApplyOperationStore.MarkStarted(ctx, id)
+}
+
+// An operator cancels the rollout while ns_0's finalizer is being claimed into
+// its drive: the cancel commits after the drive has loaded the finalizer and
+// just as it marks the operation started. The finalizer still stands down
+// cancelled without publishing ns_0's VSchema, because the drive reads pending
+// commands only once the start is durable, immediately before the engine call.
+func TestLocalClient_FinalizerHonorsCancelCommittedAsItStarts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	wrapper := &cancelOnStartStorage{}
+	f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{
+		wrapStorage: func(stor storage.Storage) storage.Storage {
+			wrapper.Storage = stor
+			return wrapper
+		},
+	})
+	wrapper.apply = f.apply
+
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
+
+	assert.Empty(t, f.eng.applies(), "a cancel committed before the engine call must keep the VSchema off the engine")
+	assert.Equal(t, state.ApplyOperation.Cancelled, f.finalizerState(t))
+	f.requireRequestPending(t, storage.ControlOperationCancel)
+	f.requireParentUntouched(t)
+}
+
+// An operator stops a sharded rollout and then escalates to cancel before the
+// stop is processed. The finalizer settles cancelled, the same outcome the
+// rollout's other operations reach by consuming the cancel first, so it is
+// never left stopped under a cancelled rollout where a start could resume it
+// into publishing ns_0's VSchema.
+func TestLocalClient_FinalizerWithPendingStopAndCancelSettlesCancelled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newFinalizerControlFixture(t, state.ApplyOperation.Running)
+	f.requestPending(t, storage.ControlOperationStop)
+	f.requestPending(t, storage.ControlOperationCancel)
+
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
+
+	assert.Empty(t, f.eng.applies(), "a cancelled finalizer must never hand its VSchema to the engine")
+	assert.Equal(t, state.ApplyOperation.Cancelled, f.finalizerState(t))
+	f.requireRequestPending(t, storage.ControlOperationCancel)
+	f.requireRequestPending(t, storage.ControlOperationStop)
+	f.requireParentUntouched(t)
 }

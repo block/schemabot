@@ -1082,10 +1082,14 @@ control paths (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`).
 Stop is the highest-priority intent. Once accepted, no actor may knowingly advance the apply
 toward deploy, cutover, or completion until the stop is processed: forward-progress commands are
 rejected while a stop pends, and contradictory intents are rejected at acceptance rather than
-resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the cutover paths
+resolved by drive ordering. Cancel is not forward progress: it halts at least as far as stop, so it
+is accepted while a stop pends and every drive consumes it ahead of the stop, as an escalation.
+*Enforced:* pending-stop checks in pollers and the cutover paths
 (`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`), and in the group_finalizer drive
 before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
-`pkg/tern/local_control_resume.go`); conflict rejection at request intake
+`pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
+(`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
+`pkg/tern/grpc_client.go`); conflict rejection at request intake
 (`pkg/api/control_handlers.go`).
 
 ### CO-5: The revert phase owns the outcome
