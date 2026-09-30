@@ -852,7 +852,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	} else if standDown {
 		return true
 	}
-	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+	if err := c.processPendingCutoverControlRequest(ctx, apply, tasks); err != nil {
 		logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
 		return true

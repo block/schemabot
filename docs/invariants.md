@@ -832,7 +832,11 @@ without completing the request would refuse the start the hold exists to preserv
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
-storage parity suite (`pkg/storage/storagetest/apply_operations.go`); for a manually deferred cutover, the turn
+storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
+dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
+same file), and each member's progress and cutover are scoped to its own operation
+(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+`pkg/tern/local_control.go`); for a manually deferred cutover, the turn
 check `CutoverBlocker` (same file, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake

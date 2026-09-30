@@ -771,6 +771,13 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
+	remoteOperationID, err := scope.remoteOperationScope()
+	if err != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, err.Error(), remoteID); failErr != nil {
+			return failErr
+		}
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("check pending stop request before pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
@@ -785,9 +792,10 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return err
 	}
 	resp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-		Caller:      controlReq.RequestedBy,
+		ApplyId:          remoteID,
+		Environment:      apply.Environment,
+		Caller:           controlReq.RequestedBy,
+		ApplyOperationId: remoteOperationID,
 	})
 	// Each branch where the data plane did not take the cutover restores the
 	// pre-cutover state before failing the request; if the restore write fails,
@@ -1128,7 +1136,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		}
 	}
 
-	progress, err := c.controlPathProgress(ctx, apply, remoteID)
+	progress, err := c.controlPathProgress(ctx, apply, remoteID, scope)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
@@ -1246,7 +1254,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logRemoteControlResend(ctx, logger, apply, controlReq, now)
 		}
 	}
-	progress, err := c.controlPathProgress(ctx, apply, remoteID)
+	progress, err := c.controlPathProgress(ctx, apply, remoteID, scope)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
@@ -1363,11 +1371,8 @@ func (c *GRPCClient) settleUndispatchedControlRequest(ctx context.Context, apply
 // reconciles a terminal remote ends the drive, so the regular poll loop never
 // runs again: a rejection the data plane settled after the last regular poll
 // reaches the operator only if it is mirrored from here.
-func (c *GRPCClient) controlPathProgress(ctx context.Context, apply *storage.Apply, remoteID string) (*ternv1.ProgressResponse, error) {
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+func (c *GRPCClient) controlPathProgress(ctx context.Context, apply *storage.Apply, remoteID string, scope applyTaskScope) (*ternv1.ProgressResponse, error) {
+	progress, err := c.remoteProgress(ctx, apply, scope, remoteID)
 	if err != nil {
 		return nil, err
 	}
@@ -1392,7 +1397,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.controlPathProgress(ctx, apply, remoteID)
+	progress, err := c.controlPathProgress(ctx, apply, remoteID, scope)
 	if err != nil {
 		logger.WarnContext(ctx, "remote gRPC stop error could not be reconciled from progress",
 			append(apply.MutableLogAttrs(),
@@ -1460,7 +1465,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.controlPathProgress(ctx, apply, remoteID)
+	progress, err := c.controlPathProgress(ctx, apply, remoteID, scope)
 	if err != nil {
 		logger.WarnContext(ctx, "remote gRPC cancel error could not be reconciled from progress",
 			append(apply.MutableLogAttrs(),
@@ -1878,6 +1883,53 @@ func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
 	req.Options[dispatchMemberTargetOption] = s.memberTarget
 }
 
+// remoteOperationScope returns the remote operation id this drive's Progress
+// and Cutover calls are scoped to, or "" when they address the whole remote
+// apply. A rollout member target shares its deployment's remote apply with its
+// sibling targets, so its progress is its own remote operation's and its
+// cutover is for that operation alone; every other drive keeps the
+// apply-level calls it always made. A member whose remote operation id was
+// never recorded cannot be told apart from its siblings, so it is refused.
+func (s applyTaskScope) remoteOperationScope() (string, error) {
+	if s.memberTarget == "" || s.operation == nil {
+		return "", nil
+	}
+	if s.operation.ExternalOperationID == "" {
+		return "", fmt.Errorf("rollout member target %s (apply_operation %d) has no remote operation id recorded; refusing to address the whole remote apply its sibling targets share", s.memberTarget, s.operation.ID)
+	}
+	return s.operation.ExternalOperationID, nil
+}
+
+// remoteProgress polls the remote apply for this drive, scoped to its remote
+// operation when the drive is a rollout member target (see
+// remoteOperationScope). A scoped answer that does not echo the operation came
+// from a data plane that answered for the whole apply, and it is refused
+// rather than read as this member's state.
+func (c *GRPCClient) remoteProgress(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (*ternv1.ProgressResponse, error) {
+	remoteOperationID, err := scope.remoteOperationScope()
+	if err != nil {
+		return nil, fmt.Errorf("poll remote apply %s for %s: %w", remoteID, apply.ApplyIdentifier, err)
+	}
+	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:          remoteID,
+		Environment:      apply.Environment,
+		ApplyOperationId: remoteOperationID,
+	})
+	if err != nil {
+		return resp, err
+	}
+	if remoteOperationID != "" && resp != nil && resp.GetApplyOperationId() != remoteOperationID {
+		c.applyLogger(apply).ErrorContext(ctx, "remote progress for a rollout member target did not come back scoped to its operation; refusing to read the whole remote apply as this member's",
+			append(apply.MutableLogAttrs(),
+				"remote_apply_id", remoteID,
+				"remote_operation_id", remoteOperationID,
+				"echoed_operation_id", resp.GetApplyOperationId(),
+				"member_target", scope.memberTarget)...)
+		return nil, fmt.Errorf("remote progress for apply %s operation %s came back scoped to %q; the data plane answered for the whole apply, which its sibling targets share", remoteID, remoteOperationID, resp.GetApplyOperationId())
+	}
+	return resp, nil
+}
+
 // dispatchState returns the state that governs the dispatch / ambiguity
 // decision. A multi-operation drive keys on the claimed operation's state: the
 // parent apply may already be running because a sibling deployment is active
@@ -2048,6 +2100,12 @@ func verifyDispatchOperationKeyEcho(plan *storage.Plan, req *ternv1.ApplyRequest
 	}
 	if resp.OperationKey != expectedKey {
 		return fmt.Errorf("remote apply %q echoed operation key %q, expected %q: the response does not address this dispatch's operation (data plane may predate sibling-operation attach)", resp.ApplyId, resp.OperationKey, expectedKey)
+	}
+	// A rollout member target shares its deployment's remote apply with its
+	// sibling targets, and its progress and cutover calls address its own
+	// remote operation. A response that names none leaves nothing to address.
+	if scope.memberTarget != "" && resp.ApplyOperationId == "" {
+		return fmt.Errorf("remote apply %q accepted rollout member target %q without naming its remote operation; its progress and cutover could not be told apart from its sibling targets'", resp.ApplyId, scope.memberTarget)
 	}
 	return nil
 }
@@ -2697,7 +2755,7 @@ func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply 
 	// Only start what the data plane still holds stopped. A start racing the
 	// drive that recorded the stop would otherwise restart an apply the data
 	// plane has already resumed, or one it has since failed.
-	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
+	resp, err := c.remoteProgress(ctx, apply, scope, remoteID)
 	if err != nil {
 		return false, fmt.Errorf("check stopped %s apply_operation %d (remote apply %s) before start: %w", kind, op.ID, remoteID, err)
 	}
@@ -2834,10 +2892,7 @@ func (c *GRPCClient) operationCutoverCaller(ctx context.Context, apply *storage.
 // when the remote was already terminal (reconciled here) or a raced stop took
 // ownership. It never writes the parent applies row directly.
 func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (poll bool, err error) {
-	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	resp, err := c.remoteProgress(ctx, apply, scope, remoteID)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			message := fmt.Sprintf("remote apply %s was not found by data plane during cutover preflight", remoteID)
@@ -2887,10 +2942,15 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return false, err
 	}
+	remoteOperationID, err := scope.remoteOperationScope()
+	if err != nil {
+		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %w", scope.applyOperationID, apply.ApplyIdentifier, remoteID, err)
+	}
 	cutoverResp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-		Caller:      c.operationCutoverCaller(ctx, apply),
+		ApplyId:          remoteID,
+		Environment:      apply.Environment,
+		Caller:           c.operationCutoverCaller(ctx, apply),
+		ApplyOperationId: remoteOperationID,
 	})
 	if err != nil {
 		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %w", scope.applyOperationID, apply.ApplyIdentifier, remoteID, err)
@@ -3002,10 +3062,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	if state.IsState(apply.State, state.Apply.Stopped) || startRequested {
 		oldState := apply.State
 		remoteStartRequested := false
-		resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-			ApplyId:     remoteID,
-			Environment: apply.Environment,
-		})
+		resp, err := c.remoteProgress(ctx, apply, scope, remoteID)
 		if err == nil {
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id during stopped-state check", apply.ExternalID)
@@ -4770,10 +4827,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 			// Poll progress from remote Tern
 			remoteID := scope.remoteApplyID(apply)
-			resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-				ApplyId:     remoteID,
-				Environment: apply.Environment,
-			})
+			resp, err := c.remoteProgress(ctx, apply, scope, remoteID)
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
 					message := fmt.Sprintf("remote apply %s was not found by data plane", remoteID)

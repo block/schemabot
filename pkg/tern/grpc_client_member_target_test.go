@@ -153,7 +153,7 @@ func dispatchOperationKey(plan *storage.Plan, req *ternv1.ApplyRequest) (string,
 // dispatch carries its own plan and DDL and lands on payments-002, and the
 // primary's lands on payments-001 by its stored plan.
 func TestMemberTargetDispatchRoutesToItsOwnTargetOnTheDataPlane(t *testing.T) {
-	server := &capturingTernServer{remoteApplyID: "remote-member"}
+	server := &capturingTernServer{remoteApplyID: "remote-member", remoteOperationID: "remote-op-member"}
 	grpcClient, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
 	fx := newMemberTargetFixture(t, grpcClient)
@@ -453,4 +453,117 @@ func TestTargetRouterDrivesEachTargetOfASharedApplyOnItsOwnConnection(t *testing
 	require.Len(t, owners, 2, "each target of the shared apply has an owner of its own")
 	assert.Equal(t, "payments-001", owners["payments-001"].key.target)
 	assert.Equal(t, "payments-002", owners["payments-002"].key.target)
+}
+
+// A member target's dispatch is only tracked once the data plane names the
+// remote operation it attached, since that id is what scopes the member's
+// progress and cutover away from its sibling targets'. A response that names
+// none is refused and nothing it carried is persisted, rather than leaving a
+// member that could only ever be polled as the whole shared apply.
+func TestGRPCClient_MemberTargetDispatchRefusesAResponseWithoutItsRemoteOperation(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-payments"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fx := newMemberTargetFixture(t, client)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, fx.apply, fx.second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `remote apply "remote-payments" accepted rollout member target "payments-002" without naming its remote operation`)
+
+	second := fx.operations.ops[fx.second]
+	assert.Empty(t, second.ExternalID, "an untrackable response's remote apply id must not be persisted")
+	assert.Empty(t, second.ExternalOperationID)
+	assert.Nil(t, server.getProgressRequest(), "a refused dispatch is never polled")
+}
+
+// Two member targets share their deployment's remote apply, so each polls
+// progress scoped to its own remote operation: payments-002's answer must not
+// carry payments-001's verdict or tables. The poll names the operation.
+func TestGRPCClient_MemberTargetPollsProgressScopedToItsOwnRemoteOperation(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-payments", remoteOperationID: "remote-op-002"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fx := newMemberTargetFixture(t, client)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, fx.apply, fx.second))
+
+	progressReq := server.getProgressRequest()
+	require.NotNil(t, progressReq, "the member's drive must poll its remote apply")
+	assert.Equal(t, "remote-payments", progressReq.ApplyId)
+	assert.Equal(t, "remote-op-002", progressReq.ApplyOperationId, "the poll must be scoped to this member's own remote operation")
+}
+
+// A data plane that answers a scoped poll for the whole shared apply, which
+// one rolled back to a build without per-operation progress does, is refused:
+// the poll is an error, so the member's drive counts it toward its error
+// streak and parks the member retryable rather than recording its sibling
+// targets' state as its own.
+func TestGRPCClient_MemberTargetRefusesProgressAnsweredForTheWholeApply(t *testing.T) {
+	server := &capturingTernServer{omitProgressScope: true, progressState: ternv1.State_STATE_COMPLETED, progressStateSet: true}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fx := newMemberTargetFixture(t, client)
+	op := fx.operations.ops[fx.second]
+	op.ExternalOperationID = "remote-op-002"
+	scope := applyTaskScope{applyOperationID: fx.second, operation: op, multiOperation: true, memberTarget: "payments-002"}
+
+	resp, err := client.remoteProgress(t.Context(), fx.apply, scope, "remote-payments")
+	require.Error(t, err)
+	assert.Nil(t, resp, "a whole-apply answer must never reach the member's state machine")
+	assert.Contains(t, err.Error(), `remote progress for apply remote-payments operation remote-op-002 came back scoped to ""`)
+	assert.Equal(t, "remote-op-002", server.getProgressRequest().ApplyOperationId, "the poll named the member's operation")
+}
+
+// A member target parked at its cutover swaps only its own table: the preflight
+// and the Cutover RPC both name its remote operation, so the data plane cuts
+// over this member and leaves its sibling targets parked. A deployment with a
+// single target keeps sending the unscoped calls it always has.
+func TestGRPCClient_MemberTargetCutoverNamesItsOwnRemoteOperation(t *testing.T) {
+	driveCutover := func(t *testing.T, memberTarget string) *capturingTernServer {
+		t.Helper()
+		server := &capturingTernServer{
+			cutoverAccepted:  true,
+			progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,
+			progressStateSet: true,
+		}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		t.Cleanup(cleanup)
+
+		apply := newCutoverDriveApply()
+		operationID, siblingID := int64(42), int64(43)
+		st, _, operationStore, _ := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.WaitingForCutover, "remote-payments")
+		client.storage = st
+		op := operationStore.ops[operationID]
+		if memberTarget != "" {
+			op.Target = memberTarget
+			op.ExternalOperationID = "remote-op-002"
+		}
+
+		scope := applyTaskScope{applyOperationID: operationID, operation: op, multiOperation: true, memberTarget: memberTarget}
+		poll, err := client.triggerRemoteOperationCutover(t.Context(), apply, scope, "remote-payments")
+		require.NoError(t, err)
+		assert.True(t, poll)
+		return server
+	}
+
+	t.Run("member target", func(t *testing.T) {
+		server := driveCutover(t, "payments-002")
+		assert.Equal(t, "remote-op-002", server.getProgressRequest().ApplyOperationId, "the preflight reads this member's own state")
+		cutoverReq := server.getCutoverRequest()
+		require.NotNil(t, cutoverReq)
+		assert.Equal(t, "remote-payments", cutoverReq.ApplyId)
+		assert.Equal(t, "remote-op-002", cutoverReq.ApplyOperationId, "the swap is bound to this member's own remote operation")
+	})
+
+	t.Run("single-target deployment", func(t *testing.T) {
+		server := driveCutover(t, "")
+		assert.Empty(t, server.getProgressRequest().ApplyOperationId)
+		cutoverReq := server.getCutoverRequest()
+		require.NotNil(t, cutoverReq)
+		assert.Empty(t, cutoverReq.ApplyOperationId, "a deployment with one target keeps the unscoped cutover every data plane accepts")
+	})
 }

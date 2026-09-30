@@ -658,7 +658,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				task.State = state.Task.Stopped
 				return taskStopped
 			}
-			if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+			if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
 				logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort

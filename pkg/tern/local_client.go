@@ -3276,9 +3276,69 @@ func (c *LocalClient) Metadata() map[string]string {
 	return maps.Clone(c.config.Metadata)
 }
 
+// recordedStateOverride returns the recorded state a progress answer reports
+// in place of the state its tasks derive: a setup phase, which task states
+// cannot express, and a retryable pause or terminal verdict, which the drive
+// records before every task row reflects it. Any other recorded state leaves
+// the task-derived state standing.
+func recordedStateOverride(taskDerived, recorded string) string {
+	switch {
+	case state.IsSetupPhase(recorded):
+		return recorded
+	case state.IsState(recorded, state.Apply.FailedRetryable):
+		return recorded
+	case state.IsTerminalApplyState(recorded):
+		return recorded
+	}
+	return taskDerived
+}
+
+// progressScopeOperation resolves the operation a progress request is scoped
+// to, or nil when the request asks about the whole apply. An id that does not
+// parse, names no operation, or names an operation of another apply is
+// refused: answering for the whole apply instead would report the rollout
+// member's siblings' work as its own.
+func (c *LocalClient) progressScopeOperation(ctx context.Context, apply *storage.Apply, applyOperationID string) (*storage.ApplyOperation, error) {
+	if applyOperationID == "" {
+		return nil, nil
+	}
+	op, err := c.applyOperationOfApply(ctx, apply, applyOperationID)
+	if err != nil {
+		return nil, fmt.Errorf("scope progress of apply %s to its operation: %w", apply.ApplyIdentifier, err)
+	}
+	return op, nil
+}
+
+// applyOperationOfApply loads the operation a control or progress request
+// names by the apply_operation_id a dispatch returned, and refuses an id that
+// does not belong to the apply the request addresses.
+func (c *LocalClient) applyOperationOfApply(ctx context.Context, apply *storage.Apply, applyOperationID string) (*storage.ApplyOperation, error) {
+	id, err := strconv.ParseInt(applyOperationID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, fmt.Errorf("apply_operation_id %q is not an operation id", applyOperationID)
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return nil, fmt.Errorf("apply operation store is not configured")
+	}
+	op, err := store.Get(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("load apply_operation %d: %w", id, err)
+	}
+	if op == nil {
+		return nil, fmt.Errorf("apply_operation %d does not exist", id)
+	}
+	if op.ApplyID != apply.ID {
+		return nil, fmt.Errorf("apply_operation %d belongs to another apply, not %s", id, apply.ApplyIdentifier)
+	}
+	return op, nil
+}
+
 // Progress returns detailed progress for an active schema change.
 // Returns ALL tasks for the current apply: completed, running, and pending.
 // req.ApplyId is required so progress is always scoped to a single apply.
+// A request that names an apply_operation_id is answered for that one
+// operation: its tasks, and its own row in place of the apply record.
 func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	var tasks []*storage.Task
 	var err error
@@ -3297,6 +3357,28 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	tasks, err = c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
+	}
+	scopedOp, err := c.progressScopeOperation(ctx, apply, req.GetApplyOperationId())
+	if err != nil {
+		return nil, err
+	}
+	if scopedOp != nil {
+		tasks = tasksForOperation(tasks, scopedOp.ID)
+		if len(tasks) == 0 {
+			c.logger.Info("Progress: serving a task-less operation from its own row",
+				append(scopedOp.LogAttrs(), "operation_state", scopedOp.State)...)
+			settled, err := c.settledControlRequests(ctx, apply)
+			if err != nil {
+				c.logger.Error("progress: serving a task-less operation without its apply's settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
+					append(scopedOp.LogAttrs(), "error", err)...)
+			}
+			return &ternv1.ProgressResponse{
+				State:                  storageStateToProto(scopedOp.State),
+				Engine:                 c.protoEngine(),
+				SettledControlRequests: settled,
+				ApplyOperationId:       req.GetApplyOperationId(),
+			}, nil
+		}
 	}
 	if len(tasks) == 0 {
 		// A task-less apply — e.g. a VSchema-only apply driven by a
@@ -3491,16 +3573,17 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// than what task states alone can derive. Check the apply record when
 	// tasks are still pending or when the overall state doesn't yet reflect
 	// real progress (e.g., engine returns "running" during setup).
-	if applyRec, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && applyRec != nil {
-		switch {
-		case state.IsSetupPhase(applyRec.State):
-			c.logger.Debug("Progress: overriding task-derived state with apply record setup phase",
+	//
+	// An answer scoped to one operation reads that operation's row instead:
+	// the apply record is the whole apply's verdict, and a sibling member's
+	// failure there must not read as this member's.
+	if scopedOp != nil {
+		overallState = recordedStateOverride(overallState, scopedOp.State)
+	} else if applyRec, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && applyRec != nil {
+		if overridden := recordedStateOverride(overallState, applyRec.State); overridden != overallState {
+			c.logger.Debug("Progress: overriding task-derived state with the apply record",
 				"task_derived", overallState, "apply_record", applyRec.State)
-			overallState = applyRec.State
-		case state.IsState(applyRec.State, state.Apply.FailedRetryable):
-			overallState = applyRec.State
-		case state.IsTerminalApplyState(applyRec.State):
-			overallState = applyRec.State
+			overallState = overridden
 		}
 	}
 
@@ -3531,6 +3614,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		Tables:       tables,
 		Summary:      summary,
 		ErrorMessage: errorMessage,
+	}
+	if scopedOp != nil {
+		resp.ApplyOperationId = req.GetApplyOperationId()
 	}
 
 	// Surface the engine's display metadata (e.g. PlanetScale branch_name,

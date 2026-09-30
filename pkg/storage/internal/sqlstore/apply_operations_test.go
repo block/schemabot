@@ -3651,6 +3651,61 @@ func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastRunningSib
 	assert.Equal(t, "region-b", claimed.Deployment)
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesMemberOrderToTheDispatcher
+// verifies that the copy-start gate between rollout members applies only
+// where the members were ordered: on an apply a dispatcher created (it carries
+// the dispatch's idempotency key), each member target arrives as its own
+// dispatch once the dispatcher has decided it may start, under the default
+// rolling policy the data plane's operations carry. Gating it again here
+// would serialize a parallel rollout and could strand a member behind a
+// sibling the dispatcher has already let fail. A keyless apply keeps the gate.
+func TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesMemberOrderToTheDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		idempotencyKey string
+		wantClaimed    bool
+	}{
+		{name: "apply ordered here", wantClaimed: false},
+		{name: "dispatched apply", idempotencyKey: "schemabot:v1:dispatched", wantClaimed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_op_member_order", 1)
+			if tc.idempotencyKey != "" {
+				_, err := testDB.ExecContext(ctx, `UPDATE applies SET idempotency_key = ? WHERE id = ?`, tc.idempotencyKey, apply.ID)
+				require.NoError(t, err)
+			}
+
+			// payments-001 is still copying (running, fresh so not
+			// stale-reclaimable); payments-002 is pending behind it. Both
+			// leave CutoverPolicy unset, so it resolves to rolling.
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-001", OperationKey: "payments-001",
+				State: state.ApplyOperation.Running,
+			})
+			require.NoError(t, err)
+			secondID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002",
+			})
+			require.NoError(t, err)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.wantClaimed {
+				assert.Nil(t, claimed, "a rolling member of an apply ordered here waits for the earlier member to complete")
+				return
+			}
+			require.NotNil(t, claimed, "a dispatched member starts when it arrives; the dispatcher already ordered it")
+			assert.Equal(t, secondID, claimed.ID)
+			assert.Equal(t, "payments-002", claimed.Target)
+		})
+	}
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling
 // verifies that parallel drops copy-phase ordering entirely: a terminal-failed
 // earlier sibling does not block a later deployment's copy start, because the
