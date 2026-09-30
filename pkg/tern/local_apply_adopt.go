@@ -61,7 +61,7 @@ func (c *LocalClient) adoptLiveApplyForDispatch(ctx context.Context, req *ternv1
 			append(apply.LogAttrs(), "error", err)...)
 		return nil, false
 	}
-	op, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	op, err := c.findApplyOperationByKey(ctx, apply, scope, operationKey)
 	if err != nil {
 		c.logger.Warn("adopt: failed to load the live apply's operation; the live apply keeps blocking the database",
 			append(apply.LogAttrs(), "operation_key", operationKey, "error", err)...)

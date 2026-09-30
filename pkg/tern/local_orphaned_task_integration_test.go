@@ -290,7 +290,7 @@ func TestLocalClient_StartRecoversAfterAStrandedTaskIsSettled(t *testing.T) {
 
 	// A conflict check on the same database settles the stranded task.
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	_, _, err = client.checkActiveTaskConflict(ctx, plan, localClientTestEnvironment, "", 0)
+	_, _, err = client.checkActiveTaskConflict(ctx, plan, localClientTestEnvironment, dispatchScope{}, 0)
 	require.NoError(t, err, "a settled task no longer holds the database")
 
 	settled, err := stor.Tasks().Get(ctx, stranded.TaskIdentifier)

@@ -18,14 +18,21 @@ import (
 )
 
 // checkActiveTaskConflict verifies there's no active schema change for this
-// database that would conflict with a new apply targeting dispatchShard.
+// database that would conflict with a new apply of the given dispatch scope.
 // Uses retry loop and engine verification to handle stale storage state.
 //
-// dispatchShard scopes the conflict to a single shard: a sharded apply is
+// The scope's shard scopes the conflict to a single shard: a sharded apply is
 // dispatched one shard at a time, and different shards of the same database are
 // distinct physical primaries that run concurrently by design, so a task on
-// another shard is not a conflict. dispatchShard is "" for a non-sharded apply,
+// another shard is not a conflict. The shard is "" for a non-sharded apply,
 // which conflicts with any active task on the database (today's behaviour).
+//
+// The scope's reserved target scopes the conflict to one target in the same
+// way: the targets of a deployment that addresses several are distinct
+// physical databases sharing one database name, and a parallel cutover policy
+// copies on several of them at once, so a task proven to run on another target
+// is not a conflict (see taskRunsOnAnotherTarget). Every other dispatch
+// reserves no target and conflicts across all of them.
 //
 // attachApplyID names the keyed apply a sibling dispatch is attaching into (0
 // when the dispatch creates a new apply). That apply's own tasks are the
@@ -46,7 +53,11 @@ import (
 // the dispatch — but it decides which released holders the dispatch may later
 // mark superseded (see markSupersededHolders): only work attributable to the
 // same environment and target is the dispatch's to take over.
-func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder, error) {
+func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment string, scope dispatchScope, attachApplyID int64) (blockingTask, []supersededHolder, error) {
+	if scope.memberTarget != "" && scope.reservedTarget == "" {
+		c.logger.Warn("conflict check: member dispatch names a target other than the plan's, so it reserves the whole database and every target's work blocks it",
+			"database", plan.Database, "plan_id", plan.PlanIdentifier, "member_target", scope.memberTarget, "plan_target", plan.Target)
+	}
 	memo := newConflictScanMemo()
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
@@ -54,9 +65,9 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 			return blockingTask{}, nil, fmt.Errorf("check existing tasks: %w", err)
 		}
 
-		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
+		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", scope.shard, "reserved_target", scope.reservedTarget, "attempt", attempt)
 
-		blocking, released := c.findBlockingTask(ctx, existingTasks, plan, environment, dispatchShard, attachApplyID, memo)
+		blocking, released := c.findBlockingTask(ctx, existingTasks, plan, environment, scope, attachApplyID, memo)
 		if !blocking.blocks() {
 			return blockingTask{}, released, nil
 		}
@@ -90,11 +101,14 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 // with the stopped applies whose resting tasks it released along the way.
 // As a side effect, resolves stale tasks by checking engine state.
 //
-// dispatchShard scopes the conflict to a single shard (see checkActiveTaskConflict):
-// when both the candidate apply and an existing task target a non-empty shard,
-// a different shard does not conflict, so a sharded fan-out runs its shards
-// concurrently instead of serializing on the first one.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64, memo *conflictScanMemo) (blockingTask, []supersededHolder) {
+// The scope's shard scopes the conflict to a single shard (see
+// checkActiveTaskConflict): when both the candidate apply and an existing task
+// target a non-empty shard, a different shard does not conflict, so a sharded
+// fan-out runs its shards concurrently instead of serializing on the first one.
+// The scope's reserved target does the same across the targets of one
+// deployment.
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, environment string, scope dispatchScope, attachApplyID int64, memo *conflictScanMemo) (blockingTask, []supersededHolder) {
+	dispatchShard := scope.shard
 	var released []supersededHolder
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
@@ -113,6 +127,10 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		// does not block this shard's apply. Only same-shard work, or work where
 		// either side is non-sharded (database-wide), can conflict.
 		if dispatchShard != "" && t.Shard != "" && t.Shard != dispatchShard {
+			continue
+		}
+
+		if c.taskRunsOnAnotherTarget(ctx, t, scope.reservedTarget, memo) {
 			continue
 		}
 
@@ -192,6 +210,7 @@ type conflictScanMemo struct {
 	resting          map[string]restingDecision
 	operationTargets map[int64]string
 	ownershipBlocks  map[string]struct{}
+	otherTarget      map[string]bool
 }
 
 // restingDecision is what one conflict check decided about a stopped task:
@@ -208,7 +227,47 @@ func newConflictScanMemo() *conflictScanMemo {
 		resting:          map[string]restingDecision{},
 		operationTargets: map[int64]string{},
 		ownershipBlocks:  map[string]struct{}{},
+		otherTarget:      map[string]bool{},
 	}
+}
+
+// taskRunsOnAnotherTarget reports whether a task provably runs on a target
+// other than reservedTarget, so it cannot conflict with a dispatch that holds
+// only that target. A task row records no target, so the answer comes from
+// the operation row that dispatched it, the same row the adoption gate and the
+// released-holder attribution read. It is true only when that row loads and
+// names a different target: a dispatch reserving no target, a task with no
+// readable operation, and an operation recording no target all answer false,
+// so the task keeps blocking (OW-7). The answer is storage-only and a target
+// never changes on an operation row, so it is decided once per check.
+func (c *LocalClient) taskRunsOnAnotherTarget(ctx context.Context, t *storage.Task, reservedTarget string, memo *conflictScanMemo) bool {
+	if reservedTarget == "" {
+		return false
+	}
+	if other, decided := memo.otherTarget[t.TaskIdentifier]; decided {
+		return other
+	}
+	other := false
+	op, err := c.taskOperation(ctx, t)
+	switch {
+	case err != nil:
+		c.logger.Warn("conflict check: failed to read the operation that owns the task, so its target is unknown and it keeps blocking this target's dispatch",
+			append(t.LogAttrs(), "reserved_target", reservedTarget, "error", err)...)
+	case op == nil:
+		c.logger.Warn("conflict check: task records no operation, so its target is unknown and it keeps blocking this target's dispatch",
+			append(t.LogAttrs(), "reserved_target", reservedTarget)...)
+	case op.Target == "":
+		c.logger.Warn("conflict check: task's operation records no target, so it keeps blocking this target's dispatch",
+			append(t.LogAttrs(), "reserved_target", reservedTarget, "apply_operation_id", op.ID)...)
+	case op.Target == reservedTarget:
+		c.logger.Debug("conflict check: task runs on the dispatch's own target", append(t.LogAttrs(), "reserved_target", reservedTarget)...)
+	default:
+		c.logger.Debug("conflict check: task runs on another target of the database, so it does not block this target's dispatch",
+			append(t.LogAttrs(), "reserved_target", reservedTarget, "task_target", op.Target)...)
+		other = true
+	}
+	memo.otherTarget[t.TaskIdentifier] = other
+	return other
 }
 
 // firstOwnershipBlock records that this scan refused to settle t for reason,

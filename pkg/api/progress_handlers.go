@@ -967,13 +967,7 @@ func (s *Service) statusOperationForDeployment(apply *storage.Apply, ops []*stor
 		CreatedAt:  matches[0].CreatedAt,
 		UpdatedAt:  matches[0].UpdatedAt,
 	}
-	externalID, err := storage.DeploymentExternalID(matches, deployment)
-	if err != nil {
-		s.logger.Warn("deployment operations record more than one data-plane apply id; status omits the external id",
-			append(apply.LogAttrs(), "operation_deployment", deployment, "error", err)...)
-	} else {
-		summary.ExternalID = externalID
-	}
+	summary.ExternalID = s.statusDeploymentExternalID(apply, matches, deployment)
 	for _, op := range matches {
 		states = append(states, op.State)
 		if summary.StartedAt == nil || (op.StartedAt != nil && op.StartedAt.Before(*summary.StartedAt)) {
@@ -991,6 +985,40 @@ func (s *Service) statusOperationForDeployment(apply *storage.Apply, ops []*stor
 	}
 	summary.State = state.DeriveApplyState(states)
 	return summary
+}
+
+// statusDeploymentExternalID is the external id of a deployment's folded
+// status row: the one data-plane apply its operations share, or "" when there
+// is no single one to show.
+//
+// A deployment that addresses several targets has one data-plane apply per
+// target by design, so its row carries none and the per-target ids stay in the
+// detail views. The ids are still checked per target, where they must agree,
+// so a divergence inside one target is logged the same way a divergence
+// inside a single-target deployment is.
+func (s *Service) statusDeploymentExternalID(apply *storage.Apply, matches []*storage.ApplyOperation, deployment string) string {
+	if !storage.DeploymentAddressesSeveralTargets(matches, deployment) {
+		externalID, err := storage.DeploymentExternalID(matches, deployment)
+		if err != nil {
+			s.logger.Warn("deployment operations record more than one data-plane apply id; status omits the external id",
+				append(apply.LogAttrs(), "operation_deployment", deployment, "error", err)...)
+			return ""
+		}
+		return externalID
+	}
+	byTarget := map[string][]*storage.ApplyOperation{}
+	for _, op := range matches {
+		byTarget[op.Target] = append(byTarget[op.Target], op)
+	}
+	for target, ops := range byTarget {
+		if _, err := storage.DeploymentExternalID(ops, deployment); err != nil {
+			s.logger.Warn("target operations record more than one data-plane apply id; status omits the external id",
+				append(apply.LogAttrs(), "operation_deployment", deployment, "operation_target", target, "error", err)...)
+		}
+	}
+	s.logger.Debug("deployment addresses several targets, each with its own data-plane apply; status row omits the external id",
+		append(apply.LogAttrs(), "operation_deployment", deployment, "target_count", len(byTarget))...)
+	return ""
 }
 
 func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOperation, deployment string) *apitypes.ActiveApplyResponse {

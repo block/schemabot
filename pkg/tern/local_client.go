@@ -2545,12 +2545,33 @@ const dispatchMemberTargetOption = "member_target"
 // DDL changes this dispatch drives, the single target shard of a shard-scoped
 // dispatch, whether the dispatch is a task-less VSchema finalizer, and the
 // rollout member target its operation key is qualified with.
+//
+// reservedTarget is the physical target the dispatch holds on its own, and is
+// set only for a member dispatch that reached the client serving its target:
+// the member target is the plan's target, which is the route this client
+// drives. Every other dispatch leaves it empty and holds the whole database
+// (see dispatchDeployment and checkActiveTaskConflict).
 type dispatchScope struct {
 	ddlChanges         []storage.TableChange
 	shard              string
 	finalizer          bool
 	finalizerNamespace string
 	memberTarget       string
+	reservedTarget     string
+}
+
+// dispatchDeployment is the deployment a dispatch's apply and operation rows
+// record, which is the unit the one-active-apply guard reserves (OW-5). A
+// member dispatch drives one target of a deployment that addresses several,
+// and its siblings copy on their own targets at the same time under a parallel
+// cutover policy, so it reserves its own target rather than the database the
+// siblings share. Every other dispatch reserves the database this client is
+// bound to, as it always has.
+func (c *LocalClient) dispatchDeployment(scope dispatchScope) string {
+	if scope.reservedTarget != "" {
+		return scope.reservedTarget
+	}
+	return c.config.Database
 }
 
 // deriveDispatchScope determines a dispatch request's scope. A sharded
@@ -2582,6 +2603,9 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 		return dispatchScope{}, err
 	}
 	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges(), memberTarget: memberTarget}
+	if memberTarget != "" && memberTarget == plan.Target {
+		scope.reservedTarget = memberTarget
+	}
 	if len(req.TargetShards) > 0 {
 		shard, err := dispatchTargetShard(req.TargetShards)
 		if err != nil {
@@ -2706,16 +2730,18 @@ func dispatchApplyResponse(apply *storage.Apply, operationID int64, operationKey
 	}
 }
 
-// findApplyOperationByKey returns the apply's operation row for this
-// deployment and operation key, or nil when the apply has no such operation.
-func (c *LocalClient) findApplyOperationByKey(ctx context.Context, apply *storage.Apply, operationKey string) (*storage.ApplyOperation, error) {
+// findApplyOperationByKey returns the apply's operation row for the
+// dispatch's deployment (see dispatchDeployment) and operation key, or nil when
+// the apply has no such operation.
+func (c *LocalClient) findApplyOperationByKey(ctx context.Context, apply *storage.Apply, scope dispatchScope, operationKey string) (*storage.ApplyOperation, error) {
 	store := c.storage.ApplyOperations()
 	if store == nil {
 		return nil, fmt.Errorf("apply operation store is not configured")
 	}
-	op, err := store.GetByApplyDeploymentAndOperationKey(ctx, apply.ID, c.config.Database, operationKey)
+	deployment := c.dispatchDeployment(scope)
+	op, err := store.GetByApplyDeploymentAndOperationKey(ctx, apply.ID, deployment, operationKey)
 	if err != nil {
-		return nil, fmt.Errorf("get apply_operation (deployment=%s, operation_key=%s) for apply %s: %w", c.config.Database, operationKey, apply.ApplyIdentifier, err)
+		return nil, fmt.Errorf("get apply_operation (deployment=%s, operation_key=%s) for apply %s: %w", deployment, operationKey, apply.ApplyIdentifier, err)
 	}
 	return op, nil
 }
@@ -2732,7 +2758,7 @@ func (c *LocalClient) dispatchIntoExistingApply(ctx context.Context, req *ternv1
 	if err != nil {
 		return nil, fmt.Errorf("derive operation identity for dispatch into apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	existing, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	existing, err := c.findApplyOperationByKey(ctx, apply, scope, operationKey)
 	if err != nil {
 		return nil, err
 	}
@@ -2827,7 +2853,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
 	// resolve into. Adoption is a create-path outcome only.
-	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
+	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope, apply.ID)
 	if err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -2860,7 +2886,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	now := time.Now()
 	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
 	operation := &storage.ApplyOperation{
-		Deployment:    c.config.Database,
+		Deployment:    c.dispatchDeployment(scope),
 		OperationKey:  operationKey,
 		OperationKind: operationKind,
 		Target:        plan.Target,
@@ -2874,7 +2900,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	case errors.Is(err, storage.ErrApplyOperationExists):
 		// A concurrent same-operation attach won the insert; the winner's row
 		// is this dispatch's replay target.
-		winner, lookupErr := c.findApplyOperationByKey(ctx, apply, operationKey)
+		winner, lookupErr := c.findApplyOperationByKey(ctx, apply, scope, operationKey)
 		if lookupErr != nil {
 			return nil, fmt.Errorf("resolve attach race for operation %s of apply %s: %w", operationKey, apply.ApplyIdentifier, lookupErr)
 		}
@@ -2992,7 +3018,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, 0)
+	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope, 0)
 	if conflictErr != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
@@ -3085,7 +3111,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		PlanID:                plan.ID,
 		Database:              plan.Database,
 		DatabaseType:          plan.DatabaseType,
-		Deployment:            c.config.Database,
+		Deployment:            c.dispatchDeployment(scope),
 		Repository:            plan.Repository,
 		PullRequest:           plan.PullRequest,
 		Environment:           req.Environment,

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"testing"
@@ -118,6 +119,39 @@ func TestStatusFoldOmitsDivergentDataPlaneApplyIDs(t *testing.T) {
 	require.NotNil(t, summary)
 	assert.Empty(t, summary.ExternalID)
 	assert.Equal(t, state.Apply.Running, summary.State)
+}
+
+// A deployment addressing targets payments-001 and payments-002 has one
+// data-plane apply per target. Its folded row has no single data-plane apply
+// to name, so it carries no external id, and the two ids are not reported as
+// a divergence between the planes; each target's id stays on its own
+// operation for the detail views. Two ids inside one target still are.
+func TestStatusFoldOmitsExternalIDForSeveralTargets(t *testing.T) {
+	var warnings bytes.Buffer
+	s := &Service{logger: slog.New(slog.NewTextHandler(&warnings, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-a"}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: 7, Deployment: "west", Target: "payments-001", OperationKey: "payments-001",
+			State: state.ApplyOperation.Running, ExternalID: "apply-remote-001"},
+		{ID: 2, ApplyID: 7, Deployment: "west", Target: "payments-002", OperationKey: "payments-002",
+			State: state.ApplyOperation.Completed, ExternalID: "apply-remote-002"},
+	}
+
+	summary := s.statusOperationForDeployment(apply, ops, "west")
+
+	require.NotNil(t, summary)
+	assert.Empty(t, summary.ExternalID)
+	assert.Equal(t, "apply-remote-001", ops[0].ExternalID)
+	assert.Equal(t, "apply-remote-002", ops[1].ExternalID)
+	assert.Equal(t, state.Apply.Running, summary.State)
+	assert.Empty(t, warnings.String(), "one data-plane apply per target is the design, not a divergence")
+
+	ops = append(ops, &storage.ApplyOperation{ID: 3, ApplyID: 7, Deployment: "west", Target: "payments-002",
+		OperationKey: "payments-002/ns_0", State: state.ApplyOperation.Running, ExternalID: "apply-remote-other"})
+	summary = s.statusOperationForDeployment(apply, ops, "west")
+	require.NotNil(t, summary)
+	assert.Empty(t, summary.ExternalID)
+	assert.Contains(t, warnings.String(), "operation_target=payments-002", "a divergence inside one target is still reported")
 }
 
 // Locally driven operations carry engine-owned resume state, not a data-plane

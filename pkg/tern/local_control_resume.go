@@ -1563,9 +1563,10 @@ func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*stor
 // shared by more than one tern, a claim of another tern's apply would
 // otherwise run that apply's DDL against this client's target. Every
 // legitimate drive reaches a client whose database matches the apply's
-// deployment (Apply stamps Deployment from the creating client's database;
-// routing resolves operation drives by their deployment) or the apply's
-// database (the target router builds per-target clients keyed by it), so a
+// deployment (Apply stamps Deployment from the creating client's database,
+// or from the member target it serves, see dispatchDeployment; routing
+// resolves operation drives by their deployment) or the apply's database (the
+// target router builds per-target clients keyed by it), so a
 // claim matching neither is foreign work. The refused apply stays claimable
 // by an operator whose client matches once its lease goes stale.
 func (c *LocalClient) guardDriveScope(apply *storage.Apply) error {

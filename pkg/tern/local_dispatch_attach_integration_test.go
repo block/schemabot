@@ -451,3 +451,62 @@ func TestLocalClient_Apply_MemberTargetDispatchKeysItsOperationByTarget(t *testi
 	require.NoError(t, err)
 	assert.Len(t, ops, 1, "the refused dispatch must not attach an operation")
 }
+
+// storeMemberTargetPlan stores a copy of the fixture plan planned for one
+// target, the plan each member of a deployment addressing several targets is
+// dispatched against on the data plane.
+func storeMemberTargetPlan(t *testing.T, stor storage.Storage, planID, target string) string {
+	t.Helper()
+	plan, err := stor.Plans().Get(t.Context(), planID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	member := *plan
+	member.ID = 0
+	member.PlanIdentifier = planID + "-" + target
+	member.Target = target
+	_, err = stor.Plans().Create(t.Context(), &member)
+	require.NoError(t, err)
+	return member.PlanIdentifier
+}
+
+// A deployment addresses targets payments-001 and payments-002 under a
+// parallel cutover policy capped at two drivers, so both targets' dispatches
+// arrive while the other's apply is still active. Each member reserves its own
+// target, so payments-002 is accepted beside payments-001 instead of being
+// refused as already in progress. A second dispatch of the same change for
+// payments-001 under a new key still meets payments-001's apply: it resolves
+// into that apply rather than starting another, so one target is never driven
+// twice.
+func TestLocalClient_Apply_MemberTargetsOfOneDeploymentRunInParallel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	firstPlan := storeMemberTargetPlan(t, stor, planID, "payments-001")
+	secondPlan := storeMemberTargetPlan(t, stor, planID, "payments-002")
+
+	first, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlan, "schemabot:v1:parallel-001", "payments-001"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "payments-001 must be accepted: %s", first.ErrorMessage)
+
+	second, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlan, "schemabot:v1:parallel-002", "payments-002"))
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "payments-002 must run beside payments-001: %s", second.ErrorMessage)
+	assert.NotEqual(t, first.ApplyId, second.ApplyId, "each target is its own data-plane apply")
+
+	for applyID, target := range map[string]string{first.ApplyId: "payments-001", second.ApplyId: "payments-002"} {
+		apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyID)
+		require.NoError(t, err)
+		require.NotNil(t, apply)
+		assert.Equal(t, state.Apply.Pending, apply.State)
+		assert.Equal(t, target, apply.Deployment, "a member apply reserves its own target")
+	}
+
+	again, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlan, "schemabot:v1:parallel-001-again", "payments-001"))
+	require.NoError(t, err)
+	require.True(t, again.Accepted, "the repeat dispatch must resolve into payments-001's apply: %s", again.ErrorMessage)
+	assert.Equal(t, first.ApplyId, again.ApplyId, "payments-001 must not get a second apply")
+	assert.Equal(t, first.ApplyOperationId, again.ApplyOperationId)
+}
