@@ -288,6 +288,8 @@ A multi-deployment environment is gated on every deployment agreeing with one re
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
 
+Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Rollout order does not apply within a member: its shards and tables are not ordered among themselves.
+
 ## Multi-Target Environment (preview)
 
 A database that lives on more than one target replaces the scalar `target` with a `targets` list. Each entry is one target the environment addresses, and rollout follows the listed order.
