@@ -487,10 +487,19 @@ takes the same flag and needs `-e` with it.
 
 A narrowed plan speaks for its one target. It never records a GitHub check
 result, so a narrowed plan or apply cannot pass a PR merge gate while other
-targets still need the change. A narrowed plan is only applied to the target
-it was made for, and a narrowed apply cannot be rolled back with `rollback`:
-restore that target by planning and applying the previous schema with the
-same `--target`.
+targets still need the change. The server records the narrowing on the stored
+plan and refuses to apply it anywhere but the target it was made for, and a
+narrowed apply cannot be rolled back with `rollback`: restore that target by
+planning and applying the previous schema with the same `--target`. In an
+environment with a single target, `--target` names the whole rollout, so the
+plan and apply are not narrowed.
+
+A plan of the whole rollout is made against its first target, and the other
+targets run that plan. When the first target is already at the desired schema,
+for example after an apply narrowed to it, the other targets can still need
+the change, so the plan is not reported as up to date: it fails with an error
+that lists the targets it did not plan. Plan and apply each of them with
+`--target`.
 
 ### Understand a refusal
 

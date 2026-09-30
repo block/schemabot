@@ -97,10 +97,19 @@ func rolloutMemberSelectors(members []routing.ExecutionTarget) []string {
 
 // resolveRolloutMember resolves a database/environment's rollout and narrows
 // it to the member a selector names.
-func (s *Service) resolveRolloutMember(database, environment, selector string) (routing.ExecutionTarget, error) {
+//
+// narrows reports whether the selection leaves any member out. Selecting the
+// only member of a single-member environment selects the whole rollout, so a
+// plan or apply made that way is not narrowed: it speaks for the rollout and
+// can be rolled back like any other.
+func (s *Service) resolveRolloutMember(database, environment, selector string) (member routing.ExecutionTarget, narrows bool, err error) {
 	members, err := s.config.ResolveDatabaseTargets(database, environment)
 	if err != nil {
-		return routing.ExecutionTarget{}, fmt.Errorf("resolve rollout members for %s/%s: %w", database, environment, err)
+		return routing.ExecutionTarget{}, false, fmt.Errorf("resolve rollout members for %s/%s: %w", database, environment, err)
 	}
-	return selectRolloutMember(database, environment, members, selector)
+	member, err = selectRolloutMember(database, environment, members, selector)
+	if err != nil {
+		return routing.ExecutionTarget{}, false, err
+	}
+	return member, len(members) > 1, nil
 }

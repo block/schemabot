@@ -87,6 +87,9 @@ func TestPlans(t *testing.T, h Harness) {
 			// A member planned against its own live schema is bound to the
 			// reviewed plan of its round; every store must carry that link.
 			PrimaryPlanIdentifier: "plan_reviewed",
+			// A plan narrowed to one rollout member is held to it at apply
+			// creation; every store must carry the narrowing.
+			NarrowedTo: "primary/commerce-target",
 			SchemaFiles: schema.SchemaFiles{
 				"commerce": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"}},
 			},
@@ -110,6 +113,7 @@ func TestPlans(t *testing.T, h Harness) {
 			assert.Equal(t, "staging", got.Environment)
 			assert.Equal(t, "sha_head", got.HeadSHA)
 			assert.Equal(t, "plan_reviewed", got.PrimaryPlanIdentifier)
+			assert.Equal(t, "primary/commerce-target", got.NarrowedTo)
 			require.Contains(t, got.SchemaFiles, "commerce")
 			assert.Equal(t, "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)",
 				got.SchemaFiles["commerce"].Files["users.sql"])
