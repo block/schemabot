@@ -382,3 +382,72 @@ func TestLocalClient_Apply_AttachNotBlockedByOwnSiblingTasks(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, ops, 2, "the same-shard sibling must attach as its own operation")
 }
+
+// memberTargetDispatchRequest is the whole-target dispatch the control plane
+// sends for one target of a deployment that addresses several: the target's
+// own idempotency key, a manifest declaring only its own operation, and the
+// target named so the data plane keys the operation by it.
+func memberTargetDispatchRequest(planID, key, target string) *ternv1.ApplyRequest {
+	return &ternv1.ApplyRequest{
+		PlanId:                  planID,
+		Environment:             localClientTestEnvironment,
+		Database:                "testdb",
+		Type:                    "mysql",
+		IdempotencyKey:          key,
+		GenerationOperationKeys: []string{target},
+		Options:                 map[string]string{dispatchMemberTargetOption: target},
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace:  "testdb",
+			TableName:  "users",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}
+}
+
+// A deployment addressing targets payments-001 and payments-002 dispatches
+// each target as its own whole-target operation. The data plane keys the
+// operation by the target, which is the key the planner stored and the
+// manifest declares, and echoes it; a replay resolves to the same operation.
+// A dispatch for payments-002 that arrives under payments-001's idempotency
+// key is refused by the manifest instead of being answered with
+// payments-001's operation, so one target is never tracked as another.
+func TestLocalClient_Apply_MemberTargetDispatchKeysItsOperationByTarget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:member-target-test"
+
+	first, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-001"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "the member dispatch must be accepted: %s", first.ErrorMessage)
+	assert.Equal(t, "payments-001", first.OperationKey, "the response must echo the target-qualified operation key")
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, []string{"payments-001"}, apply.ExpectedOperationKeys)
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, "payments-001", ops[0].OperationKey)
+	assert.Equal(t, strconv.FormatInt(ops[0].ID, 10), first.ApplyOperationId)
+
+	replay, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-001"))
+	require.NoError(t, err)
+	require.True(t, replay.Accepted, "replay must be accepted: %s", replay.ErrorMessage)
+	assert.Equal(t, first.ApplyOperationId, replay.ApplyOperationId, "replay must resolve to the original operation")
+	assert.Equal(t, "payments-001", replay.OperationKey)
+
+	aliased, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-002"))
+	require.NoError(t, err)
+	assert.False(t, aliased.Accepted, "a sibling target under another target's key must not be answered with that target's operation")
+	assert.Contains(t, aliased.ErrorMessage, "generation manifest")
+
+	ops, err = stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the refused dispatch must not attach an operation")
+}

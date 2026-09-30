@@ -1510,6 +1510,36 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, "remote-b", other.ExternalID)
 	})
 
+	// SaveExternalID_ScopesTheInvariantToTheTarget verifies that two targets of
+	// one deployment are two rollout members: each records its own remote apply
+	// ID, while a second ID for the same target is still refused.
+	t.Run("SaveExternalID_ScopesTheInvariantToTheTarget", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_external_id_targets_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_external_id_targets", 906)
+		firstID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "default", OperationKey: "payments-001", Target: "payments-001",
+		})
+		require.NoError(t, err)
+		secondID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "default", OperationKey: "payments-002", Target: "payments-002",
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, firstID, "remote-001"))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, secondID, "remote-002"),
+			"a second target of the deployment owns its own remote apply")
+		err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, secondID, "remote-001")
+		require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict,
+			"a target's operation cannot be moved onto its sibling target's remote apply")
+
+		second, err := store.ApplyOperations().Get(ctx, secondID)
+		require.NoError(t, err)
+		require.NotNil(t, second)
+		assert.Equal(t, "remote-002", second.ExternalID)
+	})
+
 	// ApplyIdentifierForRemoteApply_NamesTheApplyThisPlaneDispatched verifies the
 	// correlation an operator depends on when another change holds their
 	// database: the data plane names the holder by its own identifier, and this

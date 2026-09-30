@@ -2552,14 +2552,23 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 	return existing, nil
 }
 
+// dispatchMemberTargetOption is the dispatch option naming the rollout member
+// target of a deployment that addresses several targets. The control plane
+// sets it only for such a deployment, whose stored operation keys the planner
+// qualified with the target, so the data plane qualifies the key it derives
+// the same way. It is absent for every other dispatch.
+const dispatchMemberTargetOption = "member_target"
+
 // dispatchScope is the execution shape derived from a dispatch request: the
 // DDL changes this dispatch drives, the single target shard of a shard-scoped
-// dispatch, and whether the dispatch is a task-less VSchema finalizer.
+// dispatch, whether the dispatch is a task-less VSchema finalizer, and the
+// rollout member target its operation key is qualified with.
 type dispatchScope struct {
 	ddlChanges         []storage.TableChange
 	shard              string
 	finalizer          bool
 	finalizerNamespace string
+	memberTarget       string
 }
 
 // deriveDispatchScope determines a dispatch request's scope. A sharded
@@ -2586,7 +2595,11 @@ type dispatchScope struct {
 // Every other no-target-shard dispatch (a whole-deployment or non-sharded
 // apply) uses the stored plan unchanged.
 func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatchScope, error) {
-	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges()}
+	memberTarget, err := dispatchMemberTarget(req)
+	if err != nil {
+		return dispatchScope{}, err
+	}
+	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges(), memberTarget: memberTarget}
 	if len(req.TargetShards) > 0 {
 		shard, err := dispatchTargetShard(req.TargetShards)
 		if err != nil {
@@ -2612,8 +2625,25 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 	return scope, nil
 }
 
+// dispatchMemberTarget reads the rollout member target a dispatch names. The
+// target leads the operation key, so a target containing the key delimiter is
+// refused rather than stamped into a key no reader could split back.
+func dispatchMemberTarget(req *ternv1.ApplyRequest) (string, error) {
+	target := req.GetOptions()[dispatchMemberTargetOption]
+	if strings.Contains(target, storage.OperationKeyDelimiter) {
+		return "", fmt.Errorf("dispatch member target %q contains the operation key delimiter %q; refusing to stamp a key readers would misparse", target, storage.OperationKeyDelimiter)
+	}
+	return target, nil
+}
+
 // operationIdentityForDispatch returns the operation key and kind the dispatch
 // scope stores on its apply_operations row.
+//
+// A dispatch naming a rollout member target covers that whole target, and its
+// key is the target itself: the key the planner stored for the member, so the
+// operation attaches under a key its generation manifest declares. A
+// shard-scoped or finalizer dispatch that names one is refused, because the
+// shard and finalizer readers parse keys that carry no target.
 //
 // A shard-scoped dispatch tags its tasks with the target shard, so its
 // operation row must carry the matching shard operation key: the task loaders
@@ -2628,6 +2658,12 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 // the kind routes the claim to the finalizer drive instead of failing closed
 // on the empty task set.
 func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationKind string, err error) {
+	if scope.memberTarget != "" {
+		if scope.shard != "" || scope.finalizer {
+			return "", "", fmt.Errorf("dispatch for member target %q is shard-scoped or a group_finalizer; only whole-target work is keyed by target", scope.memberTarget)
+		}
+		return storage.TargetOperationKey(scope.memberTarget, ""), "", nil
+	}
 	if scope.shard != "" {
 		operationKey, err = shardScopedDispatchOperationKey(scope.ddlChanges, scope.shard)
 		if err != nil {
