@@ -628,26 +628,15 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		return false, nil
 	}
 
-	observer := NewCommentObserver(CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		DeferCutover:   options["defer_cutover"] == "true",
-		SupportChannel: h.supportChannel(),
-		CLIName:        h.cliName(),
-		Tenant:         h.deploymentTenant(),
-		EngineLogs:     h.engineLogReader(),
-		finalizerPlans: h.finalizerPlans,
-		Logger:         h.logger,
-		OnTerminalHook: func(a *storage.Apply) {
-			// refreshChecksForTerminalApply routes a completed rollback straight
-			// to action_required so the stored check state never passes through
-			// success while the PR's schema change is reverted on the target.
-			h.refreshChecksForTerminalApply(context.Background(), a, "rollback confirm")
-		},
-	})
+	observerCfg := h.commentObserverConfig(factory, repo, pr, installationID)
+	observerCfg.DeferCutover = options["defer_cutover"] == "true"
+	observerCfg.OnTerminalHook = func(a *storage.Apply) {
+		// refreshChecksForTerminalApply routes a completed rollback straight
+		// to action_required so the stored check state never passes through
+		// success while the PR's schema change is reverted on the target.
+		h.refreshChecksForTerminalApply(context.Background(), a, "rollback confirm")
+	}
+	observer := NewCommentObserver(observerCfg)
 	h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, observer)
 
 	// Execute apply with the rollback plan. The caller attributes the apply to

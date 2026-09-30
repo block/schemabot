@@ -18,10 +18,13 @@ func cliCommand(cliName, command string) string {
 
 // environmentFlag scopes a CLI command hint to environment, so a wrapper that
 // routes by environment reaches the right server. An unknown environment
-// renders the placeholder the operator fills in.
+// renders the placeholder the operator fills in. The placeholder is a bare
+// word rather than the <environment> of PR-comment usage lines: a terminal
+// command pasted unedited then fails as an unknown environment instead of the
+// shell reading "<environment" as an input redirect.
 func environmentFlag(environment string) string {
 	if environment == "" {
-		environment = "<environment>"
+		environment = "ENVIRONMENT"
 	}
 	return "-e " + environment
 }

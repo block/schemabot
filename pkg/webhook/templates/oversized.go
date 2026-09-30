@@ -19,6 +19,10 @@ type OversizedCommentData struct {
 	// CLIName is the tool name the notice's CLI command hint starts with, the
 	// server's cli_name. Empty renders the CLI's own default.
 	CLIName string
+	// Environment scopes the notice's CLI command hint to the environment the
+	// replaced comment is about. Empty, when the comment names no single
+	// environment, renders the placeholder.
+	Environment string
 }
 
 // FitGitHubComment returns body when GitHub will accept it once the poster's
@@ -28,8 +32,9 @@ type OversizedCommentData struct {
 // fences, truncation markers — exceeds the cap cannot be cut any further by
 // the DDL budget. Posting the notice keeps the PR's status surface visible
 // where a body GitHub rejects leaves it silent. cliName starts the notice's CLI
-// command hint.
-func FitGitHubComment(body, cliName string) (string, bool) {
+// command hint and environment scopes it; an empty environment renders the
+// placeholder.
+func FitGitHubComment(body, cliName, environment string) (string, bool) {
 	if len(body) <= commentBodyLimit {
 		return body, false
 	}
@@ -37,6 +42,7 @@ func FitGitHubComment(body, cliName string) (string, bool) {
 		Title:         headingLine(body),
 		RenderedBytes: len(body),
 		CLIName:       cliName,
+		Environment:   environment,
 	}), true
 }
 
@@ -62,7 +68,7 @@ func RenderOversizedComment(data OversizedCommentData) string {
 	fmt.Fprintf(&sb, "%s **This comment was too large to post.** SchemaBot rendered it at %s bytes and GitHub accepts at most %s in one comment, so this notice took its place. The schema change itself is unaffected; only this view of it is missing.\n\n",
 		glyph.Attention, ui.FormatNumber(int64(data.RenderedBytes)), ui.FormatNumber(int64(GitHubIssueCommentMaxChars)))
 	fmt.Fprintf(&sb, "**What to do next:** the desired schema is in this PR's schema files, and an apply's progress is available from the CLI with `%s`. The server logs record the rendering with this PR's identifiers.\n",
-		cliCommand(data.CLIName, "status "+environmentFlag("")))
+		cliCommand(data.CLIName, "status "+environmentFlag(data.Environment)))
 	writeSupportChannelOffer(&sb)
 	return sb.String()
 }

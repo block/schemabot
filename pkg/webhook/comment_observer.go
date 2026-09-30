@@ -1070,7 +1070,7 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 		return
 	}
 
-	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(body)); err != nil {
+	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(apply, body)); err != nil {
 		o.logError(apply, "observer: failed to edit comment", "error", err, "comment_state", commentState)
 		return
 	}
@@ -1662,7 +1662,7 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		return 0, false, false
 	}
 
-	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post comment", "error", err, "comment_state", commentState)
 		return 0, false, false
@@ -1691,11 +1691,15 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 	return commentID, true, true
 }
 
-// renderPRComment finishes a comment body for posting on the observed PR: an
-// oversized body is replaced with the notice that fits, then the support
-// footer is appended.
-func (o *CommentObserver) renderPRComment(body string) string {
-	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, body, o.cliName), o.supportChannel)
+// renderPRComment finishes a comment body about apply for posting on the
+// observed PR: an oversized body is replaced with the notice that fits, its CLI
+// hint scoped to the apply's environment, then the support footer is appended.
+func (o *CommentObserver) renderPRComment(apply *storage.Apply, body string) string {
+	environment := ""
+	if apply != nil {
+		environment = apply.Environment
+	}
+	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, environment, body, o.cliName), o.supportChannel)
 }
 
 // publishClaimedSummary posts the separate apply-level terminal summary
@@ -1729,7 +1733,7 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 		o.releaseSummaryClaim(ctx, apply)
 		return
 	}
-	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post claimed terminal summary; releasing claim",
 			"error", err)

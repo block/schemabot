@@ -182,7 +182,7 @@ func TestRenderRollbackMissingApplyID(t *testing.T) {
 	assert.Contains(t, rendered, "## Missing Apply ID")
 	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment>`")
 	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment>`")
-	assert.Contains(t, rendered, "`schemabot status -e <environment>`")
+	assert.Contains(t, rendered, "`schemabot status -e ENVIRONMENT`")
 	assert.NotContains(t, rendered, "--tenant")
 }
 
@@ -205,8 +205,8 @@ func TestRenderRollbackMissingApplyIDTenant(t *testing.T) {
 	rendered := RenderRollbackMissingApplyID("", "", "acme")
 	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> --tenant acme`")
 	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment> --tenant acme`")
-	assert.Contains(t, rendered, "or by running `schemabot status -e <environment>`.")
-	assert.NotContains(t, rendered, "status -e <environment> --tenant")
+	assert.Contains(t, rendered, "or by running `schemabot status -e ENVIRONMENT`.")
+	assert.NotContains(t, rendered, "status -e ENVIRONMENT --tenant")
 }
 
 func TestRenderRollbackApplyNotFound(t *testing.T) {

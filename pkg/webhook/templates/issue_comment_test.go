@@ -46,7 +46,7 @@ func TestRenderControlMissingApplyID(t *testing.T) {
 	rendered := RenderControlMissingApplyID("", "stop", "")
 	assert.Contains(t, rendered, "Missing Apply ID")
 	assert.Contains(t, rendered, "Usage: `schemabot stop <apply-id> -e <environment>`")
-	assert.Contains(t, rendered, "Use `schemabot status -e <environment>` to find the apply ID.")
+	assert.Contains(t, rendered, "Use `schemabot status -e ENVIRONMENT` to find the apply ID.")
 
 	// The status lookup is a CLI command, so it starts with the cli name and
 	// names the environment the command did; the usage line is the PR-comment

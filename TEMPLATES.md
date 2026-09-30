@@ -1953,7 +1953,7 @@ schemabot apply -e staging
 
 ⚠️ **This comment was too large to post.** SchemaBot rendered it at 84,801 bytes and GitHub accepts at most 65,536 in one comment, so this notice took its place. The schema change itself is unaffected; only this view of it is missing.
 
-**What to do next:** the desired schema is in this PR's schema files, and an apply's progress is available from the CLI with `schemabot status -e <environment>`. The server logs record the rendering with this PR's identifiers.
+**What to do next:** the desired schema is in this PR's schema files, and an apply's progress is available from the CLI with `schemabot status -e staging`. The server logs record the rendering with this PR's identifiers.
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
