@@ -83,7 +83,27 @@ func TestDriveTickSkipsTheClaimLadderAfterShutdown(t *testing.T) {
 	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
 	svc, _ := claimLadderService(ops)
 
-	svc.driveTick(cancelledContext(t), 1)
+	svc.driveTick(cancelledContext(t), 1, openClaimGate())
 
 	assert.Zero(t, ops.claims, "a tick that starts after shutdown must not claim")
 }
+
+// The same select can pick the ticker over an equally ready stop while the
+// context is still live: StopClaiming has returned, promising that this process
+// claims no new apply, and the listener drains are running. A ladder there
+// could claim a pending apply that StopOperator halts moments later and hands
+// to a peer, so a tick that finds the gate closed runs none.
+func TestDriveTickSkipsTheClaimLadderOnceClaimingStopped(t *testing.T) {
+	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
+	svc, _ := claimLadderService(ops)
+	stop := make(chan struct{})
+	close(stop)
+
+	svc.driveTick(t.Context(), 1, stop)
+
+	assert.Zero(t, ops.claims, "a tick that starts after the claim gate closed must not claim")
+}
+
+// openClaimGate is a claim gate that never closes, for ticks driven directly
+// by a test.
+func openClaimGate() <-chan struct{} { return make(chan struct{}) }

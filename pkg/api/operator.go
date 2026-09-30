@@ -634,7 +634,7 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 
 	s.logger.Debug("operator driver started", "driver", driverID)
 
-	s.driveTick(ctx, driverID)
+	s.driveTick(ctx, driverID, stop)
 
 	for {
 		select {
@@ -646,9 +646,9 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 			return
 		case <-wake:
 			s.logger.Debug("operator driver woke for queued apply", "driver", driverID)
-			s.driveTick(ctx, driverID)
+			s.driveTick(ctx, driverID, stop)
 		case <-ticker.C:
-			s.driveTick(ctx, driverID)
+			s.driveTick(ctx, driverID, stop)
 		}
 	}
 }
@@ -660,7 +660,10 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 // resumeClaimedApply seam, so a panic reaching this boundary comes from the
 // claim or projection machinery itself and leaves no apply marked failed —
 // that work is retried on a later tick.
-func (s *Service) driveTick(ctx context.Context, driverID int) {
+//
+// stop is the claim gate the driver was started with; a tick that finds it
+// closed runs no ladder.
+func (s *Service) driveTick(ctx context.Context, driverID int, stop <-chan struct{}) {
 	// The driver's select can pick a ready ticker over an equally ready
 	// ctx.Done(), so a tick can start after the operator has already been told
 	// to stop. Every claim it made would fail against the cancelled context and
@@ -668,6 +671,16 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 	if ctx.Err() != nil {
 		s.logger.Debug("operator: skipping the claim ladder; the operator is shutting down", "driver", driverID)
 		return
+	}
+	// The same select can pick the ticker over an equally ready stop, and the
+	// context is still live then: StopClaiming has returned with its promise
+	// that no new apply is claimed, while the listener drains run. A ladder
+	// here could claim a pending apply that StopOperator halts moments later.
+	select {
+	case <-stop:
+		s.logger.Debug("operator: skipping the claim ladder; claiming has stopped", "driver", driverID)
+		return
+	default:
 	}
 	err := panicsafe.Call(func() error {
 		s.recoverApplies(ctx, driverID)
