@@ -626,7 +626,7 @@ Response excerpt (illustrative values):
   "apply_id": "apply-example-73",
   "database": "shop",
   "environment": "production",
-  "engine": "spirit",
+  "engine": "Spirit",
   "state": "running",
   "tables": [
     {
@@ -708,7 +708,7 @@ Response excerpt (illustrative values):
   "apply_id": "apply-example-74",
   "database": "shop",
   "environment": "production",
-  "engine": "postgres",
+  "engine": "PostgreSQL",
   "state": "running",
   "metadata": {
     "phase": "preflight",
