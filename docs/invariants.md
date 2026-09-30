@@ -793,8 +793,10 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 
 ### ST-10: Rollouts respect order and fail closed on policy
 
-Multi-deployment rollouts claim operations in `deployment_order`, and a failed earlier deployment
-blocks later ones unless the config says otherwise. Once an operator releases a paused rollout it
+Multi-member rollouts claim operations in member order, where a member is a (deployment, target)
+pair taken in `deployment_order` and then in each deployment's `targets` order, and a failed
+earlier member blocks later ones unless the config says otherwise. The operations of one member
+are not ordered against each other. Once an operator releases a paused rollout it
 stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like
 `halt`, never like `continue`.
 

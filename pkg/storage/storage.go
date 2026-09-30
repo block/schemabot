@@ -1396,6 +1396,12 @@ type ApplyOperationStore interface {
 	// changing their state. Other terminal rows
 	// (completed/failed/cancelled/reverted) are never claimed.
 	//
+	// A pending row starts only once its cutover_policy and on_failure admit it
+	// past the earlier rollout members of its apply. A member is a (deployment,
+	// target) pair, so the targets of one deployment are ordered exactly like the
+	// deployments of a map, while the operations of one member (a sharded
+	// target's per-shard work) do not gate each other.
+	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
 	// needs work.
