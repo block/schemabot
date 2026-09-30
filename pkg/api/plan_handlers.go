@@ -1208,6 +1208,18 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		if _, ok := errors.AsType[*unsafeOptInRequiredError](err); ok {
+			s.logger.Warn("apply rejected because the plan carries an unsafe change without allow_unsafe",
+				"plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeUnsafeOptInRequired, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*blockedPlanError](err); ok {
+			s.logger.Warn("apply rejected because the plan carries a change the engine refuses",
+				"plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusUnprocessableEntity, apitypes.ErrCodePlanBlocked, "apply rejected: "+err.Error())
+			return
+		}
 		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "apply failed: "+err.Error())
 		return
@@ -1599,7 +1611,7 @@ func (s *Service) createStoredApply(
 	applyOpts.DirectExecution = directExecution
 	// Blocked changes reject before unsafe changes because no opt-in can make a
 	// statement the engine refuses executable.
-	if err := plan.BlockedApplyError(); err != nil {
+	if err := rejectBlockedStoredPlan(plan); err != nil {
 		return nil, 0, err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
@@ -1722,7 +1734,7 @@ func (s *Service) createStoredApply(
 // Blocked changes reject before unsafe ones for the same reason they do there:
 // no opt-in can make a statement the engine refuses executable.
 func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOptions) error {
-	if err := member.Plan.BlockedApplyError(); err != nil {
+	if err := rejectBlockedStoredPlan(member.Plan); err != nil {
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
@@ -1731,17 +1743,57 @@ func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOpti
 	return nil
 }
 
+// blockedPlanError identifies an apply refused because its plan carries a
+// change the engine will not execute. No retry or apply option can make that
+// statement executable, so the caller has to change the schema and plan again;
+// it is a refusal of the request, not a server failure.
+type blockedPlanError struct {
+	cause error
+}
+
+func (e *blockedPlanError) Error() string { return e.cause.Error() }
+
+func (e *blockedPlanError) Unwrap() error { return e.cause }
+
+// rejectBlockedStoredPlan returns the plan's blocked-change refusal as a
+// blockedPlanError, or nil when the plan has no blocked change.
+func rejectBlockedStoredPlan(plan *storage.Plan) error {
+	if err := plan.BlockedApplyError(); err != nil {
+		return &blockedPlanError{cause: err}
+	}
+	return nil
+}
+
+// unsafeOptInRequiredError identifies an apply refused because its plan
+// carries an unsafe change and the request did not consent to it. The same
+// request with allow_unsafe=true can succeed, so the caller is told exactly
+// that. A table change names its table; a VSchema change names its namespace.
+type unsafeOptInRequiredError struct {
+	PlanID    string
+	VSchema   bool
+	Table     string
+	Namespace string
+	Reason    string
+}
+
+func (e *unsafeOptInRequiredError) Error() string {
+	if e.VSchema {
+		return fmt.Sprintf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", e.PlanID, e.Namespace, e.Reason)
+	}
+	return fmt.Sprintf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", e.PlanID, e.Table, e.Reason)
+}
+
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
 	if applyOpts.AllowUnsafe {
 		return nil
 	}
 	if unsafeChanges := plan.UnsafeDDLChanges(); len(unsafeChanges) > 0 {
 		change := unsafeChanges[0]
-		return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
+		return &unsafeOptInRequiredError{PlanID: plan.PlanIdentifier, Table: change.Table, Reason: change.UnsafeOptInReason()}
 	}
 	if vschemaChanges := plan.UnsafeVSchemaChanges(); len(vschemaChanges) > 0 {
 		change := vschemaChanges[0]
-		return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
+		return &unsafeOptInRequiredError{PlanID: plan.PlanIdentifier, VSchema: true, Namespace: change.Namespace, Reason: change.Reason}
 	}
 	return nil
 }
