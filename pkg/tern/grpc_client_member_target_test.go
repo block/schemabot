@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,20 +12,30 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/inventory"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
 // memberTargetFixture is one apply whose deployment "default" addresses two
 // targets, payments-001 and payments-002, each owning one whole-target
-// operation keyed by its target and one task.
+// operation keyed by its target and one task. The apply is created from
+// payments-001's reviewed plan; payments-002 was planned against its own live
+// schema, so its operation runs its own member plan, whose DDL differs.
 type memberTargetFixture struct {
 	apply      *storage.Apply
 	operations *mockApplyOperationStore
+	plans      *mockPlanStore
 	first      int64
 	second     int64
 }
+
+const (
+	memberFixtureFirstDDL  = "ALTER TABLE orders ADD COLUMN note varchar(255)"
+	memberFixtureSecondDDL = "ALTER TABLE orders ADD COLUMN note varchar(255), ADD INDEX idx_note (note)"
+)
 
 func newMemberTargetFixture(t *testing.T, client *GRPCClient) memberTargetFixture {
 	t.Helper()
@@ -39,24 +50,32 @@ func newMemberTargetFixture(t *testing.T, client *GRPCClient) memberTargetFixtur
 	}
 	apply.SetOptions(storage.ApplyOptions{Target: "payments-001"})
 	first, second := int64(41), int64(42)
-	task := func(id int64, identifier string, operationID *int64) *storage.Task {
+	const secondPlanID = int64(100)
+	task := func(id int64, identifier, ddl string, planID int64, operationID *int64) *storage.Task {
 		return &storage.Task{
-			ID: id, TaskIdentifier: identifier, ApplyID: apply.ID, ApplyOperationID: operationID,
+			ID: id, TaskIdentifier: identifier, ApplyID: apply.ID, ApplyOperationID: operationID, PlanID: planID,
 			TableName: "orders", Namespace: "payments",
-			DDL: "ALTER TABLE orders ADD COLUMN note varchar(255)", DDLAction: "alter", State: state.Task.Pending,
+			DDL: ddl, DDLAction: "alter", State: state.Task.Pending,
 		}
 	}
 	operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
 		first:  {ID: first, ApplyID: apply.ID, Deployment: "default", Target: "payments-001", OperationKey: "payments-001", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
-		second: {ID: second, ApplyID: apply.ID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
+		second: {ID: second, ApplyID: apply.ID, PlanID: secondPlanID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
+	}}
+	plans := &mockPlanStore{byID: map[int64]*storage.Plan{
+		apply.PlanID: {ID: apply.PlanID, PlanIdentifier: "plan-two-targets", Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Deployment: "default", Target: "payments-001", Environment: "staging"},
+		secondPlanID: {ID: secondPlanID, PlanIdentifier: "plan-member-002", Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Deployment: "default", Target: "payments-002", Environment: "staging"},
 	}}
 	client.storage = &mockStorage{
-		applies:    &mockApplyStore{apply: apply},
-		tasks:      &mockTaskStore{tasks: []*storage.Task{task(11, "task-orders-001", &first), task(12, "task-orders-002", &second)}},
-		plans:      &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-two-targets"}},
+		applies: &mockApplyStore{apply: apply},
+		tasks: &mockTaskStore{tasks: []*storage.Task{
+			task(11, "task-orders-001", memberFixtureFirstDDL, apply.PlanID, &first),
+			task(12, "task-orders-002", memberFixtureSecondDDL, secondPlanID, &second),
+		}},
+		plans:      plans,
 		operations: operations,
 	}
-	return memberTargetFixture{apply: apply, operations: operations, first: first, second: second}
+	return memberTargetFixture{apply: apply, operations: operations, plans: plans, first: first, second: second}
 }
 
 // Two targets of one deployment are two rollout members, and a data-plane
@@ -99,6 +118,90 @@ func TestGRPCClient_SiblingTargetsOfOneDeploymentDispatchTheirOwnRemoteApplies(t
 	assert.Equal(t, "remote-002", fx.operations.ops[fx.second].ExternalID,
 		"each target records its own remote apply id")
 	assert.Empty(t, fx.apply.ExternalID, "a multi-operation dispatch must not write the parent apply external_id")
+}
+
+// Each target of a deployment that addresses several is dispatched to the one
+// data plane serving all of them, whose router picks the client, and so the
+// database, that runs the dispatch's DDL. payments-002 was planned against its
+// own live schema, so its member plan was minted on the control plane and never
+// stored on the data plane: the router finds no plan to route by and routes on
+// the request's target. The apply row names the reviewed plan's target,
+// payments-001, so the drive must reach the dispatch through the routing
+// client, which scopes the apply to the operation's own target. Driven that
+// way — the only way the operator drives an operation — payments-002's
+// dispatch carries its own plan and DDL and lands on payments-002, and the
+// primary's lands on payments-001 by its stored plan.
+func TestMemberTargetDispatchRoutesToItsOwnTargetOnTheDataPlane(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-member"}
+	grpcClient, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fx := newMemberTargetFixture(t, grpcClient)
+
+	routingClient, err := NewRoutingClient(RoutingClientConfig{
+		Resolver: routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) {
+			return nil, fmt.Errorf("an operation drive routes by its stored operation, never by config")
+		}),
+		PlanLookup:           routingPlanLookup{},
+		ApplyLookup:          routingApplyLookup{},
+		ApplyOperationLookup: fx.operations,
+		ClientForDeployment: func(_ context.Context, deployment, _ string) (Client, error) {
+			if deployment != "default" {
+				return nil, fmt.Errorf("unexpected deployment %q", deployment)
+			}
+			return grpcClient, nil
+		},
+	})
+	require.NoError(t, err)
+
+	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
+		"payments-001": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(10.0.0.1:3306)/"},
+		"payments-002": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(10.0.0.2:3306)/"},
+	}})
+	require.NoError(t, err)
+	dataPlanePlans := targetRouterPlanStore{byIdentifier: map[string]*storage.Plan{
+		"plan-two-targets": {PlanIdentifier: "plan-two-targets", Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Target: "payments-001", Environment: "staging"},
+	}}
+
+	for _, tc := range []struct {
+		name        string
+		operationID int64
+		target      string
+		dsn         string
+		planID      string
+		ddl         string
+	}{
+		{name: "primary", operationID: fx.first, target: "payments-001", dsn: "root@tcp(10.0.0.1:3306)/", planID: "plan-two-targets", ddl: memberFixtureFirstDDL},
+		{name: "independently planned member", operationID: fx.second, target: "payments-002", dsn: "root@tcp(10.0.0.2:3306)/", planID: "plan-member-002", ddl: memberFixtureSecondDDL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			require.NoError(t, routingClient.ResumeApplyOperation(ctx, fx.apply, tc.operationID))
+			req := server.getApplyRequest()
+			require.NotNil(t, req, "operation %d must dispatch to the data plane", tc.operationID)
+
+			assert.Equal(t, tc.planID, req.PlanId, "the dispatch must carry its own member's plan")
+			assert.Equal(t, tc.target, req.Target, "the dispatch must name its own target, not the reviewed plan's")
+			assert.Equal(t, tc.target, req.Options[dispatchMemberTargetOption])
+			require.Len(t, req.DdlChanges, 1)
+			assert.Equal(t, tc.ddl, req.DdlChanges[0].Ddl)
+
+			created := make(map[string]*targetRouterRecordingClient)
+			router := newTargetRouterForTest(t, resolver, nil, dataPlanePlans, created)
+			_, err := router.Apply(ctx, req)
+			require.NoError(t, err)
+			require.Len(t, created, 1)
+			for _, routed := range created {
+				assert.Equal(t, tc.dsn, routed.targetDSN, "the dispatch must run on its own target's database")
+				require.NotNil(t, routed.applyReq)
+				assert.Equal(t, tc.target, routed.applyReq.Target)
+				assert.Equal(t, tc.planID, routed.applyReq.PlanId)
+				require.Len(t, routed.applyReq.DdlChanges, 1)
+				assert.Equal(t, tc.ddl, routed.applyReq.DdlChanges[0].Ddl)
+			}
+		})
+	}
+	assert.Equal(t, "payments-001", fx.apply.GetOptions().Target, "the drive scopes a copy of the apply, never the stored row")
 }
 
 // A data plane that predates member targets derives an empty key for a
@@ -228,4 +331,5 @@ func TestOperationIdentityForDispatch_MemberTarget(t *testing.T) {
 	_, err = derive(&ternv1.ApplyRequest{DdlChanges: changes, Options: map[string]string{dispatchMemberTargetOption: "payments/001"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "operation key delimiter")
+
 }
