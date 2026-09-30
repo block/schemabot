@@ -3,6 +3,7 @@ package tern
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -111,6 +112,41 @@ func TestStoredPlanFingerprint_VSchemaChangeKeysDifferently(t *testing.T) {
 	}, nil)
 
 	assert.NotEqual(t, fingerprintOf(t, withVSchema), fingerprintOf(t, withoutVSchema))
+}
+
+// Work the stored plan records outside Metadata still keys: a namespace the
+// engine asked to finalize, and a VSchema change recorded only as its artifact.
+// Each keys like the live change set that carries it and unlike a plan without
+// it, so two members that differ only there are not reported as running the
+// same work.
+func TestStoredPlanFingerprint_KeysWorkRecordedOutsideMetadata(t *testing.T) {
+	tables := []storage.TableChange{storedAlter(storedAddEmail)}
+	live := func(metadata map[string]string) ChangeSet {
+		return ChangeSet{Changes: []*ternv1.SchemaChange{{
+			Namespace:    "shop",
+			TableChanges: []*ternv1.TableChange{{TableName: "customers", Ddl: storedAddEmail, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}},
+			Metadata:     metadata,
+		}}}
+	}
+	noWork := fingerprintOf(t, storedPlanOf(map[string]*storage.NamespacePlanData{"shop": {Tables: tables}}, nil))
+	for _, tc := range []struct {
+		name   string
+		stored *storage.NamespacePlanData
+		live   map[string]string
+	}{
+		{"finalize", &storage.NamespacePlanData{Tables: tables, Finalize: true}, map[string]string{engine.MetadataNeedsFinalizer: "true"}},
+		{"vschema artifact", &storage.NamespacePlanData{Tables: tables, Artifacts: map[string]string{storage.VSchemaArtifactName: "{}"}}, map[string]string{storage.PlanMetadataVSchemaChanged: "true"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := fingerprintOf(t, storedPlanOf(map[string]*storage.NamespacePlanData{"shop": tc.stored}, nil))
+			want, err := ChangeSetFingerprint(schema.DialectMySQL, live(tc.live))
+			require.NoError(t, err)
+
+			assert.Equal(t, want, stored)
+			assert.NotEqual(t, noWork, stored)
+			assert.Nil(t, tc.stored.Metadata, "the stored plan's own metadata is not written")
+		})
+	}
 }
 
 // A stored plan keys to the same value as the change set it was stored from, so

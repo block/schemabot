@@ -2,8 +2,10 @@ package tern
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -68,7 +70,7 @@ func changeSetFromStoredPlan(plan *storage.Plan) (ChangeSet, error) {
 		cs.Changes = append(cs.Changes, &ternv1.SchemaChange{
 			Namespace:    ns,
 			TableChanges: protoTableChangesFromStorage(nsData.Tables),
-			Metadata:     nsData.Metadata,
+			Metadata:     storedNamespaceWorkMetadata(nsData),
 		})
 	}
 	for _, shard := range plan.Shards {
@@ -79,6 +81,28 @@ func changeSetFromStoredPlan(plan *storage.Plan) (ChangeSet, error) {
 		})
 	}
 	return cs, nil
+}
+
+// storedNamespaceWorkMetadata rebuilds the change metadata that marks a
+// namespace's work beyond table DDL. The stored plan keeps two of those signals
+// outside Metadata: a requested finalize is the typed Finalize field, and a
+// VSchema change is its artifact whether or not the flag was persisted beside it.
+// Both are put back under the keys the live change set carries them in, or a
+// finalize-only or artifact-only plan would key like a plan with no work. The
+// stored map is copied, never written.
+func storedNamespaceWorkMetadata(nsData *storage.NamespacePlanData) map[string]string {
+	if !nsData.Finalize && !nsData.ChangesVSchema() {
+		return nsData.Metadata
+	}
+	metadata := make(map[string]string, len(nsData.Metadata)+2)
+	maps.Copy(metadata, nsData.Metadata)
+	if nsData.ChangesVSchema() {
+		metadata[storage.PlanMetadataVSchemaChanged] = "true"
+	}
+	if nsData.Finalize {
+		metadata[engine.MetadataNeedsFinalizer] = "true"
+	}
+	return metadata
 }
 
 // protoTableChangesFromStorage converts stored table changes back to the form
