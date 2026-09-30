@@ -64,48 +64,17 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// Generate owner for locking (used later if we have changes to apply)
 	owner := client.GenerateCLIOwner()
 
-	// Check for existing active schema change. The preflight asks about the
-	// whole database and environment, but a targeted apply reserves only its
-	// member's deployment, and one running on another deployment does not
-	// conflict with it. So a targeted apply leaves the conflict to the server's
-	// deployment reservation, which knows the member it resolves to.
-	var active *client.ActiveSchemaChange
+	// Check for existing active schema change. A rollout-wide apply asks about
+	// the whole database and environment before planning. A targeted apply
+	// reserves only its member's deployment, which is known once the plan
+	// resolves the member, so it asks after planning, below, about that
+	// deployment alone: members of a targets list share one deployment, and one
+	// running on another deployment does not conflict with it.
 	if cmd.Target == "" {
-		err = withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
-			var checkErr error
-			active, checkErr = client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
-			return checkErr
-		})
-	}
-	if err != nil {
-		// Ignore status preflight errors; apply is still guarded server-side.
-	} else if active != nil && active.State != "" {
-		progressCmd := fmt.Sprintf("%s status %s", cliname.Name(), active.ApplyID)
-		var stateMsg string
-		switch {
-		case state.IsState(active.State, state.Apply.WaitingForDeploy):
-			stateMsg = "A schema change is waiting for deploy."
-		case state.IsState(active.State, state.Apply.WaitingForCutover):
-			stateMsg = "A schema change is waiting for cutover."
-		case state.IsRunningApplyState(active.State):
-			stateMsg = "A schema change is already running."
-		case state.IsState(active.State, state.Apply.CuttingOver):
-			stateMsg = "A schema change is currently cutting over."
-		}
-		if stateMsg != "" {
-			fmt.Println()
-			fmt.Println("⏳ Schema Change In Progress")
-			fmt.Println()
-			fmt.Printf("Database: %s\n", cfg.Database)
-			fmt.Printf("Environment: %s\n", cmd.Environment)
-			fmt.Println()
-			fmt.Println(stateMsg)
-			fmt.Println()
-			if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-				fmt.Printf("To trigger cutover:  %s cutover -e %s %s\n", cliname.Name(), cmd.Environment, active.ApplyID)
-			}
-			fmt.Printf("To watch and manage: %s\n", progressCmd)
-			return fmt.Errorf("schema change already in progress")
+		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+			return client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -161,6 +130,16 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			templates.WriteExemptTables(planResult.ExemptTables)
 		}
 		return nil
+	}
+
+	// A targeted apply's preflight: the plan has resolved its member, and has
+	// work that would conflict with a schema change on that deployment.
+	if cmd.Target != "" {
+		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+			return client.CheckActiveSchemaChangeOnDeployment(ep, cfg.Database, cmd.Environment, planResult.Deployment)
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Check for unsafe changes
@@ -485,6 +464,49 @@ func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
 		// Still processing - just wait (don't show waiting instructions since cutover was already triggered)
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// refuseActiveSchemaChange runs the active schema change preflight and
+// refuses the apply, with guidance for the schema change already in progress,
+// when check reports one. A preflight that fails is not a refusal: the apply is
+// still guarded server-side.
+func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*client.ActiveSchemaChange, error)) error {
+	var active *client.ActiveSchemaChange
+	err := withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
+		var checkErr error
+		active, checkErr = check()
+		return checkErr
+	})
+	if err != nil || active == nil || active.State == "" {
+		return nil
+	}
+	var stateMsg string
+	switch {
+	case state.IsState(active.State, state.Apply.WaitingForDeploy):
+		stateMsg = "A schema change is waiting for deploy."
+	case state.IsState(active.State, state.Apply.WaitingForCutover):
+		stateMsg = "A schema change is waiting for cutover."
+	case state.IsRunningApplyState(active.State):
+		stateMsg = "A schema change is already running."
+	case state.IsState(active.State, state.Apply.CuttingOver):
+		stateMsg = "A schema change is currently cutting over."
+	}
+	if stateMsg == "" {
+		return nil
+	}
+	fmt.Println()
+	fmt.Println("⏳ Schema Change In Progress")
+	fmt.Println()
+	fmt.Printf("Database: %s\n", database)
+	fmt.Printf("Environment: %s\n", cmd.Environment)
+	fmt.Println()
+	fmt.Println(stateMsg)
+	fmt.Println()
+	if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
+		fmt.Printf("To trigger cutover:  %s cutover -e %s %s\n", cliname.Name(), cmd.Environment, active.ApplyID)
+	}
+	fmt.Printf("To watch and manage: %s status %s\n", cliname.Name(), active.ApplyID)
+	return fmt.Errorf("schema change already in progress")
 }
 
 // blockUnsafeApply displays the plan and an error when unsafe changes are detected without --allow-unsafe.
