@@ -2477,7 +2477,9 @@ func TestEngine_Plan_SizeProbeIsBounded(t *testing.T) {
 // Every statement the size probe sends runs under the probe's budget, so a
 // server that is slow to answer either one is abandoned after
 // engine.TableSizeProbeTimeout and the plan returns without sizes, well before
-// the stalled statement would have finished on its own.
+// the stalled statement would have finished on its own. The plan returning
+// only after the probe's deadline proves the stalled statement was sent and
+// ran until the deadline cancelled it, rather than failing on its own.
 func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
 	const stall = 20 * time.Second
 	stalls := map[string]func(stmt string) string{
@@ -2498,10 +2500,12 @@ func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
 	for name, rewrite := range stalls {
 		t.Run(name, func(t *testing.T) {
 			eng, dsn, files := planSizeProbeFixture(t)
-			var rewrote bool
-			eng.sizeProbeSQL = func(stmt string) string {
+			var stalledUntil time.Time
+			eng.sizeProbeSQL = func(ctx context.Context, stmt string) string {
 				out := rewrite(stmt)
-				rewrote = rewrote || out != stmt
+				if out != stmt {
+					stalledUntil, _ = ctx.Deadline()
+				}
 				return out
 			}
 
@@ -2511,11 +2515,12 @@ func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
 				SchemaFiles: files,
 				Credentials: &engine.Credentials{DSN: dsn},
 			})
-			elapsed := time.Since(start)
+			returned := time.Now()
 
 			require.NoError(t, err, "a stalled size probe must not fail the plan")
-			require.True(t, rewrote, "the stall must reach a statement the probe sends")
-			assert.Less(t, elapsed, stall/2, "the plan must abandon the stalled statement at the probe's budget, not wait it out")
+			require.False(t, stalledUntil.IsZero(), "the stall must reach a statement the probe sends, under a deadline")
+			assert.True(t, returned.After(stalledUntil), "the stalled statement must hold the probe until its deadline, not fail on its own")
+			assert.Less(t, returned.Sub(start), stall/2, "the plan must abandon the stalled statement at the probe's budget, not wait it out")
 			changes := result.FlatTableChanges()
 			require.Len(t, changes, 1)
 			assert.Equal(t, "probed_items", changes[0].Table)
