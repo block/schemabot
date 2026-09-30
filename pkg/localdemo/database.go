@@ -51,7 +51,7 @@ type container struct {
 
 // Ensure starts or reuses a sample owned by this project and engine. Docker keeps
 // its data across restarts; retrying setup never re-seeds an existing database.
-func Ensure(ctx context.Context, project, engine string) (Database, error) {
+func Ensure(ctx context.Context, project, engine string, progress ...func(string)) (Database, error) {
 	if engine != "mysql" && engine != "postgres" {
 		return Database{}, fmt.Errorf("sample databases support mysql or postgres")
 	}
@@ -71,6 +71,14 @@ func Ensure(ctx context.Context, project, engine string) (Database, error) {
 		image, port, passwordKey = "postgres:17", "5432/tcp", "POSTGRES_PASSWORD"
 		env = []string{"POSTGRES_DB=shop"}
 	}
+	report := func(stage string) {
+		for _, notify := range progress {
+			if notify != nil {
+				notify(stage)
+			}
+		}
+	}
+	report("Checking Docker")
 	endpoint := os.Getenv("DOCKER_HOST")
 	if endpoint == "" || os.Getenv("DOCKER_CONTEXT") != "" {
 		value, err := run(ctx, nil, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
@@ -91,6 +99,7 @@ func Ensure(ctx context.Context, project, engine string) (Database, error) {
 		return Database{}, err
 	}
 	if strings.TrimSpace(string(listed)) == "" {
+		report("Preparing " + image + " (downloading if needed)")
 		password := make([]byte, 24)
 		if _, err = rand.Read(password); err != nil {
 			return Database{}, err
@@ -113,6 +122,7 @@ func Ensure(ctx context.Context, project, engine string) (Database, error) {
 		return Database{}, fmt.Errorf("container %s is not this project's sample; refusing to use it", name)
 	}
 	if c.State.Status == "created" {
+		report("Preparing sample tables")
 		dir, err := os.MkdirTemp("", "schemabot-sample-")
 		if err != nil {
 			return Database{}, err
@@ -131,6 +141,7 @@ func Ensure(ctx context.Context, project, engine string) (Database, error) {
 		}
 	}
 	if !c.State.Running {
+		report("Starting your sample database")
 		if _, err = run(ctx, nil, "start", name); err != nil {
 			return Database{}, err
 		}
@@ -173,6 +184,7 @@ func Ensure(ctx context.Context, project, engine string) (Database, error) {
 	if engine == "postgres" {
 		result.Namespace = "public"
 	}
+	report("Waiting for the database to accept connections")
 	readyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(250 * time.Millisecond)

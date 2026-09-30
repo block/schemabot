@@ -29,7 +29,7 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 		if !selected.confirmed {
 			return ErrSilent
 		}
-		if selected.choice == 0 {
+		if !selected.sample {
 			return nil
 		}
 		cmd.Sample = true
@@ -60,12 +60,23 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	if _, err = validateInitSchemaReuse(cmd.SchemaDir, "shop", cmd.Type); err != nil {
 		return err
 	}
-	if !cmd.JSON {
-		fmt.Println("\n  Starting your sample database. The first run may download a Docker image.")
-	}
 	setupCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	sample, err := localdemo.Ensure(setupCtx, project, cmd.Type)
+	var sample localdemo.Database
+	provision := func(runCtx context.Context, report func(string)) (*initResult, error) {
+		var provisionErr error
+		sample, provisionErr = localdemo.Ensure(runCtx, project, cmd.Type, report)
+		return nil, provisionErr
+	}
+	if !cmd.NonInteractive && !cmd.JSON && ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout) {
+		_, err = runInitProgress(setupCtx, provision, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+	} else {
+		_, err = provision(setupCtx, func(stage string) {
+			if !cmd.JSON {
+				fmt.Println("  " + stage)
+			}
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -93,12 +104,14 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 }
 
 type initStartChoice struct {
-	choice    int
-	confirmed bool
+	choice         int
+	sample         bool
+	choosingEngine bool
+	confirmed      bool
 }
 
 func (m *initStartChoice) engine() string {
-	if m.choice == 2 {
+	if m.choice == 1 {
 		return "postgres"
 	}
 	return "mysql"
@@ -108,10 +121,22 @@ func (m *initStartChoice) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok {
 		switch key.String() {
 		case "up", "k":
-			m.choice = (m.choice + 2) % 3
+			m.choice = (m.choice + 1) % 2
 		case "down", "j":
-			m.choice = (m.choice + 1) % 3
+			m.choice = (m.choice + 1) % 2
+		case "shift+tab":
+			if m.choosingEngine {
+				m.choosingEngine = false
+				m.choice = 1
+			}
 		case "enter":
+			if !m.choosingEngine && m.choice == 1 {
+				m.sample = true
+				m.choosingEngine = true
+				m.choice = 0
+				return m, nil
+			}
+			m.sample = m.choosingEngine
 			m.confirmed = true
 			return m, tea.Quit
 		case "esc", "ctrl+c":
@@ -127,14 +152,24 @@ func (m *initStartChoice) View() string {
 	blue := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	muted := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#59636E", Dark: "#9DA7B3"})
 	var b strings.Builder
-	b.WriteString("\n  " + lipgloss.NewStyle().Bold(true).Render("What would you like to try?") + "\n\n")
-	for i, choice := range []struct{ label, hint string }{{"Connect my database", "Bring an existing database into your project."}, {"Try a sample MySQL database", "A local Docker database with a few tables to explore."}, {"Try a sample PostgreSQL database", "The same quick start, with PostgreSQL."}} {
+	title := "What would you like to try?"
+	choices := []struct{ label, hint string }{{"Connect my database", "Bring an existing database into your project."}, {"Try a sample database", "A local Docker database with a few tables to explore."}}
+	if m.choosingEngine {
+		title = "Choose your sample database"
+		choices = []struct{ label, hint string }{{"MySQL", "Schema changes powered by Spirit."}, {"PostgreSQL", "Schema changes powered by pg-sprite."}}
+	}
+	b.WriteString("\n  " + lipgloss.NewStyle().Bold(true).Render(title) + "\n\n")
+	for i, choice := range choices {
 		label := "  " + choice.label
 		if i == m.choice {
 			label = blue.Render("› " + choice.label)
 		}
 		b.WriteString("  " + label + "\n    " + muted.Render(choice.hint) + "\n\n")
 	}
-	b.WriteString("  " + muted.Render("↑/↓ choose · enter continue · esc cancel") + "\n")
+	controls := "↑/↓ choose · enter continue"
+	if m.choosingEngine {
+		controls += " · shift+tab back"
+	}
+	b.WriteString("  " + muted.Render(controls+" · esc cancel") + "\n")
 	return b.String()
 }

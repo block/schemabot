@@ -45,7 +45,7 @@ master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
 screen = pyte.Screen(88, 24)
 stream = pyte.Stream(screen)
-command = ['./schemabot', 'init'] + (['--profile', 'demo'] if args.sample else [])
+command = ['./schemabot', 'init']
 process = subprocess.Popen(command, cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
 os.close(slave)
 # Send individual keystrokes while continuing to read the terminal, so the
@@ -65,8 +65,8 @@ if args.engine == 'postgres':
     steps.append(('space select', [(0.8, ' '), (0.8, '\x1b[B'), (0.8, ' '), (1.0, '\r')]))
 steps.append(('Review your setup', [(2.0, '\r')]))
 if args.sample:
-    arrows = [(0.9, '\x1b[B')] * (2 if args.engine == 'postgres' else 1)
-    steps = [('What would you like to try?', arrows + [(1.5, '\r')])]
+    arrows = [(0.6, '\x1b[B')] if args.engine == 'postgres' else []
+    steps = [('What would you like to try?', [(0.8, '\x1b[B'), (0.8, '\r')]), ('Choose your sample database', arrows + [(0.8, '\r')])]
 else:
     steps.insert(0, ('What would you like to try?', [(1.0, '\r')]))
 pending = []
@@ -135,9 +135,9 @@ try:
     if before == after:
         raise RuntimeError('demo table does not have the expected email column')
     schema.write_text(after)
-    plan_args = ['plan', '-s', 'schema', '-e', 'development'] + (['--profile', 'demo'] if args.sample else [])
+    plan_args = ['plan', '-s', 'schema', '-e', 'development']
     plan = subprocess.run([binary, *plan_args], cwd=work, env=env, text=True, capture_output=True, check=True)
-    output = {'init_command': 'schemabot init --profile demo' if args.sample else 'schemabot init', 'plan_command': 'schemabot ' + ' '.join(plan_args), 'engine': args.engine, 'schema_file': schema_file, 'wizard': '\n'.join(screen.display).strip(), 'wizard_frames': [f for f in frames if any('SchemaBot' in ''.join(s['text'] for s in r) for r in f['rows']) or f['time'] > 1], 'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=schema_file, tofile=schema_file)), 'plan': plan.stdout, 'plan_stderr': plan.stderr}
+    output = {'sample': args.sample, 'init_command': 'schemabot init', 'plan_command': 'schemabot ' + ' '.join(plan_args), 'engine': args.engine, 'schema_file': schema_file, 'wizard': '\n'.join(screen.display).strip(), 'wizard_frames': [f for f in frames if any('SchemaBot' in ''.join(s['text'] for s in r) for r in f['rows']) or f['time'] > 1], 'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=schema_file, tofile=schema_file)), 'plan': plan.stdout, 'plan_stderr': plan.stderr}
     # One generated frame per line keeps updates reviewable without expanding
     # every terminal cell into thousands of lines of JSON.
     fields = []

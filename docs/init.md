@@ -9,8 +9,8 @@ The wizard and explicit CLI flags use the same setup workflow.
 
 ## Try without a database
 
-Run `schemabot init` in an empty project directory and choose **Try a sample MySQL database**
-or **Try a sample PostgreSQL database**. Docker must be running. SchemaBot starts a local
+Run `schemabot init` in an empty project directory and choose **Try a sample database**,
+then choose MySQL or PostgreSQL. Docker must be running. SchemaBot starts a local
 container, seeds `customers` and `orders`, and uses the same import and verification flow.
 No connection string is needed.
 

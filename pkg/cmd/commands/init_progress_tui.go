@@ -55,7 +55,11 @@ func (m *initProgress) View() string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("SchemaBot  /  connect and verify\n\n")
+	heading := "connect and verify"
+	if len(m.stages) > 0 && m.stages[0] == "Checking Docker" {
+		heading = "sample database"
+	}
+	b.WriteString("SchemaBot  /  " + heading + "\n\n")
 	for i, s := range m.stages {
 		marker := "✓"
 		if i == len(m.stages)-1 {
