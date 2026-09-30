@@ -1115,6 +1115,27 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, errPlanLookupFailed) {
+			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
+			return
+		}
+		if errors.Is(err, storage.ErrPlanNotFound) {
+			s.logger.Warn("apply rejected because the stored plan does not exist", "plan_id", req.PlanID, "environment", req.Environment)
+			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, storedPlanNotFoundMessage("apply", req.PlanID))
+			return
+		}
+		if _, ok := errors.AsType[*planEnvironmentMismatchError](err); ok {
+			s.logger.Warn("apply rejected because the stored plan was created for another environment", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*planRoutingMetadataError](err); ok {
+			s.logger.Warn("apply rejected because the stored plan lacks routing metadata", "plan_id", req.PlanID,
+				"environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
 		if errors.Is(err, storage.ErrActiveApplyExists) {
 			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
@@ -1157,6 +1178,53 @@ type UnsupportedFeatureError struct {
 
 func (e *UnsupportedFeatureError) Error() string {
 	return fmt.Sprintf("database %q: %s is not supported for database_type: %s", e.Database, e.Feature, e.DatabaseType)
+}
+
+// errPlanLookupFailed marks an apply that could not read its stored plan. The
+// storage read failed, so the request is neither accepted nor known to be
+// wrong: it is a server failure, kept apart from a plan that does not exist.
+var errPlanLookupFailed = errors.New("plan lookup failed")
+
+// storedPlanLookupFailedMessage is the response for an operation whose stored
+// plan could not be read. The storage error stays in the server log; the
+// caller learns only that the read failed and that retrying is safe.
+func storedPlanLookupFailedMessage(operation, planID string) string {
+	return fmt.Sprintf("%s failed: failed to get plan %s; see server logs, then retry", operation, planID)
+}
+
+// storedPlanNotFoundMessage is the response for an operation that names a
+// plan SchemaBot has no record of.
+func storedPlanNotFoundMessage(operation, planID string) string {
+	return fmt.Sprintf("%s rejected: plan not found: %s; check the plan_id or create a new plan", operation, planID)
+}
+
+// planEnvironmentMismatchError identifies an apply that names a different
+// environment than the one its stored plan was created for. The plan was
+// reviewed for its own environment only, so the request is refused as a
+// caller error rather than applied somewhere it was not reviewed for.
+type planEnvironmentMismatchError struct {
+	PlanID               string
+	PlanEnvironment      string
+	RequestedEnvironment string
+}
+
+func (e *planEnvironmentMismatchError) Error() string {
+	return fmt.Sprintf("plan %s was created for environment %q, not %q; apply it to %q or create a plan for %q",
+		e.PlanID, e.PlanEnvironment, e.RequestedEnvironment, e.PlanEnvironment, e.RequestedEnvironment)
+}
+
+// planRoutingMetadataError identifies a stored plan that lacks one of the
+// server-side routing fields (deployment, target) the operator needs to
+// dispatch it. The plan cannot be repaired from the apply request, so the
+// caller is told to create a new plan rather than retry this one.
+type planRoutingMetadataError struct {
+	PlanID string
+	Field  string
+}
+
+func (e *planRoutingMetadataError) Error() string {
+	return fmt.Sprintf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply",
+		e.PlanID, e.Field)
 }
 
 // ExecuteApply queues an apply request in storage and returns once the work is
@@ -1235,37 +1303,54 @@ func (s *Service) EnqueueAuthorizedApply(ctx context.Context, req ApplyRequest) 
 // execution invariants every queue path requires: the plan exists, was created
 // for the requested environment, and carries the server-side routing metadata
 // (deployment, target) the operator needs to dispatch it.
+//
+// The apply counter is keyed by the plan's repository, database, and
+// deployment, so a failed or empty lookup deliberately records nothing: there
+// is no plan to attribute the failure to, and a sentinel-labelled point would
+// only dilute the per-database series. Those failures stay on the span and in
+// the handler's log line. Every invariant checked after the plan loads records
+// an error against the plan's own labels.
 func (s *Service) loadPlanForApply(ctx context.Context, span trace.Span, req ApplyRequest) (*storage.Plan, error) {
 	// Load plan first; it is the source of truth for database, type, and routing.
 	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "get plan")
-		return nil, fmt.Errorf("get plan: %w", err)
+		if errors.Is(err, storage.ErrPlanNotFound) {
+			// A store that reports a missing plan as the sentinel rather than
+			// a nil plan is still a caller error, not a storage failure.
+			span.SetStatus(otelcodes.Error, "plan not found")
+			return nil, fmt.Errorf("%w: %s", err, req.PlanID)
+		}
+		span.SetStatus(otelcodes.Error, "plan lookup failed")
+		return nil, fmt.Errorf("%w for %s: %w", errPlanLookupFailed, req.PlanID, err)
 	}
 	if plan == nil {
-		planErr := fmt.Errorf("plan not found: %s", req.PlanID)
+		planErr := fmt.Errorf("%w: %s", storage.ErrPlanNotFound, req.PlanID)
 		span.RecordError(planErr)
 		span.SetStatus(otelcodes.Error, "plan not found")
 		return nil, planErr
 	}
 	span.SetAttributes(attribute.String("database", plan.Database))
 	if plan.Environment != req.Environment {
-		applyErr := fmt.Errorf("plan %s was created for environment %q, not %q", req.PlanID, plan.Environment, req.Environment)
+		applyErr := &planEnvironmentMismatchError{
+			PlanID:               req.PlanID,
+			PlanEnvironment:      plan.Environment,
+			RequestedEnvironment: req.Environment,
+		}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "environment mismatch")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
 		return nil, applyErr
 	}
 	if plan.Deployment == "" {
-		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "deployment")
+		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "deployment"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored deployment")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
 		return nil, applyErr
 	}
 	if plan.Target == "" {
-		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "target")
+		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "target"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored target")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
