@@ -265,7 +265,8 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 
 // SetPendingObserver stores an observer for the next apply request for this
 // target. ExecuteApply registers it on the durable apply before operator
-// dispatch can start.
+// dispatch can start. A command whose apply request fails withdraws its
+// observer with ClearPendingObserver.
 func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
 	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
 	if err != nil {
@@ -280,10 +281,27 @@ func (s *Service) SetPendingObserver(database, deployment, environment string, o
 	if s.pendingObservers == nil {
 		s.pendingObservers = make(map[pendingObserverKey]tern.ProgressObserver)
 	}
-	if observer == nil {
+	s.pendingObservers[key] = observer
+}
+
+// ClearPendingObserver withdraws the observer a command stored for this target
+// when its apply request will not produce an apply. The slot is keyed by
+// target, so a competing command on the same target may have stored its own
+// observer since; only the caller's observer is removed, never a later one
+// whose apply has yet to consume it.
+func (s *Service) ClearPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
+	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
+	if err != nil {
+		s.logger.Error("failed to resolve tern deployment for pending observer",
+			"database", database, "deployment", deployment, "environment", environment, "error", err)
+		return
+	}
+
+	key := pendingObserverKey{database: database, deployment: deployment, environment: environment}
+	s.pendingObserverMu.Lock()
+	defer s.pendingObserverMu.Unlock()
+	if s.pendingObservers[key] == observer {
 		delete(s.pendingObservers, key)
-	} else {
-		s.pendingObservers[key] = observer
 	}
 }
 

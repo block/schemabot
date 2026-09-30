@@ -670,14 +670,17 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		ExpectedPendingPlanID: existingLock.PendingPlanID,
 	}
 
-	// Every exit from here on is terminal for a durable driver: the dispatch
-	// has been attempted, so the rollback DDL may already be executing and a
-	// re-drive could double-execute it. If the lock intent is unchanged, a
-	// dispatch error leaves the pin in place for another rollback-confirm; if
-	// it changed, the user must start with a fresh rollback command.
+	// Every exit from here on is terminal for a durable driver. A dispatch that
+	// reached the engine may already be executing the rollback DDL, so a
+	// re-drive could double-execute it; a dispatch rejected for a changed lock
+	// intent ran nothing, but the pin this confirm resolved is gone, so there
+	// is nothing left for a re-drive to confirm. If the lock intent is
+	// unchanged, a dispatch error leaves the pin in place for another
+	// rollback-confirm; if it changed, the user must start with a fresh
+	// rollback command.
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
-		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
+		h.service.ClearPendingObserver(database, rollbackPlan.Deployment, environment, observer)
 		if errors.Is(err, storage.ErrLockIntentChanged) {
 			h.logger.Warn("rollback-confirm rejected: the database lock no longer pins the confirmed rollback plan; no rollback apply was created",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
@@ -692,7 +695,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	}
 
 	if !applyResp.Accepted {
-		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
+		h.service.ClearPendingObserver(database, rollbackPlan.Deployment, environment, observer)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNotAccepted(database, environment, applyResp.ErrorMessage))
 		return false, nil
@@ -703,7 +706,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	// ExecuteApply rejects accepted rollbacks unless SchemaBot stored its own
 	// apply row. Keep this guard fail-closed in case that invariant changes.
 	if applyID <= 0 {
-		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
+		h.service.ClearPendingObserver(database, rollbackPlan.Deployment, environment, observer)
 		h.logger.Error("accepted rollback did not return an apply id",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment)
@@ -749,15 +752,13 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 const msgRollbackLockIntentChanged = "The pending rollback changed while this command was running. The rollback was rejected and nothing was applied; run the rollback command again to review a fresh rollback plan before confirming."
 
 // rollbackExecutionErrorMessage renders the PR-facing detail for a failed
-// rollback dispatch. A lock intent change is an expected race with its own
-// recovery, so it gets a fixed actionable message rather than the storage
-// error text. Other failures use fixed guidance while their details remain in
-// server logs.
+// rollback dispatch. It shares the apply renderer so a rollback rejected for a
+// deterministic reason, such as a feature the database type does not support,
+// tells the operator why instead of coaching a retry that would fail the same
+// way; a lock intent change gets the rollback-specific recovery.
 func rollbackExecutionErrorMessage(err error) string {
-	if errors.Is(err, storage.ErrLockIntentChanged) {
-		return msgRollbackLockIntentChanged
-	}
-	return "Failed to execute rollback; see server logs for details and retry rollback-confirm."
+	return dispatchErrorMessage(err, msgRollbackLockIntentChanged,
+		"Failed to execute rollback. See SchemaBot server logs for details.")
 }
 
 func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr int, environment, lockOwner string) (*storage.Lock, *storage.Plan, error) {

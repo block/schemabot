@@ -1467,7 +1467,8 @@ verdict, so a plan that changed after the confirmation stops rather than running
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
-`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
+`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go` and surfaced to the
+operator as `msgRollbackLockIntentChanged`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 

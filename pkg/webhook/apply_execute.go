@@ -308,14 +308,14 @@ func (h *Handler) executeApply(
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
-		h.service.SetPendingObserver(database, "", environment, nil)
+		h.service.ClearPendingObserver(database, "", environment, observer)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(err))
 		return
 	}
 
 	if !applyResp.Accepted {
-		h.service.SetPendingObserver(database, "", environment, nil)
+		h.service.ClearPendingObserver(database, "", environment, observer)
 		h.logger.Info("apply rejected by engine", "repo", repo, "pr", pr, "database", database, "environment", environment, "error", applyResp.ErrorMessage)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, "The apply was not accepted. See SchemaBot server logs for details.")
 		return
@@ -324,7 +324,7 @@ func (h *Handler) executeApply(
 	// ExecuteApply rejects accepted applies unless SchemaBot stored its own
 	// apply row. Keep this guard fail-closed in case that invariant changes.
 	if applyID <= 0 {
-		h.service.SetPendingObserver(database, "", environment, nil)
+		h.service.ClearPendingObserver(database, "", environment, observer)
 		h.logger.Error("accepted apply did not return an apply id",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
@@ -373,14 +373,27 @@ func (h *Handler) executeApply(
 }
 
 func applyExecutionErrorMessage(err error) string {
+	return dispatchErrorMessage(err,
+		"The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again.",
+		"Failed to execute apply. See SchemaBot server logs for details.")
+}
+
+// dispatchErrorMessage renders the PR-facing detail for a failed apply or
+// rollback dispatch. Two failures are deterministic and carry their own
+// recovery, so they are named rather than sanitized: a lock intent change is an
+// expected race whose answer is lockIntentMsg, and an unsupported feature is
+// rejected before anything runs and would fail the same way on retry, so the
+// operator sees the feature error itself. Everything else is an internal error
+// whose text stays in server logs behind fallback.
+func dispatchErrorMessage(err error, lockIntentMsg, fallback string) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
-		return "The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again."
+		return lockIntentMsg
 	}
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {
 		return featureErr.Error()
 	}
-	return "Failed to execute apply. See SchemaBot server logs for details."
+	return fallback
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an

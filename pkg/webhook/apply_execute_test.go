@@ -29,7 +29,10 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 
 // A rollback-confirm whose lock stopped pinning the confirmed plan is told that
 // nothing ran and to plan a fresh rollback, in SchemaBot's words rather than
-// the storage error's; other dispatch failures keep their own guidance.
+// the storage error's. A rollback the database type cannot run is told which
+// feature was refused, because retrying it would be refused the same way.
+// Every other dispatch failure stays in server logs behind fixed guidance that
+// does not promise a retry will succeed.
 func TestRollbackExecutionErrorMessage(t *testing.T) {
 	t.Run("lock intent change coaches a fresh rollback", func(t *testing.T) {
 		msg := rollbackExecutionErrorMessage(fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
@@ -39,11 +42,17 @@ func TestRollbackExecutionErrorMessage(t *testing.T) {
 		assert.NotContains(t, msg, storage.ErrLockIntentChanged.Error())
 	})
 
-	t.Run("other dispatch failures use fixed guidance", func(t *testing.T) {
+	t.Run("unsupported feature names the refused feature", func(t *testing.T) {
+		err := fmt.Errorf("execute apply: %w", &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover})
+		assert.Equal(t, `database "orders": deferred cutover is not supported for database_type: postgres`, rollbackExecutionErrorMessage(err))
+	})
+
+	t.Run("internal errors use fixed guidance without a retry promise", func(t *testing.T) {
 		err := errors.New("dial tcp storage.internal:3306: connection refused")
 		msg := rollbackExecutionErrorMessage(err)
-		assert.Equal(t, "Failed to execute rollback; see server logs for details and retry rollback-confirm.", msg)
+		assert.Equal(t, "Failed to execute rollback. See SchemaBot server logs for details.", msg)
 		assert.NotContains(t, msg, err.Error())
+		assert.NotContains(t, msg, "retry")
 	})
 }
 

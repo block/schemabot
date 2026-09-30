@@ -517,3 +517,42 @@ func TestNewLocalTernClient_ConfiguresPostgresConcurrentIndexMaxDuration(t *test
 	require.True(t, ok)
 	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
 }
+
+// namedProgressObserver gives each test observer its own identity so the
+// pending-observer slot can tell two commands' observers apart.
+type namedProgressObserver struct{ name string }
+
+func (namedProgressObserver) OnProgress(*storage.Apply, []*storage.Task) {}
+
+func (namedProgressObserver) OnTerminal(*storage.Apply, []*storage.Task) {}
+
+// Two commands on the same target can each store a pending observer before
+// either apply request has been decided. The command whose request is
+// rejected withdraws only its own observer: when a competing command has
+// stored a newer one since, that observer stays for the competing apply to
+// consume, so the surviving apply keeps its progress and terminal reporting.
+func TestClearPendingObserverWithdrawsOnlyTheCallersObserver(t *testing.T) {
+	svc := New(nil, &ServerConfig{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	loser := namedProgressObserver{name: "loser"}
+	winner := namedProgressObserver{name: "winner"}
+
+	t.Run("own observer is withdrawn", func(t *testing.T) {
+		svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		svc.ClearPendingObserver("orders", "orders-staging", "staging", loser)
+		assert.Nil(t, svc.consumePendingObserver("orders", "orders-staging", "staging"))
+	})
+
+	t.Run("a later observer for the same target is left in place", func(t *testing.T) {
+		svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		svc.SetPendingObserver("orders", "orders-staging", "staging", winner)
+		svc.ClearPendingObserver("orders", "orders-staging", "staging", loser)
+		assert.Equal(t, winner, svc.consumePendingObserver("orders", "orders-staging", "staging"))
+	})
+
+	t.Run("other targets are untouched", func(t *testing.T) {
+		svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		svc.SetPendingObserver("orders", "orders-production", "production", winner)
+		svc.ClearPendingObserver("orders", "orders-staging", "staging", loser)
+		assert.Equal(t, winner, svc.consumePendingObserver("orders", "orders-production", "production"))
+	})
+}
