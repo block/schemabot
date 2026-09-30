@@ -135,7 +135,7 @@ func TestEnginePlanRefusesDuplicateRowSecurityDeclarations(t *testing.T) {
 					"a.sql": tt.first, "b.sql": tt.second,
 				}}},
 			})
-			require.ErrorContains(t, err, `table "documents" in namespace "public" is declared in both "a.sql" and "b.sql"`)
+			require.ErrorContains(t, err, `table "documents" is declared by both schema files "a.sql" and "b.sql"`)
 			require.Nil(t, result, "a duplicate declaration must never publish an unsafe or no-change plan")
 		})
 	}

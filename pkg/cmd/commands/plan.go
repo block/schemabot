@@ -107,7 +107,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	// Disclose ignore_namespaces once per distinct resolution: entries resolve
 	// from config alone and differ between environments only when they use
-	// $ENV, so several environments usually share one notice.
+	// {env} or $ENV, so several environments usually share one notice.
 	disclosed := make(map[string]bool)
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]

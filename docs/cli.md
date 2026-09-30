@@ -311,6 +311,77 @@ a drop. See [namespace scope](namespaces.md) for shared databases.
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
 
+#### Recovering from onboarding formatting errors
+
+Onboarding reports every table-formatting failure together and writes no files
+if any table fails. Existing files stay untouched. `--force` only permits
+overwrites; it does not bypass formatting checks. Editing a local file and
+rerunning `onboard` does not fix the refusal, because the command pulls the live
+schema again.
+
+To build the schema root manually, retrieve the original definitions with
+`pull -o json`, using the same database, environment, profile or endpoint,
+type override, and concrete namespace selection as the failed onboarding.
+Omit `--table`: recovery needs the complete managed schema, including namespace
+artifacts. For example, a one-table MySQL database returns:
+
+```console
+$ schemabot pull -d shop -e staging -o json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "staging",
+  "namespaces": {
+    "shop": {
+      "tables": {
+        "orders": "CREATE TABLE orders (id bigint NOT NULL) STATS_PERSISTENT=0"
+      }
+    }
+  },
+  "table_count": 1
+}
+```
+
+Create `schema/schemabot.yaml` with the returned `database` and `type`:
+
+```yaml
+database: shop
+type: mysql
+```
+
+Preserve any existing `ignore_namespaces` and `ignore_tables` settings. For
+each managed table, copy its decoded SQL string to
+`schema/<namespace>/<table>.sql`, adding line breaks outside quoted content
+without changing options, comments, or statements. The example becomes
+`schema/shop/orders.sql`:
+
+```sql
+CREATE TABLE orders (
+    id bigint NOT NULL
+) STATS_PERSISTENT=0;
+```
+
+Copy namespace artifacts such as `vschema.json` into the same namespace
+directory. Include every managed table, not just the tables named in the
+error; omit tables explicitly withheld by the preserved exclusions. If you
+used `--template-env-suffix`, apply the same namespace-directory mapping
+described in [namespace scope](namespaces.md).
+
+For a managed namespace with no tables or artifacts, keep its scope explicit
+with a `schema.sql` file containing exactly:
+
+```sql
+-- This namespace is empty. Add CREATE TABLE declarations here.
+```
+
+Run `schemabot plan -s ./schema -e staging` with the same connection settings.
+Before committing, require `✓ No schema changes detected.` as shown in the
+[plan walkthrough](#plan-and-apply-a-change). Resolve every error or proposed
+change against the original pull; do not apply changes to make the live
+database match an incorrectly copied baseline. If the original SQL itself
+cannot pass the dialect parser, report that parser limitation instead of
+removing the unsupported schema definition.
+
 ### Review an index change
 
 Plan output uses the target database dialect, including PostgreSQL identifier
