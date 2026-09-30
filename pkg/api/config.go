@@ -1183,28 +1183,28 @@ type EnvironmentConfig struct {
 	// alphabetical key order. Only meaningful alongside a Deployments map.
 	DeploymentOrder []string `yaml:"deployment_order,omitempty"`
 
-	// CutoverPolicy controls how a multi-deployment rollout sequences the copy
-	// and cutover phases of its deployments. "rolling" (the default, also used
-	// when unset) keeps today's fully serial behaviour: a later deployment does
-	// not start until every earlier sibling in deployment_order has completed.
-	// "barrier" lets later deployments run their copy phase once earlier
-	// siblings reach the cutover barrier, while cutover itself stays ordered.
-	// "parallel" runs members without waiting on siblings, up to the server's
-	// max_drivers_per_apply at once. Only meaningful alongside a Deployments
-	// map or a Targets list.
+	// CutoverPolicy controls how a multi-member rollout sequences the copy and
+	// cutover phases of its members: the deployments of a Deployments map, or
+	// the targets of a Targets list, in resolved order. "rolling" (the default,
+	// also used when unset) keeps the rollout fully serial: a later member does
+	// not start until every earlier member has completed. "barrier" lets later
+	// members run their copy phase once earlier members reach the cutover
+	// barrier, while cutover itself stays ordered. "parallel" starts every
+	// member's copy without waiting on earlier members, up to the server's
+	// max_drivers_per_apply at once, and still cuts over one member at a time in
+	// order. Only meaningful alongside a Deployments map or a Targets list.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
-	// OnFailure controls multi-deployment rollout continuation when a deployment
+	// OnFailure controls multi-member rollout continuation when a member
 	// terminally fails. "halt" (the default, also used when unset) stops the
-	// rollout — later deployments in deployment_order are not started. "continue"
-	// drops a terminal-failed deployment as a blocker so the rollout attempts
-	// every deployment instead of stopping at the first failure. "pause" holds
-	// the rollout after a failure until a human releases it (via the release
-	// control op) so the remaining deployments proceed; to abort instead, use
-	// the separate stop/cancel control op. It governs only rollout continuation;
-	// the apply's pass/fail verdict and the merge gate stay fail-closed on any
-	// failed deployment. Only meaningful alongside a Deployments map or a
-	// Targets list.
+	// rollout — later members are not started. "continue" drops a
+	// terminal-failed member as a blocker so the rollout attempts every member
+	// instead of stopping at the first failure. "pause" holds the rollout after
+	// a failure until a human releases it (via the release control op) so the
+	// remaining members proceed; to abort instead, use the separate stop/cancel
+	// control op. It governs only rollout continuation; the apply's pass/fail
+	// verdict and the merge gate stay fail-closed on any failed member. Only
+	// meaningful alongside a Deployments map or a Targets list.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
 	// DirectExecution configures direct execution of ALTER statements that the
