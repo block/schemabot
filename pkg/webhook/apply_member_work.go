@@ -253,10 +253,11 @@ func pendingRolloutMessage(outcome reviewDriftOutcome, reviewedTargetConverged b
 // whose plans the operator was shown. A pin without such a round covers no other
 // target's work.
 //
-// The members are planned again at confirm, and a target's schema can change in
-// between. So each member with work now must have been planned with the same
-// statements in the confirmed round, and a statement the confirmed comment did
-// not show never runs on the strength of that confirmation.
+// The targets are planned again at confirm, and a target's schema can change in
+// between. So the reviewed target, when it still has work, and each member with
+// work now must have been planned with the same statements in the confirmed
+// round, and a statement the confirmed comment did not show never runs on the
+// strength of that confirmation.
 func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment string) (bool, string, error) {
 	plans := h.service.Storage().Plans()
 	pinned, err := plans.Get(ctx, pinnedPlanID)
@@ -281,6 +282,17 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	if err != nil {
 		return false, "", fmt.Errorf("load member plans of the confirm-time round: %w", err)
 	}
+	covered, reason := roundCoversWork(pinned, current, confirmed, now)
+	return covered, reason, nil
+}
+
+// roundCoversWork reports whether the confirm-time round runs only statements
+// the confirmed round planned, with a reason for the log when it does not. A
+// target with no work now runs nothing, so only targets with work are compared.
+func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
+	if current.HasWork() && !sameMemberWork(pinned, current) {
+		return false, "the reviewed target would run statements the confirmed plan did not show"
+	}
 	for _, member := range slices.Sorted(maps.Keys(now)) {
 		plan := now[member]
 		if !plan.HasWork() {
@@ -288,13 +300,13 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 		}
 		was, ok := confirmed[member]
 		if !ok {
-			return false, fmt.Sprintf("target %s has work the confirmed round did not plan", member), nil
+			return false, fmt.Sprintf("target %s has work the confirmed round did not plan", member)
 		}
 		if !sameMemberWork(was, plan) {
-			return false, fmt.Sprintf("target %s would run statements the confirmed round did not plan", member), nil
+			return false, fmt.Sprintf("target %s would run statements the confirmed round did not plan", member)
 		}
 	}
-	return true, "", nil
+	return true, ""
 }
 
 // confirmedConvergedTargetRound reports whether the pending confirmation an

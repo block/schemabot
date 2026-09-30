@@ -123,3 +123,44 @@ func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
 	rollup.Entries[1].ExistingCopies = nil
 	assert.Empty(t, memberWorkOf(&rollup).copyAtStake, "a member that reported a clean target puts nothing at stake")
 }
+
+// A confirmation covers the statements its comment showed on every target,
+// the reviewed one included. The reviewed target's re-plan at confirm must run
+// what the confirmed plan showed, unless it now runs nothing; each other target
+// with work must run what the confirmed round planned for it.
+func TestRoundCoversWork(t *testing.T) {
+	plan := func(ddl string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {Tables: []storage.TableChange{{
+				Namespace: "payments", Table: "orders", Operation: "alter", DDL: ddl,
+			}}},
+		}}
+	}
+	const region = "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)"
+	const wider = "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)"
+	members := func(ddl string) map[string]*storage.Plan {
+		return map[string]*storage.Plan{"eu/payments-002": plan(ddl)}
+	}
+
+	covered, reason := roundCoversWork(plan(region), plan(region), members(region), members(region))
+	assert.True(t, covered, reason)
+
+	covered, reason = roundCoversWork(plan(region), &storage.Plan{}, members(region), members(region))
+	assert.True(t, covered, "a reviewed target that converged since runs nothing: %s", reason)
+
+	covered, reason = roundCoversWork(plan(region), plan(wider), members(region), members(region))
+	assert.False(t, covered)
+	assert.Equal(t, "the reviewed target would run statements the confirmed plan did not show", reason)
+
+	covered, reason = roundCoversWork(&storage.Plan{}, plan(region), members(region), members(region))
+	assert.False(t, covered, "work on a reviewed target the confirmed plan showed as converged")
+	assert.Equal(t, "the reviewed target would run statements the confirmed plan did not show", reason)
+
+	covered, reason = roundCoversWork(plan(region), plan(region), members(region), members(wider))
+	assert.False(t, covered)
+	assert.Equal(t, "target eu/payments-002 would run statements the confirmed round did not plan", reason)
+
+	covered, reason = roundCoversWork(plan(region), plan(region), map[string]*storage.Plan{}, members(region))
+	assert.False(t, covered)
+	assert.Equal(t, "target eu/payments-002 has work the confirmed round did not plan", reason)
+}
