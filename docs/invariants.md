@@ -1608,7 +1608,9 @@ An unscoped PR command resolves to exactly one unambiguous database or is reject
 never resolved by an arbitrary pick. A malformed command is rejected rather than "helpfully"
 corrected into something executable, especially one carrying `--allow-unsafe`. Every command
 receives a response, and silence only ever means another instance owns the reply. *Enforced:*
-command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
+command discovery and the unowned-command policy (`pkg/webhook/commands.go`), and on a
+repository this deployment has not registered, the unscoped responder's reply
+(`pkg/webhook/unregistered_repo_reply.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 

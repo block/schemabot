@@ -181,6 +181,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			"pr", pr,
 			"installation_id", installationID,
 			"requested_by", requestedBy)
+		if message, replied := h.replyOnUnregisteredRepo(repo, pr, installationID, deliveryID, result); replied {
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
+			return
+		}
 		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "issue_comment", payload.Action, repo)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",
@@ -309,23 +313,9 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
-		if result.Action == action.Rollback {
-			if result.ApplyID == "" {
-				h.postComment(repo, pr, installationID, templates.RenderRollbackMissingArguments())
-				h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing rollback arguments"})
-				return
-			}
-			h.postComment(repo, pr, installationID, templates.RenderRollbackMissingEnv())
-			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
-			return
-		}
-		if result.Action == action.RollbackConfirm {
-			h.postComment(repo, pr, installationID, templates.RenderRollbackMissingEnv())
-			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
-			return
-		}
-		h.postComment(repo, pr, installationID, templates.RenderMissingEnv(result.Action))
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
+		comment, message := missingEnvironmentReply(result)
+		h.postComment(repo, pr, installationID, comment)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
 		return
 	}
 
