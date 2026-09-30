@@ -806,10 +806,10 @@ func TestRenderMultiDeploymentApplySummaryComment_ResumeFooterNamesTheWholeRollo
 // Every command a member's footer offers addresses the whole apply, in every
 // state and on every engine, including states added after this test: none takes
 // a member selector. So wherever a member's section prints a command, the scope
-// sentence is in the same footer ahead of it. Cutover is the exception: one
-// cutover lands on one member, so its footer must not claim the whole rollout.
+// sentence is in the same footer ahead of it, worded for how many commands the
+// footer offers. Cutover is the exception: one cutover lands on one member, so
+// its footer must not claim the whole rollout.
 func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
-	scope := rolloutScopeLine + ", not just `us`.\n\n"
 	for _, field := range reflect.ValueOf(state.Apply).Fields() {
 		applyState := field.String()
 		for _, engine := range []string{storage.EngineSpirit, storage.EnginePlanetScale} {
@@ -834,7 +834,7 @@ func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
 			}
 			for surface, out := range renders {
 				t.Run(applyState+"/"+engine+"/"+surface, func(t *testing.T) {
-					assertEveryCommandCarriesScope(t, out, scope)
+					assertEveryCommandCarriesScope(t, out, "us")
 				})
 			}
 		}
@@ -842,9 +842,10 @@ func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
 }
 
 // assertEveryCommandCarriesScope checks that each schemabot command block in
-// out sits in a footer that opens with scope, and that each cutover command
-// sits in a footer without it.
-func assertEveryCommandCarriesScope(t *testing.T, out, scope string) {
+// out sits in a footer whose scope sentence names member and is worded for the
+// footer's number of commands, and that each cutover command sits in a footer
+// without one.
+func assertEveryCommandCarriesScope(t *testing.T, out, member string) {
 	t.Helper()
 	const command = "```\nschemabot "
 	for at := 0; ; {
@@ -855,10 +856,19 @@ func assertEveryCommandCarriesScope(t *testing.T, out, scope string) {
 		i += at
 		footerStart := strings.LastIndex(out[:i], "\n---\n")
 		require.GreaterOrEqual(t, footerStart, 0, "a command renders outside any footer:\n%s", out)
+		footer := out[footerStart+len("\n---\n"):]
+		if next := strings.Index(footer, "\n---\n"); next >= 0 {
+			footer = footer[:next]
+		}
 		if strings.HasPrefix(out[i+len(command):], "cutover ") {
-			assert.NotContains(t, out[footerStart:i], rolloutScopeLine, "a cutover command claims the whole rollout:\n%s", out)
+			assert.NotContains(t, out[footerStart:i], "addresses the whole rollout", "a cutover command claims the whole rollout:\n%s", out)
 		} else {
-			assert.Contains(t, out[footerStart:i], scope, "a command renders without the rollout scope sentence:\n%s", out)
+			subject := "This command"
+			if strings.Count(footer, command) > 1 {
+				subject = "Each command below"
+			}
+			scope := subject + " addresses the whole rollout, not just " + inlineCode(member) + ".\n\n"
+			assert.Contains(t, out[footerStart:i], scope, "a command renders without a scope sentence matching its footer:\n%s", out)
 		}
 		at = i + len(command)
 	}

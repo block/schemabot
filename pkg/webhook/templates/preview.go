@@ -2361,10 +2361,10 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 }
 
 // PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
-// members were planned independently and so run different plans: one is already
-// at the desired schema bar one index, the other still needs both. Each member's
-// section names the plan it runs, so a reader can tie it back to the block they
-// reviewed. The converged rollouts above name none.
+// members were planned independently and so run different plans: `eu` is
+// already at the desired schema bar one index, while `us` still needs all
+// three. Each member's section names the plan it runs, so a reader can tie it
+// back to the block they reviewed. The converged rollouts above name none.
 func PreviewCommentMultiDeploymentApplyDivergentPlans() string {
 	model := presentation.Derive([]presentation.Operation{
 		{Deployment: "us", State: state.ApplyOperation.Running},

@@ -515,17 +515,33 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	writeMemberFooterAction(sb, data, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
 }
 
+// footerAction is one labelled command in a footer.
+type footerAction struct {
+	label, command string
+}
+
 // writeMemberFooterAction writes a footer action for a comment that may be one
 // member's section of a larger rollout, stating the command's rollout-wide
 // reach ahead of it when it is.
 func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, label, command string) {
-	sb.WriteString("\n---\n\n")
-	writeRolloutWideControlScope(sb, data)
-	fmt.Fprintf(sb, "%s\n```\n%s\n```\n", label, command)
+	writeMemberFooterActions(sb, data, footerAction{label: label, command: command})
 }
 
-// writeRolloutWideControlScope states that the command in a member's footer
-// addresses the whole rollout, not the member whose section they sit in.
+// writeMemberFooterActions writes a footer offering one or more actions, under
+// one scope sentence that covers them all.
+func writeMemberFooterActions(sb *strings.Builder, data ApplyStatusCommentData, actions ...footerAction) {
+	sb.WriteString("\n---\n\n")
+	writeRolloutWideControlScope(sb, data, len(actions))
+	for i, a := range actions {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(sb, "%s\n```\n%s\n```\n", a.label, a.command)
+	}
+}
+
+// writeRolloutWideControlScope states that the commands in a member's footer
+// address the whole rollout, not the member whose section they sit in.
 //
 // Control commands are scoped to the apply, and none takes a member selector,
 // so a command printed under one member's name would be read as addressing
@@ -533,19 +549,24 @@ func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, l
 // Rather than print a command nobody can narrow, the comment says what the one
 // it has does. The sentence leads the footer, ahead of the command, because a
 // code block is copied from its copy button and the eye does not travel past
-// it. It names no command, so it cannot disagree with the one it qualifies.
+// it. It names no command, so one sentence covers a footer that offers two,
+// worded for how many the footer offers, and cannot disagree with them.
 // Cutover footers do not carry
 // it, because one cutover lands on one member rather than on the whole
 // rollout. It stops being needed when control commands can address one member.
-func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData) {
+func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData, commands int) {
 	if !data.RolloutWide {
 		return
 	}
+	subject := "This command"
+	if commands > 1 {
+		subject = "Each command below"
+	}
 	if data.RolloutMember == "" {
-		sb.WriteString("This command addresses the whole rollout.\n\n")
+		fmt.Fprintf(sb, "%s addresses the whole rollout.\n\n", subject)
 		return
 	}
-	fmt.Fprintf(sb, "This command addresses the whole rollout, not just %s.\n\n", inlineCode(data.RolloutMember))
+	fmt.Fprintf(sb, "%s addresses the whole rollout, not just %s.\n\n", subject, inlineCode(data.RolloutMember))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window
@@ -1475,8 +1496,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
-		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
-		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeMemberFooterActions(sb, data,
+			footerAction{label: "To skip revert and keep changes:", command: appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant)},
+			footerAction{label: "To revert:", command: appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant)})
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
