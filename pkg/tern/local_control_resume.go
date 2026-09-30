@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1740,28 +1742,99 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 }
 
 // finalizerOperationKeySuffix is the trailing segment of a namespace-scoped
-// group_finalizer operation key (namespace + "/" + segment), assigned at apply
-// creation. The drive parses the namespace back out to reconstruct the VSchema
-// change.
-const finalizerOperationKeySuffix = "/group_finalizer"
+// group_finalizer operation key within one target (namespace + "/" + segment),
+// assigned at apply creation. The drive parses the namespace back out to
+// reconstruct the VSchema change.
+const finalizerOperationKeySuffix = state.OperationKeyDelimiter + state.GroupFinalizerKeySegment
 
 // finalizerDeploymentScopedKey is the operation key of a deployment-scoped
 // group_finalizer — the single operation a VSchema-only apply is shaped as. It
 // carries no namespace: the drive applies every VSchema-changed namespace in
 // the plan in one engine apply, because the engine treats the deployment (one
 // branch, one deploy) as the unit of change.
-const finalizerDeploymentScopedKey = "group_finalizer"
+const finalizerDeploymentScopedKey = state.GroupFinalizerKeySegment
 
-// namespaceFromFinalizerKey recovers the namespace a group_finalizer operation
-// targets from its operation key. Returns empty for any key without a
-// namespace prefix — callers must distinguish the deployment-scoped key
-// (finalizerDeploymentScopedKey, where empty means "all VSchema namespaces")
-// from a malformed key, which is a fail-closed condition.
-func namespaceFromFinalizerKey(operationKey string) string {
-	if !strings.HasSuffix(operationKey, finalizerOperationKeySuffix) {
-		return ""
+// resolveFinalizerNamespace returns the namespace a group_finalizer operation
+// finalizes, or empty for a deployment-scoped finalizer, which finalizes every
+// namespace its plan asks to. It reads the operation's key in the shape the key
+// writer gave it, and the apply's operation rows are what say which shape that
+// is (see finalizerNamespaceFromKey).
+func resolveFinalizerNamespace(ctx context.Context, store storage.Storage, apply *storage.Apply, op *storage.ApplyOperation) (string, error) {
+	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("list operations of apply %s to resolve group_finalizer apply_operation %d scope: %w", apply.ApplyIdentifier, op.ID, err)
 	}
-	return strings.TrimSuffix(operationKey, finalizerOperationKeySuffix)
+	namespace, err := finalizerNamespaceFromKey(op.OperationKey, op.Target, operationKeysLeadWithTarget(ops, op))
+	if err != nil {
+		return "", fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q: %w", op.ID, apply.ApplyIdentifier, op.OperationKey, err)
+	}
+	return namespace, nil
+}
+
+// operationKeysLeadWithTarget reports whether op's key leads with its target.
+// The key writer puts the target in front of every key of a deployment that
+// addresses more than one target (routing.MultiTargetDeployments over the
+// apply's members), so the reader applies that rule to the apply's operation
+// rows, op's own included.
+func operationKeysLeadWithTarget(ops []*storage.ApplyOperation, op *storage.ApplyOperation) bool {
+	members := make([]routing.ExecutionTarget, 0, len(ops)+1)
+	members = append(members, routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target})
+	for _, sibling := range ops {
+		members = append(members, routing.ExecutionTarget{Deployment: sibling.Deployment, Target: sibling.Target})
+	}
+	return routing.MultiTargetDeployments(members)[op.Deployment]
+}
+
+// finalizerNamespaceFromKey reads the namespace out of a group_finalizer
+// operation key, or empty for a deployment-scoped finalizer. target is the
+// operation's own target, and targetQualified says whether the writer put it in
+// front of the key.
+//
+// A deployment that addresses one target keys its finalizers within that
+// target: "ns_0/group_finalizer", or the bare "group_finalizer" when
+// deployment-scoped. A deployment that addresses several targets leads each key
+// with the operation's target: "orders-001/ns_0/group_finalizer", or
+// "orders-001/group_finalizer" when deployment-scoped. The key alone cannot
+// tell a namespace from a target in "orders/group_finalizer", since a target
+// can share a namespace's name, so targetQualified decides it. Two components
+// in front of the segment are always a target and a namespace, because a
+// namespace cannot contain the delimiter; that key must still lead with the
+// operation's own target.
+//
+// Any other key, or a qualified key led by another target, is an error: the
+// drive must not finalize a scope it cannot name.
+func finalizerNamespaceFromKey(operationKey, target string, targetQualified bool) (string, error) {
+	if operationKey == state.GroupFinalizerKeySegment {
+		if targetQualified {
+			return "", fmt.Errorf("deployment addresses several targets, so the key must lead with target %q", target)
+		}
+		return "", nil
+	}
+	scope, ok := state.FinalizerScope(operationKey)
+	if !ok {
+		return "", fmt.Errorf("key does not end in %q after a scope", finalizerOperationKeySuffix)
+	}
+	parts := strings.Split(scope, state.OperationKeyDelimiter)
+	if slices.Contains(parts, "") {
+		return "", fmt.Errorf("scope %q has an empty component", scope)
+	}
+	switch len(parts) {
+	case 1:
+		if !targetQualified {
+			return parts[0], nil
+		}
+		if parts[0] != target {
+			return "", fmt.Errorf("deployment addresses several targets, so the key must lead with target %q", target)
+		}
+		return "", nil
+	case 2:
+		if target == "" || parts[0] != target {
+			return "", fmt.Errorf("scope %q names target %q, not the operation's target %q", scope, parts[0], target)
+		}
+		return parts[1], nil
+	default:
+		return "", fmt.Errorf("scope %q has more components than a target and a namespace", scope)
+	}
 }
 
 // driveGroupFinalizer drives a task-less group_finalizer operation: it applies
@@ -1791,9 +1864,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	if plan == nil {
 		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
-	namespace := namespaceFromFinalizerKey(op.OperationKey)
-	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
-		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	namespace, err := resolveFinalizerNamespace(ctx, c.storage, apply, op)
+	if err != nil {
+		return err
 	}
 	changes, err := finalizerVSchemaChanges(plan, namespace)
 	if err != nil {

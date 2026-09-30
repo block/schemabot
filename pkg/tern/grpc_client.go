@@ -2450,9 +2450,9 @@ const (
 // apply) dispatches every VSchema-changed namespace in the plan as one apply.
 func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	op := scope.operation
-	namespace := namespaceFromFinalizerKey(op.OperationKey)
-	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
-		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	namespace, err := resolveFinalizerNamespace(ctx, c.storage, apply, op)
+	if err != nil {
+		return err
 	}
 	planID, err := scope.planID(apply)
 	if err != nil {
@@ -3357,7 +3357,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	// control-plane error — turns a version/data skew into an actionable message
 	// instead of a confusing data-plane failure.
 	targetShards := taskTargetShards(tasks)
-	if scope.operation != nil && isShardWorkOperationKey(scope.operation.OperationKey) && len(targetShards) != 1 {
+	if scope.operation != nil && isShardWorkOperationKey(scope.operation.OperationKey, scope.operation.Target) && len(targetShards) != 1 {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: shard operation %q resolved %d target shards, expected exactly 1 — its tasks carry no shard, so refusing to dispatch (the data plane would reject with \"expected exactly one target shard, got 0\"); this indicates a version or data skew", scope.operation.OperationKey, len(targetShards))
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after shard-scope guard: %w", apply.ApplyIdentifier, markErr)
@@ -3596,11 +3596,18 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 }
 
 // isShardWorkOperationKey reports whether an operation key is a sharded work
-// key ("namespace/shard/table") — the per-shard fan-out's unit. A whole-apply
-// key (empty) and a finalizer key ("namespace/group_finalizer") are not, so the
-// shard-scope guard applies only to per-shard work.
-func isShardWorkOperationKey(key string) bool {
-	parts := strings.Split(key, "/")
+// key ("namespace/shard/table") — the per-shard fan-out's unit — either on its
+// own or behind the operation's target ("orders-001/namespace/shard/table"),
+// the shape a deployment addressing several targets gives it. None of the
+// components can contain the delimiter, so four components are always a target
+// and a shard key. A whole-target key (empty, or the target alone) and a
+// finalizer key ("namespace/group_finalizer") are not, so the shard-scope guard
+// applies only to per-shard work.
+func isShardWorkOperationKey(key, target string) bool {
+	parts := strings.Split(key, state.OperationKeyDelimiter)
+	if len(parts) == 4 && target != "" && parts[0] == target {
+		parts = parts[1:]
+	}
 	return len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != ""
 }
 

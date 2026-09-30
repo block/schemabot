@@ -115,17 +115,19 @@ func finalizerOrphanedByFailedWork(op RolloutOperation, ops []RolloutOperation) 
 // (pkg/storage/internal/sqlstore/apply_operations.go) is the same rule for
 // the claim query.
 func FinalizerFinalizesWork(finalizerKey, workKey string) bool {
-	scope, ok := finalizerScope(finalizerKey)
+	scope, ok := FinalizerScope(finalizerKey)
 	if !ok {
 		return false
 	}
 	return workKey == scope || strings.HasPrefix(workKey, scope+OperationKeyDelimiter)
 }
 
-// finalizerScope returns a group_finalizer key without its trailing
-// GroupFinalizerKeySegment. ok is false for a key that does not end in the
-// segment after a non-empty scope.
-func finalizerScope(finalizerKey string) (scope string, ok bool) {
+// FinalizerScope returns a group_finalizer key without its trailing
+// GroupFinalizerKeySegment: the namespace, or the target and namespace, whose
+// work the finalizer finalizes. ok is false for a key that does not end in the
+// segment after a non-empty scope, which includes the bare deployment-scoped
+// key.
+func FinalizerScope(finalizerKey string) (scope string, ok bool) {
 	scope, ok = strings.CutSuffix(finalizerKey, OperationKeyDelimiter+GroupFinalizerKeySegment)
 	if !ok || scope == "" {
 		return "", false
