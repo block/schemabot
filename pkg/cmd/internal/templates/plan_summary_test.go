@@ -1,11 +1,15 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
-	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/schema"
+	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestDDLSummaryParts_DeduplicatesTableChanges(t *testing.T) {
@@ -163,5 +167,35 @@ func TestWritePlanSummaryWithVSchema_CountsEveryStatement(t *testing.T) {
 			[]VSchemaChange{{Keyspace: "orders"}},
 		)
 	})
-	assert.Equal(t, "📋 **Plan**: 1 index to drop, 1 VSchema change\n\n", out)
+	assert.Equal(t, "📋 Plan: 1 index to drop, 1 VSchema change\n\n", out)
+}
+
+// A terminal does not render markdown, so the VSchema-aware summary writer
+// prints the same plain summary line as WritePlanSummary for the same DDL.
+func TestWritePlanSummaryWithVSchema_MatchesThePlainSummaryLine(t *testing.T) {
+	changes := []DDLChange{{ChangeType: "CREATE", TableName: "orders"}, {ChangeType: "ALTER", TableName: "users"}}
+	plain := captureStdout(t, func() { WritePlanSummary(changes) })
+	withVSchema := captureStdout(t, func() { WritePlanSummaryWithVSchema(changes, nil) })
+	assert.Equal(t, "📋 Plan: 1 table to create, 1 table to alter\n\n", plain)
+	assert.Equal(t, plain, withVSchema)
+}
+
+// Six keyspaces add the same table and the engine finalizes each. The finalize
+// is part of the DDL's work, so they collapse like any keyspaces with identical
+// DDL. Keyspaces whose only work is a finalize keep a line each instead.
+func TestWriteNamespaceChangesCollapsesFinalizedKeyspacesWithTheSameDDL(t *testing.T) {
+	changes := []DDLChange{{ChangeType: "create", TableName: "refunds", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}}
+	var withDDL, finalizeOnly []NamespaceChange
+	for _, ks := range []string{"payments_001", "payments_002", "payments_003", "payments_004", "payments_005", "payments_006"} {
+		withDDL = append(withDDL, NamespaceChange{Namespace: ks, Changes: changes, Finalize: true})
+		finalizeOnly = append(finalizeOnly, NamespaceChange{Namespace: ks, Finalize: true})
+	}
+
+	collapsed := ansi.Strip(captureStdout(t, func() { WriteNamespaceChanges(withDDL, false, "payments", schema.DialectMySQL) }))
+	assert.Contains(t, collapsed, "... and 3 more keyspaces with identical changes")
+	assert.Equal(t, 1, strings.Count(collapsed, "+ refunds"), "%s", collapsed)
+	assert.NotContains(t, collapsed, "Finalized by the engine")
+
+	listed := ansi.Strip(captureStdout(t, func() { WriteNamespaceChanges(finalizeOnly, false, "payments", schema.DialectMySQL) }))
+	assert.Equal(t, 6, strings.Count(listed, "~ Finalized by the engine once every shard's DDL has landed"), "%s", listed)
 }

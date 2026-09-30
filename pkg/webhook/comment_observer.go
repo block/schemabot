@@ -36,7 +36,10 @@ type CommentObserver struct {
 	// ran an apply, for the engine-logs fold on a failed apply's summary.
 	// Nil where no reader was wired; see EngineLogReader.
 	engineLogs EngineLogReader
-	logger     interface {
+	// plans remembers the plan rows this apply's members run, so the progress
+	// comment reads each once for the observer's life, not once per render.
+	plans  planIdentities
+	logger interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Warn(msg string, args ...any)
@@ -696,7 +699,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 func (o *CommentObserver) resolveDisplay(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]operationDisplay {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveDisplayByOperation(ctx, o.stor, apply, ops)
+	return resolveDisplayByOperation(ctx, o.stor, apply, ops, &o.plans)
 }
 
 // resolveReleased reports whether the apply's paused rollout has been released

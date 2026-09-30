@@ -156,9 +156,10 @@ type LocalConfig struct {
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly); direct_execution ("true"
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
-	// with its required companion direct_execution_max_table_rows (positive
-	// estimated-row-count bound above which direct execution is blocked) and
-	// optional direct_execution_lock_acquisition_timeout_seconds (positive bound on
+	// with its size bounds direct_execution_max_table_rows (positive row
+	// count) and direct_execution_max_table_bytes (positive data-plus-index
+	// bytes), exactly one of which is required, and optional
+	// direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
 	// (enable_experimental_autoscaling,
@@ -1730,8 +1731,13 @@ func protoExemptTables(groups []*engine.ExemptTables) []*ternv1.ExemptTables {
 func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (changes []*ternv1.SchemaChange, violations []*ternv1.LintViolation, shards []*ternv1.ShardPlan) {
 	protoByNS := make(map[string]*ternv1.SchemaChange)
 	protoTableSeen := make(map[string]map[string]bool)
+	sizeAgg := c.aggregateShardTableSizes(result.Changes)
+	vschemaWorkUnexplained := make(map[string]bool)
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
+		if reportsVSchemaWorkWithoutGeneratedOnly(sc) {
+			vschemaWorkUnexplained[ns] = true
+		}
 		protoSC := protoByNS[ns]
 		if protoSC == nil {
 			protoSC = &ternv1.SchemaChange{
@@ -1764,7 +1770,18 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				}
 				protoTableSeen[ns][t.Table] = true
 			}
-			protoSC.TableChanges = append(protoSC.TableChanges, protoTableChangeFromEngine(t, ns))
+			ptc := protoTableChangeFromEngine(t, ns)
+			// The kept entry is the first shard's change; give it the
+			// cross-shard size aggregates so the namespace view reports the
+			// whole table, not one shard.
+			if a := sizeAgg[ns][t.Table]; a != nil {
+				shardCount, estimatedRows, largestShardRows, estimatedBytes := a.sizes()
+				ptc.ShardCount = int32(shardCount)
+				ptc.EstimatedRows = estimatedRows
+				ptc.LargestShardRows = largestShardRows
+				ptc.EstimatedBytes = estimatedBytes
+			}
+			protoSC.TableChanges = append(protoSC.TableChanges, ptc)
 		}
 		// A SchemaChange with an empty shard targets the whole namespace
 		// (non-sharded engines) and contributes no shard rows.
@@ -1775,6 +1792,13 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 			}
 			shards = append(shards, protoSP)
 		}
+	}
+	// The generated-only marker says a namespace has no hand-written VSchema
+	// change, which one shard cannot vouch for on another's behalf: when any
+	// change reports VSchema work without the marker, the merged namespace
+	// drops it and renders as it would without it.
+	for ns := range vschemaWorkUnexplained {
+		delete(protoByNS[ns].Metadata, engine.MetadataVSchemaGeneratedOnly)
 	}
 
 	violations = make([]*ternv1.LintViolation, len(result.LintViolations))
@@ -1789,6 +1813,14 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 	}
 
 	return changes, violations, shards
+}
+
+// reportsVSchemaWorkWithoutGeneratedOnly reports whether an engine change
+// annotates VSchema work, as a rendered diff or the changed flag, without also
+// saying that work is entirely generated from the plan's DDL.
+func reportsVSchemaWorkWithoutGeneratedOnly(sc engine.SchemaChange) bool {
+	reportsWork := sc.Metadata[storage.PlanMetadataVSchemaDiff] != "" || sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true"
+	return reportsWork && sc.Metadata[engine.MetadataVSchemaGeneratedOnly] != "true"
 }
 
 func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
@@ -2206,9 +2238,14 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, []storage.ShardPlan) {
 	namespaces := make(map[string]*storage.NamespacePlanData)
 	seenTable := make(map[string]map[string]bool)
+	vschemaWorkUnexplained := make(map[string]bool)
 	var allShardPlans []storage.ShardPlan
+	sizeAgg := c.aggregateShardTableSizes(changes)
 	for _, sc := range changes {
 		ns := c.planNamespace(sc.Namespace)
+		if reportsVSchemaWorkWithoutGeneratedOnly(sc) {
+			vschemaWorkUnexplained[ns] = true
+		}
 		nsData := namespaces[ns]
 		if nsData == nil {
 			nsData = &storage.NamespacePlanData{}
@@ -2226,7 +2263,11 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				}
 				seenTable[ns][tc.Table] = true
 			}
-			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
+			stc := storageTableChangeFromEngine(tc, "")
+			if a := sizeAgg[ns][tc.Table]; a != nil {
+				stc.ShardCount, stc.EstimatedRows, stc.LargestShardRows, stc.EstimatedBytes = a.sizes()
+			}
+			nsData.Tables = append(nsData.Tables, stc)
 		}
 		// Record each changing shard's own changes so apply-create can rebuild
 		// per-shard operation groups with per-shard DDL (a keyspace whose shards
@@ -2275,6 +2316,12 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				}
 			}
 		}
+	}
+	// As in the plan response (see planResultToProtoChanges), one shard's
+	// generated-only marker does not speak for a sibling that reports VSchema
+	// work without it.
+	for ns := range vschemaWorkUnexplained {
+		delete(namespaces[ns].Metadata, storage.PlanMetadataVSchemaGeneratedOnly)
 	}
 	return namespaces, allShardPlans
 }

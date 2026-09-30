@@ -208,10 +208,10 @@ func PreviewCommentPlanAttributedChange() string {
 	})
 }
 
-// PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
-// for a plan whose refused statement the direct execution policy routes to
-// native MySQL DDL (execution-mode verdict "direct"), showing the disclosure
-// the operator consents to by confirming.
+// PreviewCommentPlanDirect renders a sample locked apply comment for a plan
+// whose refused statement the direct execution policy routes to native MySQL
+// DDL (execution-mode verdict "direct"), showing the disclosure of how it runs.
+// The policy approves the change, so the apply runs without a confirmation.
 func PreviewCommentPlanDirect() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -235,9 +235,8 @@ func PreviewCommentPlanDirect() string {
 			},
 		},
 		DirectChanges: []DirectChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+			{Table: "users", Reason: "the table has ~1,240 rows"},
 		},
-		PendingManualConfirmation: true,
 	})
 }
 
@@ -2357,6 +2356,44 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 			sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
 			sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
 		},
+	})
+}
+
+// PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
+// members were planned independently and so run different plans: `eu` is
+// already at the desired schema bar one index, while `us` still needs all
+// three. Each member's section names the plan it runs, so a reader can tie it
+// back to the block they reviewed. The converged rollouts above name none.
+func PreviewCommentMultiDeploymentApplyDivergentPlans() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "us", State: state.ApplyOperation.Running},
+		{Deployment: "eu", State: state.ApplyOperation.Pending},
+	})
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Running
+	usTables[0].RowsCopied = 914707
+	usTables[0].RowsTotal = 1466232
+	usTables[0].PercentComplete = 62
+	usTables[0].ETASeconds = 195
+	usTables[1].Status = state.Task.Pending
+	usTables[2].Status = state.Task.Pending
+
+	euTables := sampleApplyTables()[:1]
+	euTables[0].Status = state.Task.Pending
+
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Running, usTables)
+	usDetail.PlanID = "plan_7c41f9"
+	euDetail := sampleDeploymentDetail("payments_eu", state.Apply.Pending, euTables)
+	euDetail.PlanID = "plan_3344ab"
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-6 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     []*ApplyStatusCommentData{usDetail, euDetail},
 	})
 }
 

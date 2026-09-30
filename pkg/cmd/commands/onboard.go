@@ -630,9 +630,9 @@ func describeOnboardPlanChanges(result *apitypes.PlanResponse) []string {
 			lines = append(lines, fmt.Sprintf("%s/%s (%s): %s", change.Namespace, tableChange.TableName, strings.ToLower(tableChange.ChangeType), onboardDDLPreview(tableChange.DDL)))
 		}
 		switch {
-		case change.HasVSchemaChange():
+		case change.ShowsVSchemaChange():
 			lines = append(lines, fmt.Sprintf("%s: vschema change", change.Namespace))
-		case change.NeedsFinalizer():
+		case change.NeedsFinalizer() && len(change.TableChanges) == 0:
 			lines = append(lines, fmt.Sprintf("%s: engine finalize requested", change.Namespace))
 		}
 	}

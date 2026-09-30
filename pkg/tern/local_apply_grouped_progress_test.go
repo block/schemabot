@@ -312,6 +312,48 @@ func TestPollForCompletionAtomic_LostEngineWorkSettlesRevertPhaseTasksWhenVerifi
 	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing by re-plan; the engine is never consulted")
 }
 
+// A peer takes the lease while this drive is settling work its engine lost.
+// The settlement write is refused because the lease is gone, not because the
+// target could not be read, so the drive exits at that write instead of
+// counting the refusal against the verification budget and going on to pause
+// an apply another driver now owns.
+func TestPollForCompletionAtomic_LostWorkSettlementRefusedByLeaseLossExits(t *testing.T) {
+	for name, taskState := range map[string]string{
+		"verified settlement":     state.Task.Running,
+		"revert-phase settlement": state.Task.Reverting,
+	} {
+		t.Run(name, func(t *testing.T) {
+			eng := &lostWorkEngine{
+				phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StatePending}}},
+				planResult:          &engine.PlanResult{NoChanges: true},
+			}
+			client, apply, tasks, recording := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetReached, taskState)
+			refusing := &settlementRefusingTaskStore{
+				stateRecordingTaskStore: recording,
+				err:                     fmt.Errorf("task update: %w", storage.ErrApplyLeaseLost),
+				refusals:                -1,
+			}
+			st := client.storage.(*exactProgressStorage)
+			st.tasks = refusing
+
+			client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+
+			// The ticks inside the trust budget still project the tasks' own
+			// in-flight state onto the apply; what a displaced driver must never
+			// write is the retryable pause its budget would have reached.
+			stored, err := st.applies.Get(t.Context(), apply.ID)
+			require.NoError(t, err)
+			assert.NotEqual(t, state.Apply.FailedRetryable, stored.State, "a displaced driver never pauses the apply for retry")
+			assert.False(t, state.IsTerminalApplyState(stored.State), "a displaced driver never finalizes the apply; stored state was %q", stored.State)
+			assert.NotEqual(t, state.Apply.FailedRetryable, apply.State, "the drive's own apply claims no verdict either")
+			assert.Equal(t, 1, refusing.refused, "the drive stops at the first refused settlement instead of retrying it as a verification failure")
+			for _, task := range tasks {
+				assert.Equal(t, taskState, task.State, "the in-memory tasks are left as stored")
+			}
+		})
+	}
+}
+
 // A shard-scoped dispatch tags its tasks with the shard they ran on, while
 // re-planning the reviewed schema set describes whole namespaces. A converged
 // whole-namespace re-plan therefore never mentions a shard, and reading its

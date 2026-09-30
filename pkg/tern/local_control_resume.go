@@ -1057,40 +1057,53 @@ func sameApplyOperation(a, b *int64) bool {
 
 // prepareRetryableTasksForResume queues only the task work that previously
 // stopped on a retryable engine failure. Completed tasks remain completed, and
-// pending tasks remain queued behind the retried work.
-func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+// pending tasks remain queued behind the retried work. A requeue write that
+// does not land is returned: the task row is still failed_retryable, so driving
+// on would run its DDL while storage records it at rest. The caller exits the
+// drive with the apply still retryable, and the next claim retries the requeue.
+func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		return
+		return nil
 	}
 	apply.ErrorMessage = ""
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue
 		}
+		previous := *task
 		task.Attempt++
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
+			*task = previous
+			return fmt.Errorf("requeue retryable task %s for retry of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 // prepareStoppedTasksForResume turns an operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a driver crash can still be
 // recovered by another operator driver.
-func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) error {
 	if !startRequested {
-		return
+		return nil
 	}
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
+		previous := *task
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
+			*task = previous
+			return fmt.Errorf("requeue stopped task %s for start of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
@@ -2302,8 +2315,21 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		}
 	}
 
-	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
-	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
+	retryableApplyError := apply.ErrorMessage
+	if err := c.prepareRetryableTasksForResume(ctx, apply, activeTasks); err != nil {
+		// Nothing has written the apply row yet, so it still records the
+		// retryable pause it was claimed in; only the in-memory error message
+		// was cleared for the retry, and it is put back to match the row.
+		apply.ErrorMessage = retryableApplyError
+		logger.Warn("could not requeue retryable tasks for the retry; the apply stays retryable for the next claim",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
+	if err := c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested); err != nil {
+		logger.Warn("could not requeue stopped tasks for start; the request remains pending for the next claim",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 
 	if grouped {
 		resumeCtx, cancelResume := context.WithCancel(ctx)

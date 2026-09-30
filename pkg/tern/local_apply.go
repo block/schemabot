@@ -619,7 +619,8 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 // the work and the task keeps blocking, and a terminal report is only trusted
 // for a task in flight whose last lease belongs to this process (the
 // completing process's own report; see terminalReportDescribesTask).
-// Returns true if the task was resolved (no longer blocking).
+// Returns true if the task was resolved (no longer blocking), which requires
+// the settlement to be durably written; a refused write keeps the task blocking.
 func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string, memo *conflictScanMemo) bool {
 	eng := c.getEngine()
 	if eng == nil {
@@ -700,13 +701,20 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		c.logger.Info("conflict check: engine reports terminal state",
 			"task_id", t.TaskIdentifier, "engine_state", result.State,
 			"engine_message", result.Message, "storage_state", t.State)
+		// The task stops blocking only once its settlement is durable:
+		// reporting it resolved on a refused write would admit a new apply
+		// while storage still records the task as in-flight work. A refused
+		// write restores the task, so it keeps blocking and a later conflict
+		// check retries the settlement cleanly. The write carries the
+		// operation lease absence guard, so a drive that claimed the
+		// operation after the lease was read refuses it the same way.
 		previous := *t
+		settledState := engineStateToStorage(result.State)
 		now := time.Now()
 		t.CompletedAt = &now
-		if err := c.persistTaskStateTransition(settlementCtx, t, 0, engineStateToStorage(result.State), ""); err != nil {
+		if err := c.persistTaskStateTransition(settlementCtx, t, 0, settledState, ""); err != nil {
 			*t = previous
-			c.logger.Warn("conflict check: terminal task settlement lost its operation lease guard; the task keeps blocking",
-				append(t.LogAttrs(), "error", err)...)
+			c.logStaleTaskSettlementRefused(t, apply, settledState, err)
 			return false
 		}
 		return true
@@ -733,20 +741,36 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		}
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
 			"task_id", t.TaskIdentifier, "storage_state", t.State, "started_at", t.StartedAt)
+		// As with a terminal report, the task stops blocking only once its
+		// failure is durable, and the write carries the same absence guard.
 		previous := *t
 		now := time.Now()
 		t.ErrorMessage = "Task abandoned: engine has no active schema change (server may have crashed)"
 		t.CompletedAt = &now
 		if err := c.persistTaskStateTransition(settlementCtx, t, 0, state.Task.Failed, ""); err != nil {
 			*t = previous
-			c.logger.Warn("conflict check: abandoned task settlement lost its operation lease guard; the task keeps blocking",
-				append(t.LogAttrs(), "error", err)...)
+			c.logStaleTaskSettlementRefused(t, apply, state.Task.Failed, err)
 			return false
 		}
 		return true
 	}
 
 	return false
+}
+
+// logStaleTaskSettlementRefused records why tryResolveStaleTask left a task
+// blocking after its settlement write did not land. A write the operation
+// lease absence guard refused means a drive claimed the operation after the
+// conflict check read its lease, which is that guard working as intended and
+// worth a warning; any other refusal is a storage failure that must be seen,
+// since the task blocks its database until a later check retries it.
+func (c *LocalClient) logStaleTaskSettlementRefused(t *storage.Task, apply *storage.Apply, settledState string, err error) {
+	attrs := append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error", err)
+	if errors.Is(err, storage.ErrOperationLeaseActive) {
+		c.logger.Warn("conflict check: a drive took the task's operation lease before its settlement landed; the task keeps blocking until that drive settles it", attrs...)
+		return
+	}
+	c.logger.Error("conflict check: failed to persist a stale task's settlement; the task keeps blocking the database", attrs...)
 }
 
 // terminalReportDescribesTask reports whether a terminal engine report has

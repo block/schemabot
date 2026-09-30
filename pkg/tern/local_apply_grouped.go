@@ -742,6 +742,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if exhausted {
 			var settleErr error
 			if settled, settleErr = c.settleLostEngineWorkForTasks(ctx, apply, tasks, result.State); settleErr != nil {
+				if errors.Is(settleErr, storage.ErrApplyLeaseLost) {
+					// The target answered; only a settlement write was refused,
+					// because a peer now holds the lease. That peer settles the
+					// tasks, so this driver exits rather than counting the
+					// refusal as a failed verification and going on to pause an
+					// apply it no longer owns.
+					logger.Warn("settling lost engine work was refused because the drive's lease was lost; this driver exits",
+						append(apply.MutableLogAttrs(), "engine_state", result.State, "error", settleErr)...)
+					return true
+				}
 				// Neither the engine nor the target has answered what happened
 				// to the work, so count the failed verification against the
 				// same bounded error budget as a failed poll — this must never
@@ -1243,7 +1253,9 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 			continue
 		}
 		if taskInRevertPhase(task) {
-			c.settleLostRevertPhaseTask(ctx, apply, task, engineState)
+			if err := c.settleLostRevertPhaseTask(ctx, apply, task, engineState); err != nil {
+				return settled, err
+			}
 			settled.add(task)
 			continue
 		}
@@ -1264,7 +1276,9 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	for _, task := range unverified {
-		c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState)
+		if err := c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState); err != nil {
+			return settled, err
+		}
 		settled.add(task)
 	}
 	return settled, nil
