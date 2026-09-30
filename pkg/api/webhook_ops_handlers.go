@@ -472,21 +472,11 @@ func resolveRepoInstallationClient(ctx context.Context, cfg *ServerConfig, repo 
 	if err != nil {
 		return nil, 0, err
 	}
-	appID, err := app.Config.ResolveAppID()
+	creds, err := app.Config.ResolveCredentials()
 	if err != nil {
 		return nil, 0, fmt.Errorf("app %q: %w", app.Name, err)
 	}
-	if appID == 0 {
-		return nil, 0, fmt.Errorf("app %q has an empty app-id", app.Name)
-	}
-	privateKey, err := app.Config.ResolvePrivateKey()
-	if err != nil {
-		return nil, 0, fmt.Errorf("resolve private key for app %q: %w", app.Name, err)
-	}
-	if privateKey == "" {
-		return nil, 0, fmt.Errorf("app %q private key resolved to empty value", app.Name)
-	}
-	client := ghclient.NewClient(appID, []byte(privateKey), logger,
+	client := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(app.Config.TrustedCheckAppSlugs))
 	installationID, err := client.InstallationIDForRepo(ctx, repo)
 	if err != nil {
@@ -554,15 +544,18 @@ func webhookRedriveApps(cfg *ServerConfig, onlyApp string) ([]webhookRedriveApp,
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	configured := cfg.Apps
-	if len(configured) == 0 {
-		if !cfg.GitHub.Configured() {
-			return nil, fmt.Errorf("no GitHub App is configured")
+	if len(cfg.Apps) == 0 {
+		creds, err := cfg.GitHub.ResolveCredentials()
+		if err != nil {
+			return nil, fmt.Errorf("default GitHub App: %w", err)
 		}
-		configured = map[string]GitHubAppConfig{"default": cfg.GitHub}
+		if onlyApp != "" && onlyApp != "default" {
+			return nil, webhookOpsRequestErrorf("no configured GitHub App named %q", onlyApp)
+		}
+		return []webhookRedriveApp{{name: "default", id: creds.AppID, config: cfg.GitHub}}, nil
 	}
-	names := make([]string, 0, len(configured))
-	for name := range configured {
+	names := make([]string, 0, len(cfg.Apps))
+	for name := range cfg.Apps {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -571,7 +564,7 @@ func webhookRedriveApps(cfg *ServerConfig, onlyApp string) ([]webhookRedriveApp,
 		if onlyApp != "" && name != onlyApp {
 			continue
 		}
-		appConfig := configured[name]
+		appConfig := cfg.Apps[name]
 		appID, err := appConfig.ResolveAppID()
 		if err != nil {
 			return nil, fmt.Errorf("app %q: %w", name, err)

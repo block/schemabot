@@ -3360,9 +3360,9 @@ func TestGitHubConfig_Configured(t *testing.T) {
 
 // The app ID resolves from config or the GITHUB_APP_ID fallback with
 // surrounding whitespace trimmed, so a mounted secret's trailing newline still
-// yields the ID. An unset app ID is "not configured" (0, no error), while a
-// value that is not a positive integer is a configuration error that names the
-// setting and never echoes the value.
+// yields the ID. An unset or zero app ID is "not configured" (0, no error),
+// while a value that is not a non-negative integer is a configuration error
+// that names the setting and never echoes the value.
 func TestGitHubConfig_ResolveAppID(t *testing.T) {
 	t.Run("resolves numeric string", func(t *testing.T) {
 		g := GitHubConfig{AppID: "456789"}
@@ -3422,13 +3422,18 @@ func TestGitHubConfig_ResolveAppID(t *testing.T) {
 		assert.NotContains(t, err.Error(), "not-a-number", "the resolved value must not appear in the error")
 	})
 
-	t.Run("non-positive value is an error", func(t *testing.T) {
-		for _, value := range []string{"0", "-5"} {
-			g := GitHubConfig{AppID: value}
-			_, err := g.ResolveAppID()
-			require.ErrorIs(t, err, ErrInvalidGitHubAppID, "app-id %q", value)
-			assert.Contains(t, err.Error(), "app-id must be a positive integer")
-		}
+	t.Run("zero is not configured, as the deployment templates seed it", func(t *testing.T) {
+		g := GitHubConfig{AppID: "0"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("negative value is an error", func(t *testing.T) {
+		g := GitHubConfig{AppID: "-5"}
+		_, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "app-id must be a positive integer")
 	})
 
 	t.Run("unresolvable secret reference is an error but not an invalid app ID", func(t *testing.T) {
@@ -3454,6 +3459,75 @@ func TestGitHubConfig_ResolveAppID(t *testing.T) {
 		id, err := g.ResolveAppID()
 		require.NoError(t, err)
 		assert.Equal(t, int64(123), id)
+	})
+}
+
+// ResolveCredentials tells the three unusable shapes apart so the server can
+// start with GitHub off for an App that is not configured or whose credentials
+// have not arrived, and refuse to start for one whose App ID is malformed.
+func TestGitHubConfig_ResolveCredentials(t *testing.T) {
+	t.Run("both resolve", func(t *testing.T) {
+		t.Setenv("RESOLVE_CREDS_PK", "private-key-bytes")
+		g := GitHubConfig{AppID: "123", PrivateKey: "env:RESOLVE_CREDS_PK"}
+		creds, err := g.ResolveCredentials()
+		require.NoError(t, err)
+		assert.Equal(t, GitHubAppCredentials{AppID: 123, PrivateKey: "private-key-bytes"}, creds)
+	})
+
+	t.Run("nothing set is not configured", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		g := GitHubConfig{}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppNotConfigured)
+		assert.NotErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+	})
+
+	t.Run("placeholder zero app-id with a key reference is unavailable, not malformed", func(t *testing.T) {
+		g := GitHubConfig{AppID: "0", PrivateKey: "file:/nonexistent/private-key.pem"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "private-key is set but app-id is empty")
+	})
+
+	t.Run("app-id without a private key is unavailable", func(t *testing.T) {
+		g := GitHubConfig{AppID: "123"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "app-id is set but private-key is missing")
+	})
+
+	t.Run("unresolvable app-id reference is unavailable", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		g := GitHubConfig{AppID: "file:" + nonexistent, PrivateKey: "some-key"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "resolve app-id")
+	})
+
+	t.Run("unresolvable private key reference is unavailable", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-key.pem")
+		g := GitHubConfig{AppID: "123", PrivateKey: "file:" + nonexistent}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "resolve private-key")
+	})
+
+	t.Run("private key that resolves to empty is unavailable", func(t *testing.T) {
+		t.Setenv("RESOLVE_CREDS_EMPTY_PK", "")
+		g := GitHubConfig{AppID: "123", PrivateKey: "env:RESOLVE_CREDS_EMPTY_PK"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "private-key resolved to empty")
+	})
+
+	t.Run("malformed app-id is invalid, not unavailable", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc", PrivateKey: "some-key"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.NotErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrGitHubAppNotConfigured)
 	})
 }
 

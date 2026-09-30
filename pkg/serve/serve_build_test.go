@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -327,11 +328,13 @@ func TestForwardAuthOperatorScopingThroughServerHandler(t *testing.T) {
 	})
 }
 
-// A GitHub App ID that resolves to something other than a positive integer
+// A GitHub App ID that resolves to something other than a non-negative integer
 // fails server startup with an error naming the setting, instead of the server
-// coming up with the webhook endpoint quietly disabled. An App ID that is not
-// configured at all still starts the server, with the webhook endpoint
-// answering 503.
+// coming up with the webhook endpoint quietly disabled. Every other way the
+// credentials are unusable — not configured at all, the placeholder 0 the
+// deployment templates seed before an App exists, or a secret reference that
+// does not resolve yet — still starts the server, with the webhook endpoint
+// answering 503 until the credentials arrive.
 func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 
@@ -345,9 +348,8 @@ func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
 		assert.NotContains(t, err.Error(), "abc", "the resolved value must not appear in the error")
 	})
 
-	t.Run("unset app-id starts with the webhook endpoint disabled", func(t *testing.T) {
-		t.Setenv("GITHUB_APP_ID", "")
-		cfg := &api.ServerConfig{}
+	startsDisabled := func(t *testing.T, cfg *api.ServerConfig) {
+		t.Helper()
 		svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
 
 		runtime, err := buildWebhookRuntime(cfg, svc, logger)
@@ -357,6 +359,20 @@ func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
 		rec := httptest.NewRecorder()
 		runtime.handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", nil))
 		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	}
+
+	t.Run("unset app-id starts with the webhook endpoint disabled", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		startsDisabled(t, &api.ServerConfig{})
+	})
+
+	t.Run("placeholder zero app-id starts with the webhook endpoint disabled", func(t *testing.T) {
+		startsDisabled(t, &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "0", PrivateKey: "some-key", WebhookSecret: "secret"}})
+	})
+
+	t.Run("unresolvable app-id reference starts with the webhook endpoint disabled", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		startsDisabled(t, &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "file:" + nonexistent, PrivateKey: "some-key", WebhookSecret: "secret"}})
 	})
 }
 

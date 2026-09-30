@@ -174,10 +174,18 @@ func resolveSecretsManager(ctx context.Context, ref string) (string, error) {
 	if jsonKey == "" {
 		return secretValue, nil
 	}
+	return secretJSONKey(secretValue, secretName, jsonKey)
+}
 
-	// Parse as JSON and extract the key
+// secretJSONKey extracts one key of a JSON-object secret as a string. A string
+// value is returned as is; any other value is returned as its JSON literal, so
+// a number keeps every digit it was stored with rather than being reformatted
+// through a float.
+func secretJSONKey(secretValue, secretName, jsonKey string) (string, error) {
+	decoder := json.NewDecoder(strings.NewReader(secretValue))
+	decoder.UseNumber()
 	var data map[string]any
-	if err := json.Unmarshal([]byte(secretValue), &data); err != nil {
+	if err := decoder.Decode(&data); err != nil {
 		return "", fmt.Errorf("parse secret %q as JSON: %w", secretName, err)
 	}
 
@@ -186,10 +194,11 @@ func resolveSecretsManager(ctx context.Context, ref string) (string, error) {
 		return "", fmt.Errorf("key %q not found in secret %q", jsonKey, secretName)
 	}
 
-	// Convert to string
 	switch v := val.(type) {
 	case string:
 		return v, nil
+	case json.Number:
+		return v.String(), nil
 	default:
 		return fmt.Sprintf("%v", v), nil
 	}
