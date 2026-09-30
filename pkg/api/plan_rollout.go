@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
@@ -164,6 +166,9 @@ func unplannedMemberApplyOutcome(planning MemberPlanning) string {
 // change runs under and its reason (see planGroupKey). A member that errored has no
 // fingerprint and no plan, and a mirrored member that diverged would still run
 // the primary's plan, so neither joins a group: each is listed for attention.
+//
+// Each grouped member's table sizes are read from its own plan, not from its
+// group's, since a group's changes are its first member's.
 func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 	members := make([]routing.ExecutionTarget, len(rollup.Entries))
 	for i, e := range rollup.Entries {
@@ -200,6 +205,7 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 			resp.Groups = append(resp.Groups, group)
 		}
 		group.Members = append(group.Members, names[i])
+		resp.TableSizes = append(resp.TableSizes, memberTableSizes(names[i], e)...)
 	}
 	// The primary is the first member, so its group is already first unless
 	// the primary itself needs attention. Ordering is stated as a property of
@@ -215,6 +221,59 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 		}
 	})
 	return resp
+}
+
+// memberTableRef names a table within one member's plan namespace.
+type memberTableRef struct{ namespace, table string }
+
+// memberTableSizes lists one rollout member's size estimate for each existing
+// table its own plan copies, rebuilds, or scans. Sizes are read from the
+// member's own plan, since each member applies to its own data. A table is
+// listed once however many statements change it, since each statement carries
+// the whole table's estimate, and tables the member creates are left out,
+// having no data yet. The namespace view carries the estimate, which for a
+// sharded namespace is summed across its shards, while every shard's DDL
+// decides whether the table's cost grows with its size.
+func memberTableSizes(member string, e DeploymentRollupEntry) []*apitypes.PlanMemberTableSizeResponse {
+	shardDDL := make(map[memberTableRef][]string)
+	for _, sp := range e.ChangeSet.Shards {
+		for _, tc := range sp.GetChanges() {
+			if tc.GetDdl() == "" {
+				continue
+			}
+			ref := memberTableRef{sp.GetNamespace(), tc.GetTableName()}
+			shardDDL[ref] = append(shardDDL[ref], tc.GetDdl())
+		}
+	}
+	var sizes []*apitypes.PlanMemberTableSizeResponse
+	listed := make(map[memberTableRef]bool)
+	for _, sc := range e.ChangeSet.Changes {
+		for _, tc := range sc.GetTableChanges() {
+			ref := memberTableRef{sc.GetNamespace(), tc.GetTableName()}
+			attrs := []any{"deployment", e.Deployment, "target", e.Target, "namespace", ref.namespace, "table", ref.table}
+			if listed[ref] {
+				slog.Debug("table already has a size on this rollout member; skipping its further statements", attrs...)
+				continue
+			}
+			if tc.GetChangeType() == ternv1.ChangeType_CHANGE_TYPE_CREATE {
+				slog.Debug("table is created by this rollout member's plan; it has no size to show", attrs...)
+				continue
+			}
+			ddls := append([]string{tc.GetDdl()}, shardDDL[ref]...)
+			if !ddl.TableCostScalesWithSize(e.DatabaseType, ddls, attrs...) {
+				slog.Debug("table's changes on this rollout member are metadata-only; it gets no size", attrs...)
+				continue
+			}
+			listed[ref] = true
+			sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{
+				Target:         member,
+				Namespace:      ref.namespace,
+				Table:          ref.table,
+				EstimatedBytes: tc.EstimatedBytes,
+			})
+		}
+	}
+	return sizes
 }
 
 // planGroupKey is what two members share when one group describes both: the

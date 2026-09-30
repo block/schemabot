@@ -852,6 +852,25 @@ type PlanRolloutResponse struct {
 	// this plan is applied rollout-wide through the API, which refuses the
 	// whole apply. Set only when no member needs attention.
 	Refused []*PlanMemberRefusalResponse `json:"refused,omitempty"`
+	// TableSizes is each member's size estimate for each existing table its
+	// own plan copies, rebuilds, or scans, in rollout order, primary first.
+	// A group's changes are its first member's plan, so sizes are listed per
+	// member rather than read from a group: each member applies to its own
+	// data. Members listed for attention are not included.
+	TableSizes []*PlanMemberTableSizeResponse `json:"table_sizes,omitempty"`
+}
+
+// PlanMemberTableSizeResponse is one rollout member's plan-time size estimate
+// for one table its plan changes.
+type PlanMemberTableSizeResponse struct {
+	// Target is the member's operator-facing name, as Groups name it.
+	Target    string `json:"target"`
+	Namespace string `json:"namespace"`
+	Table     string `json:"table"`
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes) on this member, summed across shards for a sharded member.
+	// Nil when the engine reported no estimate.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 }
 
 // PlanMemberRefusalResponse is a rollout member whose own plan a rollout-wide
