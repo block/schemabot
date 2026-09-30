@@ -151,7 +151,45 @@ func TestGroupFilesByNamespace_OnlyNonSchemaFiles(t *testing.T) {
 	assert.Empty(t, result)
 }
 
-// $ENV substitution tests.
+// Environment placeholder substitution tests.
+
+func TestGroupFilesByNamespace_BraceEnvSubstitution(t *testing.T) {
+	files := map[string]string{
+		"bikeshare_{env}/bikes.sql":    "CREATE TABLE bikes (...);",
+		"bikeshare_{env}/stations.sql": "CREATE TABLE stations (...);",
+	}
+	for _, environment := range []string{"staging", "production"} {
+		t.Run(environment, func(t *testing.T) {
+			result, _, err := GroupFilesByNamespace(files, "ignored", environment, nil)
+			require.NoError(t, err)
+			require.Len(t, result, 1)
+			assert.Len(t, result["bikeshare_"+environment].Files, 2)
+		})
+	}
+}
+
+func TestGroupFilesByNamespace_BraceEnvFlatLayout(t *testing.T) {
+	result, _, err := GroupFilesByNamespace(map[string]string{"bikes.sql": "CREATE TABLE bikes (...);"}, "bikeshare_{env}", "production", nil)
+	require.NoError(t, err)
+	assert.Contains(t, result, "bikeshare_production")
+}
+
+func TestGroupFilesByNamespace_BraceEnvEmptyNamespace(t *testing.T) {
+	result, _, err := GroupFilesByNamespace(map[string]string{"bikeshare_{env}/schema.sql": EmptyNamespaceDeclaration}, "ignored", "staging", nil)
+	require.NoError(t, err)
+	require.Contains(t, result, "bikeshare_staging")
+	assert.Empty(t, result["bikeshare_staging"].Files)
+}
+
+func TestGroupFilesByNamespace_EnvAliasesCannotCollide(t *testing.T) {
+	files := map[string]string{
+		"bikeshare_$ENV/bikes.sql":  "CREATE TABLE bikes (id bigint);",
+		"bikeshare_{env}/bikes.sql": "CREATE TABLE bikes (id int);",
+	}
+	_, _, err := GroupFilesByNamespace(files, "ignored", "staging", nil)
+	require.ErrorContains(t, err, "both resolve to namespace")
+	assert.ErrorContains(t, err, "bikeshare_staging")
+}
 
 func TestGroupFilesByNamespace_EnvSubstitution_SubdirLayout(t *testing.T) {
 	// Subdirectory named "bikeshare_$ENV" becomes "bikeshare_staging" when
@@ -253,6 +291,18 @@ func TestGroupFilesByNamespace_IgnoreNamespacesEnvSubstitution(t *testing.T) {
 	assert.Equal(t, []string{"fixtures_staging"}, removed)
 }
 
+func TestGroupFilesByNamespace_IgnoreNamespacesBraceEnv(t *testing.T) {
+	files := map[string]string{
+		"app_{env}/users.sql":        "CREATE TABLE users (...);",
+		"fixtures_{env}/widgets.sql": "CREATE TABLE widgets (...);",
+	}
+	result, removed, err := GroupFilesByNamespace(files, "ignored", "staging", []string{"fixtures_{env}"})
+	require.NoError(t, err)
+	assert.Contains(t, result, "app_staging")
+	assert.NotContains(t, result, "fixtures_staging")
+	assert.Equal(t, []string{"fixtures_staging"}, removed)
+}
+
 func TestGroupFilesByNamespace_IgnoreNamespacesNoMatch(t *testing.T) {
 	// An ignore entry that matches no namespace directory removes nothing; the
 	// removed list stays empty and the entry surfaces via
@@ -335,6 +385,10 @@ func TestResolveIgnoreNamespaces(t *testing.T) {
 		ResolveIgnoreNamespaces([]string{"fixtures_$ENV", "local_fixtures"}, "staging"))
 	assert.Equal(t, []string{"fixtures_$ENV"},
 		ResolveIgnoreNamespaces([]string{"fixtures_$ENV"}, ""))
+	assert.Equal(t, []string{"fixtures_staging", "legacy_staging"},
+		ResolveIgnoreNamespaces([]string{"fixtures_{env}", "legacy_$ENV"}, "staging"))
+	assert.Equal(t, []string{"fixtures_{env}"},
+		ResolveIgnoreNamespaces([]string{"fixtures_{env}"}, ""))
 }
 
 func TestGroupFilesByNamespaceEmptyDeclaration(t *testing.T) {
