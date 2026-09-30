@@ -983,8 +983,9 @@ func (m *mockPlanStore) GetByPR(context.Context, string, int) ([]*storage.Plan, 
 func (m *mockPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
-func (m *mockPlanStore) Delete(context.Context, int64) error           { return nil }
-func (m *mockPlanStore) DeleteByPR(context.Context, string, int) error { return nil }
+func (m *mockPlanStore) UpdateRoute(context.Context, string, string, string) error { return nil }
+func (m *mockPlanStore) Delete(context.Context, int64) error                       { return nil }
+func (m *mockPlanStore) DeleteByPR(context.Context, string, int) error             { return nil }
 
 // mockStorageWithPlans wraps mockStorage but returns a real PlanStore.
 type mockStorageWithPlans struct {

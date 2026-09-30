@@ -561,6 +561,13 @@ type PlanStore interface {
 	// GetByPR returns all plans for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Plan, error)
 
+	// UpdateRoute restamps the stored plan with the rollout member it was
+	// planned for: its deployment and target. It is for the service's own row
+	// write finding the row a planner sharing this storage already stored under
+	// the same identifier, stamped with the route the planner knew. It changes
+	// nothing else on the row.
+	UpdateRoute(ctx context.Context, planIdentifier, deployment, target string) error
+
 	// List returns plans matching opts, newest first. Ordering is
 	// deterministic on created_at ties (see the sqlstore GetByPR ordering
 	// rationale). Returned plans omit SchemaFiles — the full desired-schema
