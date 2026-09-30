@@ -221,11 +221,11 @@ func TestFinalizerDispatchScopeCoversFinalizeOnlyNamespaces(t *testing.T) {
 		},
 	}
 
-	ns, err := finalizerDispatchScope(plan, []string{"ks_b", "ks_a"}, nil)
+	ns, err := finalizerDispatchScope(plan, []string{"ks_b", "ks_a"}, nil, "")
 	require.NoError(t, err)
 	assert.Empty(t, ns, "a dispatch naming the full finalizer set is deployment-scoped")
 
-	_, err = finalizerDispatchScope(plan, []string{"ks_a"}, []string{"group_finalizer"})
+	_, err = finalizerDispatchScope(plan, []string{"ks_a"}, []string{"group_finalizer"}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "plan plan-scope-finalize finalizes [ks_a ks_b]")
 }

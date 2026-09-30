@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -20,7 +21,8 @@ import (
 // orders-001 (operation 51) over the remote path and checks which namespaces it
 // dispatches: exactly its own namespace, or every namespace its plan finalizes
 // for a deployment-scoped finalizer, and nothing at all for a key that does not
-// belong to the operation's own target.
+// belong to the operation's own target. The plan is the one produced for that
+// target, since a member dispatch runs only its own target's plan.
 func TestGRPCClient_ResumeApplyOperationScopesTargetsListFinalizer(t *testing.T) {
 	finalizer := func(id int64, target, key string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{
@@ -96,7 +98,7 @@ func TestGRPCClient_ResumeApplyOperationScopesTargetsListFinalizer(t *testing.T)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			server := &capturingTernServer{remoteApplyID: "remote-targets-finalizer-1"} // default Progress = COMPLETED
+			server := &capturingTernServer{remoteApplyID: "remote-targets-finalizer-1", remoteOperationID: "remote-op-51"} // default Progress = COMPLETED
 			client, cleanup := testCapturingGRPCClient(t, server)
 			defer cleanup()
 
@@ -125,6 +127,7 @@ func TestGRPCClient_ResumeApplyOperationScopesTargetsListFinalizer(t *testing.T)
 				plans: &mockPlanStore{plan: &storage.Plan{
 					ID:             apply.PlanID,
 					PlanIdentifier: "plan-targets-finalizer",
+					Target:         tc.ops[0].Target,
 					SchemaFiles:    schemaFiles,
 					Namespaces:     namespaces,
 				}},
@@ -241,6 +244,95 @@ func TestIsShardWorkOperationKey(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.key+" on "+tc.target, func(t *testing.T) {
 			assert.Equal(t, tc.want, isShardWorkOperationKey(tc.key, tc.target))
+		})
+	}
+}
+
+// A member target's group_finalizer dispatch is keyed behind its target in the
+// shape the planner stored it, on both planes: orders-001's finalizer for
+// namespace ns_0 is "orders-001/ns_0/group_finalizer", and a deployment-scoped
+// one is "orders-001/group_finalizer", read out of a manifest whose keys all
+// lead with a target. Both carry the group_finalizer kind.
+func TestOperationIdentityForDispatch_MemberTargetFinalizer(t *testing.T) {
+	vschemaPlan := func(namespaces ...string) *storage.Plan {
+		plan := &storage.Plan{PlanIdentifier: "plan-member-finalizer", Target: "orders-001", Namespaces: map[string]*storage.NamespacePlanData{}}
+		for _, ns := range namespaces {
+			plan.Namespaces[ns] = &storage.NamespacePlanData{
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			}
+		}
+		return plan
+	}
+	dispatch := func(manifest []string, namespaces ...string) *ternv1.ApplyRequest {
+		req := &ternv1.ApplyRequest{GenerationOperationKeys: manifest, Options: map[string]string{dispatchMemberTargetOption: "orders-001"}}
+		for _, ns := range namespaces {
+			req.DdlChanges = append(req.DdlChanges, &ternv1.TableChange{Namespace: ns, TableName: "VSchema: " + ns, ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA})
+		}
+		return req
+	}
+	cases := []struct {
+		name    string
+		plan    *storage.Plan
+		req     *ternv1.ApplyRequest
+		wantKey string
+	}{
+		{
+			name:    "namespace finalizer",
+			plan:    vschemaPlan("ns_0", "ns_1"),
+			req:     dispatch([]string{"orders-001/ns_0/group_finalizer", "orders-001/ns_1/group_finalizer", "orders-002/ns_0/group_finalizer"}, "ns_0"),
+			wantKey: "orders-001/ns_0/group_finalizer",
+		},
+		{
+			name:    "deployment-scoped finalizer over several namespaces",
+			plan:    vschemaPlan("ns_0", "ns_1"),
+			req:     dispatch([]string{"orders-001/group_finalizer", "orders-002/group_finalizer"}, "ns_0", "ns_1"),
+			wantKey: "orders-001/group_finalizer",
+		},
+		{
+			name:    "deployment-scoped finalizer over one namespace, read from the target-keyed manifest",
+			plan:    vschemaPlan("ns_0"),
+			req:     dispatch([]string{"orders-001/group_finalizer", "orders-002/group_finalizer"}, "ns_0"),
+			wantKey: "orders-001/group_finalizer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scope, err := deriveDispatchScope(tc.plan, tc.req)
+			require.NoError(t, err)
+			key, kind, err := operationIdentityForDispatch(scope)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantKey, key)
+			assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, kind)
+		})
+	}
+}
+
+// A data-plane apply shared by a deployment's targets records that its keys
+// lead with a target, so target orders' finalizer "orders/group_finalizer"
+// resolves to the whole deployment even while it is the apply's only
+// operation. The same key on an apply without that record, where the rows show
+// a single target, is namespace orders' finalizer.
+func TestResolveFinalizerNamespace_RecordedTargetKeying(t *testing.T) {
+	cases := []struct {
+		name          string
+		keysLead      bool
+		key           string
+		wantNamespace string
+	}{
+		{name: "target-keyed apply, deployment-scoped key of a target sharing a namespace's name", keysLead: true, key: "orders/group_finalizer", wantNamespace: ""},
+		{name: "target-keyed apply, namespace key", keysLead: true, key: "orders/ns_0/group_finalizer", wantNamespace: "ns_0"},
+		{name: "unrecorded single-target apply, namespace key sharing the target's name", keysLead: false, key: "orders/group_finalizer", wantNamespace: "orders"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 8, ApplyIdentifier: "apply-recorded-keying"}
+			apply.SetOptions(storage.ApplyOptions{Target: "orders", OperationKeysLeadWithTarget: tc.keysLead})
+			op := &storage.ApplyOperation{ID: 51, ApplyID: apply.ID, Deployment: "orders", Target: "orders", OperationKey: tc.key, OperationKind: storage.ApplyOperationKindGroupFinalizer}
+			store := &mockStorage{operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{op.ID: op}}}
+			got, err := resolveFinalizerNamespace(t.Context(), store, apply, op)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantNamespace, got)
 		})
 	}
 }

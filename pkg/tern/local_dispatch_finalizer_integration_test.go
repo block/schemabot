@@ -457,3 +457,113 @@ func TestLocalClient_VSchemaOnlyDispatchWithoutArtifactFailsClosed(t *testing.T)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither a VSchema artifact nor a finalize request")
 }
+
+// Targets orders and orders-002 of one deployment share its remote apply, and
+// each dispatches a deployment-scoped group_finalizer over namespaces orders
+// and orders_lookup. Target orders shares a namespace's name, so its key
+// "orders/group_finalizer" reads either as its own deployment-scoped finalizer
+// or as namespace orders' finalizer, and its finalizer can drive before
+// orders-002 attaches anything. The data plane stores each operation under its
+// target with the target recorded on the row, the apply records that its keys
+// lead with a target, and the finalizer drive resolves each key to the whole
+// deployment rather than to namespace orders alone.
+func TestLocalClient_MemberTargetFinalizerStoresTargetAndResolvesItsScope(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	storeTargetPlan := func(target string) string {
+		plan := &storage.Plan{
+			PlanIdentifier: fmt.Sprintf("plan-member-finalizer-%s-%d", target, time.Now().UnixNano()),
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Deployment:     "testdb",
+			Target:         target,
+			Environment:    localClientTestEnvironment,
+			CreatedAt:      time.Now(),
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"orders": {
+					Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+					Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+				},
+				"orders_lookup": {
+					Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": false}`},
+					Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+				},
+			},
+		}
+		_, err := stor.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+		return plan.PlanIdentifier
+	}
+	const idempotencyKey = "schemabot:v1:member-target-finalizer"
+	manifest := []string{"orders-002/group_finalizer", "orders/group_finalizer"}
+	finalizerDispatch := func(planID, target string) *ternv1.ApplyRequest {
+		return &ternv1.ApplyRequest{
+			PlanId:                  planID,
+			Environment:             localClientTestEnvironment,
+			IdempotencyKey:          idempotencyKey,
+			GenerationOperationKeys: manifest,
+			DdlChanges: []*ternv1.TableChange{
+				{Namespace: "orders", TableName: "VSchema: orders", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA},
+				{Namespace: "orders_lookup", TableName: "VSchema: orders_lookup", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA},
+			},
+			Options: map[string]string{dispatchMemberTargetOption: target},
+		}
+	}
+	firstPlanID := storeTargetPlan("orders")
+	secondPlanID := storeTargetPlan("orders-002")
+
+	first, err := client.Apply(ctx, finalizerDispatch(firstPlanID, "orders"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "target orders' finalizer dispatch was not accepted: %s", first.ErrorMessage)
+	assert.Equal(t, "orders/group_finalizer", first.OperationKey)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.True(t, apply.GetOptions().OperationKeysLeadWithTarget, "the apply must record that its keys lead with a target")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, "orders", ops[0].Target, "the operation must record its member target")
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, ops[0].OperationKind)
+	namespace, err := resolveFinalizerNamespace(ctx, stor, apply, ops[0])
+	require.NoError(t, err)
+	assert.Empty(t, namespace, "before any sibling attaches, orders/group_finalizer is target orders' deployment-scoped finalizer, not namespace orders'")
+
+	second, err := client.Apply(ctx, finalizerDispatch(secondPlanID, "orders-002"))
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "target orders-002's finalizer must attach to the shared apply: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId)
+	assert.Equal(t, "orders-002/group_finalizer", second.OperationKey)
+
+	ops, err = stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 2)
+	for _, op := range ops {
+		assert.Equal(t, storage.TargetOperationKey(op.Target, "group_finalizer"), op.OperationKey)
+		namespace, err := resolveFinalizerNamespace(ctx, stor, apply, op)
+		require.NoError(t, err)
+		assert.Empty(t, namespace, "target %s's finalizer covers the whole deployment", op.Target)
+	}
+}

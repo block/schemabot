@@ -626,9 +626,9 @@ type ApplyStore interface {
 	// of the same operation loses with ErrApplyOperationExists, which the
 	// caller resolves by re-reading the winner's row. Under the same lock, an
 	// operation keyed by its target is refused with
-	// ErrApplyOperationKeyingMismatch when the deployment's existing operations
-	// of the apply are not keyed that way, and the reverse, so one target's work
-	// can never attach under two keys. On success the operation's ID and every
+	// ErrApplyOperationKeyingMismatch when the deployment's existing work
+	// operations of the apply are not keyed that way, and the reverse, so one
+	// target's work can never attach under two keys. On success the operation's ID and every
 	// task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
