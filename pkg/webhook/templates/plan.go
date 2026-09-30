@@ -1758,7 +1758,7 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, consequen
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
 		return "native MySQL DDL, not through Spirit",
-			"Writes to each table are blocked until its statement finishes."
+			"Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes."
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest

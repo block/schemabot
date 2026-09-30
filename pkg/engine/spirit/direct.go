@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -215,10 +217,68 @@ type refusedModeDecision struct {
 // uncertainty blocks.
 const blockedSizeUnknownReason = "; direct execution is enabled but the table's size is unavailable"
 
+// blockedForceKillUnavailableReason is the mode-reason suffix when the target
+// denies SchemaBot the tables it reads to find the sessions blocking a direct
+// statement's metadata lock: the performance_schema lock tables, and
+// information_schema.innodb_trx, which needs PROCESS. The denial itself stays
+// in the server log; the reason names the grants that fix it and the fresh
+// plan that picks them up.
+const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot cannot read the lock and transaction tables it uses to end sessions blocking the statement: grant its database user SELECT on performance_schema and PROCESS, then plan again"
+
+// blockedForceKillUnknownReason is the mode-reason suffix when checking those
+// tables failed for a reason other than a denied grant, such as a lost
+// connection or a deadline. Nothing is known to be missing, so the reason asks
+// for a fresh plan rather than naming a grant.
+const blockedForceKillUnknownReason = "; direct execution is enabled but SchemaBot could not check that it can end sessions blocking the statement: plan again"
+
+// Access-denied errors MySQL returns when a grant the kill depends on is
+// missing: ER_DBACCESS_DENIED_ERROR (1044), ER_TABLEACCESS_DENIED_ERROR
+// (1142), ER_COLUMNACCESS_DENIED_ERROR (1143), and
+// ER_SPECIFIC_ACCESS_DENIED_ERROR (1227), which reading innodb_trx without
+// PROCESS returns.
+const (
+	erDBAccessDenied       = 1044
+	erTableAccessDenied    = 1142
+	erColumnAccessDenied   = 1143
+	erSpecificAccessDenied = 1227
+)
+
+// isAccessDenied reports whether err is MySQL refusing a grant, as opposed to
+// a probe that could not run at all.
+func isAccessDenied(err error) bool {
+	return mysqlerr.Is(err, erDBAccessDenied, erTableAccessDenied, erColumnAccessDenied, erSpecificAccessDenied)
+}
+
+// innodbTrxProbe reads information_schema.innodb_trx, which the kill joins to
+// spare heavy transactions. MySQL checks PROCESS for that table only when it
+// fills it, and it skips the fill for a query that can return no rows, so the
+// LIMIT 0 probe in dbconn.CheckForceKillPrivileges passes for a user without
+// PROCESS. LIMIT 1 forces the fill. This retires once Spirit's own probe
+// forces it.
+const innodbTrxProbe = "SELECT 1 FROM information_schema.innodb_trx LIMIT 1"
+
+// checkInnodbTrxAccess runs innodbTrxProbe and drains it, so a denied PROCESS
+// grant surfaces here rather than when the kill first runs.
+func checkInnodbTrxAccess(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, innodbTrxProbe)
+	if err != nil {
+		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
+	}
+	return nil
+}
+
 // resolveRefusedMode decides whether the policy routes a refused statement to
 // direct execution. The table runs directly when it is within the one size
-// bound the policy sets. Everything else blocks: policy disabled, a size gate
-// that cannot be evaluated, or a table above the bound.
+// bound the policy sets and SchemaBot can end the sessions blocking the
+// statement. Everything else blocks: policy disabled, a size gate that cannot
+// be evaluated, a table above the bound, or a target on which the statement
+// could not end the sessions blocking it.
 //
 // The two bounds are not equally strong, which is why a policy chooses one
 // rather than combining them. The row bound runs in two steps, the TABLE_ROWS
@@ -239,6 +299,65 @@ const blockedSizeUnknownReason = "; direct execution is enabled but the table's 
 // decodes as the one cause the engine issued.
 func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, policy directPolicy, database, tableName, refusalReason string) refusedModeDecision {
 	refusalReason = engine.SanitizeBlockedCause(refusalReason)
+	decision := e.resolveSizeGate(ctx, target, policy, database, tableName, refusalReason)
+	if decision.mode != engine.ExecutionModeDirect {
+		return decision
+	}
+	return e.requireForceKill(ctx, target, database, tableName, refusalReason, decision)
+}
+
+// requireForceKill blocks a statement the size gate approved when SchemaBot
+// cannot read the tables it uses to find the sessions blocking the
+// statement's metadata lock. Without them the kill could only fail at apply
+// time, after the operator confirmed, leaving the statement queued on the lock
+// while table traffic stalls behind it. The statement is blocked rather than
+// run without the kill: as unavailable when the target denies a grant, and as
+// unknown when the check itself could not run.
+func (e *Engine) requireForceKill(ctx context.Context, target *lazyTargetDB, database, tableName, refusalReason string, approved refusedModeDecision) refusedModeDecision {
+	unavailable := refusedModeDecision{
+		mode:       engine.ExecutionModeBlocked,
+		modeReason: refusalReason + blockedForceKillUnavailableReason,
+		outcome:    "blocked_force_kill_unavailable",
+	}
+	unknown := refusedModeDecision{
+		mode:       engine.ExecutionModeBlocked,
+		modeReason: refusalReason + blockedForceKillUnknownReason,
+		outcome:    "blocked_force_kill_unknown",
+	}
+	// The size gate approved only after connecting, so this is the cached
+	// connection; an error here still blocks rather than run without the kill.
+	db, err := target.get(ctx)
+	if err != nil {
+		e.logger.Warn("direct execution blocked: cannot connect to target to check the grants the kill needs",
+			"database", database, "table", tableName, "error", err)
+		return unknown
+	}
+	for _, probe := range []struct {
+		tables string
+		run    func(context.Context, *sql.DB) error
+	}{
+		{"performance_schema lock tables", dbconn.CheckForceKillPrivileges},
+		{"information_schema.innodb_trx", checkInnodbTrxAccess},
+	} {
+		err := probe.run(ctx, db)
+		if err == nil {
+			continue
+		}
+		if isAccessDenied(err) {
+			e.logger.Warn("direct execution blocked: the target denies a grant the kill needs to end sessions blocking the statement",
+				"database", database, "table", tableName, "tables", probe.tables, "error", err)
+			return unavailable
+		}
+		e.logger.Warn("direct execution blocked: checking the grants the kill needs failed",
+			"database", database, "table", tableName, "tables", probe.tables, "error", err)
+		return unknown
+	}
+	return approved
+}
+
+// resolveSizeGate applies the policy's size bound to a refused statement whose
+// refusal reason is already sanitized.
+func (e *Engine) resolveSizeGate(ctx context.Context, target *lazyTargetDB, policy directPolicy, database, tableName, refusalReason string) refusedModeDecision {
 	if !policy.Enabled {
 		return refusedModeDecision{
 			mode:       engine.ExecutionModeBlocked,
@@ -451,14 +570,31 @@ func (v *ExecutionVerdicts) record(ctx context.Context, change *engine.TableChan
 	return nil
 }
 
-// defaultDirectLockAcquisitionTimeoutSeconds bounds how long a direct statement
-// waits to acquire its locks when the policy does not configure a bound.
-// MySQL's default lock_wait_timeout lets DDL queue on the table's metadata
-// lock essentially indefinitely, and every query arriving after the queued
-// DDL queues behind it — a single long-running transaction would turn a
-// direct statement into a table-wide stall. A short bound turns "the table
-// is busy" into a fast, retryable failure instead.
+// defaultDirectLockAcquisitionTimeoutSeconds bounds how long each attempt of a
+// direct statement waits to acquire its locks when the policy does not
+// configure a bound. MySQL's default lock_wait_timeout lets DDL queue on the
+// table's metadata lock essentially indefinitely, and every query arriving
+// after the queued DDL queues behind it — a single long-running transaction
+// would turn a direct statement into a table-wide stall. A short bound keeps
+// that stall short: once the statement has waited 90% of it for the lock, it
+// kills the transactions blocking it and retries, as Spirit does for its own
+// DDL. It never kills while it holds the lock and runs, so traffic to the
+// table during a rebuild is left alone. A blocker it will not kill, an
+// explicit LOCK TABLES or a transaction heavier than
+// dbconn.TransactionWeightThreshold, makes the apply fail with a retryable
+// "table is busy" error.
 const defaultDirectLockAcquisitionTimeoutSeconds = 10
+
+// directMaxAttempts is how many times a direct statement tries to take its
+// lock before the apply fails as busy. An explicit LOCK TABLES ends the
+// attempts after the first, since the kill never ends one.
+const directMaxAttempts = 3
+
+// directExecutionPoolSize caps the pool direct statements run on: one
+// connection runs the statement, and the others serve the kill's
+// performance_schema reads and KILLs while it waits. At one, the kill would
+// wait on the statement's own connection and never run.
+const directExecutionPoolSize = 3
 
 // erLockWaitTimeout is MySQL error 1205 (ER_LOCK_WAIT_TIMEOUT), returned when
 // a statement gives up waiting for a lock. For direct DDL this is almost
@@ -585,48 +721,84 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 	return routing, nil
 }
 
+// openDirectExecutionDB opens the pool direct statements run on, with the
+// policy's lock bound set as session variables on every connection it opens.
+// dbconn.ForceExec takes the statement's connection from the pool itself, so
+// the bound has to be a property of the pool rather than a SET on one
+// connection. The same pool serves the kill's performance_schema reads and
+// KILLs on other connections while the statement waits, so it is capped at
+// directExecutionPoolSize rather than one.
+func openDirectExecutionDB(ctx context.Context, dsn string, lockWaitSeconds int64) (*sql.DB, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse target DSN: %w", err)
+	}
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string)
+	}
+	bound := strconv.FormatInt(lockWaitSeconds, 10)
+	cfg.Params["lock_wait_timeout"] = bound
+	cfg.Params["innodb_lock_wait_timeout"] = bound
+	db, err := mysqlconn.Open(cfg.FormatDSN())
+	if err != nil {
+		return nil, fmt.Errorf("open target database: %w", err)
+	}
+	db.SetMaxOpenConns(directExecutionPoolSize)
+	// The ping opens the first connection, which is where MySQL accepts or
+	// rejects the session lock bound.
+	if err := db.PingContext(ctx); err != nil {
+		utils.CloseAndLog(db)
+		return nil, fmt.Errorf("ping target database with session lock wait timeouts of %ds: %w", lockWaitSeconds, err)
+	}
+	return db, nil
+}
+
+// directForceExecConfig is the dbconn configuration direct statements run
+// under: Spirit's kill (once the statement has waited 90% of the lock wait),
+// both lock waits taken from the policy, and directMaxAttempts attempts.
+func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
+	cfg := dbconn.NewDBConfig()
+	cfg.LockWaitTimeout = int(lockWaitSeconds)
+	cfg.InnodbLockWaitTimeout = int(lockWaitSeconds)
+	cfg.MaxRetries = directMaxAttempts
+	return cfg
+}
+
 // executeDirectStatements runs each direct-routed ALTER verbatim as native
 // MySQL DDL, one statement at a time in plan order. Each statement is
 // synchronous — MySQL chooses the algorithm and lock level, writes to the
 // table block while it runs, and there is no revert window — so progress is
 // reported as explicit per-statement state transitions rather than row
-// counts. It returns false when execution must stop: a cancelled context
+// counts. A statement that cannot take the table's metadata lock kills the
+// transactions blocking it, as Spirit does for its own DDL; routing has
+// already confirmed SchemaBot can read the performance_schema tables that
+// finds them. It returns false when execution must stop: a cancelled context
 // leaves the engine state Stopped, a genuine failure transitions to
 // StateFailed.
 func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTargetDB, database string, stmts []directRouted, policy directPolicy) bool {
 	logger := e.changeLogger()
 	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
-	db, err := target.get(ctx)
+	db, err := openDirectExecutionDB(ctx, target.dsn, lockWaitSeconds)
 	if err != nil {
-		logger.Error("direct execution failed: cannot connect to target",
-			"database", database, "error", err)
+		logger.Error("direct execution failed: cannot connect to target with bounded session lock waits",
+			"database", database, "lock_wait_timeout_seconds", lockWaitSeconds, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("connect for direct execution: %w", err))
 		return false
 	}
-	// Run every statement on one dedicated connection: pool connections have
-	// no session affinity, so the session-level lock bound below would not
-	// reliably apply to the DDL if both went through the pool.
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		logger.Error("direct execution failed: cannot acquire a dedicated connection",
-			"database", database, "error", err)
-		e.setSchemaChangeFailed(fmt.Errorf("acquire dedicated connection for direct execution: %w", err))
-		return false
-	}
-	defer utils.CloseAndLog(conn)
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION lock_wait_timeout = %d, innodb_lock_wait_timeout = %d",
-		lockWaitSeconds, lockWaitSeconds)); err != nil {
-		logger.Error("direct execution failed: cannot bound the session lock wait timeouts",
-			"database", database, "error", err)
-		e.setSchemaChangeFailed(fmt.Errorf("bound session lock wait timeouts for direct execution: %w", err))
-		return false
-	}
+	defer utils.CloseAndLog(db)
+	forceExecConfig := directForceExecConfig(lockWaitSeconds)
 	for _, ds := range stmts {
 		progress := e.trackDirectStatement(ds.table, ds.stmt)
 		logger.Info("executing statement directly as native MySQL DDL",
-			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows, "estimated_bytes", ds.bytes)
-		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: writes to the table block while it runs")
-		if _, err := conn.ExecContext(ctx, ds.stmt); err != nil {
+			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows, "estimated_bytes", ds.bytes,
+			"lock_wait_timeout_seconds", lockWaitSeconds, "max_attempts", forceExecConfig.MaxRetries)
+		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: transactions blocking the table's metadata lock are killed; writes to the table block while it runs")
+		// The ALTER is spliced in with %r so ForceExec's format string never
+		// interprets it: a literal % in a comment or default value stays as
+		// written.
+		tables := []*table.TableInfo{table.NewTableInfo(db, database, ds.table)}
+		killLogger := logger.With("database", database, "table", ds.table)
+		if err := dbconn.ForceExec(ctx, db, tables, forceExecConfig, killLogger, "%r", sqlescape.RawSQL(ds.stmt)); err != nil {
 			if ctx.Err() != nil {
 				// A cancelled context closes the connection, but MySQL may
 				// finish the DDL server-side — the statement's outcome is
@@ -640,14 +812,19 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 			e.setDirectStatementState(progress, directStateFailed)
 			metrics.RecordDirectExecution(ctx, database, "failed")
 			if isLockWaitTimeout(err) {
-				logger.Error("direct execution failed: statement could not acquire the table's metadata lock within the bounded wait",
-					"database", database, "table", ds.table, "lock_wait_timeout_seconds", lockWaitSeconds, "error", err)
+				// The kill did not clear the blocker: an explicit LOCK TABLES
+				// and a transaction too heavy to roll back are never killed, and
+				// a KILL the target user is not privileged to issue fails. Spirit
+				// logs which of these it hit through the kill logger above.
+				logger.Error("direct execution failed: statement could not acquire the table's metadata lock on any attempt; the force-kill did not clear the blocker",
+					"database", database, "table", ds.table, "lock_wait_timeout_seconds", lockWaitSeconds,
+					"max_attempts", forceExecConfig.MaxRetries, "error", err)
 				// The table name comes from the plan and the timeout from this
 				// deployment's own configuration, so this sentence is safe to
 				// show on the pull request that asked for the change.
 				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
-					"Table %q is busy: the change could not acquire the metadata lock within %ds. Retry when long-running transactions on the table have finished.",
-					ds.table, lockWaitSeconds))
+					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely, and it cannot find or kill another user's session unless its database user has PROCESS and CONNECTION_ADMIN. Retry when those sessions have finished, or grant PROCESS and CONNECTION_ADMIN if the server log shows the kill failed.",
+					ds.table, lockWaitSeconds, forceExecConfig.MaxRetries))
 				return false
 			}
 			logger.Error("direct execution failed",
