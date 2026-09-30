@@ -40,3 +40,22 @@ func TestValidSizeStatistic(t *testing.T) {
 	require.NotNil(t, bytes)
 	assert.Equal(t, int64(6_200_000), *bytes)
 }
+
+// Only tables already in the current schema are probed for sizes; a table the
+// plan creates has none to read, and plan order is kept within each group.
+func TestPartitionByExistence(t *testing.T) {
+	current := map[string]string{"orders": "CREATE TABLE `orders` ...", "customers": "CREATE TABLE `customers` ..."}
+	existing, created := partitionByExistence([]string{"refunds", "orders", "audit_log", "customers"}, current)
+	assert.Equal(t, []string{"orders", "customers"}, existing)
+	assert.Equal(t, []string{"refunds", "audit_log"}, created)
+}
+
+// A row information_schema returns in the server's case maps back to the name
+// the plan asked for, so the estimate lands on the plan's own table name.
+func TestRequestedTableNames(t *testing.T) {
+	requested := requestedTableNames([]string{"Orders", "line_items"})
+	assert.Equal(t, "Orders", requested["orders"])
+	assert.Equal(t, "line_items", requested["line_items"])
+	_, ok := requested["customers"]
+	assert.False(t, ok)
+}

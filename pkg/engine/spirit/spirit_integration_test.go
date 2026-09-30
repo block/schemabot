@@ -2440,3 +2440,36 @@ func TestEngine_Plan_SizeProbeIsBounded(t *testing.T) {
 	assert.Positive(t, budget)
 	require.Len(t, result.FlatTableChanges(), 1)
 }
+
+// A plan that only creates tables has no existing table to size, so it never
+// runs the size probe and never connects to the target for sizes; the created
+// table carries no estimate.
+func TestEngine_Plan_CreateOnlyPlanSkipsSizeProbe(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	eng := New(Config{})
+	probed := false
+	eng.sizeProbeFault = func(context.Context) error {
+		probed = true
+		return nil
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"fresh_items.sql": "CREATE TABLE `fresh_items` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+
+	assert.False(t, probed, "a create-only plan must not run the size probe")
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "fresh_items", changes[0].Table)
+	assert.Nil(t, changes[0].EstimatedRows)
+	assert.Nil(t, changes[0].EstimatedBytes)
+}

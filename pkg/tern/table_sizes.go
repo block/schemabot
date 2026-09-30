@@ -24,7 +24,9 @@ type tableSizeAccumulator struct {
 	// missingRows and missingBytes record that at least one shard carried no
 	// estimate of that kind. Each total is all-or-nothing: a partial sum would
 	// understate the table's size, so that kind's values are omitted entirely
-	// while the shard count survives.
+	// while the shard count survives. The largest shard follows the row sum:
+	// the shard with no estimate could be the largest, so a maximum over the
+	// shards that reported would present a smaller shard as the largest.
 	missingRows  bool
 	missingBytes bool
 	// seenShards records the shards already folded into this table's totals,

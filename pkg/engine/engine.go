@@ -535,7 +535,9 @@ type TableChange struct {
 	// engine that emits one SchemaChange per shard reports each shard's own
 	// estimate and the core sums them into the namespace-level view. Nil when
 	// no estimate is available (e.g. the table is being created, or statistics
-	// could not be read).
+	// could not be read). Several TableChanges for one table each carry that
+	// table's full estimate, so a consumer aggregating across changes must
+	// dedupe by table.
 	EstimatedRows *int64
 	// EstimatedBytes is the table's approximate on-disk footprint (data plus
 	// indexes) at plan time, for display only. Same sourcing, aggregation, and
@@ -549,7 +551,9 @@ type TableChange struct {
 	ShardCount int
 	// LargestShardRows is the approximate row count of the largest single
 	// shard, the biggest chunk a shard-at-a-time apply works through at once.
-	// Nil when the target is not sharded or no estimate is available.
+	// Nil when the target is not sharded, or when any planned shard has no row
+	// estimate: the shard with no estimate could be the largest, so a maximum
+	// over the others would name a smaller shard as the largest.
 	LargestShardRows *int64
 }
 
