@@ -47,6 +47,18 @@ type reviewDriftOutcome struct {
 	// primary already at the desired schema says nothing about members planned
 	// against schemas of their own.
 	work memberWork
+	// block is the durable reason a blocked outcome is stored under, so the
+	// apply it refuses names the right fix. Unset is review-time deployment
+	// drift, which is what the rollup reports.
+	block checkBlockReason
+}
+
+// blockingReason is the stored reason for a blocked outcome.
+func (o reviewDriftOutcome) blockingReason() string {
+	if o.block.blockingReason != "" {
+		return o.block.blockingReason
+	}
+	return reviewTimeDeploymentDriftBlock.blockingReason
 }
 
 // memberWork counts the rollout members, primary included, whose own plan
@@ -148,11 +160,11 @@ const namespacePlacementCheckSummary = "namespace placement refused the plan; se
 // namespace placement (api.NamespacePlacementRefused). That environment has no
 // plan, so without this row the aggregate folds only the environments that did
 // plan and can pass while a namespace is planned and applied nowhere (MG-12).
-// The row carries the review-time drift block: the rollout cannot be confirmed
-// to converge, and a later plan whose placement agrees clears it the way a
-// clean rollup clears drift.
+// The row carries its own review-time block, so an apply it refuses is told to
+// fix the placement, and a later plan whose placement agrees clears it the way
+// a clean rollup clears drift.
 func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) (string, error) {
-	blocked := reviewDriftOutcome{state: driftBlocked, summary: namespacePlacementCheckSummary}
+	blocked := reviewDriftOutcome{state: driftBlocked, summary: namespacePlacementCheckSummary, block: namespacePlacementRefusedBlock}
 	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
 	return headSHA, err
 }
@@ -329,7 +341,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	blockingReason := ""
 	if driftBlocked {
 		changeSummary = drift.summary
-		blockingReason = reviewTimeDeploymentDriftBlock.blockingReason
+		blockingReason = drift.blockingReason()
 	}
 
 	check := &storage.Check{

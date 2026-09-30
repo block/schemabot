@@ -131,6 +131,15 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Execute plan via the service
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if api.NamespacePlacementRefused(err) {
+		h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
+			"repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "head_sha", schemaResult.HeadSHA, "error", err)
+		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
+		h.failClosedOnNamespacePlacement(ctx, client, repo, pr, schemaResult, environment)
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan refused by namespace placement"})
+		return
+	}
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
 		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
@@ -189,6 +198,25 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		"message": "plan generated successfully",
 		"plan_id": planResp.PlanID,
 	})
+}
+
+// failClosedOnNamespacePlacement fails one environment's check closed after
+// namespace placement refused its plan. The refusal is stored as the
+// environment's check row, so a later fold from stored check state, from any
+// plan of any environment, reads it rather than an older passing row (MG-12).
+// A row that cannot be stored is posted as a failing aggregate from memory
+// instead, which keeps the gate closed until the next fold.
+func (h *Handler) failClosedOnNamespacePlacement(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schemaResult *ghclient.SchemaRequestResult, environment string) {
+	headSHA, err := h.storeNamespacePlacementCheck(ctx, client, repo, pr, schemaResult, environment)
+	if err != nil {
+		h.logger.Error("failed to store namespace placement check record; posting a failing aggregate for the environment instead",
+			"repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, schemaResult.HeadSHA,
+			map[string]string{environment: namespacePlacementCheckSummary}, namespacePlacementRefusedBlock)
+		return
+	}
+	h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
+	h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 }
 
 // planForResolvedDatabaseBlocked enforces actor authorization once a
@@ -381,6 +409,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Environments whose check record could not be persisted while some rollout
 	// member, the primary included, has work (MG-12), kept for the same reason.
 	pendingWorkUnstored := map[string]string{}
+	// Environments whose namespace placement refusal could not be persisted,
+	// kept for the same reason and posted under the placement block's reason.
+	placementBlockUnstored := map[string]string{}
 	// Whether any environment's rollout round found a member with work. The
 	// primary's plan alone cannot say, so auto-plan reads this before skipping
 	// its comment.
@@ -460,7 +491,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			if checkErr != nil {
 				h.logger.Error("failed to store namespace placement check record; posting a failing aggregate for the environment instead",
 					"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", checkErr)
-				driftBlockUnstored[env] = namespacePlacementCheckSummary
+				placementBlockUnstored[env] = namespacePlacementCheckSummary
 			}
 			if sha != "" {
 				headSHA = sha
@@ -550,6 +581,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"repo", repo,
 			"pr", pr,
 			"environments", len(driftBlockUnstored))
+	}
+	if len(placementBlockUnstored) > 0 && multiEnvData.HeadSHA != "" {
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, multiEnvData.HeadSHA, placementBlockUnstored, namespacePlacementRefusedBlock)
+	} else if len(placementBlockUnstored) > 0 {
+		h.logger.Warn("namespace placement refused one or more environments' plans but no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
+			"repo", repo,
+			"pr", pr,
+			"environments", len(placementBlockUnstored))
 	}
 	if len(pendingWorkUnstored) > 0 && multiEnvData.HeadSHA != "" {
 		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, pendingWorkUnstored)

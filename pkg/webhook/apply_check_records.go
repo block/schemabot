@@ -74,11 +74,12 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier, err)
 	}
 
-	// A stored review-time deployment drift block must not be cleared by starting
-	// an apply: the block means a deployment's live schema no longer matches the
-	// reviewed plan, so transitioning the row to in_progress (which clears the
-	// block) would let the apply proceed against unverified drift. Fail closed and
-	// leave the block for an operator to reconcile.
+	// A stored review-time block must not be cleared by starting an apply.
+	// Deployment drift means a deployment's live schema no longer matches the
+	// reviewed plan; a namespace placement refusal means the environment has no
+	// plan that places every namespace. Transitioning the row to in_progress
+	// (which clears the block) would let the apply proceed past either, so fail
+	// closed and leave the block for the fix its reason names.
 	if check != nil && check.BlockingReason == storage.ReviewTimeDeploymentDriftBlockingReason {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "apply_started",
@@ -93,6 +94,22 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			"database_type", schema.Type, "database", schema.Database,
 			"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
 		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: review-time deployment drift block present",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
+	}
+	if check != nil && check.BlockingReason == storage.NamespacePlacementRefusedBlockingReason {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "placement_blocked",
+		})
+		h.logger.Warn("apply start refused: namespace placement block is present; fix the namespace placement and re-run plan before applying",
+			"repo", repo, "pr", pr, "environment", environment,
+			"database_type", schema.Type, "database", schema.Database,
+			"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
+		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: namespace placement refused this environment's plan; fix the namespace placement in the server config or the schema files and re-run plan",
 			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
 	}
 

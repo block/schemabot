@@ -151,6 +151,16 @@ var reviewTimeDeploymentDriftBlock = checkBlockReason{
 	message:        "One or more deployments differ from the reviewed plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
 }
 
+// namespacePlacementRefusedBlock is used when an environment's plan was refused
+// because its targets entries and the schema files disagree on where a
+// namespace lives (api.NamespacePlacementRefused). The environment has no plan,
+// so its check fails closed until a plan whose placement agrees clears it; the
+// fix is in the server config or the schema files, not on any deployment.
+var namespacePlacementRefusedBlock = checkBlockReason{
+	blockingReason: checkstate.BlockNamespacePlacementRefused,
+	message:        "SchemaBot could not plan this environment because its targets entries and the schema files disagree on where a namespace lives; fix the namespace placement in the server config or the schema files, then re-run plan before this check can pass.",
+}
+
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
 // the server-configured environments for the database do not overlap this
 // service's allowed_environments. SchemaBot cannot safely plan the schema
@@ -178,6 +188,7 @@ var allCheckBlockReasons = []checkBlockReason{
 	prFileCapExceededBlock,
 	managedDirMissingConfigBlock,
 	reviewTimeDeploymentDriftBlock,
+	namespacePlacementRefusedBlock,
 	noAllowedConfiguredEnvironmentsBlock,
 	{blockingReason: participantUnresolvedBlockingReason},
 }
