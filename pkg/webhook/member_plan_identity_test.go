@@ -22,14 +22,15 @@ func (s *planIdentityStorage) Plans() storage.PlanStore { return s.store }
 
 type planIdentityPlanStore struct {
 	storage.PlanStore
-	plans map[int64]*storage.Plan
-	err   error
-	reads []int64
+	plans  map[int64]*storage.Plan
+	err    error
+	failID int64 // when set, only this row's read fails with err
+	reads  []int64
 }
 
 func (s *planIdentityPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
 	s.reads = append(s.reads, id)
-	if s.err != nil {
+	if s.err != nil && (s.failID == 0 || s.failID == id) {
 		return nil, s.err
 	}
 	return s.plans[id], nil
@@ -81,7 +82,7 @@ func TestResolvePlanIdentifiers_NamesEachMembersPlan(t *testing.T) {
 		{ID: 2, Deployment: "eu-west", PlanID: 42},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, byOp)
 }
@@ -97,7 +98,7 @@ func TestResolvePlanIdentifiers_ConvergedRolloutReadsNoPlans(t *testing.T) {
 		{ID: 2, Deployment: "eu-west", PlanID: 7},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	assert.Empty(t, byOp)
 	assert.Empty(t, store.reads, "members sharing a plan row need no plan read to be seen as converged")
@@ -121,7 +122,7 @@ func TestResolvePlanIdentifiers_SeparatelyPlannedMembersRunningTheSameWorkNameNo
 		{ID: 3, Deployment: "ap-south", PlanID: 43},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	assert.Empty(t, byOp, "three plan rows carrying one change set are one change set")
 }
@@ -142,7 +143,7 @@ func TestResolvePlanIdentifiers_SeparatelyPlannedMembersRunningDifferentWorkAreN
 		{ID: 3, Deployment: "ap-south", PlanID: 43},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344", 3: "plan_3345"}, byOp)
 }
@@ -162,7 +163,7 @@ func TestResolvePlanIdentifiers_SameWorkWrittenDifferentlyNamesNoPlan(t *testing
 		{ID: 2, Deployment: "eu-west", PlanID: 42},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	assert.Empty(t, byOp)
 }
@@ -180,11 +181,61 @@ func TestResolvePlanIdentifiers_ReadsEachPlanOnce(t *testing.T) {
 		{ID: 3, Deployment: "ap-south", PlanID: 42},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	require.Len(t, byOp, 3)
 	assert.Equal(t, "plan_3344", byOp[3])
 	assert.ElementsMatch(t, []int64{7, 42}, store.reads)
+}
+
+// The progress comment re-renders every few seconds for the life of an apply. It
+// names every member or none, so a failed read never leaves the field on some
+// members and not others, and it reads each plan once: the next render reads only
+// what failed, and after that nothing.
+func TestResolvePlanIdentifiers_ReadsEachPlanOnceAcrossRendersAndNamesAllOrNone(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addZip),
+	})
+	store.err, store.failID = errors.New("storage read failed"), 42
+	stor := &planIdentityStorage{store: store}
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary"},
+		{ID: 2, Deployment: "eu-west", PlanID: 42},
+	}
+	var known planIdentities
+
+	assert.Empty(t, resolvePlanIdentifiers(t.Context(), stor, apply, ops, &known), "one failed read names nobody")
+	assert.Equal(t, []int64{7, 42}, store.reads)
+
+	store.err, store.reads = nil, nil
+	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, resolvePlanIdentifiers(t.Context(), stor, apply, ops, &known))
+	assert.Equal(t, []int64{42}, store.reads, "only the plan that failed is read again")
+
+	store.reads = nil
+	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, resolvePlanIdentifiers(t.Context(), stor, apply, ops, &known))
+	assert.Empty(t, store.reads, "a resolved plan is never read again")
+}
+
+// Once the display deadline has passed, no further plan is read and no member
+// is named, so the comment renders without the field rather than issuing reads
+// that cannot succeed.
+func TestResolvePlanIdentifiers_StopsReadingAtTheDeadline(t *testing.T) {
+	store := planIdentityStore(map[int64]*storage.Plan{
+		7:  storedPlan(7, "plan_reviewed", addEmail),
+		42: storedPlan(42, "plan_3344", addZip),
+	})
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary"},
+		{ID: 2, Deployment: "eu-west", PlanID: 42},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	assert.Empty(t, resolvePlanIdentifiers(ctx, &planIdentityStorage{store: store}, apply, ops, nil))
+	assert.Empty(t, store.reads)
 }
 
 // A plan row that cannot be read leaves its members unnamed rather than failing
@@ -205,7 +256,7 @@ func TestResolvePlanIdentifiers_UnreadablePlanLeavesMembersUnnamed(t *testing.T)
 				{ID: 2, Deployment: "eu-west", PlanID: 42},
 			}
 
-			byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: tc.store}, apply, ops)
+			byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: tc.store}, apply, ops, nil)
 
 			assert.NotContains(t, byOp, int64(2), "the unreadable plan names no member")
 		})
@@ -228,7 +279,7 @@ func TestResolvePlanIdentifiers_UnreadablePlanDoesNotConvergeItsSiblings(t *test
 		{ID: 3, Deployment: "ap-south", PlanID: 43},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, byOp)
 }
@@ -246,7 +297,7 @@ func TestResolvePlanIdentifiers_UnkeyablePlanDoesNotConvergeItsSiblings(t *testi
 		{ID: 2, Deployment: "eu-west", PlanID: 42},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	assert.Equal(t, map[int64]string{1: "plan_reviewed", 2: "plan_3344"}, byOp)
 }
@@ -265,7 +316,7 @@ func TestResolvePlanIdentifiers_TwoUnkeyablePlansAreNotOneAnswer(t *testing.T) {
 		{ID: 2, Deployment: "ap-south", PlanID: 43},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, &storage.Apply{ApplyIdentifier: "apply-1"}, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, &storage.Apply{ApplyIdentifier: "apply-1"}, ops, nil)
 
 	assert.Equal(t, map[int64]string{1: "plan_3344", 2: "plan_3345"}, byOp)
 }
@@ -282,7 +333,7 @@ func TestResolvePlanIdentifiers_UnresolvableOperationDoesNotSplitAConvergedRollo
 		{ID: 3, Deployment: "ap-south"},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, nil, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, nil, ops, nil)
 
 	assert.Empty(t, byOp)
 	assert.Empty(t, store.reads, "the members that do have a plan all run the same one")
@@ -301,7 +352,7 @@ func TestResolvePlanIdentifiers_OperationWithoutAPlanIsSkipped(t *testing.T) {
 		{ID: 3, Deployment: "ap-south", PlanID: 43},
 	}
 
-	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, &storage.Apply{ApplyIdentifier: "apply-1"}, ops)
+	byOp := resolvePlanIdentifiers(t.Context(), &planIdentityStorage{store: store}, &storage.Apply{ApplyIdentifier: "apply-1"}, ops, nil)
 
 	assert.Equal(t, map[int64]string{2: "plan_3344", 3: "plan_3345"}, byOp)
 }
@@ -320,7 +371,7 @@ func TestResolveDisplayByOperation_NamesThePlanOfAMemberWithNoOtherState(t *test
 		{ID: 2, Deployment: "eu-west", PlanID: 42},
 	}
 
-	byOp := resolveDisplayByOperation(t.Context(), &planIdentityStorage{store: store}, apply, ops)
+	byOp := resolveDisplayByOperation(t.Context(), &planIdentityStorage{store: store}, apply, ops, nil)
 
 	require.Contains(t, byOp, int64(2))
 	assert.Equal(t, "plan_3344", byOp[2].PlanIdentifier)
