@@ -1030,6 +1030,7 @@ func multiDeployColumnExists(t *testing.T, deployment, tableName, columnName str
 	db, err := sql.Open("block-mysql", multiDeployTernMySQLDSN(t, deployment))
 	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
 	defer utils.CloseAndLog(db)
+	require.NoErrorf(t, db.PingContext(t.Context()), "ping tern mysql (%s)", deployment)
 
 	var count int
 	err = db.QueryRowContext(t.Context(),

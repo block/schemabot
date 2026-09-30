@@ -112,6 +112,9 @@ type ShardCounts struct {
 	Queued            int
 	Failed            int
 	Cancelled         int
+	// Other counts every status the fields above do not name, keyed by
+	// status, so a part in any phase stays in the summary.
+	Other map[string]int
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)

@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -63,36 +64,31 @@ func formatPartProgress(shards []ShardProgress, noun presentation.Noun) string {
 	// of copying shards, then collapse the rest into a summary.
 	const maxCopyingShown = 5
 
-	// Always show failed shards (they need attention). Limit other non-copying
-	// shards to avoid a wall of identical "waiting for cutover" lines.
+	// Always show failed shards (they need attention). Every other status
+	// that is neither copying, complete nor queued is sampled a few lines
+	// per status with the rest counted, so a wall of identical "waiting for
+	// cutover" lines stays short and no part in any phase goes unmentioned.
 	const maxNonCopyingShown = 3
 	for _, s := range shards {
 		if s.Status == state.Task.Failed {
 			b.WriteString(formatShardLine(s))
 		}
 	}
-	var waitingCount, cuttingCount int
+	sampled := make(map[string]int)
 	for _, s := range shards {
-		switch s.Status {
-		case state.Task.WaitingForCutover:
-			if waitingCount < maxNonCopyingShown {
-				b.WriteString(formatShardLine(s))
-			}
-			waitingCount++
-		case state.Task.CuttingOver:
-			if cuttingCount < maxNonCopyingShown {
-				b.WriteString(formatShardLine(s))
-			}
-			cuttingCount++
+		if !isSampledPartStatus(s.Status) {
+			continue
 		}
+		if sampled[s.Status] < maxNonCopyingShown {
+			b.WriteString(formatShardLine(s))
+		}
+		sampled[s.Status]++
 	}
-	if waitingCount > maxNonCopyingShown {
-		fmt.Fprintf(&b, indentShardMore+"%s... %d more waiting for cutover%s\n",
-			ANSIDim, waitingCount-maxNonCopyingShown, ANSIReset)
-	}
-	if cuttingCount > maxNonCopyingShown {
-		fmt.Fprintf(&b, indentShardMore+"%s... %d more cutting over%s\n",
-			ANSIDim, cuttingCount-maxNonCopyingShown, ANSIReset)
+	for _, status := range orderedPartStatuses(sampled) {
+		if more := sampled[status] - maxNonCopyingShown; more > 0 {
+			fmt.Fprintf(&b, indentShardMore+"%s... %d more %s%s\n",
+				ANSIDim, more, partStatusLabel(status), ANSIReset)
+		}
 	}
 
 	// Collect copying shards, sorted by percent complete (lowest first)
@@ -152,7 +148,79 @@ func formatShardLine(s ShardProgress) string {
 	case state.Task.Failed:
 		return fmt.Sprintf(indentShardLine+"%s✗ %s%s: failed\n", ANSIRed, s.Shard, ANSIReset)
 	default:
-		return fmt.Sprintf(indentShardLine+"%s○ %s: %s%s\n", ANSIDim, s.Shard, s.Status, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s○ %s: %s%s\n", ANSIDim, s.Shard, partStatusLabel(s.Status), ANSIReset)
+	}
+}
+
+// sampledPartStatusOrder is the order the summary and the sampled lines list
+// the statuses ShardCounts has no field of its own for, alongside waiting
+// for and cutting over. A status outside it still counts, after these.
+var sampledPartStatusOrder = []string{
+	state.Task.WaitingForCutover,
+	state.Task.CuttingOver,
+	state.Task.CatchingUp,
+	state.Task.Checksumming,
+	state.Task.PostChecksum,
+	state.Task.WaitingForDeploy,
+	state.Task.Recovering,
+	state.Task.FailedRetryable,
+	state.Task.Stopped,
+	state.Task.Reverting,
+	state.Task.RevertWindow,
+	state.Task.Reverted,
+	state.Task.Cancelled,
+}
+
+// isSampledPartStatus reports whether a part in a wide table is shown by
+// sampling its status: every status except copying (sampled by how far
+// behind), failed (always shown), and complete or queued (counted).
+func isSampledPartStatus(status string) bool {
+	switch status {
+	case state.Task.Running, state.Task.Failed, state.Task.Completed, state.Task.Pending:
+		return false
+	default:
+		return true
+	}
+}
+
+// orderedPartStatuses is the statuses counted in counts, in
+// sampledPartStatusOrder and then any others alphabetically.
+func orderedPartStatuses(counts map[string]int) []string {
+	ordered := make([]string, 0, len(counts))
+	for _, status := range sampledPartStatusOrder {
+		if counts[status] > 0 {
+			ordered = append(ordered, status)
+		}
+	}
+	var unlisted []string
+	for status, n := range counts {
+		if n > 0 && !slices.Contains(sampledPartStatusOrder, status) {
+			unlisted = append(unlisted, status)
+		}
+	}
+	slices.Sort(unlisted)
+	return append(ordered, unlisted...)
+}
+
+// partStatusLabel names a part's status in its line and in the summary.
+func partStatusLabel(status string) string {
+	switch status {
+	case state.Task.WaitingForCutover:
+		return "waiting for cutover"
+	case state.Task.CuttingOver:
+		return "cutting over"
+	case state.Task.CatchingUp:
+		return "catching up"
+	case state.Task.PostChecksum:
+		return "applying final changes"
+	case state.Task.WaitingForDeploy:
+		return "waiting for deploy"
+	case state.Task.FailedRetryable:
+		return "retrying"
+	case state.Task.RevertWindow:
+		return "revert window open"
+	default:
+		return status
 	}
 }
 
@@ -176,6 +244,11 @@ func CountShardsByStatus(shards []ShardProgress) ShardCounts {
 			c.Failed++
 		case state.Task.Cancelled:
 			c.Cancelled++
+		default:
+			if c.Other == nil {
+				c.Other = make(map[string]int)
+			}
+			c.Other[s.Status]++
 		}
 	}
 	return c
@@ -195,6 +268,9 @@ func FormatShardSummaryParts(c ShardCounts, compact bool) []string {
 	}
 	if c.Running > 0 {
 		parts = append(parts, fmt.Sprintf("%d copying", c.Running))
+	}
+	for _, status := range orderedPartStatuses(c.Other) {
+		parts = append(parts, fmt.Sprintf("%d %s", c.Other[status], partStatusLabel(status)))
 	}
 	if c.Queued > 0 {
 		parts = append(parts, fmt.Sprintf("%d queued", c.Queued))

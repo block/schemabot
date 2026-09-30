@@ -135,8 +135,11 @@ func tableChangeSignature(tables []TableProgress) string {
 
 // tableAcrossTargets rolls table up across members: one entry per target,
 // in the rollout's order, and the rows and ETA the engines reported for the
-// targets copying or done. A target's entry matches on DDL as well as table,
-// so a table changed by two statements rolls up once per statement.
+// targets that have started the change and not halted. A target's entry
+// matches on DDL as well as table, so a table changed by two statements rolls
+// up once per statement. The change reads as instant only when every target
+// that ran it reports it instant: an engine decides that per target, so one
+// target's instant ALTER says nothing about how another applied it.
 func tableAcrossTargets(v RolloutView, members []int, table TableProgress) TableProgress {
 	rolled := TableProgress{
 		TableName:     table.TableName,
@@ -144,10 +147,10 @@ func tableAcrossTargets(v RolloutView, members []int, table TableProgress) Table
 		Dialect:       table.Dialect,
 		ChangeType:    table.ChangeType,
 		DDL:           table.DDL,
-		IsInstant:     table.IsInstant,
 		AcrossTargets: true,
 	}
 	statuses := make([]string, 0, len(members))
+	allInstant := true
 	for _, i := range members {
 		d := v.Model.Deployments[i]
 		for _, t := range activeTablesForMember(v.Tables, d.Deployment, d.Target) {
@@ -164,7 +167,8 @@ func tableAcrossTargets(v RolloutView, members []int, table TableProgress) Table
 				ETASeconds:      t.ETASeconds,
 				PercentComplete: t.PercentComplete,
 			})
-			if status == state.Task.Running || status == state.Task.Completed {
+			allInstant = allInstant && t.IsInstant
+			if countsTowardRolledRows(status) {
 				rolled.RowsCopied += t.RowsCopied
 				rolled.RowsTotal += t.RowsTotal
 				rolled.ChecksumRowsChecked += t.ChecksumRowsChecked
@@ -178,10 +182,23 @@ func tableAcrossTargets(v RolloutView, members []int, table TableProgress) Table
 		}
 	}
 	rolled.Status = rollupTaskStatus(statuses)
+	rolled.IsInstant = len(statuses) > 0 && allInstant
 	if rolled.RowsTotal > 0 {
 		rolled.PercentComplete = int(min(rolled.RowsCopied, rolled.RowsTotal) * 100 / rolled.RowsTotal)
 	}
 	return rolled
+}
+
+// countsTowardRolledRows reports whether a target's rows join the table's
+// rolled-up totals: a target still working on the change, including one past
+// its row copy (catching up, checksumming, waiting for or cutting over), or
+// one that has finished it. Leaving a finished-copy target out would sum only
+// the targets still copying and read the rollout as further behind than the
+// engines report. A queued target has reported nothing yet, and a halted one
+// is named in its own line instead.
+func countsTowardRolledRows(status string) bool {
+	return state.IsInFlightTaskState(status) ||
+		state.IsState(status, state.Task.Completed, state.Task.RevertWindow)
 }
 
 // rollupTaskStatus is a table's status across targets. While any target is

@@ -28,6 +28,7 @@ type rolloutTarget struct {
 	eta        int64
 	err        string
 	externalID string
+	isInstant  bool
 }
 
 // targetRolloutData builds a running apply of orders to production whose prod
@@ -66,6 +67,7 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 			Deployment: "prod", Target: name, Namespace: "orders", TableName: "orders",
 			ChangeType: "alter", DDL: ddl, Status: target.status,
 			RowsCopied: target.rowsCopied, RowsTotal: target.rowsTotal, ETASeconds: target.eta, PercentComplete: percent,
+			IsInstant: target.isInstant,
 		})
 	}
 	return data
@@ -212,4 +214,66 @@ func TestFormatRolloutFooter_PlanetScaleOffersCancel(t *testing.T) {
 	out := renderRollout(t, data)
 	assert.Contains(t, out, "To cancel this schema change:\n  schemabot cancel apply-7f3c -e production")
 	assert.NotContains(t, out, "schemabot stop")
+}
+
+// An engine decides per target whether an ALTER applies instantly, so the
+// rolled-up table reads "Applied instantly" only when every target that ran
+// the change reports it instant; one target that copied rows makes it read
+// complete instead.
+func TestWriteProgress_TargetRollupIsInstantOnlyWhenEveryTargetIs(t *testing.T) {
+	instant := completedTarget()
+	instant.isInstant = true
+	completedRollout := func(targets ...rolloutTarget) ProgressData {
+		data := targetRolloutData(targets)
+		data.State = state.Apply.Completed
+		return data
+	}
+
+	mixed := renderRollout(t, completedRollout(instant, completedTarget()))
+	assert.NotContains(t, mixed, "Applied instantly", "a target that copied rows keeps the change from reading instant:\n%s", mixed)
+	assert.Contains(t, mixed, "✓ Complete")
+
+	allInstant := renderRollout(t, completedRollout(instant, instant))
+	assert.Contains(t, allInstant, "⚡ Applied instantly")
+}
+
+// A target that has finished its row copy and waits for cutover still counts
+// toward the table's rows, so a rollout with one target waiting at 100% and
+// one copying at 20% reads 60% copied, not the 20% of the copying target
+// alone.
+func TestWriteProgress_TargetRollupSumsTargetsPastRowCopy(t *testing.T) {
+	waiting := rolloutTarget{opState: state.ApplyOperation.WaitingForCutover, status: state.Task.WaitingForCutover, rowsCopied: 1000, rowsTotal: 1000}
+
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{waiting, copyingTarget(200)}))
+	assert.Contains(t, out, "60.00%", "the bar sums every target past the start of its copy:\n%s", out)
+	assert.Contains(t, out, "Rows: 1,200 / 2,000")
+	assert.Contains(t, out, "• Targets: 2 (1 waiting for cutover, 1 copying)")
+}
+
+// A wide rollout past its row copy names the phase each target is in: the
+// summary counts catching up and checksumming targets, and the lines sample
+// each phase with the rest counted, rather than reading "(none)" with no
+// target named.
+func TestWriteProgress_WideTargetRollupNamesEveryPhase(t *testing.T) {
+	var targets []rolloutTarget
+	for i := range 12 {
+		status := state.Task.Checksumming
+		if i < 3 {
+			status = state.Task.CatchingUp
+		}
+		targets = append(targets, rolloutTarget{opState: state.ApplyOperation.Running, status: status, rowsCopied: 1000, rowsTotal: 1000})
+	}
+
+	out := renderRollout(t, targetRolloutData(targets))
+	assert.Contains(t, out, "• Targets: 12 (3 catching up, 9 checksumming)", "%s", out)
+	assert.NotContains(t, out, "(none)")
+	for _, name := range []string{"payments-001", "payments-002", "payments-003"} {
+		assert.Contains(t, out, "○ "+name+": catching up")
+	}
+	for _, name := range []string{"payments-004", "payments-005", "payments-006"} {
+		assert.Contains(t, out, "○ "+name+": checksumming")
+	}
+	assert.NotContains(t, out, "payments-007:", "past the sample, a phase's targets are counted")
+	assert.Contains(t, out, "... 6 more checksumming")
+	assert.NotContains(t, out, "more catching up", "every catching-up target is already named")
 }
