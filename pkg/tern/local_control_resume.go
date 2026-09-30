@@ -1809,19 +1809,6 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	}
 
 	work := finalizerWork(changes)
-	c.logger.Info("driving group_finalizer",
-		"work", work,
-		"apply_id", apply.ApplyIdentifier,
-		"apply_operation_id", op.ID,
-		"deployment", op.Deployment,
-		"namespace", namespace,
-		"namespace_count", len(changes),
-		"database", apply.Database,
-	)
-	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
-		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
-	}
-
 	failClosed := func(cause error) error {
 		if markErr := c.storage.ApplyOperations().MarkFailed(ctx, op.ID, cause.Error()); markErr != nil {
 			c.logger.Error("group_finalizer: failed to mark operation failed",
@@ -1856,6 +1843,27 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		return failClosed(fmt.Errorf("load engine resume state for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, getErr))
 	case stored != nil:
 		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+	}
+
+	// An operator's pending cancel or stop decides whether this finalizer may
+	// start at all. It is consulted before the operation is marked started and
+	// before anything reaches the engine, the same way a work operation's drive
+	// consumes pending commands before it resumes its tasks.
+	if standDown, err := c.finalizerStandsDownForPendingControl(ctx, apply, op, namespace, resumeState != nil); standDown || err != nil {
+		return err
+	}
+
+	c.logger.Info("driving group_finalizer",
+		"work", work,
+		"apply_id", apply.ApplyIdentifier,
+		"apply_operation_id", op.ID,
+		"deployment", op.Deployment,
+		"namespace", namespace,
+		"namespace_count", len(changes),
+		"database", apply.Database,
+	)
+	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
+		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
@@ -1897,6 +1905,91 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	c.logger.Info("group_finalizer completed",
 		"work", work, "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
 	return nil
+}
+
+// finalizerStandsDownForPendingControl answers an operator's pending cancel or
+// stop for a group_finalizer before the finalizer hands anything to the engine.
+// Cancel is consulted first because it is the stronger intent. A finalizer that
+// has not started settles its own operation row: cancelled for a cancel, and
+// for a stop the state the database type's stop settles to (stopped, or
+// cancelled where a stop cannot pause). The drive then stands down without
+// applying the VSchema.
+//
+// The request itself stays pending. A finalizer owns only its own row, while
+// the command belongs to the whole apply: sibling operations still have to
+// consume it, and the rollout projection completes it once the apply resolves.
+//
+// inFlight reports that the finalizer already handed its work to the engine
+// (engine resume state is recorded). Settling storage then would record a
+// cancel or stop over a VSchema deploy the engine is still carrying out, so the
+// drive keeps following that work to the outcome the engine reports.
+func (c *LocalClient) finalizerStandsDownForPendingControl(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, namespace string, inFlight bool) (bool, error) {
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+		controlReq, err := pendingControlRequest(ctx, c.storage, apply, operation)
+		if err != nil {
+			return false, fmt.Errorf("check pending %s before group_finalizer apply_operation %d (apply %s): %w", operation, op.ID, apply.ApplyIdentifier, err)
+		}
+		if controlReq == nil {
+			continue
+		}
+		caller := controlRequestCaller(controlReq)
+		logAttrs := append(apply.LogAttrs(),
+			"apply_operation_id", op.ID, "operation_deployment", op.Deployment, "operation_key", op.OperationKey,
+			"namespace", namespace, "control_operation", operation, "requested_by", caller)
+		if inFlight {
+			c.logger.Warn("group_finalizer has VSchema work in flight on the engine; the drive follows it to the engine's outcome and leaves the pending command to the rest of the apply",
+				logAttrs...)
+			return false, nil
+		}
+		settledState := finalizerSettledStateForControl(operation, apply.DatabaseType)
+		if err := c.settleFinalizerOperation(ctx, op, settledState); err != nil {
+			return true, fmt.Errorf("settle group_finalizer apply_operation %d (apply %s) %s for pending %s: %w", op.ID, apply.ApplyIdentifier, settledState, operation, err)
+		}
+		c.logger.Info("group_finalizer settled for a pending command before it applied anything; the rollout projection completes the command",
+			append(logAttrs, "previous_operation_state", op.State, "operation_state", settledState)...)
+		logEvent := storage.LogEventCancelRequested
+		if operation == storage.ControlOperationStop {
+			logEvent = storage.LogEventStopRequested
+		}
+		eventMsg := fmt.Sprintf("%s requested: VSchema finalizer for %s %s before it applied anything",
+			capitalizeControlVerb(string(operation)), finalizerScopeLabel(namespace), settledState)
+		if caller != "" {
+			eventMsg += callerApplyLogSuffix(caller)
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, logEvent, storage.LogSourceSchemaBot,
+			eventMsg, op.State, settledState)
+		return true, nil
+	}
+	return false, nil
+}
+
+// finalizerSettledStateForControl is the operation state a never-started
+// finalizer settles to for a pending command. A stop settles to stopped so a
+// later start resumes the finalizer, except on an engine whose stop is
+// permanent, where the single stop-terminality decision makes it cancelled.
+func finalizerSettledStateForControl(operation storage.ControlOperation, databaseType string) string {
+	if operation == storage.ControlOperationStop && !stopTerminatesChange(databaseType) {
+		return state.ApplyOperation.Stopped
+	}
+	return state.ApplyOperation.Cancelled
+}
+
+// settleFinalizerOperation moves the finalizer's own row to settledState under
+// the drive's lease. stopped is resumable and keeps completed_at nil.
+func (c *LocalClient) settleFinalizerOperation(ctx context.Context, op *storage.ApplyOperation, settledState string) error {
+	if state.IsState(settledState, state.ApplyOperation.Stopped) {
+		return c.storage.ApplyOperations().UpdateState(ctx, op.ID, settledState)
+	}
+	return c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, settledState)
+}
+
+// finalizerScopeLabel names what a finalizer covers in the apply log: its one
+// namespace, or every VSchema namespace for a deployment-scoped finalizer.
+func finalizerScopeLabel(namespace string) string {
+	if namespace == "" {
+		return "every namespace"
+	}
+	return "namespace " + namespace
 }
 
 // finalizerVSchemaChanges reconstructs the change(s) a group_finalizer applies,
