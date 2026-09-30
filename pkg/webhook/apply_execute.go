@@ -166,7 +166,7 @@ func (h *Handler) executeApply(
 	}
 
 	// Direct-execution changes never run from the automatic apply path: the
-	// operator must confirm the blocking, non-revertible native DDL against
+	// operator must confirm the write-blocking native DDL against
 	// the locked plan comment that discloses it, so downgrade to manual
 	// confirmation.
 	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {

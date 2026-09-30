@@ -1206,8 +1206,8 @@ type EnvironmentConfig struct {
 	// DirectExecution configures direct execution of ALTER statements that the
 	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
 	// When enabled, a refused statement whose table is within the policy's
-	// size bound runs verbatim as native MySQL DDL: synchronous, and
-	// blocking writes to the table while it runs. Only
+	// size bound runs verbatim as native MySQL DDL: it runs synchronously and
+	// blocks writes to the table while it runs. Only
 	// valid for MySQL databases: setting this block on any other database
 	// type fails config validation, even when disabled, so a policy that can
 	// never take effect is never silently carried in config.

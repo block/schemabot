@@ -1763,7 +1763,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 	headerNoun, consequence := directConsentCopy(databaseType, isMySQL)
 	footer := consequence
 	if deferCutover {
-		footer += " `--defer-cutover` does not apply to them: they have no cutover to defer."
+		footer += " `--defer-cutover` does not apply to these direct statements: they have no cutover to defer."
 	}
 	footer += " Confirming the apply consents to this."
 	n := len(changes)

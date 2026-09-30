@@ -57,7 +57,7 @@ func TestRenderPlanComment_DirectNotesDeferCutoverOnlyWhenPassed(t *testing.T) {
 	}
 
 	apply := RenderPlanComment(data)
-	assert.Contains(t, apply, "Writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to them: they have no cutover to defer. Confirming the apply consents to this.")
+	assert.Contains(t, apply, "Writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer. Confirming the apply consents to this.")
 }
 
 func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {
