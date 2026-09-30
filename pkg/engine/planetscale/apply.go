@@ -945,8 +945,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 // resumeExistingDeployRequest resumes an apply whose deploy request was already
 // created before the crash. It reattaches to the recovered deploy request,
 // deploys it when the driver crashed after creation but before the deploy was
-// started, and rediscovers the Vitess migration_context so per-shard progress
-// keeps working for the rest of the apply.
+// started, records the deferral when the operator deferred the deploy and the
+// driver stopped before recording it, and rediscovers the Vitess
+// migration_context so per-shard progress keeps working for the rest of the
+// apply.
 func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (*engine.ApplyResult, error) {
 	dr, err := e.getDeployRequest(ctx, client, org, req.Database, meta.DeployRequestID)
 	if err != nil {
@@ -963,6 +965,20 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			return e.Apply(ctx, req)
 		}
 		return nil, fmt.Errorf("get deploy request #%d on resume: %w", meta.DeployRequestID, err)
+	}
+
+	// The deploy request ID is persisted before PlanetScale finishes computing
+	// the schema diff, so a drive that stopped inside that window recovers a
+	// request still in "pending". Wait it out exactly as the fresh path does:
+	// every decision below is taken against the settled state, and a request
+	// left in "pending" is never deployed by anyone.
+	if dr.DeploymentState == deployState.Pending {
+		e.logger.Info("recovered deploy request is still computing its schema diff, waiting before resuming",
+			"database", req.Database, "deploy_request", dr.Number)
+		dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+		if err != nil {
+			return nil, fmt.Errorf("wait for recovered deploy request #%d on resume: %w", meta.DeployRequestID, err)
+		}
 	}
 
 	// If the deploy request failed, start fresh with a new branch rather
@@ -1069,6 +1085,10 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		}, nil
 	}
 
+	if deployRequestAwaitsDeferredDeployRecord(dr, meta, deferDeploy) {
+		return e.recordRecoveredDeferredDeploy(ctx, client, org, req, meta, dr, deferCutover)
+	}
+
 	// Reattach-only path: no deploy was started here. If the stored context is
 	// still the tern apply identifier (not a real Vitess context), an earlier
 	// crash lost the discovered context, so per-shard progress would stay empty
@@ -1122,6 +1142,75 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 // yet say so, and the request the operator made is what settles it.
 func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
 	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && !deferDeploy && dr.DeployedAt == nil
+}
+
+// deployRequestAwaitsDeferredDeployRecord reports whether a recovered deploy
+// request belongs to a deferred deploy whose stored metadata does not yet say
+// so. The deferral is recorded only once the deploy request is ready, so a
+// drive that stopped before then leaves a ready, undeployed request the
+// operator asked to hold with metadata that reads as non-deferred. Until the
+// deferral is recorded, progress reports the apply as pending rather than
+// waiting for deploy, and the operator-triggered deploy is refused.
+func deployRequestAwaitsDeferredDeployRecord(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
+	return deferDeploy && !meta.DeferredDeploy && dr.DeploymentState == deployState.Ready && dr.DeployedAt == nil
+}
+
+// recordRecoveredDeferredDeploy finishes what the fresh deferred path does once
+// its deploy request is ready and the drive that created it did not: it
+// verifies a deferred cutover is held, takes the instant DDL decision, and
+// durably records the deferral so progress reports waiting_for_deploy and the
+// operator-triggered deploy is accepted. The deploy itself is left to the
+// operator.
+func (e *Engine) recordRecoveredDeferredDeploy(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, deferCutover bool) (*engine.ApplyResult, error) {
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL on the recovered deferred deploy request because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database, "deploy_request", dr.Number, "reason", unsafeReason)
+		} else {
+			e.logger.Info("declining instant DDL on the recovered deferred deploy request so the deferred cutover has a gate to hold",
+				"database", req.Database, "deploy_request", dr.Number)
+		}
+		e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
+	}
+
+	meta.DeployRequestURL = dr.HtmlURL
+	meta.IsInstant = useInstant
+	meta.DeferredDeploy = true
+	persistMeta, err := encodePSMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata for recovered deferred deploy request #%d: %w", dr.Number, err)
+	}
+	resumeState := &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         persistMeta,
+	}
+	if req.OnStateChange != nil {
+		req.OnStateChange(resumeState)
+	} else {
+		e.logger.Warn("recovered deferred deploy recorded only in the returned resume state: no OnStateChange callback",
+			"database", req.Database, "deploy_request", dr.Number)
+	}
+
+	e.logger.Info("recorded deferral on recovered deploy request — operator must trigger the deploy",
+		"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", useInstant)
+	suffix := ""
+	if useInstant {
+		suffix = " (instant DDL)"
+	}
+	return &engine.ApplyResult{
+		Accepted:    true,
+		Message:     fmt.Sprintf("Deploy request #%d ready%s — waiting for deploy", dr.Number, suffix),
+		ResumeState: resumeState,
+	}, nil
 }
 
 // resolveResumeSchemaChangeContext rediscovers the Vitess migration_context after a

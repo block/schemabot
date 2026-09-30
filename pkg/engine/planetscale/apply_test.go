@@ -275,6 +275,9 @@ type resumeDeployClient struct {
 	lastDeploy   *ps.PerformDeployRequest
 	deployResult *ps.DeployRequest
 	autoCutover  bool
+	// pendingGets is how many Get calls report the deploy request as still
+	// computing its schema diff before the recovered state is served.
+	pendingGets int
 }
 
 func (c *resumeDeployClient) DeployRequestAutoCutover(_ context.Context, _, _ string, _ uint64) (bool, error) {
@@ -288,6 +291,9 @@ func (c *resumeDeployClient) GetDeployRequest(_ context.Context, req *ps.GetDepl
 	}
 	dr := *c.recovered
 	dr.Number = req.Number
+	if c.getCalls <= c.pendingGets {
+		dr.DeploymentState = deployState.Pending
+	}
 	return &dr, nil
 }
 
@@ -594,6 +600,102 @@ func TestResumeExistingDeployRequest_DeferredIsNotDeployed(t *testing.T) {
 	require.NotNil(t, result)
 	assert.Equal(t, 0, client.deployCalls)
 	assert.Contains(t, result.Message, "Resumed deploy request #9")
+}
+
+// A driver that stops after creating a non-deferred deploy request, while
+// PlanetScale is still computing its schema diff, recovers the request in
+// "pending". Resume waits for the diff to finish and then starts the deploy,
+// so the schema change runs instead of sitting in pending forever.
+func TestResumeExistingDeployRequest_WaitsOutPendingThenDeploys(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &resumeDeployClient{
+		recovered:   &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/44"},
+		pendingGets: 1,
+	}
+
+	meta := &psMetadata{BranchName: "schemabot-testdb-pend", DeployRequestID: 44}
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+
+	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, 2, client.getCalls, "resume polls past pending before deciding")
+	assert.Equal(t, 1, client.deployCalls)
+	require.NotNil(t, client.lastDeploy)
+	assert.Equal(t, uint64(44), client.lastDeploy.Number)
+	assert.Contains(t, result.Message, "Resumed and deployed request #44")
+}
+
+// A driver running a deferred deploy can stop after creating the deploy request
+// but before recording the deferral, which is written only once the request is
+// ready. Resume records the deferral itself, with the deploy left to the
+// operator: progress then reports waiting_for_deploy instead of pending, and the
+// operator-triggered deploy is accepted instead of refused. This holds whether
+// the recovered request is already ready or still computing its schema diff.
+func TestResumeExistingDeployRequest_RecordsDeferralTheStoppedDriveDidNot(t *testing.T) {
+	tests := []struct {
+		name        string
+		pendingGets int
+	}{
+		{name: "recovered request already ready", pendingGets: 0},
+		{name: "recovered request still computing its schema diff", pendingGets: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumeDeployClient{
+				recovered:   &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/52"},
+				pendingGets: tt.pendingGets,
+			}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-defer", DeployRequestID: 52}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Options = map[string]string{"defer_deploy": "true"}
+			persisted := captureStateChanges(req)
+
+			result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, 0, client.deployCalls, "a deferred deploy is left for the operator")
+			assert.Contains(t, result.Message, "Deploy request #52 ready — waiting for deploy")
+
+			require.Len(t, *persisted, 1, "the deferral is durably recorded, not only returned")
+			stored, err := decodePSMetadata((*persisted)[0].Metadata)
+			require.NoError(t, err)
+			assert.True(t, stored.DeferredDeploy)
+			assert.Equal(t, uint64(52), stored.DeployRequestID)
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", (*persisted)[0].MigrationContext)
+			require.NotNil(t, result.ResumeState)
+			assert.Equal(t, (*persisted)[0].Metadata, result.ResumeState.Metadata)
+
+			creds := &engine.Credentials{Metadata: map[string]string{
+				"organization": "org",
+				"token_name":   "token",
+				"token_value":  "secret",
+			}}
+			progress, err := e.Progress(t.Context(), &engine.ProgressRequest{
+				Database:    "testdb",
+				ResumeState: (*persisted)[0],
+				Credentials: creds,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, engine.StateWaitingForDeploy, progress.State)
+
+			started, err := e.Start(t.Context(), &engine.ControlRequest{
+				Database:    "testdb",
+				ResumeState: (*persisted)[0],
+				Credentials: creds,
+			})
+			require.NoError(t, err)
+			assert.True(t, started.Accepted)
+			assert.Equal(t, 1, client.deployCalls)
+			require.NotNil(t, client.lastDeploy)
+			assert.Equal(t, uint64(52), client.lastDeploy.Number)
+		})
+	}
 }
 
 // A failed deploy request must not be resumed; the apply restarts fresh on a new
