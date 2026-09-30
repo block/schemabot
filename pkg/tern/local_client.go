@@ -2546,18 +2546,16 @@ const dispatchMemberTargetOption = "member_target"
 // dispatch, whether the dispatch is a task-less VSchema finalizer, and the
 // rollout member target its operation key is qualified with.
 //
-// reservedTarget is the physical target the dispatch holds on its own, and is
-// set only for a member dispatch that reached the client serving its target:
-// the member target is the plan's target, which is the route this client
-// drives. Every other dispatch leaves it empty and holds the whole database
-// (see dispatchDeployment and checkActiveTaskConflict).
+// A member target is also the physical target the dispatch holds on its own:
+// deriveDispatchScope admits one only when it is the plan's target, which is
+// the route this client drives. Every other dispatch names none and holds the
+// whole database (see dispatchDeployment and checkActiveTaskConflict).
 type dispatchScope struct {
 	ddlChanges         []storage.TableChange
 	shard              string
 	finalizer          bool
 	finalizerNamespace string
 	memberTarget       string
-	reservedTarget     string
 }
 
 // dispatchDeployment is the deployment a dispatch's apply and operation rows
@@ -2568,8 +2566,8 @@ type dispatchScope struct {
 // siblings share. Every other dispatch reserves the database this client is
 // bound to, as it always has.
 func (c *LocalClient) dispatchDeployment(scope dispatchScope) string {
-	if scope.reservedTarget != "" {
-		return scope.reservedTarget
+	if scope.memberTarget != "" {
+		return scope.memberTarget
 	}
 	return c.config.Database
 }
@@ -2602,10 +2600,16 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 	if err != nil {
 		return dispatchScope{}, err
 	}
-	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges(), memberTarget: memberTarget}
-	if memberTarget != "" && memberTarget == plan.Target {
-		scope.reservedTarget = memberTarget
+	// A member dispatch runs only a plan produced for its own target. The router
+	// routes the dispatch to the target its request names and a materialized
+	// plan records that same target, so a plan naming any other one means the
+	// dispatch reached a sibling's database, or carries a sibling's plan. Either
+	// way running it would apply a schema this target was never planned for, and
+	// no reservation makes that safe, so the dispatch is refused.
+	if memberTarget != "" && plan.Target != memberTarget {
+		return dispatchScope{}, fmt.Errorf("dispatch for rollout member target %q runs plan %s, which was produced for target %q; refusing to run one target's plan on another target's database", memberTarget, plan.PlanIdentifier, plan.Target)
 	}
+	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges(), memberTarget: memberTarget}
 	if len(req.TargetShards) > 0 {
 		shard, err := dispatchTargetShard(req.TargetShards)
 		if err != nil {

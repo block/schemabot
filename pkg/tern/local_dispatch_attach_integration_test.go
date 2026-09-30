@@ -411,15 +411,19 @@ func memberTargetDispatchRequest(planID, key, target string) *ternv1.ApplyReques
 // manifest declares, and echoes it; a replay resolves to the same operation.
 // A dispatch for payments-002 that arrives under payments-001's idempotency
 // key is refused by the manifest instead of being answered with
-// payments-001's operation, so one target is never tracked as another.
+// payments-001's operation, and one that arrives under payments-001's plan is
+// refused before it can run that plan, so one target is never tracked as, or
+// run as, another.
 func TestLocalClient_Apply_MemberTargetDispatchKeysItsOperationByTarget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	stor, client, planID := setupAttachDispatchClient(t)
+	stor, client, basePlanID := setupAttachDispatchClient(t)
 	ctx := t.Context()
 	const key = "schemabot:v1:member-target-test"
+	planID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+	siblingPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-002")
 
 	first, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-001"))
 	require.NoError(t, err)
@@ -442,10 +446,14 @@ func TestLocalClient_Apply_MemberTargetDispatchKeysItsOperationByTarget(t *testi
 	assert.Equal(t, first.ApplyOperationId, replay.ApplyOperationId, "replay must resolve to the original operation")
 	assert.Equal(t, "payments-001", replay.OperationKey)
 
-	aliased, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-002"))
+	aliased, err := client.Apply(ctx, memberTargetDispatchRequest(siblingPlanID, key, "payments-002"))
 	require.NoError(t, err)
 	assert.False(t, aliased.Accepted, "a sibling target under another target's key must not be answered with that target's operation")
 	assert.Contains(t, aliased.ErrorMessage, "generation manifest")
+
+	_, err = client.Apply(ctx, memberTargetDispatchRequest(planID, "schemabot:v1:member-target-sibling-plan", "payments-002"))
+	require.Error(t, err, "a target dispatched under its sibling's plan must be refused")
+	assert.Contains(t, err.Error(), `which was produced for target "payments-001"`)
 
 	ops, err = stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)

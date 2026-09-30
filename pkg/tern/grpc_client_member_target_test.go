@@ -298,9 +298,10 @@ func TestLoadOperationApplyTaskScope_MemberTarget(t *testing.T) {
 // helpers. A whole-target dispatch naming a member target derives the target
 // itself, which is the key the planner stored; one naming none derives the
 // empty key it always has. A shard or finalizer dispatch naming a member target
-// is refused, and so is a target that could not be split back out of a key.
+// is refused, and so is a target that could not be split back out of a key,
+// and so is a member target the plan was not produced for.
 func TestOperationIdentityForDispatch_MemberTarget(t *testing.T) {
-	plan := &storage.Plan{PlanIdentifier: "plan-members"}
+	plan := &storage.Plan{PlanIdentifier: "plan-members", Target: "payments-001"}
 	changes := []*ternv1.TableChange{{
 		Namespace:  "payments",
 		TableName:  "orders",
@@ -332,4 +333,7 @@ func TestOperationIdentityForDispatch_MemberTarget(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "operation key delimiter")
 
+	_, err = derive(&ternv1.ApplyRequest{DdlChanges: changes, Options: map[string]string{dispatchMemberTargetOption: "payments-002"}})
+	require.Error(t, err, "a member must never run a plan produced for its sibling target")
+	assert.Contains(t, err.Error(), "refusing to run one target's plan on another target's database")
 }

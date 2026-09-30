@@ -93,7 +93,7 @@ func TestConflictCheck_MemberTargetScopesToItsOwnTarget(t *testing.T) {
 	})
 
 	plan, sibling := memberDispatchScope(t, "payments-002", "payments-002")
-	assert.Equal(t, "payments-002", sibling.reservedTarget)
+	assert.Equal(t, "payments-002", sibling.memberTarget)
 	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", sibling, 0)
 	require.NoError(t, err, "a sibling target's copy must not hold this target's dispatch")
 
@@ -104,30 +104,27 @@ func TestConflictCheck_MemberTargetScopesToItsOwnTarget(t *testing.T) {
 	assert.Equal(t, "task-payments-001-orders", blocking.taskIdentifier)
 
 	plan, whole := memberDispatchScope(t, "payments-002", "")
-	assert.Empty(t, whole.reservedTarget)
+	assert.Empty(t, whole.memberTarget)
 	_, _, err = client.checkActiveTaskConflict(t.Context(), plan, "production", whole, 0)
 	require.Error(t, err, "a dispatch reserving no target conflicts with every target's work")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 }
 
 // A member dispatch is scoped to its target only when it reached the client
-// serving that target, which is the plan's target. One that names a target the
-// plan does not reserves the whole database, so a routing disagreement
-// between the planes can never let two drives onto one physical database.
-func TestConflictCheck_MemberTargetDisagreeingWithPlanReservesTheDatabase(t *testing.T) {
-	task := memberCopyTask()
-	client := memberTargetConflictClient(task, map[int64]*storage.ApplyOperation{
-		21: {ID: 21, ApplyID: 1, Deployment: "payments-001", OperationKey: "payments-001", Target: "payments-001"},
-	})
-
-	plan, scope := memberDispatchScope(t, "payments-001", "payments-002")
-	assert.Equal(t, "payments-002", scope.memberTarget)
-	assert.Empty(t, scope.reservedTarget, "a member target the plan does not name reserves nothing on its own")
-	assert.Equal(t, "payments", client.dispatchDeployment(scope), "it records the database-wide deployment")
-
-	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", scope, 0)
+// serving that target, which is the plan's target. One naming a target the
+// plan does not has reached a sibling's database or carries a sibling's plan,
+// and no reservation stops it from running a schema its target was never
+// planned for, so it is refused before any conflict check or row exists.
+func TestDeriveDispatchScope_RefusesMemberTargetDisagreeingWithPlan(t *testing.T) {
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-payments-001",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Target:         "payments-001",
+	}
+	_, err := deriveDispatchScope(plan, &ternv1.ApplyRequest{Options: map[string]string{dispatchMemberTargetOption: "payments-002"}})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Contains(t, err.Error(), `dispatch for rollout member target "payments-002" runs plan plan-payments-001, which was produced for target "payments-001"`)
 }
 
 // A task's target is known only through its operation row. When that row is

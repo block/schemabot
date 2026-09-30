@@ -27,7 +27,7 @@ import (
 // another shard is not a conflict. The shard is "" for a non-sharded apply,
 // which conflicts with any active task on the database (today's behaviour).
 //
-// The scope's reserved target scopes the conflict to one target in the same
+// The scope's member target scopes the conflict to one target in the same
 // way: the targets of a deployment that addresses several are distinct
 // physical databases sharing one database name, and a parallel cutover policy
 // copies on several of them at once, so a task proven to run on another target
@@ -54,10 +54,6 @@ import (
 // mark superseded (see markSupersededHolders): only work attributable to the
 // same environment and target is the dispatch's to take over.
 func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment string, scope dispatchScope, attachApplyID int64) (blockingTask, []supersededHolder, error) {
-	if scope.memberTarget != "" && scope.reservedTarget == "" {
-		c.logger.Warn("conflict check: member dispatch names a target other than the plan's, so it reserves the whole database and every target's work blocks it",
-			"database", plan.Database, "plan_id", plan.PlanIdentifier, "member_target", scope.memberTarget, "plan_target", plan.Target)
-	}
 	memo := newConflictScanMemo()
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
@@ -65,7 +61,7 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 			return blockingTask{}, nil, fmt.Errorf("check existing tasks: %w", err)
 		}
 
-		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", scope.shard, "reserved_target", scope.reservedTarget, "attempt", attempt)
+		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", scope.shard, "reserved_target", scope.memberTarget, "attempt", attempt)
 
 		blocking, released := c.findBlockingTask(ctx, existingTasks, plan, environment, scope, attachApplyID, memo)
 		if !blocking.blocks() {
@@ -105,7 +101,7 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 // checkActiveTaskConflict): when both the candidate apply and an existing task
 // target a non-empty shard, a different shard does not conflict, so a sharded
 // fan-out runs its shards concurrently instead of serializing on the first one.
-// The scope's reserved target does the same across the targets of one
+// The scope's member target does the same across the targets of one
 // deployment.
 func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, environment string, scope dispatchScope, attachApplyID int64, memo *conflictScanMemo) (blockingTask, []supersededHolder) {
 	dispatchShard := scope.shard
@@ -130,7 +126,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue
 		}
 
-		if c.taskRunsOnAnotherTarget(ctx, t, scope.reservedTarget, memo) {
+		if c.taskRunsOnAnotherTarget(ctx, t, scope.memberTarget, memo) {
 			continue
 		}
 
