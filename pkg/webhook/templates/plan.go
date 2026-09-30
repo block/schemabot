@@ -1629,6 +1629,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 	slices.SortStableFunc(plans, func(a, b DeploymentPlanGroup) int {
 		return compareWorkFirst(a.Empty(), b.Empty())
 	})
+	defer budget.forTargetGroups()()
 	for _, g := range plans {
 		writeGroupHeading(sb, targetNoun, g.Members, len(drift.Deployments))
 		if g.Empty() {

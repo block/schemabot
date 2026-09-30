@@ -48,7 +48,14 @@ const ddlTruncatedMarker = "_DDL truncated to fit GitHub's comment size limit; t
 // command is labelled as a CLI command because every other schemabot command a
 // plan comment names is a PR-comment command, and this one is not.
 func planPointerMarker(planID string) string {
-	return "_DDL truncated to fit GitHub's comment size limit; the full plan is available from the CLI with " + listPlanCommand(planID) + "._\n"
+	return scopedPlanPointerMarker(planID, "")
+}
+
+// scopedPlanPointerMarker is planPointerMarker for a plan whose scope needs
+// saying, such as one target group's plan, which holds only those targets'
+// statements rather than the whole rollout's.
+func scopedPlanPointerMarker(planID, scope string) string {
+	return "_DDL truncated to fit GitHub's comment size limit; the full plan" + scope + " is available from the CLI with " + listPlanCommand(planID) + "._\n"
 }
 
 // sharedPlanPointerMarker is planPointerMarker for a section that renders one
@@ -58,12 +65,18 @@ func planPointerMarker(planID string) string {
 // the same DDL, rather than handing another environment's operator a plan that
 // reads as their own.
 func sharedPlanPointerMarker(planID string, environments []string) string {
+	return scopedSharedPlanPointerMarker(planID, environments, "")
+}
+
+// scopedSharedPlanPointerMarker is sharedPlanPointerMarker for a plan whose
+// scope needs saying (see scopedPlanPointerMarker).
+func scopedSharedPlanPointerMarker(planID string, environments []string, scope string) string {
 	named := flattenIdentifier(environments[0])
 	matching := make([]string, 0, len(environments)-1)
 	for _, env := range environments[1:] {
 		matching = append(matching, flattenIdentifier(env))
 	}
-	return "_DDL truncated to fit GitHub's comment size limit; the full " + named + " plan is available from the CLI with " + listPlanCommand(planID) +
+	return "_DDL truncated to fit GitHub's comment size limit; the full " + named + " plan" + scope + " is available from the CLI with " + listPlanCommand(planID) +
 		" (" + strings.Join(matching, " and ") + " " + runVerb(len(matching)) + " the same DDL)._\n"
 }
 
@@ -118,6 +131,11 @@ type ddlBlockBudget struct {
 	// a pointer marker in it says whose stored plan it names. Empty outside
 	// such a section.
 	sharedBy []string
+
+	// scope qualifies the plan a pointer marker names when the DDL is one
+	// target group's plan rather than the whole plan, so the reader knows
+	// the stored plan holds only those targets' statements. Empty otherwise.
+	scope string
 }
 
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
@@ -143,10 +161,23 @@ func (b *ddlBlockBudget) pointAt(planID string) (restore func()) {
 // it is when the section is shared by several environments.
 func (b *ddlBlockBudget) pointerMarker(planID string) string {
 	if len(b.sharedBy) > 1 {
-		return sharedPlanPointerMarker(planID, b.sharedBy)
+		return scopedSharedPlanPointerMarker(planID, b.sharedBy, b.scope)
 	}
-	return planPointerMarker(planID)
+	return scopedPlanPointerMarker(planID, b.scope)
 }
+
+// forTargetGroups marks the DDL rendered from here on as target groups'
+// plans, each naming a stored plan that covers only its group's targets,
+// until the returned restore runs.
+func (b *ddlBlockBudget) forTargetGroups() (restore func()) {
+	previous := b.scope
+	b.scope = targetGroupPlanScope
+	return func() { b.scope = previous }
+}
+
+// targetGroupPlanScope is how a pointer marker under a target group's DDL
+// qualifies the plan it names.
+const targetGroupPlanScope = " for these targets"
 
 // shareAcross marks the DDL rendered from here on as one section shared by
 // environments, rendered from the first one's plan, until the returned restore

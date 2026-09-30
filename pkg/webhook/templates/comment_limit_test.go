@@ -390,6 +390,45 @@ func TestMultiEnvPlanCommentSharedSectionSaysWhosePlanItNames(t *testing.T) {
 	})
 }
 
+// A shared section that renders target groups cuts each group's DDL under a
+// marker naming that group's stored plan, which holds only the group's
+// targets, so the marker says the plan is for these targets rather than
+// calling it the environment's full plan.
+func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
+	withTargets := func(env, planID, memberPlanID string) PlanCommentData {
+		plan := greenfieldPlan(env, "orders", 150)
+		plan.PlanID = planID
+		second := greenfieldPlan(env, "orders_eu", 150).Changes
+		plan.Changes[0].Keyspace, second[0].Keyspace = "orders", "orders"
+		plan.DeploymentDrift = &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/orders_1"}, Primary: true, Changes: plan.Changes},
+				{Members: []string{"primary/orders_2"}, Changes: second, PlanID: memberPlanID},
+			},
+		}
+		return plan
+	}
+	staging := withTargets("staging", "plan_staging1", "plan_staging_member_2")
+	production := withTargets("production", "plan_production1", "plan_production_member_2")
+	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "orders",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	require.Contains(t, body, "### Staging & Production")
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Contains(t, body, "the full staging plan for these targets is available from the CLI with `schemabot list-plans plan_staging_member_2` (production runs the same DDL).")
+	assert.NotContains(t, body, "the full staging plan is available")
+}
+
 // DDL cut to fit the comment comes from a stored plan, so the marker under it
 // names the command that prints that plan in full rather than sending the
 // reader to the schema files, which hold the desired schema and not the
@@ -447,9 +486,9 @@ func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
 	middle, last, found := strings.Cut(rest, "**target `primary/orders_3`**")
 	require.True(t, found, body)
 
-	assert.Contains(t, first, planPointerMarker("plan_reviewed"))
+	assert.Contains(t, first, scopedPlanPointerMarker("plan_reviewed", targetGroupPlanScope))
 	assert.NotContains(t, first, "plan_member_2")
-	assert.Contains(t, middle, planPointerMarker("plan_member_2"))
+	assert.Contains(t, middle, "the full plan for these targets is available from the CLI with `schemabot list-plans plan_member_2`.")
 	assert.NotContains(t, middle, "plan_reviewed")
 	assert.Contains(t, last, ddlTruncatedMarker)
 	assert.NotContains(t, last, "list-plans")

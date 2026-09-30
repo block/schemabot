@@ -772,12 +772,15 @@ const releasedFailureExemptionSQL = `NOT (
 // (deployment, target) pair: a deployments map gives each member its own
 // deployment, and a targets list gives each member its own target within one
 // deployment. Operations of the same member — one target's per-shard,
-// per-namespace work and its finalizers — share both columns, so they never
-// gate each other and drive in parallel. Every operation row stamps its
-// member's target at creation, and a row with no target (a single-target
-// shape) shares the empty value with its siblings, so the target half only
-// ever separates rows that name different targets. The fragment references
-// the apply_operations and earlier aliases and takes no placeholders.
+// per-namespace work and its finalizers — share both columns, so this
+// fragment never gates one on another and their copies start in parallel.
+// Their cutovers are still ordered by the cutover claim, which has no member
+// filter, and a finalizer still waits for its member's work through the
+// finalizer arm. Every operation row stamps its member's target at creation,
+// and a row with no target (a single-target shape) shares the empty value
+// with its siblings, so the target half only ever separates rows that name
+// different targets. The fragment references the apply_operations and
+// earlier aliases and takes no placeholders.
 const earlierRolloutMemberSQL = `(
 	earlier.deployment <> apply_operations.deployment
 	OR earlier.target <> apply_operations.target
@@ -1533,8 +1536,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // Two claim paths, mirroring FindNextApplyOperation:
 //
 //   - Start a parked cutover. A waiting_for_cutover row is claimed and
-//     transitioned to cutting_over only when every earlier deployment_order
-//     sibling has reached completed and no pending stop control request exists.
+//     transitioned to cutting_over only when every earlier operation of the
+//     apply has reached completed, whichever member it belongs to, and no
+//     pending stop control request exists. The gate carries no member filter,
+//     so two shards of one member cut over one after the other.
 //     Unlike the copy gate's barrier relaxation, the cutover gate's "done" set is
 //     completed-only, so the high-risk swaps never overlap and run strictly in
 //     order. The on_failure "continue" exemption lets a terminal-failed earlier

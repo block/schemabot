@@ -167,11 +167,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			require.NoError(t, err)
 			require.NotNil(t, claimed, "target %d is next in order", i+1)
 			assert.Equal(t, id, claimed.ID)
-			assert.Equal(t, fmt.Sprintf("payments-00%d", i+1), claimed.Target)
+			assert.Equal(t, fmt.Sprintf("payments-%03d", i+1), claimed.Target)
 
 			blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 			require.NoError(t, err)
-			assert.Nil(t, blocked, "no later target starts while payments-00%d is still running", i+1)
+			assert.Nil(t, blocked, "no later target starts while payments-%03d is still running", i+1)
 
 			require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, id))
 		}
@@ -247,9 +247,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "operation_target_parallel_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_operation_target_parallel", 912)
+		require.GreaterOrEqual(t, storage.DefaultMaxDriversPerApply, 2,
+			"the cutover half needs two targets parked behind the first")
 		targets := make([]string, storage.DefaultMaxDriversPerApply+1)
 		for i := range targets {
-			targets[i] = fmt.Sprintf("payments-00%d", i+1)
+			targets[i] = fmt.Sprintf("payments-%03d", i+1)
 		}
 		ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyParallel, storage.OnFailureHalt, targets...)
 
@@ -286,11 +288,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
 		require.NoError(t, err)
 		require.NotNil(t, next)
-		assert.Equal(t, ids[last], next.ID)
+		assert.Equal(t, ids[2], next.ID, "the next target in list order cuts over once the earlier one completes")
 	})
 
 	// FindNextApplyOperation_RollingKeepsOneTargetsShardsTogether verifies that
-	// ordering by member leaves one member's own work unordered. Under rolling,
+	// ordering by member leaves one member's own copy starts unordered. Under rolling,
 	// both shards of payments-001 start together, and payments-002's shards wait
 	// until both have completed.
 	t.Run("FindNextApplyOperation_RollingKeepsOneTargetsShardsTogether", func(t *testing.T) {
@@ -490,6 +492,72 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, pauseParked)
 		require.NoError(t, err)
 		assert.Nil(t, blocker, "a release lets the cutover proceed past the failed deployment")
+	})
+
+	// FindNextApplyOperation_BarrierCutsOverOneTargetsShardsOneAtATime verifies
+	// what stays ordered inside one rollout member. Under barrier, both shards of
+	// payments-001 start their copies together, but they cut over one at a time:
+	// shard 80- parks behind shard -80 even though both belong to the same
+	// target. The target's finalizer waits until both shards have completed.
+	t.Run("FindNextApplyOperation_BarrierCutsOverOneTargetsShardsOneAtATime", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_target_shard_cutover_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_target_shard_cutover", 914)
+		const target = "payments-001"
+		var shardIDs []int64
+		for _, shard := range []string{"-80", "80-"} {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+				OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shard, "orders")),
+				OperationKind: storage.ApplyOperationKindWork,
+				CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+			shardIDs = append(shardIDs, id)
+		}
+		finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+			OperationKey:  storage.TargetOperationKey(target, "orders/group_finalizer"),
+			OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+		})
+		require.NoError(t, err)
+
+		for _, want := range shardIDs {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "one target's shards start their copies together")
+			assert.Equal(t, want, claimed.ID)
+		}
+		for _, id := range shardIDs {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.WaitingForCutover))
+		}
+
+		first, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, first)
+		assert.Equal(t, shardIDs[0], first.ID, "shard -80 cuts over first")
+
+		held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, held, "shard 80- does not cut over while shard -80 of the same target is mid-cutover")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[0]))
+		finalizerEarly, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, finalizerEarly, "the finalizer waits while shard 80- has not completed")
+
+		second, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, second)
+		assert.Equal(t, shardIDs[1], second.ID, "shard 80- cuts over once shard -80 completes")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[1]))
+		finalizer, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, finalizer, "the finalizer starts once all of its target's work has completed")
+		assert.Equal(t, finalizerID, finalizer.ID)
 	})
 
 	// FindNextApplyOperation_CapsDriversPerApply verifies that one wide fan-out
