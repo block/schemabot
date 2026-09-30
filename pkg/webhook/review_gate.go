@@ -38,7 +38,7 @@ type ReviewGateResult struct {
 // evaluation-failure comment on durable attempts, where the driver retries
 // and posts the single terminal answer instead; merit blocks always comment.
 func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
-	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath)
+	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath, schemaResult.SchemaLinkPath)
 	if err != nil {
 		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
 			"database", schemaResult.Database, "environment", environment,
@@ -78,8 +78,14 @@ func reviewGateErrorDetail(err error) string {
 // Returns nil if review gating is disabled (apply proceeds).
 // Returns a result with Approved=true if gate passes.
 // Returns a result with Approved=false if gate blocks.
-// schemaPath is the repo-relative path to the database's schema directory (e.g. "schema/payments").
-func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, schemaPath string) (*ReviewGateResult, error) {
+// schemaPath is the repo-relative path to the database's schema directory (e.g. "schema/payments");
+// schemaLinkPath is the logical environment path when schemaPath was resolved
+// through a symlink, or empty.
+//
+// An approval counts only for the schema it reviewed: it must have been given
+// on the PR's head commit, or on an earlier commit from which no schema input
+// changed on the way to the head (see approvalCoversHead).
+func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, schemaPath, schemaLinkPath string) (*ReviewGateResult, error) {
 	if !h.isReviewGateEnabled(repo) {
 		return nil, nil
 	}
@@ -102,27 +108,47 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		return nil, fmt.Errorf("review policy has no configured reviewers for database %q", database)
 	}
 
-	approvedReviewers := ghclient.GetApprovedReviewers(reviews)
+	approvals := ghclient.GetApprovedReviews(reviews)
 	h.logger.Info("review gate: fetched reviews",
 		"repo", repo, "pr", pr, "database", database,
-		"approved_by", approvedReviewers, "pr_author", prInfo.User)
+		"approved_by", ghclient.GetApprovedReviewers(reviews), "pr_author", prInfo.User,
+		"head_sha", prInfo.HeadSHA)
 
+	var validApprovals []*ghclient.ReviewInfo
 	var validApprovers []string
-	for _, reviewer := range approvedReviewers {
-		if !strings.EqualFold(reviewer, prInfo.User) {
-			validApprovers = append(validApprovers, reviewer)
+	for _, approval := range approvals {
+		if !strings.EqualFold(approval.User, prInfo.User) {
+			validApprovals = append(validApprovals, approval)
+			validApprovers = append(validApprovers, approval.User)
 		}
 	}
 
-	for _, reviewer := range validApprovers {
+	coverage := approvalCoverage{
+		repo:        repo,
+		pr:          pr,
+		database:    database,
+		headSHA:     prInfo.HeadSHA,
+		schemaPaths: reviewGateSchemaPaths(schemaPath, schemaLinkPath),
+		verdicts:    make(map[string]bool),
+	}
+	var staleApprovers []string
+	for _, approval := range validApprovals {
+		reviewer := approval.User
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
 		if err != nil {
 			return nil, err
+		}
+		// A matching reviewer whose approval does not cover the head is treated
+		// like a reviewer who has not approved.
+		if matched && !h.approvalCoversHead(ctx, client, &coverage, approval) {
+			staleApprovers = append(staleApprovers, reviewer)
+			continue
 		}
 		if matched {
 			h.logger.Info("review gate: approved",
 				"repo", repo, "pr", pr, "database", database,
 				"approved_by", reviewer, "matched_principal", principal,
+				"approved_sha", approval.CommitID, "head_sha", prInfo.HeadSHA,
 				"operator_reviewers", policy.OperatorReviewers,
 				"other_reviewers", policy.OtherReviewers)
 			return &ReviewGateResult{
@@ -137,6 +163,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 	h.logger.Info("review gate: blocked",
 		"repo", repo, "pr", pr, "database", database,
 		"valid_approvers", validApprovers,
+		"stale_approvers", staleApprovers, "head_sha", prInfo.HeadSHA,
 		"operator_reviewers", policy.OperatorReviewers,
 		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
@@ -145,6 +172,100 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		OtherReviewers:    policy.OtherReviewers,
 		PRAuthor:          prInfo.User,
 	}, nil
+}
+
+// approvalCoverage holds the PR head an approval must cover and caches the
+// verdict per approved commit, so reviewers who approved the same commit share
+// one comparison.
+type approvalCoverage struct {
+	repo        string
+	pr          int
+	database    string
+	headSHA     string
+	schemaPaths []string
+	verdicts    map[string]bool
+}
+
+// approvalCoversHead reports whether an approval still stands for the PR head.
+// An approval on the head commit covers it. An approval on an earlier commit
+// covers it only when GitHub proves the head descends from that commit and no
+// schema input — a schema or config file anywhere, or any file under the
+// database's schema paths — changed in between. Anything that prevents that
+// proof (an unknown commit, a compare error, history rewritten by a
+// force-push, a truncated file list) leaves the approval not counting.
+func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) bool {
+	approvedSHA := approval.CommitID
+	if c.headSHA == "" || approvedSHA == "" {
+		h.logger.Warn("review gate: approval does not count because its commit or the PR head is unknown",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approvedSHA, "head_sha", c.headSHA)
+		return false
+	}
+	if approvedSHA == c.headSHA {
+		return true
+	}
+	if covers, ok := c.verdicts[approvedSHA]; ok {
+		return covers
+	}
+	covers := h.schemaUnchangedSince(ctx, client, c, approval)
+	c.verdicts[approvedSHA] = covers
+	return covers
+}
+
+func (h *Handler) schemaUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) bool {
+	files, err := client.FetchChangedFilesBetween(ctx, c.repo, approval.CommitID, c.headSHA)
+	if err != nil {
+		h.logger.Warn("review gate: approval on an earlier commit does not count because the schema inputs since it could not be compared",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "error", err)
+		return false
+	}
+	if ghclient.HasSchemaInputFiles(files) || anyFileUnderPaths(files, c.schemaPaths) {
+		h.logger.Info("review gate: approval on an earlier commit does not count because schema inputs changed since it",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA)
+		return false
+	}
+	h.logger.Info("review gate: approval on an earlier commit counts because no schema input changed since it",
+		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+		"approved_sha", approval.CommitID, "head_sha", c.headSHA)
+	return true
+}
+
+// reviewGateSchemaPaths lists the schema paths the gate protects, the same
+// paths the base schema freshness guard compares.
+func reviewGateSchemaPaths(schemaPath, schemaLinkPath string) []string {
+	var paths []string
+	for _, p := range []string{schemaPath, schemaLinkPath} {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// anyFileUnderPaths reports whether a changed file, or the path it was renamed
+// from, is one of paths or lies beneath one. A root path covers every file.
+func anyFileUnderPaths(files []ghclient.PRFile, paths []string) bool {
+	for _, f := range files {
+		for _, p := range paths {
+			if pathWithin(f.Filename, p) || pathWithin(f.PreviousFilename, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pathWithin(file, dir string) bool {
+	if file == "" {
+		return false
+	}
+	dir = strings.TrimSuffix(dir, "/")
+	if dir == "" || dir == "." {
+		return true
+	}
+	return file == dir || strings.HasPrefix(file, dir+"/")
 }
 
 type reviewGatePolicy struct {

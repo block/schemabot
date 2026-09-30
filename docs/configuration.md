@@ -1489,7 +1489,9 @@ CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review 
 
 The base branch is used, not the PR's head branch, to prevent a PR from relaxing its own approval requirements by modifying CODEOWNERS.
 
-Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. If a PR is force-pushed after approval, GitHub may dismiss approvals; `apply-confirm` re-checks the gate and blocks if the approval no longer satisfies the policy. Team membership and CODEOWNERS are evaluated fresh at each gate check.
+Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. Team membership and CODEOWNERS are evaluated fresh at each gate check.
+
+An approval counts only for the schema it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit when GitHub shows the head descends from it and no schema input changed in between: no `.sql`, `vschema.json`, or `schemabot.yaml` file anywhere in the repository, and no file under the database's schema directory. If that cannot be shown (the comparison fails, a force-push rewrote the approved commit out of the branch's history, or GitHub truncates the list of changed files), the approval does not count and the reviewer must approve the current head. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 
 ## Authentication
 
