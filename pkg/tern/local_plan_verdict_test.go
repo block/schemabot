@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -191,7 +192,7 @@ func TestReplannedChangesRecordBlockedWins(t *testing.T) {
 // shard is deduped out of the namespace-level tables but survives on the shard
 // plan, which is what the admission gate reads.
 func TestBlockedVerdictSurvivesShardedDedupe(t *testing.T) {
-	client := &LocalClient{}
+	client := &LocalClient{logger: slog.New(slog.DiscardHandler)}
 	changes := []engine.SchemaChange{
 		{Namespace: "ks", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{
 			{Table: "users", DDL: "ALTER TABLE users ADD COLUMN email text", Operation: ddl.StatementAlterTable},

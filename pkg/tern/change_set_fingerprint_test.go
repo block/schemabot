@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -86,6 +87,29 @@ func TestChangeSetFingerprint_VSchemaChangeSplitsAGroup(t *testing.T) {
 	}}}
 
 	assert.NotEqual(t, fingerprint(t, plain), fingerprint(t, withVSchema))
+}
+
+// A requested finalize carries no table DDL, and the comparison reports one
+// member finalizing a namespace the other does not as drift. The key has to
+// split them too, and keep a finalize apart from a vschema change on the same
+// namespace, so grouping never merges members the comparison would not.
+func TestChangeSetFingerprint_FinalizeRequestSplitsAGroup(t *testing.T) {
+	change := func(metadata map[string]string) ChangeSet {
+		return ChangeSet{Changes: []*ternv1.SchemaChange{{
+			Namespace:    "testapp",
+			TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()},
+			Metadata:     metadata,
+		}}}
+	}
+	plain := change(nil)
+	finalize := change(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"})
+	vschema := change(map[string]string{"vschema_changed": "true"})
+
+	assert.NotEqual(t, fingerprint(t, plain), fingerprint(t, finalize))
+	assert.NotEqual(t, fingerprint(t, vschema), fingerprint(t, finalize))
+	diff, err := CompareChangeSets(schema.DialectMySQL, plain, finalize)
+	require.NoError(t, err)
+	assert.False(t, diff.Empty(), "the comparison and the key agree that these differ")
 }
 
 // The key joins fields that can each hold anything a schema author wrote, so it

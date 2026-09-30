@@ -1,12 +1,242 @@
 package ddl
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/schema"
 )
+
+func TestFormatSchemaFileForDialect(t *testing.T) {
+	tests := []struct {
+		name     string
+		dialect  schema.Dialect
+		input    string
+		expected string
+	}{
+		{
+			name:     "single-column MySQL table",
+			dialect:  schema.DialectMySQL,
+			input:    "CREATE TABLE `users` (`id` BIGINT NOT NULL)",
+			expected: "CREATE TABLE `users` (\n    `id` bigint NOT NULL\n);\n",
+		},
+		{
+			name:     "quoted MySQL content",
+			dialect:  schema.DialectMySQL,
+			input:    "CREATE TABLE `events` (`id` INT, `note` VARCHAR(64) DEFAULT 'Keep INT, comma')",
+			expected: "CREATE TABLE `events` (\n    `id` int,\n    `note` varchar(64) DEFAULT 'Keep INT, comma'\n);\n",
+		},
+		{
+			name:     "single-column PostgreSQL table",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE users (id bigint PRIMARY KEY)",
+			expected: "CREATE TABLE users (\n    id bigint PRIMARY KEY\n);\n",
+		},
+		{
+			name:     "existing multiline SQL is preserved",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE \"Order\" (\n  \"id\" bigint PRIMARY KEY\n);\nCREATE INDEX \"idx_id\" ON \"Order\" (\"id\");\n\n",
+			expected: "CREATE TABLE \"Order\" (\n  \"id\" bigint PRIMARY KEY\n);\nCREATE INDEX \"idx_id\" ON \"Order\" (\"id\");\n",
+		},
+		{
+			name:    "PostgreSQL table and indexes",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE TABLE users (id bigint PRIMARY KEY); CREATE INDEX users_id_idx ON users (id)",
+			expected: "CREATE TABLE users (\n    id bigint PRIMARY KEY\n);\n\n" +
+				"CREATE INDEX users_id_idx ON users USING btree (id);\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(tt.dialect, tt.input)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, got)
+			assert.Contains(t, strings.TrimSuffix(got, "\n"), "\n")
+
+			parser, err := ParserForDialect(tt.dialect)
+			require.NoError(t, err)
+			before, err := ParseCreateSet(parser, tt.input)
+			require.NoError(t, err)
+			after, err := ParseCreateSet(parser, got)
+			require.NoError(t, err)
+			require.Len(t, after.Statements, len(before.Statements))
+			for i := range before.Statements {
+				assert.Equal(t, parser.Canonicalize(before.Statements[i]), parser.Canonicalize(after.Statements[i]))
+			}
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectRejectsNonTableContent(t *testing.T) {
+	_, err := FormatSchemaFileForDialect(schema.DialectMySQL, "ALTER TABLE users ADD COLUMN email text")
+	require.ErrorContains(t, err, "must start with CREATE TABLE")
+
+	_, err = FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE")
+	require.ErrorContains(t, err, "parse declarative schema file")
+}
+
+func TestFormatSchemaFileForDialectRequiresMultilineTable(t *testing.T) {
+	// UNLOGGED tables pass desired-schema admission but have no multiline
+	// layout. An index separator cannot satisfy the table's layout contract.
+	for _, suffix := range []string{"", "; CREATE INDEX t_id ON t (id)"} {
+		t.Run(suffix, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectPostgres, "CREATE UNLOGGED TABLE t (id bigint)"+suffix)
+			require.EqualError(t, err, "formatter produced a single-line CREATE TABLE")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPostgresRequiresTable(t *testing.T) {
+	for _, input := range []string{
+		"CREATE INDEX t_id ON t (id)",
+		"ALTER TABLE t ENABLE ROW LEVEL SECURITY; CREATE POLICY readers ON t USING (true)",
+	} {
+		t.Run(input, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+			require.ErrorContains(t, err, "parse declarative schema file")
+			require.ErrorContains(t, err, "CREATE TABLE")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPostgresOrdersTableFirst(t *testing.T) {
+	for _, suffix := range []string{"", "; ALTER TABLE t ENABLE ROW LEVEL SECURITY; CREATE POLICY readers ON t USING (true)"} {
+		t.Run(suffix, func(t *testing.T) {
+			input := "CREATE INDEX t_id ON t (id); CREATE TABLE t (id bigint)" + suffix
+			got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+			require.NoError(t, err)
+			assert.True(t, strings.HasPrefix(got, "CREATE TABLE t (\n    id bigint\n);\n\nCREATE INDEX t_id ON t USING btree (id);\n"), got)
+			before, err := postgresSchemaFileStatements(input)
+			require.NoError(t, err)
+			after, err := postgresSchemaFileStatements(got)
+			require.NoError(t, err)
+			assert.Equal(t, before, after)
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectRefusesCommentLoss(t *testing.T) {
+	for _, input := range []string{
+		"CREATE TABLE t (id int /* keep me */)",
+		"CREATE TABLE t (id int) /* keep me */",
+		"CREATE TABLE t (id int); -- keep me",
+		"CREATE TABLE t (id int); # keep me",
+		"CREATE TABLE t (id int); --",
+		"CREATE TABLE t (id int); --\tkeep me",
+		"CREATE TABLE t (id int); --\xA0keep me",
+		"CREATE TABLE t (id int) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */",
+		"CREATE TABLE t (id int) /*+ keep me */",
+		`CREATE TABLE t (note varchar(64) DEFAULT 'escaped\' quote') /* keep me */`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+			require.ErrorContains(t, err, "comments")
+			assert.Empty(t, got)
+		})
+	}
+
+	got, err := FormatSchemaFileForDialect(schema.DialectPostgres, "CREATE TABLE t (id bigint PRIMARY KEY /* keep me */)")
+	require.ErrorContains(t, err, "format PostgreSQL declarative schema file")
+	assert.Empty(t, got)
+}
+
+func TestFormatSchemaFileForDialectPreservesMySQLQuotedCommentMarkers(t *testing.T) {
+	for _, input := range []string{
+		"CREATE TABLE `/* -- # */` (`id` int) COMMENT='/* -- # */'",
+		`CREATE TABLE t (note varchar(64) DEFAULT 'it''s /* -- # */')`,
+		`CREATE TABLE t (note varchar(64) DEFAULT 'it\'s /* -- # */')`,
+		`CREATE TABLE t (note varchar(64) DEFAULT "it's /* -- # */")`,
+		"CREATE TABLE `a``/* -- # */` (`id` int)",
+		"CREATE TABLE t (id int DEFAULT (1--2))",
+		`CREATE TABLE t (note varchar(64) DEFAULT 'path\\') COMMENT='/* keep me */'`,
+		"CREATE TABLE t (id int) COMMENT='/* TableOptionStatsPersistent is not supported */'",
+	} {
+		t.Run(input, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+			require.NoError(t, err)
+			assert.Contains(t, strings.TrimSuffix(got, "\n"), "\n")
+			assert.Equal(t, Canonicalize(input), Canonicalize(got))
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
+	for _, option := range []string{
+		"ENCRYPTION = 'Y'",
+		"MAX_ROWS = 1000",
+		"STATS_SAMPLE_PAGES = 32",
+		"SECONDARY_ENGINE = NULL",
+		"CHECKSUM = 1",
+		"DELAY_KEY_WRITE = 1",
+		"MIN_ROWS = 10",
+		"STATS_AUTO_RECALC = 0",
+	} {
+		t.Run(option, func(t *testing.T) {
+			input := "CREATE TABLE t (id int) ENGINE=InnoDB " + option + " COMMENT='Keep INT, comma' PARTITION BY HASH (id) PARTITIONS 4"
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+			require.NoError(t, err)
+			assert.Contains(t, got, "\n    `id` int\n)")
+			assert.Contains(t, got, option)
+			assert.Contains(t, got, "COMMENT = 'Keep INT, comma'")
+			assert.Contains(t, got, "PARTITION BY HASH")
+			assert.Equal(t, Canonicalize(input), Canonicalize(got))
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectRefusesLossyMySQLCanonicalization(t *testing.T) {
+	for _, option := range []string{"STATS_PERSISTENT=0", "STATS_PERSISTENT=1", "PACK_KEYS=0", "PACK_KEYS=1"} {
+		t.Run(option, func(t *testing.T) {
+			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE t (id int) ENGINE=InnoDB "+option)
+			require.ErrorContains(t, err, "canonical SQL contains comments")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestFormatSchemaFileForDialectPreservesMultilineMySQL(t *testing.T) {
+	input := "CREATE TABLE t (\n  id int /* keep me */\n) ENGINE=InnoDB STATS_PERSISTENT=0 PACK_KEYS=1\n/*!50100 PARTITION BY HASH (id) PARTITIONS 4 */;\n"
+	got, err := FormatSchemaFileForDialect(schema.DialectMySQL, input)
+	require.NoError(t, err)
+	assert.Equal(t, input, got)
+}
+
+func TestFormatSchemaFileForDialectRefusesUnformattableTable(t *testing.T) {
+	got, err := FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE t LIKE other_table")
+	require.Error(t, err)
+	assert.Empty(t, got)
+}
+
+func TestFormatSchemaFileForDialectPreservesPostgresRowSecurity(t *testing.T) {
+	input := "CREATE TABLE documents (\n  id bigint PRIMARY KEY\n);\nALTER TABLE documents ENABLE ROW LEVEL SECURITY;\nCREATE POLICY readers ON documents FOR SELECT USING (id = 1);\nCOMMENT ON POLICY readers ON documents IS 'Read your documents';\n\n"
+
+	got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+	require.NoError(t, err)
+	assert.Equal(t, strings.TrimRight(input, "\r\n")+"\n", got)
+}
+
+func TestFormatSchemaFileForDialectFormatsSingleLinePostgresRowSecurity(t *testing.T) {
+	input := "CREATE TABLE documents (id bigint PRIMARY KEY); ALTER TABLE documents ENABLE ROW LEVEL SECURITY; CREATE POLICY readers ON documents FOR SELECT USING (id = 1); COMMENT ON POLICY readers ON documents IS 'Read your documents'"
+
+	got, err := FormatSchemaFileForDialect(schema.DialectPostgres, input)
+	require.NoError(t, err)
+	assert.Contains(t, strings.TrimSuffix(got, "\n"), "\n")
+	assert.Contains(t, got, "ALTER TABLE documents ENABLE ROW LEVEL SECURITY;")
+	assert.Contains(t, got, "CREATE POLICY readers ON documents")
+	assert.Contains(t, got, "COMMENT ON POLICY readers ON documents")
+
+	before, err := postgresSchemaFileStatements(input)
+	require.NoError(t, err)
+	after, err := postgresSchemaFileStatements(got)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
 
 func TestFormatDDL(t *testing.T) {
 	tests := []struct {
@@ -82,12 +312,15 @@ func TestFormatDDL(t *testing.T) {
 				");",
 		},
 		{
-			// A literal holding a backslash character canonicalizes to a form
-			// the parser reads back differently, so the round-trip guard keeps
-			// the raw input. Display only; the applied DDL is never this string.
-			name:     "literal containing a backslash character falls back to the raw input",
-			input:    "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c')",
-			expected: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c');",
+			// A literal holding a backslash character keeps its escape in the
+			// canonical form, so the parser reads the same value back and the
+			// statement formats with the comma still inside the literal.
+			name:  "literal containing a backslash character keeps its escape and formats",
+			input: "CREATE TABLE t (id int, note varchar(10) DEFAULT 'a\\\\b, c')",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` int,\n" +
+				"    `note` varchar(10) DEFAULT 'a\\\\b, c'\n" +
+				");",
 		},
 		{
 			name:  "CREATE TABLE with indexes formatted",

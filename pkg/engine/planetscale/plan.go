@@ -3,6 +3,8 @@ package planetscale
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -299,10 +301,14 @@ func (e *Engine) withholdIgnoredTables(ignored engine.IgnoredTables, req *engine
 
 // parseDesiredSchemas parses CREATE TABLE statements from schema files in a namespace,
 // returning table schemas suitable for diffing against current state. Skips vschema.json
-// and non-.sql files.
+// and non-.sql files. A keyspace is diffed as one set, so a table two schema
+// files declare is refused; files are read in sorted order so the refusal names
+// the same pair on every run.
 func parseDesiredSchemas(keyspace string, ns *schema.Namespace) ([]table.TableSchema, error) {
 	var schemas []table.TableSchema
-	for filename, content := range ns.Files {
+	var declared ddl.TableDeclarations
+	for _, filename := range slices.Sorted(maps.Keys(ns.Files)) {
+		content := ns.Files[filename]
 		if filename == "vschema.json" || !strings.HasSuffix(filename, ".sql") {
 			continue
 		}
@@ -317,6 +323,9 @@ func parseDesiredSchemas(keyspace string, ns *schema.Namespace) ([]table.TableSc
 			}
 			if err := ddl.ValidateCreateTable(ct); err != nil {
 				return nil, fmt.Errorf("SQL usage error in keyspace %s/%s: %w", keyspace, filename, err)
+			}
+			if err := declared.Declare(keyspace+"/"+filename, ct.TableName); err != nil {
+				return nil, err
 			}
 			schemas = append(schemas, table.TableSchema{
 				Name:   ct.TableName,

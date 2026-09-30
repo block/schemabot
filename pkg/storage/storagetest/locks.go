@@ -519,6 +519,61 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Nil(t, stored)
 	})
 
+	t.Run("AcquireIfPendingPlanID", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lockPinned := func(pendingPlanID string) *storage.Lock {
+			return &storage.Lock{
+				DatabaseName:  "plan_acquire_db",
+				DatabaseType:  storage.DatabaseTypeMySQL,
+				Repository:    "org/repo",
+				PullRequest:   123,
+				Owner:         "owner-a",
+				PendingPlanID: pendingPlanID,
+			}
+		}
+		storedPin := func() string {
+			stored, err := store.Locks().Get(ctx, "plan_acquire_db", storage.DatabaseTypeMySQL)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			return stored.PendingPlanID
+		}
+
+		// A caller that observed a pin finds no lock: the intent it planned
+		// against was released, so it must not claim the key as if unheld.
+		err := store.Locks().AcquireIfPendingPlanID(ctx, lockPinned("plan-1"), "plan-stale")
+		require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+		stored, err := store.Locks().Get(ctx, "plan_acquire_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Nil(t, stored, "a refused acquire must not create the lock")
+
+		// A caller that observed no lock claims a free key.
+		require.NoError(t, store.Locks().AcquireIfPendingPlanID(ctx, lockPinned("plan-1"), ""))
+		assert.Equal(t, "plan-1", storedPin())
+
+		// The same owner pinned a newer intent since the caller looked: the
+		// acquire is refused and that pin stays.
+		err = store.Locks().AcquireIfPendingPlanID(ctx, lockPinned("plan-2"), "")
+		require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+		assert.Equal(t, "plan-1", storedPin(), "a refused acquire must leave the newer pin in place")
+
+		err = store.Locks().AcquireIfPendingPlanID(ctx, lockPinned("plan-2"), "plan-stale")
+		require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+		assert.Equal(t, "plan-1", storedPin())
+
+		// The caller observed the pin the lock still carries: it replaces it.
+		require.NoError(t, store.Locks().AcquireIfPendingPlanID(ctx, lockPinned("plan-2"), "plan-1"))
+		assert.Equal(t, "plan-2", storedPin())
+
+		// Another owner's lock is a held lock, whatever pin was observed.
+		other := lockPinned("plan-3")
+		other.Owner = "owner-b"
+		require.ErrorIs(t, store.Locks().AcquireIfPendingPlanID(ctx, other, "plan-2"), storage.ErrLockHeld)
+		require.ErrorIs(t, store.Locks().AcquireIfPendingPlanID(ctx, other, ""), storage.ErrLockHeld)
+		assert.Equal(t, "plan-2", storedPin())
+	})
+
 	t.Run("ForceRelease", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

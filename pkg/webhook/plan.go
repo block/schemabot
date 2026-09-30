@@ -229,7 +229,9 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 }
 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
-// When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
+// When isAutoPlan is true and there is genuinely nothing to show, the comment is skipped to reduce
+// PR noise — which is narrower than "no environment has changes": a rollout still converging plans
+// no changes for the target that was reviewed and is not a no-op for the fleet.
 // commentID is the command comment to acknowledge once discovery commits this
 // deployment to acting; auto-plans pass zero (no comment to acknowledge).
 // commandScopeDatabases is how many databases a bare command offered by this
@@ -918,6 +920,18 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 	return discarded, adopted, running
 }
 
+// setNamespaceWork records on a keyspace's comment data the namespace-level
+// work the engine planned beside its DDL: a VSchema change to show, with its
+// rendered diff, and a finalize. The plan and rollback comments both read it
+// through here so they describe the same plan the same way.
+func setNamespaceWork(ks *templates.KeyspaceChangeData, sc *apitypes.SchemaChangeResponse) {
+	if sc.ShowsVSchemaChange() {
+		ks.VSchemaChanged = true
+		ks.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
+	}
+	ks.Finalize = sc.NeedsFinalizer()
+}
+
 // planCommentDatabaseFlag returns the database a plan comment's copy-paste
 // commands name, empty when they are to stay unscoped.
 //
@@ -1012,11 +1026,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
 		}
-		// Extract VSchema changes from metadata
-		if sc.HasVSchemaChange() {
-			ksData.VSchemaChanged = true
-			ksData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
-		}
+		setNamespaceWork(&ksData, sc)
 		data.Changes = append(data.Changes, ksData)
 	}
 
@@ -1104,6 +1114,8 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 		}
 	}
+
+	data.AllChangesDirect = planResp.AllChangesDirect()
 
 	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 

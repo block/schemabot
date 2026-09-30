@@ -172,6 +172,14 @@ func TestPlanResponse_HasChanges(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "finalize request only",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
+				Namespace: "payments",
+				Metadata:  map[string]string{NeedsFinalizerMetadataKey: "true"},
+			}}},
+			want: true,
+		},
+		{
 			name: "table changes and vschema",
 			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
 				Namespace:    "boardgames_sharded",
@@ -264,7 +272,7 @@ func TestPlanResponse_DirectChanges(t *testing.T) {
 		Changes: []*SchemaChangeResponse{{
 			Namespace: "testdb",
 			TableChanges: []*TableChangeResponse{
-				{TableName: "users", ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows"},
+				{TableName: "users", ExecutionMode: "direct", ModeReason: "the table has ~40 rows"},
 				{TableName: "orders"},
 				{TableName: "items", ExecutionMode: "blocked"},
 			},
@@ -287,7 +295,7 @@ func TestPlanResponse_DirectChanges(t *testing.T) {
 
 // AllChangesDirect holds only when the plan has at least one table change and
 // every one carries the direct verdict — a mixed or empty plan still has
-// engine-driven work, and a VSchema change is never direct.
+// engine-driven work, and neither a VSchema change nor a finalize is direct.
 func TestPlanResponse_AllChangesDirect(t *testing.T) {
 	direct := func(table string) *TableChangeResponse {
 		return &TableChangeResponse{TableName: table, ExecutionMode: "direct"}
@@ -329,6 +337,17 @@ func TestPlanResponse_AllChangesDirect(t *testing.T) {
 					Namespace:    "testdb",
 					TableChanges: []*TableChangeResponse{direct("users")},
 					Metadata:     map[string]string{"vschema": "{}"},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "finalize request alongside a direct change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace:    "testdb",
+					TableChanges: []*TableChangeResponse{direct("users")},
+					Metadata:     map[string]string{NeedsFinalizerMetadataKey: "true"},
 				}},
 			},
 			want: false,

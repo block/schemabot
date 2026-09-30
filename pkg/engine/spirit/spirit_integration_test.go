@@ -5,6 +5,7 @@ package spirit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -23,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -612,6 +614,67 @@ func TestEngine_Plan_NoChanges(t *testing.T) {
 	assert.True(t, result.NoChanges, "expected NoChanges, got DDL: %v", result.FlatDDL())
 }
 
+// The live database has `orders (id, status)`. Two schema files both declare
+// `orders`: orders.sql matches the live table and orders_extras.sql replaces
+// `status` with `note`. The differ keeps one definition per table, so planning
+// either one would silently discard the other and could drop `status`. The
+// plan is refused with an error naming the table and both files, on every
+// run, and the same holds when the two files sit in different namespaces,
+// since every namespace is diffed against the one database together.
+func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create table")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	liveOrders := `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	withNote := `CREATE TABLE orders (
+		id INT NOT NULL,
+		note VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+
+	t.Run("two files in one namespace", func(t *testing.T) {
+		// Map iteration order varies between runs, so plan repeatedly: every
+		// run must refuse with the same, fully named error.
+		for range 10 {
+			result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database: "testdb",
+				SchemaFiles: testSchemaFiles(map[string]string{
+					"orders.sql":        liveOrders,
+					"orders_extras.sql": withNote,
+				}),
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.EqualError(t, err, `table "orders" is declared by both schema files "testdb/orders.sql" and "testdb/orders_extras.sql". Declare each table in exactly one schema file`)
+			assert.Nil(t, result)
+		}
+	})
+
+	t.Run("two files in different namespaces", func(t *testing.T) {
+		result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+			Database: "testdb",
+			SchemaFiles: schema.SchemaFiles{
+				"billing": &schema.Namespace{Files: map[string]string{"orders.sql": withNote}},
+				"testdb":  &schema.Namespace{Files: map[string]string{"orders.sql": liveOrders}},
+			},
+			Credentials: &engine.Credentials{DSN: dsn},
+		})
+		require.EqualError(t, err, `table "orders" is declared by both schema files "billing/orders.sql" and "testdb/orders.sql". Declare each table in exactly one schema file`)
+		assert.Nil(t, result)
+	})
+}
+
 func TestEngine_Plan_NewTable(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 
@@ -647,6 +710,38 @@ func TestEngine_Plan_NewTable(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected CREATE TABLE statement, got: %v", result.FlatDDL())
+}
+
+// One schema file declares two tables against an empty database. The plan
+// creates both of them, each from its own statement, so a multi-table file
+// plans every table it declares rather than only the first.
+func TestEngine_Plan_MultipleTablesInOneFile(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db) // Start with clean database
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"tables.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`));\n" +
+				"CREATE TABLE `events` (`id` bigint NOT NULL, PRIMARY KEY (`id`));\n",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges)
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 2, "DDL: %v", result.FlatDDL())
+	planned := make(map[string]string, len(changes))
+	for _, tc := range changes {
+		assert.Equal(t, ddl.StatementCreateTable, tc.Operation, "DDL: %s", tc.DDL)
+		planned[tc.Table] = tc.DDL
+	}
+	assert.Contains(t, planned["orders"], "CREATE TABLE `orders`")
+	assert.Contains(t, planned["events"], "CREATE TABLE `events`")
 }
 
 func TestEngine_Plan_LintViolationMapping(t *testing.T) {
@@ -2296,4 +2391,235 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
 	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
 	assert.True(t, m.EnableExperimentalLocklessChecksum, "the lockless checksum override enables it")
+}
+
+// A plan that touches existing tables reports each table's approximate row
+// count, so the plan comment can show the scale of what the change touches.
+// Estimates are display-only and best-effort: a table being created does not
+// exist yet and gets none.
+func TestEngine_Plan_TableRowEstimates(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `sized_items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `name` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create table")
+
+	// Seed rows and refresh statistics so information_schema reports a
+	// meaningful estimate.
+	var values strings.Builder
+	for i := range 1200 {
+		if i > 0 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "('name-%d')", i)
+	}
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `sized_items` (`name`) VALUES "+values.String())
+	require.NoError(t, err, "seed rows")
+	_, err = db.ExecContext(t.Context(), "ANALYZE TABLE `sized_items`")
+	require.NoError(t, err, "analyze table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"sized_items.sql": "CREATE TABLE `sized_items` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  `name` varchar(255) NOT NULL,\n" +
+				"  `quantity` int DEFAULT NULL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			"sized_gadgets.sql": "CREATE TABLE `sized_gadgets` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges)
+
+	byTable := make(map[string]engine.TableChange)
+	for _, tc := range result.FlatTableChanges() {
+		byTable[tc.Table] = tc
+	}
+
+	altered, ok := byTable["sized_items"]
+	require.True(t, ok, "expected an ALTER for sized_items, got: %v", result.FlatDDL())
+	require.NotNil(t, altered.EstimatedRows, "an existing table carries a row estimate")
+	// TABLE_ROWS is an estimate; allow statistics slop around the seeded count.
+	assert.InDelta(t, 1200, float64(*altered.EstimatedRows), 300)
+	require.NotNil(t, altered.EstimatedBytes, "an existing table carries a byte estimate")
+	assert.Positive(t, *altered.EstimatedBytes, "data plus index bytes of a seeded table")
+	assert.Zero(t, altered.ShardCount, "a single MySQL target is not sharded")
+	assert.Nil(t, altered.LargestShardRows)
+
+	created, ok := byTable["sized_gadgets"]
+	require.True(t, ok, "expected a CREATE for sized_gadgets, got: %v", result.FlatDDL())
+	assert.Nil(t, created.EstimatedRows, "a table being created has no estimate")
+	assert.Nil(t, created.EstimatedBytes, "a table being created has no byte estimate")
+}
+
+// planSizeProbeFixture creates one table and returns the engine, DSN, and schema
+// files for a plan that alters it, so a test can fault the size probe.
+func planSizeProbeFixture(t *testing.T) (*Engine, string, schema.SchemaFiles) {
+	t.Helper()
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `probed_items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create table")
+	files := testSchemaFiles(map[string]string{
+		"probed_items.sql": "CREATE TABLE `probed_items` (\n" +
+			"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+			"  `label` varchar(64) DEFAULT NULL,\n" +
+			"  PRIMARY KEY (`id`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	})
+	return New(Config{}), dsn, files
+}
+
+// Table sizes are display-only plan context, so a size probe that fails still
+// yields the full plan: the ALTER is planned and simply carries no size.
+func TestEngine_Plan_SizeProbeFailureStillPlans(t *testing.T) {
+	eng, dsn, files := planSizeProbeFixture(t)
+	eng.sizeProbeFault = func(context.Context) error {
+		return errors.New("statistics unreadable")
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: files,
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "a failed size probe must not fail the plan")
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "probed_items", changes[0].Table)
+	assert.Contains(t, changes[0].DDL, "ADD COLUMN `label`")
+	assert.Nil(t, changes[0].EstimatedRows)
+	assert.Nil(t, changes[0].EstimatedBytes)
+}
+
+// The size probe runs under its own budget, never the plan's, so a probe that
+// hangs gives up after engine.TableSizeProbeTimeout and the plan goes on
+// without sizes instead of waiting out the caller's deadline.
+func TestEngine_Plan_SizeProbeIsBounded(t *testing.T) {
+	eng, dsn, files := planSizeProbeFixture(t)
+	var budget time.Duration
+	var hasDeadline bool
+	eng.sizeProbeFault = func(ctx context.Context) error {
+		var deadline time.Time
+		deadline, hasDeadline = ctx.Deadline()
+		budget = time.Until(deadline)
+		return context.DeadlineExceeded
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: files,
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "a timed-out size probe must not fail the plan")
+	require.True(t, hasDeadline, "the size probe must run under a deadline")
+	assert.LessOrEqual(t, budget, engine.TableSizeProbeTimeout)
+	assert.Positive(t, budget)
+	require.Len(t, result.FlatTableChanges(), 1)
+}
+
+// Every statement the size probe sends runs under the probe's budget, so a
+// server that is slow to answer either one is abandoned after
+// engine.TableSizeProbeTimeout and the plan returns without sizes, well before
+// the stalled statement would have finished on its own. The plan returning
+// only after the probe's deadline proves the stalled statement was sent and
+// ran until the deadline cancelled it, rather than failing on its own.
+func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
+	const stall = 20 * time.Second
+	stalls := map[string]func(stmt string) string{
+		// SLEEP returns 0, so the stalled SET still sets the value the probe wants.
+		"session setting": func(stmt string) string {
+			if !strings.HasPrefix(stmt, "SET SESSION") {
+				return stmt
+			}
+			return fmt.Sprintf("SET SESSION information_schema_stats_expiry = (SELECT SLEEP(%d))", int(stall.Seconds()))
+		},
+		"statistics query": func(stmt string) string {
+			if !strings.Contains(stmt, "information_schema.tables") {
+				return stmt
+			}
+			return fmt.Sprintf("SELECT probe.* FROM (%s) AS probe, (SELECT SLEEP(%d)) AS stall", stmt, int(stall.Seconds()))
+		},
+	}
+	for name, rewrite := range stalls {
+		t.Run(name, func(t *testing.T) {
+			eng, dsn, files := planSizeProbeFixture(t)
+			var stalledUntil time.Time
+			eng.sizeProbeSQL = func(ctx context.Context, stmt string) string {
+				out := rewrite(stmt)
+				if out != stmt {
+					stalledUntil, _ = ctx.Deadline()
+				}
+				return out
+			}
+
+			start := time.Now()
+			result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database:    "testdb",
+				SchemaFiles: files,
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			returned := time.Now()
+
+			require.NoError(t, err, "a stalled size probe must not fail the plan")
+			require.False(t, stalledUntil.IsZero(), "the stall must reach a statement the probe sends, under a deadline")
+			assert.True(t, returned.After(stalledUntil), "the stalled statement must hold the probe until its deadline, not fail on its own")
+			assert.Less(t, returned.Sub(start), stall/2, "the plan must abandon the stalled statement at the probe's budget, not wait it out")
+			changes := result.FlatTableChanges()
+			require.Len(t, changes, 1)
+			assert.Equal(t, "probed_items", changes[0].Table)
+			assert.Nil(t, changes[0].EstimatedRows)
+			assert.Nil(t, changes[0].EstimatedBytes)
+		})
+	}
+}
+
+// A plan that only creates tables has no existing table to size, so it never
+// runs the size probe and never connects to the target for sizes; the created
+// table carries no estimate.
+func TestEngine_Plan_CreateOnlyPlanSkipsSizeProbe(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	eng := New(Config{})
+	probed := false
+	eng.sizeProbeFault = func(context.Context) error {
+		probed = true
+		return nil
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"fresh_items.sql": "CREATE TABLE `fresh_items` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+
+	assert.False(t, probed, "a create-only plan must not run the size probe")
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "fresh_items", changes[0].Table)
+	assert.Nil(t, changes[0].EstimatedRows)
+	assert.Nil(t, changes[0].EstimatedBytes)
 }

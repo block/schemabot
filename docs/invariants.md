@@ -240,8 +240,9 @@ logged and the drive continues. An error reading something safety-gating ends th
 and leaves the row claimable for another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
-the drive loop (`pkg/api/operator.go`), the pre-start task re-read in the sequential drive
-(`pkg/tern/local_apply_sequential.go`) and the remote progress error limit
+the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
+terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
+in the grouped drive (`pkg/tern/local_apply_grouped.go`) and the remote progress error limit
 (`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -505,7 +506,9 @@ agreement.
 Config-discovery failure, stored-check-state read failure, head-SHA ambiguity, or an in-flight
 apply must surface as a blocking or absent check, never a passing one. *Breaks if violated:* a PR
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
-publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`).
+publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`), and the
+automatic apply, which dispatches only after its pending changes are stored
+(`applyCommandCore` in `pkg/webhook/apply_handlers.go`).
 
 ### MG-2: Absence never passes
 
@@ -844,7 +847,8 @@ whose drive liveness signal has gone quiet for longer than the operator's whole 
 re-asserted on the guarded write rather than trusted from the scan. Any new non-driver write needs
 a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
+`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
 
@@ -937,7 +941,8 @@ can reach, leaving the row untouched for an instance that can drive it. A claim 
 proceed releases its lease immediately rather than holding the row idle until the staleness window
 expires. And an instance never trusts its own in-memory engine state to answer questions about
 work it does not own. *Enforced:* scope checks and token-guarded claim release in the drive path
-(`pkg/api/operator.go`).
+(`pkg/api/operator.go`) and operation lease checks before conflict resolution
+(`pkg/tern/local_apply.go`, `pkg/storage/internal/sqlstore/tasks.go`).
 
 ### OW-8: Only drivers and elected reapers write apply and task rows
 
@@ -1389,7 +1394,7 @@ the sequential drive (`pkg/tern/local_apply_sequential.go`).
 Automatic cleanup acts only where the record provably carries no engine work, as with a `pending`
 task, which has no checkpoint by construction. Anything uncertain keeps blocking for an operator.
 *Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`,
-`pkg/engine/postgres/apply.go`).
+`pkg/engine/postgres/apply.go`, `pkg/tern/local_apply.go`).
 
 ### RC-5: A terminal summary is never lost, and never silently duplicated
 
@@ -1441,7 +1446,9 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
 the sequential and grouped drives). The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
-and rollup paths).
+and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
+apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
+by `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
 ### RV-2: Stale plans never apply
 
@@ -1456,25 +1463,27 @@ waive with.
 ### RV-3: Consent is explicit, specific, and re-checked
 
 Unsafe changes (error-severity lint findings such as table and column drops) block without
-`--allow-unsafe`. Changes an operator cannot undo mid-flight, such as direct execution's
-write-blocking DDL with no cutover and no revert, require the operator to confirm the specific
-consequences disclosed to them. The re-plan that runs just before execution re-checks that
-verdict, so a plan that changed after the confirmation stops rather than running something the
-operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`).
+`--allow-unsafe`. Changes that destroy work already done on the target, such as discarding an
+unfinished row copy, require the operator to confirm the specific consequences disclosed to
+them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
+after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
+`pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
+(`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
+`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
 Whether the engine will refuse a statement, or route it to direct execution (a MySQL and Spirit
 execution mode), is recorded on the plan or stops plan creation using the engine's own checks rather than a
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
-direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
-estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
+direct execution's table-size bound, a table whose size cannot be measured is blocked. A row
+estimate is trusted only in the blocking direction: the row bound approves only on an exact count.
+The byte bound has no exact corroboration and approves on its estimate. The verdict
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS comparison refusals
-in `pkg/engine/postgres/row_security.go` that abort plan creation); the whole-plan
+privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
+in `pkg/engine/postgres/row_security_apply.go` that abort plan creation); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying
@@ -1534,7 +1543,10 @@ proposal. Symlinked namespaces resolving outside the repository root, or to them
 rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
 (`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
-`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
+`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`), and
+a table declared by two desired schema files fails planning on every engine through one rule
+(`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,
+`pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
 
 ## Routing and authorization (AZ)
 

@@ -469,6 +469,25 @@ type TableChange struct {
 	// ModeReason records the engine's reason for any non-empty ExecutionMode
 	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
+
+	// EstimatedRows is the planner's approximate row count for the table,
+	// summed across shards for sharded targets. Display only — estimates come
+	// from engine statistics and may be stale. Nil when no estimate was
+	// available at plan time.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int `json:"shard_count,omitempty"`
+
+	// LargestShardRows is the approximate row count of the largest single
+	// shard. Nil when the target is not sharded or no estimate was available.
+	LargestShardRows *int64 `json:"largest_shard_rows,omitempty"`
+
+	// EstimatedBytes is the planner's approximate on-disk footprint for the
+	// table (data plus indexes), summed across shards for sharded targets.
+	// Display only, like EstimatedRows. Nil when no estimate was available.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 }
 
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
@@ -484,6 +503,12 @@ func (tc TableChange) RequiresUnsafeOptIn() bool {
 // it is guaranteed to fail.
 func (tc TableChange) EngineBlocked() bool {
 	return strings.EqualFold(tc.ExecutionMode, "blocked")
+}
+
+// DirectExecution reports whether the planner routed this change to direct
+// execution: native DDL on the target instead of the schema change engine.
+func (tc TableChange) DirectExecution() bool {
+	return strings.EqualFold(tc.ExecutionMode, "direct")
 }
 
 // UnsafeOptInReason returns the planner-provided unsafe reason, or a generic
@@ -541,6 +566,14 @@ type NamespacePlanData struct {
 	// Plan.IgnoreTables reads their union. A re-plan that rebuilds only some
 	// of the plan's namespaces therefore still withholds all of them.
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
+
+	// Finalize records that the engine asked for this namespace's group
+	// finalizer to run once every shard's DDL has landed, independent of a
+	// VSchema change (engine.MetadataNeedsFinalizer). It is a typed field
+	// rather than a Metadata key because Metadata is the VSchema safety gate's
+	// record: a namespace carrying Metadata without a VSchema document is one
+	// the gate treats as divergent and fails closed on.
+	Finalize bool `json:"finalize,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
@@ -549,6 +582,40 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 		return false
 	}
 	return n.Artifacts[VSchemaArtifactName] != ""
+}
+
+// ShowsVSchemaChange reports whether plan and apply surfaces show this
+// namespace's VSchema change as one. It is the stored-plan counterpart of
+// apitypes.SchemaChangeResponse.ShowsVSchemaChange: a change the engine
+// generated entirely from the plan's DDL, with no diff to review, no recorded
+// deletion or mutation, and a finalize to write it, is left to the DDL and
+// that finalize.
+func (n *NamespacePlanData) ShowsVSchemaChange() bool {
+	if !n.ChangesVSchema() {
+		return false
+	}
+	return !n.vschemaChangeGeneratedFromDDL()
+}
+
+// vschemaChangeGeneratedFromDDL reports whether the stored plan marks this
+// namespace's VSchema change generated from the DDL, with no diff and no
+// deletion or mutation record, and finalizes the namespace.
+func (n *NamespacePlanData) vschemaChangeGeneratedFromDDL() bool {
+	meta := n.Metadata
+	generatedOnly := meta[PlanMetadataVSchemaGeneratedOnly] == "true"
+	noDiff := meta[PlanMetadataVSchemaDiff] == ""
+	noUnsafeRecord := meta[PlanMetadataVSchemaDeletions] == "" && meta[PlanMetadataVSchemaMutations] == ""
+	return generatedOnly && noDiff && noUnsafeRecord && n.Finalize
+}
+
+// NeedsFinalizer reports whether an apply of this namespace ends with a group
+// finalizer: its VSchema changes, which only the finalizer applies, or the
+// engine asked for one.
+func (n *NamespacePlanData) NeedsFinalizer() bool {
+	if n == nil {
+		return false
+	}
+	return n.ChangesVSchema() || n.Finalize
 }
 
 // ShardPlan records per-shard membership and drift captured at plan time for a
@@ -726,6 +793,41 @@ func (p *Plan) VSchemaNamespaces() []string {
 	var namespaces []string
 	for namespace, nsData := range p.Namespaces {
 		if nsData.ChangesVSchema() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// FinalizerNamespaces returns, in sorted order, every namespace in the plan
+// whose apply ends with a group finalizer (see NamespacePlanData.NeedsFinalizer).
+// It is the set the finalizer is scheduled and driven from; VSchemaNamespaces
+// is the subset whose finalizer applies a VSchema document.
+func (p *Plan) FinalizerNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData.NeedsFinalizer() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// EngineFinalizedNamespaces returns, in sorted order, every namespace the
+// engine asked to finalize (NamespacePlanData.Finalize), whether or not its
+// VSchema also changes.
+func (p *Plan) EngineFinalizedNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData != nil && nsData.Finalize {
 			namespaces = append(namespaces, namespace)
 		}
 	}
@@ -1190,6 +1292,19 @@ func (op *ApplyOperation) IsTasklessVSchemaOnlyWork(plan *Plan) bool {
 	return plan.IsVSchemaOnly()
 }
 
+// HasFreshLease reports whether a driver holds this apply_operation's lease
+// with a heartbeat newer than ApplyLeaseStaleAfter according to the supplied
+// clock. A drive heartbeats its operation row, so the row's last write is the
+// liveness signal. Under a multi-operation drive this
+// is the only live lease — the parent apply row's heartbeat can be stale, or
+// carry a leftover owner, while the operation's drive is running.
+func (op *ApplyOperation) HasFreshLease(now time.Time) bool {
+	if op == nil || op.LeaseOwner == "" {
+		return false
+	}
+	return now.Sub(op.UpdatedAt) < ApplyLeaseStaleAfter
+}
+
 // Lease returns the ownership token for this apply_operation.
 func (op *ApplyOperation) Lease() OperationLease {
 	if op == nil {
@@ -1211,7 +1326,10 @@ type ApplyOptions struct {
 
 	// Branch is the name of an existing PlanetScale branch to reuse.
 	// When set, the engine refreshes the branch schema from main instead
-	// of creating a new branch.
+	// of creating a new branch. The engine reads it back from the stored
+	// apply on every resume, through Map, to decide whether the deploy
+	// request it creates deletes the branch: it must survive the round trip,
+	// or a resumed drive deletes a branch the operator owns.
 	Branch string `json:"branch,omitempty"`
 
 	// DeferCutover pauses at cutover and waits for explicit trigger.
@@ -1250,10 +1368,15 @@ type ApplyOptions struct {
 // policy its dispatch was admitted under. It mirrors the policy the caller
 // sent rather than restating the rules: the engine reading it back off the
 // metadata keys is what enforces them, including refusing an enabled policy
-// that carries no row bound.
+// that carries no size bound, or both.
 type DirectExecutionPolicy struct {
-	Enabled                       bool  `json:"enabled"`
-	MaxTableRows                  int64 `json:"max_table_rows,omitempty"`
+	Enabled bool `json:"enabled"`
+	// MaxTableRows is the optional bound on the table's row count. Zero
+	// states no row bound.
+	MaxTableRows int64 `json:"max_table_rows,omitempty"`
+	// MaxTableBytes is the optional bound on the table's data plus index
+	// footprint, in bytes. Zero states no byte bound.
+	MaxTableBytes                 int64 `json:"max_table_bytes,omitempty"`
 	LockAcquisitionTimeoutSeconds int64 `json:"lock_acquisition_timeout_seconds,omitempty"`
 }
 
@@ -1267,7 +1390,12 @@ func (p *DirectExecutionPolicy) EngineMetadata() map[string]string {
 	if p == nil {
 		return nil
 	}
-	return engine.DirectExecutionMetadata(p.Enabled, p.MaxTableRows, p.LockAcquisitionTimeoutSeconds)
+	return engine.DirectExecutionMetadata(engine.DirectExecutionSettings{
+		Enabled:                       p.Enabled,
+		MaxTableRows:                  p.MaxTableRows,
+		MaxTableBytes:                 p.MaxTableBytes,
+		LockAcquisitionTimeoutSeconds: p.LockAcquisitionTimeoutSeconds,
+	})
 }
 
 // ControlOperation identifies a user-requested control operation.
@@ -1439,22 +1567,38 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 // distinct from one that states the policy disabled: the first defers to the
 // executing server's configuration, the second overrides it.
 //
-// A malformed number reads as zero rather than failing here. The engine
-// refuses an enabled policy whose row bound is not positive, so a garbled
-// bound blocks the statement instead of widening it — the one direction this
-// is allowed to fail in.
+// A malformed number does not fail here; it reads as a value the engine
+// refuses, so a garbled bound blocks the statement instead of changing the
+// policy — the one direction this is allowed to fail in. Both size bounds are
+// optional, so zero would mean "no such bound" and silently drop it; a bound
+// that is present but not a positive integer reads as -1 instead, which
+// renders back onto the metadata and the engine refuses.
 func directExecutionPolicyFromMap(options map[string]string) *DirectExecutionPolicy {
 	raw, ok := options[engine.MetadataDirectExecution]
 	if !ok {
 		return nil
 	}
-	maxRows, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionMaxTableRows], 10, 64)
 	lockWait, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds], 10, 64)
 	return &DirectExecutionPolicy{
 		Enabled:                       raw == "true",
-		MaxTableRows:                  maxRows,
+		MaxTableRows:                  storedSizeBound(options, engine.MetadataDirectExecutionMaxTableRows),
+		MaxTableBytes:                 storedSizeBound(options, engine.MetadataDirectExecutionMaxTableBytes),
 		LockAcquisitionTimeoutSeconds: lockWait,
 	}
+}
+
+// storedSizeBound reads an optional size bound back out of an options map:
+// zero when absent, -1 when present but not a positive integer.
+func storedSizeBound(options map[string]string, key string) int64 {
+	raw, ok := options[key]
+	if !ok {
+		return 0
+	}
+	bound, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || bound <= 0 {
+		return -1
+	}
+	return bound
 }
 
 // GroupsEngineExecution reports whether an apply against databaseType hands the

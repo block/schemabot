@@ -668,13 +668,14 @@ MySQL database the server drives:
 ```yaml
 direct_execution:
   enabled: true           # default: false
-  max_table_rows: 100000  # required (positive) when enabled
+  max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
+                          # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more
-place for the row bound to drift. It is also what covers a database with no
+place for the size bounds to drift. It is also what covers a database with no
 `databases` entry at all — one a data-plane server resolves through its
 `target_resolver`, addressed by an opaque identifier.
 
@@ -718,32 +719,79 @@ read off that apply rather than resolved again. The two can differ: a
 rollback runs after the change it reverses, and withdrawing the grant in
 between would otherwise refuse the statement that undoes a change it allowed.
 
-A direct statement is synchronous, blocks writes to the table while it runs,
-and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
-bound. A refused statement runs directly only when the table's size is within
-the bound; larger tables, and tables whose size cannot be determined, stay
-blocked. The size gate trusts the InnoDB optimizer's estimate
-(`information_schema` `TABLE_ROWS`) only to block, and corroborates a verdict
-for direct execution with an exact row count whose scan is capped just past
-the bound — a stale estimate can never approve a large table. The bound is
-re-evaluated when the apply executes, so a table that grew past it after
-planning is blocked, not run.
+A direct statement is synchronous and blocks writes to the table while it
+runs — the size bound is the fail-closed blast-radius cap.
+An enabled policy sets exactly one of `max_table_rows` and `max_table_bytes`,
+and a refused statement runs directly only when the table is within it. A
+table above the bound, or whose size cannot be determined, stays blocked. The
+bound is re-evaluated when the apply executes, so a table that grew past it
+after planning is blocked, not run.
 
-`lock_acquisition_timeout` bounds how long each direct statement waits to
-acquire its locks. Each engine maps it to its native session lock timeout —
-on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`. Native DDL
-queues on the table's metadata lock behind any open transaction that has
-touched the table — and by default MySQL lets it queue essentially forever,
-with all new table traffic stalling behind it. When the bound expires the
-apply fails fast with a retryable "table is busy" error instead. Lower it for
-environments where even a short stall is unacceptable; the value must be a
-whole number of seconds (at least `1s`).
+`max_table_rows` bounds the row count. The size gate trusts the InnoDB
+optimizer's estimate (`information_schema` `TABLE_ROWS`) only to block, and
+corroborates a verdict for direct execution with an exact row count whose scan
+is capped just past the bound — a stale estimate can never approve a large
+table.
+
+`max_table_bytes` bounds the table's footprint, data plus indexes
+(`information_schema` `DATA_LENGTH + INDEX_LENGTH`). How long a native
+rebuild blocks writes tracks how much it copies more closely than how many
+rows there are, so a table of a few wide rows and one of many narrow rows are
+judged by what the rebuild actually moves. The byte figure is an InnoDB
+statistics estimate that, like `TABLE_ROWS`, can undercount a table that just
+grew, and there is no cheap exact measure to corroborate it, so the byte bound
+approves on the estimate alone. Choose `max_table_rows` when only the
+corroborated gate is acceptable. The value is a whole number followed by a
+binary unit, such as `100MiB` or `2GiB`. Decimal units such as `MB` are
+rejected rather than interpreted, because readers disagree on whether they
+mean 1000² or 1024² bytes.
+
+A policy cannot set both. The two bounds differ in strength, and a second
+limit on a safety policy reads as a ceiling: requiring both would let the
+weaker estimate veto the corroborated count, and letting either approve would
+make a table the gate measured far above the byte limit run directly through
+the row bound. Choosing one keeps the configured limit the one that decides.
+
+A server running a build that predates `max_table_bytes` ignores the byte
+bound when it arrives on a request or an apply record, so it rejects a
+byte-bound policy as missing its row bound, and its plans and applies for the
+database fail until it is upgraded. Switch a database to `max_table_bytes`
+once every server that executes statements for it runs a build that reads it.
+
+`lock_acquisition_timeout` bounds how long each attempt of a direct statement
+waits to acquire its locks. Each engine maps it to its native session lock
+timeout — on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`.
+Native DDL queues on the table's metadata lock behind any open transaction
+that has touched the table — and by default MySQL lets it queue essentially
+forever, with all new table traffic stalling behind it. On MySQL, once the
+statement has waited 90% of the bound for the lock, it kills the transactions
+blocking it and tries again, up to 3 attempts, as Spirit does for its own
+DDL. It never kills while it holds the lock and runs, so traffic to a table
+being rebuilt is left alone. A session holding an explicit `LOCK TABLES`, or a
+transaction too large to roll back safely, is never killed; while one holds
+the lock the apply fails with a retryable "table is busy" error, after one
+attempt for an explicit table lock. Every attempt runs the statement from the
+start, so a rebuild that times out waiting to upgrade its lock at the end is
+rolled back and runs again. Traffic to the table can stall for up to one bound
+per attempt, and between attempts the statement waits up to 30 seconds for
+killed sessions to roll back. A lower bound shortens the stall
+and gives a blocker less time to finish before it is killed; the value must
+be a whole number of seconds (at least `1s`).
+
+The kill reads `performance_schema` and `information_schema.innodb_trx` to
+find the blocking sessions, so the SchemaBot user needs `SELECT` on
+`performance_schema.*` and `PROCESS` for a statement to run directly; without
+either the statement is blocked at plan time. Killing
+another user's session also needs `CONNECTION_ADMIN` (or `SUPER`); without it
+the kill fails and a blocked apply fails as busy.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
-enabled without a positive `max_table_rows`, or when
-`lock_acquisition_timeout` is malformed (not a duration, under a second, or
-not whole seconds). A per-database policy that can never take effect is never
+enabled with neither `max_table_rows` nor `max_table_bytes`, when a policy
+sets both, when `max_table_rows` is negative, when `max_table_bytes` is malformed (not a
+positive whole number with a binary unit), or when `lock_acquisition_timeout`
+is malformed (not a duration, under a second, or not whole seconds). The size
+bounds and `lock_acquisition_timeout` are checked even on a disabled policy. A per-database policy that can never take effect is never
 silently carried in config.
 
 The server-wide policy is held to the same shape rules but is not rejected
@@ -757,9 +805,9 @@ engines behind its targets are not knowable from config.
 
 `direct_execution` is a policy rather than an engine setting, which is why it
 sits beside `pending_drops` at the top level rather than inside an engine
-block like `spirit`, `planetscale`, or `postgres`. Its two fields mean the
-same thing on any engine — a blast-radius bound in rows, and a bound on lock
-acquisition — and each engine supplies only the three pieces that are
+block like `spirit`, `planetscale`, or `postgres`. Its fields mean the same
+thing on any engine — blast-radius bounds in rows and in bytes, and a bound
+on lock acquisition — and each engine supplies only the three pieces that are
 genuinely its own: which statements it refuses, how it estimates a table's
 size, and which native session timeout the lock bound maps to. Today the
 MySQL engine is the only one that implements those, so the policy reaches
@@ -780,7 +828,7 @@ direct_execution:
 ```
 
 This keeps the shared bounds stated once, in one place, for every engine —
-which is the property worth protecting, since `max_table_rows` is the only
+which is the property worth protecting, since the size bounds are the only
 thing between a refused statement and an unbounded write outage. There is no
 such field today, and one should only be added where the value genuinely has
 no cross-engine meaning; a bound that any engine could honor belongs at the
@@ -1804,24 +1852,25 @@ to no changes, no new comment appears (the check run alone reports the green
 state), but plan comments from prior commits are still retired — the pending
 DDL and apply prompt they show no longer match the branch.
 
-By default, a superseded comment is minimized (collapsed as **Outdated**) and
-stays expandable on GitHub — with one safety hold: a plan comment whose commit
-produced an apply is never minimized, even after new pushes. That comment is
-the record of what actually ran against the database, and it stays visible
-until an operator reconciles the apply.
+By default, a superseded plan comment no apply ever acted on is deleted from
+the PR timeline outright — its DDL never ran and is reproducible from the
+commit it was rendered at, so on a busy PR the comment is pure noise. A
+superseded comment whose commit produced an apply is minimized (collapsed as
+**Outdated**) rather than deleted, keeping the record of what ran expandable
+on the PR.
 
-A server can opt into a delete-based policy instead, which applies to every
-repository it manages:
+A server can opt out to a minimize-based policy instead, which applies to
+every repository it manages:
 
 ```yaml
-delete_unactioned_plan_comments: true
+delete_unactioned_plan_comments: false
 ```
 
-Under this policy, a superseded plan comment no apply ever acted on is deleted
-from the PR timeline outright — its DDL never ran and is reproducible from the
-commit it was rendered at, so on a busy PR the comment is pure noise. A
-superseded comment whose commit produced an apply is minimized rather than
-deleted, keeping the record of what ran expandable on the PR.
+Under this policy, a superseded comment is minimized and stays expandable on
+GitHub — with one safety hold: a plan comment whose commit produced an apply is
+never minimized, even after new pushes. That comment is the record of what
+actually ran against the database, and it stays visible until an operator
+reconciles the apply.
 
 Unactioned means exactly that: no apply ran from the comment's commit. It says
 nothing about human engagement — a comment people reacted to or linked

@@ -63,6 +63,73 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
 	t.Run("ApplyCommentProgressAuthorityStaleTakeover", func(t *testing.T) { testPostgresApplyCommentProgressAuthorityStaleTakeover(t, h) })
 	t.Run("ApplyUpdateRefusesReopenAcrossSnapshotRace", func(t *testing.T) { testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t, h) })
+	t.Run("LeaseFencedWritesFailClosedAgainstConcurrentSteal", func(t *testing.T) {
+		testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db))
+	})
+	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
+}
+
+// testPostgresNonUTCWriterTimesStoreTheirInstant verifies that a driver running
+// in a non-UTC local time zone records the instant it means. The driver stamps
+// started_at and completed_at from its own clock, so the values carry its
+// location; every datetime column is a plain timestamp, which keeps only a
+// wall-clock reading. The stored reading must be the UTC one: the apply reads
+// back at the instant it finished, and a GitHub-backed apply that finished
+// moments ago with no summary comment is still inside the now()-relative
+// reconciliation window, so its terminal summary is posted after a restart.
+func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	// West of UTC, so a local wall-clock reading taken for UTC lands hours in
+	// the past, outside the reconciliation window.
+	driverZone := time.FixedZone("UTC-5", -5*60*60)
+	completedAt := time.Now().In(driverZone).Truncate(time.Microsecond)
+	startedAt := completedAt.Add(-time.Minute)
+
+	lock := storagetest.CreateLock(t, store, "non_utc_writer_db", storage.DatabaseTypeMySQL)
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_non_utc_writer",
+		LockID:          lock.ID,
+		PlanID:          730,
+		Database:        lock.DatabaseName,
+		DatabaseType:    lock.DatabaseType,
+		Repository:      lock.Repository,
+		PullRequest:     lock.PullRequest,
+		Environment:     "staging",
+		Caller:          "org/repo#123",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Completed,
+	}
+	applyID, err := store.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	apply.StartedAt = &startedAt
+	apply.CompletedAt = &completedAt
+	require.NoError(t, store.Applies().Update(ctx, apply))
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 1001,
+	}))
+
+	stored, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.NotNil(t, stored.StartedAt)
+	require.NotNil(t, stored.CompletedAt)
+	assert.Equal(t, startedAt.UTC(), *stored.StartedAt, "started_at reads back as the instant the driver wrote, in UTC")
+	assert.Equal(t, completedAt.UTC(), *stored.CompletedAt, "completed_at reads back as the instant the driver wrote, in UTC")
+
+	missing, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, missing, 1, "an apply that finished moments ago with no summary is inside the reconciliation window")
+	assert.Equal(t, apply.ApplyIdentifier, missing[0].ApplyIdentifier)
 }
 
 // reopenRaceDeadline bounds each wait in the snapshot race: the update reaching
@@ -673,7 +740,9 @@ func TestPGXStdlibValueContracts(t *testing.T) {
 	// semantics. The stores' portability contract is therefore UTC-in/UTC-out:
 	// a UTC value must round-trip byte-exact, so predicates comparing stored
 	// values against server-side now() (lease expiry, retry windows) hold as
-	// long as writers hand the driver UTC times.
+	// long as the driver is handed UTC times. This is a raw pgx pool; the
+	// postgresconn pools used by storage convert every timestamp parameter to
+	// UTC themselves.
 	assert.Equal(t, wantTime.UTC(), gotPlain.UTC(), "plain timestamp round-trips a UTC write unchanged")
 	assert.Equal(t, wantTime.Nanosecond(), gotPlain.Nanosecond(), "plain timestamp retains microsecond precision")
 
@@ -1231,4 +1300,60 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 	assert.Equal(t, state.Task.Cancelled, taskState(t, "task-expire-queued"),
 		"a task that never started is cancelled, not failed")
 	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-settled"))
+}
+
+// The conflict check settles an abandoned task only while no drive holds the
+// task's operation, and the guard that decides that is rendered SQL PostgreSQL
+// has to execute: a live operation lease refuses the write, and a lease that
+// has aged past the reclaim window admits it.
+func TestPostgresTaskUpdateHonorsOperationLeaseAbsence(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_task_absence")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	store := postgresHarness{db: db, dsn: dsn}.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options)
+		VALUES ('apply-absence', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}')
+		RETURNING id`, state.Apply.Running).Scan(&applyID))
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options)
+		VALUES ('task-absence', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'events', 'ALTER TABLE events ADD COLUMN c int', 'ALTER', '{}')`,
+		applyID, opID, state.Task.Running)
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	guarded := storage.WithOperationLeaseAbsent(t.Context(), storage.OperationLeaseAbsence{ApplyID: applyID, OperationID: opID})
+
+	task.State = state.Task.Failed
+	require.ErrorIs(t, store.Tasks().Update(guarded, task), storage.ErrOperationLeaseActive,
+		"a drive heartbeating the operation keeps the task")
+	reloaded, err := store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Running, reloaded.State)
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tasks().Update(guarded, task), "a stale operation lease no longer holds the task")
+	reloaded, err = store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
 }

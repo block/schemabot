@@ -118,7 +118,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	vschemaDiffs := vschemaDiffsFromChanges(req.Changes)
 
 	// Create or reuse a branch
-	existingBranch := req.Options["branch"]
+	existingBranch := operatorBranch(req.Options)
 	var branchName string
 	branchStart := time.Now()
 
@@ -298,7 +298,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// The server computes the schema diff asynchronously — poll until the deploy
 	// request transitions from "pending" to "ready" (or "no_changes"/"error").
 	drStart := time.Now()
-	autoDeleteBranch := existingBranch == "" // don't delete reused branches
+	autoDeleteBranch := deployRequestDeletesBranch(req.Options)
+	e.logger.Info("creating deploy request",
+		"database", req.Database,
+		"branch", branchName,
+		"auto_delete_branch", autoDeleteBranch,
+	)
 	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, autoDeleteBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
@@ -817,7 +822,16 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	deferDeploy := req.Options["defer_deploy"] == "true"
 	deferCutover := req.Options["defer_cutover"] == "true"
 
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, true)
+	// The resume creates the deploy request the crashed drive never did, so it
+	// makes the same teardown decision that drive would have made: a branch the
+	// operator supplied is never handed to the deploy request for deletion.
+	autoDeleteBranch := deployRequestDeletesBranch(req.Options)
+	e.logger.Info("creating deploy request on resume",
+		"database", req.Database,
+		"branch", meta.BranchName,
+		"auto_delete_branch", autoDeleteBranch,
+	)
+	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, autoDeleteBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
