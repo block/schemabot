@@ -1426,6 +1426,18 @@ type ApplyOperationStore interface {
 	// row, or nil if nothing is ready to cut over.
 	FindNextApplyOperationCutover(ctx context.Context, owner string) (*ApplyOperation, error)
 
+	// CutoverBlocker returns the earliest earlier operation of another rollout
+	// member (deployment, target) that holds the operation's cutover, or nil
+	// when it is that operation's turn. It applies the same rule as
+	// FindNextApplyOperationCutover: an earlier sibling holds until it has
+	// completed, unless the rollout's on_failure policy continues past its
+	// terminal failure. A manually requested cutover uses it so that it lands
+	// on the member whose turn it is, in the order the automatic cutover claim
+	// would follow. Operations of the same member, its shards and tables, never
+	// hold each other: a cutover addresses the member's remote apply, which
+	// takes whichever of them are parked. It claims nothing.
+	CutoverBlocker(ctx context.Context, operationID int64) (*ApplyOperation, error)
+
 	// ReleaseClaim releases an operation lease the calling driver holds but
 	// cannot use — typically because the parent apply lease it also needs was
 	// transiently unclaimable. It clears the lease fields and backdates the

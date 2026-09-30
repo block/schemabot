@@ -783,6 +783,27 @@ const earlierRolloutMemberSQL = `(
 	OR earlier.target <> apply_operations.target
 )`
 
+// earlierSiblingHoldsCutoverSQL is the cutover-order rule: an earlier sibling
+// (lower created_at, id — deployment_order as materialized at apply-create)
+// holds a later operation's cutover until it has completed, unless
+// releasedFailureExemptionSQL lets a terminal-failed one stop blocking. The
+// swaps are strictly ordered, so a sibling parked at the barrier still holds.
+// It references the apply_operations (the operation whose turn is asked about)
+// and earlier aliases, so the automatic cutover claim
+// (FindNextApplyOperationCutover) and the manual-request turn check
+// (CutoverBlocker) evaluate the same rule. pkg/presentation blocksCutover is
+// the render-side mirror. Placeholders: see earlierSiblingHoldsCutoverArgs.
+const earlierSiblingHoldsCutoverSQL = `earlier.apply_id = apply_operations.apply_id
+	AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+	AND earlier.state <> ?
+	AND ` + releasedFailureExemptionSQL
+
+// earlierSiblingHoldsCutoverArgs returns the positional arguments for
+// earlierSiblingHoldsCutoverSQL, in placeholder order.
+func earlierSiblingHoldsCutoverArgs() []any {
+	return append([]any{state.ApplyOperation.Completed}, releasedFailureExemptionArgs()...)
+}
+
 // freshLeaseCountSQL counts the operation leases the candidate row's parent
 // apply already holds: sibling operations in an active state, owned by some
 // driver, whose heartbeat is still inside the staleness window. It is the
@@ -1584,11 +1605,8 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// sibling so it no longer blocks later cutovers under "continue", or under
 	// "pause" once a release latches the rollout open; and the pending-stop NOT
 	// EXISTS makes `stop` halt remaining cutovers even under those exemptions.
-	queryArgs = append(queryArgs,
-		state.ApplyOperation.WaitingForCutover,
-		state.ApplyOperation.Completed,
-	)
-	queryArgs = append(queryArgs, releasedFailureExemptionArgs()...)
+	queryArgs = append(queryArgs, state.ApplyOperation.WaitingForCutover)
+	queryArgs = append(queryArgs, earlierSiblingHoldsCutoverArgs()...)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending,
 	)
@@ -1624,10 +1642,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_operations AS earlier
-					WHERE earlier.apply_id = apply_operations.apply_id
-						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-						AND earlier.state <> ?
-						AND `+releasedFailureExemptionSQL+`
+					WHERE `+earlierSiblingHoldsCutoverSQL+`
 				)
 				AND NOT EXISTS (
 					SELECT 1
@@ -1710,6 +1725,37 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
+}
+
+// CutoverBlocker returns the earliest earlier sibling that holds the given
+// operation's cutover, or nil when it is that operation's turn. It evaluates
+// earlierSiblingHoldsCutoverSQL, the rule the automatic cutover claim gates on,
+// so a manually requested cutover and the automatic one agree on whose turn it
+// is. Only operations of another rollout member (earlierRolloutMemberSQL) are
+// considered: a member's own operations, its shards and tables, cut over
+// together, since the cutover a request sends addresses the member's remote
+// apply and takes whichever of them are parked. It reads the order and does
+// not claim anything.
+func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID int64) (*storage.ApplyOperation, error) {
+	args := append([]any{operationID}, earlierSiblingHoldsCutoverArgs()...)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations AS earlier
+		WHERE EXISTS (
+			SELECT 1
+			FROM apply_operations
+			WHERE apply_operations.id = ?
+				AND `+earlierRolloutMemberSQL+`
+				AND `+earlierSiblingHoldsCutoverSQL+`
+		)
+		ORDER BY created_at, id
+		LIMIT 1
+	`, args...)
+	blocker, err := scanApplyOperation(row)
+	if err != nil {
+		return nil, fmt.Errorf("find sibling holding the cutover of apply_operation %d: %w", operationID, err)
+	}
+	return blocker, nil
 }
 
 // ReleaseClaim clears the lease fields and backdates the heartbeat past the

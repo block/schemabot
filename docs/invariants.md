@@ -813,8 +813,12 @@ or `paused` where a pause is holding it — until that sibling is started and fi
 cancelled. A rollout held open this way still resolves the stop that produced it, once that stop
 has reached every operation: the pending request is what `start` consults, so holding it open
 without completing the request would refuse the start the hold exists to preserve (CO-2).
-*Enforced:* the ordered-claim gate in `FindNextApplyOperation`
-(`pkg/storage/internal/sqlstore/apply_operations.go`) and the rollout state derivation
+*Enforced:* the ordered-claim gates in `FindNextApplyOperation` and `FindNextApplyOperationCutover`
+(`pkg/storage/internal/sqlstore/apply_operations.go`); for a manually deferred cutover, the turn
+check `CutoverBlocker` (same file, sharing the automatic cutover claim's
+`earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
+(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
+(`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), with `completeLandedStopForHeldOpenApply` and
 `RolloutHeldByResumableChild` keeping a held-open rollout's stop resolved and its recovery claim
@@ -1103,7 +1107,10 @@ a consumer that will never come. A release against a rollout that is not paused 
 cutover while one is already in flight are both refused at intake. Its effect is also scoped to
 the one change it targets: an incident-time tuning, or one operation's completion, never bleeds
 onto sibling operations or future applies. *Enforced:* queue-time eligibility gates and
-operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`).
+operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`); a cutover
+request on an ordered rollout is bound at intake to the member whose turn it is
+(`cutoverTurnForRequest`, `pkg/api/control_handlers.go`), and only that member's drive takes it
+(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`).
 
 ### CO-7: ID namespaces are never conflated
 

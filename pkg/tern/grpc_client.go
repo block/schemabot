@@ -726,6 +726,42 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		return nil
 	}
+	if scope.takesCutoverRequestInOrder() {
+		// The apply being ready says only that some member is parked. The
+		// Cutover call below goes to this drive's own remote apply, so the
+		// request is this drive's to take only when its own member is parked
+		// and it is that member's turn; every other drive leaves it pending for
+		// the member whose turn it is.
+		turn, err := operationCutoverRequestTurn(ctx, c.storage, apply, scope, controlReq)
+		if err != nil {
+			return fmt.Errorf("check cutover turn for apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if !turn.ready {
+			attrs := append(apply.MutableLogAttrs(),
+				"requested_by", controlRequestCaller(controlReq),
+				"operation_deployment", scope.operation.Deployment,
+				"operation_target", scope.operation.Target,
+				"reason", turn.reason)
+			if turn.blocker != nil {
+				attrs = append(attrs,
+					"blocking_deployment", turn.blocker.Deployment,
+					"blocking_target", turn.blocker.Target,
+					"blocking_state", turn.blocker.State)
+			}
+			switch turn.settle {
+			case cutoverRequestLanded:
+				logger.InfoContext(ctx, "completing pending gRPC cutover request whose bound member has cut over", attrs...)
+				return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
+			case cutoverRequestEnded:
+				logger.WarnContext(ctx, "failing pending gRPC cutover request whose bound member ended without cutting over", attrs...)
+				return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover,
+					fmt.Sprintf("cutover request was not applied because the member it was accepted for is %s", turn.blocker.State))
+			case cutoverRequestUnsettled:
+				logger.InfoContext(ctx, "pending gRPC cutover request left for the member whose turn it is", attrs...)
+			}
+			return nil
+		}
+	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		message := "remote apply id is not available"
