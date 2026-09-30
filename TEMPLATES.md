@@ -7706,15 +7706,15 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-**Targets**: 40 completed, 87 running, 1 failed
+**Targets**: 40 completed, 8 running, 79 queued, 1 failed
 
 > ❌ **First failure:** <code>us/orders_062</code> — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39;
 
-- ❌ `us` — 40 completed, 23 running, 1 failed (64 targets)
-- 🔄 `eu` — 64 running (64 targets)
+- ❌ `us` — 40 completed, 4 running, 19 queued, 1 failed (64 targets)
+- 🔄 `eu` — 4 running, 60 queued (64 targets)
 
 <details open>
-<summary>❌ us — 40 completed, 23 running, 1 failed (64 targets)</summary>
+<summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
 
 Targets diverge — what applies where:
@@ -7726,8 +7726,9 @@ Targets diverge — what applies where:
 
 </details>
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 89% · 40 of 56 targets complete
-- Rows: 73,284,592 / 82,108,992 across 56 of 56 targets · ETA: 3m 15s
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 96% · 40 complete, 4 running, 12 queued
+- Rows: 62,308,108 / 64,514,208 across 44 of 56 targets · ETA: ≥ 3m 15s
+- Running: `orders_040`, `orders_041`, `orders_042`, `orders_043`
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -7735,8 +7736,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 **targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% · 0 of 8 targets complete, 1 failed
-- Rows: 6,402,949 / 10,263,624 across 7 of 8 targets · ETA: 3m 15s
+**`orders`**: ❌ Failed · 7 queued, 1 failed
 
 ```sql
 ALTER TABLE `orders`
@@ -7753,11 +7753,12 @@ ALTER TABLE `orders`
 </details>
 
 <details open>
-<summary>🔄 eu — 64 running (64 targets)</summary>
+<summary>🔄 eu — 4 running, 60 queued (64 targets)</summary>
 <dl><dd>
 
-**`orders`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 12% · 0 of 64 targets complete
-- Rows: 11,713,856 / 93,838,848 across 64 of 64 targets · ETA: 3m 15s
+**`orders`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 12% · 4 running, 60 queued
+- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
+- Running: `orders_000`, `orders_001`, `orders_002`, `orders_003`
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);

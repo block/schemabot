@@ -242,12 +242,17 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	footer := ApplyStatusCommentData{State: data.Model.State, ApplyID: data.ApplyID, Environment: data.Environment, Tenant: data.Tenant}
 	// The members of one apply change one database, so they share its engine
 	// and its cutover option; the first member with detail speaks for all.
+	// Every member's tables feed the footer, so a table retrying on any target
+	// gets the retry guidance.
 	for _, detail := range data.Details {
-		if detail != nil {
+		if detail == nil {
+			continue
+		}
+		if footer.Engine == "" {
 			footer.Engine = detail.Engine
 			footer.DeferCutover = detail.DeferCutover
-			break
 		}
+		footer.Tables = append(footer.Tables, detail.Tables...)
 	}
 	writeApplyFooter(sb, footer)
 }

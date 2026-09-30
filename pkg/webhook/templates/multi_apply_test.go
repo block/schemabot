@@ -658,7 +658,7 @@ func TestRenderMultiDeploymentApplyComment_RollsUpADeploymentsTargets(t *testing
 	assert.Contains(t, out, "**Targets**: 1 completed, 3 running\n")
 	assert.Contains(t, out, "- 🔄 `primary` — 1 completed, 2 running (3 targets)\n- 🔄 `eu-west` — running table copy\n")
 	assert.Contains(t, out, "<details open>\n<summary>🔄 primary — 1 completed, 2 running (3 targets)</summary>\n<dl><dd>\n\n")
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(53)+" 53% · 1 of 3 targets complete\n- Rows: 1,600 / 3,000 across 3 of 3 targets · ETA: "+ui.FormatETA(420)+"\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(53)+" 53% · 1 complete, 2 running\n- Rows: 1,600 / 3,000 · ETA: "+ui.FormatETA(420)+"\n- Running: `testapp-002`, `testapp-003`\n")
 	assert.NotContains(t, out, "Targets diverge", "the targets run one change")
 
 	// The shared DDL renders once for primary's three targets and once in
@@ -728,7 +728,7 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailureKeepsTheOthersProgress
 		targetDetail("testapp_003", state.Task.Failed, addNote, 900),
 	)
 
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(75)+" 75% · 1 of 3 targets complete, 1 failed\n- Rows: 1,500 / 2,000 across 2 of 3 targets · ETA: "+ui.FormatETA(500)+"\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(75)+" 75% · 1 complete, 1 running, 1 failed\n- Rows: 1,500 / 2,000 across 2 of 3 targets · ETA: "+ui.FormatETA(500)+"\n- Running: `testapp-002`\n")
 	assert.Contains(t, out, "| `testapp-003` | ❌ failed |")
 
 	// A target that has yet to report its rows can only add time, so while one
@@ -742,6 +742,39 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailureKeepsTheOthersProgress
 		queued,
 	)
 	assert.Contains(t, out, "across 2 of 4 targets · ETA: ≥ "+ui.FormatETA(500)+"\n")
+
+	// A target with no detail at all is still one of the deployment's targets:
+	// the rows cover fewer than all of them, the ETA is a floor, and the section
+	// says how many have not reported.
+	out = renderTargets(presentation.Derive(append(ops, parallelTarget("primary", "testapp-004", so.Pending))),
+		targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+		targetDetail("testapp_002", state.Task.Running, addNote, 500),
+		targetDetail("testapp_003", state.Task.Failed, addNote, 900),
+		nil,
+	)
+	assert.Contains(t, out, "across 2 of 4 targets · ETA: ≥ "+ui.FormatETA(500)+"\n")
+	assert.Contains(t, out, "\n_1 of 4 targets have not reported progress yet._\n")
+}
+
+// A table changed by two statements on each target gets a line per statement,
+// each aggregating only that statement's progress.
+func TestRenderMultiDeploymentApplyComment_RolledUpTableWithTwoStatements(t *testing.T) {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_note`(`note`)"
+	twoStatements := func(database string, noteCopied, indexCopied int64) *ApplyStatusCommentData {
+		d := targetDetail(database, state.Task.Running, addNote, noteCopied)
+		d.Tables = append(d.Tables, TableProgressData{TableName: "orders", DDL: addIndex, Status: state.Task.Running, RowsCopied: indexCopied, RowsTotal: 1000, ETASeconds: indexCopied})
+		return d
+	}
+	out := renderTargets(presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+	}),
+		twoStatements("testapp_001", 800, 100),
+		twoStatements("testapp_002", 600, 300),
+	)
+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(70)+" 70% · 2 running\n- Rows: 1,400 / 2,000 · ETA: "+ui.FormatETA(800)+"\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(20)+" 20% · 2 running\n- Rows: 400 / 2,000 · ETA: "+ui.FormatETA(300)+"\n")
 }
 
 // A deployment can address hundreds of targets. The comment then grows with
@@ -765,6 +798,7 @@ func TestRenderMultiDeploymentApplyComment_ManyTargetsFitOneComment(t *testing.T
 	assert.Equal(t, 2, strings.Count(out, "<details"), "one section per deployment")
 	assert.Equal(t, 2, strings.Count(out, "ADD COLUMN `note`"), "each deployment's change renders once")
 	assert.Contains(t, out, "<summary>🔄 us — 256 running (256 targets)</summary>")
+	assert.NotContains(t, out, "- Running:", "with every target running, the count already says which")
 }
 
 // A cutover suggestion names the member it applies to, so an operator reading it
@@ -884,6 +918,23 @@ func TestRenderMultiDeploymentApplyComment_RunningRolloutFooterStopsIt(t *testin
 			assert.Equal(t, 1, strings.Count(out, "schemabot "), "the command renders once:\n%s", out)
 		})
 	}
+}
+
+// A table retrying on any member makes the rollout's one footer the retry
+// guidance, not the plain stop command.
+func TestRenderMultiDeploymentApplyComment_RetryingMemberTableGetsRetryFooter(t *testing.T) {
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive([]presentation.Operation{parallelTarget("primary", "testapp-001", so.Running), parallelTarget("primary", "testapp-002", so.Running)}),
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			targetDetail("testapp_001", state.Task.Running, addNote, 500),
+			targetDetail("testapp_002", state.Task.FailedRetryable, addNote, 500),
+		},
+	})
+
+	footer := out[strings.LastIndex(out, "</details>"):]
+	assert.Contains(t, footer, "SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:\n```\nschemabot stop apply-123 -e production\n```\n")
 }
 
 // When the round produced more than one plan, each member's section names the

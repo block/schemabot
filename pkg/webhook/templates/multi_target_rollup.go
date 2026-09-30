@@ -10,6 +10,9 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
+// runningTargetNameLimit bounds the running-target names a table's line lists.
+const runningTargetNameLimit = 10
+
 // failedTargetRowLimit bounds the failed-target table so a deployment whose
 // every target failed still fits one comment; the <summary> counts carry the total.
 const failedTargetRowLimit = 20
@@ -31,6 +34,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	if len(work) == 0 {
 		sb.WriteString("_No details available yet._\n")
 	}
+	silent := unreportedTargets(data, g)
 	if len(work) > 1 {
 		sb.WriteString("Targets diverge — what applies where:\n\n")
 	}
@@ -40,12 +44,28 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		}
 		dialect := dialectForEngine(memberDetail(data.Details, w.members[0]).Engine, data.ApplyID)
 		for _, t := range w.tables {
-			writeTargetTableLine(sb, t.TableName, tableAcrossTargets(data, w.members, t))
+			cells, targets := tableAcrossTargets(data, w.members, t)
+			writeTargetTableLine(sb, t.TableName, cells, targets, silent)
 			writeDDLLine(sb, dialect, t.DDL, budget)
 			sb.WriteString("\n")
 		}
 	}
+	if len(work) > 0 && silent > 0 {
+		fmt.Fprintf(sb, "_%d of %d targets have not reported progress yet._\n", silent, len(g.Members))
+	}
 	writeFailedTargets(sb, data.Model, g)
+}
+
+// unreportedTargets counts the targets with no table progress to show yet, so
+// the table lines do not read as covering the whole deployment.
+func unreportedTargets(data MultiDeploymentApplyData, g presentation.Group) int {
+	n := 0
+	for _, i := range g.Members {
+		if detail := memberDetail(data.Details, i); detail == nil || len(detail.Tables) == 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // targetWorkGroups partitions a deployment's targets by the change they run.
@@ -82,41 +102,51 @@ func tableChangeSignature(tables []TableProgressData) string {
 	return strings.Join(parts, "\x01")
 }
 
-// tableAcrossTargets returns table's progress on each of members.
-func tableAcrossTargets(data MultiDeploymentApplyData, members []int, table TableProgressData) []TableProgressData {
+// tableAcrossTargets returns table's progress on each of members, and the
+// target each cell belongs to. A cell matches on its DDL as well as its table,
+// so a table changed by two statements gets a line per statement.
+func tableAcrossTargets(data MultiDeploymentApplyData, members []int, table TableProgressData) ([]TableProgressData, []string) {
 	cells := make([]TableProgressData, 0, len(members))
+	targets := make([]string, 0, len(members))
 	for _, i := range members {
 		for _, t := range memberDetail(data.Details, i).Tables {
-			if t.Namespace == table.Namespace && t.TableName == table.TableName {
+			if t.Namespace == table.Namespace && t.TableName == table.TableName && t.DDL == table.DDL {
 				cells = append(cells, t)
+				targets = append(targets, memberTarget(data.Model.Deployments[i]))
 				break
 			}
 		}
 	}
-	return cells
+	return cells, targets
 }
 
 // writeTargetTableLine writes one table's line across the targets that run it.
-// While any target copies, the bar sums the rows of targets copying or done;
-// until every target still to copy reports, the ETA (the slowest target's) is
-// a floor. Failed targets are counted rather than summed, since their rows are
-// not progressing. With nothing copying, the line names the table's phase.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData) {
-	var done, failed, reporting, unreported int
+// While any target copies, the bar sums the rows of targets copying or done,
+// and the rows line names its coverage only when a target is left out of the
+// sum; until every target still to copy reports, the ETA (the slowest
+// target's) is a floor. Failed targets are counted rather than summed, since
+// their rows are not progressing. The running targets are named unless every
+// target is running. With nothing copying, the line names the table's phase.
+// silent is the deployment's targets with no progress reported at all; they
+// widen the row denominator and make the ETA a floor.
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, targets []string, silent int) {
+	var done, queued, failed, reporting, unreported int
 	var copied, total, eta int64
-	copying := false
-	for _, c := range cells {
+	var running []string
+	for i, c := range cells {
 		status := state.NormalizeTaskStatus(c.Status)
 		switch status {
 		case state.Task.Completed:
 			done++
+		case state.Task.Pending:
+			queued++
 		case state.Task.Failed, state.Task.FailedRetryable:
 			failed++
 			continue
 		case state.Task.Stopped, state.Task.Cancelled:
 			continue
 		case state.Task.Running:
-			copying = true
+			running = append(running, targets[i])
 			eta = max(eta, c.ETASeconds)
 		}
 		if c.RowsTotal == 0 {
@@ -128,22 +158,23 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		total += c.RowsTotal
 	}
 	name := inlineCode(table)
-	coverage := fmt.Sprintf("%d of %d targets complete", done, len(cells))
-	if failed > 0 {
-		coverage += fmt.Sprintf(", %d failed", failed)
-	}
-	if copying && total > 0 {
+	coverage := targetCoverage(done, len(running), queued, failed)
+	if len(running) > 0 && total > 0 {
 		if pct := ui.RowCopyDisplayPercent(int(copied*100/total), copied); pct > 0 {
-			fmt.Fprintf(sb, "**%s**: %s %d%% · %s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
-			line := fmt.Sprintf("- Rows: %s / %s across %d of %d targets", ui.FormatNumber(copied), ui.FormatNumber(total), reporting, len(cells))
+			fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
+			line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
+			if reporting < len(cells)+silent {
+				line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
+			}
 			if eta > 0 {
 				floor := ""
-				if unreported > 0 {
+				if unreported+silent > 0 {
 					floor = "≥ "
 				}
 				line += " · ETA: " + floor + ui.FormatETA(eta)
 			}
 			sb.WriteString(line + "\n")
+			writeRunningTargets(sb, running, len(cells))
 			return
 		}
 	}
@@ -158,7 +189,47 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		// the change is live on the completed targets.
 		phrase = "⊘ Cancelled"
 	}
-	fmt.Fprintf(sb, "**%s**: %s · %s\n", name, phrase, coverage)
+	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
+}
+
+// targetCoverage is the " · 40 complete, 4 running, 19 queued, 1 failed"
+// suffix of a table's line, naming only the states some target is in. Queued
+// targets are waiting on the apply's driver cap or on their turn in order.
+func targetCoverage(done, running, queued, failed int) string {
+	var parts []string
+	if done > 0 {
+		parts = append(parts, fmt.Sprintf("%d complete", done))
+	}
+	if running > 0 {
+		parts = append(parts, fmt.Sprintf("%d running", running))
+	}
+	if queued > 0 {
+		parts = append(parts, fmt.Sprintf("%d queued", queued))
+	}
+	if failed > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", failed))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " · " + strings.Join(parts, ", ")
+}
+
+// writeRunningTargets names the targets copying the table, unless all of them
+// are, where the count alone already says which.
+func writeRunningTargets(sb *strings.Builder, running []string, targets int) {
+	if len(running) == 0 || len(running) == targets {
+		return
+	}
+	names := make([]string, 0, runningTargetNameLimit)
+	for _, r := range running[:min(len(running), runningTargetNameLimit)] {
+		names = append(names, inlineCode(r))
+	}
+	line := "- Running: " + strings.Join(names, ", ")
+	if more := len(running) - runningTargetNameLimit; more > 0 {
+		line += fmt.Sprintf(", and %d more", more)
+	}
+	sb.WriteString(line + "\n")
 }
 
 // rollupTaskStatus is a table's status across targets: a failure or halt

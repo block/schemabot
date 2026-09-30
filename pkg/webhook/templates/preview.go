@@ -2361,16 +2361,18 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 }
 
 // PreviewCommentMultiTargetApplyInProgress renders a parallel rollout across
-// two deployments of 64 targets each. Each deployment rolls its targets up into
-// one section: counts by status, one line per table across its targets, and
-// the DDL once per distinct change. In us, eight targets need a second index
-// and one target failed; the rollout continues past it.
+// two deployments of 64 targets each, with the apply's driver cap holding eight
+// targets in flight and the rest queued. Each deployment rolls its targets up
+// into one section: counts by status, one line per table naming the targets
+// copying it, and the DDL once per distinct change. In us, eight targets also
+// add a `note` column and one target failed; the rollout continues past it.
 func PreviewCommentMultiTargetApplyInProgress() string {
 	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
 	const addIndexAndColumn = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`), ADD COLUMN `note` text"
+	const rows = 1_466_232
 	var ops []presentation.Operation
 	var details []*ApplyStatusCommentData
-	add := func(deployment string, i int, opState, taskState, ddl string, copied int64) {
+	add := func(deployment string, i int, opState, taskState, ddl string, copied, total, eta int64) {
 		target := fmt.Sprintf("orders_%03d", i)
 		op := presentation.Operation{Deployment: deployment, Target: target, State: opState, Parallel: true, ContinueOnFailure: true}
 		if opState == state.ApplyOperation.Failed {
@@ -2378,8 +2380,11 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 		}
 		ops = append(ops, op)
 		details = append(details, sampleDeploymentDetail(target, opState, []TableProgressData{
-			{TableName: "orders", DDL: ddl, Status: taskState, RowsCopied: copied, RowsTotal: 1_466_232, ETASeconds: 195},
+			{TableName: "orders", DDL: ddl, Status: taskState, RowsCopied: copied, RowsTotal: total, ETASeconds: eta},
 		}))
+	}
+	queue := func(deployment string, i int, ddl string) {
+		add(deployment, i, state.ApplyOperation.Pending, state.Task.Pending, ddl, 0, 0, 0)
 	}
 	for i := range 64 {
 		ddl := addIndex
@@ -2388,15 +2393,21 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 		}
 		switch {
 		case i < 40:
-			add("us", i, state.ApplyOperation.Completed, state.Task.Completed, ddl, 1_466_232)
+			add("us", i, state.ApplyOperation.Completed, state.Task.Completed, ddl, rows, rows, 0)
+		case i < 44:
+			add("us", i, state.ApplyOperation.Running, state.Task.Running, ddl, 914_707, rows, 195)
 		case i == 62:
-			add("us", i, state.ApplyOperation.Failed, state.Task.Failed, ddl, 402_118)
+			add("us", i, state.ApplyOperation.Failed, state.Task.Failed, ddl, 402_118, rows, 0)
 		default:
-			add("us", i, state.ApplyOperation.Running, state.Task.Running, ddl, 914_707)
+			queue("us", i, ddl)
 		}
 	}
 	for i := range 64 {
-		add("eu", i, state.ApplyOperation.Running, state.Task.Running, addIndex, 183_029)
+		if i < 4 {
+			add("eu", i, state.ApplyOperation.Running, state.Task.Running, addIndex, 183_029, rows, 1_380)
+			continue
+		}
+		queue("eu", i, addIndex)
 	}
 
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
