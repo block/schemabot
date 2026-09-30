@@ -1154,8 +1154,15 @@ type PlanRequest struct {
 	// configuration decides, which with none configured leaves every statement
 	// the engine refuses blocked.
 	DirectExecution *DirectExecutionPolicy `protobuf:"bytes,14,opt,name=direct_execution,json=directExecution,proto3" json:"direct_execution,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Declared namespaces the caller left out of schema_files because the
+	// target's entry in its database's targets list selects only other
+	// namespaces. Like ignored_namespaces, they are withheld rather than
+	// removed, so the data plane refuses engine shapes that diff the whole target
+	// as one unit (a database-scoped MySQL DSN), where an unselected namespace's
+	// live tables would otherwise be planned as drops.
+	UnselectedNamespaces []string `protobuf:"bytes,15,rep,name=unselected_namespaces,json=unselectedNamespaces,proto3" json:"unselected_namespaces,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1275,6 +1282,13 @@ func (x *PlanRequest) GetIgnoreTables() []string {
 func (x *PlanRequest) GetDirectExecution() *DirectExecutionPolicy {
 	if x != nil {
 		return x.DirectExecution
+	}
+	return nil
+}
+
+func (x *PlanRequest) GetUnselectedNamespaces() []string {
+	if x != nil {
+		return x.UnselectedNamespaces
 	}
 	return nil
 }
@@ -4799,7 +4813,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\x83\x05\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xb8\x05\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -4817,7 +4831,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x120\n" +
 	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x12#\n" +
 	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x12I\n" +
-	"\x10direct_execution\x18\x0e \x01(\v2\x1e.tern.v1.DirectExecutionPolicyR\x0fdirectExecution\x1aT\n" +
+	"\x10direct_execution\x18\x0e \x01(\v2\x1e.tern.v1.DirectExecutionPolicyR\x0fdirectExecution\x123\n" +
+	"\x15unselected_namespaces\x18\x0f \x03(\tR\x14unselectedNamespaces\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +

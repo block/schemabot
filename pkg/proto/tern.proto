@@ -494,6 +494,13 @@ message PlanRequest {
   // configuration decides, which with none configured leaves every statement
   // the engine refuses blocked.
   DirectExecutionPolicy direct_execution = 14;
+  // Declared namespaces the caller left out of schema_files because the
+  // target's entry in its database's targets list selects only other
+  // namespaces. Like ignored_namespaces, they are withheld rather than
+  // removed, so the data plane refuses engine shapes that diff the whole target
+  // as one unit (a database-scoped MySQL DSN), where an unselected namespace's
+  // live tables would otherwise be planned as drops.
+  repeated string unselected_namespaces = 15;
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses

@@ -1575,6 +1575,9 @@ feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 a table declared by two desired schema files fails planning on every engine through one rule
 (`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,
 `pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
+A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
+refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
+`pkg/tern/local_client.go`).
 
 ## Routing and authorization (AZ)
 

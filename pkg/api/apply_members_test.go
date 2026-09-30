@@ -53,7 +53,7 @@ func memberResolutionService(t *testing.T, env EnvironmentConfig, plans storage.
 }
 
 func multiTargetEnv() EnvironmentConfig {
-	return EnvironmentConfig{Deployment: "eu", Targets: []string{"testapp-001", "testapp-002"}}
+	return EnvironmentConfig{Deployment: "eu", Targets: targetNames("testapp-001", "testapp-002")}
 }
 
 func mirroredEnv() EnvironmentConfig {
