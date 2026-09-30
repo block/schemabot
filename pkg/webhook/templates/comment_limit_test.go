@@ -293,6 +293,71 @@ func TestRenderWithinCommentLimitCutsDDLByTheOvershoot(t *testing.T) {
 	})
 }
 
+// renderPointedBlocks renders a comment of chrome bytes of non-DDL text and
+// the given DDL blocks, each drawn from the stored plan planID so a block cut
+// to fit carries the pointer marker, counting the passes the fit loop takes.
+func renderPointedBlocks(chrome int, blocks []string, planID string) (body string, passes int) {
+	body = renderWithinCommentLimit(len(blocks), 0, func(budget *ddlBlockBudget) string {
+		passes++
+		defer budget.pointAt(planID)()
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("h", chrome))
+		for _, block := range blocks {
+			writeSQLFencedBlock(&sb, block, budget)
+		}
+		return sb.String()
+	})
+	return body, passes
+}
+
+// repeatedDDL returns at least size bytes of DDL with no backtick run, so a
+// block holding any prefix of it keeps the shortest fence.
+func repeatedDDL(size int) string {
+	const statement = "CREATE TABLE t (id int);\n"
+	return strings.Repeat(statement, size/len(statement)+1)
+}
+
+// The second pass of the fit loop charges each block the pass cuts for the
+// marker it will carry, however long its section's marker is, and charges no
+// block twice for a marker it already carries. So a comment whose DDL is cut
+// into several blocks fits on the second pass, and the DDL keeps the room the
+// markers leave rather than a marker's worth per block besides.
+func TestRenderWithinCommentLimitChargesEachCutBlockOneMarker(t *testing.T) {
+	planID := "plan_" + strings.Repeat("7c41f9", 8)
+	pointer := planPointerMarker(planID)
+	require.Greater(t, len(pointer), len(ddlTruncatedMarker)+32, "the pointer marker outgrows the plain marker, so charging the plain one would undercharge")
+
+	t.Run("blocks first cut on the second pass are charged the pointer marker", func(t *testing.T) {
+		// Pass 1 offers every block the whole limit, so none is cut and none
+		// carries a marker; the chrome then pushes the body over, and pass 2
+		// cuts all of them.
+		blocks := []string{
+			repeatedDDL(commentBodyLimit / 8), repeatedDDL(commentBodyLimit / 8),
+			repeatedDDL(commentBodyLimit / 8), repeatedDDL(commentBodyLimit / 8),
+		}
+		body, passes := renderPointedBlocks(commentBodyLimit/2+2048, blocks, planID)
+
+		assert.Equal(t, 2, passes, "the second pass reserved room for every marker it wrote")
+		assert.Equal(t, len(blocks), strings.Count(body, pointer))
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+	})
+
+	t.Run("blocks already cut on the first pass are not charged again", func(t *testing.T) {
+		// Every block is cut on pass 1 and carries its pointer marker there,
+		// so pass 2 cuts the DDL by the overshoot alone.
+		blocks := []string{
+			repeatedDDL(commentBodyLimit), repeatedDDL(commentBodyLimit),
+			repeatedDDL(commentBodyLimit), repeatedDDL(commentBodyLimit),
+		}
+		body, passes := renderPointedBlocks(1000, blocks, planID)
+
+		assert.Equal(t, 2, passes)
+		assert.Equal(t, len(blocks), strings.Count(body, pointer))
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+		assert.Greater(t, len(body), commentBodyLimit-len(pointer), "the DDL gave up only the overshoot, not a second marker's worth per block")
+	})
+}
+
 // DDL cut to fit the comment comes from a stored plan, so the marker under it
 // names the command that prints that plan in full rather than sending the
 // reader to the schema files, which hold the desired schema and not the

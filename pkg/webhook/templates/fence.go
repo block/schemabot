@@ -58,9 +58,16 @@ func listPlanCommand(planID string) string {
 
 // fenceOverhead is the byte count of a block's fixed text beyond the two fence
 // runs and the content: the info string, the newline after each fence, and the
-// newline that terminates content when it lacks one.
-func fenceOverhead(info string) int {
-	return len(info) + len("\n") + len("\n") + len("\n")
+// newline writeFencedBlock adds to content that lacks one. It is exact rather
+// than an upper bound, because the fit loop cuts the DDL by the overshoot
+// measured against what the budget was charged, and a block charged more than
+// it wrote would let the next pass overshoot by the difference.
+func fenceOverhead(info, content string) int {
+	overhead := len(info) + len("\n") + len("\n")
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		overhead += len("\n")
+	}
+	return overhead
 }
 
 // ddlBlockBudget shares one comment's DDL budget across the blocks the comment
@@ -244,7 +251,7 @@ func fenceLength(content string) int {
 // sqlBlockSize is the byte count of the block writeSQLFencedBlock renders for
 // content: the content, both fence runs, and the fixed text around them.
 func sqlBlockSize(content string) int {
-	return len(content) + 2*fenceLength(content) + fenceOverhead("sql")
+	return len(content) + 2*fenceLength(content) + fenceOverhead("sql", content)
 }
 
 // fitSQLBlock returns the longest prefix of content whose rendered block fits
