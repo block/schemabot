@@ -113,6 +113,31 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// A confirmation pinned to an empty reviewed plan was given against a
+	// comment saying the reviewed target already had this schema. If the
+	// reviewed target has changes of its own now, none of them were on that
+	// comment, so they never run on the strength of it.
+	if storedPlan == nil && planResp.HasChanges() {
+		confirmedEmpty, emptyErr := h.confirmedPlanHasNoWork(ctx, expectedPendingPlanID)
+		if emptyErr != nil {
+			h.logger.Error("apply-confirm rejected: could not load the confirmed plan to compare with the reviewed target's changes; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", emptyErr)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+			return
+		}
+		if confirmedEmpty {
+			h.logger.Info("apply-confirm refused: the reviewed target has changes the confirmed comment did not show",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the reviewed target has changes the confirmation did not cover")
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"The comment this confirmation acts on showed the reviewed target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
+			return
+		}
+	}
+
 	// No changes (neither table DDL nor a VSchema update) — release the lock
 	// (keyed on the pending intent this handler observed, so a lock re-pinned by
 	// a newer plan is preserved) and notify. An empty primary plan speaks only
@@ -144,6 +169,22 @@ func (h *Handler) executeApply(
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
 				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work is not what was confirmed")
 				h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout)
+				return
+			}
+			// The statements match the confirmed round's, but a copy can appear on
+			// a target after the comment was posted.
+			refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout)
+			if refusalErr != nil {
+				h.logger.Error("apply-confirm rejected: could not verify that the other targets' plans can run from this apply; the pending confirmation is preserved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", refusalErr)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+				return
+			}
+			if refusal != "" {
+				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
+				h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, memberWorkRefusalMessage(refusal))
 				return
 			}
 			h.logger.Info("apply-confirm: the reviewed target is already at the desired schema; running the confirmed plans of the targets that still need the change",

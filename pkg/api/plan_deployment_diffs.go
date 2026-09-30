@@ -43,6 +43,14 @@ type DeploymentPlanDiff struct {
 	Shards         []*ternv1.ShardPlan
 	LintViolations []*ternv1.LintViolation
 
+	// ExistingCopies are the unfinished copies on this member that applying its
+	// diff would continue or destroy. ExistingCopiesReported says the data plane
+	// looked: one that predates the disclosure leaves both unset, which is not
+	// the same as a clean target. The primary's entry leaves them unset too; its
+	// copies are disclosed on the reviewed plan itself.
+	ExistingCopies         []*ternv1.ExistingCopy
+	ExistingCopiesReported bool
+
 	// DirectExecution is the policy this member's diff was judged under. The
 	// member's stored plan records it, so the apply that dispatches this
 	// member runs its statements under the policy its verdicts were computed
@@ -189,6 +197,8 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].Changes = resp.Changes
 			results[i].Shards = resp.Shards
 			results[i].LintViolations = resp.LintViolations
+			results[i].ExistingCopies = resp.ExistingCopies
+			results[i].ExistingCopiesReported = resp.ExistingCopiesReported
 			// A diff that succeeded at the RPC layer but reported planning errors
 			// is not a trustworthy comparison input; block on it so the rollup
 			// never mistakes an incomplete diff for agreement.

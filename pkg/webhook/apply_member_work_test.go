@@ -5,7 +5,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/block/schemabot/pkg/api"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -86,4 +89,34 @@ func TestSameMemberWork(t *testing.T) {
 	finalized := plan(nil)
 	finalized.Namespaces["payments"].Finalize = true
 	assert.False(t, sameMemberWork(plan(nil), finalized), "a finalizer")
+}
+
+// A rollout member whose apply would discard an unfinished copy is named on the
+// work the PR apply reads, so the refusal tells the operator which target holds
+// the copy at stake.
+func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
+	work := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "payments",
+		TableChanges: []*ternv1.TableChange{{
+			Namespace:  "payments",
+			TableName:  "orders",
+			Ddl:        "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}}}
+	rollup := api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{
+		{Deployment: "primary", Target: "payments-001", Class: api.DeploymentPlanned},
+		{
+			Deployment: "primary", Target: "payments-002", Class: api.DeploymentPlanned, ChangeSet: work,
+			ExistingCopiesReported: true,
+			ExistingCopies:         []*ternv1.ExistingCopy{{Namespace: "payments", Disposition: "discard", Tables: []string{"orders"}}},
+		},
+	}}
+
+	got := memberWorkOf(&rollup)
+	assert.Equal(t, `target primary/payments-002: applying its plan discards the unfinished copy of orders in namespace "payments"`, got.copyAtStake)
+	assert.Equal(t, []string{"primary/payments-002"}, got.names)
+
+	rollup.Entries[1].ExistingCopies = nil
+	assert.Empty(t, memberWorkOf(&rollup).copyAtStake, "a member that reported a clean target puts nothing at stake")
 }

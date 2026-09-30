@@ -57,6 +57,10 @@ type memberWork struct {
 	// names are the members with work, the way an operator addresses them, in
 	// rollout order.
 	names []string
+	// copyAtStake names a member other than the primary whose apply would
+	// discard an unfinished copy, or could not say whether it would, and why.
+	// Empty when no member with work puts a copy at stake.
+	copyAtStake string
 }
 
 // memberWorkOf counts the work in a rollup. A nil rollup is one that was not
@@ -79,6 +83,9 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 		}
 	}
 	work.pending = len(work.names)
+	if at, reason := rollup.MemberCopyAtStake(); at >= 0 {
+		work.copyAtStake = fmt.Sprintf("target %s: %s", names[at], reason)
+	}
 	return work
 }
 

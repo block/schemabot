@@ -684,6 +684,12 @@ message PlanDiffResponse {
   // Per-shard membership and drift, populated for sharded engines. Empty for
   // single-endpoint engines.
   repeated ShardPlan shards = 5;
+  // Unfinished work already on the target that applying this diff's changes
+  // would continue or destroy, the same disclosures PlanResponse carries.
+  repeated ExistingCopy existing_copies = 6;
+  // Set by a data plane that reports existing_copies, so a caller can tell a
+  // clean target from a data plane that never looked.
+  bool existing_copies_reported = 7;
 }
 
 // ApplyRequest requests execution of a previously generated plan.

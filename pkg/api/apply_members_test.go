@@ -576,8 +576,9 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.
 
 // An apply created from a reviewed plan with no work gives every member one work
 // operation, so member work that needs another shape is refused rather than
-// settled as done. So is direct-execution DDL, whose consent is given against
-// a disclosure the empty reviewed plan does not carry.
+// settled as done. So are direct-execution DDL and unsafe changes, even under
+// the opt-in, whose consent is given against a disclosure the empty reviewed
+// plan does not carry.
 func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -617,11 +618,23 @@ func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *te
 			},
 			want: "runs table \"users\" as direct-execution DDL",
 		},
+		{
+			name: "unsafe change under the opt-in",
+			member: func() *storage.Plan {
+				return memberPlanWithChange(storage.TableChange{
+					Namespace: "testapp",
+					Table:     "users",
+					Operation: "drop",
+					DDL:       "DROP TABLE `users`",
+				})
+			},
+			want: "carries an unsafe change for table \"users\"",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{tc.member()}})
 
-			_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production"}, nil, "apply-converged-primary")
+			_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production"}, map[string]string{"allow_unsafe": "true"}, "apply-converged-primary")
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
 			assert.Contains(t, err.Error(), tc.want)

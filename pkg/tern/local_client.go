@@ -1701,6 +1701,11 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 		Changes:        changes,
 		LintViolations: violations,
 		Shards:         protoShards,
+		// A member's diff can become the plan an apply runs on that member, so
+		// it discloses the copies that apply would continue or destroy exactly
+		// as Plan does.
+		ExistingCopies:         c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
+		ExistingCopiesReported: true,
 	}, nil
 }
 

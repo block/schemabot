@@ -369,6 +369,21 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Debug("apply: the reviewed target has changes of its own; the rollout round is not consulted before locking",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
 	case rolloutRunsMemberWork(rollout, rolloutPreview):
+		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout)
+		if refusalErr != nil {
+			h.logger.Error("apply rejected: could not verify that the other targets' plans can run from this apply",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", refusalErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
+		}
+		if refusal != "" {
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, memberWorkRefusalMessage(refusal))
+			return false, nil
+		}
 		h.logger.Info("apply: the reviewed target is already at the desired schema; other targets' own plans will run once confirmed",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "targets_pending", rollout.work.pending, "targets", rollout.work.members,
