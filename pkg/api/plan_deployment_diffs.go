@@ -3,6 +3,9 @@ package api
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 
 	"golang.org/x/sync/errgroup"
 
@@ -28,6 +31,11 @@ type DeploymentPlanDiff struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
+
+	// SchemaFiles is the desired state this member was planned against: the
+	// request's schema files narrowed to the namespaces its targets entry
+	// selects. The member's stored plan records exactly these.
+	SchemaFiles map[string]*ternv1.SchemaFiles
 
 	Engine         ternv1.Engine
 	Changes        []*ternv1.SchemaChange
@@ -117,6 +125,20 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			continue
 		}
 
+		schemaFiles, err := memberSchemaFiles(req, target)
+		if err != nil {
+			s.logger.Warn("rollout member selects a namespace the schema files do not declare; deployment will block the review rollup",
+				"database", req.Database,
+				"environment", req.Environment,
+				"deployment", target.Deployment,
+				"target", target.Target,
+				"error", err)
+			metrics.RecordDeploymentDiff(ctx, req.Database, target.Deployment, req.Environment, "errored")
+			results[i].Err = err
+			continue
+		}
+		results[i].SchemaFiles = schemaFiles
+
 		g.Go(func() error {
 			directExecution, err := s.config.DirectExecutionPolicyFor(req.Database, req.Environment, target.DatabaseType)
 			if err != nil {
@@ -133,7 +155,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			}
 			results[i].DirectExecution = directExecution
 
-			resp, err := s.planDeploymentDiff(gctx, req, target, directExecution)
+			resp, err := s.planDeploymentDiff(gctx, req, target, schemaFiles, directExecution)
 			if err != nil {
 				s.logger.Warn("plan deployment diff failed; deployment will block the review rollup",
 					"database", req.Database,
@@ -188,7 +210,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 // planDeploymentDiff runs the non-persisting PlanDiff RPC against a single
 // deployment, building the per-target request the same way ExecutePlan builds
 // the primary's plan request.
-func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, target routing.ExecutionTarget, directExecution *storage.DirectExecutionPolicy) (*ternv1.PlanDiffResponse, error) {
+func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, target routing.ExecutionTarget, schemaFiles map[string]*ternv1.SchemaFiles, directExecution *storage.DirectExecutionPolicy) (*ternv1.PlanDiffResponse, error) {
 	client, err := s.TernClient(target.Deployment, req.Environment)
 	if err != nil {
 		return nil, fmt.Errorf("tern client for deployment %q environment %q: %w", target.Deployment, req.Environment, err)
@@ -201,7 +223,7 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 	ternReq := &ternv1.PlanRequest{
 		Database:    req.Database,
 		Type:        target.DatabaseType,
-		SchemaFiles: req.SchemaFiles,
+		SchemaFiles: schemaFiles,
 		Repository:  req.Repository,
 		Environment: req.Environment,
 		Target:      target.Target,
@@ -236,4 +258,32 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		return nil, fmt.Errorf("plan diff on deployment %q target %q: %w", target.Deployment, target.Target, err)
 	}
 	return resp, nil
+}
+
+// memberSchemaFiles returns the desired state one rollout member is planned
+// against: the request's schema files narrowed to the namespaces the member's
+// targets entry selects, or all of them when it selects none.
+//
+// The schema files declare the namespace set, and a selection can only narrow
+// it. A selected namespace the files do not carry is an error naming the member
+// rather than a plan without it: planning nothing for the namespace would read
+// as a target already converged on a schema no file describes.
+func memberSchemaFiles(req PlanRequest, member routing.ExecutionTarget) (map[string]*ternv1.SchemaFiles, error) {
+	if len(member.Namespaces) == 0 {
+		return req.SchemaFiles, nil
+	}
+	selected := make(map[string]*ternv1.SchemaFiles, len(member.Namespaces))
+	for _, namespace := range member.Namespaces {
+		files, ok := req.SchemaFiles[namespace]
+		if ok {
+			selected[namespace] = files
+			continue
+		}
+		if slices.Contains(req.IgnoredNamespaces, namespace) {
+			return nil, fmt.Errorf("database %q environment %q target %q selects namespace %q, which ignore_namespaces withholds from this plan; remove it from one of the two", req.Database, req.Environment, member.Target, namespace)
+		}
+		return nil, fmt.Errorf("database %q environment %q target %q selects namespace %q, which the schema files do not declare (declared: %s); a targets entry can only select namespaces the schema directory declares",
+			req.Database, req.Environment, member.Target, namespace, strings.Join(slices.Sorted(maps.Keys(req.SchemaFiles)), ", "))
+	}
+	return selected, nil
 }

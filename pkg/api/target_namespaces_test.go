@@ -1,0 +1,331 @@
+package api
+
+import (
+	"io"
+	"log/slog"
+	"maps"
+	"slices"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
+)
+
+const targetNamespacesConfig = `
+tern_deployments:
+  eu:
+    production: tern-eu:9090
+databases:
+  orders:
+    type: mysql
+    environments:
+      production:
+        deployment: eu
+        targets:
+          - orders-001
+          - target: orders-002
+            namespaces: [ns_2, ns_1]
+          - target: orders-003
+`
+
+// A targets entry is a bare target name or a mapping that selects which
+// declared namespaces live on the target. Members resolve in entry order and
+// each keeps its namespaces in the order they were written, which is the
+// fan-out order and the display order. A bare entry and a mapping without
+// namespaces both select nothing, so the target covers every declared
+// namespace.
+func TestParseServerConfig_TargetEntriesSelectNamespaces(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(targetNamespacesConfig))
+	require.NoError(t, err)
+
+	got, err := cfg.ResolveDatabaseTargets("orders", "production")
+	require.NoError(t, err)
+	assert.Equal(t, []routing.ExecutionTarget{
+		{DatabaseType: "mysql", Deployment: "eu", Target: "orders-001"},
+		{DatabaseType: "mysql", Deployment: "eu", Target: "orders-002", Namespaces: []string{"ns_2", "ns_1"}},
+		{DatabaseType: "mysql", Deployment: "eu", Target: "orders-003"},
+	}, got)
+	assert.Equal(t, "eu/orders-002", got[1].MemberID(), "the target stays the member; its namespaces are not part of its identity")
+}
+
+// The strict decoder's unknown-field check does not reach a custom
+// unmarshaler, so a misspelled key inside a mapping entry must still fail the
+// load. Accepting it would leave the target silently covering every namespace.
+func TestParseServerConfig_TargetEntryRejectsUnknownFields(t *testing.T) {
+	for name, entry := range map[string]string{
+		"misspelled namespaces": "- target: orders-002\n            namespace: [ns_1]",
+		"unrelated key":         "- target: orders-002\n            dsn: root@tcp(db)/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := `
+tern_deployments:
+  eu:
+    production: tern-eu:9090
+databases:
+  orders:
+    type: mysql
+    environments:
+      production:
+        deployment: eu
+        targets:
+          ` + entry + `
+`
+			_, err := ParseServerConfig([]byte(config))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not found in targets entry")
+		})
+	}
+
+	_, err := ParseServerConfig([]byte(`
+tern_deployments:
+  eu:
+    production: tern-eu:9090
+databases:
+  orders:
+    type: mysql
+    environments:
+      production:
+        deployment: eu
+        targets:
+          - [orders-001]
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "a targets entry must be a target name or a mapping")
+}
+
+// A selection is an enumerated list of names, each checked where the config
+// loads: empty, repeated, and delimiter-bearing names are refused, as is a
+// target listed twice even with different selections, since the target is
+// still the rollout member.
+func TestServerConfig_ValidateTargetNamespaces(t *testing.T) {
+	cases := []struct {
+		name       string
+		targets    []TargetEntry
+		wantErrSub string
+	}{
+		{
+			name:    "a selection on one target is accepted",
+			targets: []TargetEntry{{Target: "orders-001", Namespaces: []string{"ns_0"}}, {Target: "orders-002"}},
+		},
+		{
+			name:       "an explicitly empty selection is rejected",
+			targets:    []TargetEntry{{Target: "orders-001", Namespaces: []string{}}},
+			wantErrSub: `targets entry 0 "orders-001" namespaces list is empty`,
+		},
+		{
+			name:       "an empty namespace name is rejected",
+			targets:    []TargetEntry{{Target: "orders-001", Namespaces: []string{"ns_0", " "}}},
+			wantErrSub: `targets entry 0 "orders-001" namespaces entry 1 is empty`,
+		},
+		{
+			name:       "a namespace listed twice is rejected",
+			targets:    []TargetEntry{{Target: "orders-001", Namespaces: []string{"ns_0", "ns_0"}}},
+			wantErrSub: `lists namespace "ns_0" more than once`,
+		},
+		{
+			name:       "a namespace containing the operation key delimiter is rejected",
+			targets:    []TargetEntry{{Target: "orders-001", Namespaces: []string{"ns/0"}}},
+			wantErrSub: `namespaces entry 0 "ns/0" contains reserved delimiter "/"`,
+		},
+		{
+			name: "a target listed twice with different selections is rejected",
+			targets: []TargetEntry{
+				{Target: "orders-001", Namespaces: []string{"ns_0"}},
+				{Target: "orders-001", Namespaces: []string{"ns_1"}},
+			},
+			wantErrSub: `lists target "orders-001" more than once`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"orders": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+						"production": {Deployment: "eu", Targets: tc.targets},
+					}},
+				},
+				TernDeployments: TernConfig{"eu": {"production": "tern-eu:9090"}},
+			}
+			err := cfg.Validate()
+			if tc.wantErrSub == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErrSub)
+		})
+	}
+}
+
+func threeNamespaceRequest() PlanRequest {
+	files := func(table string) *ternv1.SchemaFiles {
+		return &ternv1.SchemaFiles{Files: map[string]string{table + ".sql": "CREATE TABLE `" + table + "` (id bigint primary key)"}}
+	}
+	return PlanRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{"ns_0": files("orders"), "ns_1": files("orders"), "ns_2": files("orders")},
+	}
+}
+
+// The schema files declare the namespace set and a selection only narrows it.
+// A namespace the files do not declare, or one ignore_namespaces withholds, is
+// an error naming the target and the namespace rather than a plan that
+// silently leaves it out.
+func TestMemberSchemaFiles(t *testing.T) {
+	req := threeNamespaceRequest()
+
+	all, err := memberSchemaFiles(req, routing.ExecutionTarget{Target: "orders-001"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ns_0", "ns_1", "ns_2"}, slices.Sorted(maps.Keys(all)), "a target selecting nothing covers every declared namespace")
+
+	selected, err := memberSchemaFiles(req, routing.ExecutionTarget{Target: "orders-002", Namespaces: []string{"ns_2", "ns_1"}})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ns_1", "ns_2"}, slices.Sorted(maps.Keys(selected)))
+	assert.Same(t, req.SchemaFiles["ns_1"], selected["ns_1"])
+	assert.Len(t, req.SchemaFiles, 3, "narrowing one member must not narrow the request the others are planned from")
+
+	_, err = memberSchemaFiles(req, routing.ExecutionTarget{Target: "orders-002", Namespaces: []string{"ns_1", "ns_9"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target "orders-002" selects namespace "ns_9", which the schema files do not declare (declared: ns_0, ns_1, ns_2)`)
+
+	req.IgnoredNamespaces = []string{"ns_3"}
+	_, err = memberSchemaFiles(req, routing.ExecutionTarget{Target: "orders-002", Namespaces: []string{"ns_3"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target "orders-002" selects namespace "ns_3", which ignore_namespaces withholds`)
+}
+
+func namespaceSelectionService(t *testing.T, client *mockTernClient, plans storage.PlanStore) *Service {
+	t.Helper()
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {Deployment: "eu", Targets: []TargetEntry{
+					{Target: "orders-001", Namespaces: []string{"ns_0"}},
+					{Target: "orders-002", Namespaces: []string{"ns_1", "ns_2"}},
+				}},
+			}},
+		},
+		TernDeployments: TernConfig{"eu": {"production": "tern-eu:9090"}},
+	}
+	return New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{"eu/production": client},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// The primary plans only the namespaces its entry selects, and its stored plan
+// records only those, so the apply created from it has nothing to run on a
+// namespace another target holds.
+func TestExecutePlan_PrimaryPlansOnlyItsSelectedNamespaces(t *testing.T) {
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary"}}
+	plans := &capturingPlanStore{}
+	svc := namespaceSelectionService(t, client, plans)
+
+	_, err := svc.ExecutePlan(t.Context(), threeNamespaceRequest())
+	require.NoError(t, err)
+
+	require.NotNil(t, client.planReq)
+	assert.Equal(t, "orders-001", client.planReq.Target)
+	assert.Equal(t, []string{"ns_0"}, slices.Sorted(maps.Keys(client.planReq.SchemaFiles)))
+	require.NotNil(t, plans.created)
+	assert.Equal(t, []string{"ns_0"}, slices.Sorted(maps.Keys(plans.created.SchemaFiles)))
+}
+
+// A non-primary member is diffed against, and stores, only its own selection.
+// A member selecting an undeclared namespace blocks the review rather than
+// reporting a clean plan for a namespace no schema file describes.
+func TestRollupReviewTimeDrift_MemberPlansOnlyItsSelectedNamespaces(t *testing.T) {
+	primary := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001"}
+	reviewed := &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}
+
+	t.Run("declared selection", func(t *testing.T) {
+		client := &mockTernClient{planDiffResp: &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}}
+		plans := &recordingPlanStore{}
+		svc := namespaceSelectionService(t, client, plans)
+
+		rollup, err := svc.RollupReviewTimeDrift(t.Context(), threeNamespaceRequest(), reviewed, primary)
+		require.NoError(t, err)
+		require.Len(t, rollup.Entries, 2)
+		assert.Equal(t, DeploymentPlanned, rollup.Entries[1].Class)
+
+		require.NotNil(t, client.planDiffReq)
+		assert.Equal(t, "orders-002", client.planDiffReq.Target)
+		assert.Equal(t, []string{"ns_1", "ns_2"}, slices.Sorted(maps.Keys(client.planDiffReq.SchemaFiles)))
+		require.Len(t, plans.created, 1)
+		assert.Equal(t, []string{"ns_1", "ns_2"}, slices.Sorted(maps.Keys(plans.created[0].SchemaFiles)))
+	})
+
+	t.Run("undeclared selection", func(t *testing.T) {
+		client := &mockTernClient{planDiffResp: &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}}
+		plans := &recordingPlanStore{}
+		svc := namespaceSelectionService(t, client, plans)
+		req := threeNamespaceRequest()
+		delete(req.SchemaFiles, "ns_2")
+
+		rollup, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewed, primary)
+		require.NoError(t, err)
+		assert.False(t, rollup.Clean)
+		require.Len(t, rollup.Entries, 2)
+		assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+		assert.ErrorContains(t, rollup.Entries[1].Err, `target "orders-002" selects namespace "ns_2"`)
+		assert.Nil(t, client.planDiffReq, "a member with an undeclared selection is never diffed")
+		assert.Empty(t, plans.created)
+	})
+}
+
+// A pull of every namespace asks a selecting target for its selection by name,
+// so the data plane never scans the cluster for it; a target selecting nothing
+// is still asked to discover its own. An explicitly requested namespace a
+// target does not select is left out of that target's pull.
+func TestMemberPullNamespaces(t *testing.T) {
+	svc := &Service{logger: slog.New(slog.DiscardHandler)}
+	req := pullRequest()
+	selecting := routing.ExecutionTarget{Deployment: "eu", Target: "orders-002", Namespaces: []string{"ns_2", "ns_1"}}
+
+	assert.Equal(t, []string{""}, svc.memberPullNamespaces(req, routing.ExecutionTarget{Target: "orders-001"}, []string{""}))
+	assert.Equal(t, []string{"ns_0"}, svc.memberPullNamespaces(req, routing.ExecutionTarget{Target: "orders-001"}, []string{"ns_0"}))
+	assert.Equal(t, []string{"ns_2", "ns_1"}, svc.memberPullNamespaces(req, selecting, []string{""}))
+	assert.Equal(t, []string{"ns_1"}, svc.memberPullNamespaces(req, selecting, []string{"ns_0", "ns_1"}))
+}
+
+// A target holding several namespaces can hold the same table in more than one
+// of them. Unsharded work is one operation per target, keyed by the target, and
+// each table's task carries its namespace, so two namespaces' orders tables are
+// two distinct tasks under one operation and no key collides.
+func TestBuildApplyOperationGroups_SameTableInTwoNamespacesOfOneTarget(t *testing.T) {
+	alter := "ALTER TABLE `orders` ADD COLUMN `note` varchar(64)"
+	applyPlan := primaryPlanRow("orders-001")
+	applyPlan.Namespaces = map[string]*storage.NamespacePlanData{
+		"ns_0": {Tables: []storage.TableChange{{Namespace: "ns_0", Table: "orders", DDL: alter, Operation: "alter"}}},
+		"ns_1": {Tables: []storage.TableChange{{Namespace: "ns_1", Table: "orders", DDL: alter, Operation: "alter"}}},
+	}
+	secondPlan := &storage.Plan{ID: 11, Deployment: "eu", Target: "orders-002", Namespaces: map[string]*storage.NamespacePlanData{
+		"ns_2": {Tables: []storage.TableChange{{Namespace: "ns_2", Table: "orders", DDL: alter, Operation: "alter"}}},
+	}}
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0", "ns_1"}}, Plan: applyPlan},
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "orders-002", Namespaces: []string{"ns_2"}}, Plan: secondPlan},
+	}
+
+	groups, sharded, err := buildApplyOperationGroups(applyPlan, applyTaskChanges(applyPlan), members, "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	assert.False(t, sharded)
+	require.Len(t, groups, 2)
+
+	assert.Equal(t, "orders-001", groups[0].Operation.OperationKey)
+	assert.Equal(t, "orders-002", groups[1].Operation.OperationKey)
+
+	tasks := make([]string, 0, len(groups[0].Tasks))
+	for _, task := range groups[0].Tasks {
+		tasks = append(tasks, task.Namespace+"."+task.TableName)
+	}
+	slices.Sort(tasks)
+	assert.Equal(t, []string{"ns_0.orders", "ns_1.orders"}, tasks)
+	require.Len(t, groups[1].Tasks, 1)
+	assert.Equal(t, "ns_2", groups[1].Tasks[0].Namespace)
+}
