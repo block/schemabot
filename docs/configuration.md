@@ -1322,7 +1322,10 @@ _DDL truncated to fit GitHub's comment size limit; the full plan is available fr
 
 Only terminal commands take the name. Commands a PR author comments on the
 PR, such as `schemabot plan` and `schemabot apply -e staging`, keep
-`schemabot`, the word the bot answers to. When omitted, hints start with
+`schemabot`, the word the bot answers to. Terminal commands also never
+carry `--tenant`: the tenant routes PR comments, and the CLI reaches a
+tenant deployment through its endpoint or profile, so a tenant deployment's
+`cli_name` names the wrapper that points there. When omitted, hints start with
 `schemabot`. The name must be a single line of at most 100 characters with no
 backtick and no leading or trailing whitespace, because it renders inside
 inline code.

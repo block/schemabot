@@ -192,14 +192,15 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			// Lock held by a different entity
 			h.logger.Info("apply blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 			h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-				Database:    database,
-				Environment: environment,
-				RequestedBy: requestedBy,
-				LockOwner:   existingLock.Owner,
-				LockRepo:    existingLock.Repository,
-				LockPR:      existingLock.PullRequest,
-				LockCreated: existingLock.CreatedAt,
-				CLIName:     h.cliName(),
+				Database:     database,
+				DatabaseType: dbType,
+				Environment:  environment,
+				RequestedBy:  requestedBy,
+				LockOwner:    existingLock.Owner,
+				LockRepo:     existingLock.Repository,
+				LockPR:       existingLock.PullRequest,
+				LockCreated:  existingLock.CreatedAt,
+				CLIName:      h.cliName(),
 			}))
 			return false, nil
 		}
@@ -822,14 +823,15 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if existingLock.Owner != lockOwner {
 		h.logger.Info("apply-confirm blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 		h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-			Database:    database,
-			Environment: environment,
-			RequestedBy: requestedBy,
-			LockOwner:   existingLock.Owner,
-			LockRepo:    existingLock.Repository,
-			LockPR:      existingLock.PullRequest,
-			LockCreated: existingLock.CreatedAt,
-			CLIName:     h.cliName(),
+			Database:     database,
+			DatabaseType: dbType,
+			Environment:  environment,
+			RequestedBy:  requestedBy,
+			LockOwner:    existingLock.Owner,
+			LockRepo:     existingLock.Repository,
+			LockPR:       existingLock.PullRequest,
+			LockCreated:  existingLock.CreatedAt,
+			CLIName:      h.cliName(),
 		}))
 		return false, nil
 	}

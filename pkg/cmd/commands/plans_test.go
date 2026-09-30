@@ -52,6 +52,8 @@ func TestCheckStoredPlanEnvironment(t *testing.T) {
 
 	require.NoError(t, checkStoredPlanEnvironment(plan, "staging"))
 	require.NoError(t, checkStoredPlanEnvironment(plan, ""), "no -e accepts the plan whatever its environment")
+	require.NoError(t, checkStoredPlanEnvironment(plan, "Staging"), "-e matches the stored environment in any case, as the list filter does")
+	require.NoError(t, checkStoredPlanEnvironment(plan, "STAGING"), "-e is folded the way storage folds the environment on write")
 
 	err := checkStoredPlanEnvironment(plan, "production")
 	require.Error(t, err)

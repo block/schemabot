@@ -3116,7 +3116,7 @@ A CLI session currently holds the lock for this database.
 **Locked by**: `cli:jackjackbits`
 **Since**: 2026-03-15 14:00:00 UTC
 
-Ask the lock holder to run `schemabot unlock -d testapp` from their CLI, or force-unlock with:
+Ask the lock holder to run `schemabot unlock -d testapp -t mysql` from their CLI, or force-unlock with:
 ```
 schemabot unlock -d testapp --force
 ```

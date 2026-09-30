@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // PlansCmd lists recently generated plans, or shows one stored plan's content.
@@ -133,8 +134,11 @@ func showStoredPlan(endpoint, planID, environment string, outputJSON bool) error
 // checkStoredPlanEnvironment refuses a stored plan made for an environment
 // other than the one -e named, so a plan pasted against the wrong environment
 // is never read as that environment's plan. An empty environment accepts any.
+// Both sides are folded before comparing, the way storage folds the environment
+// on write and the list filter folds -e, so "-e Staging" matches a plan stored
+// as "staging" here exactly as it does in the list.
 func checkStoredPlanEnvironment(plan *apitypes.StoredPlanResponse, environment string) error {
-	if environment == "" || plan.Environment == environment {
+	if environment == "" || storage.CanonicalKey(plan.Environment) == storage.CanonicalKey(environment) {
 		return nil
 	}
 	return fmt.Errorf("plan %s was made for environment %q, not %q; rerun with -e %s", plan.PlanID, plan.Environment, environment, plan.Environment)

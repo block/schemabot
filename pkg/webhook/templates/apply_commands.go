@@ -330,13 +330,25 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	fmt.Fprintf(&sb, "**Since**: %s\n\n", data.LockCreated.UTC().Format("2006-01-02 15:04:05 UTC"))
 
 	if isCLI {
-		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, "unlock -d "+data.Database))
+		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
 		fmt.Fprintf(&sb, "```\nschemabot unlock -d %s --force\n```\n", data.Database)
 	} else {
 		sb.WriteString("Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.\n")
 	}
 
 	return offerSupportChannel(sb.String())
+}
+
+// cliUnlockArgs renders the CLI unlock arguments for the lock on database.
+// Locks are keyed by database and type, and the CLI's unlock defaults -t to
+// mysql, so the type is named whenever it is known: without it, a hint for a
+// PostgreSQL or Vitess lock would miss the lock it names.
+func cliUnlockArgs(database, databaseType string) string {
+	args := "unlock -d " + database
+	if databaseType != "" {
+		args += " -t " + databaseType
+	}
+	return args
 }
 
 // RenderApplyInProgress renders a comment when the same PR already has an active apply.

@@ -197,13 +197,16 @@ func TestRenderRollbackMissingApplyIDCLIName(t *testing.T) {
 	assert.NotContains(t, rendered, "acme schemabot rollback")
 }
 
-// On a tenant deployment, the missing-apply-ID usage hints must carry the
-// deployment's tenant so pasting them addresses this deployment.
+// On a tenant deployment, the missing-apply-ID rollback usage hints must carry
+// the deployment's tenant so pasting them addresses this deployment. The status
+// lookup is a CLI command, and the CLI has no --tenant flag, so it must not
+// carry one or the pasted command is rejected.
 func TestRenderRollbackMissingApplyIDTenant(t *testing.T) {
 	rendered := RenderRollbackMissingApplyID("", "", "acme")
 	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> --tenant acme`")
 	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment> --tenant acme`")
-	assert.Contains(t, rendered, "`schemabot status -e <environment> --tenant acme`")
+	assert.Contains(t, rendered, "or by running `schemabot status -e <environment>`.")
+	assert.NotContains(t, rendered, "status -e <environment> --tenant")
 }
 
 func TestRenderRollbackApplyNotFound(t *testing.T) {
