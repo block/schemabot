@@ -829,7 +829,11 @@ without completing the request would refuse the start the hold exists to preserv
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
-storage parity suite (`pkg/storage/storagetest/apply_operations.go`), and the rollout state derivation
+storage parity suite (`pkg/storage/storagetest/apply_operations.go`); for a manually deferred cutover, the turn
+check `CutoverBlocker` (same file, sharing the automatic cutover claim's
+`earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
+(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
+(`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`), through which every
 projection builds its children, with `completeLandedStopForHeldOpenApply` and `RolloutHeldByResumableChild` keeping a held-open
@@ -1118,7 +1122,10 @@ a consumer that will never come. A release against a rollout that is not paused 
 cutover while one is already in flight are both refused at intake. Its effect is also scoped to
 the one change it targets: an incident-time tuning, or one operation's completion, never bleeds
 onto sibling operations or future applies. *Enforced:* queue-time eligibility gates and
-operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`).
+operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`); a cutover
+request on an ordered rollout is bound at intake to the member whose turn it is
+(`cutoverTurnForRequest`, `pkg/api/control_handlers.go`), and only that member's drive takes it
+(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`).
 
 ### CO-7: ID namespaces are never conflated
 
