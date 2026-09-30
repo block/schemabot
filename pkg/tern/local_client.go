@@ -2919,7 +2919,12 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 
 	now := time.Now()
 	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
+	// The attached operation names the plan it was dispatched with. The apply
+	// names only the plan of the dispatch that created it, and a rollout member
+	// target attaching here was planned against its own live schema, so a drive
+	// that fell back to the apply's plan would run another target's DDL.
 	operation := &storage.ApplyOperation{
+		PlanID:        plan.ID,
 		Deployment:    c.config.Database,
 		OperationKey:  operationKey,
 		OperationKind: operationKind,
@@ -3363,13 +3368,29 @@ func (c *LocalClient) progressScopeOperation(ctx context.Context, apply *storage
 	return op, nil
 }
 
+// notAnOperationOfApplyError is applyOperationOfApply's answer that the id a
+// request names is not one of the apply's operations: it does not parse,
+// names no operation, or names another apply's. It is the caller's to refuse,
+// unlike a failure to read storage, which decides nothing about the id.
+type notAnOperationOfApplyError struct{ reason string }
+
+func (e *notAnOperationOfApplyError) Error() string { return e.reason }
+
+// isNotAnOperationOfApply reports whether err says the id a request names is
+// not one of the apply's operations.
+func isNotAnOperationOfApply(err error) bool {
+	var target *notAnOperationOfApplyError
+	return errors.As(err, &target)
+}
+
 // applyOperationOfApply loads the operation a control or progress request
 // names by the apply_operation_id a dispatch returned, and refuses an id that
-// does not belong to the apply the request addresses.
+// does not belong to the apply the request addresses with a
+// notAnOperationOfApplyError. Any other error is a failure to find out.
 func (c *LocalClient) applyOperationOfApply(ctx context.Context, apply *storage.Apply, applyOperationID string) (*storage.ApplyOperation, error) {
 	id, err := strconv.ParseInt(applyOperationID, 10, 64)
 	if err != nil || id <= 0 {
-		return nil, fmt.Errorf("apply_operation_id %q is not an operation id", applyOperationID)
+		return nil, &notAnOperationOfApplyError{reason: fmt.Sprintf("apply_operation_id %q is not an operation id", applyOperationID)}
 	}
 	store := c.storage.ApplyOperations()
 	if store == nil {
@@ -3380,10 +3401,10 @@ func (c *LocalClient) applyOperationOfApply(ctx context.Context, apply *storage.
 		return nil, fmt.Errorf("load apply_operation %d: %w", id, err)
 	}
 	if op == nil {
-		return nil, fmt.Errorf("apply_operation %d does not exist", id)
+		return nil, &notAnOperationOfApplyError{reason: fmt.Sprintf("apply_operation %d does not exist", id)}
 	}
 	if op.ApplyID != apply.ID {
-		return nil, fmt.Errorf("apply_operation %d belongs to another apply, not %s", id, apply.ApplyIdentifier)
+		return nil, &notAnOperationOfApplyError{reason: fmt.Sprintf("apply_operation %d belongs to another apply, not %s", id, apply.ApplyIdentifier)}
 	}
 	return op, nil
 }

@@ -252,7 +252,12 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		return taskFailed
 	}
 	if needsFiles {
-		plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		planID, err := planIDForTasks(apply, []*storage.Task{task})
+		if err != nil {
+			c.markTaskFailed(ctx, task, fmt.Sprintf("resolve desired schema plan for row security apply: %v", err))
+			return taskFailed
+		}
+		plan, err := c.storage.Plans().GetByID(ctx, planID)
 		if err != nil {
 			c.markTaskFailed(ctx, task, fmt.Sprintf("load desired schema for row security apply: %v", err))
 			return taskFailed
@@ -962,9 +967,13 @@ func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.A
 		}
 		return taskFailed, nil
 	}
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := planIDForTasks(apply, []*storage.Task{task})
 	if err != nil {
-		return taskContinue, fmt.Errorf("load plan for apply %s to verify target schema for task %s: %w", apply.ApplyIdentifier, task.TaskIdentifier, err)
+		return taskContinue, fmt.Errorf("resolve plan to verify target schema for task %s: %w", task.TaskIdentifier, err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
+	if err != nil {
+		return taskContinue, fmt.Errorf("load plan %d for apply %s to verify target schema for task %s: %w", planID, apply.ApplyIdentifier, task.TaskIdentifier, err)
 	}
 	if plan == nil {
 		return taskContinue, fmt.Errorf("plan not found for apply %s while verifying target schema for task %s", apply.ApplyIdentifier, task.TaskIdentifier)

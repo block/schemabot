@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -240,4 +242,139 @@ func TestLocalClient_BoundCutoverSettlesOnceItsMemberHasEnded(t *testing.T) {
 			assert.Equal(t, tc.want, fx.controlRequests.requests[0].Status)
 		})
 	}
+}
+
+// A cutover naming payments-002's operation while storage cannot be read is a
+// failure to decide, not a refusal: the caller gets an error it can retry and
+// no request is recorded, where a refusal would tell the operator the
+// operation does not exist. An id that names no operation of the apply is
+// still refused.
+func TestLocalClient_CutoverThatCannotReadItsOperationIsAnErrorNotARefusal(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Running, state.ApplyOperation.WaitingForCutover, state.Task.Running, state.Task.WaitingForCutover)
+	cutover := func(operationID string) (*ternv1.CutoverResponse, error) {
+		return fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "cli:alice", ApplyOperationId: operationID})
+	}
+
+	unknown, err := cutover("77")
+	require.NoError(t, err)
+	require.NotNil(t, unknown)
+	assert.False(t, unknown.Accepted)
+	assert.Equal(t, "cutover names an operation this apply does not have: apply_operation 77 does not exist", unknown.ErrorMessage)
+
+	fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore).err = errors.New("storage read timed out")
+	resp, err := cutover("12")
+	require.Error(t, err, "a storage failure must reach the caller as an error it can retry")
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "resolve the operation a cutover of apply apply-shared-deployment names")
+	assert.Contains(t, err.Error(), "storage read timed out")
+	assert.Empty(t, fx.controlRequests.requests, "neither call records a request")
+}
+
+// payments-002 is parked at its cutover with an acknowledged cutover bound to
+// it when the shared apply goes into recovery after a restart. Its drive
+// leaves the request pending rather than failing it on the cutover path's
+// recovering refusal, and takes it once recovery has finished, so the
+// operator never re-issues a cutover that was already acknowledged.
+func TestLocalClient_BoundCutoverWaitsForTheApplyToRecover(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover, state.Task.WaitingForCutover)
+	fx.apply.State = state.Apply.Recovering
+	fx.controlRequests.requests = []*storage.ApplyControlRequest{{
+		ID: 1, ApplyID: fx.apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+		RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(fx.second.ID),
+	}}
+
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.Empty(t, fx.engine.cutoverContexts, "nothing swaps while the apply is recovering")
+	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status, "the acknowledged cutover must wait for recovery, not fail")
+
+	fx.apply.State = state.Apply.WaitingForCutover
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "the bound member swaps once recovery has finished")
+	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
+}
+
+// plansByIDStore answers GetByID for the plans it holds, and nil for any
+// other id, recording every id asked for.
+type plansByIDStore struct {
+	storage.PlanStore
+	plans     map[int64]*storage.Plan
+	requested []int64
+}
+
+func (s *plansByIDStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	s.requested = append(s.requested, id)
+	return s.plans[id], nil
+}
+
+// memberPlanOnly stores only plan 8, the plan payments-002's tasks were built
+// from, while the apply they attached to names plan 7, the plan of the target
+// dispatched first.
+func memberPlanOnly(client *LocalClient, tasks ...*storage.Task) *plansByIDStore {
+	for _, task := range tasks {
+		task.PlanID = 8
+	}
+	plans := &plansByIDStore{plans: map[int64]*storage.Plan{8: {ID: 8, Target: "payments-002", SchemaFiles: schema.SchemaFiles{}}}}
+	client.storage.(*exactProgressStorage).plans = plans
+	return plans
+}
+
+// payments-002 attached its grouped work to the apply payments-001's dispatch
+// created, so the apply names payments-001's plan. When the engine loses
+// payments-002's work, the drive verifies the target against the schema set
+// payments-002's tasks were built from, never payments-001's.
+func TestPollForCompletionAtomic_LostEngineWorkVerifiesAgainstTheTasksOwnPlan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StatePending}}},
+		planResult:          &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+	plans := memberPlanOnly(client, tasks...)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, []int64{8}, plans.requested, "the verification loads the plan the tasks were built from")
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Completed, task.State, "table %s", task.TableName)
+	}
+}
+
+// The sequential counterpart: payments-002's lost task is verified against its
+// own plan, not the plan of the apply it attached to.
+func TestPollTaskToCompletion_LostEngineWorkVerifiesAgainstTheTasksOwnPlan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StatePending}}},
+		planResult:          &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+	task.Shard = ""
+	plans := memberPlanOnly(client, task)
+
+	assert.Equal(t, taskContinue, client.pollTaskToCompletion(t.Context(), apply, task, nil, nil))
+
+	assert.Equal(t, []int64{8}, plans.requested, "the verification loads the plan the task was built from")
+	assert.Equal(t, state.Task.Completed, task.State)
+}
+
+// Tasks built from different plans are never judged against one of them, and
+// tasks that record no plan are judged against the apply's.
+func TestPlanIDForTasks(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-shared-deployment", PlanID: 7}
+	task := func(planID int64) *storage.Task { return &storage.Task{PlanID: planID} }
+
+	got, err := planIDForTasks(apply, []*storage.Task{task(8), task(8)})
+	require.NoError(t, err)
+	assert.Equal(t, int64(8), got)
+
+	got, err = planIDForTasks(apply, []*storage.Task{task(0)})
+	require.NoError(t, err)
+	assert.Equal(t, int64(7), got)
+
+	_, err = planIDForTasks(apply, []*storage.Task{task(8), task(9)})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tasks of apply apply-shared-deployment were built from different plans (8 and 9)")
+
+	_, err = planIDForTasks(&storage.Apply{ApplyIdentifier: "apply-without-plan"}, []*storage.Task{task(0)})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither the tasks nor apply apply-without-plan name a plan")
 }

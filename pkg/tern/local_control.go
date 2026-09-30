@@ -59,8 +59,11 @@ func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverReq
 func (c *LocalClient) cutoverRequestOperation(ctx context.Context, apply *storage.Apply, applyOperationID string) (bound *storage.ApplyOperation, refusal string, err error) {
 	if applyOperationID != "" {
 		op, err := c.applyOperationOfApply(ctx, apply, applyOperationID)
-		if err != nil {
+		if isNotAnOperationOfApply(err) {
 			return nil, fmt.Sprintf("cutover names an operation this apply does not have: %v", err), nil
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("resolve the operation a cutover of apply %s names: %w", apply.ApplyIdentifier, err)
 		}
 		return op, "", nil
 	}
@@ -2442,8 +2445,20 @@ func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storag
 
 // takeBoundCutoverRequest cuts over the one operation a pending request is
 // bound to, from that operation's own drive, and settles the request with the
-// outcome. It follows the unbound path's stop and not-ready handling.
+// outcome. It follows the unbound path's recovery wait and its stop and
+// not-ready handling. The apply-state verdicts the unbound path settles on are
+// not this request's to read: the members sharing the apply end on their own,
+// so the bound operation's own state (see boundCutoverRequestTurn) decides
+// whether the request can still apply.
 func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) error {
+	if state.IsState(apply.State, state.Apply.Recovering) {
+		// The cutover path refuses a recovering apply, and settling the
+		// request on that refusal would fail an acknowledged cutover the
+		// operator then has to re-issue. It waits for recovery instead.
+		logger.Info("pending cutover request is waiting for recovery to complete",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "state", apply.State)
+		return nil
+	}
 	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {

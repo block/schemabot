@@ -475,6 +475,23 @@ func TestLocalClient_Apply_MemberTargetsShareTheDeploymentsApply(t *testing.T) {
 	assert.Equal(t, "payments-001", byKey["payments-001"].Target)
 	assert.Equal(t, "payments-002", byKey["payments-002"].Target)
 
+	// The apply names the plan of the target dispatched first. Each target's
+	// drive runs the plan its own operation names, so payments-002 runs
+	// payments-002's plan and never payments-001's.
+	firstPlan, err := stor.Plans().Get(ctx, firstPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, firstPlan)
+	secondPlan, err := stor.Plans().Get(ctx, secondPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, secondPlan)
+	require.Equal(t, firstPlan.ID, apply.PlanID, "the apply names the plan of the dispatch that created it")
+	for target, wantPlan := range map[string]*storage.Plan{"payments-001": firstPlan, "payments-002": secondPlan} {
+		drivesPlan, err := client.drivePlanID(apply, byKey[target])
+		require.NoError(t, err)
+		assert.Equal(t, wantPlan.ID, drivesPlan, "%s's drive must run %s", target, wantPlan.PlanIdentifier)
+	}
+	assert.Equal(t, secondPlan.ID, byKey["payments-002"].PlanID, "the attached operation records the plan it was dispatched with")
+
 	replay, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlanID, key, "payments-002"))
 	require.NoError(t, err)
 	require.True(t, replay.Accepted, "replay must be accepted: %s", replay.ErrorMessage)

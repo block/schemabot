@@ -1261,9 +1261,13 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 	if len(unverified) == 0 {
 		return settled, nil
 	}
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := planIDForTasks(apply, unverified)
 	if err != nil {
-		return settled, fmt.Errorf("load plan for apply %s to verify target schema: %w", apply.ApplyIdentifier, err)
+		return settled, fmt.Errorf("resolve plan to verify target schema: %w", err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
+	if err != nil {
+		return settled, fmt.Errorf("load plan %d for apply %s to verify target schema: %w", planID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
 		return settled, fmt.Errorf("plan not found for apply %s while verifying target schema", apply.ApplyIdentifier)
