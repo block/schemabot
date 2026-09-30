@@ -280,6 +280,33 @@ func TestPullMemberDivergence_PrimaryMissingFromMembersFailsThePull(t *testing.T
 	assert.Contains(t, err.Error(), "eu/testapp-001, eu/testapp-002", "the error names the members it did resolve")
 }
 
+// The primary was pulled for the namespaces its entry selected in the caller's
+// read. A reload that keeps the target but re-places its namespaces would
+// compare that schema with members pulled under the new placement, so the pull
+// fails instead of reporting the comparison.
+func TestPullMemberDivergence_PrimarySelectionChangedFailsThePull(t *testing.T) {
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-002": pulledTables(map[string]string{"users": pullUsersDDL}),
+	}, nil)
+	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	pulledUnder := routing.ExecutionTarget{
+		Deployment:   "eu",
+		Target:       "testapp-001",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Namespaces:   []string{"testapp"},
+	}
+
+	_, err := svc.pullMemberDivergence(t.Context(), pullRequest(), pulledUnder,
+		pulledTables(map[string]string{"users": pullUsersDDL}), []string{"testapp"},
+		ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pulled the primary eu/testapp-001 for namespaces [testapp], but it now selects []")
+	assert.Empty(t, client.pulledTargets(), "no member is pulled once the placement is known to have moved")
+}
+
 // A target that cannot be pulled fails the request. Returning the primary's
 // schema with that target simply absent would report the environment as
 // converged on the strength of a comparison that never happened.

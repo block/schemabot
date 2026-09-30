@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 
@@ -45,6 +46,14 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 	planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("resolve member planning for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	// Every declared namespace must be held by some member. One that no targets
+	// entry selects has no plan anywhere, so the rollout would read converged
+	// while that namespace's schema change never runs.
+	if uncovered := uncoveredNamespaces(req, targets); len(uncovered) > 0 {
+		return PlanRollup{}, fmt.Errorf("database %q environment %q declares namespaces [%s] that no targets entry selects; select each on the target that holds it, or list it in ignore_namespaces to keep it out of the rollout",
+			req.Database, req.Environment, strings.Join(uncovered, ", "))
 	}
 
 	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryMember, targets)

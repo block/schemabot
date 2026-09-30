@@ -225,6 +225,13 @@ func (s *Service) pullMemberDivergence(
 		return nil, fmt.Errorf("pull for %s/%s resolves rollout members %s, which do not include the primary %s the schema was pulled from; the environment's routing changed during the pull, so re-run it",
 			req.Database, req.Environment, memberIDs(targets), primary.MemberID())
 	}
+	// The primary was pulled for the namespaces its entry selected in the
+	// caller's read. A reload that re-placed them would compare that schema with
+	// members pulled under the new placement, so it fails the same way.
+	if current := memberNamespaces(targets, primary); !slices.Equal(current, primary.Namespaces) {
+		return nil, fmt.Errorf("pull for %s/%s pulled the primary %s for namespaces [%s], but it now selects [%s]; the environment's placement changed during the pull, so re-run it",
+			req.Database, req.Environment, primary.MemberID(), strings.Join(primary.Namespaces, ", "), strings.Join(current, ", "))
+	}
 
 	dialect := schema.DialectForDatabaseType(primary.DatabaseType)
 	parser, err := ddl.ParserForDialect(dialect)
@@ -290,6 +297,17 @@ func containsMember(targets []routing.ExecutionTarget, want routing.ExecutionTar
 	return slices.ContainsFunc(targets, func(target routing.ExecutionTarget) bool {
 		return target.MemberID() == want.MemberID()
 	})
+}
+
+// memberNamespaces returns the namespace selection one member has in a member
+// set. The caller has already checked that the member is present.
+func memberNamespaces(targets []routing.ExecutionTarget, want routing.ExecutionTarget) []string {
+	for _, target := range targets {
+		if target.MemberID() == want.MemberID() {
+			return target.Namespaces
+		}
+	}
+	return nil
 }
 
 // memberIDs names a member set for an error message.

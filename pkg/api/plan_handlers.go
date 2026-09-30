@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -871,6 +872,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	// targets, so the deployment alone does not identify the member.
 	planResp.Deployment = deployment
 	planResp.Target = resolvedTarget.Target
+	planResp.SelectedNamespaces = slices.Clone(resolvedTarget.Namespaces)
 	return resp, planResp, nil
 }
 

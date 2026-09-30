@@ -354,8 +354,9 @@ Rules:
 - `namespaces` is an enumerated list of names, not a pattern. When present it MUST contain at least one entry; each entry must be non-empty, listed once within the entry, and free of `/`.
 - The target is still the rollout member, so a target may not be listed twice even with different `namespaces`.
 - A selected namespace the schema files do not declare, or one `ignore_namespaces` withholds, is an error at plan time that names the target and the namespace. For the primary target it fails the plan; for any other target it blocks the review.
+- Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects blocks the review, since no target would plan or apply it. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.
 
-`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the same schema. What differs is what a difference between members means when one is found.
+`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the schema the files describe for it: every declared namespace, or, for a target whose entry selects namespaces, only those. What differs is what a difference between members means when one is found.
 
 The deployments of one environment are mirrors, so a difference between them is a fault: the plan under review was not written for the member that disagrees, and the check blocks rather than apply it.
 

@@ -226,8 +226,9 @@ func TestExecutePlan_PrimaryPlansOnlyItsSelectedNamespaces(t *testing.T) {
 	plans := &capturingPlanStore{}
 	svc := namespaceSelectionService(t, client, plans)
 
-	_, err := svc.ExecutePlan(t.Context(), threeNamespaceRequest())
+	resp, err := svc.ExecutePlan(t.Context(), threeNamespaceRequest())
 	require.NoError(t, err)
+	assert.Equal(t, []string{"ns_0"}, resp.SelectedNamespaces, "the response records the selection the rollup checks the primary against")
 
 	require.NotNil(t, client.planReq)
 	assert.Equal(t, "orders-001", client.planReq.Target)
@@ -240,7 +241,7 @@ func TestExecutePlan_PrimaryPlansOnlyItsSelectedNamespaces(t *testing.T) {
 // A member selecting an undeclared namespace blocks the review rather than
 // reporting a clean plan for a namespace no schema file describes.
 func TestRollupReviewTimeDrift_MemberPlansOnlyItsSelectedNamespaces(t *testing.T) {
-	primary := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001"}
+	primary := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
 	reviewed := &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}
 
 	t.Run("declared selection", func(t *testing.T) {
@@ -276,6 +277,53 @@ func TestRollupReviewTimeDrift_MemberPlansOnlyItsSelectedNamespaces(t *testing.T
 		assert.Nil(t, client.planDiffReq, "a member with an undeclared selection is never diffed")
 		assert.Empty(t, plans.created)
 	})
+}
+
+// A declared namespace that no targets entry selects would be planned and
+// applied nowhere while every member's plan read clean, so the rollup blocks
+// before any member is diffed or stored. A member selecting nothing holds every
+// declared namespace, so its presence covers the whole set.
+func TestRollupReviewTimeDrift_UncoveredNamespaceBlocks(t *testing.T) {
+	primary := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
+	reviewed := &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}
+	client := &mockTernClient{planDiffResp: &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}}
+	plans := &recordingPlanStore{}
+	svc := namespaceSelectionService(t, client, plans)
+	req := threeNamespaceRequest()
+	req.SchemaFiles["ns_3"] = req.SchemaFiles["ns_0"]
+
+	_, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewed, primary)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "orders" environment "production" declares namespaces [ns_3] that no targets entry selects`)
+	assert.Nil(t, client.planDiffReq, "no member is diffed while a namespace is unplaced")
+	assert.Empty(t, plans.created, "no member plan is stored while a namespace is unplaced")
+
+	assert.Empty(t, uncoveredNamespaces(req, []routing.ExecutionTarget{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002"},
+	}), "a member selecting nothing covers every declared namespace")
+	assert.Equal(t, []string{"ns_1", "ns_3"}, uncoveredNamespaces(req, []routing.ExecutionTarget{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_2"}},
+	}))
+}
+
+// The reviewed primary plan covers the namespaces its entry selected when it
+// was planned. A config reloaded before the rollup with a different selection
+// for the same target would pair that plan with members placed under the new
+// one, so the rollup fails closed rather than trusting the target name alone.
+func TestRollupReviewTimeDrift_PrimarySelectionChangedFailsClosed(t *testing.T) {
+	plannedUnder := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0", "ns_1"}}
+	reviewed := &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}
+	client := &mockTernClient{planDiffResp: &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}}
+	plans := &recordingPlanStore{}
+	svc := namespaceSelectionService(t, client, plans)
+
+	_, err := svc.RollupReviewTimeDrift(t.Context(), threeNamespaceRequest(), reviewed, plannedUnder)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rollout member eu/orders-001 now selects namespaces [ns_0] but the reviewed plan was created for [ns_0, ns_1]")
+	assert.Nil(t, client.planDiffReq)
+	assert.Empty(t, plans.created)
 }
 
 // A pull of every namespace asks a selecting target for its selection by name,

@@ -94,6 +94,14 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 		if targets[0].Deployment != primaryMember.Deployment || targets[0].Target != primaryMember.Target {
 			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the reviewed plan was created against %q", req.Database, req.Environment, targets[0].MemberID(), primaryMember.MemberID())
 		}
+		// The reviewed plan covers only the namespaces the primary selected when
+		// it was planned. A config reloaded since then with a different selection
+		// would pair that plan with members planned under the new placement,
+		// leaving a namespace in neither or in both, so it fails closed too.
+		if !slices.Equal(targets[0].Namespaces, primaryMember.Namespaces) {
+			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout member %s now selects namespaces [%s] but the reviewed plan was created for [%s]; the environment's placement changed since the plan, so re-run it",
+				req.Database, req.Environment, primaryMember.MemberID(), strings.Join(targets[0].Namespaces, ", "), strings.Join(primaryMember.Namespaces, ", "))
+		}
 	}
 
 	results := make([]DeploymentPlanDiff, len(targets))
@@ -286,4 +294,31 @@ func memberSchemaFiles(req PlanRequest, member routing.ExecutionTarget) (map[str
 			req.Database, req.Environment, member.Target, namespace, strings.Join(slices.Sorted(maps.Keys(req.SchemaFiles)), ", "))
 	}
 	return selected, nil
+}
+
+// uncoveredNamespaces returns the declared namespaces no rollout member holds,
+// in sorted order. A member selecting nothing holds every declared namespace,
+// so any such member covers the whole set.
+//
+// The selections only narrow what each member plans, so a namespace every
+// entry leaves out would be planned and applied nowhere while each member's
+// plan read clean. A namespace deliberately kept out of the rollout belongs in
+// ignore_namespaces, which removes it from the declared set before this runs.
+func uncoveredNamespaces(req PlanRequest, targets []routing.ExecutionTarget) []string {
+	covered := make(map[string]bool)
+	for _, target := range targets {
+		if len(target.Namespaces) == 0 {
+			return nil
+		}
+		for _, namespace := range target.Namespaces {
+			covered[namespace] = true
+		}
+	}
+	var uncovered []string
+	for _, namespace := range slices.Sorted(maps.Keys(req.SchemaFiles)) {
+		if !covered[namespace] {
+			uncovered = append(uncovered, namespace)
+		}
+	}
+	return uncovered
 }

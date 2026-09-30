@@ -17,6 +17,19 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// plannedPrimaryMember is the rollout member a primary plan was created
+// against, as the plan response recorded it: the deployment and target, and
+// the namespaces the target's entry selected. The rollup checks all three
+// against its own resolution, so a config reloaded between the plan and the
+// rollup fails closed instead of pairing this plan with a different placement.
+func plannedPrimaryMember(planResp *apitypes.PlanResponse) routing.ExecutionTarget {
+	return routing.ExecutionTarget{
+		Deployment: planResp.Deployment,
+		Target:     planResp.Target,
+		Namespaces: planResp.SelectedNamespaces,
+	}
+}
+
 // reviewTimeDrift computes the review-time drift rollup for a database and
 // environment and turns it into the check-record outcome plus the preview
 // rendering of that rollup.

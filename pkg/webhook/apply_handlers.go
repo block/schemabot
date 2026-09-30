@@ -9,7 +9,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -355,7 +354,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// speaks only for the primary where members hold schemas of their own, so
 	// the other members are planned first and their work, if any, answers.
 	if !planResp.HasChanges() {
-		rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+		rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 		if rolloutStillPending(rollout) {
 			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
 			return false, nil
