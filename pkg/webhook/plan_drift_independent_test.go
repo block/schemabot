@@ -231,19 +231,25 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 // reviewed target's does not, because the verdict belongs to the target that
 // runs it. That write-blocking DDL is disclosed under the target that carries
 // it, the way the reviewed plan's own direct changes are, and once rather than
-// again plan-wide.
+// again plan-wide. The verdict is matched the way apply admission matches it,
+// ignoring case, so a verdict spelled in another case that runs directly is
+// disclosed too.
 func TestReviewDriftComment_IndependentDisclosesDirectMember(t *testing.T) {
-	diffs := []api.DeploymentPlanDiff{
-		independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false),
-		independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false),
-	}
-	direct := diffs[1].Changes[0].TableChanges[0]
-	direct.ExecutionMode = engine.ExecutionModeDirect
-	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
+	for _, mode := range []string{engine.ExecutionModeDirect, strings.ToUpper(engine.ExecutionModeDirect)} {
+		t.Run(mode, func(t *testing.T) {
+			diffs := []api.DeploymentPlanDiff{
+				independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false),
+				independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false),
+			}
+			direct := diffs[1].Changes[0].TableChanges[0]
+			direct.ExecutionMode = mode
+			direct.ModeReason = "table is 12 MiB, within the direct execution bound"
 
-	rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
-	require.True(t, rollup.Clean)
-	assert.Contains(t, out, "**target `commerce/orders-002`**\n\n```sql\nALTER TABLE `orders` ADD COLUMN `phone` varchar(32);\n```\n\n⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit\n- `orders`: table is 12 MiB, within the direct execution bound\n",
-		"the direct change is disclosed under the target and DDL that carry it")
-	assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the target that runs nothing directly carries no disclosure")
+			rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
+			require.True(t, rollup.Clean)
+			assert.Contains(t, out, "**target `commerce/orders-002`**\n\n```sql\nALTER TABLE `orders` ADD COLUMN `phone` varchar(32);\n```\n\n⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit\n- `orders`: table is 12 MiB, within the direct execution bound\n",
+				"the direct change is disclosed under the target and DDL that carry it")
+			assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the target that runs nothing directly carries no disclosure")
+		})
+	}
 }
