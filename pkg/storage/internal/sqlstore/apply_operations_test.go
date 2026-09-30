@@ -68,29 +68,6 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.NotZero(t, got.UpdatedAt)
 }
 
-func TestApplyOperationStore_SaveExternalOperationID(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_save_external_operation", 1)
-
-	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID:    apply.ID,
-		Deployment: "region-a",
-		Target:     "payments",
-	})
-	require.NoError(t, err)
-
-	require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
-
-	got, err := store.ApplyOperations().Get(ctx, operationID)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, "remote-operation-1", got.ExternalOperationID)
-}
-
 func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -106,7 +83,7 @@ func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
 	require.NoError(t, err)
@@ -140,7 +117,7 @@ func TestApplyOperationStore_SaveExternalIDSharesDeploymentRemoteApply(t *testin
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a"))
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a", ""))
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
 	require.NoError(t, err)
@@ -180,7 +157,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesDeploymentConflict(t *testing.
 			})
 			require.NoError(t, err)
 
-			err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+			err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other", "")
 			require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
 			assert.Contains(t, err.Error(), `"remote-apply-a"`)
 			assert.Contains(t, err.Error(), `"remote-apply-other"`)
@@ -214,7 +191,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesReplayWhenSiblingsDiverged(t *
 	})
 	require.NoError(t, err)
 
-	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other", "")
 	require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
@@ -240,7 +217,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesForeignOperation(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a")
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a", "")
 	require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
@@ -289,11 +266,11 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 		{"state transition", func(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationID, state.ApplyOperation.Running))
 		}},
-		{"save external operation id", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
-		}},
 		{"save external id", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
+		}},
+		{"save external id with its remote operation", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", "remote-operation-1"))
 		}},
 		{"save engine resume state", func(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, &storage.EngineResumeState{
@@ -303,7 +280,7 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 			}))
 		}},
 		{"identical-value replay", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
 		}},
 	}
 	for _, w := range writes {
