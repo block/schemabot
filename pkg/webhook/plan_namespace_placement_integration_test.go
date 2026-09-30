@@ -102,10 +102,13 @@ func newNamespacePlacementHarness(t *testing.T, productionTargets []api.TargetEn
 		"ns_1/orders.sql": table,
 	}, "database: "+dbName+"\ntype: mysql\n", dbName)
 
+	// The App slug lets a later fold on the same head verify that it owns the
+	// aggregate Check Run an earlier fold published, and so update it.
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	return &namespacePlacementHarness{
 		dbName:     dbName,
 		store:      st,
-		handler:    NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger),
+		handler:    NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
 		github:     result,
 		production: production,
 	}
