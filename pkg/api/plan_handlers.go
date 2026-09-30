@@ -471,8 +471,8 @@ func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, erro
 		if strings.Contains(namespace, "..") || strings.ContainsAny(namespace, `/\`) {
 			return nil, fmt.Errorf("pull namespace %q must be a single path component", namespace)
 		}
-		if strings.Contains(namespace, "$ENV") {
-			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve $ENV before calling pull", namespace)
+		if schema.HasNamespaceEnvironmentPlaceholder(namespace) {
+			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve {env} or $ENV before calling pull", namespace)
 		}
 		if schema.IsReservedPullNamespaceForDialect(dialect, namespace) {
 			return nil, fmt.Errorf("pull namespace %q is reserved and cannot be pulled", namespace)

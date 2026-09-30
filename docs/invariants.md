@@ -1443,7 +1443,9 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
 the sequential and grouped drives). The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
-and rollup paths).
+and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
+apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
+by `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
 ### RV-2: Stale plans never apply
 
@@ -1463,15 +1465,18 @@ write-blocking DDL with no cutover and no revert, require the operator to confir
 consequences disclosed to them. The re-plan that runs just before execution re-checks that
 verdict, so a plan that changed after the confirmation stops rather than running something the
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`).
+`pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
+(`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
+`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
 Whether the engine will refuse a statement, or route it to direct execution (a MySQL and Spirit
 execution mode), is recorded on the plan or stops plan creation using the engine's own checks rather than a
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
-direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
-estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
+direct execution's table-size bound, a table whose size cannot be measured is blocked. A row
+estimate is trusted only in the blocking direction: the row bound approves only on an exact count.
+The byte bound has no exact corroboration and approves on its estimate. The verdict
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the

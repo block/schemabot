@@ -177,6 +177,19 @@ type ApplyStatusCommentData struct {
 	// the drive triggers cutover automatically — surfacing the command there
 	// would tell the operator to act when no action is needed.
 	DeferCutover bool
+
+	// RolloutWide marks this comment as one member's section of an apply that
+	// fans out across several. Every control command a footer offers addresses
+	// the apply, not one member of it, so a section headed by one member's name
+	// that carries such a command otherwise reads as an instruction to act on
+	// that member alone. False on a single-member apply, where there is nothing
+	// else for a command to reach.
+	RolloutWide bool
+
+	// RolloutMember is the name of the member whose section this is, used to
+	// say which member the section's commands reach past. It only qualifies the
+	// scope sentence; RolloutWide alone decides whether the sentence renders.
+	RolloutMember string
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -468,7 +481,40 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	if command == "cancel" {
 		prefix = cancelPrefix
 	}
-	writeFooterAction(sb, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
+}
+
+// writeMemberFooterAction writes a footer action for a comment that may be one
+// member's section of a larger rollout, stating the command's rollout-wide
+// reach ahead of it when it is.
+func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, label, command string) {
+	sb.WriteString("\n---\n\n")
+	writeRolloutWideControlScope(sb, data)
+	fmt.Fprintf(sb, "%s\n```\n%s\n```\n", label, command)
+}
+
+// writeRolloutWideControlScope states that the commands in a member's footer
+// address the whole rollout, not the member whose section they sit in.
+//
+// Control commands are scoped to the apply, and none takes a member selector,
+// so a command printed under one member's name would be read as addressing
+// that member and would do something broader than the operator intended.
+// Rather than print a command nobody can narrow, the comment says what the one
+// it has does. The sentence leads the footer, ahead of the command, because a
+// code block is copied from its copy button and the eye does not travel past
+// it. It names no command, so one sentence covers a footer that offers two and
+// cannot disagree with the command it qualifies. Cutover footers do not carry
+// it, because one cutover lands on one member rather than on the whole
+// rollout. It stops being needed when control commands can address one member.
+func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData) {
+	if !data.RolloutWide {
+		return
+	}
+	if data.RolloutMember == "" {
+		sb.WriteString("Each command below addresses the whole rollout.\n\n")
+		return
+	}
+	fmt.Fprintf(sb, "Each command below addresses the whole rollout, not just %s.\n\n", inlineCode(data.RolloutMember))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window
@@ -1348,6 +1394,9 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 // explanatory guidance pointing at the right next step.
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
+	// Cutover footers carry no rollout scope sentence: a cutover lands on one
+	// member rather than on the whole rollout, so the sentence would overstate
+	// what the command does.
 	case state.Apply.WaitingForDeploy:
 		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.WaitingForCutover:
@@ -1387,15 +1436,15 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Cancelled:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
-		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
-		writeFooterAction(sb, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
@@ -1499,7 +1548,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
 func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int, budget *ddlBlockBudget) {
@@ -1511,7 +1560,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 
 // writeSummaryCancelled renders the terminal summary for a cancelled schema

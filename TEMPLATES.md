@@ -1387,7 +1387,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+**Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 ```sql
 CREATE TABLE `users` (
@@ -1440,7 +1440,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+**Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 - `eu` (primary) ✅ matches the reviewed plan
 - `au` ✅ matches the reviewed plan · blocked: 1
@@ -1586,6 +1586,157 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-converging"></a><strong>Rollout Plans (Converging)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+Targets diverge — what applies where:
+
+**targets `primary/testapp_1`, `primary/testapp_2`**
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+**target `primary/testapp_3`**
+
+No schema changes detected
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-reviewed-target-already-there"></a><strong>Rollout Plans (Reviewed Target Already There)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+Targets diverge — what applies where:
+
+**targets `primary/testapp_2`, `primary/testapp_3`**
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+**target `primary/testapp_1`**
+
+No schema changes detected
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-distinct-plans"></a><strong>Rollout Plans (Distinct Plans)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+Targets diverge — what applies where:
+
+**targets `primary/testapp_1`, `primary/testapp_2`**
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
+```
+
+**target `primary/testapp_3`**
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📋 **Plan**: **1** table to alter
 
 
 ---
@@ -7446,6 +7597,8 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
+Each command below addresses the whole rollout, not just `us`.
+
 To stop this schema change:
 ```
 schemabot stop apply-a1b2c3d4e5f6 -e production
@@ -7567,6 +7720,8 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 > ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
+
+Each command below addresses the whole rollout, not just `us`.
 
 To retry:
 ```
@@ -7924,6 +8079,8 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
+Each command below addresses the whole rollout, not just `us`.
+
 To retry:
 ```
 schemabot apply -e production
@@ -7961,14 +8118,14 @@ _No details available yet._
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
 2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
 
-== engine logs: shard-a, target: cluster-a ==
+== engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001 ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
 2026-03-15 14:24:00 UTC [INF] [users] copy progress: 12.4% 181812/1466232 rows, eta 21m
 2026-03-15 14:27:00 UTC [INF] [users] copy progress: 30.0% 439870/1466232 rows, eta 14m
 2026-03-15 14:27:40 UTC [WRN] [users] unsafe warning 1265: Data truncated for column 'nickname' at row 1
 2026-03-15 14:27:41 UTC [ERR] [users] aborting: the copy would change values that are already in the table
 
-== engine logs: shard-b, target: cluster-b ==
+== engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002 ==
 2026-03-15 14:22:30 UTC [INF] [users] copy starting: 1192044 rows estimated, 4 threads
 2026-03-15 14:27:00 UTC [INF] [users] copy complete: 1192044 rows
 2026-03-15 14:28:00 UTC [INF] [users] cutover complete
@@ -8067,15 +8224,15 @@ schemabot apply -e production
 #### Keyspace: `cdb_resolute_sharded`
 Shards diverge — what applies where:
 
-**shard `-40`**
-
-_Already applied — no change._
-
 **shards `40-80`, `80-c0`, `c0-`**
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
+
+**shard `-40`**
+
+No schema changes detected
 
 📋 **Plan**: **1** table to alter
 
@@ -9143,6 +9300,7 @@ Retry-After: 1
        ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
        • Rows copied: 145,250,000 so far
        • ℹ️ More rows than initially estimated, copying is still active and will continue
+
 
 
 ESC detach • s stop

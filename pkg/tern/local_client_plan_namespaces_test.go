@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -13,10 +14,13 @@ import (
 )
 
 func planNamespacesTestClient() *LocalClient {
-	return &LocalClient{config: LocalConfig{
-		Database: "commerce",
-		Type:     storage.DatabaseTypeVitess,
-	}}
+	return &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		logger: slog.New(slog.DiscardHandler),
+	}
 }
 
 // TestNormalizeSchemaFilesKeepsEmptyNamespace proves a namespace that
