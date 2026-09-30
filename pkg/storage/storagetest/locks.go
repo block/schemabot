@@ -237,7 +237,7 @@ func TestLocks(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		created := &storage.Lock{
 			DatabaseName: "acquirer_db",
 			DatabaseType: storage.DatabaseTypeMySQL,
 			Repository:   "org/repo",
@@ -246,7 +246,8 @@ func TestLocks(t *testing.T, h Harness) {
 				Subject:        "bob@example.com",
 				OperatorGroups: []string{"orders-oncall", "orders-operators"},
 			},
-		}))
+		}
+		require.NoError(t, store.Locks().Acquire(ctx, created))
 		want := &storage.LockAcquirer{
 			Subject:        "bob@example.com",
 			OperatorGroups: []string{"orders-oncall", "orders-operators"},
@@ -256,6 +257,7 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, want, stored.Acquirer)
+		assert.Equal(t, stored.ID, created.ID, "the acquire that creates the row reports the row's ID")
 
 		listed, err := store.Locks().List(ctx)
 		require.NoError(t, err)
@@ -268,15 +270,18 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Equal(t, want, byPR[0].Acquirer)
 
 		// A same-owner re-acquire by somebody else, carrying a new pending
-		// plan, refreshes the plan and leaves the acquirer as recorded.
-		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		// plan, refreshes the plan and leaves the acquirer as recorded. It
+		// creates no row, so it reports no ID.
+		reacquire := &storage.Lock{
 			DatabaseName:  "acquirer_db",
 			DatabaseType:  storage.DatabaseTypeMySQL,
 			Repository:    "org/repo",
 			Owner:         "cli:bob@laptop",
 			PendingPlanID: "plan-2",
 			Acquirer:      &storage.LockAcquirer{Subject: "mallory@example.com", OperatorGroups: []string{"other-team"}},
-		}))
+		}
+		require.NoError(t, store.Locks().Acquire(ctx, reacquire))
+		assert.Zero(t, reacquire.ID, "a re-acquire of a held lock creates no row and reports no ID")
 		refreshed, err := store.Locks().Get(ctx, "acquirer_db", storage.DatabaseTypeMySQL)
 		require.NoError(t, err)
 		require.NotNil(t, refreshed)

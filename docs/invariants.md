@@ -1581,7 +1581,8 @@ only when its recorded verified acquirer shared one of the operator's groups for
 a lock with no recorded acquirer is released only under a deployment-wide grant. *Enforced:* the
 trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
 layer (`pkg/auth`); the scoped lock release and re-acquire in `pkg/api/lock_handlers.go`, the release
-pinned to the lock row it checked (`ReleaseByID` in `pkg/storage/internal/sqlstore/locks.go`).
+pinned to the lock row it checked and the re-acquire told which row its acquire created (`ReleaseByID`
+and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 
 ### AZ-4: Applying takes an authorized actor
 

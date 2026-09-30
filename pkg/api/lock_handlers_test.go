@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -186,10 +187,15 @@ type memoryLockStore struct {
 	storage.LockStore
 	lock              *storage.Lock
 	beforeReleaseByID func(*memoryLockStore)
-	// beforeAcquire runs between the handler's read of the lock and its
-	// acquire, to stage a lock taken in between.
+	// beforeAcquire runs at the start of an acquire, to stage a lock taken
+	// under the same owner before this acquire's insert.
 	beforeAcquire func(*memoryLockStore)
-	lastID        int64
+	// afterAcquire runs once an acquire has succeeded, to stage a release
+	// between the acquire and the handler's read of the lock.
+	afterAcquire func(*memoryLockStore)
+	// getError, when set, fails every read of the lock.
+	getError error
+	lastID   int64
 }
 
 func (s *memoryLockStore) holds(database, dbType string) bool {
@@ -197,8 +203,9 @@ func (s *memoryLockStore) holds(database, dbType string) bool {
 }
 
 // Acquire has the storage layer's acquire semantics for a request carrying no
-// pending plan: it creates the row when none is held, succeeds without writing
-// anything when the same owner already holds it, and refuses any other owner.
+// pending plan: it creates the row when none is held, reporting the new row's
+// ID on lock, succeeds without writing anything when the same owner already
+// holds it, and refuses any other owner.
 func (s *memoryLockStore) Acquire(_ context.Context, lock *storage.Lock) error {
 	if s.beforeAcquire != nil {
 		s.beforeAcquire(s)
@@ -207,16 +214,22 @@ func (s *memoryLockStore) Acquire(_ context.Context, lock *storage.Lock) error {
 		if s.lock.Owner != lock.Owner {
 			return storage.ErrLockHeld
 		}
-		return nil
+	} else {
+		s.lastID++
+		lock.ID = s.lastID
+		created := *lock
+		s.lock = &created
 	}
-	s.lastID++
-	created := *lock
-	created.ID = s.lastID
-	s.lock = &created
+	if s.afterAcquire != nil {
+		s.afterAcquire(s)
+	}
 	return nil
 }
 
 func (s *memoryLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	if s.getError != nil {
+		return nil, s.getError
+	}
 	if !s.holds(database, dbType) {
 		return nil, nil
 	}
@@ -417,6 +430,17 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 		svc := New(&mockStorageWithApplyStores{locks: locks}, cfg, nil, logger)
 		return scopedDenialRequest(t, svc.handleLockAcquire, user, http.MethodPost, "/api/locks/acquire", body)
 	}
+	// acquireUnverified sends the acquire as user without a verified identity,
+	// so the request records no acquirer.
+	acquireUnverified := func(t *testing.T, locks *memoryLockStore, user *auth.User) *httptest.ResponseRecorder {
+		t.Helper()
+		svc := New(&mockStorageWithApplyStores{locks: locks}, cfg, nil, logger)
+		ctx := auth.WithUser(t.Context(), user)
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/locks/acquire", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		svc.handleLockAcquire(rec, req)
+		return rec
+	}
 	assertUnchanged := func(t *testing.T, locks *memoryLockStore, want *storage.Lock) {
 		t.Helper()
 		require.NotNil(t, locks.lock, "a refused re-acquire leaves the lock held")
@@ -474,7 +498,7 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 		assert.Equal(t, int64(7), locks.lock.ID)
 	})
 
-	t.Run("a lock taken by another group between the read and the acquire is refused", func(t *testing.T) {
+	t.Run("a lock taken by another group while this acquire ran is refused", func(t *testing.T) {
 		otherTeam := paymentsLock(8, owner, &storage.LockAcquirer{Subject: "erin", OperatorGroups: []string{"payments-oncall"}})
 		locks := &memoryLockStore{beforeAcquire: func(s *memoryLockStore) {
 			taken := *otherTeam
@@ -489,15 +513,42 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 
 	t.Run("an unverified operator creating a free lock holds it", func(t *testing.T) {
 		locks := &memoryLockStore{}
-		svc := New(&mockStorageWithApplyStores{locks: locks}, cfg, nil, logger)
-		ctx := auth.WithUser(t.Context(), bob)
-		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/locks/acquire", strings.NewReader(body))
-		rec := httptest.NewRecorder()
-		svc.handleLockAcquire(rec, req)
+		rec := acquireUnverified(t, locks, bob)
 
 		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 		require.NotNil(t, locks.lock)
 		assert.Nil(t, locks.lock.Acquirer, "an unverified caller is recorded as no acquirer")
+	})
+
+	t.Run("an unverified operator is refused a lock with no recorded acquirer taken while this acquire ran", func(t *testing.T) {
+		unrecorded := paymentsLock(8, owner, nil)
+		locks := &memoryLockStore{beforeAcquire: func(s *memoryLockStore) {
+			taken := *unrecorded
+			s.lock = &taken
+		}}
+		rec := acquireUnverified(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "records no verified acquirer")
+		assertUnchanged(t, locks, unrecorded)
+	})
+
+	t.Run("a lock released before the acquire could be read back is not reported held", func(t *testing.T) {
+		locks := &memoryLockStore{afterAcquire: func(s *memoryLockStore) { s.lock = nil }}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "released before this acquire could be confirmed")
+		assert.Nil(t, locks.lock)
+	})
+
+	t.Run("a lock that cannot be read back after the acquire is not reported held", func(t *testing.T) {
+		locks := &memoryLockStore{getError: errors.New("storage unavailable")}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "internal error")
+		assert.NotContains(t, rec.Body.String(), owner, "a lock that could not be read back is not described to the caller")
 	})
 
 	t.Run("a deployment write-group member re-acquires any group's lock by owner", func(t *testing.T) {

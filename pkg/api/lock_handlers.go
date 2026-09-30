@@ -99,22 +99,8 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	// Acquiring a lock the same owner already holds succeeds, so the owner
 	// string alone would tell anyone who listed locks that they hold one. A
 	// scoped operator is held to the lock's recorded acquirer instead (see
-	// scopedLockAcquireHeld), which needs the row as it stood before this
-	// acquire to tell a lock this request created from one it found.
+	// scopedLockAcquireHeld).
 	scoped := !holdsLockByOwnerAlone(authorization.Reason)
-	var before *storage.Lock
-	if scoped {
-		var err error
-		before, err = s.storage.Locks().Get(ctx, req.Database, req.DatabaseType)
-		if err != nil {
-			metrics.RecordLockOperation(ctx, "acquire", req.Database, "error")
-			s.logger.Error("scoped lock acquire could not read the lock; nothing was acquired",
-				"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
-				"owner", req.Owner, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-	}
 
 	lock := &storage.Lock{
 		DatabaseName: req.Database,
@@ -148,19 +134,30 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Refetch to get created_at
+	// The row as it stands after the acquire is what the caller is told they
+	// hold, and what a scoped caller's claim to it is decided on. The lock is
+	// reported held only from that row: a read that fails leaves it unknown
+	// whether the row is the one this request acquired, and a row that is
+	// gone was released before this request could be told it held it.
 	acquired, err := s.storage.Locks().Get(ctx, req.Database, req.DatabaseType)
-	if err != nil || acquired == nil {
-		// Shouldn't happen, but handle gracefully
-		metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
-		s.writeJSON(w, http.StatusOK, LockResponse{Lock: &LockInfo{
-			Database:     req.Database,
-			DatabaseType: req.DatabaseType,
-			Owner:        req.Owner,
-		}})
+	if err != nil {
+		metrics.RecordLockOperation(ctx, "acquire", req.Database, "error")
+		s.logger.Error("lock acquire could not read the lock back after acquiring it; the lock is not reported held",
+			"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
+			"owner", req.Owner, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if scoped && !s.scopedLockAcquireHeld(w, r, req, before, acquired, acquirer) {
+	if acquired == nil {
+		metrics.RecordLockOperation(ctx, "acquire", req.Database, "not_found")
+		s.logger.Warn("lock acquire found the lock released before it could be read back; nothing is held",
+			"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
+			"owner", req.Owner)
+		s.writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("lock on database %q was released before this acquire could be confirmed; nothing is held, retry", req.Database))
+		return
+	}
+	if scoped && !s.scopedLockAcquireHeld(w, r, req, lock.ID, acquired) {
 		return
 	}
 	metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
@@ -171,15 +168,16 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 // scopedLockAcquireHeld decides whether a scoped operator whose acquire
 // succeeded may be told they hold acquired, the lock row as read after it, and
 // on refusal writes the 403 and reports false. The caller holds a row this
-// request created, recognized by carrying the acquirer the request recorded on
-// a row that was not there before it; any other row is one they found, and they
-// hold it only under the rule that decides who may release it (see
-// scopedLockRefusal). Deciding after the acquire leaves a refused caller's
-// target lock as it was: this endpoint carries no pending plan, so a same-owner
-// acquire writes nothing, and deciding on the row as read afterwards also covers
-// a lock another group took under the same owner while this acquire ran.
-func (s *Service) scopedLockAcquireHeld(w http.ResponseWriter, r *http.Request, req LockAcquireRequest, before, acquired *storage.Lock, acquirer *storage.LockAcquirer) bool {
-	if lockCreatedByAcquire(before, acquired, acquirer) {
+// request created, recognized by the ID the acquire assigned it (createdID,
+// zero when the acquire created no row) still being the ID read back; any other
+// row is one they found, and they hold it only under the rule that decides who
+// may release it (see scopedLockRefusal). Deciding after the acquire leaves a
+// refused caller's target lock as it was: this endpoint carries no pending
+// plan, so a same-owner acquire writes nothing, and deciding on the row as read
+// afterwards also covers a lock another group took under the same owner while
+// this acquire ran.
+func (s *Service) scopedLockAcquireHeld(w http.ResponseWriter, r *http.Request, req LockAcquireRequest, createdID int64, acquired *storage.Lock) bool {
+	if lockCreatedByAcquire(createdID, acquired) {
 		return true
 	}
 	ctx := r.Context()
@@ -209,22 +207,13 @@ func (s *Service) scopedLockAcquireHeld(w http.ResponseWriter, r *http.Request, 
 }
 
 // lockCreatedByAcquire reports whether acquired, the lock row read after an
-// acquire, is the row that acquire created: a row that was not there before it
-// (before is the row read first, or nil), carrying the acquirer it recorded.
-func lockCreatedByAcquire(before, acquired *storage.Lock, acquirer *storage.LockAcquirer) bool {
-	if before != nil && before.ID == acquired.ID {
-		return false
-	}
-	return sameLockAcquirer(acquired.Acquirer, acquirer)
-}
-
-// sameLockAcquirer reports whether two recorded acquirers are the same record:
-// both unrecorded, or the same subject with the same operator groups.
-func sameLockAcquirer(a, b *storage.LockAcquirer) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return a.Subject == b.Subject && slices.Equal(a.OperatorGroups, b.OperatorGroups)
+// acquire, is the row that acquire created: createdID is the ID the acquire
+// assigned to the row it inserted, or zero when it inserted none because the
+// owner already held the lock. A row found under the same owner, whether it
+// was there before the acquire or another request inserted it while this one
+// ran, carries a different ID or none this request assigned.
+func lockCreatedByAcquire(createdID int64, acquired *storage.Lock) bool {
+	return createdID != 0 && acquired.ID == createdID
 }
 
 // handleLockRelease handles DELETE /api/locks.
