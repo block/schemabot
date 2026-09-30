@@ -725,6 +725,25 @@ type Plan struct {
 	CreatedAt time.Time
 }
 
+// HasWork reports whether applying the plan would change anything: a table
+// change, a namespace to finalize (a VSchema document or an engine-requested
+// finalize), or a shard with changes of its own. A plan without work is the plan
+// of a target already at the desired schema.
+func (p *Plan) HasWork() bool {
+	if p == nil {
+		return false
+	}
+	if len(p.FlatDDLChanges()) > 0 || len(p.FinalizerNamespaces()) > 0 {
+		return true
+	}
+	for _, shard := range p.Shards {
+		if len(shard.Changes) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
 func (p *Plan) FlatDDLChanges() []TableChange {
 	if len(p.Namespaces) == 0 {

@@ -1965,6 +1965,13 @@ No schema changes detected
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
 </details>
 
 <details>

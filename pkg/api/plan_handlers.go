@@ -1677,6 +1677,15 @@ func (s *Service) createStoredApply(
 			return nil, 0, err
 		}
 	}
+	// An apply whose own plan has no work exists only to run the other members'
+	// own plans, since its reviewed target is already at the desired schema.
+	if !plan.HasWork() {
+		for _, member := range members {
+			if err := rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
 	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, members, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
 	if err != nil {
 		return nil, 0, err
@@ -1727,6 +1736,36 @@ func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOpti
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	return nil
+}
+
+// rejectMemberWorkAnEmptyReviewedPlanCannotCarry refuses a member's work that
+// an apply created from an empty reviewed plan cannot run as it was planned.
+//
+// The apply's shape, whether a per-shard fan-out, a finalizer, or one work
+// operation per member, is chosen from the apply's own plan, so an empty one
+// leaves every member on one work operation per member. Per-shard changes and
+// finalizer work have no place in that shape, and a member carrying only them
+// would be settled as having nothing to do while its target never got the
+// change. A direct-execution change is refused as well: the operator consents
+// to its write-blocking native DDL against the disclosure the reviewed plan
+// carries, and an empty reviewed plan discloses none.
+func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
+	const refusal = "an apply whose reviewed target is already at the desired schema runs every other target's plan table by table"
+	if shards := changingShardsByNamespace(member.Plan.Shards); len(shards) > 0 {
+		return fmt.Errorf("rollout member %s: plan %s carries per-shard changes, but %s",
+			member.MemberID(), member.Plan.PlanIdentifier, refusal)
+	}
+	if namespaces := member.Plan.FinalizerNamespaces(); len(namespaces) > 0 {
+		return fmt.Errorf("rollout member %s: plan %s finalizes namespaces %v, but %s",
+			member.MemberID(), member.Plan.PlanIdentifier, namespaces, refusal)
+	}
+	for _, change := range member.Plan.FlatDDLChanges() {
+		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
+			return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, whose consent is given against the reviewed plan, and the reviewed target's plan is empty",
+				member.MemberID(), member.Plan.PlanIdentifier, change.Table)
+		}
 	}
 	return nil
 }
