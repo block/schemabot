@@ -459,6 +459,18 @@ type SchemaChange struct {
 // namespace's work in its DDL never set it.
 const MetadataNeedsFinalizer = "needs_finalizer"
 
+// MetadataVSchemaGeneratedOnly is the plan change-metadata key ("true") an
+// engine sets beside vschema_changed when every difference in the namespace's
+// VSchema is one the engine generates from the plan's own DDL, such as the
+// entries and column lists of the tables the plan creates or alters. The
+// VSchema is still written, but there is nothing hand-written to review, so
+// the engine sends no rendered diff, and plan surfaces show the namespace as
+// finalized after its DDL rather than as a VSchema change with no diff.
+// Engines set it on every change of the namespace that reports VSchema work; a
+// sharded namespace whose changes disagree renders without it. Display-only:
+// no scheduling or safety gate reads it.
+const MetadataVSchemaGeneratedOnly = "vschema_generated_only"
+
 // NeedsFinalizer reports whether the engine asked for this change's namespace
 // to be finalized after its DDL.
 func (sc SchemaChange) NeedsFinalizer() bool {
@@ -570,8 +582,8 @@ const (
 
 	// ExecutionModeDirect marks a statement the engine refuses but that the
 	// database's direct execution policy routes to native DDL on the target
-	// instead: it runs synchronously, it blocks writes to the table while it
-	// runs, and it is not revertible.
+	// instead: it runs synchronously and blocks writes to the table while it
+	// runs.
 	ExecutionModeDirect = "direct"
 )
 

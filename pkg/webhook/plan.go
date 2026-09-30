@@ -920,6 +920,18 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 	return discarded, adopted, running
 }
 
+// setNamespaceWork records on a keyspace's comment data the namespace-level
+// work the engine planned beside its DDL: a VSchema change to show, with its
+// rendered diff, and a finalize. The plan and rollback comments both read it
+// through here so they describe the same plan the same way.
+func setNamespaceWork(ks *templates.KeyspaceChangeData, sc *apitypes.SchemaChangeResponse) {
+	if sc.ShowsVSchemaChange() {
+		ks.VSchemaChanged = true
+		ks.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
+	}
+	ks.Finalize = sc.NeedsFinalizer()
+}
+
 // planCommentDatabaseFlag returns the database a plan comment's copy-paste
 // commands name, empty when they are to stay unscoped.
 //
@@ -1014,12 +1026,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
 		}
-		// Extract VSchema changes from metadata
-		if sc.HasVSchemaChange() {
-			ksData.VSchemaChanged = true
-			ksData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
-		}
-		ksData.Finalize = sc.NeedsFinalizer()
+		setNamespaceWork(&ksData, sc)
 		data.Changes = append(data.Changes, ksData)
 	}
 

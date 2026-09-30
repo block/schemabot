@@ -578,6 +578,30 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 	return n.Artifacts[VSchemaArtifactName] != ""
 }
 
+// ShowsVSchemaChange reports whether plan and apply surfaces show this
+// namespace's VSchema change as one. It is the stored-plan counterpart of
+// apitypes.SchemaChangeResponse.ShowsVSchemaChange: a change the engine
+// generated entirely from the plan's DDL, with no diff to review, no recorded
+// deletion or mutation, and a finalize to write it, is left to the DDL and
+// that finalize.
+func (n *NamespacePlanData) ShowsVSchemaChange() bool {
+	if !n.ChangesVSchema() {
+		return false
+	}
+	return !n.vschemaChangeGeneratedFromDDL()
+}
+
+// vschemaChangeGeneratedFromDDL reports whether the stored plan marks this
+// namespace's VSchema change generated from the DDL, with no diff and no
+// deletion or mutation record, and finalizes the namespace.
+func (n *NamespacePlanData) vschemaChangeGeneratedFromDDL() bool {
+	meta := n.Metadata
+	generatedOnly := meta[PlanMetadataVSchemaGeneratedOnly] == "true"
+	noDiff := meta[PlanMetadataVSchemaDiff] == ""
+	noUnsafeRecord := meta[PlanMetadataVSchemaDeletions] == "" && meta[PlanMetadataVSchemaMutations] == ""
+	return generatedOnly && noDiff && noUnsafeRecord && n.Finalize
+}
+
 // NeedsFinalizer reports whether an apply of this namespace ends with a group
 // finalizer: its VSchema changes, which only the finalizer applies, or the
 // engine asked for one.
@@ -1296,7 +1320,10 @@ type ApplyOptions struct {
 
 	// Branch is the name of an existing PlanetScale branch to reuse.
 	// When set, the engine refreshes the branch schema from main instead
-	// of creating a new branch.
+	// of creating a new branch. The engine reads it back from the stored
+	// apply on every resume, through Map, to decide whether the deploy
+	// request it creates deletes the branch: it must survive the round trip,
+	// or a resumed drive deletes a branch the operator owns.
 	Branch string `json:"branch,omitempty"`
 
 	// DeferCutover pauses at cutover and waits for explicit trigger.

@@ -230,7 +230,7 @@ statements run as ordinary MySQL DDL instead. The policy covers only tables unde
 count, and the PR asks for a second, explicit confirmation before anything runs.
 
 What runs then is not an online change. It is synchronous, it blocks writes to the table for its
-full duration, nothing throttles it, nothing checkpoints it, and it cannot be reverted. The row
+full duration, nothing throttles it, and nothing checkpoints it. The row
 count in the policy is what bounds that outage, since how long the table is blocked scales with
 its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
 any open transaction that has touched it, and everything arriving after queues behind the DDL, so

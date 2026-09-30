@@ -320,20 +320,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		AgentHint:    h.agentHint(),
 	}
 
-	for _, sc := range planResp.Changes {
-		nsData := templates.KeyspaceChangeData{
-			Keyspace: sc.Namespace,
-		}
-		for _, t := range sc.TableChanges {
-			nsData.Statements = append(nsData.Statements, t.DDL)
-		}
-		if sc.HasVSchemaChange() {
-			nsData.VSchemaChanged = true
-			nsData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
-		}
-		nsData.Finalize = sc.NeedsFinalizer()
-		commentData.Changes = append(commentData.Changes, nsData)
-	}
+	commentData.Changes = rollbackKeyspaceChanges(planResp.Changes)
 
 	for _, w := range planResp.LintNonErrors() {
 		commentData.LintViolations = append(commentData.LintViolations, templates.LintViolationData{
@@ -878,4 +865,22 @@ func planHasChanges(plan *storage.Plan) bool {
 		return true
 	}
 	return len(plan.FinalizerNamespaces()) > 0
+}
+
+// rollbackKeyspaceChanges maps a rollback plan's changes onto the comment's
+// per-keyspace sections: each keyspace's DDL plus the namespace-level work the
+// engine planned beside it.
+func rollbackKeyspaceChanges(changes []*apitypes.SchemaChangeResponse) []templates.KeyspaceChangeData {
+	var out []templates.KeyspaceChangeData
+	for _, sc := range changes {
+		nsData := templates.KeyspaceChangeData{
+			Keyspace: sc.Namespace,
+		}
+		for _, t := range sc.TableChanges {
+			nsData.Statements = append(nsData.Statements, t.DDL)
+		}
+		setNamespaceWork(&nsData, sc)
+		out = append(out, nsData)
+	}
+	return out
 }

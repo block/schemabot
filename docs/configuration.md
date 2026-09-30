@@ -719,8 +719,8 @@ read off that apply rather than resolved again. The two can differ: a
 rollback runs after the change it reverses, and withdrawing the grant in
 between would otherwise refuse the statement that undoes a change it allowed.
 
-A direct statement is synchronous, blocks writes to the table while it runs,
-and cannot be reverted — the size bound is the fail-closed blast-radius cap.
+A direct statement is synchronous and blocks writes to the table while it
+runs — the size bound is the fail-closed blast-radius cap.
 An enabled policy sets exactly one of `max_table_rows` and `max_table_bytes`,
 and a refused statement runs directly only when the table is within it. A
 table above the bound, or whose size cannot be determined, stays blocked. The
@@ -1852,24 +1852,25 @@ to no changes, no new comment appears (the check run alone reports the green
 state), but plan comments from prior commits are still retired — the pending
 DDL and apply prompt they show no longer match the branch.
 
-By default, a superseded comment is minimized (collapsed as **Outdated**) and
-stays expandable on GitHub — with one safety hold: a plan comment whose commit
-produced an apply is never minimized, even after new pushes. That comment is
-the record of what actually ran against the database, and it stays visible
-until an operator reconciles the apply.
+By default, a superseded plan comment no apply ever acted on is deleted from
+the PR timeline outright — its DDL never ran and is reproducible from the
+commit it was rendered at, so on a busy PR the comment is pure noise. A
+superseded comment whose commit produced an apply is minimized (collapsed as
+**Outdated**) rather than deleted, keeping the record of what ran expandable
+on the PR.
 
-A server can opt into a delete-based policy instead, which applies to every
-repository it manages:
+A server can opt out to a minimize-based policy instead, which applies to
+every repository it manages:
 
 ```yaml
-delete_unactioned_plan_comments: true
+delete_unactioned_plan_comments: false
 ```
 
-Under this policy, a superseded plan comment no apply ever acted on is deleted
-from the PR timeline outright — its DDL never ran and is reproducible from the
-commit it was rendered at, so on a busy PR the comment is pure noise. A
-superseded comment whose commit produced an apply is minimized rather than
-deleted, keeping the record of what ran expandable on the PR.
+Under this policy, a superseded comment is minimized and stays expandable on
+GitHub — with one safety hold: a plan comment whose commit produced an apply is
+never minimized, even after new pushes. That comment is the record of what
+actually ran against the database, and it stays visible until an operator
+reconciles the apply.
 
 Unactioned means exactly that: no apply ran from the comment's commit. It says
 nothing about human engagement — a comment people reacted to or linked

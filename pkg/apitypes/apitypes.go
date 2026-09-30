@@ -886,11 +886,15 @@ type PlanSummaryResponse struct {
 	// BlockedCount is how many of those table changes the engine will
 	// deterministically refuse (execution mode "blocked").
 	BlockedCount int `json:"blocked_count,omitempty"`
-	// VSchemaChangeCount is how many namespaces carry a VSchema change.
+	// VSchemaChangeCount is how many namespaces show a VSchema change. A
+	// VSchema change the engine generates entirely from the plan's DDL is
+	// shown as that DDL, so it is not counted here.
 	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
-	// FinalizeCount is how many namespaces the engine asked to finalize once
-	// their DDL lands. A finalizer is work an apply runs, so a plan whose only
-	// work is a finalizer is not a no-change plan.
+	// FinalizeCount is how many namespaces have nothing to run but the
+	// finalize the engine asked for. A finalize beside a namespace's DDL or
+	// VSchema change is part of that work and is not counted. A finalize is
+	// work an apply runs, so a plan whose only work is a finalize is not a
+	// no-change plan.
 	FinalizeCount int `json:"finalize_count,omitempty"`
 }
 
@@ -1270,8 +1274,8 @@ func (t *TableChangeResponse) EngineBlocked() bool {
 }
 
 // DirectExecution reports whether the planner's execution-mode verdict routes
-// this change to direct execution: it runs as native MySQL DDL — synchronous,
-// blocking writes to the table while it runs, and not revertible.
+// this change to direct execution: it runs synchronously as native MySQL DDL
+// and blocks writes to the table while it runs.
 func (t *TableChangeResponse) DirectExecution() bool {
 	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
 }

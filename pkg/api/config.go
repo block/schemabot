@@ -238,20 +238,21 @@ type ServerConfig struct {
 	// RateLimitsConfig for the shape and defaults.
 	RateLimits RateLimitsConfig `yaml:"rate_limits,omitempty"`
 
-	// DeleteUnactionedPlanComments opts every repository this server manages
-	// into the delete-based plan comment retirement policy: a superseded plan
-	// comment no apply ever acted on is deleted from the PR timeline (its
-	// storage row survives for triage), and a superseded comment whose head
-	// an apply owns is minimized so the record stays expandable. Defaults to
-	// false, which keeps the minimize-based policy: superseded unactioned
-	// comments are minimized and apply-owned comments stay fully expanded.
+	// DeleteUnactionedPlanComments selects the plan comment retirement policy
+	// for every repository this server manages. Unset or true uses the
+	// delete-based policy: a superseded plan comment no apply ever acted on is
+	// deleted from the PR timeline (its storage row survives for triage), and
+	// a superseded comment whose head an apply owns is minimized so the record
+	// stays expandable. False keeps the minimize-based policy: superseded
+	// unactioned comments are minimized and apply-owned comments stay fully
+	// expanded.
 	//
 	// "Unactioned" means no apply ran from the comment's head — it says
 	// nothing about human engagement. Deletion is irreversible where
 	// minimizing is not: the comment's reactions are lost and any permalink
 	// to it (in chat, tickets, or other PRs) breaks, and the surviving
 	// storage row keeps the comment's identifiers, not its rendered body.
-	DeleteUnactionedPlanComments bool `yaml:"delete_unactioned_plan_comments,omitempty"`
+	DeleteUnactionedPlanComments *bool `yaml:"delete_unactioned_plan_comments,omitempty"`
 }
 
 // RateLimitsConfig groups the per-endpoint request budgets.
@@ -1206,8 +1207,8 @@ type EnvironmentConfig struct {
 	// DirectExecution configures direct execution of ALTER statements that the
 	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
 	// When enabled, a refused statement whose table is within the policy's
-	// size bound runs verbatim as native MySQL DDL: synchronous,
-	// blocking writes to the table while it runs, and not revertible. Only
+	// size bound runs verbatim as native MySQL DDL: it runs synchronously and
+	// blocks writes to the table while it runs. Only
 	// valid for MySQL databases: setting this block on any other database
 	// type fails config validation, even when disabled, so a policy that can
 	// never take effect is never silently carried in config.
@@ -3081,13 +3082,14 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 }
 
 // DeletesUnactionedPlanComments returns whether this server uses the
-// delete-based plan comment retirement policy. Unconfigured servers keep the
-// default minimize-based policy.
+// delete-based plan comment retirement policy. It is the default: only an
+// explicit delete_unactioned_plan_comments: false keeps the minimize-based
+// policy.
 func (c *ServerConfig) DeletesUnactionedPlanComments() bool {
-	if c == nil {
-		return false
+	if c == nil || c.DeleteUnactionedPlanComments == nil {
+		return true
 	}
-	return c.DeleteUnactionedPlanComments
+	return *c.DeleteUnactionedPlanComments
 }
 
 // ResolvedGitHubApp identifies which configured GitHub App owns a repository.

@@ -110,9 +110,9 @@ func TestPlanChangeSummary(t *testing.T) {
 			want:    "2 finalize",
 		},
 		{
-			name:    "finalize follows table and vschema counts",
-			summary: &apitypes.PlanSummaryResponse{ChangeCounts: map[string]int{"create": 1}, VSchemaChangeCount: 1, FinalizeCount: 1},
-			want:    "1 create · 1 vschema · 1 finalize",
+			name:    "finalize-only namespace beside another namespace's table change",
+			summary: &apitypes.PlanSummaryResponse{ChangeCounts: map[string]int{"create": 1}, FinalizeCount: 1},
+			want:    "1 create · 1 finalize",
 		},
 	}
 	for _, tc := range tests {

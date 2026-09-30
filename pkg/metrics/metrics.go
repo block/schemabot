@@ -161,9 +161,10 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 // RecordPlanCommentRetirement counts the outcome of retiring one superseded
 // plan comment. Outcomes: "minimized" (hidden on GitHub but still expandable
 // as the record of what was planned), "deleted" (no apply ever acted on the
-// plan and the repository opted into deletion, so the comment is removed from
-// the timeline), "apply_owned" (kept fully expanded because an apply owns the
-// plan's head and the repository uses the minimize-based policy),
+// plan and the deployment uses the default delete-based policy, so the comment
+// is removed from the timeline), "apply_owned" (kept fully expanded because an
+// apply owns the plan's head and the deployment opted out to the
+// minimize-based policy),
 // "guard_error" (apply-ownership lookup failed, comment left untouched fail
 // closed — investigate storage), "minimize_error" / "delete_error" (the
 // GitHub call failed; retried on the next supersede — investigate GitHub API

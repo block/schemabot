@@ -733,3 +733,30 @@ func TestBuildShardedApplyData_PendingOutranksRevertWindow(t *testing.T) {
 	assert.Equal(t, state.Task.Pending, data.Keyspaces[0].Tables[0].Status,
 		"an undispatched shard outranks a sibling holding in its revert window")
 }
+
+// A sharded Strata apply creates a table whose VSchema entry the engine
+// generates from the DDL. The plan comment showed the keyspace as finalized
+// after its DDL, with no VSchema section, so the apply progress comment shows
+// it the same way rather than as a VSchema change with no diff.
+func TestShardedCommentShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "payments", Environment: "staging", State: state.Apply.Running, PlanID: 7}
+	mk := func(id int64, key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{mk(1, "ks/-40/refund_notes"), mk(2, "ks/40-/refund_notes"), mk(3, "ks/group_finalizer")}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+		"ks": {
+			Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaGeneratedOnly: "true"},
+			Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+			Finalize:  true,
+		},
+	}}
+
+	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	finalizers := o.resolveFinalizerPlan(apply, ops)
+	require.NotNil(t, finalizers)
+	assert.Equal(t, map[string]bool{"ks": true}, finalizers.finalizeOnly)
+
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, finalizers, "")
+	assert.NotContains(t, body, "VSchema")
+}
