@@ -469,6 +469,25 @@ type TableChange struct {
 	// ModeReason records the engine's reason for any non-empty ExecutionMode
 	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
+
+	// EstimatedRows is the planner's approximate row count for the table,
+	// summed across shards for sharded targets. Display only — estimates come
+	// from engine statistics and may be stale. Nil when no estimate was
+	// available at plan time.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int `json:"shard_count,omitempty"`
+
+	// LargestShardRows is the approximate row count of the largest single
+	// shard. Nil when the target is not sharded or no estimate was available.
+	LargestShardRows *int64 `json:"largest_shard_rows,omitempty"`
+
+	// EstimatedBytes is the planner's approximate on-disk footprint for the
+	// table (data plus indexes), summed across shards for sharded targets.
+	// Display only, like EstimatedRows. Nil when no estimate was available.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 }
 
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
@@ -1316,10 +1335,15 @@ type ApplyOptions struct {
 // policy its dispatch was admitted under. It mirrors the policy the caller
 // sent rather than restating the rules: the engine reading it back off the
 // metadata keys is what enforces them, including refusing an enabled policy
-// that carries no row bound.
+// that carries no size bound, or both.
 type DirectExecutionPolicy struct {
-	Enabled                       bool  `json:"enabled"`
-	MaxTableRows                  int64 `json:"max_table_rows,omitempty"`
+	Enabled bool `json:"enabled"`
+	// MaxTableRows is the optional bound on the table's row count. Zero
+	// states no row bound.
+	MaxTableRows int64 `json:"max_table_rows,omitempty"`
+	// MaxTableBytes is the optional bound on the table's data plus index
+	// footprint, in bytes. Zero states no byte bound.
+	MaxTableBytes                 int64 `json:"max_table_bytes,omitempty"`
 	LockAcquisitionTimeoutSeconds int64 `json:"lock_acquisition_timeout_seconds,omitempty"`
 }
 
@@ -1333,7 +1357,12 @@ func (p *DirectExecutionPolicy) EngineMetadata() map[string]string {
 	if p == nil {
 		return nil
 	}
-	return engine.DirectExecutionMetadata(p.Enabled, p.MaxTableRows, p.LockAcquisitionTimeoutSeconds)
+	return engine.DirectExecutionMetadata(engine.DirectExecutionSettings{
+		Enabled:                       p.Enabled,
+		MaxTableRows:                  p.MaxTableRows,
+		MaxTableBytes:                 p.MaxTableBytes,
+		LockAcquisitionTimeoutSeconds: p.LockAcquisitionTimeoutSeconds,
+	})
 }
 
 // ControlOperation identifies a user-requested control operation.
@@ -1505,22 +1534,38 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 // distinct from one that states the policy disabled: the first defers to the
 // executing server's configuration, the second overrides it.
 //
-// A malformed number reads as zero rather than failing here. The engine
-// refuses an enabled policy whose row bound is not positive, so a garbled
-// bound blocks the statement instead of widening it — the one direction this
-// is allowed to fail in.
+// A malformed number does not fail here; it reads as a value the engine
+// refuses, so a garbled bound blocks the statement instead of changing the
+// policy — the one direction this is allowed to fail in. Both size bounds are
+// optional, so zero would mean "no such bound" and silently drop it; a bound
+// that is present but not a positive integer reads as -1 instead, which
+// renders back onto the metadata and the engine refuses.
 func directExecutionPolicyFromMap(options map[string]string) *DirectExecutionPolicy {
 	raw, ok := options[engine.MetadataDirectExecution]
 	if !ok {
 		return nil
 	}
-	maxRows, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionMaxTableRows], 10, 64)
 	lockWait, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds], 10, 64)
 	return &DirectExecutionPolicy{
 		Enabled:                       raw == "true",
-		MaxTableRows:                  maxRows,
+		MaxTableRows:                  storedSizeBound(options, engine.MetadataDirectExecutionMaxTableRows),
+		MaxTableBytes:                 storedSizeBound(options, engine.MetadataDirectExecutionMaxTableBytes),
 		LockAcquisitionTimeoutSeconds: lockWait,
 	}
+}
+
+// storedSizeBound reads an optional size bound back out of an options map:
+// zero when absent, -1 when present but not a positive integer.
+func storedSizeBound(options map[string]string, key string) int64 {
+	raw, ok := options[key]
+	if !ok {
+		return 0
+	}
+	bound, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || bound <= 0 {
+		return -1
+	}
+	return bound
 }
 
 // GroupsEngineExecution reports whether an apply against databaseType hands the

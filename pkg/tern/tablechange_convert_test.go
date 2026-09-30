@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,7 +12,7 @@ import (
 )
 
 func TestNamespacesFromEngineChangesPreservesBlockedNonShardedSteps(t *testing.T) {
-	client := &LocalClient{}
+	client := &LocalClient{logger: slog.New(slog.DiscardHandler)}
 	reason := "requires privileges unavailable to the engine"
 	changes := []engine.SchemaChange{{
 		Namespace: "public",

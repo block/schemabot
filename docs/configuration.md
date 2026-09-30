@@ -668,13 +668,14 @@ MySQL database the server drives:
 ```yaml
 direct_execution:
   enabled: true           # default: false
-  max_table_rows: 100000  # required (positive) when enabled
+  max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
+                          # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more
-place for the row bound to drift. It is also what covers a database with no
+place for the size bounds to drift. It is also what covers a database with no
 `databases` entry at all — one a data-plane server resolves through its
 `target_resolver`, addressed by an opaque identifier.
 
@@ -719,15 +720,43 @@ rollback runs after the change it reverses, and withdrawing the grant in
 between would otherwise refuse the statement that undoes a change it allowed.
 
 A direct statement is synchronous, blocks writes to the table while it runs,
-and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
-bound. A refused statement runs directly only when the table's size is within
-the bound; larger tables, and tables whose size cannot be determined, stay
-blocked. The size gate trusts the InnoDB optimizer's estimate
-(`information_schema` `TABLE_ROWS`) only to block, and corroborates a verdict
-for direct execution with an exact row count whose scan is capped just past
-the bound — a stale estimate can never approve a large table. The bound is
-re-evaluated when the apply executes, so a table that grew past it after
-planning is blocked, not run.
+and cannot be reverted — the size bound is the fail-closed blast-radius cap.
+An enabled policy sets exactly one of `max_table_rows` and `max_table_bytes`,
+and a refused statement runs directly only when the table is within it. A
+table above the bound, or whose size cannot be determined, stays blocked. The
+bound is re-evaluated when the apply executes, so a table that grew past it
+after planning is blocked, not run.
+
+`max_table_rows` bounds the row count. The size gate trusts the InnoDB
+optimizer's estimate (`information_schema` `TABLE_ROWS`) only to block, and
+corroborates a verdict for direct execution with an exact row count whose scan
+is capped just past the bound — a stale estimate can never approve a large
+table.
+
+`max_table_bytes` bounds the table's footprint, data plus indexes
+(`information_schema` `DATA_LENGTH + INDEX_LENGTH`). How long a native
+rebuild blocks writes tracks how much it copies more closely than how many
+rows there are, so a table of a few wide rows and one of many narrow rows are
+judged by what the rebuild actually moves. The byte figure is an InnoDB
+statistics estimate that, like `TABLE_ROWS`, can undercount a table that just
+grew, and there is no cheap exact measure to corroborate it, so the byte bound
+approves on the estimate alone. Choose `max_table_rows` when only the
+corroborated gate is acceptable. The value is a whole number followed by a
+binary unit, such as `100MiB` or `2GiB`. Decimal units such as `MB` are
+rejected rather than interpreted, because readers disagree on whether they
+mean 1000² or 1024² bytes.
+
+A policy cannot set both. The two bounds differ in strength, and a second
+limit on a safety policy reads as a ceiling: requiring both would let the
+weaker estimate veto the corroborated count, and letting either approve would
+make a table the gate measured far above the byte limit run directly through
+the row bound. Choosing one keeps the configured limit the one that decides.
+
+A server running a build that predates `max_table_bytes` ignores the byte
+bound when it arrives on a request or an apply record, so it rejects a
+byte-bound policy as missing its row bound, and its plans and applies for the
+database fail until it is upgraded. Switch a database to `max_table_bytes`
+once every server that executes statements for it runs a build that reads it.
 
 `lock_acquisition_timeout` bounds how long each attempt of a direct statement
 waits to acquire its locks. Each engine maps it to its native session lock
@@ -752,9 +781,11 @@ the kill fails and a blocked apply fails as busy.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
-enabled without a positive `max_table_rows`, or when
-`lock_acquisition_timeout` is malformed (not a duration, under a second, or
-not whole seconds). A per-database policy that can never take effect is never
+enabled with neither `max_table_rows` nor `max_table_bytes`, when a policy
+sets both, when `max_table_rows` is negative, when `max_table_bytes` is malformed (not a
+positive whole number with a binary unit), or when `lock_acquisition_timeout`
+is malformed (not a duration, under a second, or not whole seconds). The size
+bounds and `lock_acquisition_timeout` are checked even on a disabled policy. A per-database policy that can never take effect is never
 silently carried in config.
 
 The server-wide policy is held to the same shape rules but is not rejected
@@ -768,9 +799,9 @@ engines behind its targets are not knowable from config.
 
 `direct_execution` is a policy rather than an engine setting, which is why it
 sits beside `pending_drops` at the top level rather than inside an engine
-block like `spirit`, `planetscale`, or `postgres`. Its two fields mean the
-same thing on any engine — a blast-radius bound in rows, and a bound on lock
-acquisition — and each engine supplies only the three pieces that are
+block like `spirit`, `planetscale`, or `postgres`. Its fields mean the same
+thing on any engine — blast-radius bounds in rows and in bytes, and a bound
+on lock acquisition — and each engine supplies only the three pieces that are
 genuinely its own: which statements it refuses, how it estimates a table's
 size, and which native session timeout the lock bound maps to. Today the
 MySQL engine is the only one that implements those, so the policy reaches
@@ -791,7 +822,7 @@ direct_execution:
 ```
 
 This keeps the shared bounds stated once, in one place, for every engine —
-which is the property worth protecting, since `max_table_rows` is the only
+which is the property worth protecting, since the size bounds are the only
 thing between a refused statement and an unbounded write outage. There is no
 such field today, and one should only be added where the value genuinely has
 no cross-engine meaning; a bound that any engine could honor belongs at the

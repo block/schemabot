@@ -66,13 +66,13 @@ force, and the plan records a per-table execution-mode verdict:
 ```diagram
 engine refuses statement (e.g. primary-key reshape)
         │ direct_execution policy in force for this database/environment?
-        ├─ absent or disabled ───────────────► blocked
-        ├─ table row count unavailable ──────► blocked
-        ├─ estimated rows > max_table_rows ──► blocked
-        ├─ exact bounded count > bound ──────► blocked
-        └─ within bound ─────────────────────► direct: statement runs verbatim
-                                               as native MySQL DDL, with its own
-                                               progress entry and outcome metric
+        ├─ absent or disabled ───────────────────► blocked
+        ├─ table size unavailable ───────────────► blocked
+        ├─ above the policy's one size bound ────► blocked
+        └─ within it ────────────────────────────► direct: statement runs verbatim
+             max_table_rows: estimate, then        as native MySQL DDL, with its own
+               exact bounded row count             progress entry and outcome metric
+             max_table_bytes: estimate
 ```
 
 The same predicate is re-evaluated at apply time before anything runs, so a
@@ -147,19 +147,20 @@ did.
 
 ## The size bound
 
-`max_table_rows` is the blast-radius cap. How long writes stay blocked during
-native DDL is roughly proportional to table size, so the bound expresses "only
-run this on tables small enough that the write outage is acceptable" — and the
-operator enabling the policy decides what that means for the fleet, or for one
-environment that overrides it.
+The policy sets exactly one blast-radius cap, `max_table_rows` or
+`max_table_bytes`, and a table within it runs directly. How long writes stay
+blocked during native DDL is roughly proportional to table size, so the bound
+expresses "only run this on tables small enough that the write
+outage is acceptable" — and the operator enabling the policy decides what that
+means for the fleet, or for one environment that overrides it.
 
-The bound travels with the grant. An override states its own
-`max_table_rows` rather than inheriting one, because a policy assembled from
-two sources can enable direct execution in one place under a bound written in
-another — and the bound is the only thing standing between a refused
-statement and an unbounded write outage.
+The bound travels with the grant. An override states its own bound rather
+than inheriting one, because a policy assembled from two sources can enable
+direct execution in one place under a bound written in another — and the
+bound is the only thing standing between a refused statement and an
+unbounded write outage.
 
-The gate runs in two steps. The first reads `information_schema` `TABLE_ROWS`,
+The row bound runs in two steps. The first reads `information_schema` `TABLE_ROWS`,
 the InnoDB optimizer's sampled estimate, with statistics caching disabled
 (`information_schema_stats_expiry = 0`) so it sees current statistics rather
 than a cached value up to a day old. That estimate is trusted only to
@@ -170,6 +171,47 @@ scan is capped just past the bound, so a stale or undercounting estimate can
 never approve a table that actually exceeds the limit. A missing table, a NULL
 or negative estimate, or a failed count query never passes the gate — unknown
 size is blocked, not assumed small.
+
+### The byte bound
+
+Row count is a coarse proxy for how long a rebuild runs: a table of a few
+million narrow rows can be smaller on disk than one of a hundred thousand wide
+ones. `max_table_bytes` bounds what the rebuild actually copies, the table's
+data plus its indexes, read as `DATA_LENGTH + INDEX_LENGTH` in the same
+uncached `information_schema` query as `TABLE_ROWS`. For example, a table with
+about 154,000 rows (`TABLE_ROWS` estimate about 164,000) held 20.6 MiB of data
+and 23.1 MiB of indexes, 43.7 MiB in all: within a `100MiB` bound, and within
+a row bound of 175,000.
+
+The byte figure is not a measurement. InnoDB computes it from the page counts
+its persistent statistics last recorded, so it lags a table that just grew,
+like `TABLE_ROWS`. Unlike the row estimate, nothing cheap corroborates it: an
+exact byte count would mean reading the table. So the byte bound approves on
+the estimate alone, and a table that grew since its statistics were last
+sampled can pass it while above it. An operator who wants only the
+corroborated gate chooses `max_table_rows`.
+
+A policy cannot set both bounds; config validation rejects it at startup and
+the engine refuses it. The bounds differ in strength, and a second limit on a
+safety policy reads as a ceiling. Requiring both would let the uncorroborated
+byte estimate veto a table the exact count approved. Letting either approve
+would run a table the gate measured at many times the byte limit, because
+its row count was within the row bound. Neither rule makes the second limit
+mean what it reads as, so a policy chooses one, and the configured limit is
+the one that decides.
+
+A NULL or negative `DATA_LENGTH` or `INDEX_LENGTH` blocks, the same as an
+unknown row estimate. A row-bound policy does not read those columns, and a
+byte-bound policy does not read `TABLE_ROWS` or run the count.
+
+The mode reasons follow the row bound's shape. A table above the byte bound
+is blocked with a reason naming only the configured limit ("above the
+configured limit of 100.0 MiB of data and indexes"), so the same verdict on
+tables or shards of different sizes renders as one entry. A direct verdict
+reports the measured size ("on a table with ~45.8 MB of data and indexes").
+The limit is shown in
+binary units, matching how it is configured, and the measurement is shown as
+an approximate decimal figure, matching how plan output shows table sizes.
 
 ## Engine compatibility
 
@@ -194,8 +236,9 @@ reshaping any shared surface:
 
 An engine that adopts direct execution owns three pieces: its **refusal
 detector** (which statements it deterministically cannot run), its **size
-estimator** (for MySQL, `TABLE_ROWS`; a PostgreSQL engine would use its
-catalog's row estimate), and its **executor**. Everything else — policy
+estimator** (for MySQL, `TABLE_ROWS`, plus `DATA_LENGTH + INDEX_LENGTH` for
+the byte bound; a PostgreSQL engine would use its catalog's row estimate and
+relation size), and its **executor**. Everything else — policy
 schema, verdicts, metrics, and the PR consent flow — is shared. Two contract
 requirements come with those pieces:
 
@@ -220,7 +263,7 @@ Engine notes:
   again: the Spirit engine's `ExecutionVerdicts` records, for a change planned
   against one shard primary, the verdict the Spirit engine's own plan would
   record there, from the same refusal check, policy, and size gate. Once both
-  pieces are in place, `max_table_rows` becomes a per-shard bound — one
+  pieces are in place, the size bounds become per-shard bounds — one
   over-bound or unknown-size shard blocking the whole apply through the normal
   any-shard-blocked aggregation, and a
   direct statement that does run executing per shard rather than atomically
@@ -259,10 +302,12 @@ Every routing outcome increments
 `outcome` attribute: `completed`, `failed`, or `stopped` for executed
 statements; `blocked_policy_disabled`, `blocked_size_limit`,
 `blocked_size_unknown`, or `blocked_force_kill_unavailable` for statements the
-policy did not route. Direct executions are rare, operator-consented events —
-a spike in `failed` means native DDL is erroring on the target (check the
-apply logs for the statement and MySQL error), a spike in
-`blocked_size_unknown` means row counts are unavailable (check target
-connectivity and `information_schema` access), and
-`blocked_force_kill_unavailable` means the SchemaBot user cannot read
-`performance_schema` on the target (grant `SELECT` on `performance_schema.*`).
+policy did not route. `blocked_size_limit` covers either bound; the server log
+line for the verdict says which bound blocked and carries the measured
+estimate. Direct executions are rare, operator-consented events — a spike in
+`failed` means native DDL is erroring on the target (check the apply logs for
+the statement and MySQL error), a spike in `blocked_size_unknown` means table
+size statistics are unavailable (check target connectivity and
+`information_schema` access), and `blocked_force_kill_unavailable` means the
+SchemaBot user cannot read `performance_schema` on the target (grant `SELECT`
+on `performance_schema.*`).
