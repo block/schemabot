@@ -156,6 +156,12 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
+	// AllChangesDirect marks a plan whose every change runs as direct
+	// execution. Such a plan has no cutover to defer, so the apply-confirm
+	// command a paused comment suggests leaves out --defer-cutover, which
+	// apply-confirm rejects on it.
+	AllChangesDirect bool
+
 	// Unfinished copies already on the target that the apply will throw away
 	// and copy again from the start.
 	DiscardedCopies []ExistingCopyData
@@ -328,6 +334,14 @@ func (d PlanCommentData) applyingWithoutConfirmation() bool {
 	return d.IsLocked && !d.PendingManualConfirmation
 }
 
+// directNotesDeferCutover reports whether the direct disclosure says
+// --defer-cutover leaves the direct statements alone: on an apply that passed
+// the flag, and on a paused comment, where the operator can still pass it to
+// apply-confirm.
+func (d PlanCommentData) directNotesDeferCutover() bool {
+	return d.DeferCutover || (d.IsLocked && d.PendingManualConfirmation)
+}
+
 // PausedApplyCauseData is a cause the rest of the comment does not already
 // disclose, in the shape every other disclosure uses: a heading naming what is
 // wrong, the specifics behind it, and what the operator can do. Entries may be
@@ -466,7 +480,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// The policy approves them, so the plan only discloses how they run; the
 	// locked apply comment repeats it so the apply shows what it is running.
 	if len(data.DirectChanges) > 0 {
-		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, data.DeferCutover)
+		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 	}
 
 	// Copies already on the target. Shown on the locked apply comment too:
@@ -525,7 +539,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		applyConfirmCmd := scopedApplyCommand("schemabot apply-confirm", data.Environment, data.ScopedDatabase, ApplyCommandOptions{
 			Tenant:       data.Tenant,
 			AllowUnsafe:  data.AllowUnsafe,
-			DeferCutover: data.DeferCutover,
+			DeferCutover: data.DeferCutover && !data.AllChangesDirect,
 			SkipRevert:   data.SkipRevert,
 		})
 
@@ -1781,10 +1795,9 @@ func writePausedApplyCause(sb *strings.Builder, cause *PausedApplyCauseData) {
 // writeDirectChanges writes the section for statements the direct execution
 // policy routes to native DDL, naming each table and the planner's reason
 // (the table's measured size). The footer says what running them does to the
-// table. It mentions --defer-cutover
-// only on an apply that passed it: a direct statement has no cutover, so the
-// flag leaves these statements alone even though it defers the rest of the
-// plan's.
+// table. It mentions --defer-cutover only when the flag is or can still be in
+// play: a direct statement has no cutover, so the flag leaves these statements
+// alone even though it defers the rest of the plan's.
 func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL, deferCutover bool) {
 	headerNoun, consequence := directDisclosureCopy(databaseType, isMySQL)
 	footer := consequence

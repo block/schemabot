@@ -492,9 +492,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Discarding an unfinished copy destroys work already done on the target —
 	// often hours of it — so it never happens in one step. Downgrade to the
 	// two-step confirm against the locked comment that discloses what is being
-	// thrown away, the same way a direct-execution change does: the operator
-	// spends the hours, so the operator decides, and there is no flag that
-	// converts an automatic apply into that consent.
+	// thrown away: the operator spends the hours, so the operator decides, and
+	// there is no flag that converts an automatic apply into that consent.
 	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
@@ -577,7 +576,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
 	return false, nil
 }
 
@@ -912,7 +911,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
 }
 

@@ -61,6 +61,55 @@ func TestRenderPlanComment_DirectNotesDeferCutoverOnlyWhenPassed(t *testing.T) {
 	assert.Contains(t, apply, "Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer.\n")
 }
 
+// A paused --defer-cutover apply whose every change runs as direct execution
+// suggests an apply-confirm without the flag, since apply-confirm rejects it on
+// such a plan. The disclosure still notes the flag leaves the direct statements
+// alone, and a mixed plan keeps the flag in its suggested command.
+func TestRenderPlanComment_PausedAllDirectConfirmOmitsDeferCutover(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
+		PendingManualConfirmation: true, DeferCutover: true, AllChangesDirect: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
+		}},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "the table has ~1,240 rows"},
+		},
+	}
+
+	paused := RenderPlanComment(data)
+	assert.Contains(t, paused, "```\nschemabot apply-confirm -e staging\n```")
+	assert.Contains(t, paused, "`--defer-cutover` does not apply to these direct statements: they have no cutover to defer.")
+
+	data.AllChangesDirect = false
+	assert.Contains(t, RenderPlanComment(data), "```\nschemabot apply-confirm -e staging --defer-cutover\n```",
+		"a plan with engine-driven changes keeps the flag the operator passed")
+}
+
+// apply-confirm reads its own flags, so a paused comment notes that
+// --defer-cutover leaves the direct statements alone even when the paused
+// apply did not pass the flag: the operator can still add it when confirming.
+func TestRenderPlanComment_PausedDirectNotesDeferCutover(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true, PendingManualConfirmation: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+				"ALTER TABLE `orders` ADD COLUMN `notes` text",
+			},
+		}},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "the table has ~1,240 rows"},
+		},
+	}
+
+	paused := RenderPlanComment(data)
+	assert.Contains(t, paused, "`--defer-cutover` does not apply to these direct statements: they have no cutover to defer.")
+	assert.Contains(t, paused, "```\nschemabot apply-confirm -e staging\n```", "the suggested command adds no flag the operator did not pass")
+}
+
 func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,

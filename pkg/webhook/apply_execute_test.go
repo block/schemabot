@@ -466,17 +466,65 @@ func TestNewlyDirectChanges(t *testing.T) {
 		assert.Equal(t, []directChangeIdentity{{namespace: "ks", shard: "80-", table: "users", ddl: swap}},
 			newlyDirectChanges(planResp, storedPlan))
 	})
+	t.Run("a sharded namespace is judged by its shard rows, not its namespace summary", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{
+				{Namespace: "ks", TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []*apitypes.ShardPlanResponse{
+				{Namespace: "ks", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+		}
+		storedPlan := &storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks": {Tables: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []storage.ShardPlan{
+				{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+			},
+		}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", shard: "-80", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan),
+			"one entry for the shard, and the namespace summary neither adds one nor counts as disclosure")
+	})
+	t.Run("a namespace summary the disclosed plan rendered per shard does not disclose an unsharded re-plan", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "ks", TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+		}}
+		storedPlan := &storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks": {Tables: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []storage.ShardPlan{
+				{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+			},
+		}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan))
+	})
+	t.Run("statement differing only in surrounding whitespace is the same statement", func(t *testing.T) {
+		storedPlan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", DDL: "\n" + swap + "\n", ExecutionMode: "direct"},
+				{Table: "orders", DDL: addColumn},
+			}},
+		}}
+		assert.Empty(t, newlyDirectChanges(replan("direct", ""), storedPlan))
+	})
 }
 
 func TestNewlyDirectCauseNamesEachTable(t *testing.T) {
 	cause := newlyDirectCause([]directChangeIdentity{
 		{namespace: "mydb", table: "users", ddl: "ALTER TABLE `users` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "-80", table: "events", ddl: "ALTER TABLE `events` DROP PRIMARY KEY"},
 		{namespace: "ks", shard: "80-", table: "events", ddl: "ALTER TABLE `events` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "80-", table: "orders", ddl: "ALTER TABLE `orders` DROP PRIMARY KEY"},
 	})
 	assert.Equal(t, "Changes run differently from the plan this apply was started from", cause.Heading)
 	assert.Equal(t, []string{
 		"`users` now runs as direct execution",
-		"`events` (shard `80-`) now runs as direct execution",
+		"`events` (shards `-80`, `80-`) now runs as direct execution",
+		"`orders` (shard `80-`) now runs as direct execution",
 	}, cause.Entries)
 	assert.Equal(t, "The direct execution section above shows how they will run. Review it, then confirm to apply.", cause.Remedy)
 }
