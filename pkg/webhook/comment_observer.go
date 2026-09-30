@@ -40,10 +40,11 @@ type CommentObserver struct {
 	// plans remembers the plan rows this apply's members run, so the progress
 	// comment reads each once for the observer's life, not once per render.
 	plans planIdentities
-	// finalizers remembers what the stored plan says about each apply's
-	// finalizers once it has been read; see shardedPlanCache.
-	finalizers *shardedPlanCache
-	logger     interface {
+	// shardedPlans remembers what each sharded apply's stored plan says about
+	// its finalizers and table sizes once it has been read; see
+	// shardedPlanCache.
+	shardedPlans *shardedPlanCache
+	logger       interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Warn(msg string, args ...any)
@@ -242,9 +243,9 @@ func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any)
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	clk := clock.Default(cfg.Clock)
-	finalizers := cfg.shardedPlans
-	if finalizers == nil {
-		finalizers = newShardedPlanCache()
+	shardedPlans := cfg.shardedPlans
+	if shardedPlans == nil {
+		shardedPlans = newShardedPlanCache()
 	}
 	return &CommentObserver{
 		ghClient:       cfg.GHClient,
@@ -259,7 +260,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		cliName:        cfg.CLIName,
 		tenant:         cfg.Tenant,
 		engineLogs:     cfg.EngineLogs,
-		finalizers:     finalizers,
+		shardedPlans:   shardedPlans,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -732,14 +733,14 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 }
 
 // resolveShardedPlan loads what the stored plan says about a sharded apply's
-// finalizers for its comment rendering, through the cache shared with every
-// other render of the apply (see shardedPlanCache). It uses a short,
-// independent deadline so a slow storage read degrades to a comment without
-// diffs rather than blocking the update.
+// finalizers and table sizes for its comment rendering, through the cache
+// shared with every other render of the apply (see shardedPlanCache). It uses
+// a short, independent deadline so a slow storage read degrades to a comment
+// without VSchema diffs or table sizes rather than blocking the update.
 func (o *CommentObserver) resolveShardedPlan(apply *storage.Apply, ops []*storage.ApplyOperation) *shardedPlanView {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return o.finalizers.resolve(ctx, o.stor, apply, ops)
+	return o.shardedPlans.resolve(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -775,11 +776,11 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 	// the body actually posted.
 	var released bool
 	var display map[int64]operationDisplay
-	var finalizers *shardedPlanView
+	var view *shardedPlanView
 	if opsErr == nil {
 		released = o.resolveReleased(apply, ops)
 		display = o.resolveDisplay(apply, ops)
-		finalizers = o.resolveShardedPlan(apply, ops)
+		view = o.resolveShardedPlan(apply, ops)
 	}
 	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
 	renderBody := func(apply *storage.Apply) string {
@@ -787,7 +788,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 		if opsErr != nil {
 			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 		} else {
-			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, finalizers, o.tenant)
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, view, o.tenant)
 		}
 		return body + renderControlRejections(rejections, o.logger, apply, body)
 	}

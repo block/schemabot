@@ -128,6 +128,12 @@ type ShardedTableStatus struct {
 	// the scale of the copy. Nil when no estimate is known, which omits it.
 	EstimatedBytes *int64
 
+	// PlannedShards is how many shards EstimatedBytes was summed over, from
+	// the plan. It can exceed len(Shards) while dispatch is still attaching the
+	// table's shard operations, so the size line names it rather than the
+	// shards attached so far. Zero when the plan does not record it.
+	PlannedShards int
+
 	// Shards is the per-shard state (and percent while copying) in resolved
 	// order, rendered as the compact one-line summary while the table is in
 	// flight.
@@ -656,12 +662,21 @@ func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
 	// The planned size is the whole table's, so beside rows that cover only
 	// some shards it names the full span rather than reading as theirs.
 	if t.EstimatedBytes != nil {
-		line += fmt.Sprintf(" · %s across all %d shards", ui.FormatApproxBytes(*t.EstimatedBytes), len(t.Shards))
+		line += fmt.Sprintf(" · %s %s", ui.FormatApproxBytes(*t.EstimatedBytes), plannedShardSpan(t.PlannedShards))
 	}
 	if t.ETASeconds > 0 {
 		line += fmt.Sprintf(" · ETA: ≥ %s", ui.FormatETA(t.ETASeconds))
 	}
 	sb.WriteString(line + "\n")
+}
+
+// plannedShardSpan names the shards a table's planned size covers: the plan's
+// count when it recorded one, otherwise every shard without a number.
+func plannedShardSpan(plannedShards int) string {
+	if plannedShards > 0 {
+		return fmt.Sprintf("across all %d shards", plannedShards)
+	}
+	return "across all shards"
 }
 
 // shardedTableStatusPhrase maps a table's aggregate task state to its display

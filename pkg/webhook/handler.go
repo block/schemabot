@@ -743,10 +743,10 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
-		finalizers := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
+		view := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, finalizers, h.deploymentTenant())
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant())
 			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)

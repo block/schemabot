@@ -249,9 +249,9 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 		mk(3, "commerce/group_finalizer", state.ApplyOperation.Running),
 		mk(4, "payments/group_finalizer", state.ApplyOperation.Pending),
 	}
-	finalizers := &shardedPlanView{finalizeOnly: map[string]bool{"commerce": true}}
+	view := &shardedPlanView{finalizeOnly: map[string]bool{"commerce": true}}
 
-	data := buildShardedApplyData(apply, ops, false, nil, finalizers, "")
+	data := buildShardedApplyData(apply, ops, false, nil, view, "")
 
 	assert.Equal(t, []templates.ShardedFinalize{{Keyspace: "commerce", Status: "applying"}}, data.Finalizes)
 	require.Len(t, data.VSchemaChanges, 1)
@@ -265,7 +265,7 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	for _, op := range ops {
 		op.State = state.ApplyOperation.Completed
 	}
-	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, finalizers, ""))
+	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, view, ""))
 	assert.Contains(t, summary, "### Finalize\n\n**`commerce`**: Finalized\n")
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
 }
@@ -342,20 +342,24 @@ func TestResolveShardedPlanView(t *testing.T) {
 			Finalize:  true,
 		},
 		"pay": {Finalize: true, Tables: []storage.TableChange{
-			{Table: "mutes", EstimatedBytes: new(int64(23_400_000_000))},
+			{Table: "mutes", EstimatedBytes: new(int64(23_400_000_000)), ShardCount: 4},
 			{Table: "outcomes"},
 		}},
 	}}
-	finalizers := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
-	require.NotNil(t, finalizers)
-	assert.Equal(t, map[string]string{"ks": "+ vindex hash"}, finalizers.vschemaDiffs,
+	view := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+	require.NotNil(t, view)
+	assert.Equal(t, map[string]string{"ks": "+ vindex hash"}, view.vschemaDiffs,
 		"only namespaces with a persisted diff contribute")
-	assert.Equal(t, map[string]bool{"pay": true}, finalizers.finalizeOnly,
+	assert.Equal(t, map[string]bool{"pay": true}, view.finalizeOnly,
 		"only a namespace finalized without a VSchema change is finalize-only")
-	require.NotNil(t, finalizers.estimatedBytes("pay", "mutes"))
-	assert.Equal(t, int64(23_400_000_000), *finalizers.estimatedBytes("pay", "mutes"))
-	assert.Nil(t, finalizers.estimatedBytes("pay", "outcomes"), "a table without an estimate has no size")
-	assert.Nil(t, finalizers.estimatedBytes("ks", "mutes"), "sizes are keyed by namespace")
+	bytes, shards := view.plannedSize("pay", "mutes")
+	require.NotNil(t, bytes)
+	assert.Equal(t, int64(23_400_000_000), *bytes)
+	assert.Equal(t, 4, shards, "the size carries the plan's shard count")
+	bytes, _ = view.plannedSize("pay", "outcomes")
+	assert.Nil(t, bytes, "a table without an estimate has no size")
+	bytes, _ = view.plannedSize("ks", "mutes")
+	assert.Nil(t, bytes, "sizes are keyed by namespace")
 
 	assert.Nil(t, resolveShardedPlanView(t.Context(), &stubPlanStorage{err: errors.New("storage down")}, apply, ops),
 		"a plan load failure degrades to no diffs")
@@ -368,7 +372,8 @@ func TestResolveShardedPlanView(t *testing.T) {
 	// tables' sizes.
 	shardOnly := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, []*storage.ApplyOperation{shardOp})
 	require.NotNil(t, shardOnly)
-	assert.NotNil(t, shardOnly.estimatedBytes("pay", "mutes"))
+	bytes, _ = shardOnly.plannedSize("pay", "mutes")
+	assert.NotNil(t, bytes)
 
 	// A shape that is not the sharded layout — here a two-deployment apply —
 	// discards the diffs downstream, so the resolver must not pay the
@@ -673,8 +678,8 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 }
 
 // Each table's planned size comes from the stored plan view, keyed by its
-// namespace, since a shard task carries no size of its own. Without a view
-// the table renders without a size.
+// namespace and carrying the plan's shard count, since a shard task carries no
+// size of its own. Without a view the table renders without a size.
 func TestBuildShardedApplyData_TableSizeFromStoredPlan(t *testing.T) {
 	mk := func(id int64, key string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
@@ -685,9 +690,9 @@ func TestBuildShardedApplyData_TableSizeFromStoredPlan(t *testing.T) {
 		mk(3, "cdb_resolute_sharded/-80/outcomes"),
 	}
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
-	view := &shardedPlanView{tableBytes: map[shardedTableKey]int64{
-		{"cdb_resolute_sharded", "mutes"}: 23_400_000_000,
-		{"other", "outcomes"}:             1_000,
+	view := &shardedPlanView{tableSizes: map[shardedTableKey]plannedTableSize{
+		{"cdb_resolute_sharded", "mutes"}: {bytes: 23_400_000_000, shards: 4},
+		{"other", "outcomes"}:             {bytes: 1_000, shards: 4},
 	}}
 
 	data := buildShardedApplyData(apply, ops, false, nil, view, "")
@@ -698,6 +703,8 @@ func TestBuildShardedApplyData_TableSizeFromStoredPlan(t *testing.T) {
 	assert.Equal(t, "mutes", mutes.Table)
 	require.NotNil(t, mutes.EstimatedBytes)
 	assert.Equal(t, int64(23_400_000_000), *mutes.EstimatedBytes)
+	assert.Equal(t, 4, mutes.PlannedShards,
+		"the size's shard span is the plan's, not the two shard operations attached so far")
 	assert.Equal(t, "outcomes", outcomes.Table)
 	assert.Nil(t, outcomes.EstimatedBytes, "a size planned for another namespace's table is not this one's")
 
@@ -714,7 +721,7 @@ func TestBuildSingleShardApplyCommentData_TableSizeFromStoredPlan(t *testing.T) 
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &opID, Shard: "-", Namespace: "ks", TableName: "mutes",
 		State: state.Task.Running, ProgressPercent: 40, RowsCopied: 400, RowsTotal: 1000, ETASeconds: 60}}
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
-	view := &shardedPlanView{tableBytes: map[shardedTableKey]int64{{"ks", "mutes"}: 1_130_000_000}}
+	view := &shardedPlanView{tableSizes: map[shardedTableKey]plannedTableSize{{"ks", "mutes"}: {bytes: 1_130_000_000, shards: 1}}}
 
 	data := buildSingleShardApplyCommentData(apply, ops, tasks, nil, view, "")
 
@@ -825,11 +832,11 @@ func TestShardedCommentShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 	}}
 
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	finalizers := o.resolveShardedPlan(apply, ops)
-	require.NotNil(t, finalizers)
-	assert.Equal(t, map[string]bool{"ks": true}, finalizers.finalizeOnly)
+	view := o.resolveShardedPlan(apply, ops)
+	require.NotNil(t, view)
+	assert.Equal(t, map[string]bool{"ks": true}, view.finalizeOnly)
 
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, finalizers, "")
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, view, "")
 	assert.NotContains(t, body, "VSchema")
 }
 
@@ -907,10 +914,10 @@ func TestRendersAsSingleShard(t *testing.T) {
 		return &storage.ApplyOperation{Deployment: "cake", OperationKey: key}
 	}
 	cases := []struct {
-		name       string
-		ops        []*storage.ApplyOperation
-		finalizers *shardedPlanView
-		want       bool
+		name string
+		ops  []*storage.ApplyOperation
+		view *shardedPlanView
+		want bool
 	}{
 		{"one shard beside its finalize", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, finalizesOnly("ks"), true},
 		{"one shard, several tables", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/-/users")}, nil, true},
@@ -924,7 +931,7 @@ func TestRendersAsSingleShard(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, rendersAsSingleShard(nil, tc.ops, tc.finalizers))
+			assert.Equal(t, tc.want, rendersAsSingleShard(nil, tc.ops, tc.view))
 		})
 	}
 
@@ -949,9 +956,9 @@ func TestResolveShardedPlanViewReadsTheDeclaredFinalizer(t *testing.T) {
 	ops := []*storage.ApplyOperation{{OperationKey: "ks/-/orders"}}
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"ks": {Finalize: true}}}
 
-	finalizers := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
-	require.NotNil(t, finalizers, "the declared finalizer reads the stored plan")
-	assert.True(t, finalizers.finalizesOnly("ks"))
+	view := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+	require.NotNil(t, view, "the declared finalizer reads the stored plan")
+	assert.True(t, view.finalizesOnly("ks"))
 }
 
 // Every comment render of an apply shares its handler's sharded plan cache.

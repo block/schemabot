@@ -617,9 +617,10 @@ func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.
 // A copying table carries its planned size beside its rows. With every shard
 // reporting the line matches the single-deployment one; while later waves
 // have yet to start, the size names the whole table's shard span so it does
-// not read as the size of the reporting shards alone.
+// not read as the size of the reporting shards alone. The span is the plan's
+// shard count, which can exceed the shard operations attached so far.
 func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
-	render := func(reporting int, second ShardProgressData) string {
+	render := func(reporting, plannedShards int, second ShardProgressData) string {
 		return RenderShardedApplyComment(ShardedApplyData{
 			State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
 			ApplyID: "apply-x",
@@ -630,6 +631,7 @@ func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
 					RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
 					ShardsReporting: reporting,
 					EstimatedBytes:  new(int64(23_400_000_000)),
+					PlannedShards:   plannedShards,
 					Shards: []ShardProgressData{
 						{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
 						second,
@@ -639,11 +641,19 @@ func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
 		})
 	}
 
-	full := render(2, ShardProgressData{Shard: "80-", Status: state.Task.Running, PercentComplete: 54})
+	full := render(2, 2, ShardProgressData{Shard: "80-", Status: state.Task.Running, PercentComplete: 54})
 	assert.Contains(t, full, "- Rows: 914,707 / 1,466,232 · ~23.4 GB · ETA: 3m 15s\n")
 
-	partial := render(1, ShardProgressData{Shard: "80-", Status: state.Task.Pending})
+	partial := render(1, 2, ShardProgressData{Shard: "80-", Status: state.Task.Pending})
 	assert.Contains(t, partial, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ~23.4 GB across all 2 shards · ETA: ≥ 3m 15s\n")
+
+	stillAttaching := render(1, 4, ShardProgressData{Shard: "40-80", Status: state.Task.Pending})
+	assert.Contains(t, stillAttaching, "· ~23.4 GB across all 4 shards ·",
+		"the size names the plan's shards, not the operations attached so far")
+
+	unrecorded := render(1, 0, ShardProgressData{Shard: "80-", Status: state.Task.Pending})
+	assert.Contains(t, unrecorded, "· ~23.4 GB across all shards ·",
+		"a plan without a shard count names no number")
 }
 
 // A copy past its estimated total with later waves still unreported names the
