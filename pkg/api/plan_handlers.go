@@ -32,7 +32,11 @@ import (
 )
 
 const applyOperationKeyMaxLen = 255
-const finalizerOperationKeySegment = "group_finalizer"
+
+// finalizerOperationKeySegment ends every group_finalizer key. The rollout
+// projection and the claim query read the finalizer's scope back as the key in
+// front of it (state.FinalizerFinalizesWork), so it is that package's constant.
+const finalizerOperationKeySegment = state.GroupFinalizerKeySegment
 
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
@@ -1939,7 +1943,7 @@ func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.
 }
 
 func finalizerOperationKey(namespace string) string {
-	return namespace + "/" + finalizerOperationKeySegment
+	return namespace + storage.OperationKeyDelimiter + finalizerOperationKeySegment
 }
 
 // newPendingApplyOperation builds one member's pending operation.

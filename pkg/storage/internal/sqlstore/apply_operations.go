@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -738,15 +739,32 @@ func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operatio
 	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
-// finalizerScopeSQL renders the scope a group_finalizer shares with the work
-// it finalizes: the leading segment of the operation key, or the whole key
-// when it has no delimiter. A finalizer and its work also share a deployment,
-// which callers match separately.
-func finalizerScopeSQL(alias string) string {
-	return `CASE
-		WHEN POSITION('/' IN ` + alias + `.operation_key) = 0 THEN ` + alias + `.operation_key
-		ELSE SUBSTRING(` + alias + `.operation_key FROM 1 FOR POSITION('/' IN ` + alias + `.operation_key) - 1)
-	END`
+// finalizerFinalizesWorkSQL matches when the group_finalizer at finalizerAlias
+// finalizes the work at workAlias: the finalizer's key ends in the
+// group_finalizer segment after a non-empty scope, and the work's key is that
+// scope or begins with it and the delimiter. It is state.FinalizerFinalizesWork
+// in SQL, so the claim query and every rollout projection agree on which work
+// a finalizer waits for and is orphaned by: one namespace of one target, in
+// both the single-target and the targets-list key shape. A finalizer and its
+// work also share a deployment, which callers match separately. The fragment
+// takes no placeholders.
+func finalizerFinalizesWorkSQL(finalizerAlias, workAlias string) string {
+	suffix := state.OperationKeyDelimiter + state.GroupFinalizerKeySegment
+	suffixLen := strconv.Itoa(len(suffix))
+	finalizerKey := finalizerAlias + `.operation_key`
+	workKey := workAlias + `.operation_key`
+	scopeLen := `CHAR_LENGTH(` + finalizerKey + `) - ` + suffixLen
+	// The scope with the delimiter that closes it, so ns_0 never claims
+	// ns_01's work.
+	scopeWithDelimiterLen := scopeLen + ` + ` + strconv.Itoa(len(state.OperationKeyDelimiter))
+	return `(
+		CHAR_LENGTH(` + finalizerKey + `) > ` + suffixLen + `
+		AND RIGHT(` + finalizerKey + `, ` + suffixLen + `) = '` + suffix + `'
+		AND (
+			` + workKey + ` = LEFT(` + finalizerKey + `, ` + scopeLen + `)
+			OR LEFT(` + workKey + `, ` + scopeWithDelimiterLen + `) = LEFT(` + finalizerKey + `, ` + scopeWithDelimiterLen + `)
+		)
+	)`
 }
 
 // orphanedFinalizerSQL matches an earlier group_finalizer that nothing will
@@ -767,7 +785,7 @@ var orphanedFinalizerSQL = `(
 		WHERE orphaning.apply_id = earlier.apply_id
 			AND orphaning.deployment = earlier.deployment
 			AND orphaning.operation_kind = ?
-			AND ` + finalizerScopeSQL("orphaning") + ` = ` + finalizerScopeSQL("earlier") + `
+			AND ` + finalizerFinalizesWorkSQL("earlier", "orphaning") + `
 			AND orphaning.state = ?
 	)
 )`
@@ -895,7 +913,7 @@ var finalizerStartGateSQL = `(
 		WHERE sibling.apply_id = apply_operations.apply_id
 			AND sibling.deployment = apply_operations.deployment
 			AND sibling.operation_kind = ?
-			AND ` + finalizerScopeSQL("sibling") + ` = ` + finalizerScopeSQL("apply_operations") + `
+			AND ` + finalizerFinalizesWorkSQL("apply_operations", "sibling") + `
 			AND sibling.state <> ?
 	)
 	AND NOT EXISTS (

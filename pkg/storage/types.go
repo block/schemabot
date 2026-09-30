@@ -374,7 +374,7 @@ const (
 // component containing it would make the key ambiguous to split, so producers
 // refuse the delimiter inside a component rather than escaping it. It is the
 // rollout projection's delimiter, which reads a finalizer's scope back out of
-// the key (see state.OperationScope).
+// the key (see state.FinalizerFinalizesWork).
 const OperationKeyDelimiter = state.OperationKeyDelimiter
 
 // ShardOperationKey builds the operation key for one shard's work on one table

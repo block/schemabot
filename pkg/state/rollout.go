@@ -4,9 +4,15 @@ import "strings"
 
 // OperationKeyDelimiter separates the components of an operation key.
 // storage.OperationKeyDelimiter, which builds the keys, is defined as this
-// constant; the rollout projection reads the leading component back as a
-// finalizer's scope.
+// constant; the rollout projection reads a finalizer's scope back out of the
+// key (see FinalizerFinalizesWork).
 const OperationKeyDelimiter = "/"
+
+// GroupFinalizerKeySegment is the trailing component of a group_finalizer's
+// operation key. Everything in front of it is the finalizer's scope: the
+// namespace ("ns_0/group_finalizer"), or the target and namespace when a
+// targets list qualifies the keys ("orders-001/ns_0/group_finalizer").
+const GroupFinalizerKeySegment = "group_finalizer"
 
 // RolloutOperation is one operation as the rollout projection reads it: the
 // facts about the row that decide how its state counts toward the parent
@@ -23,8 +29,8 @@ type RolloutOperation struct {
 	// Deployment is the operation's deployment. A finalizer and the work it
 	// finalizes share it.
 	Deployment string
-	// OperationKey is the operation's key. Its leading component is the scope
-	// a finalizer shares with the work it finalizes (see OperationScope).
+	// OperationKey is the operation's key. A finalizer's key names the scope
+	// of the work it finalizes (see FinalizerFinalizesWork).
 	OperationKey string
 	// Work is true for a work operation.
 	Work bool
@@ -73,7 +79,7 @@ func RolloutChildren(ops []RolloutOperation) []RolloutChild {
 // started) and work it finalizes has terminally failed. A finalizer starts
 // only once that work completes, and a failed operation never runs again, so
 // the row is dead rather than queued. A finalizer matches its work by
-// deployment and by the leading component of the operation key.
+// deployment and by FinalizerFinalizesWork.
 func finalizerOrphanedByFailedWork(op RolloutOperation, ops []RolloutOperation) bool {
 	if !op.Finalizer {
 		return false
@@ -81,22 +87,48 @@ func finalizerOrphanedByFailedWork(op RolloutOperation, ops []RolloutOperation) 
 	if !IsState(op.State, ApplyOperation.Pending, ApplyOperation.Stopped) {
 		return false
 	}
-	scope := OperationScope(op.OperationKey)
 	for _, work := range ops {
 		if !work.Work || work.Deployment != op.Deployment {
 			continue
 		}
-		if OperationScope(work.OperationKey) == scope && IsState(work.State, ApplyOperation.Failed) {
+		if FinalizerFinalizesWork(op.OperationKey, work.OperationKey) && IsState(work.State, ApplyOperation.Failed) {
 			return true
 		}
 	}
 	return false
 }
 
-// OperationScope returns the scope a group_finalizer shares with the work it
-// finalizes: the operation key's leading component, or the whole key when it
-// has no delimiter.
-func OperationScope(operationKey string) string {
-	scope, _, _ := strings.Cut(operationKey, OperationKeyDelimiter)
-	return scope
+// FinalizerFinalizesWork reports whether the group_finalizer keyed
+// finalizerKey finalizes the work keyed workKey. The finalizer's scope is its
+// key without the trailing GroupFinalizerKeySegment, and its work is the scope
+// itself and every key under it. That is one namespace of one target in either
+// key shape:
+//
+//	"ns_0/group_finalizer"            finalizes "ns_0/-80/orders"
+//	"orders-001/ns_0/group_finalizer" finalizes "orders-001/ns_0/-80/orders",
+//	                                  not "orders-001/ns_1/-80/orders"
+//
+// A finalizer key with nothing in front of the segment (the deployment-scoped
+// finalizer of a single-target plan whose only changes are finalizers) has no
+// work alongside it and finalizes none. A finalizer and its work also share a
+// deployment, which callers match separately. finalizerFinalizesWorkSQL
+// (pkg/storage/internal/sqlstore/apply_operations.go) is the same rule for
+// the claim query.
+func FinalizerFinalizesWork(finalizerKey, workKey string) bool {
+	scope, ok := finalizerScope(finalizerKey)
+	if !ok {
+		return false
+	}
+	return workKey == scope || strings.HasPrefix(workKey, scope+OperationKeyDelimiter)
+}
+
+// finalizerScope returns a group_finalizer key without its trailing
+// GroupFinalizerKeySegment. ok is false for a key that does not end in the
+// segment after a non-empty scope.
+func finalizerScope(finalizerKey string) (scope string, ok bool) {
+	scope, ok = strings.CutSuffix(finalizerKey, OperationKeyDelimiter+GroupFinalizerKeySegment)
+	if !ok || scope == "" {
+		return "", false
+	}
+	return scope, true
 }
