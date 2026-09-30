@@ -501,6 +501,10 @@ the change, so the plan is not reported as up to date: it fails with an error
 that lists the targets it did not plan. Plan and apply each of them with
 `--target`.
 
+A targeted apply checks for a schema change already in progress on its
+target's deployment, which every target of a `targets:` list shares, and
+refuses to start while one is running there.
+
 ### Understand a refusal
 
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.

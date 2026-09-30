@@ -398,6 +398,20 @@ type ActiveSchemaChange struct {
 }
 
 func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSchemaChange, error) {
+	return findActiveSchemaChange(endpoint, database, environment, func(*apitypes.ActiveApplyResponse) bool { return true })
+}
+
+// CheckActiveSchemaChangeOnDeployment is CheckActiveSchemaChange limited to
+// the active schema changes that hold the given deployment, for an apply that
+// reserves only that deployment. An active apply whose deployment is not
+// reported is counted as holding it, since nothing shows it does not.
+func CheckActiveSchemaChangeOnDeployment(endpoint, database, environment, deployment string) (*ActiveSchemaChange, error) {
+	return findActiveSchemaChange(endpoint, database, environment, func(apply *apitypes.ActiveApplyResponse) bool {
+		return apply.Deployment == "" || apply.Deployment == deployment
+	})
+}
+
+func findActiveSchemaChange(endpoint, database, environment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
 	var result apitypes.StatusResponse
 	query := url.Values{}
 	query.Set("environment", environment)
@@ -428,6 +442,9 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 		// The server already excluded terminal states; re-checking here keeps the
 		// answer correct if this ever reads a response that was not filtered.
 		if state.IsTerminalApplyState(apply.State) {
+			continue
+		}
+		if !holds(apply) {
 			continue
 		}
 		return &ActiveSchemaChange{State: apply.State, ApplyID: apply.ApplyID}, nil

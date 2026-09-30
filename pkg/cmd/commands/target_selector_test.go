@@ -41,8 +41,9 @@ func TestPlanCmd_TargetRequiresEnvironment(t *testing.T) {
 	assert.Contains(t, err.Error(), "pass -e")
 }
 
-// narrowedPlanServer serves plan from /api/plan and accepts every apply, and
-// records the requests the CLI sent and the paths it called.
+// narrowedPlanServer serves plan from /api/plan, the given active applies from
+// /api/status, and accepts every apply, and records the requests the CLI sent
+// and the paths it called.
 type narrowedPlanServer struct {
 	mu       sync.Mutex
 	planReq  apitypes.PlanRequest
@@ -50,9 +51,11 @@ type narrowedPlanServer struct {
 	paths    []string
 }
 
-func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse) (*narrowedPlanServer, string) {
+func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse, active ...*apitypes.ActiveApplyResponse) (*narrowedPlanServer, string) {
 	t.Helper()
 	planBody, err := json.Marshal(plan)
+	require.NoError(t, err)
+	statusBody, err := json.Marshal(apitypes.StatusResponse{Applies: active})
 	require.NoError(t, err)
 	recorded := &narrowedPlanServer{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +67,9 @@ func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse) (*narrowed
 		case "/api/plan":
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&recorded.planReq))
 			_, writeErr := w.Write(planBody)
+			assert.NoError(t, writeErr)
+		case "/api/status":
+			_, writeErr := w.Write(statusBody)
 			assert.NoError(t, writeErr)
 		case "/api/apply":
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&recorded.applyReq))
@@ -81,6 +87,7 @@ func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse) (*narrowed
 func narrowedPlan(tables ...*apitypes.TableChangeResponse) *apitypes.PlanResponse {
 	plan := planWithTablesAndEngine("mysql", tables...)
 	plan.PlanID = "plan-narrowed"
+	plan.Deployment = "prod"
 	plan.Target = "payments-002"
 	plan.NarrowedTo = "prod/payments-002"
 	return plan
@@ -99,11 +106,11 @@ func targetedApplyCmd(t *testing.T) ApplyCmd {
 
 // apply --target sends the selector with the plan, then applies the plan to the
 // member the server narrowed it to, so the apply cannot run rollout-wide. The
-// active schema change preflight asks about the whole environment, so a
-// targeted apply leaves conflicts to the server's deployment reservation
-// instead of being blocked by an apply on another deployment.
+// active schema change preflight runs once the plan names the member's
+// deployment, so an apply running on another deployment does not block it.
 func TestApplyCmd_TargetNarrowsPlanAndApply(t *testing.T) {
-	recorded, endpoint := newNarrowedPlanServer(t, narrowedPlan(createUsers()))
+	recorded, endpoint := newNarrowedPlanServer(t, narrowedPlan(createUsers()),
+		&apitypes.ActiveApplyResponse{ApplyID: "apply-elsewhere", Database: "testdb", Environment: "production", Deployment: "prod-east", State: "running"})
 
 	cmd := targetedApplyCmd(t)
 	out := stripAnsi(captureStdout(func() {
@@ -115,7 +122,7 @@ func TestApplyCmd_TargetNarrowsPlanAndApply(t *testing.T) {
 	assert.Equal(t, "payments-002", recorded.planReq.Target)
 	assert.Equal(t, "plan-narrowed", recorded.applyReq.PlanID)
 	assert.Equal(t, "prod/payments-002", recorded.applyReq.Target)
-	assert.Equal(t, []string{"/api/plan", "/api/apply"}, recorded.paths, "a targeted apply skips the environment-wide status preflight")
+	assert.Equal(t, []string{"/api/plan", "/api/status", "/api/apply"}, recorded.paths, "a targeted apply checks for active schema changes after planning resolves its member")
 	assert.Equal(t, 1, strings.Count(out, "Target: prod/payments-002 (this plan covers only this rollout member)"), "the narrowing is disclosed once:\n%s", out)
 }
 
@@ -158,4 +165,29 @@ func TestApplyCmd_UnsafeRetryKeepsTarget(t *testing.T) {
 	recorded.mu.Lock()
 	defer recorded.mu.Unlock()
 	assert.NotContains(t, recorded.paths, "/api/apply", "a blocked unsafe change is never applied")
+}
+
+// Members of a targets list share one deployment, so a schema change running
+// there blocks a targeted apply to any of them. The apply is refused with the
+// in-progress guidance before the plan is shown, the lock taken, or anything
+// submitted.
+func TestApplyCmd_TargetRefusedWhileItsDeploymentHasAnActiveSchemaChange(t *testing.T) {
+	recorded, endpoint := newNarrowedPlanServer(t, narrowedPlan(createUsers()),
+		&apitypes.ActiveApplyResponse{ApplyID: "apply-running", Database: "testdb", Environment: "production", Deployment: "prod", State: "waiting_for_cutover"})
+
+	cmd := targetedApplyCmd(t)
+	cmd.NoLock = false
+	cmd.Output = OutputFormatInteractive
+	var runErr error
+	out := stripAnsi(captureStdout(func() {
+		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+	}))
+
+	require.Error(t, runErr)
+	assert.Equal(t, "schema change already in progress", runErr.Error())
+	assert.Contains(t, out, "A schema change is waiting for cutover.")
+	assert.Contains(t, out, "cutover -e production apply-running")
+	recorded.mu.Lock()
+	defer recorded.mu.Unlock()
+	assert.Equal(t, []string{"/api/plan", "/api/status"}, recorded.paths, "nothing is locked or applied while the deployment is busy")
 }
