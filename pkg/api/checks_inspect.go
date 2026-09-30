@@ -44,9 +44,16 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 		s.writeWebhookOpsError(w, err)
 		return
 	}
+	if !s.checkChecksInspectCallerBudget(w, r, req) {
+		return
+	}
 	ctx, cancel := s.extendWebhookOpsDeadline(w, r)
 	defer cancel()
-	response, err := executeChecksInspect(ctx, s.config, s.storage, req, s.logger)
+	resolve := s.checksInspectClientFor
+	if resolve == nil {
+		resolve = installationChecksInspectClient
+	}
+	response, err := executeChecksInspectWith(ctx, s.config, s.storage, req, s.logger, resolve)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
 		return
@@ -104,7 +111,25 @@ type checksInspectClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
+// checksInspectClientResolver returns the GitHub client an inspection of repo
+// reads through.
+type checksInspectClientResolver func(ctx context.Context, cfg *ServerConfig, repo string, logger *slog.Logger) (checksInspectClient, error)
+
+// installationChecksInspectClient reads through the repository's GitHub App
+// installation, the same one SchemaBot publishes its Check Runs through.
+func installationChecksInspectClient(ctx context.Context, cfg *ServerConfig, repo string, logger *slog.Logger) (checksInspectClient, error) {
+	client, _, err := resolveRepoInstallationClient(ctx, cfg, repo, logger)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
 func executeChecksInspect(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksInspectRequest, logger *slog.Logger) (*ChecksInspectResponse, error) {
+	return executeChecksInspectWith(ctx, cfg, store, req, logger, installationChecksInspectClient)
+}
+
+func executeChecksInspectWith(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksInspectRequest, logger *slog.Logger, resolve checksInspectClientResolver) (*ChecksInspectResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
@@ -128,7 +153,7 @@ func executeChecksInspect(ctx context.Context, cfg *ServerConfig, store storage.
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
 
-	client, _, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
+	client, err := resolve(ctx, cfg, req.Repo, logger)
 	if err != nil {
 		return nil, err
 	}

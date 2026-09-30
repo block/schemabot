@@ -834,7 +834,10 @@ environments were not read."), because a clean answer for one environment is
 not a clean answer for the pull request. `--json` gives each row a stable
 `reason` code to branch on. The inspection only reads, so any token that can
 already see a pull request's status can run it; recreating a Check Run with
-`checks backfill` is the admin operation.
+`checks backfill` is the admin operation. Every inspection reads GitHub
+through the App installation, so each caller has a
+[request budget](configuration.md#check-inspection); a loop that exceeds it is
+refused with a retry delay rather than spending the quota the merge gate needs.
 
 ### Recover missing GitHub checks
 

@@ -145,6 +145,16 @@ type Service struct {
 	pullPerCallerLimiter *ratelimit.Limiter
 	pullPerTargetLimiter *ratelimit.Limiter
 
+	// checksInspectLimiter bounds GET /api/checks/inspect per caller. Nil when
+	// the endpoint's rate limiting is disabled; built and rebuilt alongside
+	// the pull limiters.
+	checksInspectLimiter *ratelimit.Limiter
+
+	// checksInspectClientFor resolves the GitHub client an inspection reads
+	// through. Nil means the repository's App installation; tests replace it
+	// to count the GitHub calls an inspection makes.
+	checksInspectClientFor checksInspectClientResolver
+
 	// engineFactories holds engine implementations for database types this build
 	// does not provide natively, registered by an embedding service via
 	// RegisterEngine. Local clients the service builds receive them.
@@ -329,15 +339,20 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 }
 
 // buildRateLimiters (re)builds the endpoint limiters from the current config
-// and clock. Both limiters are left nil when the endpoint's rate limiting is
+// and clock. An endpoint's limiters are left nil when its rate limiting is
 // disabled, which the request path reads as "not enforced" and returns on
 // before it spends or records anything.
 //
-// Enforcement being off is worth one line at startup: an unbounded pull
-// endpoint is a deliberate choice, and an operator watching a target absorb
-// traffic should be able to tell from the server's own logs whether a budget
-// was ever in play.
+// Enforcement being off is worth one line at startup: an unbounded endpoint is
+// a deliberate choice, and an operator watching a target or a GitHub quota
+// absorb traffic should be able to tell from the server's own logs whether a
+// budget was ever in play.
 func (s *Service) buildRateLimiters() {
+	s.buildPullRateLimiters()
+	s.buildChecksInspectRateLimiter()
+}
+
+func (s *Service) buildPullRateLimiters() {
 	if s.config == nil || !s.config.PullRateLimitEnabled() {
 		s.pullPerCallerLimiter = nil
 		s.pullPerTargetLimiter = nil
@@ -353,6 +368,20 @@ func (s *Service) buildRateLimiters() {
 		"per_caller_burst", perCaller.Burst,
 		"per_target_requests_per_minute", perTarget.RequestsPerMinute,
 		"per_target_burst", perTarget.Burst,
+	)
+}
+
+func (s *Service) buildChecksInspectRateLimiter() {
+	if s.config == nil || !s.config.ChecksInspectRateLimitEnabled() {
+		s.checksInspectLimiter = nil
+		s.logger.Info("check inspection rate limiting is disabled; inspections will not be bounded by a request budget")
+		return
+	}
+	perCaller := s.config.ChecksInspectPerCallerRateLimit()
+	s.checksInspectLimiter = ratelimit.New(perCaller, s.clock)
+	s.logger.Info("check inspection rate limiting is enabled",
+		"per_caller_requests_per_minute", perCaller.RequestsPerMinute,
+		"per_caller_burst", perCaller.Burst,
 	)
 }
 

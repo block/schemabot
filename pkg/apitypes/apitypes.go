@@ -156,6 +156,14 @@ const (
 	PullRateLimitSharedReason = "too many pull requests; this server does not authenticate callers, so every client shares one request budget"
 )
 
+// The reasons a check inspection is refused for exceeding its request budget,
+// split the same way as the pull reasons: the shared form replaces the
+// per-caller one on a server that does not authenticate callers.
+const (
+	ChecksInspectRateLimitCallerReason = "too many check inspections from this caller"
+	ChecksInspectRateLimitSharedReason = "too many check inspections; this server does not authenticate callers, so every client shares one request budget"
+)
+
 // NewRateLimitedResponse builds the body of a 429 refusal from the budget that
 // ran out and how long the caller must wait.
 //
