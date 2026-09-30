@@ -958,6 +958,18 @@ actually ran, inspect the apply's task DDL and outcome through progress.
 `schemabot list-plans` and `schemabot list-plans <plan_id>` render
 both, with `--json` for the raw response.
 
+Each table change can carry the planner's size estimates for the table:
+`estimated_rows`, `estimated_bytes` (data plus indexes), and, when the target
+is sharded, `shard_count` and `largest_shard_rows` (the largest single shard's
+rows). For a sharded target the row and byte figures are totals across the
+planned shards. They come from engine statistics at plan time, so treat them
+as approximate and display-only: they are not inputs to any verdict. A field
+is omitted when no estimate was available. That covers a table the plan
+creates, a failed or timed-out size read, and any shard reporting nothing
+(which omits that table's total rather than undercounting it). MySQL targets
+planned by Spirit report rows and bytes for every existing table the plan
+touches; other engines omit the fields for now.
+
 Each entry in the plan's `changes` is one namespace, and its `metadata`
 carries the namespace-level work the engine planned alongside the table DDL.
 `needs_finalizer: "true"` means the engine asked for the namespace's group
@@ -1156,21 +1168,27 @@ Response excerpt (illustrative values):
           {
             "table_name": "orders",
             "ddl": "ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32) DEFAULT NULL",
-            "change_type": "alter"
+            "change_type": "alter",
+            "estimated_rows": 2340000,
+            "estimated_bytes": 1130000000
           },
           {
             "table_name": "old_orders",
             "ddl": "DROP TABLE `old_orders`",
             "change_type": "drop",
             "is_unsafe": true,
-            "unsafe_reason": "Dropping a table permanently deletes its data"
+            "unsafe_reason": "Dropping a table permanently deletes its data",
+            "estimated_rows": 18400,
+            "estimated_bytes": 6100000
           },
           {
             "table_name": "old_order_events",
             "ddl": "DROP TABLE `old_order_events`",
             "change_type": "drop",
             "is_unsafe": true,
-            "unsafe_reason": "Dropping a table permanently deletes its data"
+            "unsafe_reason": "Dropping a table permanently deletes its data",
+            "estimated_rows": 96000,
+            "estimated_bytes": 41000000
           }
         ]
       }
