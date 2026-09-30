@@ -231,8 +231,8 @@ type PlanCommentData struct {
 	DeploymentDrift *DeploymentDriftData
 
 	// MemberApplyRefusal says why a PR apply cannot run the other targets'
-	// plans this comment renders for a reviewed target already at the desired
-	// schema, naming only targets, tables, and namespaces. Such an apply is
+	// plans this comment renders, whether or not the reviewed target has work
+	// of its own, naming only targets, tables, and namespaces. Such an apply is
 	// refused whatever its flags, so the comment offers no apply command in its
 	// place. Empty when the apply can run them, or when the comment renders the
 	// reviewed plan alone.
@@ -631,7 +631,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			sb.WriteString("**Applying automatically**\n")
 		}
 	case data.MemberApplyRefusal != "":
-		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal, !hasChanges(data.Changes))
 	default:
 		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
@@ -646,9 +646,17 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 // writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
 // apply cannot run the other targets' plans the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
-func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
-	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but %s.\n\n", escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " ")))
-	sb.WriteString("A PR apply whose reviewed target is already at the desired schema cannot run that or disclose it for confirmation. The schema check keeps blocking merge until every target has the change.\n")
+// reviewedTargetConverged says whether the reviewed target is already at the
+// desired schema, which decides what the reader is told about it.
+func writeMemberApplyRefusal(sb *strings.Builder, refusal string, reviewedTargetConverged bool) {
+	refusal = escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " "))
+	if reviewedTargetConverged {
+		fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but %s.\n\n", refusal)
+		sb.WriteString("A PR apply whose reviewed target is already at the desired schema cannot run that or disclose it for confirmation. The schema check keeps blocking merge until every target has the change.\n")
+		return
+	}
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: targets other than the reviewed one have plans of their own, but %s.\n\n", refusal)
+	sb.WriteString("A PR apply cannot run that or disclose it for confirmation, so it cannot run the reviewed target's plan either. The schema check keeps blocking merge until every target has the change.\n")
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
@@ -2801,7 +2809,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		if targetPlans {
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
 			if plan.MemberApplyRefusal != "" {
-				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal, true)
 				sb.WriteString("\n")
 			}
 			return
@@ -2872,6 +2880,13 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Summary (after DDL, matching CLI layout). Target plans are summarized
 	// together, as a sharded keyspace's shards are.
 	writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
+
+	// An apply this section's other targets' plans would refuse is not offered
+	// in the footer, so the section says why.
+	if plan.MemberApplyRefusal != "" {
+		writeMemberApplyRefusal(sb, plan.MemberApplyRefusal, false)
+		sb.WriteString("\n")
+	}
 }
 
 // writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
@@ -3178,15 +3193,18 @@ func capitalizeEnvNames(envs []string) string {
 }
 
 // environmentHasWork reports whether an environment's plan section offers an
-// apply: its reviewed plan has changes, or its reviewed target is already at the
-// desired schema while the section renders other targets' plans that do and a
-// PR apply can run them. A section whose apply would be refused says why in the
-// section itself.
+// apply: a PR apply can run the other targets' plans the section renders, and
+// its reviewed plan has changes, or its reviewed target is already at the
+// desired schema while those other targets' plans do. A section whose apply
+// would be refused says why in the section itself.
 func environmentHasWork(plan *PlanCommentData) bool {
+	if plan.MemberApplyRefusal != "" {
+		return false
+	}
 	if hasChanges(plan.Changes) {
 		return true
 	}
-	return RendersTargetPlans(plan.DeploymentDrift) && plan.MemberApplyRefusal == ""
+	return RendersTargetPlans(plan.DeploymentDrift)
 }
 
 // hasChanges returns true if there are any schema changes.

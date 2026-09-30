@@ -237,3 +237,24 @@ func TestPendingRolloutMessageNamesTheTargetsThatNeedTheChange(t *testing.T) {
 		"2 of 2 targets need this change: eu, us. The plans of the targets other than the reviewed one were not on the comment this apply acts on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
 		pendingRolloutMessage(outcome, false))
 }
+
+// An apply-confirm refused because a plan changed after the confirmation tells
+// the operator which target's plan changed. When it is the reviewed target's own
+// re-plan, the message says so rather than blaming the other targets' plans.
+func TestUnconfirmedWorkMessageNamesTheTargetWhosePlanChanged(t *testing.T) {
+	plan := func(ddl string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {Tables: []storage.TableChange{{Namespace: "payments", Table: "orders", Operation: "alter", DDL: ddl}}},
+		}}
+	}
+	confirmed := plan("ALTER TABLE `orders` MODIFY COLUMN `region` varchar(255)")
+	unchanged := map[string]*storage.Plan{"us/payments-002": plan("ALTER TABLE `orders` ADD COLUMN `region` varchar(32)")}
+
+	covered, reason := roundCoversWork(confirmed, plan("ALTER TABLE `orders` MODIFY COLUMN `region` varchar(32)"), unchanged, unchanged)
+	require.False(t, covered)
+	message := unconfirmedWorkMessage(memberWork{pending: 2, members: 2, names: []string{"eu/payments-001", "us/payments-002"}}, reason)
+	assert.Equal(t,
+		"2 of 2 targets need this change: eu/payments-001, us/payments-002. This confirmation no longer covers what the apply would run: the reviewed target would run statements the confirmed plan did not show, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		message)
+	assert.NotContains(t, message, "other than the reviewed one")
+}

@@ -149,18 +149,18 @@ func memberWorkReviewedPlanCannotRun(reviewed, member *storage.Plan, reviewedTar
 }
 
 // annotateMemberApplyRefusal records on a plan comment why a PR apply cannot
-// run the other targets' plans it renders, when its reviewed target is already
-// at the desired schema. Such an apply is refused whatever its flags, so the
+// run the other targets' plans it renders, whether or not the reviewed target
+// has work of its own. Such an apply is refused whatever its flags, so the
 // comment must not offer it. A refusal that cannot be computed leaves the apply
 // offered: the apply asks again before it pauses and refuses on the same
 // grounds, so the comment only ever misses a shortcut, never a gate.
 func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, repo string, pr int) {
-	if planResp.HasChanges() || !rolloutRunsMemberWork(rollout, data.DeploymentDrift) {
-		h.logger.Debug("plan comment renders no other targets' plans for a converged reviewed target; no member-work refusal to disclose",
+	if !rolloutRunsMemberWork(rollout, data.DeploymentDrift) {
+		h.logger.Debug("plan comment renders no other targets' plans a PR apply would run; no member-work refusal to disclose",
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID)
 		return
 	}
-	refusal, err := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, true)
+	refusal, err := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, !planResp.HasChanges())
 	if err != nil {
 		h.logger.Warn("could not tell whether a PR apply can run the other targets' plans; the plan comment offers the apply, which re-checks before it pauses",
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -246,6 +246,20 @@ func pendingRolloutMessage(outcome reviewDriftOutcome, reviewedTargetConverged b
 	default:
 		return fmt.Sprintf("%s: %s. The plans of the targets other than the reviewed one were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
 	}
+}
+
+// unconfirmedWorkMessage tells the operator why an apply-confirm did not run:
+// what the rollout would run now is not what the confirmation was given
+// against. reason names only targets, and says whether it is the reviewed
+// target or another one whose plan changed. The rollout's pending summary leads,
+// so the operator sees which targets still need the change, as on every other
+// refusal of a pending rollout.
+func unconfirmedWorkMessage(work memberWork, reason string) string {
+	message := fmt.Sprintf("This confirmation no longer covers what the apply would run: %s, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.", reason)
+	if work.members > 1 && work.pending > 0 {
+		return fmt.Sprintf("%s: %s. %s", work.summary(), strings.Join(work.names, ", "), message)
+	}
+	return message
 }
 
 // confirmationCoversMemberWork reports whether the pending confirmation an
@@ -348,6 +362,21 @@ func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanI
 	h.logger.Debug("apply-confirm: the confirmed round planned no other target with work, so its comment was not a converged-target confirmation",
 		"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "member_plans", len(members))
 	return false, nil
+}
+
+// confirmationCoversReviewedTarget reports whether the reviewed target's
+// confirm-time re-plan runs the same table changes as the plan the pending
+// confirmation was given against. A pinned plan that no longer loads is an
+// error: what its comment showed cannot be told.
+func (h *Handler) confirmationCoversReviewedTarget(ctx context.Context, pinnedPlanID string, planResp *apitypes.PlanResponse) (bool, error) {
+	pinned, err := h.service.Storage().Plans().Get(ctx, pinnedPlanID)
+	if err != nil {
+		return false, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
+	}
+	if pinned == nil {
+		return false, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
+	}
+	return ddlMatchesStoredPlan(planResp, pinned), nil
 }
 
 // sameMemberWork reports whether two plans for one member run the same

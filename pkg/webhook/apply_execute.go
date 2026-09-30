@@ -183,7 +183,8 @@ func (h *Handler) executeApply(
 			h.logger.Info("apply-confirm refused: the other targets' work is not what the confirmation was given against",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
-			refuseRollout("the other targets' work is not what was confirmed")
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rollout's work is not what was confirmed")
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
 			return
 		}
 		// The statements match the confirmed round's, but a copy can appear on
@@ -232,6 +233,29 @@ func (h *Handler) executeApply(
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoChanges(database, environment))
 		return
 	default:
+		// The reviewed target's re-plan runs from this confirmation even when
+		// no other target has work left, so in a rollout it must be the
+		// statements the confirmed comment showed.
+		if storedPlan == nil && rollout.work.members > 1 {
+			covered, coverErr := h.confirmationCoversReviewedTarget(ctx, expectedPendingPlanID, planResp)
+			if coverErr != nil {
+				h.logger.Error("apply-confirm rejected: could not load the confirmed plan to compare with the reviewed target's re-plan; the pending confirmation is preserved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+				return
+			}
+			if !covered {
+				h.logger.Info("apply-confirm refused: the reviewed target would run statements the confirmed plan did not show",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
+				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the reviewed target's statements are not what was confirmed")
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					unconfirmedWorkMessage(rollout.work, "the reviewed target would run statements the confirmed plan did not show"))
+				return
+			}
+		}
 		h.logger.Debug("apply: only the reviewed target's own plan runs",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
 	}
