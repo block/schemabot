@@ -1211,7 +1211,10 @@ type ApplyOptions struct {
 
 	// Branch is the name of an existing PlanetScale branch to reuse.
 	// When set, the engine refreshes the branch schema from main instead
-	// of creating a new branch.
+	// of creating a new branch. The engine reads it back from the stored
+	// apply on every resume, through Map, to decide whether the deploy
+	// request it creates deletes the branch: it must survive the round trip,
+	// or a resumed drive deletes a branch the operator owns.
 	Branch string `json:"branch,omitempty"`
 
 	// DeferCutover pauses at cutover and waits for explicit trigger.

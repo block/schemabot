@@ -298,7 +298,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// The server computes the schema diff asynchronously — poll until the deploy
 	// request transitions from "pending" to "ready" (or "no_changes"/"error").
 	drStart := time.Now()
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, deployRequestDeletesBranch(req.Options))
+	autoDeleteBranch := deployRequestDeletesBranch(req.Options)
+	e.logger.Info("creating deploy request",
+		"database", req.Database,
+		"branch", branchName,
+		"auto_delete_branch", autoDeleteBranch,
+	)
+	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, autoDeleteBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}

@@ -581,6 +581,11 @@ func operatorBranch(options map[string]string) string {
 // its branch once it deploys. Only a branch SchemaBot created is handed to the
 // deploy request for teardown; an operator-supplied branch belongs to the
 // operator and outlives the deploy.
+//
+// Absent options mean SchemaBot created the branch, so the default answer is
+// the destructive one. Callers must pass the apply's stored options as a whole,
+// never a subset built for another purpose: a map that happens to omit
+// "branch" hands an operator's branch to the deploy request for deletion.
 func deployRequestDeletesBranch(options map[string]string) bool {
 	return operatorBranch(options) == ""
 }
