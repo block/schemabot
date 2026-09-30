@@ -250,8 +250,8 @@ func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, appl
 		return nil
 	}
 	hasFinalizer := false
-	for _, op := range ops {
-		if _, ok := parseFinalizerOperationKey(op.OperationKey); ok {
+	for _, key := range applyOperationKeys(apply, ops) {
+		if _, ok := parseFinalizerOperationKey(key); ok {
 			hasFinalizer = true
 			break
 		}
@@ -644,19 +644,22 @@ const fullKeyRangeShard = "-"
 // changing shard of a keyspace with several is still a sharded change and
 // keeps the shard layout, which names it. So do a VSchema change, a keyspace
 // whose only work is its finalize, and a stored plan that could not be read
-// (nil finalizers).
-func rendersAsSingleShard(ops []*storage.ApplyOperation, finalizers *shardedFinalizerPlan) bool {
+// (nil finalizers). The decision reads every operation the apply declared, not
+// only those attached so far, so an apply whose operations attach over time
+// takes one layout from its first comment rather than switching as its
+// siblings appear.
+func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, finalizers *shardedFinalizerPlan) bool {
 	keyspacesWithWork := make(map[string]bool)
 	var finalizerKeyspaces []string
-	for _, op := range ops {
-		if ns, shard, _, ok := parseShardOperationKey(op.OperationKey); ok {
+	for _, key := range applyOperationKeys(apply, ops) {
+		if ns, shard, _, ok := parseShardOperationKey(key); ok {
 			if shard != fullKeyRangeShard {
 				return false
 			}
 			keyspacesWithWork[ns] = true
 			continue
 		}
-		if ns, ok := parseFinalizerOperationKey(op.OperationKey); ok {
+		if ns, ok := parseFinalizerOperationKey(key); ok {
 			finalizerKeyspaces = append(finalizerKeyspaces, ns)
 		}
 	}
@@ -695,4 +698,19 @@ func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.Apply
 		}
 	}
 	return data
+}
+
+// applyOperationKeys returns the keys of every operation the apply is made of:
+// the manifest the dispatcher declared when the apply carries one, since its
+// operations may still be attaching, and the attached operations' keys
+// otherwise.
+func applyOperationKeys(apply *storage.Apply, ops []*storage.ApplyOperation) []string {
+	if apply != nil && len(apply.ExpectedOperationKeys) > 0 {
+		return apply.ExpectedOperationKeys
+	}
+	keys := make([]string, 0, len(ops))
+	for _, op := range ops {
+		keys = append(keys, op.OperationKey)
+	}
+	return keys
 }

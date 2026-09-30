@@ -1040,6 +1040,23 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	assert.Contains(t, inFlight, "└ shards:")
 }
 
+// A table that changes on only some of the keyspace's shards names them above
+// its DDL, so the statement never reads as running on every shard.
+func TestRenderShardedApplyComment_NamesTheShardsOfAPartialTable(t *testing.T) {
+	blocks := ShardCell{Shard: "-40", Table: "blocks", Statements: []string{"ALTER TABLE `blocks` ADD INDEX `created_at`(`created_at`);"}}
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: withTables(oneKeyspace([]ShardStatus{
+			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+		}, []ShardCell{mutesCell("-40"), blocks, mutesCell("80-")}), "mutes", "blocks"),
+	})
+
+	assert.Contains(t, out, "**`mutes`**: ⏳ Queued\n\n```sql\nALTER TABLE `mutes`", "a table on every shard shows its DDL without a heading")
+	assert.Contains(t, out, "**`blocks`**: ⏳ Queued\n\n**shard `-40`**\n```sql\nALTER TABLE `blocks`", "a table on some shards names them")
+}
+
 // A table copying across shards reads like a Vitess apply: the progress bar
 // aggregated across the shards, the DDL right under it, then the summed rows
 // and the per-shard breakdown.

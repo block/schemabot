@@ -46,7 +46,7 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 	// that runs on a single shard per keyspace with no VSchema change reads as
 	// one change on one database, so it takes the single-deployment layout.
 	if isShardedApply(ops) {
-		if rendersAsSingleShard(ops, finalizers) {
+		if rendersAsSingleShard(apply, ops, finalizers) {
 			return templates.RenderApplyStatusComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, tenant))
 		}
 		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, finalizers, tenant))
@@ -75,7 +75,7 @@ func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperati
 	// other apply shapes' summaries lead with. One that rendersAsSingleShard
 	// takes the single-deployment summary, as its status comment does.
 	if isShardedApply(ops) {
-		if rendersAsSingleShard(ops, finalizers) {
+		if rendersAsSingleShard(apply, ops, finalizers) {
 			return templates.RenderApplySummaryComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, tenant))
 		}
 		return templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, released, tasks, finalizers, tenant))

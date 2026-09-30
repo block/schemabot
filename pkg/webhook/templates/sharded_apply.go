@@ -469,10 +469,11 @@ func shardedTableDDLGroups(ks ShardedKeyspace, table string) []shardedDDLGroup {
 
 // writeShardedTableDDL writes a table's DDL below its rollup line. A table that
 // runs the same statements on every shard shows them once, as the
-// single-deployment comment does; when its shards diverge, each distinct set
-// is headed by the shards that run it, as the plan comment does.
+// single-deployment comment does; otherwise each distinct set is headed by the
+// shards that run it, as the plan comment does, so DDL that runs on only some
+// of the keyspace's shards never reads as running on all of them.
 func writeShardedTableDDL(sb *strings.Builder, groups []shardedDDLGroup, totalShards int, dialect schema.Dialect, budget *ddlBlockBudget) {
-	if len(groups) == 1 {
+	if len(groups) == 1 && len(groups[0].shards) == totalShards {
 		sb.WriteString("\n")
 		writeSQLFencedBlocks(sb, formatDDLBlocks(groups[0].statements, dialect), budget)
 		return

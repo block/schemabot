@@ -856,9 +856,34 @@ func TestRendersAsSingleShard(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, rendersAsSingleShard(tc.ops, tc.finalizers))
+			assert.Equal(t, tc.want, rendersAsSingleShard(nil, tc.ops, tc.finalizers))
 		})
 	}
+
+	// An apply whose operations are still attaching is judged by every
+	// operation it declared, so its layout does not change as siblings attach.
+	attaching := &storage.Apply{ExpectedOperationKeys: []string{"ks/-/orders", "ks/group_finalizer"}}
+	onlyWork := []*storage.ApplyOperation{work("ks/-/orders")}
+	assert.False(t, rendersAsSingleShard(attaching, onlyWork, &shardedFinalizerPlan{}),
+		"a declared finalizer with a VSchema change keeps the shard layout before it attaches")
+	assert.True(t, rendersAsSingleShard(attaching, onlyWork, finalizesOnly("ks")),
+		"a declared finalize-only finalizer takes the single-deployment layout before it attaches")
+	widening := &storage.Apply{ExpectedOperationKeys: []string{"ks/-80/orders", "ks/80-/orders"}}
+	assert.False(t, rendersAsSingleShard(widening, []*storage.ApplyOperation{work("ks/-80/orders")}, nil),
+		"a declared sibling shard keeps the shard layout before it attaches")
+}
+
+// A finalizer the apply declared but has not attached yet still needs the
+// stored plan, so the first comment already knows whether it carries a VSchema
+// change.
+func TestResolveShardedFinalizerPlanReadsTheDeclaredFinalizer(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: 7, ExpectedOperationKeys: []string{"ks/-/orders", "ks/group_finalizer"}}
+	ops := []*storage.ApplyOperation{{OperationKey: "ks/-/orders"}}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"ks": {Finalize: true}}}
+
+	finalizers := resolveShardedFinalizerPlan(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+	require.NotNil(t, finalizers, "the declared finalizer reads the stored plan")
+	assert.True(t, finalizers.finalizesOnly("ks"))
 }
 
 // A comment observer keeps the first stored plan it reads for an apply's
