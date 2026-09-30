@@ -369,6 +369,26 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 // WritePlanSummaryWithKeyspaceUpdates writes a single plan summary line
 // including VSchema changes and the keyspaces whose only work is a finalize.
 func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
+	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
+		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
+		fmt.Println()
+	}
+}
+
+// WriteRolloutPlanSummary writes the one summary line that closes a rollout's
+// plan: what the rollout runs across every group, and on how much of it —
+// "📋 Plan: 1 table to alter on 61 of 64 targets".
+func WriteRolloutPlanSummary(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int, coverage string) {
+	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
+		fmt.Printf("📋 Plan: %s on %s\n", strings.Join(parts, ", "), coverage)
+		fmt.Println()
+	}
+}
+
+// planSummaryParts builds the clauses of the plan summary: the table and
+// index clauses, then VSchema changes and keyspaces whose only work is a
+// finalize.
+func planSummaryParts(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) []string {
 	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
@@ -384,11 +404,7 @@ func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges 
 		}
 		parts = append(parts, fmt.Sprintf("%d %s to finalize", finalizes, word))
 	}
-
-	if len(parts) > 0 {
-		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
-		fmt.Println()
-	}
+	return parts
 }
 
 // ddlSummaryParts builds the table and index clauses of the plan summary.

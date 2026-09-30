@@ -18,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -253,9 +254,11 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 // the PR comment does: the members that need attention first, then one
 // heading per distinct plan naming the members that run it, with that plan's
 // changes under it. Groups with work lead; a group already at the desired
-// schema says so in place of DDL. Lint results and exempt tables describe the
-// schema files and the primary's live schema, so they are written once, after
-// every group.
+// schema says so in one line in place of DDL. Lint results, the plan summary,
+// and exempt tables are written once, after every group: lint and exempt
+// tables describe the schema files and the primary's live schema, and the
+// summary counts what the whole rollout runs and on how many members, so the
+// output closes on one summary as a single plan's does.
 func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	rollout := result.WholeRollout()
 	noun := templates.RolloutNoun(rollout)
@@ -264,19 +267,42 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteRolloutDivergence(noun)
 	}
 	plans := result.MemberPlans()
+	work := make([]planWork, len(plans))
+	for i, plan := range plans {
+		work[i] = collectPlanWork(plan)
+	}
 	order := make([]int, len(rollout.Groups))
 	for i := range order {
 		order[i] = i
 	}
 	slices.SortStableFunc(order, func(a, b int) int {
-		return compareWorkFirst(plans[a].HasChanges(), plans[b].HasChanges())
+		return compareWorkFirst(!work[a].empty(), !work[b].empty())
 	})
+	// A rollout with no work anywhere closes on the one no-changes line a
+	// single plan does, so its groups carry no line of their own.
+	anyWork := slices.ContainsFunc(work, func(w planWork) bool { return !w.empty() })
+	var rolloutWork []planWork
+	changingMembers := 0
 	for _, i := range order {
 		templates.WriteRolloutGroupHeading(noun, rollout.Groups[i].Members, rollout.Members)
-		writeChangesBody(plans[i], isApply)
+		if work[i].empty() {
+			if anyWork {
+				templates.WriteRolloutGroupNoChanges()
+			}
+			continue
+		}
+		writeChangeDetail(plans[i], work[i], isApply)
+		rolloutWork = append(rolloutWork, work[i])
+		changingMembers += len(rollout.Groups[i].Members)
 	}
 	if lint := result.LintNonErrors(); len(lint) > 0 {
 		templates.WriteLintViolations(lint)
+	}
+	if len(rolloutWork) == 0 {
+		templates.WriteNoChanges()
+	} else {
+		total := combinePlanWork(rolloutWork)
+		templates.WriteRolloutPlanSummary(total.allChanges, total.vschemaChanges, total.finalizes(), presentation.CoveragePhrase(noun, changingMembers, rollout.Members))
 	}
 	templates.WriteExemptTables(result.ExemptTables)
 }
@@ -293,81 +319,177 @@ func compareWorkFirst(aHasWork, bHasWork bool) int {
 	}
 }
 
-// writeChangesBody writes one plan's changes, unsafe warnings, lint, and
-// summary.
-func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
-	// Collect VSchema changes from metadata, and the namespaces the engine
-	// asked to finalize: a finalize is work the apply runs, so a plan made only
-	// of finalizes must not read as "no changes". finalizeOnly holds those with
-	// no VSchema change to show; the summary counts the ones with no DDL either.
-	var vschemaChanges []templates.VSchemaChange
-	finalize := map[string]bool{}
-	finalizeOnly := map[string]bool{}
+// planWork is what one plan runs, gathered once so its DDL block and its
+// summary are built from the same set.
+type planWork struct {
+	// renderedTables counts the plan's rendered table changes, internal
+	// Spirit tables included, so a plan made only of those still has work.
+	renderedTables int
+	// namespaceMap holds the DDL changes shown, grouped by namespace.
+	namespaceMap map[string][]templates.DDLChange
+	// allChanges flattens namespaceMap for the summary.
+	allChanges []templates.DDLChange
+	// vschemaChanges holds the VSchema diffs, one per keyspace.
+	vschemaChanges []templates.VSchemaChange
+	// finalize holds the namespaces the engine asked to finalize, and
+	// finalizeOnly those of them with no VSchema change to show: a finalize
+	// is work the apply runs, so a plan made only of finalizes must not read
+	// as "no changes".
+	finalize     map[string]bool
+	finalizeOnly map[string]bool
+}
+
+// collectPlanWork gathers what result runs. For a sharded plan the tables are
+// every distinct per-shard statement, the same set the PR comment counts.
+func collectPlanWork(result *apitypes.PlanResponse) planWork {
+	w := planWork{
+		namespaceMap: make(map[string][]templates.DDLChange),
+		finalize:     map[string]bool{},
+		finalizeOnly: map[string]bool{},
+	}
 	for _, sc := range result.Changes {
 		if sc.NeedsFinalizer() {
-			finalize[renderedNamespace(sc.Namespace, result.Database)] = true
+			w.finalize[renderedNamespace(sc.Namespace, result.Database)] = true
 		}
 		if sc.ShowsVSchemaChange() {
-			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
+			w.vschemaChanges = append(w.vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
 				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
 			})
 		} else if sc.NeedsFinalizer() {
-			finalizeOnly[renderedNamespace(sc.Namespace, result.Database)] = true
+			w.finalizeOnly[renderedNamespace(sc.Namespace, result.Database)] = true
 		}
 	}
-
-	// Check if there are any changes (DDL or VSchema)
-	// The exempt-table disclosure renders on both branches: a clean result is
-	// exactly where a reader needs to tell an exempted live table from one the
-	// plan simply found declared.
-	//
-	// The DDL block and the summary below are both built from this one set, so
-	// the summary counts what the block shows — and for a sharded plan that is
-	// every distinct per-shard statement, the same set the PR comment counts.
 	tables := result.RenderedTables()
-	if len(tables) == 0 && len(vschemaChanges) == 0 && len(finalizeOnly) == 0 {
-		templates.WriteNoChanges()
-		templates.WriteExemptTables(result.ExemptTables)
-		return
-	}
-
+	w.renderedTables = len(tables)
 	// Collect DDL changes (filter out internal Spirit tables), grouped by namespace
-	namespaceMap := make(map[string][]templates.DDLChange)
 	for _, tbl := range ddl.FilterInternalTablesTyped(tables) {
 		ns := renderedNamespace(tbl.Namespace, result.Database)
-		namespaceMap[ns] = append(namespaceMap[ns], templates.DDLChange{
+		w.namespaceMap[ns] = append(w.namespaceMap[ns], templates.DDLChange{
 			ChangeType: tbl.ChangeType,
 			Namespace:  ns,
 			TableName:  tbl.TableName,
 			DDL:        tbl.DDL,
 		})
 	}
+	for _, c := range w.namespaceMap {
+		w.allChanges = append(w.allChanges, c...)
+	}
+	return w
+}
 
-	// Flatten all changes for summary/lint
-	var allChanges []templates.DDLChange
-	for _, c := range namespaceMap {
-		allChanges = append(allChanges, c...)
+// empty reports whether the plan runs nothing: no DDL, no VSchema change, and
+// no finalize.
+func (w planWork) empty() bool {
+	return w.renderedTables == 0 && len(w.vschemaChanges) == 0 && len(w.finalizeOnly) == 0
+}
+
+// finalizes counts the namespaces whose only work is a finalize. A namespace
+// with DDL finalizes as part of that work, so it is not counted.
+func (w planWork) finalizes() int {
+	n := 0
+	for ns := range w.finalizeOnly {
+		if len(w.namespaceMap[ns]) == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// combinePlanWork merges the work of a rollout's groups into what the summary
+// counts, as the PR comment summarizes target plans together: a statement run
+// by several groups is counted once, as is a keyspace's VSchema change, and a
+// namespace whose only work is a finalize on some members is counted as a
+// finalize even where another group also runs DDL in it.
+func combinePlanWork(groups []planWork) planWork {
+	combined := planWork{
+		namespaceMap: make(map[string][]templates.DDLChange),
+		finalize:     map[string]bool{},
+		finalizeOnly: map[string]bool{},
+	}
+	seenStatements := make(map[[2]string]bool)
+	seenVSchema := make(map[string]bool)
+	for _, g := range groups {
+		combined.renderedTables += g.renderedTables
+		for _, c := range g.allChanges {
+			key := [2]string{c.Namespace, c.DDL}
+			if seenStatements[key] {
+				continue
+			}
+			seenStatements[key] = true
+			combined.allChanges = append(combined.allChanges, c)
+		}
+		for _, vc := range g.vschemaChanges {
+			if seenVSchema[vc.Keyspace] {
+				continue
+			}
+			seenVSchema[vc.Keyspace] = true
+			combined.vschemaChanges = append(combined.vschemaChanges, vc)
+		}
+		for ns := range g.finalizeOnly {
+			if len(g.namespaceMap[ns]) == 0 {
+				combined.finalizeOnly[ns] = true
+			}
+		}
+	}
+	// namespaceMap stays empty, so finalizes() counts every finalize-only
+	// namespace once.
+	return combined
+}
+
+// writeChangesBody writes one plan's changes, unsafe warnings, lint, and
+// summary.
+func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
+	// The exempt-table disclosure renders on both branches: a clean result is
+	// exactly where a reader needs to tell an exempted live table from one the
+	// plan simply found declared.
+	w := collectPlanWork(result)
+	if w.empty() {
+		templates.WriteNoChanges()
+		templates.WriteExemptTables(result.ExemptTables)
+		return
+	}
+	writeChangeDetail(result, w, isApply)
+
+	// Show advisory (non-error) lint violations
+	lintViolations := result.LintNonErrors()
+	if len(lintViolations) > 0 {
+		templates.WriteLintViolations(lintViolations)
 	}
 
+	// The summary counts what the DDL block above shows.
+	finalizes := w.finalizes()
+	switch {
+	case len(w.vschemaChanges) > 0 || finalizes > 0:
+		templates.WritePlanSummaryWithKeyspaceUpdates(w.allChanges, w.vschemaChanges, finalizes)
+	default:
+		templates.WritePlanSummary(w.allChanges)
+	}
+	templates.WriteExemptTables(result.ExemptTables)
+}
+
+// writeChangeDetail writes one plan's DDL and VSchema changes grouped by
+// namespace, then its direct-execution and unsafe-change disclosures. It
+// writes no summary, so a rollout can close every group's detail with one.
+func writeChangeDetail(result *apitypes.PlanResponse, w planWork, isApply bool) {
 	// Build VSchema diff map by keyspace for merging into namespace changes
 	vsDiffByKS := make(map[string]string)
-	for _, vc := range vschemaChanges {
+	for _, vc := range w.vschemaChanges {
 		vsDiffByKS[vc.Keyspace] = vc.Diff
 	}
 
 	// Render DDL + VSchema changes grouped by namespace/keyspace
 	isVitess := state.IsPlanetScaleEngine(result.Engine)
-	if len(allChanges) > 0 || len(vschemaChanges) > 0 || len(finalizeOnly) > 0 {
+	if len(w.allChanges) > 0 || len(w.vschemaChanges) > 0 || len(w.finalizeOnly) > 0 {
 		// Collect all namespaces (from DDL, VSchema, and finalizes)
 		allNamespaces := make(map[string]bool)
-		for ns := range namespaceMap {
+		for ns := range w.namespaceMap {
 			allNamespaces[ns] = true
 		}
-		for _, vc := range vschemaChanges {
+		for _, vc := range w.vschemaChanges {
 			allNamespaces[vc.Keyspace] = true
 		}
-		for ns := range finalizeOnly {
+		for ns := range w.finalizeOnly {
 			allNamespaces[ns] = true
 		}
 
@@ -375,8 +497,8 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 		for ns := range allNamespaces {
 			nc := templates.NamespaceChange{
 				Namespace: ns,
-				Changes:   namespaceMap[ns],
-				Finalize:  finalize[ns],
+				Changes:   w.namespaceMap[ns],
+				Finalize:  w.finalize[ns],
 			}
 			if diff, ok := vsDiffByKS[ns]; ok {
 				nc.VSchemaChanged = true
@@ -398,28 +520,6 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	if len(unsafeChanges) > 0 && !isApply {
 		templates.WriteUnsafeChangesWarning(unsafeChanges)
 	}
-
-	// Show advisory (non-error) lint violations
-	lintViolations := result.LintNonErrors()
-	if len(lintViolations) > 0 {
-		templates.WriteLintViolations(lintViolations)
-	}
-
-	// Write summary. A namespace with DDL finalizes as part of that work, so
-	// only a finalize that is the namespace's only work is counted.
-	finalizes := 0
-	for ns := range finalizeOnly {
-		if len(namespaceMap[ns]) == 0 {
-			finalizes++
-		}
-	}
-	switch {
-	case len(vschemaChanges) > 0 || finalizes > 0:
-		templates.WritePlanSummaryWithKeyspaceUpdates(allChanges, vschemaChanges, finalizes)
-	default:
-		templates.WritePlanSummary(allChanges)
-	}
-	templates.WriteExemptTables(result.ExemptTables)
 }
 
 // directChangeNotices lists the plan's direct-execution changes one per table

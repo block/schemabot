@@ -96,6 +96,107 @@ func TestWritePlanBody_SixtyFourTargetRolloutFoldsItsMembers(t *testing.T) {
 	}
 }
 
+// A 64-target rollout in which 61 targets still need a column and 3 already
+// have it reads like one plan: each group shows only its heading and its DDL,
+// the settled group says so in one line, and a single summary at the bottom
+// counts what the rollout runs and on how many of its targets. No group closes
+// on a summary or a "✓ No schema changes detected." of its own, which would
+// read as the end of the plan part-way through it.
+func TestWritePlanBody_DivergingRolloutEndsOnOneSummary(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     64,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: paymentsTargets(62, 64), Changes: []*apitypes.SchemaChangeResponse{}},
+				{Members: paymentsTargets(1, 61), Primary: true, Changes: addColumnTo("region")},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	want := strings.Join([]string{
+		"Targets diverge — what applies where:",
+		"",
+		"▸ 61 of 64 targets",
+		"  prod/payments-001, prod/payments-002, prod/payments-003, prod/payments-004,",
+		"  prod/payments-005, prod/payments-006, prod/payments-007, prod/payments-008,",
+		"  prod/payments-009, prod/payments-010, prod/payments-011, prod/payments-012,",
+		"  prod/payments-013, prod/payments-014, prod/payments-015, prod/payments-016,",
+		"  prod/payments-017, prod/payments-018, prod/payments-019, prod/payments-020,",
+		"  prod/payments-021, prod/payments-022, prod/payments-023, prod/payments-024,",
+		"  and 37 more",
+		"",
+		"     ~ orders",
+		"       ALTER TABLE `orders` ADD COLUMN `region` varchar(32);",
+		"",
+		"▸ targets prod/payments-062, prod/payments-063, prod/payments-064",
+		"",
+		"  No schema changes detected",
+		"",
+		"📋 Plan: 1 table to alter on 61 of 64 targets",
+		"",
+		"",
+	}, "\n")
+	assert.Equal(t, want, out)
+	assert.Equal(t, 1, strings.Count(out, "📋 Plan:"), "a rollout plan has one summary")
+	assert.NotContains(t, out, "✓ No schema changes detected.", "a settled group beside groups with work does not close the plan")
+}
+
+// A statement several groups run is one change of the rollout, and the
+// summary names how much of the rollout runs any work at all. Two groups that
+// alter orders differently but build the same index create one index, not two.
+func TestWritePlanBody_RolloutSummaryCountsEachChangeOnce(t *testing.T) {
+	withIndex := func(column string) []*apitypes.SchemaChangeResponse {
+		changes := addColumnTo(column)
+		changes[0].TableChanges = append(changes[0].TableChanges, &apitypes.TableChangeResponse{
+			TableName:  "orders",
+			Namespace:  "orders",
+			DDL:        "CREATE INDEX `idx_created_at` ON `orders` (`created_at`)",
+			ChangeType: "create_index",
+		})
+		return changes
+	}
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  withIndex("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     64,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: paymentsTargets(1, 40), Primary: true, Changes: withIndex("region")},
+				{Members: paymentsTargets(41, 64), Changes: withIndex("zone")},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Equal(t, 1, strings.Count(out, "📋 Plan:"), "%s", out)
+	assert.True(t, strings.HasSuffix(out, "📋 Plan: 1 table to alter, 1 index to create on all 64 targets\n\n"), "the one summary closes the plan:\n%s", out)
+}
+
+// A rollout already at the desired schema everywhere closes as a single
+// plan's does, on the one "✓ No schema changes detected." line.
+func TestWritePlanBody_ConvergedRolloutEndsOnNoChanges(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  []*apitypes.SchemaChangeResponse{},
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 3), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}}},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Equal(t, "▸ targets prod/payments-001, prod/payments-002, prod/payments-003\n\n✓ No schema changes detected.\n\n", out)
+}
+
 // A 64-target rollout that splits 40/24 names each group by its share of the
 // rollout, so a subset never reads like the whole.
 func TestWritePlanBody_SixtyFourTargetRolloutSplitStatesCoverage(t *testing.T) {

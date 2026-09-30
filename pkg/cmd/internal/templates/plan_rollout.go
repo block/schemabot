@@ -79,6 +79,15 @@ func WriteRolloutGroupHeading(noun presentation.Noun, members []string, total in
 	fmt.Println()
 }
 
+// WriteRolloutGroupNoChanges says, under a group's heading, that its members
+// are already at the desired schema. Such a group renders beside groups with
+// work, so it carries no ✓: the rollout is not done, and the plan's one
+// summary closes the output after every group.
+func WriteRolloutGroupNoChanges() {
+	fmt.Println("  No schema changes detected")
+	fmt.Println()
+}
+
 // wrapNames joins names into lines no wider than memberNamesLineWidth,
 // closing with how many more were left out.
 func wrapNames(names []string, more int) []string {
