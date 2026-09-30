@@ -53,7 +53,10 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
 		return nil, nil
 	}
-	primary := routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}
+	// The primary is held to the namespace selection it was planned under, so
+	// the rollup can tell a placement change since the plan from the plan
+	// itself.
+	primary := routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target, Namespaces: planResp.SelectedNamespaces}
 	if primary.MemberID() != targets[0].MemberID() {
 		return nil, fmt.Errorf("plan %s for %s/%s was made for rollout member %s, not the rollout primary %s; the other members are planned only beside the primary's plan",
 			primaryPlan.GetPlanId(), req.Database, req.Environment, primary.MemberID(), targets[0].MemberID())
