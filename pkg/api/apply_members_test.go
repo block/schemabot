@@ -659,8 +659,8 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.
 
 // A member's own plan can run a statement as direct-execution DDL while the
 // reviewed target is already converged. The plan comment discloses that change
-// under the member that runs it, and confirming is the operator's consent to it,
-// so apply creation builds the member's task with the direct verdict intact.
+// under the member that runs it, so apply creation builds the member's task with
+// the direct verdict intact.
 func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.T) {
 	member := memberPlanWithChange(storage.TableChange{
 		Namespace:     "testapp",
@@ -882,10 +882,11 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 	assert.Nil(t, byTarget["testapp-002"].StartedAt, "nothing ran on the converged member")
 }
 
-// The operator consents to direct-execution DDL against the locked comment's
-// disclosure, which names only the reviewed plan's statements. A member planned
-// on its own that runs direct-execution DDL is refused even when the reviewed
-// target has work of its own, including the same statement run directly.
+// Where the reviewed target has work of its own, the locked comment discloses
+// how the reviewed plan's statements run and names no other target's direct
+// changes. A member planned on its own that runs direct-execution DDL is refused
+// there, including the same statement the reviewed plan runs directly, so no
+// direct statement runs without a comment disclosing it.
 func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasWork(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
