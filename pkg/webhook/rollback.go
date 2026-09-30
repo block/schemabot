@@ -489,8 +489,9 @@ func isRollbackConfirmRejection(err error) bool {
 // Every exit at or after the ExecuteApply call is terminal regardless of
 // outcome: once the dispatch is attempted, the rollback DDL may already be
 // executing on the target, so a durable re-drive could double-execute it.
-// The pinned lock is not released on those failures, so recovery for a
-// pre-acceptance failure is the user re-issuing rollback-confirm.
+// The pinned lock is not released on failures where its intent is unchanged,
+// so recovery for those pre-acceptance failures is re-issuing rollback-confirm.
+// If the lock intent changed, recovery starts with a fresh rollback command.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -653,23 +654,40 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	// Execute apply with the rollback plan. The caller attributes the apply to
 	// the user who confirmed the rollback, not the lock owner (repo#pr), so
 	// history and progress views show who acted.
+	//
+	// The expected lock owner and pending plan pin the rollback to the lock
+	// intent the confirm resolved: storage re-checks both in the transaction
+	// that stores the apply, so an unlock or a newer pin landing after the
+	// resolution above rejects the rollback instead of running it with unsafe
+	// changes allowed under a lock that no longer names this plan.
 	applyReq := api.ApplyRequest{
-		PlanID:         rollbackPlan.PlanIdentifier,
-		Environment:    environment,
-		Options:        options,
-		Caller:         formatGitHubCaller(requestedBy, repo, pr),
-		InstallationID: installationID,
+		PlanID:                rollbackPlan.PlanIdentifier,
+		Environment:           environment,
+		Options:               options,
+		Caller:                formatGitHubCaller(requestedBy, repo, pr),
+		InstallationID:        installationID,
+		ExpectedLockOwner:     lockOwner,
+		ExpectedPendingPlanID: existingLock.PendingPlanID,
 	}
 
 	// Every exit from here on is terminal for a durable driver: the dispatch
 	// has been attempted, so the rollback DDL may already be executing and a
-	// re-drive could double-execute it. A dispatch error leaves the pinned
-	// lock in place, so the user can re-issue rollback-confirm.
+	// re-drive could double-execute it. If the lock intent is unchanged, a
+	// dispatch error leaves the pin in place for another rollback-confirm; if
+	// it changed, the user must start with a fresh rollback command.
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
-		h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Failed to execute rollback: "+err.Error())
+		if errors.Is(err, storage.ErrLockIntentChanged) {
+			h.logger.Warn("rollback-confirm rejected: the database lock no longer pins the confirmed rollback plan; no rollback apply was created",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", rollbackPlan.PlanIdentifier,
+				"lock_owner", lockOwner, "pending_plan_id", existingLock.PendingPlanID, "error", err)
+		} else {
+			h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "database", database,
+				"database_type", dbType, "environment", environment, "plan_id", rollbackPlan.PlanIdentifier, "error", err)
+		}
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, rollbackExecutionErrorMessage(err))
 		return false, nil
 	}
 
@@ -721,6 +739,25 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	progressBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 	return false, nil
+}
+
+// msgRollbackLockIntentChanged is the rollback-confirm answer when the lock
+// stopped pinning the confirmed rollback plan before the rollback was stored:
+// an unlock, a newer rollback, or an apply re-pinned it. Nothing ran, and the
+// plan the operator reviewed is no longer the one the lock names, so the
+// recovery is a fresh rollback plan rather than re-confirming.
+const msgRollbackLockIntentChanged = "The pending rollback changed while this command was running. The rollback was rejected and nothing was applied; run the rollback command again to review a fresh rollback plan before confirming."
+
+// rollbackExecutionErrorMessage renders the PR-facing detail for a failed
+// rollback dispatch. A lock intent change is an expected race with its own
+// recovery, so it gets a fixed actionable message rather than the storage
+// error text. Other failures use fixed guidance while their details remain in
+// server logs.
+func rollbackExecutionErrorMessage(err error) string {
+	if errors.Is(err, storage.ErrLockIntentChanged) {
+		return msgRollbackLockIntentChanged
+	}
+	return "Failed to execute rollback; see server logs for details and retry rollback-confirm."
 }
 
 func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr int, environment, lockOwner string) (*storage.Lock, *storage.Plan, error) {
