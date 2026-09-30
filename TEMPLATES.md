@@ -8570,6 +8570,10 @@ schemabot apply -e production
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 - Rows: 914,707 / 1,466,232 across 1 of 4 shards · ETA: ≥ 3m 15s
   └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
 
@@ -8596,6 +8600,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ❌ Failed
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 | Shard | Status |
 | --- | --- |
@@ -8630,6 +8638,18 @@ schemabot apply -e production
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: 🔄 Row copy in progress
+
+**shards `-40`, `80-c0`**
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+**shard `40-80`**
+```sql
+ALTER TABLE `mutes`
+    ADD INDEX `created_at`(`created_at`),
+    ADD COLUMN `reason` varchar(255);
+```
   └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0
 
 Shards diverge — grouped by change:
@@ -8669,14 +8689,26 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **`outcomes`**: ✅ Complete
 
+```sql
+ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);
+```
+
 #### Keyspace `cdb_resolute_lookup`
 
 **`outcomes_lookup`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 27%
+
+```sql
+ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);
+```
 - Rows: 540,211 / 2,000,780 · ETA: 8m 0s
 
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ⏳ Queued
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 ### VSchema
 
@@ -8704,6 +8736,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ✅ Complete (4 shards)
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 ### VSchema
 
@@ -8744,6 +8780,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **`mutes`**: ✅ Complete (2 shards)
 
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
 ### Finalize
 
 **`cdb_resolute_sharded`**: Finalized
@@ -8769,6 +8809,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ❌ Failed
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 | Shard | Status |
 | --- | --- |
@@ -8806,6 +8850,10 @@ schemabot apply -e production
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ⊘ Cancelled — applied on 2 of 4 shards
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 | Shard | Status |
 | --- | --- |

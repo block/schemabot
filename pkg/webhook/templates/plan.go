@@ -1215,10 +1215,17 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 // statement that is neither a single statement nor a valid create set is
 // still rendered as written, and the reason is logged for triage.
 func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
+	writeSQLFencedBlocks(sb, formatDDLBlocks(statements, dialect), budget)
+	sb.WriteString("\n")
+}
+
+// formatDDLBlocks formats each statement as the content of its own SQL block,
+// as writePlanDDLBlocks describes.
+func formatDDLBlocks(statements []string, dialect schema.Dialect) []string {
 	blocks := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
-		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
+		slog.Warn("DDL block cannot split create sets; multi-statement DDL will be rendered as written",
 			"dialect", dialect, "error", parserErr)
 	}
 	for _, stmt := range statements {
@@ -1227,7 +1234,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 			if _, _, classifyErr := parser.Classify(stmt); classifyErr != nil {
 				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
 				if createSetErr != nil {
-					slog.Warn("plan DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
+					slog.Warn("DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
 						"dialect", dialect, "classify_error", classifyErr, "create_set_error", createSetErr)
 				} else {
 					statementsToFormat = createSet.Statements
@@ -1240,8 +1247,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 		}
 		blocks = append(blocks, strings.Join(formattedCreateSet, "\n"))
 	}
-	writeSQLFencedBlocks(sb, blocks, budget)
-	sb.WriteString("\n")
+	return blocks
 }
 
 // writeShardedPlanDDL renders a sharded keyspace's DDL grouped by change: shards

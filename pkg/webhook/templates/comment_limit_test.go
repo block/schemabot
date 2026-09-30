@@ -211,6 +211,41 @@ func TestApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
 	})
 }
 
+// A sharded apply's DDL draws on the same budget as a single-deployment apply's,
+// so a wide keyspace changing many tables still leaves the reserve for the
+// sections the poster appends, and the footer still renders.
+func TestShardedApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
+	limit := commentBodyLimit - applyCommentAppendReserve
+	ks := ShardedKeyspace{Keyspace: "ledger_sharded"}
+	for _, shard := range []string{"-80", "80-"} {
+		ks.Shards = append(ks.Shards, ShardStatus{Shard: shard, Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed})
+	}
+	for _, table := range greenfieldTables("events", 200, state.Task.Failed) {
+		ks.Tables = append(ks.Tables, ShardedTableStatus{Table: table.TableName, Status: state.Task.Failed})
+		for _, shard := range ks.Shards {
+			ks.Cells = append(ks.Cells, ShardCell{Shard: shard.Shard, Table: table.TableName, Statements: []string{table.DDL}})
+		}
+	}
+	data := ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "ledger", ApplyID: "apply-x",
+		ErrorMessage: "Error 1205: Lock wait timeout exceeded",
+		Keyspaces:    []ShardedKeyspace{ks},
+	}
+
+	for name, body := range map[string]string{
+		"progress": RenderShardedApplyComment(data),
+		"summary":  RenderShardedApplySummaryComment(data),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.LessOrEqual(t, len(body), limit)
+			assert.Greater(t, len(body), limit-512, "the DDL takes the room the reserve leaves")
+			assert.Contains(t, body, ddlTruncatedMarker)
+			assert.Contains(t, body, "CREATE TABLE `events_000`", "the first table's DDL renders")
+			assert.Contains(t, body, "To retry:", "the footer after the keyspace sections still renders")
+		})
+	}
+}
+
 // A rollout across several deployments renders one <details> body per
 // deployment inside a single comment, so the deployments share one DDL budget:
 // the whole comment stays under the limit however many deployments carry DDL.

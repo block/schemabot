@@ -38,8 +38,11 @@ type CommentObserver struct {
 	engineLogs EngineLogReader
 	// plans remembers the plan rows this apply's members run, so the progress
 	// comment reads each once for the observer's life, not once per render.
-	plans  planIdentities
-	logger interface {
+	plans planIdentities
+	// finalizers remembers what the stored plan says about each apply's
+	// finalizers once it has been read; see finalizerPlanCache.
+	finalizers *finalizerPlanCache
+	logger     interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Warn(msg string, args ...any)
@@ -168,6 +171,10 @@ type CommentObserverConfig struct {
 	// engine-logs fold off the summary.
 	EngineLogs EngineLogReader
 
+	// finalizerPlans is the finalizer plan cache shared with every other
+	// comment render in the process. Nil gives the observer a cache of its own.
+	finalizerPlans *finalizerPlanCache
+
 	Logger interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
@@ -229,6 +236,10 @@ func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any)
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	clk := clock.Default(cfg.Clock)
+	finalizers := cfg.finalizerPlans
+	if finalizers == nil {
+		finalizers = newFinalizerPlanCache()
+	}
 	return &CommentObserver{
 		ghClient:       cfg.GHClient,
 		stor:           cfg.Storage,
@@ -241,6 +252,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		supportChannel: cfg.SupportChannel,
 		tenant:         cfg.Tenant,
 		engineLogs:     cfg.EngineLogs,
+		finalizers:     finalizers,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -713,13 +725,14 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 }
 
 // resolveFinalizerPlan loads what the stored plan says about a sharded apply's
-// finalizers for its comment rendering. It uses a short, independent deadline
-// so a slow storage read degrades to a comment without diffs rather than
-// blocking the update.
+// finalizers for its comment rendering, through the cache shared with every
+// other render of the apply (see finalizerPlanCache). It uses a short,
+// independent deadline so a slow storage read degrades to a comment without
+// diffs rather than blocking the update.
 func (o *CommentObserver) resolveFinalizerPlan(apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveShardedFinalizerPlan(ctx, o.stor, apply, ops)
+	return o.finalizers.resolve(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,

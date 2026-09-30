@@ -79,6 +79,11 @@ type Handler struct {
 	service   *api.Service
 	ghClients github.ClientSet
 
+	// finalizerPlans is the finalizer plan cache every comment render this
+	// handler starts shares; see finalizerPlanCache. Nil (a Handler built
+	// without its constructor) reads storage on every render.
+	finalizerPlans *finalizerPlanCache
+
 	// transientPlanRetryDelay overrides the pause before retrying a plan
 	// request that failed with transient remote unavailability. Zero means
 	// the package default.
@@ -318,6 +323,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		checkSuiteRecoveryGrace:     defaultCheckSuiteRecoveryGrace,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
+		finalizerPlans:              newFinalizerPlanCache(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -355,6 +361,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					SupportChannel: h.supportChannel(),
 					Tenant:         h.deploymentTenant(),
 					EngineLogs:     h.engineLogReader(),
+					finalizerPlans: h.finalizerPlans,
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
 						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
@@ -396,6 +403,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				SupportChannel: h.supportChannel(),
 				Tenant:         h.deploymentTenant(),
 				EngineLogs:     h.engineLogReader(),
+				finalizerPlans: h.finalizerPlans,
 				Logger:         logger,
 				OnTerminalHook: func(a *storage.Apply) {
 					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
@@ -733,7 +741,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
-		finalizers := resolveShardedFinalizerPlan(ctx, h.service.Storage(), apply, ops)
+		finalizers := h.finalizerPlans.resolve(ctx, h.service.Storage(), apply, ops)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
 			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, finalizers, h.deploymentTenant())

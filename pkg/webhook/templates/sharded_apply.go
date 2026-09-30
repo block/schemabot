@@ -7,16 +7,17 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
 // ShardedApplyData is the input to the sharded-apply comment: an apply that fans
 // out across the shards of one or more keyspaces within one deployment. Its unit
-// of work is one operation per (shard, table). The applied comment shows shard
-// status only — the DDL is already shown in the plan and apply-gate comments, so
-// it is not repeated here. Each keyspace renders as per-table rollup lines;
-// per-shard status tables are exception detail, appearing only when the keyspace
+// of work is one operation per (shard, table). Each keyspace renders as
+// per-table rollup lines, each followed by the table's DDL; per-shard status
+// tables are exception detail, appearing only when the keyspace
 // needs shard-level attention (see writeShardKeyspaceSections), grouped by
 // change signature when shards diverge so a divergent apply shows which shards
 // moved together. This is distinct from the multi-deployment comment, whose unit
@@ -139,18 +140,19 @@ type ShardStatus struct {
 	Error string
 }
 
-// ShardCell is one (shard, table) operation: the DDL for that table on that
-// shard. Cells with the same (table, DDL) set across shards group those shards
-// together.
+// ShardCell is one (shard, table) operation: the statements that table runs
+// on that shard, in task order. Cells with the same (table, statements) set
+// across shards group those shards together, and the statements render under
+// the table's rollup line.
 type ShardCell struct {
-	Shard string
-	Table string
-	DDL   string
+	Shard      string
+	Table      string
+	Statements []string
 }
 
-// ShardChange is one table's DDL within a group. The DDL is not rendered in the
-// applied comment; it defines the group's change signature so shards that apply
-// the same change are grouped together.
+// ShardChange is one table's DDL within a group. It defines the group's change
+// signature so shards that apply the same change are grouped together; the
+// statements themselves render under the table's rollup line.
 type ShardChange struct {
 	Table string
 	DDL   string
@@ -168,11 +170,18 @@ type shardGroup struct {
 // keyspace, the first failed shard's error lifted to the top, then a section
 // per keyspace with its per-table rollup lines, adding per-shard status tables
 // (grouped by change signature when shards diverge) only where a keyspace
-// needs shard detail. The comment is status-only; the DDL is shown in the
-// plan and apply-gate comments, not repeated here.
+// needs shard detail. Each table's DDL follows its rollup line, as in the
+// single-deployment comment, taking the room the rest of the comment leaves.
 func RenderShardedApplyComment(data ShardedApplyData) string {
-	var sb strings.Builder
 	renderedAt := currentTimestamp()
+	formatter := newShardedDDLFormatter(data.ApplyID)
+	return renderWithinCommentLimit(countShardedDDLBlocks(data.Keyspaces), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderShardedApplyComment(data, renderedAt, formatter, budget)
+	})
+}
+
+func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatter *shardedDDLFormatter, budget *ddlBlockBudget) string {
+	var sb strings.Builder
 
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeShardedMetadata(&sb, data, renderedAt)
@@ -180,7 +189,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
-	writeShardKeyspaceSections(&sb, data.Keyspaces)
+	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeFinalizeStatus(&sb, data.Finalizes)
 
@@ -197,8 +206,16 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 // apply shape's summary shares, then carries the same shard rollup the status
 // comment shows: counts, first failure, and per-table rollup lines, with
 // per-shard status tables wherever a keyspace's outcome needs shard detail —
-// a failure, divergent change signatures, or divergent shard outcomes.
+// a failure, divergent change signatures, or divergent shard outcomes. Each
+// table's DDL follows its rollup line, as in the status comment.
 func RenderShardedApplySummaryComment(data ShardedApplyData) string {
+	formatter := newShardedDDLFormatter(data.ApplyID)
+	return renderWithinCommentLimit(countShardedDDLBlocks(data.Keyspaces), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
+		return renderShardedApplySummaryComment(data, formatter, budget)
+	})
+}
+
+func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedDDLFormatter, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
@@ -208,7 +225,7 @@ func RenderShardedApplySummaryComment(data ShardedApplyData) string {
 	}
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
-	writeShardKeyspaceSections(&sb, data.Keyspaces)
+	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeFinalizeStatus(&sb, data.Finalizes)
 	writeShardedFooter(&sb, data)
@@ -377,8 +394,7 @@ func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
 
 // writeShardKeyspaceSections writes one section per keyspace: its heading and
 // its per-table rollup lines, each with the compact shard summary while in
-// flight. The section shows status only: the DDL (what changes) is already
-// shown in the plan and apply-gate comments, so repeating it here adds nothing.
+// flight, and its DDL (see writeShardedTableDDL).
 // Per-shard status tables are exception detail — they render only when the
 // keyspace needs them: a shard failure anywhere in the apply (the failed shard
 // and its halted siblings need naming, and a halted sibling can sit in another
@@ -386,7 +402,8 @@ func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
 // signature (which shards moved together is invisible at the table level),
 // divergent shard outcomes (the split the operator reconciles shard by shard),
 // or a keyspace carrying no table rollup to stand in for them.
-func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace) {
+func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, formatter *shardedDDLFormatter, budget *ddlBlockBudget) {
+	keyspaces := data.Keyspaces
 	applyHasShardFailure := false
 	for _, ks := range keyspaces {
 		if keyspaceHasShardFailure(ks.Shards) {
@@ -397,7 +414,9 @@ func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace
 	for _, ks := range keyspaces {
 		fmt.Fprintf(sb, "\n#### Keyspace %s\n\n", inlineCode(ks.Keyspace))
 		for _, t := range ks.Tables {
-			writeShardedTableLine(sb, t)
+			writeShardedTableLine(sb, t, func() {
+				writeShardedTableDDL(sb, shardedTableDDLGroups(ks, t.Table), len(ks.Shards), formatter, budget)
+			})
 		}
 		needsShardDetail := applyHasShardFailure || keyspaceHasDivergentOutcome(ks.Shards)
 		groups := groupShardsBySignature(ks.Shards, ks.Cells)
@@ -414,6 +433,97 @@ func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace
 			writeShardStatusTable(sb, g.Shards)
 		}
 	}
+}
+
+// shardedDDLGroup is a set of a keyspace's shards that run the same statements
+// for one table.
+type shardedDDLGroup struct {
+	shards     []string
+	statements []string
+}
+
+// shardedTableDDLGroups buckets the keyspace's shards by the statements they
+// run for the table, in resolved shard order, so a uniform keyspace yields one
+// group. Shards with no statements for the table contribute none.
+func shardedTableDDLGroups(ks ShardedKeyspace, table string) []shardedDDLGroup {
+	var order []string
+	bySig := make(map[string]*shardedDDLGroup)
+	for _, c := range ks.Cells {
+		if c.Table != table || len(c.Statements) == 0 {
+			continue
+		}
+		sig := strings.Join(c.Statements, "\x00")
+		g := bySig[sig]
+		if g == nil {
+			g = &shardedDDLGroup{statements: c.Statements}
+			bySig[sig] = g
+			order = append(order, sig)
+		}
+		g.shards = append(g.shards, c.Shard)
+	}
+	groups := make([]shardedDDLGroup, 0, len(order))
+	for _, sig := range order {
+		groups = append(groups, *bySig[sig])
+	}
+	return groups
+}
+
+// writeShardedTableDDL writes a table's DDL below its rollup line. A table that
+// runs the same statements on every shard shows them once, as the
+// single-deployment comment does; otherwise each distinct set is headed by the
+// shards that run it, as the plan comment does, so DDL that runs on only some
+// of the keyspace's shards never reads as running on all of them.
+func writeShardedTableDDL(sb *strings.Builder, groups []shardedDDLGroup, totalShards int, formatter *shardedDDLFormatter, budget *ddlBlockBudget) {
+	if len(groups) == 1 && len(groups[0].shards) == totalShards {
+		sb.WriteString("\n")
+		writeSQLFencedBlocks(sb, formatter.format(groups[0].statements), budget)
+		return
+	}
+	for _, g := range groups {
+		fmt.Fprintf(sb, "\n**%s**\n", planShardList(g.shards, totalShards))
+		writeSQLFencedBlocks(sb, formatter.format(g.statements), budget)
+	}
+}
+
+// shardedDDLFormatter formats each distinct statement set of one sharded
+// comment once. renderWithinCommentLimit renders the comment more than once to
+// fit it, and the formatting does not depend on the room left, so each later
+// pass reuses the blocks instead of parsing the same DDL again.
+type shardedDDLFormatter struct {
+	dialect schema.Dialect
+	blocks  map[string][]string
+}
+
+func newShardedDDLFormatter(applyID string) *shardedDDLFormatter {
+	return &shardedDDLFormatter{
+		dialect: dialectForEngine(storage.EngineStrata, applyID),
+		blocks:  make(map[string][]string),
+	}
+}
+
+// format returns the statements' SQL block contents, as formatDDLBlocks
+// renders them.
+func (f *shardedDDLFormatter) format(statements []string) []string {
+	key := strings.Join(statements, "\x00")
+	if blocks, ok := f.blocks[key]; ok {
+		return blocks
+	}
+	blocks := formatDDLBlocks(statements, f.dialect)
+	f.blocks[key] = blocks
+	return blocks
+}
+
+// countShardedDDLBlocks counts the DDL blocks the sharded comment renders, one
+// per table per distinct statement set, so the comment's DDL budget is shared
+// across exactly those blocks.
+func countShardedDDLBlocks(keyspaces []ShardedKeyspace) int {
+	count := 0
+	for _, ks := range keyspaces {
+		for _, t := range ks.Tables {
+			count += len(shardedTableDDLGroups(ks, t.Table))
+		}
+	}
+	return count
 }
 
 // keyspaceHasShardFailure reports whether any of the keyspace's shards is in a
@@ -456,10 +566,12 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 // shards — a partially-landed table between dispatch waves, or one cancelled
 // after part of the fleet applied — the line states the landed coverage so the
 // aggregate phrase alone never hides or contradicts work that happened.
-func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
+// writeDDL writes the table's DDL directly under the headline, before the rows
+// and shard lines, where the single-deployment comment puts it.
+func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
 	status := state.NormalizeTaskStatus(t.Status)
 	if status == state.Task.Running && t.RowsTotal > 0 {
-		writeShardedTableCopyProgress(sb, t)
+		writeShardedTableCopyProgress(sb, t, writeDDL)
 	} else {
 		phrase := shardedTableStatusPhrase(status)
 		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !shardSummaryBreakdownState(status) {
@@ -475,6 +587,7 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 			line += fmt.Sprintf(" (%d shards)", len(t.Shards))
 		}
 		sb.WriteString(line + "\n")
+		writeDDL()
 	}
 	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards})
 }
@@ -488,9 +601,10 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 // dispatch waves), the figures describe only the reporting shards, so both the
 // headline and the rows line name the coverage and the ETA renders as a floor —
 // nothing claims to describe shards that have not started.
-func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
+func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
 	if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 		fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(t.Table), ui.ProgressBarActivity(), shardedCopyCoverageSuffix(t))
+		writeDDL()
 		fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
 		fmt.Fprintf(sb, "- %s _%s_\n", glyph.Info, ui.EstimateExceededTooltip)
 		return
@@ -498,10 +612,12 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
 	pct := ui.RowCopyDisplayPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal)*100/t.RowsTotal), t.RowsCopied)
 	if pct == 0 {
 		fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...\n", inlineCode(t.Table))
+		writeDDL()
 		writeShardedRowsAndETA(sb, t)
 		return
 	}
 	fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct, shardedCopyCoverageSuffix(t))
+	writeDDL()
 	writeShardedRowsAndETA(sb, t)
 }
 
@@ -606,7 +722,7 @@ func writeShardedMetadata(sb *strings.Builder, data ShardedApplyData, renderedAt
 func groupShardsBySignature(shards []ShardStatus, cells []ShardCell) []shardGroup {
 	changesByShard := make(map[string][]ShardChange, len(shards))
 	for _, c := range cells {
-		changesByShard[c.Shard] = append(changesByShard[c.Shard], ShardChange{Table: c.Table, DDL: c.DDL})
+		changesByShard[c.Shard] = append(changesByShard[c.Shard], ShardChange{Table: c.Table, DDL: strings.Join(c.Statements, "\x00")})
 	}
 
 	var order []string
