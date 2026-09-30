@@ -236,7 +236,8 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 // one the aggregate state would carry, such as stop while running. Whenever a
 // member is still writing to its target, stop follows in the same footer, so
 // neither a pending action nor the aggregate state can take stop away from
-// live work.
+// live work. A terminal apply refuses stop, so stop is never offered under
+// one.
 func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	footer := rolloutFooterData(data)
 	footerStart := sb.Len()
@@ -248,7 +249,7 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	// deployments proceed, and stop parks the whole apply instead.
 	paused := state.IsState(data.Model.State, state.Apply.Paused)
 	if paused {
-		writeFooterAction(sb, "Paused after a failure — to let the held deployments proceed:",
+		writeRolloutFooterAction(sb, footerStart, "Paused after a failure — to let the held deployments proceed:",
 			appendTenantFlag(fmt.Sprintf("schemabot release %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	}
 	if !actionPending && !paused {
@@ -257,18 +258,28 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 			return
 		}
 	}
+	// Stop is refused once the apply is terminal, even while a member is
+	// still writing to its target.
+	if state.IsTerminalApplyState(data.Model.State) {
+		return
+	}
 	// A paused rollout always offers stop beside release; otherwise stop
 	// follows only a member that is still writing to its target.
 	if !paused && !hasStoppableLiveWork(data.Model.Deployments) {
 		return
 	}
 	label, command := rolloutStopAction(footer)
+	writeRolloutFooterAction(sb, footerStart, label, command)
+}
+
+// writeRolloutFooterAction writes one command of the rollout footer. The first
+// command opens the footer with its --- separator; a later one joins the
+// footer that already began at footerStart rather than opening a second one.
+func writeRolloutFooterAction(sb *strings.Builder, footerStart int, label, command string) {
 	if sb.Len() == footerStart {
 		writeFooterAction(sb, label, command)
 		return
 	}
-	// The footer already began above; stop joins it rather than opening a
-	// second one.
 	fmt.Fprintf(sb, "\n%s\n```\n%s\n```\n", label, command)
 }
 
