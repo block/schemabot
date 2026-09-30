@@ -395,14 +395,15 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	for _, tbl := range ddl.FilterInternalTablesTyped(result.RenderedTables()) {
 		namespacesWithDDL[renderedNamespace(tbl.Namespace, result.Database)] = true
 	}
-	// A finalize beside DDL renders as the DDL alone, so only a finalize that
-	// is its namespace's only work distinguishes one plan's output from another.
+	// A finalize beside DDL or a VSchema change renders as that work alone, so
+	// only a finalize that is its namespace's only work distinguishes one
+	// plan's output from another.
 	var vschemas, finalizes []string
 	for _, sc := range result.Changes {
 		if sc.ShowsVSchemaChange() {
 			vschemas = append(vschemas, sc.Namespace+":"+sc.Metadata[apitypes.VSchemaDiffMetadataKey])
 		}
-		if sc.NeedsFinalizer() && !namespacesWithDDL[renderedNamespace(sc.Namespace, result.Database)] {
+		if sc.NeedsFinalizer() && !sc.ShowsVSchemaChange() && !namespacesWithDDL[renderedNamespace(sc.Namespace, result.Database)] {
 			finalizes = append(finalizes, sc.Namespace)
 		}
 	}

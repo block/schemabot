@@ -939,14 +939,14 @@ Each summary carries the plan ID, database, database type, environment, and
 creation time, plus a count of changes by operation and how many were unsafe
 or blocked. Namespace-level work is counted separately:
 `vschema_change_count` is how many namespaces show a VSchema change, and
-`finalize_count` is how many namespaces the engine asked to finalize once
-their DDL lands. A namespace whose VSchema change the engine generates
-entirely from the plan's DDL has nothing to review, so it counts under
-`finalize_count` alone. A plan with no changes omits every count; a plan
+`finalize_count` is how many namespaces have nothing to run but the finalize
+the engine asked for. A finalize beside a namespace's DDL or VSchema change is
+part of that work, so it is not counted, and a namespace whose VSchema change
+the engine generates entirely from the plan's DDL has nothing to review, so it
+is counted by its DDL alone. A plan with no changes omits every count; a plan
 whose only work is a finalize carries `finalize_count` alone, and
-`list-plans` renders it as `1 finalize` rather than `no changes`. A finalize
-is implied by the table and VSchema changes beside it, so `list-plans` lists
-finalizes only for a plan that has neither. The repository, PR, and
+`list-plans` renders it as `1 finalize` rather than `no changes`. The
+repository, PR, and
 head SHA it was planned from appear when the plan came from a PR (an ad-hoc
 CLI plan has none, and older plans may lack the SHA); `deployment` names the
 primary deployment the plan was computed against, when one was recorded.
@@ -1027,8 +1027,8 @@ Response excerpt (illustrative values):
 GET /api/plans/plan-example-52
 ```
 
-The namespace still reports `vschema_changed`, but the plan counts it under
-`finalize_count` and has no `vschema_change_count`.
+The namespace still reports `vschema_changed`, but the plan counts it by its
+`create` alone, with no `vschema_change_count` and no `finalize_count`.
 
 Response excerpt (illustrative values):
 
@@ -1042,7 +1042,6 @@ Response excerpt (illustrative values):
   "change_counts": {
     "create": 1
   },
-  "finalize_count": 1,
   "plan": {
     "plan_id": "plan-example-52",
     "engine": "strata",

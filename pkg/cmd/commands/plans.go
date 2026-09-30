@@ -164,9 +164,7 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 	if p.VSchemaChangeCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d vschema", p.VSchemaChangeCount))
 	}
-	// A plan with DDL or a VSchema change finalizes as part of that work, so
-	// the finalize is listed only when it is all the plan does.
-	if p.FinalizeCount > 0 && total == 0 && p.VSchemaChangeCount == 0 {
+	if p.FinalizeCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d finalize", p.FinalizeCount))
 	}
 	if p.UnsafeCount > 0 {

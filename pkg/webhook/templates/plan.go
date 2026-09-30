@@ -669,11 +669,12 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 }
 
 // countChanges counts a plan's DDL statements and its keyspace-level updates:
-// each keyspace whose VSchema changes or that the engine asks to finalize.
+// each keyspace whose VSchema changes or whose only work is a finalize. A
+// finalize beside DDL is part of that DDL's work, so it adds nothing.
 func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspaceUpdates int) {
 	for _, ks := range changes {
 		totalStatements += keyspaceStatementCount(ks)
-		if ks.VSchemaChanged || ks.Finalize {
+		if ks.VSchemaChanged || finalizeIsOnlyWork(ks) {
 			keyspaceUpdates++
 		}
 	}
@@ -1646,10 +1647,16 @@ func targetPlansDiscloseBlocked(data PlanCommentData) bool {
 // combinedTargetPlanChanges merges every target's plan into the one change list
 // the plan summary counts, the way a sharded keyspace's summary counts each
 // distinct statement once however many shards run it.
+//
+// A target whose only work in a keyspace is a finalize shows that finalize in
+// its own plan, so the summary counts it even when another target runs DDL in
+// the same keyspace: the keyspace is then listed a second time, with the
+// finalize alone.
 func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 	var combined []KeyspaceChangeData
 	byKeyspace := make(map[string]int)
 	seen := make(map[string]map[string]struct{})
+	finalizeOnly := make(map[string]bool)
 	for _, g := range data.DeploymentDrift.Plans {
 		if g.Empty() {
 			continue
@@ -1663,7 +1670,9 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 				seen[ks.Keyspace] = make(map[string]struct{})
 			}
 			combined[i].VSchemaChanged = combined[i].VSchemaChanged || ks.VSchemaChanged
-			combined[i].Finalize = combined[i].Finalize || ks.Finalize
+			if finalizeIsOnlyWork(ks) {
+				finalizeOnly[ks.Keyspace] = true
+			}
 			for _, stmt := range keyspaceStatements(ks) {
 				if _, dup := seen[ks.Keyspace][stmt]; dup {
 					continue
@@ -1672,6 +1681,17 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 				combined[i].Statements = append(combined[i].Statements, stmt)
 			}
 		}
+	}
+	for i, n := 0, len(combined); i < n; i++ {
+		ks := combined[i].Keyspace
+		if !finalizeOnly[ks] {
+			continue
+		}
+		if keyspaceStatementCount(combined[i]) == 0 && !combined[i].VSchemaChanged {
+			combined[i].Finalize = true
+			continue
+		}
+		combined = append(combined, KeyspaceChangeData{Keyspace: ks, Finalize: true})
 	}
 	return combined
 }

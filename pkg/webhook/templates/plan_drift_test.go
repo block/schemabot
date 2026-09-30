@@ -930,3 +930,30 @@ func TestRenderPlanComment_TargetPlanFinalizeIsCounted(t *testing.T) {
 	assert.Contains(t, out, keyspaceFinalizeNote, out)
 	assert.Contains(t, out, "📋 **Plan**: **1** keyspace to finalize\n", out)
 }
+
+// The reviewed target creates a table in keyspace payments, and another
+// target's only work there is the finalize its engine asked for. That target's
+// plan shows the finalize, so the rollout's summary counts it beside the create.
+func TestRenderPlanComment_TargetPlanFinalizeBesideAnotherTargetsDDLIsCounted(t *testing.T) {
+	create := "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	reviewed := []KeyspaceChangeData{{Keyspace: "payments", Statements: []string{create}, Finalize: true}}
+	data := PlanCommentData{
+		Database: "payments", Environment: "production", DatabaseType: "strata",
+		Changes: reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "payments_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "payments_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/payments_1"}, Primary: true, Changes: reviewed},
+				{Members: []string{"primary/payments_2"}, Changes: []KeyspaceChangeData{{Keyspace: "payments", Finalize: true}}},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Equal(t, 1, strings.Count(out, keyspaceFinalizeNote), out)
+	assert.Contains(t, out, "📋 **Plan**: **1** table to create, **1** keyspace to finalize\n", out)
+}

@@ -817,6 +817,20 @@ func TestPlanFingerprint_GeneratedVSchemaChangeDiffersFromAVSchemaChange(t *test
 	assert.NotEqual(t, planFingerprint(generated), planFingerprint(unmarked))
 }
 
+// Two environments change keyspace payments' VSchema with no DDL, and only one
+// engine asks to finalize the keyspace. Both print the same VSchema change and
+// no finalize line, so they are deduplicated into one section.
+func TestPlanFingerprint_FinalizeBesideVSchemaChangeRendersTheSame(t *testing.T) {
+	mk := func(metadata map[string]string) *apitypes.PlanResponse {
+		return &apitypes.PlanResponse{Database: "commerce", Changes: []*apitypes.SchemaChangeResponse{{Namespace: "payments", Metadata: metadata}}}
+	}
+	diff := "+  \"refunds\": {}"
+	finalized := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.VSchemaDiffMetadataKey: diff, apitypes.NeedsFinalizerMetadataKey: "true"})
+	plain := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.VSchemaDiffMetadataKey: diff})
+
+	assert.Equal(t, planFingerprint(plain), planFingerprint(finalized))
+}
+
 // Two environments plan the same table create in keyspace payments, and only
 // one engine asks to finalize the keyspace. The finalize is part of the DDL's
 // work, so both render the same and are deduplicated into one section.

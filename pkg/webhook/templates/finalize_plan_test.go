@@ -114,3 +114,26 @@ func TestRenderPlanComment_ShardedKeyspaceFinalize(t *testing.T) {
 	assert.Contains(t, satisfied, "#### Keyspace: `payments`\n"+keyspaceFinalizeNote)
 	assert.Contains(t, satisfied, "📋 **Plan**: **1** table to create, **1** keyspace to finalize\n")
 }
+
+// Staging and production each create one table in a keyspace the engine then
+// finalizes. The finalize is part of that DDL's work, so each environment's
+// section has a single change and shows it inline rather than folding it into a
+// details block.
+func TestRenderMultiEnvPlanComment_FinalizeBesideOneCreateStaysInline(t *testing.T) {
+	create := "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	plan := func(env string) *PlanCommentData {
+		return &PlanCommentData{
+			Environment: env, DatabaseType: "strata",
+			Changes: []KeyspaceChangeData{{Keyspace: "payments", Statements: []string{create + ";"}, Finalize: true}},
+		}
+	}
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "payments", DatabaseType: "strata",
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": plan("staging"), "production": plan("production")},
+	})
+
+	assert.Contains(t, out, "CREATE TABLE `refund_notes`", out)
+	assert.NotContains(t, out, "<details>", out)
+	assert.NotContains(t, out, keyspaceFinalizeNote, out)
+}

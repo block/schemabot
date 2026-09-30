@@ -177,7 +177,9 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 		if nsData.ShowsVSchemaChange() {
 			summary.VSchemaChangeCount++
 		}
-		if nsData.Finalize {
+		// A finalize beside a namespace's DDL or VSchema change is part of that
+		// work, so only a namespace whose only work is the finalize counts.
+		if nsData.Finalize && !nsData.ShowsVSchemaChange() && len(nsData.Tables) == 0 {
 			summary.FinalizeCount++
 		}
 		for _, change := range nsData.Tables {

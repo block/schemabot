@@ -47,11 +47,40 @@ func TestPlanSummaryFromStorageCountsFinalizeRequests(t *testing.T) {
 	assert.Zero(t, summary.VSchemaChangeCount)
 }
 
+// A stored plan creates a table in one namespace, which the engine finalizes
+// as part of that DDL, and has nothing but a finalize in another. Only the
+// namespace whose only work is the finalize counts under finalize_count, so
+// GET /api/plans lists the plan the way its plan comment summarizes it.
+func TestPlanSummaryFromStorageCountsOnlyFinalizeOnlyNamespaces(t *testing.T) {
+	summary := planSummaryFromStorage(&storage.Plan{
+		PlanIdentifier: "plan-finalize-beside-ddl",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeStrata,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Tables:   []storage.TableChange{{Table: "refund_notes", DDL: "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", Operation: "create"}},
+				Finalize: true,
+			},
+			"ledger": {Finalize: true},
+			"audit": {
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {"events": {}}}`},
+				Finalize:  true,
+			},
+		},
+	})
+
+	assert.Equal(t, map[string]int{"create": 1}, summary.ChangeCounts)
+	assert.Equal(t, 1, summary.VSchemaChangeCount)
+	assert.Equal(t, 1, summary.FinalizeCount)
+}
+
 // A stored plan whose VSchema change the engine generated entirely from the
-// plan's DDL counts under finalize_count rather than as a VSchema change, and
-// reads back without a VSchema change to show, the way the live plan showed
-// it, while still reporting the VSchema change to anything that acts on it.
-func TestStoredPlanShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
+// plan's DDL lists by that DDL alone, with neither a VSchema change nor a
+// finalize count, and reads back without a VSchema change to show, the way the
+// live plan showed it, while still reporting the VSchema change to anything
+// that acts on it.
+func TestStoredPlanShowsGeneratedVSchemaChangeAsItsDDL(t *testing.T) {
 	plan := &storage.Plan{
 		PlanIdentifier: "plan-generated-vschema",
 		Database:       "payments",
@@ -67,7 +96,8 @@ func TestStoredPlanShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 	}
 
 	summary := planSummaryFromStorage(plan)
-	assert.Equal(t, 1, summary.FinalizeCount)
+	assert.Equal(t, map[string]int{"create": 1}, summary.ChangeCounts)
+	assert.Zero(t, summary.FinalizeCount)
 	assert.Zero(t, summary.VSchemaChangeCount)
 
 	resp := planContentFromStorage(plan)
