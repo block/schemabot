@@ -661,7 +661,8 @@ primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); 
 refusing member work the apply's operation shape cannot carry, rather than settling that member as
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
-(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
+(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`).
 
 ## Apply state machine (ST)
 
@@ -1590,6 +1591,17 @@ a table declared by two desired schema files fails planning on every engine thro
 A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
 refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
 `pkg/tern/local_client.go`).
+
+### RV-9: A rollout member runs only a plan made for it
+
+Each member of an apply runs the plan made against that member, or, where the environment's
+members mirror each other, the rollout primary's plan. A plan made for one member never runs on
+another: an apply narrowed to one member runs only on the member its plan was made for, and an
+apply of the whole rollout runs from the rollout primary's plan. An apply that ran on one member
+is never rolled back across the rollout. *Enforced:* member pairing at apply creation
+(`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
+`pkg/api/plan_handlers.go`); the narrowed-apply refusal in `ExecuteRollbackPlanForApply`
+(`pkg/api/plan_handlers.go`).
 
 ## Routing and authorization (AZ)
 

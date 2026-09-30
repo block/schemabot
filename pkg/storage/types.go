@@ -1397,6 +1397,12 @@ type ApplyOptions struct {
 	// leave the required check action_required (the PR's change has been reverted
 	// and must not merge as-is), not success.
 	Rollback bool `json:"rollback,omitempty"`
+
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
+	// recorded at creation and never read from caller options, so a rollback
+	// can tell an apply that changed one member from one that changed them all.
+	NarrowedTo string `json:"narrowed_to,omitempty"`
 }
 
 // DirectExecutionPolicy is an apply's durable record of the direct execution
