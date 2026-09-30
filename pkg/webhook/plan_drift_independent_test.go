@@ -229,10 +229,9 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 
 // A target's own plan can route a statement to direct execution when the
 // reviewed target's does not, because the verdict belongs to the target that
-// runs it. Confirming the apply is the operator's consent to that write-blocking
-// DDL, so the disclosure renders under the target that carries it, the way the
-// reviewed plan's own direct changes are disclosed, and once rather than again
-// plan-wide.
+// runs it. That write-blocking DDL is disclosed under the target that carries
+// it, the way the reviewed plan's own direct changes are, and once rather than
+// again plan-wide.
 func TestReviewDriftComment_IndependentDisclosesDirectMember(t *testing.T) {
 	diffs := []api.DeploymentPlanDiff{
 		independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false),

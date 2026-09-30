@@ -99,10 +99,11 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 // confirms renders those plans' statements and nothing else. So work the apply
 // cannot run as planned, and anything whose consent rests on a disclosure that
 // comment does not carry, refuses here: an unsafe change the reviewed plan's
-// disclosure does not name, a direct-execution change, or an unfinished copy
-// the apply would discard. It is asked before the apply pauses, so a refusal
-// never pins a confirmation that could not succeed, and again at confirm against
-// the rollout as it is then.
+// disclosure does not name, or an unfinished copy the apply would discard. A
+// direct-execution change is not refused: the comment discloses it under the
+// target that runs it. It is asked before the apply pauses, so a refusal never
+// pins a confirmation that could not succeed, and again at confirm against the
+// rollout as it is then.
 //
 // A copy at stake refuses whether or not the reviewed target has work, since
 // the comment discloses only the reviewed plan's discarded copies. The rest is

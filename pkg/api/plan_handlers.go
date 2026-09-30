@@ -1922,7 +1922,7 @@ func rejectMemberDirectExecution(member applyMember, applyPlan *storage.Plan) er
 	}
 	for _, change := range member.Plan.FlatDDLChanges() {
 		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
-			return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, whose consent is given against the reviewed plan's disclosure, which names no other target's statements",
+			return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, which the reviewed plan's disclosure does not name: it discloses no other target's statements",
 				member.MemberID(), member.Plan.PlanIdentifier, change.Table)
 		}
 	}

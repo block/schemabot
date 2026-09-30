@@ -331,7 +331,7 @@ type DeploymentPlanGroup struct {
 	PlanID string
 	// DirectChanges are the group's changes the direct execution policy routes
 	// to native DDL, each naming the targets that run it that way when that is
-	// not all of them. Confirming the apply consents to them.
+	// not all of them.
 	DirectChanges []DirectChangeData
 }
 
@@ -2051,8 +2051,8 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if len(g.BlockedChanges) > 0 {
 			writeBlockedChanges(sb, g.BlockedChanges)
 		}
-		// A direct change is disclosed the same way: confirming the apply
-		// consents to its write-blocking DDL on the targets named here.
+		// A direct change is disclosed the same way, naming the targets that
+		// run its write-blocking DDL.
 		if len(g.DirectChanges) > 0 {
 			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 		}
@@ -2062,8 +2062,8 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 // targetPlansDiscloseDirect reports whether the rendered target plans carry
 // the reviewed plan's direct changes under the reviewed target's own group, so
 // the plan-wide section would only repeat them. A reviewed plan whose group
-// carries none keeps the plan-wide section: consent is never asked for DDL the
-// comment leaves unsaid because the two sources disagree.
+// carries none keeps the plan-wide section, so the comment never leaves a direct
+// statement unsaid because the two sources disagree.
 func targetPlansDiscloseDirect(data PlanCommentData) bool {
 	if !RendersTargetPlans(data.DeploymentDrift) {
 		return false

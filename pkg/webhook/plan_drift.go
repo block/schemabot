@@ -206,8 +206,8 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		}
 		// A direct verdict is read per member for the same reason a refusal is:
 		// the policy judges each target's own table, so members that run the same
-		// DDL can differ in how it runs. Confirming the apply consents to that
-		// write-blocking DDL, so it is disclosed under the targets that run it.
+		// DDL can differ in how it runs. That write-blocking DDL is disclosed
+		// under the targets that run it, the way a refusal is.
 		for _, dc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeDirect) {
 			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
 		}

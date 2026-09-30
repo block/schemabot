@@ -285,8 +285,8 @@ func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {
 // When every target's own plan renders, a direct change is disclosed under the
 // targets that run it, naming them when only some of the group does. The
 // reviewed plan's own direct changes move under its group rather than repeat
-// plan-wide, and stay plan-wide when its group carries none, so consent is
-// never asked for a direct statement the comment does not disclose.
+// plan-wide, and stay plan-wide when its group carries none, so the comment
+// never leaves a direct statement undisclosed.
 func TestRenderPlanComment_DirectDisclosedPerTargetGroup(t *testing.T) {
 	const alter = "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)"
 	direct := DirectChangeData{Table: "users", Reason: "the table has ~1,240 rows"}
