@@ -953,9 +953,15 @@ func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit i
 type mockPlanStore struct {
 	storage.PlanStore
 	plan *storage.Plan
+	// byID, when set, answers GetByID per plan id instead of returning plan
+	// for every id, for applies whose operations run plans of their own.
+	byID map[int64]*storage.Plan
 }
 
-func (m *mockPlanStore) GetByID(context.Context, int64) (*storage.Plan, error) {
+func (m *mockPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	if m.byID != nil {
+		return m.byID[id], nil
+	}
 	return m.plan, nil
 }
 
