@@ -448,6 +448,11 @@ func TestCreateStoredApply_BlockedMemberPlanIsRefused(t *testing.T) {
 	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
 	assert.Contains(t, err.Error(), "blocked change")
 	assert.Contains(t, err.Error(), "orders")
+	refused, ok := errors.AsType[*MemberPlanRefusedError](err)
+	require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
+	assert.Equal(t, MemberPlanBlocked, refused.Refusal)
+	assert.Equal(t, "eu/testapp-002", refused.Target, "the target is named the way the plan comment names it")
+	assert.Equal(t, "orders", refused.Table)
 }
 
 // The unsafe opt-in is the operator's, given against the disclosure on the
@@ -470,6 +475,10 @@ func TestCreateStoredApply_DisclosedUnsafeMemberChangeNeedsTheOptIn(t *testing.T
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "legacy_orders")
 	assert.Contains(t, err.Error(), "allow_unsafe")
+	refused, ok := errors.AsType[*MemberPlanRefusedError](err)
+	require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
+	assert.Equal(t, MemberPlanUnsafe, refused.Refusal)
+	assert.Equal(t, "legacy_orders", refused.Table)
 
 	_, _, err = svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"},
 		map[string]string{"allow_unsafe": "true"}, "apply-unsafe-member-opted-in")

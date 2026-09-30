@@ -79,6 +79,14 @@ type DirectChangeData struct {
 	// rendering too wide to name every shard can state coverage ("12 of 32
 	// shards") instead of a bare count. Zero when unknown.
 	TotalShards int
+	// Targets names the rollout targets that run this change directly, for a
+	// target plan group in which only some targets do: the direct execution
+	// policy judges each target's own table. Empty when every target in the
+	// group runs it directly.
+	Targets []string
+	// TotalTargets is how many targets the group holds, so a subset too wide
+	// to name reads as coverage ("3 of 12 targets").
+	TotalTargets int
 }
 
 // AttributedChangeData is a table carrying a planned destructive change that
@@ -321,6 +329,10 @@ type DeploymentPlanGroup struct {
 	// reviewed plan and points at PlanCommentData.PlanID. Empty when the
 	// member's plan was not stored.
 	PlanID string
+	// DirectChanges are the group's changes the direct execution policy routes
+	// to native DDL, each naming the targets that run it that way when that is
+	// not all of them. Confirming the apply consents to them.
+	DirectChanges []DirectChangeData
 }
 
 // Empty reports that the group's members are already at the desired schema and
@@ -539,7 +551,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Direct-execution changes — statements the policy routes to native DDL.
 	// The policy approves them, so the plan only discloses how they run; the
 	// locked apply comment repeats it so the apply shows what it is running.
-	if len(data.DirectChanges) > 0 {
+	if len(data.DirectChanges) > 0 && !targetPlansDiscloseDirect(data) {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 	}
 
@@ -2039,7 +2051,29 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if len(g.BlockedChanges) > 0 {
 			writeBlockedChanges(sb, g.BlockedChanges)
 		}
+		// A direct change is disclosed the same way: confirming the apply
+		// consents to its write-blocking DDL on the targets named here.
+		if len(g.DirectChanges) > 0 {
+			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
+		}
 	}
+}
+
+// targetPlansDiscloseDirect reports whether the rendered target plans carry
+// the reviewed plan's direct changes under the reviewed target's own group, so
+// the plan-wide section would only repeat them. A reviewed plan whose group
+// carries none keeps the plan-wide section: consent is never asked for DDL the
+// comment leaves unsaid because the two sources disagree.
+func targetPlansDiscloseDirect(data PlanCommentData) bool {
+	if !RendersTargetPlans(data.DeploymentDrift) {
+		return false
+	}
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Primary {
+			return len(g.DirectChanges) > 0
+		}
+	}
+	return false
 }
 
 // targetPlansDiscloseBlocked reports whether the rendered target plans carry
@@ -2213,6 +2247,9 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
+		}
+		if len(c.Targets) > 0 {
+			table = fmt.Sprintf("%s on %s", table, planGroupList(targetNoun, c.Targets, c.TotalTargets))
 		}
 		writeEngineReasonItem(sb, table, c.Reason)
 	}
@@ -2801,7 +2838,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// Direct-execution changes — each environment's section discloses its own,
 	// since the policy is configured per environment.
-	if len(plan.DirectChanges) > 0 {
+	if len(plan.DirectChanges) > 0 && !targetPlansDiscloseDirect(*plan) {
 		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL, plan.DeferCutover)
 	}
 
