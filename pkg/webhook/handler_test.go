@@ -370,10 +370,10 @@ func TestHandlerRendersCLIHintsWithTheConfiguredCLIName(t *testing.T) {
 // printed. Both observer kinds, the per-driver one and the one-shot aggregate
 // terminal-summary publisher, render the same hint.
 func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testing.T) {
-	h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: "acme schemabot"}, nil, testLogger()), finalizerPlans: newFinalizerPlanCache()}
+	h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: "acme schemabot"}, nil, testLogger()), shardedPlans: newShardedPlanCache()}
 	cfg := h.commentObserverConfig(nil, "octo/repo", 7, 42)
 	assert.Equal(t, "acme schemabot", cfg.CLIName)
-	assert.Same(t, h.finalizerPlans, cfg.finalizerPlans, "every observer shares the handler's finalizer plan cache")
+	assert.Same(t, h.shardedPlans, cfg.shardedPlans, "every observer shares the handler's sharded plan cache")
 
 	oversized := "## Schema Change Apply — Staging\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
 	apply := &storage.Apply{ApplyIdentifier: "apply-7c41f9", Database: "orders", Environment: "staging"}

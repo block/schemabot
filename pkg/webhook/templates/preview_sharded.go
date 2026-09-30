@@ -49,6 +49,8 @@ func PreviewCommentShardedApplyInProgress() string {
 				Table: "mutes", Status: state.Task.Running,
 				RowsCopied: previewMutesRowsCopied, RowsTotal: previewMutesRowsTotal, ETASeconds: 195,
 				ShardsReporting: 1,
+				EstimatedBytes:  new(int64(23_400_000_000)),
+				PlannedShards:   4,
 				Shards: []ShardProgressData{
 					{Shard: "-40", Status: state.Task.Running, PercentComplete: previewMutesCopyPercent},
 					{Shard: "40-80", Status: state.Task.Pending},
@@ -310,6 +312,8 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 					Table: "outcomes_lookup", Status: state.Task.Running,
 					RowsCopied: 540211, RowsTotal: 2000780, ETASeconds: 480,
 					ShardsReporting: 1,
+					EstimatedBytes:  new(int64(612_000_000)),
+					PlannedShards:   1,
 					Shards:          []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
 				}},
 				Shards: []ShardStatus{unshard(shards[1], "-")},

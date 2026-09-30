@@ -123,6 +123,17 @@ type ShardedTableStatus struct {
 	// unstarted shards can only add rows and time).
 	ShardsReporting int
 
+	// EstimatedBytes is the table's on-disk size when it was planned, summed
+	// across its shards, shown beside the copy progress so the operator sees
+	// the scale of the copy. Nil when no estimate is known, which omits it.
+	EstimatedBytes *int64
+
+	// PlannedShards is how many shards EstimatedBytes was summed over, from
+	// the plan. It can exceed len(Shards) while dispatch is still attaching the
+	// table's shard operations, so the size line names it rather than the
+	// shards attached so far. Zero when the plan does not record it.
+	PlannedShards int
+
 	// Shards is the per-shard state (and percent while copying) in resolved
 	// order, rendered as the compact one-line summary while the table is in
 	// flight.
@@ -627,10 +638,19 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus, wr
 // instead of passing a wave's fraction off as the whole table's. With every
 // shard reporting the figures are the table's and no qualifier is needed.
 func shardedCopyCoverageSuffix(t ShardedTableStatus) string {
-	if t.ShardsReporting >= len(t.Shards) {
+	if t.ShardsReporting >= t.shardTotal() {
 		return ""
 	}
-	return fmt.Sprintf(" (%s)", shardCoveragePhrase(t.ShardsReporting, len(t.Shards)))
+	return fmt.Sprintf(" (%s)", shardCoveragePhrase(t.ShardsReporting, t.shardTotal()))
+}
+
+// shardTotal is how many shards the table's copy spans: the plan's count, or
+// the shards attached so far when more have attached than the plan recorded
+// or it recorded none. Coverage is judged against it, so a table whose later
+// shard operations have yet to attach does not read as fully reported, and
+// the rows clause names the same total as the size beside it.
+func (t ShardedTableStatus) shardTotal() int {
+	return max(len(t.Shards), t.PlannedShards)
 }
 
 // writeShardedRowsAndETA writes the copying table's rows/ETA line. With every
@@ -640,18 +660,32 @@ func shardedCopyCoverageSuffix(t ShardedTableStatus) string {
 // coverage and renders the ETA as "≥" — the remaining shards can only add
 // rows and time.
 func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
-	if t.ShardsReporting >= len(t.Shards) {
-		writeRowsAndETA(sb, TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds})
+	if t.ShardsReporting >= t.shardTotal() {
+		writeRowsAndETA(sb, TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds, EstimatedBytes: t.EstimatedBytes})
 		return
 	}
 	line := fmt.Sprintf("- Rows: %s / %s across %d of %d shards",
 		ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)),
 		ui.FormatNumber(t.RowsTotal),
-		t.ShardsReporting, len(t.Shards))
+		t.ShardsReporting, t.shardTotal())
+	// The planned size is the whole table's, so beside rows that cover only
+	// some shards it names the full span rather than reading as theirs.
+	if t.EstimatedBytes != nil {
+		line += fmt.Sprintf(" · %s %s", ui.FormatApproxBytes(*t.EstimatedBytes), plannedShardSpan(t.PlannedShards))
+	}
 	if t.ETASeconds > 0 {
 		line += fmt.Sprintf(" · ETA: ≥ %s", ui.FormatETA(t.ETASeconds))
 	}
 	sb.WriteString(line + "\n")
+}
+
+// plannedShardSpan names the shards a table's planned size covers: the plan's
+// count when it recorded one, otherwise every shard without a number.
+func plannedShardSpan(plannedShards int) string {
+	if plannedShards > 0 {
+		return fmt.Sprintf("across all %d shards", plannedShards)
+	}
+	return "across all shards"
 }
 
 // shardedTableStatusPhrase maps a table's aggregate task state to its display
