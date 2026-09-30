@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
@@ -112,6 +113,14 @@ type ServerConfig struct {
 	// Deployments use it to point agents at the preferred way to drive
 	// SchemaBot (for example, a skill or internal tool to install).
 	AgentHint string `yaml:"agent_hint,omitempty"`
+
+	// CLIName is the tool name the CLI command hints in SchemaBot's PR
+	// comments start with, such as "acme schemabot" when operators run the
+	// CLI through a wrapper. It is the server-side counterpart of the CLI's
+	// --cli-name flag and takes the same value. Commands a PR author comments
+	// on the PR keep "schemabot", the bot's trigger word. Read it through
+	// HintCLIName, which applies the default.
+	CLIName string `yaml:"cli_name,omitempty"`
 
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
@@ -2012,6 +2021,9 @@ func (c *ServerConfig) Validate() error {
 	if err := validateAgentHint(c.AgentHint); err != nil {
 		return err
 	}
+	if err := validateCLIName(c.CLIName); err != nil {
+		return err
+	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
 	}
@@ -2519,6 +2531,46 @@ const maxAgentHintChars = 300
 // close the comment early and render its tail on the PR page: the HTML parsing
 // spec ends a comment on the bang form as well as the plain one.
 var htmlCommentTerminators = []string{"-->", "--!>"}
+
+// maxCLINameChars bounds cli_name, which every CLI command hint in a PR
+// comment repeats.
+const maxCLINameChars = 100
+
+// HintCLIName is the tool name CLI command hints in PR comments start with:
+// the configured cli_name, or the CLI's own default when none is set.
+func (c *ServerConfig) HintCLIName() string {
+	if c == nil || c.CLIName == "" {
+		return cliname.DefaultName
+	}
+	return c.CLIName
+}
+
+// validateCLIName rejects a cli_name that cannot render as the start of an
+// inline-code command hint: one that is blank, padded, spans lines, or carries
+// a backtick that would close the code span.
+func validateCLIName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if count := utf8.RuneCountInString(name); count > maxCLINameChars {
+		return fmt.Errorf("cli_name must be at most %d characters (got %d)", maxCLINameChars, count)
+	}
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("cli_name must not be blank")
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("cli_name contains leading or trailing whitespace")
+	}
+	if strings.Contains(name, "`") {
+		return fmt.Errorf("cli_name must not contain a backtick: it would close the inline code a command hint renders in")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("cli_name must be a single line with no control characters")
+		}
+	}
+	return nil
+}
 
 func validateAgentHint(hint string) error {
 	if hint == "" {

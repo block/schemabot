@@ -940,6 +940,18 @@ plan-example-42
 Each replan has its own ID, so one PR can appear more than once. The warning
 marker identifies plans with unsafe changes.
 
+A plan ID given with `-e` must belong to that environment. This is the form
+PR comments print when they cut DDL to fit, so a pasted command either shows
+that environment's plan or refuses:
+
+```sh
+schemabot list-plans -e production plan-example-42
+```
+
+```text
+Error: plan plan-example-42 was made for environment "staging", not "production"; rerun with -e staging
+```
+
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
 `repository`, and `pull_request` (with `repository`), plus a `last` window.

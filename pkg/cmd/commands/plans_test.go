@@ -34,6 +34,28 @@ func TestPlansCmdParsesListFiltersAndPlanID(t *testing.T) {
 	_, err = parser.Parse([]string{"list-plans", "plan-1784327902264169990"})
 	require.NoError(t, err)
 	assert.Equal(t, "plan-1784327902264169990", cli.Plans.PlanIDArg)
+
+	// The hint a PR comment prints names the plan's environment ahead of the
+	// plan ID, so the two parse together.
+	cli.Plans = PlansCmd{}
+	_, err = parser.Parse([]string{"list-plans", "-e", "staging", "plan_abc"})
+	require.NoError(t, err)
+	assert.Equal(t, "plan_abc", cli.Plans.PlanIDArg)
+	assert.Equal(t, "staging", cli.Plans.Environment)
+}
+
+// A stored plan shown with -e must belong to that environment: a hint pasted
+// against the wrong environment is refused, naming the plan's own, rather
+// than showing another environment's plan as if it were the requested one.
+func TestCheckStoredPlanEnvironment(t *testing.T) {
+	plan := &apitypes.StoredPlanResponse{PlanSummaryResponse: apitypes.PlanSummaryResponse{PlanID: "plan_abc", Environment: "staging"}}
+
+	require.NoError(t, checkStoredPlanEnvironment(plan, "staging"))
+	require.NoError(t, checkStoredPlanEnvironment(plan, ""), "no -e accepts the plan whatever its environment")
+
+	err := checkStoredPlanEnvironment(plan, "production")
+	require.Error(t, err)
+	assert.Equal(t, `plan plan_abc was made for environment "staging", not "production"; rerun with -e staging`, err.Error())
 }
 
 // setHyperlinks pins the terminal hyperlink detection for the test, so

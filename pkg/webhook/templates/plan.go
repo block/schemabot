@@ -131,6 +131,10 @@ type PlanCommentData struct {
 	// the PR's schema files.
 	PlanID string
 
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
+
 	// AgentHint is the deployment's configured guidance for AI agents reading
 	// the plan. Empty on deployments that configure none, which render an
 	// unchanged comment.
@@ -1112,7 +1116,7 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 // writeKeyspaceChanges renders each keyspace's DDL and VSchema changes, with
 // the DDL blocks drawing on the comment's shared budget.
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget) {
-	defer budget.pointAt(data.PlanID)()
+	defer budget.pointAt(storedPlanRef{cliName: data.CLIName, environment: data.Environment, id: data.PlanID})()
 
 	// The DDL blocks below format statements under the plan's own dialect so
 	// they are never reformatted under another family's grammar.

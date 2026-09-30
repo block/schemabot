@@ -15,7 +15,7 @@ func TestFitGitHubCommentKeepsABodyThatFits(t *testing.T) {
 	body := "## Schema Change Apply — Production\n\n" + strings.Repeat("x", commentBodyLimit-40)
 	require.LessOrEqual(t, len(body), commentBodyLimit)
 
-	fitted, replaced := FitGitHubComment(body)
+	fitted, replaced := FitGitHubComment(body, "")
 
 	assert.False(t, replaced)
 	assert.Equal(t, body, fitted)
@@ -27,7 +27,7 @@ func TestFitGitHubCommentKeepsABodyThatFits(t *testing.T) {
 func TestFitGitHubCommentReplacesAnOversizedBody(t *testing.T) {
 	body := "## Schema Change Apply — Production\n\n" + strings.Repeat("x", 2*GitHubIssueCommentMaxChars)
 
-	fitted, replaced := FitGitHubComment(body)
+	fitted, replaced := FitGitHubComment(body, "")
 
 	assert.True(t, replaced)
 	assert.LessOrEqual(t, len(fitted), commentBodyLimit)
@@ -35,14 +35,20 @@ func TestFitGitHubCommentReplacesAnOversizedBody(t *testing.T) {
 	assert.Contains(t, fitted, "too large to post")
 	assert.Contains(t, fitted, ui.FormatNumber(int64(len(body)))+" bytes")
 	assert.Contains(t, fitted, "at most 65,536")
-	assert.Contains(t, fitted, "`schemabot status`")
+	assert.Contains(t, fitted, "`schemabot status -e <environment>`")
 	assert.True(t, OffersSupportChannel(fitted))
+
+	t.Run("the status hint starts with the cli name", func(t *testing.T) {
+		fitted, replaced := FitGitHubComment(body, "acme schemabot")
+		assert.True(t, replaced)
+		assert.Contains(t, fitted, "available from the CLI with `acme schemabot status -e <environment>`.")
+	})
 }
 
 // A body that does not open with a heading gets a notice with no title: no
 // other first line is known to be safe to repeat on its own.
 func TestFitGitHubCommentRepeatsOnlyAHeading(t *testing.T) {
-	fitted, replaced := FitGitHubComment(strings.Repeat("| cell |\n", GitHubIssueCommentMaxChars/4))
+	fitted, replaced := FitGitHubComment(strings.Repeat("| cell |\n", GitHubIssueCommentMaxChars/4), "")
 
 	assert.True(t, replaced)
 	assert.True(t, strings.HasPrefix(fitted, "⚠️ **This comment was too large to post.**"), fitted)

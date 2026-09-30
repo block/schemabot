@@ -91,7 +91,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 				"requested_by", requestedBy)
 			return false, nil
 		}
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
 		return false, nil
 	}
 
@@ -329,6 +329,7 @@ func (h *Handler) rollbackPlanCommentData(apply *storage.Apply, planResp *apityp
 		PlanID:       planResp.PlanID,
 		Tenant:       h.deploymentTenant(),
 		AgentHint:    h.agentHint(),
+		CLIName:      h.cliName(),
 	}
 
 	commentData.Changes = rollbackKeyspaceChanges(planResp.Changes)
@@ -635,6 +636,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		InstallationID: installationID,
 		DeferCutover:   options["defer_cutover"] == "true",
 		SupportChannel: h.supportChannel(),
+		CLIName:        h.cliName(),
 		Tenant:         h.deploymentTenant(),
 		EngineLogs:     h.engineLogReader(),
 		finalizerPlans: h.finalizerPlans,

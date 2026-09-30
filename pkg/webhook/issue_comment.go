@@ -374,7 +374,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}
@@ -848,14 +848,15 @@ func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, 
 // oversized body is replaced with the notice that fits, then the support
 // footer is appended.
 func (h *Handler) renderPRComment(repo string, pr int, body string) string {
-	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, body), h.supportChannel())
+	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, body, h.cliName()), h.supportChannel())
 }
 
 // fitPRComment returns body when GitHub will accept it and otherwise the
 // oversized-comment notice, logging the rendered size with the identifiers an
-// operator needs to find the comment that was replaced.
-func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, body string) string {
-	fitted, replaced := templates.FitGitHubComment(body)
+// operator needs to find the comment that was replaced. cliName starts the
+// notice's CLI command hint.
+func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, body, cliName string) string {
+	fitted, replaced := templates.FitGitHubComment(body, cliName)
 	if replaced {
 		logger.Error("comment exceeds GitHub's size cap; posting the oversized-comment notice in its place",
 			"repo", repo, "pr", pr, "rendered_bytes", len(body), "limit_bytes", templates.GitHubIssueCommentMaxChars)
@@ -869,6 +870,12 @@ func (h *Handler) supportChannel() api.SupportChannelConfig {
 		return api.SupportChannelConfig{}
 	}
 	return cfg.SupportChannel
+}
+
+// cliName is the tool name the CLI command hints in this server's PR comments
+// start with: the configured cli_name, or the CLI's own default.
+func (h *Handler) cliName() string {
+	return h.config().HintCLIName()
 }
 
 func (h *Handler) agentHint() string {

@@ -329,12 +329,12 @@ func TestRenderWithinCommentLimitCutsDDLByTheOvershoot(t *testing.T) {
 }
 
 // renderPointedBlocks renders a comment of chrome bytes of non-DDL text and
-// the given DDL blocks, each drawn from the stored plan planID so a block cut
-// to fit carries the pointer marker, counting the passes the fit loop takes.
-func renderPointedBlocks(chrome int, blocks []string, planID string) (body string, passes int) {
+// the given DDL blocks, each drawn from the stored plan so a block cut to fit
+// carries the pointer marker, counting the passes the fit loop takes.
+func renderPointedBlocks(chrome int, blocks []string, plan storedPlanRef) (body string, passes int) {
 	body = renderWithinCommentLimit(len(blocks), 0, func(budget *ddlBlockBudget) string {
 		passes++
-		defer budget.pointAt(planID)()
+		defer budget.pointAt(plan)()
 		var sb strings.Builder
 		sb.WriteString(strings.Repeat("h", chrome))
 		for _, block := range blocks {
@@ -358,7 +358,7 @@ func repeatedDDL(size int) string {
 // into several blocks fits on the second pass, and the DDL keeps the room the
 // markers leave rather than a marker's worth per block besides.
 func TestRenderWithinCommentLimitChargesEachCutBlockOneMarker(t *testing.T) {
-	planID := "plan_" + strings.Repeat("7c41f9", 8)
+	planID := storedPlanRef{environment: "production", id: "plan_" + strings.Repeat("7c41f9", 8)}
 	pointer := planPointerMarker(planID)
 	require.Greater(t, len(pointer), len(ddlTruncatedMarker)+32, "the pointer marker outgrows the plain marker, so charging the plain one would undercharge")
 
@@ -413,15 +413,16 @@ func TestMultiEnvPlanCommentSharedSectionSaysWhosePlanItNames(t *testing.T) {
 
 	require.Contains(t, body, "### Staging & Production")
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
-	assert.Contains(t, body, "the full staging plan is available from the CLI with `schemabot list-plans plan_staging1` (production runs the same DDL).")
-	assert.Equal(t, 1, strings.Count(body, sharedPlanPointerMarker("plan_staging1", []string{"staging", "production"})))
-	assert.NotContains(t, body, planPointerMarker("plan_staging1"))
+	assert.Contains(t, body, "the full staging plan is available from the CLI with `schemabot list-plans -e staging plan_staging1` (production runs the same DDL).")
+	stagingPlan := storedPlanRef{environment: "staging", id: "plan_staging1"}
+	assert.Equal(t, 1, strings.Count(body, sharedPlanPointerMarker(stagingPlan, []string{"staging", "production"})))
+	assert.NotContains(t, body, planPointerMarker(stagingPlan))
 	assert.NotContains(t, body, ddlTruncatedMarker)
 
 	t.Run("more than one matching environment", func(t *testing.T) {
 		assert.Equal(t,
-			"_DDL truncated to fit GitHub's comment size limit; the full staging plan is available from the CLI with `schemabot list-plans plan_staging1` (production and sandbox run the same DDL)._\n",
-			sharedPlanPointerMarker("plan_staging1", []string{"staging", "production", "sandbox"}))
+			"_DDL truncated to fit GitHub's comment size limit; the full staging plan is available from the CLI with `schemabot list-plans -e staging plan_staging1` (production and sandbox run the same DDL)._\n",
+			sharedPlanPointerMarker(stagingPlan, []string{"staging", "production", "sandbox"}))
 	})
 }
 
@@ -465,8 +466,8 @@ func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
 	first, rest, found := strings.Cut(body, "**targets `primary/orders_2`, `primary/orders_3`**")
 	require.True(t, found, body)
-	assert.Contains(t, first, "the full staging plan for this target is available from the CLI with `schemabot list-plans plan_staging1` (production runs the same DDL).")
-	assert.Contains(t, rest, "the full staging plan for `primary/orders_2` is available from the CLI with `schemabot list-plans plan_staging_member_2` (every target in this group runs the same DDL; production runs the same DDL).")
+	assert.Contains(t, first, "the full staging plan for this target is available from the CLI with `schemabot list-plans -e staging plan_staging1` (production runs the same DDL).")
+	assert.Contains(t, rest, "the full staging plan for `primary/orders_2` is available from the CLI with `schemabot list-plans -e staging plan_staging_member_2` (every target in this group runs the same DDL; production runs the same DDL).")
 	assert.NotContains(t, body, "the full staging plan is available")
 }
 
@@ -480,9 +481,38 @@ func TestPlanCommentCutDDLNamesTheStoredPlan(t *testing.T) {
 	body := RenderPlanComment(data)
 
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
-	assert.Equal(t, 1, strings.Count(body, planPointerMarker("plan_7c41f9")))
-	assert.Contains(t, body, "the full plan is available from the CLI with `schemabot list-plans plan_7c41f9`.")
+	assert.Equal(t, 1, strings.Count(body, planPointerMarker(storedPlanRef{environment: "production", id: "plan_7c41f9"})))
+	assert.Contains(t, body, "the full plan is available from the CLI with `schemabot list-plans -e production plan_7c41f9`.")
 	assert.NotContains(t, body, ddlTruncatedMarker)
+}
+
+// A deployment whose operators run the CLI through a wrapper configures the
+// wrapper's name, and the pointer under cut DDL starts with it, scoped to the
+// stored plan's environment so the wrapper routes the lookup to the server
+// that stored it. The PR-comment commands in the same comment keep
+// "schemabot", the word the bot answers to. The marker's length depends on the
+// name, and the comment still fits the limit with the longest name the config
+// accepts.
+func TestPlanCommentCutDDLStartsTheStoredPlanCommandWithTheCLIName(t *testing.T) {
+	data := greenfieldPlan("staging", "events", 200)
+	data.PlanID = "plan_7c41f9"
+	data.CLIName = "acme schemabot"
+	body := RenderPlanComment(data)
+
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Contains(t, body, "the full plan is available from the CLI with `acme schemabot list-plans -e staging plan_7c41f9`.")
+	assert.Contains(t, body, "schemabot apply -e staging", "the PR-comment command keeps the bot's trigger word")
+	assert.NotContains(t, body, "acme schemabot apply", "a PR-comment command never takes the cli name")
+
+	t.Run("a long cli name still fits", func(t *testing.T) {
+		long := greenfieldPlan("production-us-east-and-west", "events", 200)
+		long.PlanID = "plan_" + strings.Repeat("7c41f9", 8)
+		long.CLIName = strings.Repeat("w", 100)
+		body := RenderPlanComment(long)
+
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+		assert.Equal(t, 1, strings.Count(body, planPointerMarker(storedPlanRef{cliName: long.CLIName, environment: long.Environment, id: long.PlanID})))
+	})
 }
 
 // A plan whose DDL fits in full is shown in full, so the comment points at no
@@ -527,9 +557,9 @@ func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
 	middle, last, found := strings.Cut(rest, "**target `primary/orders_3`**")
 	require.True(t, found, body)
 
-	assert.Contains(t, first, "the full plan for this target is available from the CLI with `schemabot list-plans plan_reviewed`.")
+	assert.Contains(t, first, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_reviewed`.")
 	assert.NotContains(t, first, "plan_member_2")
-	assert.Contains(t, middle, "the full plan for this target is available from the CLI with `schemabot list-plans plan_member_2`.")
+	assert.Contains(t, middle, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_member_2`.")
 	assert.NotContains(t, middle, "plan_reviewed")
 	assert.Contains(t, last, ddlTruncatedMarker)
 	assert.NotContains(t, last, "list-plans")
@@ -561,8 +591,8 @@ func TestPlanCommentCutTargetGroupNamesWhosePlanItPointsAt(t *testing.T) {
 
 	first, rest, found := strings.Cut(body, "**targets `primary/orders_3`, `primary/orders_4`**")
 	require.True(t, found, body)
-	assert.Contains(t, first, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_1` is available from the CLI with `schemabot list-plans plan_reviewed` (every target in this group runs the same DDL)._\n")
-	assert.Contains(t, rest, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_3` is available from the CLI with `schemabot list-plans plan_member_3` (every target in this group runs the same DDL)._\n")
+	assert.Contains(t, first, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_1` is available from the CLI with `schemabot list-plans -e production plan_reviewed` (every target in this group runs the same DDL)._\n")
+	assert.Contains(t, rest, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_3` is available from the CLI with `schemabot list-plans -e production plan_member_3` (every target in this group runs the same DDL)._\n")
 	assert.NotContains(t, body, "for these targets")
 	assert.NotContains(t, body, ddlTruncatedMarker)
 }

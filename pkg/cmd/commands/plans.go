@@ -32,7 +32,7 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 	}
 
 	if cmd.PlanIDArg != "" {
-		return showStoredPlan(ep, cmd.PlanIDArg, cmd.JSON)
+		return showStoredPlan(ep, cmd.PlanIDArg, cmd.Environment, cmd.JSON)
 	}
 
 	if cmd.PR > 0 && cmd.Repository == "" {
@@ -92,8 +92,10 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 }
 
 // showStoredPlan shows one stored plan: its provenance header plus the stored
-// plan content, rendered through the same body a fresh plan uses.
-func showStoredPlan(endpoint, planID string, outputJSON bool) error {
+// plan content, rendered through the same body a fresh plan uses. A non-empty
+// environment is the one the caller expects the plan to belong to, and a plan
+// made for another is refused rather than shown.
+func showStoredPlan(endpoint, planID, environment string, outputJSON bool) error {
 	var result *apitypes.StoredPlanResponse
 	err := withLoading("Loading plan...", !outputJSON, func() error {
 		var loadErr error
@@ -105,6 +107,9 @@ func showStoredPlan(endpoint, planID string, outputJSON bool) error {
 			fmt.Printf("No plan found for '%s'\n", planID)
 			return nil
 		}
+		return err
+	}
+	if err := checkStoredPlanEnvironment(result, environment); err != nil {
 		return err
 	}
 
@@ -123,6 +128,16 @@ func showStoredPlan(endpoint, planID string, outputJSON bool) error {
 	fmt.Println()
 	writePlanBody(result.Plan, false)
 	return nil
+}
+
+// checkStoredPlanEnvironment refuses a stored plan made for an environment
+// other than the one -e named, so a plan pasted against the wrong environment
+// is never read as that environment's plan. An empty environment accepts any.
+func checkStoredPlanEnvironment(plan *apitypes.StoredPlanResponse, environment string) error {
+	if environment == "" || plan.Environment == environment {
+		return nil
+	}
+	return fmt.Errorf("plan %s was made for environment %q, not %q; rerun with -e %s", plan.PlanID, plan.Environment, environment, plan.Environment)
 }
 
 // planSource renders a plan's provenance the way the status list renders an

@@ -32,6 +32,22 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 
 	assert.Contains(t, rendered, "schemabot unlock -d example-db --force")
 	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
+	assert.Contains(t, rendered, "Ask the lock holder to run `schemabot unlock -d example-db` from their CLI")
+
+	// The lock holder's unlock runs in their terminal, so it starts with the
+	// cli name; the force-unlock is a PR-comment command and keeps the bot's
+	// trigger word.
+	t.Run("cli name", func(t *testing.T) {
+		rendered := RenderApplyBlockedByOtherPR(ApplyLockConflictData{
+			Database:    "example-db",
+			Environment: "staging",
+			LockOwner:   "cli:testuser@example.local",
+			LockCreated: time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC),
+			CLIName:     "acme schemabot",
+		})
+		assert.Contains(t, rendered, "Ask the lock holder to run `acme schemabot unlock -d example-db` from their CLI")
+		assert.Contains(t, rendered, "```\nschemabot unlock -d example-db --force\n```")
+	})
 	assert.Contains(t, rendered, "**Locked by**: `cli:testuser`")
 	assert.NotContains(t, rendered, "example.local",
 		"the lock owner's machine is internal detail and stays out of PR markdown")

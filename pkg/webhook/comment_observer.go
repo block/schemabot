@@ -31,6 +31,7 @@ type CommentObserver struct {
 	applyLease     storage.ApplyLease
 	deferCutover   bool
 	supportChannel api.SupportChannelConfig
+	cliName        string
 	tenant         string
 	// engineLogs reads the engine's own lines back from the data planes that
 	// ran an apply, for the engine-logs fold on a failed apply's summary.
@@ -160,6 +161,11 @@ type CommentObserverConfig struct {
 	DeferCutover   bool
 	SupportChannel api.SupportChannelConfig
 
+	// CLIName is the tool name the CLI command hints in the observer's
+	// comments start with, the server's cli_name. Empty renders the CLI's own
+	// default.
+	CLIName string
+
 	// Tenant is the deployment's tenant identity, carried into every pasteable
 	// command hint the observer's comments render. Empty on single-tenant
 	// deployments.
@@ -250,6 +256,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		applyLease:     cfg.ApplyLease,
 		deferCutover:   cfg.DeferCutover,
 		supportChannel: cfg.SupportChannel,
+		cliName:        cfg.CLIName,
 		tenant:         cfg.Tenant,
 		engineLogs:     cfg.EngineLogs,
 		finalizers:     finalizers,
@@ -1688,7 +1695,7 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 // oversized body is replaced with the notice that fits, then the support
 // footer is appended.
 func (o *CommentObserver) renderPRComment(body string) string {
-	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, body), o.supportChannel)
+	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, body, o.cliName), o.supportChannel)
 }
 
 // publishClaimedSummary posts the separate apply-level terminal summary

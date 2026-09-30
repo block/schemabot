@@ -199,6 +199,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				LockRepo:    existingLock.Repository,
 				LockPR:      existingLock.PullRequest,
 				LockCreated: existingLock.CreatedAt,
+				CLIName:     h.cliName(),
 			}))
 			return false, nil
 		}
@@ -358,7 +359,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
 			return false, nil
 		}
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		commentData.DeploymentDrift = rolloutPreview
 		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
@@ -376,7 +377,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -397,7 +398,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -458,7 +459,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// apply proceeds automatically and the unsafe opt-in already solicited
 	// consent for every attributed table, where the re-plan choice the
 	// disclosure coaches is no longer open.
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
@@ -828,6 +829,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			LockRepo:    existingLock.Repository,
 			LockPR:      existingLock.PullRequest,
 			LockCreated: existingLock.CreatedAt,
+			CLIName:     h.cliName(),
 		}))
 		return false, nil
 	}

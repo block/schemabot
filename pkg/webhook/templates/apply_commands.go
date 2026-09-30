@@ -25,6 +25,10 @@ type ApplyLockConflictData struct {
 	// Active apply info (for "apply in progress" case)
 	ApplyID    string
 	ApplyState string
+
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
 }
 
 // ActorAuthorizationCommentData contains data for PR command actor
@@ -326,7 +330,7 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	fmt.Fprintf(&sb, "**Since**: %s\n\n", data.LockCreated.UTC().Format("2006-01-02 15:04:05 UTC"))
 
 	if isCLI {
-		sb.WriteString("Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:\n")
+		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, "unlock -d "+data.Database))
 		fmt.Fprintf(&sb, "```\nschemabot unlock -d %s --force\n```\n", data.Database)
 	} else {
 		sb.WriteString("Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.\n")

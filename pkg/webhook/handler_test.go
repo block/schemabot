@@ -323,7 +323,7 @@ func TestBuildPlanCommentDataCarriesTheAgentHint(t *testing.T) {
 	t.Run("no hint configured", func(t *testing.T) {
 		h := &Handler{service: api.New(nil, &api.ServerConfig{}, nil, testLogger())}
 
-		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint(), h.cliName())
 
 		assert.Empty(t, data.AgentHint)
 		assert.NotContains(t, templates.RenderPlanComment(data), "<!-- 💡 ")
@@ -333,11 +333,32 @@ func TestBuildPlanCommentDataCarriesTheAgentHint(t *testing.T) {
 		hint := "Agents: comment `schemabot help` for the command reference."
 		h := &Handler{service: api.New(nil, &api.ServerConfig{AgentHint: hint}, nil, testLogger())}
 
-		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint(), h.cliName())
 
 		assert.Equal(t, hint, data.AgentHint)
 		assert.Contains(t, templates.RenderPlanComment(data), "<!-- 💡 "+hint+" -->")
 	})
+}
+
+// A deployment's cli_name reaches the CLI hints in the comments the handler
+// posts: the plan data it builds carries it for the stored-plan pointer, and
+// the oversized-comment notice starts its status hint with it. A deployment
+// that configures none renders the CLI's own name.
+func TestHandlerRendersCLIHintsWithTheConfiguredCLIName(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	oversized := "## Schema Change Plan\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
+	for _, tc := range []struct{ name, configured, want string }{
+		{"no cli_name configured", "", "schemabot"},
+		{"cli_name configured", "acme schemabot", "acme schemabot"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: tc.configured}, nil, testLogger())}
+
+			data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "octocat", h.agentHint(), h.cliName())
+			assert.Equal(t, tc.want, data.CLIName)
+			assert.Contains(t, h.renderPRComment("octo/repo", 7, oversized), "`"+tc.want+" status -e <environment>`")
+		})
+	}
 }
 
 func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
