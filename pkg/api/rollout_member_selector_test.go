@@ -631,8 +631,8 @@ func (c *memberDiffClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) 
 // member. A plan with changes, a narrowed plan, and a plan of a single-target
 // environment carry no such error. Beside that check, a plan of the whole
 // rollout plans every member and reports the rollout's work from each
-// member's own plan, while a plan of a single-target environment is the
-// primary's plan alone and diffs no one else.
+// member's own plan, while a narrowed plan and a plan of a single-target
+// environment are the primary's plan alone and diff no one else.
 func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.T) {
 	withChanges := &ternv1.PlanResponse{PlanId: "plan-changes", Changes: []*ternv1.SchemaChange{{
 		Namespace: "payments",
@@ -697,15 +697,7 @@ func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.
 			wantMembers:        3,
 			wantRolloutChanges: true,
 		},
-		{
-			name:        "narrowed plan with no changes",
-			config:      narrowingServerConfig(),
-			database:    "payments",
-			target:      "payments-001",
-			planResp:    &ternv1.PlanResponse{PlanId: "plan-narrowed", Engine: ternv1.Engine_ENGINE_SPIRIT},
-			wantDiffed:  []string{"payments-002", "payments-003"},
-			wantMembers: 3,
-		},
+		{name: "narrowed plan with no changes", config: narrowingServerConfig(), database: "payments", target: "payments-001", planResp: &ternv1.PlanResponse{PlanId: "plan-narrowed"}},
 		{name: "single-target environment", config: singleTargetServerConfig(), database: "orders", planResp: &ternv1.PlanResponse{PlanId: "plan-orders"}},
 	}
 	for _, tc := range cases {
@@ -738,10 +730,10 @@ func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.
 			diffed := slices.Clone(client.diffed)
 			client.mu.Unlock()
 			slices.Sort(diffed)
-			assert.Equal(t, tc.wantDiffed, slices.Compact(diffed), "only the members other than the primary are diffed")
+			assert.Equal(t, tc.wantDiffed, slices.Compact(diffed), "only the members other than the primary are diffed, and never for a narrowed or single-target plan")
 
 			if tc.wantMembers == 0 {
-				assert.Nil(t, resp.Rollout, "a single-target environment has no other member to plan")
+				assert.Nil(t, resp.Rollout, "a narrowed or single-target plan has no other member to plan")
 				return
 			}
 			require.NotNil(t, resp.Rollout)

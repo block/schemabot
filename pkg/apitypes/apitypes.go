@@ -856,6 +856,18 @@ const (
 	PlanMemberUnplanned = "unplanned"
 )
 
+// WholeRollout returns the plan of every rollout member the response
+// describes, or nil when it describes one member: an environment with a single
+// member, or a plan narrowed to one member. A narrowed plan says nothing about
+// the other members, so it is never read as the rollout's plan even if it
+// carries a rollout block.
+func (r *PlanResponse) WholeRollout() *PlanRolloutResponse {
+	if r == nil || r.NarrowedTo != "" {
+		return nil
+	}
+	return r.Rollout
+}
+
 // MemberPlans returns the plan of each group of rollout members, in the
 // order of Rollout.Groups, or the response itself when it covers one member.
 // Each group's plan carries the response's identity and engine with the
@@ -865,11 +877,12 @@ func (r *PlanResponse) MemberPlans() []*PlanResponse {
 	if r == nil {
 		return nil
 	}
-	if r.Rollout == nil || len(r.Rollout.Groups) == 0 {
+	rollout := r.WholeRollout()
+	if rollout == nil || len(rollout.Groups) == 0 {
 		return []*PlanResponse{r}
 	}
-	plans := make([]*PlanResponse, 0, len(r.Rollout.Groups))
-	for _, g := range r.Rollout.Groups {
+	plans := make([]*PlanResponse, 0, len(rollout.Groups))
+	for _, g := range rollout.Groups {
 		plans = append(plans, &PlanResponse{
 			PlanID:       r.PlanID,
 			Database:     r.Database,

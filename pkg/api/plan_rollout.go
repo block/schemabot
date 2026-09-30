@@ -25,9 +25,20 @@ const divergedMemberDetail = "its live schema differs from the primary's, so the
 // through the API, so the response says what an apply would run on each
 // member, and an apply created from the primary's plan has a stored plan for
 // every member planned against its own schema. It returns nil for an
-// environment with a single member, and for a primary plan that reported
-// errors, which already fails the plan on its own.
+// environment with a single member, for a plan narrowed to one member, and
+// for a primary plan that reported errors, which already fails the plan on its
+// own.
+//
+// A narrowed plan speaks for its one member only. Planning the other members
+// beside it would present that member's plan as the rollout's and store member
+// plans bound to it, so the rollout is planned only beside the primary's plan.
 func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, planResp *apitypes.PlanResponse) (*apitypes.PlanRolloutResponse, error) {
+	if req.Target != "" {
+		s.logger.Info("skipping rollout member plans: the plan is narrowed to one rollout member",
+			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId(),
+			"selector", req.Target, "narrowed_to", planResp.NarrowedTo)
+		return nil, nil
+	}
 	if len(primaryPlan.GetErrors()) > 0 {
 		s.logger.Debug("skipping rollout member plans: the primary plan reported errors",
 			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
@@ -38,9 +49,15 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		return nil, fmt.Errorf("resolve rollout members for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	if len(targets) <= 1 {
+		s.logger.Debug("skipping rollout member plans: the environment has a single rollout member",
+			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
 		return nil, nil
 	}
 	primary := routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}
+	if primary.MemberID() != targets[0].MemberID() {
+		return nil, fmt.Errorf("plan %s for %s/%s was made for rollout member %s, not the rollout primary %s; the other members are planned only beside the primary's plan",
+			primaryPlan.GetPlanId(), req.Database, req.Environment, primary.MemberID(), targets[0].MemberID())
+	}
 	rollup, err := s.planRolloutMembers(ctx, req, primaryPlan, primary, targets)
 	if err != nil {
 		return nil, err

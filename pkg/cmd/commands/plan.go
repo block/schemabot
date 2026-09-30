@@ -189,7 +189,7 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 	// A rollout's plan names its members, so it never reads as another
 	// environment's plan.
 	plansIdentical := bothConfigured && stagingHasChanges && productionHasChanges &&
-		stagingResult.Rollout == nil && productionResult.Rollout == nil &&
+		stagingResult.WholeRollout() == nil && productionResult.WholeRollout() == nil &&
 		planFingerprint(stagingResult) == planFingerprint(productionResult)
 
 	// Header box (title + database only, environment shown below)
@@ -241,7 +241,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteErrors(result.Errors)
 		return
 	}
-	if result.Rollout != nil {
+	if result.WholeRollout() != nil {
 		writeRolloutPlanBody(result, isApply)
 		return
 	}
@@ -256,7 +256,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 // schema files and the primary's live schema, so they are written once, after
 // every group.
 func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
-	rollout := result.Rollout
+	rollout := result.WholeRollout()
 	noun := templates.RolloutNoun(rollout)
 	templates.WriteRolloutAttention(noun, rollout.Attention)
 	if len(rollout.Groups) > 1 {

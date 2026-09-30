@@ -120,7 +120,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// An apply runs on every member of a rollout, and one the server could
 	// not plan has no plan to run, so the apply is refused before it starts.
-	if rollout := planResult.Rollout; rollout != nil && len(rollout.Attention) > 0 {
+	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Attention) > 0 {
 		if cmd.Output != OutputFormatJSON {
 			templates.WriteRolloutAttention(templates.RolloutNoun(rollout), rollout.Attention)
 		}

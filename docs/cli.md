@@ -485,14 +485,16 @@ deployments address a target of the same name; an ambiguous bare name is
 refused. An unknown name is refused with the list of valid targets. `plan`
 takes the same flag and needs `-e` with it.
 
-A narrowed plan speaks for its one target. It never records a GitHub check
-result, so a narrowed plan or apply cannot pass a PR merge gate while other
-targets still need the change. The server records the narrowing on the stored
-plan and refuses to apply it anywhere but the target it was made for, and a
-narrowed apply cannot be rolled back with `rollback`: restore that target by
-planning and applying the previous schema with the same `--target`. In an
-environment with a single target, `--target` names the whole rollout, so the
-plan and apply are not narrowed.
+A narrowed plan speaks for its one target. It shows only that target's
+changes, never the whole rollout's split of what applies where, and it is
+never gated on another target that needs attention. It never records a GitHub
+check result, so a narrowed plan or apply cannot pass a PR merge gate while
+other targets still need the change. The server records the narrowing on the
+stored plan and refuses to apply it anywhere but the target it was made for,
+and a narrowed apply cannot be rolled back with `rollback`: restore that
+target by planning and applying the previous schema with the same `--target`.
+In an environment with a single target, `--target` names the whole rollout,
+so the plan and apply are not narrowed.
 
 A plan of the whole rollout is made against its first target, and the other
 targets run that plan. The plan also plans every target beside the first one
