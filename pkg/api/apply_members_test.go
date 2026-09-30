@@ -500,7 +500,9 @@ func TestCreateStoredApply_UndisclosedUnsafeMemberChangeIsRefusedUnderTheOptIn(t
 		map[string]string{"allow_unsafe": "true"}, "apply-undisclosed-unsafe")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
-	assert.Contains(t, err.Error(), "carries an unsafe change for table \"users\" that the reviewed plan plan-primary does not carry")
+	assert.Contains(t, err.Error(), "carries an unsafe change for table \"users\" whose statement differs from the one the reviewed plan discloses for that table",
+		"the reviewed plan drops a column from users too, so the refusal says the statements differ")
+	assert.Contains(t, err.Error(), "the disclosure on reviewed plan plan-primary never named it")
 	assert.NotContains(t, err.Error(), "retry with allow_unsafe", "no opt-in covers a change the disclosure never named")
 	applies, ok := svc.storage.Applies().(*capturingApplyStore)
 	require.True(t, ok)
@@ -532,8 +534,9 @@ func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
 	}{
 		{name: "same work", reviewed: planWith(alter), member: planWith(alter), want: ""},
 		{name: "disclosed unsafe change", reviewed: planWith(alter, drop), member: planWith(alter, drop), want: ""},
-		{name: "undisclosed unsafe change", reviewed: planWith(alter), member: planWith(alter, drop), want: `carries an unsafe change for table "legacy_orders"`},
+		{name: "undisclosed unsafe change", reviewed: planWith(alter), member: planWith(alter, drop), want: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`},
 		{name: "direct execution", reviewed: planWith(alter), member: planWith(direct), want: `runs table "users" as direct-execution DDL`},
+		{name: "direct execution the reviewed plan runs too", reviewed: planWith(direct), member: planWith(direct), want: `runs table "users" as direct-execution DDL`},
 		{name: "blocked change", reviewed: planWith(alter), member: planWith(blocked), want: "carries changes its target's engine refuses"},
 		{name: "work outside the shape", reviewed: planWith(alter), member: shardOnly, want: "has per-shard changes in namespaces [testapp]"},
 	} {
@@ -856,7 +859,7 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 // The operator consents to direct-execution DDL against the locked comment's
 // disclosure, which names only the reviewed plan's statements. A member planned
 // on its own that runs direct-execution DDL is refused even when the reviewed
-// target has work of its own.
+// target has work of its own, including the same statement run directly.
 func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasWork(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -866,15 +869,88 @@ func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasW
 	}
 	direct := alter
 	direct.ExecutionMode = "direct"
-	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
-	reviewed := primaryPlanRow("testapp-001")
-	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+	// The disclosure names the reviewed target's table at the size measured
+	// there, so the reviewed plan running the identical statement directly
+	// consents to nothing on the other target's copy of the table.
+	for name, reviewedChange := range map[string]storage.TableChange{
+		"reviewed plan runs it online":   alter,
+		"reviewed plan runs it directly": direct,
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
+			reviewed := primaryPlanRow("testapp-001")
+			reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{reviewedChange}}}
 
-	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-member-direct")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
-	assert.Contains(t, err.Error(), "runs table \"users\" as direct-execution DDL")
-	applies, ok := svc.storage.Applies().(*capturingApplyStore)
-	require.True(t, ok)
-	assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
+			_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-member-direct")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+			assert.Contains(t, err.Error(), "runs table \"users\" as direct-execution DDL")
+			applies, ok := svc.storage.Applies().(*capturingApplyStore)
+			require.True(t, ok)
+			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
+		})
+	}
+}
+
+// Two PostgreSQL targets map the namespace to differently named physical
+// schemas, so each plan qualifies the same drop with its own schema. The comment
+// groups them as one change, and the reviewed plan's unsafe disclosure names it,
+// so the member's copy runs under the opt-in. A drop of another column on the
+// same table is a different statement, and the refusal says the statements
+// differ.
+func TestUndisclosedMemberUnsafeChange_SchemaQualifierIsNotADifference(t *testing.T) {
+	planWith := func(ddl string) *storage.Plan {
+		plan := primaryPlanRow("testapp-001")
+		plan.DatabaseType = storage.DatabaseTypePostgres
+		plan.Namespaces = map[string]*storage.NamespacePlanData{"app": {Tables: []storage.TableChange{
+			{Namespace: "app", Table: "users", Operation: "alter", DDL: ddl, IsUnsafe: true},
+		}}}
+		return plan
+	}
+	reviewed := planWith(`ALTER TABLE "app_eu".users DROP COLUMN legacy`)
+
+	assert.Empty(t, UndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN legacy`)),
+		"the same drop rendered against another physical schema is the change the disclosure named")
+	assert.Equal(t, `carries an unsafe change for table "users" whose statement differs from the one the reviewed plan discloses for that table`,
+		UndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN nickname`)))
+}
+
+// A sharded apply builds every member into per-shard operations. A member
+// planned on its own that already holds the change has no changing shard, so it
+// is recorded as settled at creation rather than left out of the apply, which
+// would then address fewer targets than the rollout has.
+func TestBuildShardedApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t *testing.T) {
+	mutes := storage.TableChange{Namespace: pershardNamespace, Table: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX (`created_at`)", Operation: "alter"}
+	applyPlan := primaryPlanRow("testapp-001")
+	applyPlan.Namespaces = map[string]*storage.NamespacePlanData{pershardNamespace: {Tables: []storage.TableChange{mutes}}}
+	applyPlan.Shards = []storage.ShardPlan{{Namespace: pershardNamespace, Shard: "-80", Changes: []storage.TableChange{mutes}}}
+	converged := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+	converged.ID = 11
+	converged.Deployment = "us"
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-001"}, Plan: applyPlan},
+		{Target: routing.ExecutionTarget{Deployment: "us", Target: "testapp-002"}, Plan: converged},
+	}
+
+	now := pershardTestTime()
+	groups, sharded, err := buildApplyOperationGroups(applyPlan, applyTaskChanges(applyPlan), members,
+		"production", storage.ApplyOptions{}, "", "", now)
+	require.NoError(t, err)
+	assert.True(t, sharded)
+	byDeployment := map[string][]*storage.ApplyOperationWithTasks{}
+	for _, group := range groups {
+		byDeployment[group.Operation.Deployment] = append(byDeployment[group.Operation.Deployment], group)
+	}
+	require.Len(t, byDeployment["eu"], 1)
+	assert.Equal(t, pershardNamespace+"/-80/mutes", byDeployment["eu"][0].Operation.OperationKey)
+	assert.Equal(t, state.ApplyOperation.Pending, byDeployment["eu"][0].Operation.State, "the reviewed target's shard work is driven")
+	require.Len(t, byDeployment["us"], 1, "the converged member stays in the apply")
+	settled := byDeployment["us"][0]
+	assert.Empty(t, settled.Tasks, "the converged member has nothing to run")
+	assert.Equal(t, storage.ApplyOperationKindWork, settled.Operation.OperationKind)
+	assert.Equal(t, state.ApplyOperation.Completed, settled.Operation.State)
+	require.NotNil(t, settled.Operation.CompletedAt)
+	assert.Equal(t, now, *settled.Operation.CompletedAt)
+	assert.Nil(t, settled.Operation.StartedAt, "nothing ran on the converged member")
+	assert.Equal(t, int64(11), settled.Operation.PlanID)
 }

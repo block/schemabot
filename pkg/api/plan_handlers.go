@@ -1853,6 +1853,16 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 // plan's direct-execution statements and no other target's, so a member's own
 // direct-execution statement has no consent behind it. A member running the
 // apply's plan runs exactly the statements that disclosure names.
+//
+// This holds even when the reviewed plan runs the identical statement directly,
+// unlike an unsafe change the reviewed plan also carries
+// (rejectMemberUndisclosedUnsafe). An unsafe change's consequence is the
+// statement's own, so disclosing it for one target discloses it for every
+// target running it. A direct statement's consequence is its table's: it blocks
+// that table's writes for as long as the statement runs, and the disclosure
+// names the reviewed target's table with the size the planner measured there.
+// Another target's copy of the table was measured on its own and can be any
+// size under the bound, which the disclosure never showed.
 func rejectMemberDirectExecution(member applyMember, applyPlan *storage.Plan) error {
 	if member.Plan == applyPlan {
 		return nil
@@ -1879,7 +1889,7 @@ func rejectMemberUndisclosedUnsafe(member applyMember, applyPlan *storage.Plan) 
 		return nil
 	}
 	if reason := UndisclosedMemberUnsafeChange(applyPlan, member.Plan); reason != "" {
-		return fmt.Errorf("rollout member %s: plan %s %s that the reviewed plan %s does not carry, so the disclosure the operator confirmed never named it and no opt-in covers it",
+		return fmt.Errorf("rollout member %s: plan %s %s, so the disclosure on reviewed plan %s never named it and no opt-in covers it",
 			member.MemberID(), member.Plan.PlanIdentifier, reason, applyPlan.PlanIdentifier)
 	}
 	return nil
@@ -1888,28 +1898,64 @@ func rejectMemberUndisclosedUnsafe(member applyMember, applyPlan *storage.Plan) 
 // UndisclosedMemberUnsafeChange describes the first unsafe change in a member's
 // own plan that the reviewed plan does not carry, or returns "" when every
 // unsafe change the member carries is one the reviewed plan's disclosure names.
-// A change is the same when it touches the same table with the same statement,
-// or the same namespace's VSchema for the same reason. An empty reviewed plan
-// discloses nothing, so every unsafe member change is undisclosed. The
-// description names only tables and namespaces, so it is fit for a PR comment.
+// An empty reviewed plan discloses nothing, so every unsafe member change is
+// undisclosed. The description names only tables and namespaces, so it is fit
+// for a PR comment.
+//
+// A table change is the same when it touches the same namespace's table with
+// the same operation and a statement sameUnsafeStatement reads as the same; a
+// VSchema change, when it is the same namespace's change for the same reason.
+// The whole statement is compared, not each of its clauses: a member whose
+// ALTER drops the column the reviewed ALTER drops, without the column the
+// reviewed ALTER also adds, runs a statement the disclosure never showed, and
+// the description says the statements differ so the operator knows which.
 func UndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) string {
 	disclosed := reviewed.UnsafeDDLChanges()
 	for _, change := range member.UnsafeDDLChanges() {
-		if !slices.ContainsFunc(disclosed, func(named storage.TableChange) bool { return sameUnsafeTableChange(named, change) }) {
-			return fmt.Sprintf("carries an unsafe change for table %q", change.Table)
+		if slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
+			return sameUnsafeTableChange(member.DatabaseType, named, change)
+		}) {
+			continue
 		}
+		if slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
+			return named.Namespace == change.Namespace && named.Table == change.Table
+		}) {
+			return fmt.Sprintf("carries an unsafe change for table %q whose statement differs from the one the reviewed plan discloses for that table", change.Table)
+		}
+		return fmt.Sprintf("carries an unsafe change for table %q that the reviewed plan does not carry", change.Table)
 	}
 	disclosedVSchema := reviewed.UnsafeVSchemaChanges()
 	for _, change := range member.UnsafeVSchemaChanges() {
 		if !slices.Contains(disclosedVSchema, change) {
-			return fmt.Sprintf("carries an unsafe VSchema change in namespace %q", change.Namespace)
+			return fmt.Sprintf("carries an unsafe VSchema change in namespace %q that the reviewed plan does not carry", change.Namespace)
 		}
 	}
 	return ""
 }
 
-func sameUnsafeTableChange(a, b storage.TableChange) bool {
-	return a.Namespace == b.Namespace && a.Table == b.Table && a.Operation == b.Operation && a.DDL == b.DDL
+func sameUnsafeTableChange(databaseType string, a, b storage.TableChange) bool {
+	return a.Namespace == b.Namespace && a.Table == b.Table && a.Operation == b.Operation && sameUnsafeStatement(databaseType, a.DDL, b.DDL)
+}
+
+// sameUnsafeStatement reports whether two statements for one namespace's table
+// are the same change the way the comment groups targets: canonicalized by the
+// dialect's parser with the schema qualifier of the relation they change
+// removed (ddl.StatementParser.CanonicalizeUnqualified, the form the review-time
+// rollup keys members on). Two targets that map one namespace to differently
+// named physical schemas render one change with two qualifiers, and the comment
+// shows them as one group, so the disclosure of one names the other. A statement
+// the parser cannot read canonicalizes to itself, and a dialect without a parser
+// compares byte for byte, so an unreadable statement only ever reads as
+// undisclosed.
+func sameUnsafeStatement(databaseType, a, b string) bool {
+	if a == b {
+		return true
+	}
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if err != nil {
+		return false
+	}
+	return parser.CanonicalizeUnqualified(a) == parser.CanonicalizeUnqualified(b)
 }
 
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
@@ -1987,8 +2033,8 @@ func buildApplyOperationGroups(
 				// A member planned on its own that already holds the change has
 				// no namespace to finalize, so a finalizer driven from its plan
 				// could never run. It is recorded as the settled work it is, as
-				// the per-member shape records it; the reviewed plan has
-				// finalizer work, so the apply keeps a drivable operation.
+				// the other shapes record it; the reviewed plan has finalizer
+				// work, so the apply keeps a drivable operation.
 				operation.State = state.ApplyOperation.Completed
 				operation.CompletedAt = &now
 			}
@@ -2271,6 +2317,23 @@ func buildShardedApplyOperationGroups(
 	// own groups instead of one member's shard work being folded into the other's.
 	groupsByMemberAndKey := make(map[string]*storage.ApplyOperationWithTasks)
 	for _, member := range members {
+		if memberAlreadyConverged(member, applyPlan) {
+			// A member planned on its own that already holds the change has no
+			// changing shard and no namespace to finalize, so it would get no
+			// operation at all and the apply would address fewer targets than
+			// the rollout has. It is recorded as the settled work it is, as the
+			// other shapes record it; the reviewed plan has per-shard work, so the
+			// apply keeps a drivable operation.
+			operationKey, err := keys.qualify(member, "")
+			if err != nil {
+				return nil, err
+			}
+			operation := newPendingApplyOperation(member, applyPlan, operationKey, cutoverPolicy, onFailure, now)
+			operation.State = state.ApplyOperation.Completed
+			operation.CompletedAt = &now
+			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
+			continue
+		}
 		// A member planned on its own carries its own shards and changes; a member
 		// of a mirrored environment carries the apply's plan, so this is the same
 		// shard set for every member there.
