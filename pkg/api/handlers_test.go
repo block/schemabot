@@ -69,13 +69,21 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
-func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
-func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
+func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string) error { return nil }
+func (m *mockPlanLookupStore) Delete(context.Context, int64) error                       { return nil }
+func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error             { return nil }
 
 type capturingPlanStore struct {
 	mockPlanLookupStore
 	created   *storage.Plan
 	createErr error
+	// routed records each UpdateRoute call as "plan_id deployment/target".
+	routed []string
+}
+
+func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target string) error {
+	s.routed = append(s.routed, planIdentifier+" "+deployment+"/"+target)
+	return nil
 }
 
 func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {
@@ -1626,9 +1634,20 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		assert.Empty(t, plans.created.SchemaPath)
 	})
 
-	t.Run("duplicate plan identifier is tolerated", func(t *testing.T) {
+	// A planner that shares the service's storage stores the row for a plan
+	// with changes first, stamped with the database it was configured with as
+	// the deployment. The service keeps that row and restamps it with the
+	// rollout member it planned, so the apply can find the reviewed target by it.
+	t.Run("duplicate plan identifier keeps the stored row on the planned route", func(t *testing.T) {
 		svc, _, plans := newPolicyService()
 		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     "payments",
+			Target:         "payments-staging-target",
+		}
 		pr := int32(1)
 
 		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
@@ -1646,6 +1665,52 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		require.NotNil(t, resp)
 		require.NotNil(t, plans.created)
 		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
+		assert.Equal(t, []string{"plan-source-policy " + DefaultDeployment + "/payments-staging-target"}, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier already on the planned route is kept as is", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     DefaultDeployment,
+			Target:         "payments-staging-target",
+		}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.NoError(t, err)
+		assert.Empty(t, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier for another database fails the plan", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{PlanIdentifier: "plan-source-policy", Database: "orders", Environment: "staging"}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "collides with a stored plan for database \"orders\"")
+		assert.Empty(t, plans.routed)
 	})
 }
 

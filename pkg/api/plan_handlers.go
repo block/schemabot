@@ -1092,7 +1092,8 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 // diff RPC.
 //
 // An identifier that is already stored is not an error: a re-plan of unchanged
-// content re-stores the same plan, and the row already there is that plan.
+// content re-stores the same plan, and the row already there is that plan. It is
+// held to this member's route, though (keepStoredPlanOnRoute).
 func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, route storedPlanRoute) error {
 	if planIdentifier == "" {
 		return fmt.Errorf("store plan for database %s deployment %q target %q: plan has no identifier", req.Database, route.Deployment, route.Target)
@@ -1138,11 +1139,56 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 	}
 	storedPlan.RecordIgnoreTables(req.IgnoreTables)
 	// An identifier the planner supplied can already name a stored row when a
-	// plan is delivered twice, and re-storing it is a no-op rather than a
-	// failure. A member's identifier is minted here per call, so it never
-	// collides and this only ever forgives the supplied kind.
-	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
+	// plan is delivered twice, or when the planner stored the row itself, and
+	// re-storing it keeps that row rather than failing. A member's identifier is
+	// minted here per call, so it never collides and this only ever forgives the
+	// supplied kind.
+	_, err = s.storage.Plans().Create(ctx, storedPlan)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, storage.ErrPlanIDExists):
+		return s.keepStoredPlanOnRoute(ctx, storedPlan)
+	default:
 		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
+	}
+}
+
+// keepStoredPlanOnRoute holds the row already stored under a plan's identifier
+// to the rollout member the service planned it for.
+//
+// A planner sharing this storage, such as a local client or a target router
+// serving this server's own requests, stores the row for a plan with changes
+// before the service does, stamped with the route it knows: the database it was
+// configured with as the deployment, and the target it resolved. The service
+// keeps that row, so the row has to name the member: an apply finds the
+// reviewed target among the rollout's members by the plan's deployment and
+// target, and a row stamped with anything else reads as a member with no stored
+// plan, refused after the operator has confirmed. A row for another database or
+// environment is not this plan at all, and fails the plan rather than being
+// taken for it.
+func (s *Service) keepStoredPlanOnRoute(ctx context.Context, plan *storage.Plan) error {
+	plans := s.storage.Plans()
+	existing, err := plans.Get(ctx, plan.PlanIdentifier)
+	if err != nil {
+		return fmt.Errorf("load plan %s already stored under its identifier: %w", plan.PlanIdentifier, err)
+	}
+	if existing == nil {
+		return fmt.Errorf("plan %s was reported as already stored, but no row carries its identifier", plan.PlanIdentifier)
+	}
+	if existing.Database != plan.Database || existing.Environment != plan.Environment {
+		return fmt.Errorf("plan %s for database %q environment %q collides with a stored plan for database %q environment %q",
+			plan.PlanIdentifier, plan.Database, plan.Environment, existing.Database, existing.Environment)
+	}
+	if existing.Deployment == plan.Deployment && existing.Target == plan.Target {
+		return nil
+	}
+	s.logger.Info("plan row stored by the planner names a different route; restamping it with the rollout member it was planned for",
+		"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", plan.Environment,
+		"stored_deployment", existing.Deployment, "stored_target", existing.Target,
+		"deployment", plan.Deployment, "target", plan.Target)
+	if err := plans.UpdateRoute(ctx, plan.PlanIdentifier, plan.Deployment, plan.Target); err != nil {
+		return fmt.Errorf("restamp plan %s with its rollout member: %w", plan.PlanIdentifier, err)
 	}
 	return nil
 }
@@ -1673,7 +1719,10 @@ func (s *Service) createStoredApply(
 	// member's. Members that run the apply's plan re-clear the same checks here,
 	// which is a no-op rather than a second verdict.
 	for _, member := range members {
-		if err := rejectUnapplyableMemberPlan(member, applyOpts); err != nil {
+		if err := rejectUnapplyableMemberPlan(member, plan, applyOpts); err != nil {
+			return nil, 0, err
+		}
+		if err := rejectMemberDirectExecution(member, plan); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -1729,10 +1778,15 @@ func (s *Service) createStoredApply(
 // looking for it in the plan they reviewed.
 //
 // Blocked changes reject before unsafe ones for the same reason they do there:
-// no opt-in can make a statement the engine refuses executable.
-func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOptions) error {
+// no opt-in can make a statement the engine refuses executable. An unsafe change
+// the reviewed plan's disclosure never named rejects before the opt-in is
+// consulted, since no opt-in covers it.
+func rejectUnapplyableMemberPlan(member applyMember, applyPlan *storage.Plan, applyOpts storage.ApplyOptions) error {
 	if err := member.Plan.BlockedApplyError(); err != nil {
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	if err := rejectMemberUndisclosedUnsafe(member, applyPlan); err != nil {
+		return err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
@@ -1765,7 +1819,10 @@ func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 // change. Blocked changes never run. Direct-execution and unsafe changes are
 // refused whatever the command's flags: the operator consents to them against
 // the disclosure the reviewed plan's comment carries, and the member plans that
-// comment renders carry none.
+// comment renders carry none. Apply creation refuses a member's own
+// direct-execution statement, and an unsafe change the reviewed plan does not
+// carry, whether or not the reviewed plan is empty (rejectMemberDirectExecution,
+// rejectMemberUndisclosedUnsafe).
 func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 	if plan.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
@@ -1788,6 +1845,117 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q", unsafe[0].Namespace)
 	}
 	return ""
+}
+
+// rejectMemberDirectExecution refuses a member planned on its own whose plan
+// runs direct-execution DDL. The operator consents to that write-blocking native
+// DDL against the disclosure on the locked comment, which names the reviewed
+// plan's direct-execution statements and no other target's, so a member's own
+// direct-execution statement has no consent behind it. A member running the
+// apply's plan runs exactly the statements that disclosure names.
+//
+// This holds even when the reviewed plan runs the identical statement directly,
+// unlike an unsafe change the reviewed plan also carries
+// (rejectMemberUndisclosedUnsafe). An unsafe change's consequence is the
+// statement's own, so disclosing it for one target discloses it for every
+// target running it. A direct statement's consequence is its table's: it blocks
+// that table's writes for as long as the statement runs, and the disclosure
+// names the reviewed target's table with the size the planner measured there.
+// Another target's copy of the table was measured on its own and can be any
+// size under the bound, which the disclosure never showed.
+func rejectMemberDirectExecution(member applyMember, applyPlan *storage.Plan) error {
+	if member.Plan == applyPlan {
+		return nil
+	}
+	for _, change := range member.Plan.FlatDDLChanges() {
+		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
+			return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, whose consent is given against the reviewed plan's disclosure, which names no other target's statements",
+				member.MemberID(), member.Plan.PlanIdentifier, change.Table)
+		}
+	}
+	return nil
+}
+
+// rejectMemberUndisclosedUnsafe refuses a member planned on its own whose plan
+// carries an unsafe change the reviewed plan does not, whatever the command's
+// flags. The operator's unsafe opt-in is given against the disclosure on the
+// comment it confirms, which lists the reviewed plan's unsafe changes and no
+// other target's: the other targets' plans render as statements alone. So a
+// member's unsafe change runs under the opt-in only when the reviewed plan
+// carries the same change, which the disclosure named (RV-3). A member running
+// the apply's plan runs exactly the changes that disclosure names.
+func rejectMemberUndisclosedUnsafe(member applyMember, applyPlan *storage.Plan) error {
+	if member.Plan == applyPlan {
+		return nil
+	}
+	if reason := UndisclosedMemberUnsafeChange(applyPlan, member.Plan); reason != "" {
+		return fmt.Errorf("rollout member %s: plan %s %s, so the disclosure on reviewed plan %s never named it and no opt-in covers it",
+			member.MemberID(), member.Plan.PlanIdentifier, reason, applyPlan.PlanIdentifier)
+	}
+	return nil
+}
+
+// UndisclosedMemberUnsafeChange describes the first unsafe change in a member's
+// own plan that the reviewed plan does not carry, or returns "" when every
+// unsafe change the member carries is one the reviewed plan's disclosure names.
+// An empty reviewed plan discloses nothing, so every unsafe member change is
+// undisclosed. The description names only tables and namespaces, so it is fit
+// for a PR comment.
+//
+// A table change is the same when it touches the same namespace's table with
+// the same operation and a statement sameUnsafeStatement reads as the same; a
+// VSchema change, when it is the same namespace's change for the same reason.
+// The whole statement is compared, not each of its clauses: a member whose
+// ALTER drops the column the reviewed ALTER drops, without the column the
+// reviewed ALTER also adds, runs a statement the disclosure never showed, and
+// the description says the statements differ so the operator knows which.
+func UndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) string {
+	disclosed := reviewed.UnsafeDDLChanges()
+	for _, change := range member.UnsafeDDLChanges() {
+		if slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
+			return sameUnsafeTableChange(member.DatabaseType, named, change)
+		}) {
+			continue
+		}
+		if slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
+			return named.Namespace == change.Namespace && named.Table == change.Table
+		}) {
+			return fmt.Sprintf("carries an unsafe change for table %q whose statement differs from the one the reviewed plan discloses for that table", change.Table)
+		}
+		return fmt.Sprintf("carries an unsafe change for table %q that the reviewed plan does not carry", change.Table)
+	}
+	disclosedVSchema := reviewed.UnsafeVSchemaChanges()
+	for _, change := range member.UnsafeVSchemaChanges() {
+		if !slices.Contains(disclosedVSchema, change) {
+			return fmt.Sprintf("carries an unsafe VSchema change in namespace %q that the reviewed plan does not carry", change.Namespace)
+		}
+	}
+	return ""
+}
+
+func sameUnsafeTableChange(databaseType string, a, b storage.TableChange) bool {
+	return a.Namespace == b.Namespace && a.Table == b.Table && a.Operation == b.Operation && sameUnsafeStatement(databaseType, a.DDL, b.DDL)
+}
+
+// sameUnsafeStatement reports whether two statements for one namespace's table
+// are the same change the way the comment groups targets: canonicalized by the
+// dialect's parser with the schema qualifier of the relation they change
+// removed (ddl.StatementParser.CanonicalizeUnqualified, the form the review-time
+// rollup keys members on). Two targets that map one namespace to differently
+// named physical schemas render one change with two qualifiers, and the comment
+// shows them as one group, so the disclosure of one names the other. A statement
+// the parser cannot read canonicalizes to itself, and a dialect without a parser
+// compares byte for byte, so an unreadable statement only ever reads as
+// undisclosed.
+func sameUnsafeStatement(databaseType, a, b string) bool {
+	if a == b {
+		return true
+	}
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if err != nil {
+		return false
+	}
+	return parser.CanonicalizeUnqualified(a) == parser.CanonicalizeUnqualified(b)
 }
 
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
@@ -1828,7 +1996,13 @@ func buildApplyOperationGroups(
 	// externally-authoritative engine (e.g. PlanetScale) — whose plans never
 	// carry per-shard changes — is never fanned out, regardless of transport.
 	keys := newMemberOperationKeys(members)
-	if canBuildShardedOperationGroups(plan, taskChanges) {
+	shape := operationShapeOf(plan, taskChanges)
+	for _, member := range members {
+		if err := rejectMemberWorkOutsideShape(member, plan, shape); err != nil {
+			return nil, false, err
+		}
+	}
+	if shape == operationShapeSharded {
 		groups, err := buildShardedApplyOperationGroups(plan, members, keys, environment, applyOpts, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, false, err
@@ -1846,7 +2020,7 @@ func buildApplyOperationGroups(
 	// stands up one branch covering the whole deployment and validates every
 	// keyspace in it, so splitting the namespaces across operations would have
 	// each drive validating keyspaces whose VSchema it never applied.
-	if len(taskChanges) == 0 && len(plan.FinalizerNamespaces()) > 0 {
+	if shape == operationShapeFinalizer {
 		groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
 		for _, member := range members {
 			operationKey, err := keys.qualify(member, finalizerOperationKeySegment)
@@ -1855,6 +2029,15 @@ func buildApplyOperationGroups(
 			}
 			operation := newPendingApplyOperation(member, plan, operationKey, cutoverPolicy, onFailure, now)
 			operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
+			if memberAlreadyConverged(member, plan) {
+				// A member planned on its own that already holds the change has
+				// no namespace to finalize, so a finalizer driven from its plan
+				// could never run. It is recorded as the settled work it is, as
+				// the other shapes record it; the reviewed plan has finalizer
+				// work, so the apply keeps a drivable operation.
+				operation.State = state.ApplyOperation.Completed
+				operation.CompletedAt = &now
+			}
 			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
 		}
 		return groups, false, nil
@@ -1927,6 +2110,137 @@ func settleConvergedMemberOperations(groups []*storage.ApplyOperationWithTasks, 
 		group.Operation.State = state.ApplyOperation.Completed
 		group.Operation.CompletedAt = &now
 	}
+}
+
+// memberAlreadyConverged reports whether a member runs a plan of its own that
+// has nothing left to do. A member running the apply's plan is never settled
+// here: its work is the apply's.
+func memberAlreadyConverged(member applyMember, applyPlan *storage.Plan) bool {
+	return member.Plan != applyPlan && !member.Plan.HasWork()
+}
+
+// operationShape is how an apply's work is laid out as operations. One shape is
+// chosen per apply, from the apply's own plan, and every member is built into
+// it.
+type operationShape int
+
+const (
+	// operationShapePerMember is one work operation per member carrying that
+	// member's table changes, with any VSchema change riding inside the work.
+	operationShapePerMember operationShape = iota
+	// operationShapeSharded is one work operation per changing shard and table,
+	// plus a finalizer per namespace that needs one.
+	operationShapeSharded
+	// operationShapeFinalizer is one task-less finalizer per member.
+	operationShapeFinalizer
+)
+
+func (s operationShape) String() string {
+	switch s {
+	case operationShapeSharded:
+		return "per-shard operations"
+	case operationShapeFinalizer:
+		return "a namespace finalizer only"
+	default:
+		return "one table-by-table work operation per target"
+	}
+}
+
+// operationShapeOf is the shape a plan's work is laid out in when it is the
+// apply's own plan.
+func operationShapeOf(plan *storage.Plan, taskChanges []storage.TableChange) operationShape {
+	switch {
+	case canBuildShardedOperationGroups(plan, taskChanges):
+		return operationShapeSharded
+	case len(taskChanges) == 0 && len(plan.FinalizerNamespaces()) > 0:
+		return operationShapeFinalizer
+	default:
+		return operationShapePerMember
+	}
+}
+
+// rejectMemberWorkOutsideShape refuses a member whose own plan has work the
+// apply's shape has no place for.
+//
+// A member planned against its own live schema can need a different shape than
+// the reviewed plan: a target whose only change is its VSchema, one with
+// per-shard changes under a reviewed plan without them, or the reverse. Built
+// into the apply's shape anyway, that work gets no operation at all, or an
+// operation with no tasks that is settled as done, and the member reads as
+// converged while its target never got the change. So the member must need the
+// same shape, and outside the per-shard shape every namespace with changing
+// shards must carry the table statements its work is built from. The reviewed
+// plan is held to the second rule as well, since it chose the shape without
+// being checked against it. A member with no work fits every shape.
+func rejectMemberWorkOutsideShape(member applyMember, applyPlan *storage.Plan, shape operationShape) error {
+	if reason := memberWorkOutsideShape(member.Plan, applyPlan, shape); reason != "" {
+		return fmt.Errorf("rollout member %s: plan %s %s, so the apply was not created rather than mark the target done without its change",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)
+	}
+	return nil
+}
+
+// memberWorkOutsideShape describes the work in memberPlan that an apply of
+// shape, chosen from applyPlan, has no place for, or returns "" when it fits.
+func memberWorkOutsideShape(memberPlan, applyPlan *storage.Plan, shape operationShape) string {
+	if !memberPlan.HasWork() {
+		return ""
+	}
+	memberChanges := applyTaskChanges(memberPlan)
+	if memberPlan != applyPlan {
+		if needs := operationShapeOf(memberPlan, memberChanges); needs != shape {
+			return fmt.Sprintf("needs %s, but this apply runs %s, chosen from the reviewed plan", needs, shape)
+		}
+	}
+	if shape == operationShapeSharded {
+		return ""
+	}
+	if namespaces := shardWorkWithoutTableChanges(memberPlan, memberChanges); len(namespaces) > 0 {
+		return fmt.Sprintf("has per-shard changes in namespaces %v with no table statements to run them from, and this apply runs %s", namespaces, shape)
+	}
+	return ""
+}
+
+// MemberWorkTheReviewedPlanCannotRun describes the first thing in a member's
+// own plan that apply creation refuses when the apply is created from reviewed,
+// or returns "" when there is none: a blocked change, direct-execution DDL, an
+// unsafe change the reviewed plan's disclosure does not name, or work the
+// apply's shape has no place for. It asks what createStoredApply asks of each
+// member, so a caller can refuse before it pins a confirmation that apply
+// creation would refuse. The description names only tables, namespaces, and
+// the apply's shape, so it is fit for a PR comment.
+func MemberWorkTheReviewedPlanCannotRun(reviewed, member *storage.Plan) string {
+	if member.BlockedApplyError() != nil {
+		return "carries changes its target's engine refuses"
+	}
+	for _, change := range member.FlatDDLChanges() {
+		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
+			return fmt.Sprintf("runs table %q as direct-execution DDL", change.Table)
+		}
+	}
+	if reason := UndisclosedMemberUnsafeChange(reviewed, member); reason != "" {
+		return reason
+	}
+	return memberWorkOutsideShape(member, reviewed, operationShapeOf(reviewed, applyTaskChanges(reviewed)))
+}
+
+// shardWorkWithoutTableChanges returns, in sorted order, the namespaces whose
+// shards have changes of their own while the plan carries no table change for
+// the namespace. Outside the per-shard shape a namespace's work is built from
+// its table changes alone, so those shards' changes would have no operation.
+func shardWorkWithoutTableChanges(plan *storage.Plan, taskChanges []storage.TableChange) []string {
+	withTableChanges := make(map[string]bool, len(taskChanges))
+	for _, change := range taskChanges {
+		withTableChanges[change.Namespace] = true
+	}
+	var namespaces []string
+	for namespace := range changingShardsByNamespace(plan.Shards) {
+		if !withTableChanges[namespace] {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
 }
 
 // buildNamespaceFinalizerOperations builds one task-less group_finalizer per
@@ -2003,6 +2317,23 @@ func buildShardedApplyOperationGroups(
 	// own groups instead of one member's shard work being folded into the other's.
 	groupsByMemberAndKey := make(map[string]*storage.ApplyOperationWithTasks)
 	for _, member := range members {
+		if memberAlreadyConverged(member, applyPlan) {
+			// A member planned on its own that already holds the change has no
+			// changing shard and no namespace to finalize, so it would get no
+			// operation at all and the apply would address fewer targets than
+			// the rollout has. It is recorded as the settled work it is, as the
+			// other shapes record it; the reviewed plan has per-shard work, so the
+			// apply keeps a drivable operation.
+			operationKey, err := keys.qualify(member, "")
+			if err != nil {
+				return nil, err
+			}
+			operation := newPendingApplyOperation(member, applyPlan, operationKey, cutoverPolicy, onFailure, now)
+			operation.State = state.ApplyOperation.Completed
+			operation.CompletedAt = &now
+			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
+			continue
+		}
 		// A member planned on its own carries its own shards and changes; a member
 		// of a mirrored environment carries the apply's plan, so this is the same
 		// shard set for every member there.

@@ -67,6 +67,17 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 	return id, nil
 }
 
+// UpdateRoute restamps a stored plan's deployment and target.
+func (s *planStore) UpdateRoute(ctx context.Context, planIdentifier, deployment, target string) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE plans SET deployment = ?, target = ?
+		WHERE plan_identifier = ?
+	`, deployment, target, planIdentifier); err != nil {
+		return fmt.Errorf("update route of plan %s to deployment %q target %q: %w", planIdentifier, deployment, target, err)
+	}
+	return nil
+}
+
 // Get returns a plan by plan_identifier (external identifier), or nil if not found.
 func (s *planStore) Get(ctx context.Context, planIdentifier string) (*storage.Plan, error) {
 	row := s.db.QueryRowContext(ctx, `

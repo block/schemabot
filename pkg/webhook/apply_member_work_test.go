@@ -15,12 +15,12 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// A PR apply whose reviewed target is already converged runs the other targets'
-// plans only when the rollout passed its contract, some target has work, and
-// the comment renders every target's plan. Anything else refuses, since the
-// apply would otherwise run statements its comment never showed.
+// A PR apply runs the other targets' plans only when the rollout passed its
+// contract, a target other than the reviewed one has work, and the comment
+// renders every target's plan. Anything else refuses, since the apply would
+// otherwise run statements its comment never showed.
 func TestRolloutRunsMemberWork(t *testing.T) {
-	pending := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 3, names: []string{"payments-002", "payments-003"}}}
+	pending := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 3, others: 2, names: []string{"payments-002", "payments-003"}}}
 	targetPlans := func() *templates.DeploymentDriftData {
 		return &templates.DeploymentDriftData{
 			Computed: true, Clean: true, Independent: true,
@@ -42,6 +42,9 @@ func TestRolloutRunsMemberWork(t *testing.T) {
 
 	converged := reviewDriftOutcome{state: driftClean, work: memberWork{members: 3}}
 	assert.False(t, rolloutRunsMemberWork(converged, targetPlans()), "a rollout with no work left has nothing to run")
+
+	reviewedOnly := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 1, members: 3, names: []string{"payments-001"}}}
+	assert.False(t, rolloutRunsMemberWork(reviewedOnly, targetPlans()), "work on the reviewed target alone runs the reviewed plan")
 
 	assert.False(t, rolloutRunsMemberWork(pending, nil), "no preview means the comment showed no target's plan")
 
@@ -172,4 +175,56 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 	assert.Contains(t, multi, "**This PR cannot apply the other targets' plans**")
 	assert.NotContains(t, multi, "schemabot apply")
 	assert.NotContains(t, multi, "No changes to apply", "a target still needs the change")
+}
+
+// A confirmation covers the statements its comment showed on every target,
+// the reviewed one included. The reviewed target's re-plan at confirm must run
+// what the confirmed plan showed, unless it now runs nothing; each other target
+// with work must run what the confirmed round planned for it.
+func TestRoundCoversWork(t *testing.T) {
+	plan := func(ddl string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {Tables: []storage.TableChange{{
+				Namespace: "payments", Table: "orders", Operation: "alter", DDL: ddl,
+			}}},
+		}}
+	}
+	const region = "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)"
+	const wider = "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)"
+	members := func(ddl string) map[string]*storage.Plan {
+		return map[string]*storage.Plan{"eu/payments-002": plan(ddl)}
+	}
+
+	covered, reason := roundCoversWork(plan(region), plan(region), members(region), members(region))
+	assert.True(t, covered, reason)
+
+	covered, reason = roundCoversWork(plan(region), &storage.Plan{}, members(region), members(region))
+	assert.True(t, covered, "a reviewed target that converged since runs nothing: %s", reason)
+
+	covered, reason = roundCoversWork(plan(region), plan(wider), members(region), members(region))
+	assert.False(t, covered)
+	assert.Equal(t, "the reviewed target would run statements the confirmed plan did not show", reason)
+
+	covered, reason = roundCoversWork(&storage.Plan{}, plan(region), members(region), members(region))
+	assert.False(t, covered, "work on a reviewed target the confirmed plan showed as converged")
+	assert.Equal(t, "the reviewed target would run statements the confirmed plan did not show", reason)
+
+	covered, reason = roundCoversWork(plan(region), plan(region), members(region), members(wider))
+	assert.False(t, covered)
+	assert.Equal(t, "target eu/payments-002 would run statements the confirmed round did not plan", reason)
+
+	covered, reason = roundCoversWork(plan(region), plan(region), map[string]*storage.Plan{}, members(region))
+	assert.False(t, covered)
+	assert.Equal(t, "target eu/payments-002 has work the confirmed round did not plan", reason)
+}
+
+// When the reviewed target has work too, the refusal counts every target that
+// needs the change, the reviewed one included, and never calls that list the
+// targets other than the reviewed one.
+func TestPendingRolloutMessageNamesTheTargetsThatNeedTheChange(t *testing.T) {
+	outcome := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 2, others: 1, names: []string{"eu", "us"}}}
+
+	assert.Equal(t,
+		"2 of 2 targets need this change: eu, us. The plans of the targets other than the reviewed one were not on the comment this apply acts on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		pendingRolloutMessage(outcome, false))
 }

@@ -61,6 +61,9 @@ type memberWork struct {
 	// discard an unfinished copy, or could not say whether it would, and why.
 	// Empty when no member with work puts a copy at stake.
 	copyAtStake string
+	// others counts the members with work other than the reviewed primary,
+	// whose work runs from plans of their own rather than the reviewed plan.
+	others int
 }
 
 // memberWorkOf counts the work in a rollup. A nil rollup is one that was not
@@ -80,6 +83,9 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	for i, entry := range rollup.Entries {
 		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
 			work.names = append(work.names, names[i])
+			if i > 0 {
+				work.others++
+			}
 		}
 	}
 	work.pending = len(work.names)

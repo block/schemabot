@@ -656,8 +656,10 @@ every path that records a check from a plan plans the other members first. A mem
 be planned is unknown work, never none. *Breaks if violated:* a PR merges green while a target still
 lacks its schema change. *Enforced:* member work counted into the stored check state
 (`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
-in `pkg/api`); the rollout round the apply command and apply-confirm run before answering an empty
-primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); the failing
+in `pkg/api`); the rollout round the apply command and apply-confirm run before answering any
+primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); apply creation
+refusing member work the apply's operation shape cannot carry, rather than settling that member as
+done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
 (`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
 
@@ -1495,9 +1497,12 @@ Unsafe changes (error-severity lint findings such as table and column drops) blo
 unfinished row copy, require the operator to confirm the specific consequences disclosed to
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`), including the re-check that other rollout members' work is what the
-confirmation was given against, that the reviewed target has gained no changes of its own since, and that the work carries no consequence it did not disclose
-(`confirmedConvergedTargetRound`, `confirmationCoversMemberWork` and `memberWorkRefusal` in `pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), plus rollback confirmation's transactional lock-intent check
+`pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
+reviewed target's included, is what the confirmation was given against and carries no consequence
+it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
+`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags, direct-execution DDL
+and unsafe changes that the disclosure never named in a plan it did not come from (`rejectMemberDirectExecution`
+and `rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
