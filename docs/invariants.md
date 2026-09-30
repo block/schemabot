@@ -844,7 +844,8 @@ whose drive liveness signal has gone quiet for longer than the operator's whole 
 re-asserted on the guarded write rather than trusted from the scan. Any new non-driver write needs
 a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
+`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
 
@@ -937,7 +938,8 @@ can reach, leaving the row untouched for an instance that can drive it. A claim 
 proceed releases its lease immediately rather than holding the row idle until the staleness window
 expires. And an instance never trusts its own in-memory engine state to answer questions about
 work it does not own. *Enforced:* scope checks and token-guarded claim release in the drive path
-(`pkg/api/operator.go`).
+(`pkg/api/operator.go`) and operation lease checks before conflict resolution
+(`pkg/tern/local_apply.go`, `pkg/storage/internal/sqlstore/tasks.go`).
 
 ### OW-8: Only drivers and elected reapers write apply and task rows
 
@@ -1389,7 +1391,7 @@ the sequential drive (`pkg/tern/local_apply_sequential.go`).
 Automatic cleanup acts only where the record provably carries no engine work, as with a `pending`
 task, which has no checkpoint by construction. Anything uncertain keeps blocking for an operator.
 *Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`,
-`pkg/engine/postgres/apply.go`).
+`pkg/engine/postgres/apply.go`, `pkg/tern/local_apply.go`).
 
 ### RC-5: A terminal summary is never lost, and never silently duplicated
 
@@ -1441,7 +1443,9 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
 the sequential and grouped drives). The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
-and rollup paths).
+and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
+apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
+by `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
 ### RV-2: Stale plans never apply
 
@@ -1461,7 +1465,9 @@ write-blocking DDL with no cutover and no revert, require the operator to confir
 consequences disclosed to them. The re-plan that runs just before execution re-checks that
 verdict, so a plan that changed after the confirmation stops rather than running something the
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`).
+`pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
+(`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
+`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
@@ -1473,8 +1479,8 @@ estimate is trusted only in the blocking direction: an estimate alone never appr
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
-privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS comparison refusals
-in `pkg/engine/postgres/row_security.go` that abort plan creation); the whole-plan
+privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
+in `pkg/engine/postgres/row_security_apply.go` that abort plan creation); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying

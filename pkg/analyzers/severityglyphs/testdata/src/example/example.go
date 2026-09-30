@@ -3,7 +3,7 @@ package example
 import "fmt"
 
 // The fixtures are exercised by the analyzer, not by callers.
-var _ = []any{bad, badEscape, badBare, badRaw, badInfo, badSynonym, goodConcat, goodStateGlyphs}
+var _ = []any{bad, badEscape, badBare, badRaw, badInfo, badSynonym, badDocs, goodConcat, goodStateGlyphs}
 
 // Bad: literal severity glyph inline.
 func bad() string {
@@ -35,6 +35,12 @@ func badInfo() string {
 // place. It collapses into the member it is a synonym of.
 func badSynonym() string {
 	return "🛑 Check before applying" // want `severity glyph 🛑 in string literal — use glyph.Attention from pkg/glyph`
+}
+
+// Bad: the documentation glyph is a vocabulary member too, so a literal at a
+// rendering site would let the two surfaces drift apart.
+func badDocs() string {
+	return "📖 **Docs:** [Setting up the config](https://example.invalid/docs)" // want `documentation glyph 📖 in string literal — use glyph.Docs from pkg/glyph`
 }
 
 // Good: the vocabulary constant (glyph.Refused at real call sites)

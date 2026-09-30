@@ -143,6 +143,36 @@ func PreviewCommentShardedSummaryCompleted() string {
 	})
 }
 
+// PreviewCommentShardedSummaryFinalized renders the terminal summary for a
+// sharded apply whose engine finalized the keyspace once every shard's DDL
+// landed, with no VSchema change in the plan: the finalizer is listed in its
+// own Finalize section rather than as a VSchema change.
+func PreviewCommentShardedSummaryFinalized() string {
+	return RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "production", Database: "cdb_resolute",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		RequestedBy: previewRequestedBy,
+		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Completed,
+				Shards: []ShardProgressData{
+					{Shard: "-80", Status: state.Task.Completed},
+					{Shard: "80-", Status: state.Task.Completed},
+				},
+			}},
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-80", State: state.ApplyOperation.Completed},
+				{Deployment: "80-", State: state.ApplyOperation.Completed},
+			}),
+			Cells: []ShardCell{previewMutesCell("-80"), previewMutesCell("80-")},
+		}},
+		Finalizes: []ShardedFinalize{{Keyspace: "cdb_resolute_sharded", Status: "applied"}},
+	})
+}
+
 // PreviewCommentShardedSummaryFailed renders the terminal summary for a sharded
 // apply where one shard failed and the rest halted behind it: the failed
 // verdict header, the surfaced error, the final per-shard results, the

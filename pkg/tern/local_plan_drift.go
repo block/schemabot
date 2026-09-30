@@ -167,9 +167,17 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 	// re-plan reads the engine's Metadata["vschema_changed"], the dispatch reads
 	// the proto CHANGE_TYPE_VSCHEMA. They agree today; any divergence drops a
 	// namespace from one set, which trips parity in the fail-closed direction.
+	//
+	// A finalize the engine asked for travels the same way and is held to the
+	// same parity: the re-plan must still ask to finalize exactly the
+	// namespaces the reviewed plan did, so a finalizer whose reason went away
+	// fails closed instead of finalizing a keyspace nobody reviewed.
 	if !shardScoped {
 		if err := compareVSchemaParity(vschemaNamespacesFromPlanResult(c, result), vschemaNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
 			return replannedChanges{}, fmt.Errorf("local vschema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
+		}
+		if err := compareFinalizeParity(finalizeNamespacesFromPlanResult(c, result), finalizeNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
+			return replannedChanges{}, fmt.Errorf("local keyspace finalization has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 		}
 	}
 	return replanned, nil
@@ -395,6 +403,15 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("empty DDL")
 	}
+	// An atomic operation is compared as one ordered sequence. Its engine owns
+	// grammar admission; ordinary statement and create-set parsing remain strict.
+	// RLS retains its physical target: a dispatch does not prove the source
+	// deployment’s namespace mapping, so it cannot authorize schema erasure.
+	if rls, ok := p.(interface{ CanonicalRowSecurity(string) (string, error) }); ok {
+		if canonical, err := rls.CanonicalRowSecurity(raw); err == nil {
+			return canonical, nil
+		}
+	}
 	if stmtType, _, err := p.Classify(raw); err == nil {
 		return canonicalDriftStatement(p, raw, stmtType)
 	}
@@ -511,7 +528,31 @@ func vschemaNamespacesFromPlanResult(c *LocalClient, result *engine.PlanResult) 
 func vschemaNamespacesFromApplyRequest(c *LocalClient, changes []*ternv1.TableChange) map[string]bool {
 	out := map[string]bool{}
 	for _, ch := range changes {
-		if ch != nil && ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+		if ch != nil && ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA && !dispatchChangeFinalizesOnly(ch) {
+			out[c.planNamespace(ch.Namespace)] = true
+		}
+	}
+	return out
+}
+
+// finalizeNamespacesFromPlanResult returns the namespaces the recomputed plan
+// asks to finalize.
+func finalizeNamespacesFromPlanResult(c *LocalClient, result *engine.PlanResult) map[string]bool {
+	out := map[string]bool{}
+	for _, sc := range result.Changes {
+		if sc.NeedsFinalizer() {
+			out[c.planNamespace(sc.Namespace)] = true
+		}
+	}
+	return out
+}
+
+// finalizeNamespacesFromApplyRequest returns the namespaces the dispatch
+// request asks to finalize.
+func finalizeNamespacesFromApplyRequest(c *LocalClient, changes []*ternv1.TableChange) map[string]bool {
+	out := map[string]bool{}
+	for _, ch := range changes {
+		if ch != nil && ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA && ch.Metadata[engine.MetadataNeedsFinalizer] == "true" {
 			out[c.planNamespace(ch.Namespace)] = true
 		}
 	}
@@ -521,7 +562,27 @@ func vschemaNamespacesFromApplyRequest(c *LocalClient, changes []*ternv1.TableCh
 // compareVSchemaParity reports drift unless the recomputed and dispatched sets
 // of vschema-changed namespaces are identical.
 func compareVSchemaParity(recomputed, dispatched map[string]bool) error {
-	var missing, unexpected []string
+	missing, unexpected := namespaceSetDifference(recomputed, dispatched)
+	if len(missing) == 0 && len(unexpected) == 0 {
+		return nil
+	}
+	return fmt.Errorf("reviewed vschema changes this deployment would not plan: %v; vschema changes this deployment would plan that were not reviewed: %v", missing, unexpected)
+}
+
+// compareFinalizeParity reports drift unless the recomputed and dispatched sets
+// of namespaces the engine asks to finalize are identical.
+func compareFinalizeParity(recomputed, dispatched map[string]bool) error {
+	missing, unexpected := namespaceSetDifference(recomputed, dispatched)
+	if len(missing) == 0 && len(unexpected) == 0 {
+		return nil
+	}
+	return fmt.Errorf("reviewed keyspace finalizations this deployment would not plan: %v; keyspace finalizations this deployment would plan that were not reviewed: %v", missing, unexpected)
+}
+
+// namespaceSetDifference returns, sorted, the dispatched namespaces the
+// recomputed set lacks (missing) and the recomputed namespaces the dispatch
+// lacks (unexpected).
+func namespaceSetDifference(recomputed, dispatched map[string]bool) (missing, unexpected []string) {
 	for ns := range dispatched {
 		if !recomputed[ns] {
 			missing = append(missing, ns)
@@ -532,10 +593,7 @@ func compareVSchemaParity(recomputed, dispatched map[string]bool) error {
 			unexpected = append(unexpected, ns)
 		}
 	}
-	if len(missing) == 0 && len(unexpected) == 0 {
-		return nil
-	}
 	sort.Strings(missing)
 	sort.Strings(unexpected)
-	return fmt.Errorf("reviewed vschema changes this deployment would not plan: %v; vschema changes this deployment would plan that were not reviewed: %v", missing, unexpected)
+	return missing, unexpected
 }

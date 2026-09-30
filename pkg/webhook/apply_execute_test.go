@@ -27,6 +27,41 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 	})
 }
 
+// A rollback-confirm whose lock stopped pinning the confirmed plan is told that
+// nothing ran and to plan a fresh rollback, in SchemaBot's words rather than
+// the storage error's; other dispatch failures keep their own guidance.
+func TestRollbackExecutionErrorMessage(t *testing.T) {
+	t.Run("lock intent change coaches a fresh rollback", func(t *testing.T) {
+		msg := rollbackExecutionErrorMessage(fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
+		assert.Equal(t, msgRollbackLockIntentChanged, msg)
+		assert.Contains(t, msg, "nothing was applied")
+		assert.Contains(t, msg, "run the rollback command again")
+		assert.NotContains(t, msg, storage.ErrLockIntentChanged.Error())
+	})
+
+	t.Run("other dispatch failures use fixed guidance", func(t *testing.T) {
+		err := errors.New("dial tcp storage.internal:3306: connection refused")
+		msg := rollbackExecutionErrorMessage(err)
+		assert.Equal(t, "Failed to execute rollback; see server logs for details and retry rollback-confirm.", msg)
+		assert.NotContains(t, msg, err.Error())
+	})
+}
+
+func TestPendingRollbackApplyRefusal(t *testing.T) {
+	t.Run("loaded plan offers confirmation in its environment", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", &storage.Plan{Environment: "staging"})
+		assert.Contains(t, msg, "schemabot rollback-confirm -e staging")
+		assert.Contains(t, msg, "schemabot unlock")
+	})
+
+	t.Run("unavailable plan only offers unlock", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", nil)
+		assert.Contains(t, msg, "rollback plan that is unavailable")
+		assert.Contains(t, msg, "schemabot unlock")
+		assert.NotContains(t, msg, "rollback-confirm")
+	})
+}
+
 func TestDDLMatchesStoredPlan(t *testing.T) {
 	tests := []struct {
 		name       string

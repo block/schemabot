@@ -1,9 +1,13 @@
 package ddl
 
 import (
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
+	"unicode"
+
+	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -18,17 +22,170 @@ func FormatDDL(ddl string) string {
 	return FormatDDLForDialect(schema.DialectMySQL, ddl)
 }
 
-// layoutDDL line-breaks a canonicalized statement for readability: a CREATE
-// TABLE gets each column/index and table option on its own line, and a
-// multi-clause ALTER TABLE gets each clause on its own line. The layout is
-// plain string splitting on the statement's own text, so it applies to any
-// dialect's canonical form. Other statement types are returned unchanged.
-func layoutDDL(ddl string) string {
+// FormatSchemaFileForDialect formats one declarative table file for source
+// control. Unlike FormatDDLForDialect, which is a best-effort display helper,
+// this function is strict: the file must match the dialect's supported
+// declarative shape, and a single-line file must render across multiple lines
+// with every statement canonicalizing to the same SQL as its input. PostgreSQL
+// files may include the supported row-security declaration after their table
+// and indexes. Existing multiline SQL is kept verbatim apart from its final
+// newline. Single-line SQL with comments is refused when reformatting cannot
+// preserve them, including MySQL executable comments. MySQL canonical forms
+// containing comments are also refused: they can flag discarded option values.
+// The returned file ends with one newline.
+func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string, error) {
+	parser, err := ParserForDialect(dialect)
+	if err != nil {
+		return "", err
+	}
+	statements, err := schemaFileStatements(dialect, parser, content)
+	if err != nil {
+		return "", fmt.Errorf("parse declarative schema file: %w", err)
+	}
+	trimmed := strings.TrimSpace(content)
+	if strings.Contains(trimmed, "\n") {
+		return strings.TrimRight(content, "\r\n") + "\n", nil
+	}
+	if dialect == schema.DialectPostgres {
+		if err := pgstatement.CheckNoComments(content); err != nil {
+			return "", fmt.Errorf("format PostgreSQL declarative schema file: %w", err)
+		}
+	}
+	if dialect == schema.DialectMySQL && containsMySQLComment(content, true) {
+		return "", fmt.Errorf("cannot preserve MySQL comments while formatting; format the schema file across multiple lines manually")
+	}
+
+	formatted := make([]string, 0, len(statements))
+	for i, stmt := range statements {
+		// Canonical equality cannot prove preservation when Restore emits a
+		// comment in place of an option's original value. Do not write that
+		// canonical form, even if reparsing it would compare equal.
+		if dialect == schema.DialectMySQL && containsMySQLComment(parser.Canonicalize(stmt), false) {
+			return "", fmt.Errorf("cannot prove statement %d preserved its SQL: canonical SQL contains comments; format the schema file across multiple lines manually", i+1)
+		}
+		rendered, equivalent := formatDDLForDialect(dialect, parser, stmt, i == 0)
+		if !equivalent {
+			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
+		}
+		formatted = append(formatted, rendered)
+	}
+
+	// Admission guarantees a CREATE TABLE first. Separators between later
+	// statements must not stand in for line breaks inside the table itself.
+	if !strings.Contains(formatted[0], "\n") {
+		return "", fmt.Errorf("formatter produced a single-line CREATE TABLE")
+	}
+	result := strings.Join(formatted, "\n\n") + "\n"
+	after, err := schemaFileStatements(dialect, parser, result)
+	if err != nil {
+		return "", fmt.Errorf("validate formatted declarative schema file: %w", err)
+	}
+	if len(after) != len(statements) {
+		return "", fmt.Errorf("formatter changed statement count from %d to %d", len(statements), len(after))
+	}
+	for i := range statements {
+		if parser.Canonicalize(statements[i]) != parser.Canonicalize(after[i]) {
+			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
+		}
+	}
+	return result, nil
+}
+
+// containsMySQLComment checks for comment openers outside quoted content. It
+// is only a content-loss guard; the dialect parser still validates the SQL.
+// Source literals allow backslash escapes, while Restore uses doubled quotes
+// and literal backslashes. Backtick identifiers only use doubled backticks.
+func containsMySQLComment(sql string, backslashEscapes bool) bool {
+	var quote byte
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if quote != 0 {
+			if backslashEscapes && quote != '`' && c == '\\' {
+				i++
+				continue
+			}
+			if c == quote {
+				if i+1 < len(sql) && sql[i+1] == quote {
+					i++
+				} else {
+					quote = 0
+				}
+			}
+			continue
+		}
+		if isQuote(c) {
+			quote = c
+			continue
+		}
+		if c == '#' || strings.HasPrefix(sql[i:], "/*") {
+			return true
+		}
+		// Unlike PostgreSQL, MySQL requires whitespace/control after --.
+		if strings.HasPrefix(sql[i:], "--") && (i+2 == len(sql) || sql[i+2] <= ' ' || unicode.IsSpace(rune(sql[i+2]))) {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaFileStatements validates a declarative file under the grammar that
+// consumes it and returns its statements in execution order. PostgreSQL row
+// security is a broader desired-file shape than the greenfield create sets
+// used by apply, so it must use pg-sprite's dedicated admission boundary.
+func schemaFileStatements(dialect schema.Dialect, parser StatementParser, content string) ([]string, error) {
+	if dialect == schema.DialectPostgres {
+		return postgresSchemaFileStatements(content)
+	}
+	createSet, err := ParseCreateSet(parser, content)
+	if err != nil {
+		return nil, err
+	}
+	if createSet.Type != StatementCreateTable {
+		return nil, fmt.Errorf("declarative schema file must start with CREATE TABLE, got %s", createSet.Type)
+	}
+	return createSet.Statements, nil
+}
+
+func postgresSchemaFileStatements(content string) ([]string, error) {
+	hasRowSecurity, err := pgstatement.HasRowSecurityDeclaration(content)
+	if err != nil {
+		return nil, err
+	}
+
+	// Both desired-schema parsers require a table and return it first, even
+	// when an index precedes the table in the source file.
+	var statements []pgstatement.Statement
+	if hasRowSecurity {
+		desired, err := pgstatement.ParseDesiredWithRowSecurity(content)
+		if err != nil {
+			return nil, err
+		}
+		statements = desired.Statements()
+	} else {
+		desired, err := pgstatement.ParseDesired(content)
+		if err != nil {
+			return nil, err
+		}
+		statements = desired.Statements()
+	}
+
+	result := make([]string, len(statements))
+	for i, stmt := range statements {
+		result[i] = stmt.SQL()
+	}
+	return result, nil
+}
+
+// layoutDDLWithOptions applies the ordinary display layout and can force even
+// a one-column CREATE TABLE onto multiple lines for checked-in schema files.
+// The layout is plain string splitting on the statement's canonical text, so
+// it applies to any dialect's canonical form. Other statements stay unchanged.
+func layoutDDLWithOptions(ddl string, multilineCreate bool) string {
 	upperDDL := strings.ToUpper(ddl)
 
 	switch {
 	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
-		return formatCreateTable(ddl)
+		return formatCreateTableWithOptions(ddl, multilineCreate)
 	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
 		clauses := splitAlterClauses(ddl)
 		if len(clauses) <= 1 {
@@ -73,19 +230,27 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 		slog.Debug("DDL display formatting has no parser for this dialect; preserving original SQL", "dialect", dialect, "error", err)
 		return raw
 	}
-	canonical := parser.Canonicalize(raw)
-	formatted := layoutDDL(canonical)
-	if dialect == schema.DialectMySQL {
-		formatted = lowercaseTypes(formatted)
-	}
-	formatted = strings.TrimRight(formatted, "; ") + ";"
-	// Keep the original SQL whenever canonical comparison cannot prove that
-	// display layout and case changes preserve quoted identifiers and values.
-	if canonical != parser.Canonicalize(formatted) {
+	formatted, equivalent := formatDDLForDialect(dialect, parser, raw, false)
+	if !equivalent {
 		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
 		return raw
 	}
 	return formatted
+}
+
+// formatDDLForDialect formats one statement and reports whether the parser can
+// prove that the result is equivalent to the input. The strict schema-file
+// formatter asks it to line-break even a one-column CREATE TABLE; display
+// callers retain their established compact form.
+func formatDDLForDialect(dialect schema.Dialect, parser StatementParser, stmt string, multilineCreate bool) (string, bool) {
+	raw := strings.TrimRight(strings.TrimSpace(stmt), ";") + ";"
+	canonical := parser.Canonicalize(raw)
+	formatted := layoutDDLWithOptions(canonical, multilineCreate)
+	if dialect == schema.DialectMySQL {
+		formatted = lowercaseTypes(formatted)
+	}
+	formatted = strings.TrimRight(formatted, "; ") + ";"
+	return formatted, canonical == parser.Canonicalize(formatted)
 }
 
 // dataTypePattern matches SQL data types that should be lowercased.
@@ -173,6 +338,10 @@ func lowercaseUnquotedTypes(ddl string) string {
 
 // formatCreateTable formats a CREATE TABLE statement with line breaks.
 func formatCreateTable(ddl string) string {
+	return formatCreateTableWithOptions(ddl, false)
+}
+
+func formatCreateTableWithOptions(ddl string, multiline bool) string {
 	// Find the opening parenthesis
 	openParen := findOpeningParen(ddl)
 	if openParen == -1 {
@@ -196,7 +365,7 @@ func formatCreateTable(ddl string) string {
 	options := strings.TrimSpace(footer[1:]) // Skip the ")"
 	options, partition := splitPartitionClause(options)
 
-	if len(parts) <= 1 {
+	if len(parts) <= 1 && !multiline {
 		// Single column — no line-break formatting for columns,
 		// but still format table options if present
 		if options != "" || partition != "" {
@@ -210,6 +379,9 @@ func formatCreateTable(ddl string) string {
 	sb.WriteString(header)
 	sb.WriteString("\n")
 	for i, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
 		sb.WriteString("    ")
 		sb.WriteString(strings.TrimSpace(part))
 		if i < len(parts)-1 {
@@ -217,8 +389,14 @@ func formatCreateTable(ddl string) string {
 		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString(")")
-	sb.WriteString(formatFooter(options, partition))
+	if multiline {
+		// Source files need all table options, including those the display
+		// formatter does not recognize. Keep the canonical suffix intact.
+		sb.WriteString(footer)
+	} else {
+		sb.WriteString(")")
+		sb.WriteString(formatFooter(options, partition))
+	}
 
 	return sb.String()
 }
