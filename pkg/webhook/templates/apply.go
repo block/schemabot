@@ -199,6 +199,11 @@ type ApplyStatusCommentData struct {
 	// block names no plan, whether its members share a plan row or were each
 	// planned into their own and came out running the same change.
 	PlanID string
+
+	// InRolloutSection marks this comment as rendered inside one member's
+	// section of a rollout, below a header that already carries the apply ID and
+	// who applied it, so the section's metadata leaves both out.
+	InRolloutSection bool
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -350,15 +355,20 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 }
 
-// writeApplyMetadata writes the database, apply ID, plan, and requester info.
+// writeApplyMetadata writes the database, apply ID, plan, and requester info. A
+// rollout member section leaves out the apply ID and requester, which the
+// rollout header above it already shows.
 func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
 	parts = appendPlanMetadata(parts, data.PlanID)
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+	if data.InRolloutSection {
+		return
+	}
 	attributionAt := renderedAt
 	if data.RequestedBy == "" {
 		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
@@ -514,8 +524,8 @@ func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, l
 	fmt.Fprintf(sb, "%s\n```\n%s\n```\n", label, command)
 }
 
-// writeRolloutWideControlScope states that the commands in a member's footer
-// address the whole rollout, not the member whose section they sit in.
+// writeRolloutWideControlScope states that the command in a member's footer
+// addresses the whole rollout, not the member whose section they sit in.
 //
 // Control commands are scoped to the apply, and none takes a member selector,
 // so a command printed under one member's name would be read as addressing
@@ -523,8 +533,8 @@ func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, l
 // Rather than print a command nobody can narrow, the comment says what the one
 // it has does. The sentence leads the footer, ahead of the command, because a
 // code block is copied from its copy button and the eye does not travel past
-// it. It names no command, so one sentence covers a footer that offers two and
-// cannot disagree with the command it qualifies. Cutover footers do not carry
+// it. It names no command, so it cannot disagree with the one it qualifies.
+// Cutover footers do not carry
 // it, because one cutover lands on one member rather than on the whole
 // rollout. It stops being needed when control commands can address one member.
 func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData) {
@@ -532,10 +542,10 @@ func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentDa
 		return
 	}
 	if data.RolloutMember == "" {
-		sb.WriteString("Each command below addresses the whole rollout.\n\n")
+		sb.WriteString("This command addresses the whole rollout.\n\n")
 		return
 	}
-	fmt.Fprintf(sb, "Each command below addresses the whole rollout, not just %s.\n\n", inlineCode(data.RolloutMember))
+	fmt.Fprintf(sb, "This command addresses the whole rollout, not just %s.\n\n", inlineCode(data.RolloutMember))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window
@@ -1551,9 +1561,16 @@ func completedOutcomeMessage(singular, rollback bool) string {
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
 // Only shows database — environment is already in the title, and apply ID plus
 // duration are operational details that add clutter without value for most users.
+// A rollout member running a plan its siblings do not also names that plan, the
+// record that ties its outcome back to the block it was reviewed as.
 func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	writeDBLine(sb, data.Database)
-	sb.WriteString("\n")
+	if data.PlanID == "" || data.Database == "" {
+		writeDBLine(sb, data.Database)
+		sb.WriteString("\n")
+		return
+	}
+	parts := appendPlanMetadata([]string{fmt.Sprintf("**Database**: `%s`", data.Database)}, data.PlanID)
+	fmt.Fprintf(sb, "%s\n\n", strings.Join(parts, " | "))
 }
 
 func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, _, totalTables int, budget *ddlBlockBudget) {
@@ -1609,7 +1626,7 @@ func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 	// Combine database, apply ID, plan, and duration on one metadata line.
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
 	parts = appendPlanMetadata(parts, data.PlanID)
@@ -1617,6 +1634,9 @@ func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+	if data.InRolloutSection {
+		return
+	}
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
 }
 
@@ -1688,14 +1708,14 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) == 0 && len(data.VSchemaChanges) == 0 {
 		// No per-operation detail to collapse (e.g. a task-less apply that found
 		// no changes). Still surface the Apply ID so the summary stays auditable.
-		if data.ApplyID != "" {
+		if data.ApplyID != "" && !data.InRolloutSection {
 			fmt.Fprintf(sb, "\n_Apply ID: `%s`_\n", data.ApplyID)
 		}
 		return
 	}
 
 	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		fmt.Fprintf(sb, "_Apply ID: `%s`_\n\n", data.ApplyID)
 	}
 	writeCompletedNamespaceSummary(sb, data)

@@ -736,7 +736,7 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 
 // rolloutScopeLine opens the sentence a member's footer carries when the
 // apply fans out across several members.
-const rolloutScopeLine = "Each command below addresses the whole rollout"
+const rolloutScopeLine = "This command addresses the whole rollout"
 
 // Control commands address the apply, not one member of it, and the CLI offers
 // no way to narrow them. A member's section therefore says how far its stop
@@ -928,8 +928,18 @@ func TestRenderMultiDeploymentApplyComment_MemberSectionNamesItsPlan(t *testing.
 		},
 	})
 
-	assert.Contains(t, out, "**Database**: `orders` | **Apply ID**: `apply-7f3a` | **Plan**: `plan_reviewed`")
-	assert.Contains(t, out, "**Database**: `orders_eu` | **Apply ID**: `apply-7f3a` | **Plan**: `plan_3344`")
+	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Plan**: `plan_3344`\n")
+	assertRolloutHeaderNotRepeated(t, out)
+}
+
+// assertRolloutHeaderNotRepeated checks that the apply ID and who applied it
+// appear once, in the rollout header, and not again in each member's section.
+func assertRolloutHeaderNotRepeated(t *testing.T, out string) {
+	t.Helper()
+	assert.Equal(t, 1, strings.Count(out, "**Apply ID**"), "only the rollout header names the apply")
+	assert.NotContains(t, out, "_Apply ID:", "no member section names the apply again")
+	assert.Equal(t, 1, strings.Count(out, "*Started at")+strings.Count(out, "*Applied by"), "only the rollout header says who applied it")
 }
 
 // A rollout whose members all run the same plan names none of them: the
@@ -949,14 +959,14 @@ func TestRenderMultiDeploymentApplyComment_ConvergedRolloutNamesNoPlan(t *testin
 		},
 	})
 
-	assert.Contains(t, out, "**Database**: `orders` | **Apply ID**: `apply-7f3a`\n")
+	assert.Contains(t, out, "**Database**: `orders`\n")
 	assert.NotContains(t, out, "**Plan**:")
+	assertRolloutHeaderNotRepeated(t, out)
 }
 
-// The terminal summary names it too, wherever that summary shows identifiers at
-// all: which plan a failed member ran is the first thing triage needs, and it is
-// the record that ties the outcome back to a reviewed block. A completed member
-// keeps its deliberately bare metadata line.
+// The terminal summary names it too, on every member: which plan a failed member
+// ran is the first thing triage needs, and for every member it is the record
+// that ties the outcome back to a reviewed block.
 func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		rollingOp("primary", so.Completed),
@@ -972,7 +982,7 @@ func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *t
 		},
 	})
 
-	assert.Contains(t, out, "**Database**: `orders_eu` | **Apply ID**: `apply-7f3a` | **Plan**: `plan_3344`")
-	assert.Contains(t, out, "**Database**: `orders`\n", "a completed member keeps its bare metadata line")
-	assert.NotContains(t, out, "**Plan**: `plan_reviewed`")
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Plan**: `plan_3344`\n")
+	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
+	assertRolloutHeaderNotRepeated(t, out)
 }
