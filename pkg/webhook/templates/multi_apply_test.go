@@ -736,7 +736,7 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 
 // rolloutScopeLine opens the sentence a member's footer carries when the
 // apply fans out across several members.
-const rolloutScopeLine = "Each command below addresses the whole rollout"
+const rolloutScopeLine = "This command addresses the whole rollout"
 
 // Control commands address the apply, not one member of it, and the CLI offers
 // no way to narrow them. A member's section therefore says how far its stop
@@ -806,10 +806,10 @@ func TestRenderMultiDeploymentApplySummaryComment_ResumeFooterNamesTheWholeRollo
 // Every command a member's footer offers addresses the whole apply, in every
 // state and on every engine, including states added after this test: none takes
 // a member selector. So wherever a member's section prints a command, the scope
-// sentence is in the same footer ahead of it. Cutover is the exception: one
-// cutover lands on one member, so its footer must not claim the whole rollout.
+// sentence is in the same footer ahead of it, worded for how many commands the
+// footer offers. Cutover is the exception: one cutover lands on one member, so
+// its footer must not claim the whole rollout.
 func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
-	scope := rolloutScopeLine + ", not just `us`.\n\n"
 	for _, field := range reflect.ValueOf(state.Apply).Fields() {
 		applyState := field.String()
 		for _, engine := range []string{storage.EngineSpirit, storage.EnginePlanetScale} {
@@ -834,7 +834,7 @@ func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
 			}
 			for surface, out := range renders {
 				t.Run(applyState+"/"+engine+"/"+surface, func(t *testing.T) {
-					assertEveryCommandCarriesScope(t, out, scope)
+					assertEveryCommandCarriesScope(t, out, "us")
 				})
 			}
 		}
@@ -842,9 +842,10 @@ func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
 }
 
 // assertEveryCommandCarriesScope checks that each schemabot command block in
-// out sits in a footer that opens with scope, and that each cutover command
-// sits in a footer without it.
-func assertEveryCommandCarriesScope(t *testing.T, out, scope string) {
+// out sits in a footer whose scope sentence names member and is worded for the
+// footer's number of commands, and that each cutover command sits in a footer
+// without one.
+func assertEveryCommandCarriesScope(t *testing.T, out, member string) {
 	t.Helper()
 	const command = "```\nschemabot "
 	for at := 0; ; {
@@ -855,10 +856,19 @@ func assertEveryCommandCarriesScope(t *testing.T, out, scope string) {
 		i += at
 		footerStart := strings.LastIndex(out[:i], "\n---\n")
 		require.GreaterOrEqual(t, footerStart, 0, "a command renders outside any footer:\n%s", out)
+		footer := out[footerStart+len("\n---\n"):]
+		if next := strings.Index(footer, "\n---\n"); next >= 0 {
+			footer = footer[:next]
+		}
 		if strings.HasPrefix(out[i+len(command):], "cutover ") {
-			assert.NotContains(t, out[footerStart:i], rolloutScopeLine, "a cutover command claims the whole rollout:\n%s", out)
+			assert.NotContains(t, out[footerStart:i], "addresses the whole rollout", "a cutover command claims the whole rollout:\n%s", out)
 		} else {
-			assert.Contains(t, out[footerStart:i], scope, "a command renders without the rollout scope sentence:\n%s", out)
+			subject := "This command"
+			if strings.Count(footer, command) > 1 {
+				subject = "Each command below"
+			}
+			scope := subject + " addresses the whole rollout, not just " + inlineCode(member) + ".\n\n"
+			assert.Contains(t, out[footerStart:i], scope, "a command renders without a scope sentence matching its footer:\n%s", out)
 		}
 		at = i + len(command)
 	}
@@ -908,4 +918,81 @@ func TestRenderApplyStatusComment_NoRolloutScopeLine(t *testing.T) {
 
 	assert.Contains(t, out, "To stop this schema change:")
 	assert.NotContains(t, out, rolloutScopeLine)
+}
+
+// When the round produced more than one plan, each member's section names the
+// one it runs, beside the database and apply identifiers it already carries, so
+// a running member can be tied back to the block that was reviewed.
+func TestRenderMultiDeploymentApplyComment_MemberSectionNamesItsPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Running, PlanID: "plan_reviewed"},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Pending, PlanID: "plan_3344"},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Plan**: `plan_3344`\n")
+	assertRolloutHeaderNotRepeated(t, out)
+}
+
+// assertRolloutHeaderNotRepeated checks that the apply ID and who applied it
+// appear once, in the rollout header, and not again in each member's section.
+func assertRolloutHeaderNotRepeated(t *testing.T, out string) {
+	t.Helper()
+	assert.Equal(t, 1, strings.Count(out, "**Apply ID**"), "only the rollout header names the apply")
+	assert.NotContains(t, out, "_Apply ID:", "no member section names the apply again")
+	assert.Equal(t, 1, strings.Count(out, "*Started at")+strings.Count(out, "*Applied by"), "only the rollout header says who applied it")
+}
+
+// A rollout whose members all run the same plan names none of them: the
+// identifier would be identical under every member and name nothing.
+func TestRenderMultiDeploymentApplyComment_ConvergedRolloutNamesNoPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Running},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders`\n")
+	assert.NotContains(t, out, "**Plan**:")
+	assertRolloutHeaderNotRepeated(t, out)
+}
+
+// The terminal summary names it too, on every member: which plan a failed member
+// ran is the first thing triage needs, and for every member it is the record
+// that ties the outcome back to a reviewed block.
+func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Completed),
+		rollingOp("eu-west", so.Failed),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Completed, PlanID: "plan_reviewed"},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Failed, PlanID: "plan_3344"},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Plan**: `plan_3344`\n")
+	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
+	assertRolloutHeaderNotRepeated(t, out)
 }

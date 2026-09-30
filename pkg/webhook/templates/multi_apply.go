@@ -280,6 +280,7 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 			// commands reach past the section, naming the member it heads.
 			body.RolloutWide = fanOut
 			body.RolloutMember = d.Name
+			body.InRolloutSection = true
 			sb.WriteString(stripLeadingHeading(renderDetail(body)))
 		} else {
 			sb.WriteString("_No details available yet._\n")

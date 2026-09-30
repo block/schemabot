@@ -190,6 +190,20 @@ type ApplyStatusCommentData struct {
 	// say which member the section's commands reach past. It only qualifies the
 	// scope sentence; RolloutWide alone decides whether the sentence renders.
 	RolloutMember string
+
+	// PlanID names the plan this member is running, alongside the database and
+	// the apply identifier. It is set only when the members of one apply do not
+	// all run the same work, which is the only case where naming it tells the
+	// reader anything: it ties a running member back to the block it came from
+	// among the several the review showed. A rollout the review showed as one
+	// block names no plan, whether its members share a plan row or were each
+	// planned into their own and came out running the same change.
+	PlanID string
+
+	// InRolloutSection marks this comment as rendered inside one member's
+	// section of a rollout, below a header that already carries the apply ID and
+	// who applied it, so the section's metadata leaves both out.
+	InRolloutSection bool
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -341,19 +355,36 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 }
 
-// writeApplyMetadata writes the database, apply ID, and requester info.
+// writeApplyMetadata writes the database, apply ID, plan, and requester info. A
+// rollout member section leaves out the apply ID and requester, which the
+// rollout header above it already shows.
 func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
+	parts = appendPlanMetadata(parts, data.PlanID)
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+	if data.InRolloutSection {
+		return
+	}
 	attributionAt := renderedAt
 	if data.RequestedBy == "" {
 		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
 	}
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+}
+
+// appendPlanMetadata adds the plan the member is running to a metadata line,
+// beside the database and apply identifiers it belongs with. An unset plan adds
+// nothing: every apply runs some plan, so the field is set only where naming it
+// distinguishes this member from its siblings.
+func appendPlanMetadata(parts []string, planID string) []string {
+	if planID == "" {
+		return parts
+	}
+	return append(parts, fmt.Sprintf("**Plan**: `%s`", planID))
 }
 
 func startedAtDisplay(startedAt, fallback string) string {
@@ -484,13 +515,29 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	writeMemberFooterAction(sb, data, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
 }
 
+// footerAction is one labelled command in a footer.
+type footerAction struct {
+	label, command string
+}
+
 // writeMemberFooterAction writes a footer action for a comment that may be one
 // member's section of a larger rollout, stating the command's rollout-wide
 // reach ahead of it when it is.
 func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, label, command string) {
+	writeMemberFooterActions(sb, data, footerAction{label: label, command: command})
+}
+
+// writeMemberFooterActions writes a footer offering one or more actions, under
+// one scope sentence that covers them all.
+func writeMemberFooterActions(sb *strings.Builder, data ApplyStatusCommentData, actions ...footerAction) {
 	sb.WriteString("\n---\n\n")
-	writeRolloutWideControlScope(sb, data)
-	fmt.Fprintf(sb, "%s\n```\n%s\n```\n", label, command)
+	writeRolloutWideControlScope(sb, data, len(actions))
+	for i, a := range actions {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(sb, "%s\n```\n%s\n```\n", a.label, a.command)
+	}
 }
 
 // writeRolloutWideControlScope states that the commands in a member's footer
@@ -502,19 +549,24 @@ func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, l
 // Rather than print a command nobody can narrow, the comment says what the one
 // it has does. The sentence leads the footer, ahead of the command, because a
 // code block is copied from its copy button and the eye does not travel past
-// it. It names no command, so one sentence covers a footer that offers two and
-// cannot disagree with the command it qualifies. Cutover footers do not carry
+// it. It names no command, so one sentence covers a footer that offers two,
+// worded for how many the footer offers, and cannot disagree with them.
+// Cutover footers do not carry
 // it, because one cutover lands on one member rather than on the whole
 // rollout. It stops being needed when control commands can address one member.
-func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData) {
+func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData, commands int) {
 	if !data.RolloutWide {
 		return
 	}
+	subject := "This command"
+	if commands > 1 {
+		subject = "Each command below"
+	}
 	if data.RolloutMember == "" {
-		sb.WriteString("Each command below addresses the whole rollout.\n\n")
+		fmt.Fprintf(sb, "%s addresses the whole rollout.\n\n", subject)
 		return
 	}
-	fmt.Fprintf(sb, "Each command below addresses the whole rollout, not just %s.\n\n", inlineCode(data.RolloutMember))
+	fmt.Fprintf(sb, "%s addresses the whole rollout, not just %s.\n\n", subject, inlineCode(data.RolloutMember))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window
@@ -1444,8 +1496,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
-		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
-		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeMemberFooterActions(sb, data,
+			footerAction{label: "To skip revert and keep changes:", command: appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant)},
+			footerAction{label: "To revert:", command: appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant)})
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
@@ -1530,9 +1583,16 @@ func completedOutcomeMessage(singular, rollback bool) string {
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
 // Only shows database — environment is already in the title, and apply ID plus
 // duration are operational details that add clutter without value for most users.
+// A rollout member running a plan its siblings do not also names that plan, the
+// record that ties its outcome back to the block it was reviewed as.
 func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	writeDBLine(sb, data.Database)
-	sb.WriteString("\n")
+	if data.PlanID == "" || data.Database == "" {
+		writeDBLine(sb, data.Database)
+		sb.WriteString("\n")
+		return
+	}
+	parts := appendPlanMetadata([]string{fmt.Sprintf("**Database**: `%s`", data.Database)}, data.PlanID)
+	fmt.Fprintf(sb, "%s\n\n", strings.Join(parts, " | "))
 }
 
 func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, _, totalTables int, budget *ddlBlockBudget) {
@@ -1585,16 +1645,20 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 }
 
 func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	// Combine database, apply ID, and duration on one metadata line.
+	// Combine database, apply ID, plan, and duration on one metadata line.
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
+	parts = appendPlanMetadata(parts, data.PlanID)
 	if d := durationDisplay(data.StartedAt, data.CompletedAt); d != "" {
 		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+	if data.InRolloutSection {
+		return
+	}
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
 }
 
@@ -1666,14 +1730,14 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) == 0 && len(data.VSchemaChanges) == 0 {
 		// No per-operation detail to collapse (e.g. a task-less apply that found
 		// no changes). Still surface the Apply ID so the summary stays auditable.
-		if data.ApplyID != "" {
+		if data.ApplyID != "" && !data.InRolloutSection {
 			fmt.Fprintf(sb, "\n_Apply ID: `%s`_\n", data.ApplyID)
 		}
 		return
 	}
 
 	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		fmt.Fprintf(sb, "_Apply ID: `%s`_\n\n", data.ApplyID)
 	}
 	writeCompletedNamespaceSummary(sb, data)
