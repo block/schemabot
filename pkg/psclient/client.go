@@ -63,8 +63,12 @@ type PSClient interface {
 
 	// Keyspace operations
 
-	// ListKeyspaces returns every keyspace on the branch, across all the pages
-	// the API reports, or an error; never a partial list.
+	// ListKeyspaces returns every keyspace the API reports for the branch,
+	// across all of its pages, or an error; the pages already read are never
+	// returned on their own. The pages are read one after another, so a branch
+	// whose keyspaces change while the listing is in progress can be read
+	// incompletely; the result is as of a read that may span pages, not a
+	// snapshot.
 	ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error)
 	GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error)
 	UpdateKeyspaceVSchema(ctx context.Context, req *ps.UpdateKeyspaceVSchemaRequest) (*ps.VSchema, error)
@@ -241,19 +245,31 @@ const maxKeyspacePages = 100
 // takes no page options, so the listing uses raw HTTP via baseURL and returns an
 // error if baseURL is not set.
 //
+// The pages are numbered offsets into a set that can change between requests.
+// A keyspace added before a later page is read shifts the rest forward, so a
+// name can appear on two pages; the first copy is kept and the repeat is
+// logged, since it is the one visible sign that the set moved under the read.
+// A keyspace removed shifts the rest back, and the name that slides off the
+// start of the next page is not seen at all; nothing in the response reveals
+// that, so the result is complete for a branch whose keyspaces held still and
+// the next listing heals one that did not.
+//
 // The HTTP client's timeout applies to each page request. The listing as a whole
 // is bounded by maxKeyspacePages and by ctx.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
 	if w.baseURL == "" {
 		return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: no PlanetScale API base URL", req.Organization, req.Database, req.Branch)
 	}
-	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces", req.Organization, req.Database, req.Branch)
+	// Each name is its own path segment, so a character that URL syntax gives
+	// meaning to cannot retarget the request or swallow the page query.
+	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces",
+		url.PathEscape(req.Organization), url.PathEscape(req.Database), url.PathEscape(req.Branch))
 	var keyspaces []*ps.Keyspace
-	seen := make(map[string]struct{})
+	seen := make(map[string]int)
 	page := 1
 	for fetched := 1; ; fetched++ {
 		if fetched > maxKeyspacePages {
-			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: API still reports page %d after %d pages", req.Organization, req.Database, req.Branch, page, maxKeyspacePages)
+			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: API still reports page %d after %d pages and %d keyspaces", req.Organization, req.Database, req.Branch, page, maxKeyspacePages, len(keyspaces))
 		}
 		query := url.Values{}
 		query.Set("page", strconv.Itoa(page))
@@ -270,10 +286,14 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 			return nil, fmt.Errorf("decode keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
 		}
 		for _, keyspace := range payload.Data {
-			if _, ok := seen[keyspace.Name]; !ok {
-				seen[keyspace.Name] = struct{}{}
-				keyspaces = append(keyspaces, keyspace)
+			if firstPage, ok := seen[keyspace.Name]; ok {
+				slog.Warn("keyspace listed on two pages; the branch's keyspaces changed while they were being listed, so a keyspace may have been skipped",
+					"organization", req.Organization, "database", req.Database, "branch", req.Branch,
+					"keyspace", keyspace.Name, "first_page", firstPage, "page", page)
+				continue
 			}
+			seen[keyspace.Name] = page
+			keyspaces = append(keyspaces, keyspace)
 		}
 		if payload.NextPage == nil || *payload.NextPage == 0 {
 			return keyspaces, nil

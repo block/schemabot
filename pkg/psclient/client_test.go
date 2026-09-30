@@ -375,17 +375,22 @@ func TestListKeyspacesStopsWhenNextPageIsZero(t *testing.T) {
 	assert.Equal(t, []string{"1"}, requested)
 }
 
+// A keyspace added while the pages are being read shifts the later ones onto
+// the next page, so a name can be listed twice. The copy from the earlier page
+// is kept, and the repeat is not counted as a second keyspace.
 func TestListKeyspacesDeduplicatesNamesAcrossPages(t *testing.T) {
 	var requested []string
 	srv := keyspacesServer(t, map[string]string{
 		"1": `{"next_page":2,"data":[{"name":"orders","shards":1}]}`,
-		"2": `{"data":[{"name":"orders","shards":1},{"name":"payments","shards":2}]}`,
+		"2": `{"data":[{"name":"orders","shards":3},{"name":"payments","shards":2}]}`,
 	}, &requested)
 
 	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"orders", "payments"}, keyspaceNames(keyspaces))
+	assert.Equal(t, 1, keyspaces[0].Shards, "the copy from the earlier page is kept")
+	assert.Equal(t, []string{"1", "2"}, requested)
 }
 
 func TestListKeyspacesFailsToDecodeALaterPage(t *testing.T) {
@@ -400,6 +405,33 @@ func TestListKeyspacesFailsToDecodeALaterPage(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, keyspaces)
 	assert.Contains(t, err.Error(), "decode keyspaces for block/orders branch main page 2")
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// Organization, database, and branch names are path segments. One that carries
+// a character URL syntax gives meaning to is escaped, so it neither retargets
+// the request nor swallows the page query that the whole listing depends on.
+func TestListKeyspacesEscapesPathSegments(t *testing.T) {
+	var gotPath, gotPage string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		gotPage = r.URL.Query().Get("page")
+		_, _ = w.Write([]byte(`{"data":[{"name":"orders","shards":1}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	keyspaces, err := client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "feature/x?y",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+	assert.Equal(t, "/v1/organizations/block/databases/orders/branches/feature%2Fx%3Fy/keyspaces", gotPath)
+	assert.Equal(t, "1", gotPage)
 }
 
 // A failure on a later page fails the listing rather than returning the pages
@@ -437,7 +469,7 @@ func TestListKeyspacesFailsPastThePageBound(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Nil(t, keyspaces)
-	assert.Contains(t, err.Error(), fmt.Sprintf("API still reports page %d after %d pages", maxKeyspacePages+1, maxKeyspacePages))
+	assert.Contains(t, err.Error(), fmt.Sprintf("API still reports page %d after %d pages and %d keyspaces", maxKeyspacePages+1, maxKeyspacePages, maxKeyspacePages))
 	assert.Len(t, requested, maxKeyspacePages)
 }
 
