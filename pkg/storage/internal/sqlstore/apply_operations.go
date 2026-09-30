@@ -774,17 +774,45 @@ const releasedFailureExemptionSQL = `NOT (
 // deployment. Operations of the same member — one target's per-shard,
 // per-namespace work and its finalizers — share both columns, so this
 // fragment never gates one on another and their copies start in parallel.
-// Their cutovers are still ordered by the cutover claim, which has no member
-// filter, and a finalizer still waits for its member's work through the
-// finalizer arm. Every operation row stamps its member's target at creation,
-// and a row with no target (a single-target shape) shares the empty value
-// with its siblings, so the target half only ever separates rows that name
-// different targets. The fragment references the apply_operations and
-// earlier aliases and takes no placeholders.
+// Their cutovers are still ordered under barrier and parallel by the cutover
+// claim, which has no member filter, and a finalizer still waits for its
+// member's work through the finalizer arm. Every operation row stamps its
+// member's target at creation, and a row with no target (a single-target
+// shape) shares the empty value with its siblings, so the target half only
+// ever separates rows that name different targets. The fragment references
+// the apply_operations and earlier aliases and takes no placeholders.
 const earlierRolloutMemberSQL = `(
 	earlier.deployment <> apply_operations.deployment
 	OR earlier.target <> apply_operations.target
 )`
+
+// earlierFinalizerAtBarrierSQL matches an earlier group_finalizer that the
+// barrier copy gate treats as having reached the barrier. A finalizer never
+// parks at waiting_for_cutover: it stays pending until its member's work has
+// cut over and completed, then publishes in one running step. Counting pending
+// or running as blocking would hold every later member's copy until the
+// earlier member had fully cut over, which is rolling, not barrier. Letting
+// the copy start publishes nothing: the later member's cutover and its
+// finalizer both still wait for this finalizer to complete. While the earlier
+// member's work is still copying, that work blocks the later copy on its own.
+// A stopped, failed_retryable or failed finalizer still blocks, as the matching
+// work states do. The fragment references the earlier alias; its
+// placeholders, in order, are the finalizer kind, pending and running (see
+// earlierFinalizerAtBarrierArgs).
+const earlierFinalizerAtBarrierSQL = `(
+	earlier.operation_kind = ?
+	AND earlier.state IN (?, ?)
+)`
+
+// earlierFinalizerAtBarrierArgs returns the positional arguments for
+// earlierFinalizerAtBarrierSQL, in placeholder order.
+func earlierFinalizerAtBarrierArgs() []any {
+	return []any{
+		storage.ApplyOperationKindGroupFinalizer,
+		state.ApplyOperation.Pending,
+		state.ApplyOperation.Running,
+	}
+}
 
 // freshLeaseCountSQL counts the operation leases the candidate row's parent
 // apply already holds: sibling operations in an active state, owned by some
@@ -875,27 +903,39 @@ func releasedFailureExemptionArgs() []any {
 // then each deployment's targets list, materialized by the apply-create
 // dual-write into row insertion order. Work rows of the SAME member (the
 // per-shard, per-namespace fan-out of a sharded target) do not gate each
-// other, so a member's shard work drives in parallel; the group_finalizer clause below still holds each namespace's
-// finalizer until that namespace's work siblings complete — and a namespace
-// whose only change is its VSchema (no shard work siblings) has its finalizer
-// claimable immediately, since there is no incomplete sibling to wait on. The
-// gate is
+// other, so a member's shard work drives in parallel. A work row's gate is
 // cutover_policy-aware (the policy is captured per row at apply-create):
 //
-//   - rolling (the default, and any non-barrier value — which fails closed to
-//     the serial gate): a pending row is claimable only once every earlier
-//     sibling has reached completed. This serializes the rollout and halts it
-//     on the first non-completed sibling (e.g. a failed deployment).
+//   - rolling (the default, and any value other than barrier or parallel,
+//     which fails closed to the serial gate): a pending row is claimable only
+//     once every earlier-member sibling has reached completed. This serializes
+//     the rollout and halts it on the first non-completed sibling (e.g. a
+//     failed deployment).
 //   - barrier: an earlier sibling stops blocking once it reaches the cutover
 //     barrier or succeeds (waiting_for_cutover, cutting_over, revert_window,
 //     completed), so a later deployment may start its copy phase while earlier
-//     siblings sit at the barrier. Earlier siblings that are still in-flight or
-//     not yet at the barrier (pending, running, failed_retryable, stopped) — and
-//     terminal non-success states (failed, cancelled, reverted) — still block,
-//     so a failed earlier deployment still halts the rollout.
+//     siblings sit at the barrier. An earlier group_finalizer that is pending
+//     or running counts as at the barrier, since a finalizer never parks (see
+//     earlierFinalizerAtBarrierSQL). Earlier siblings that are still in-flight
+//     or not yet at the barrier (pending, running, failed_retryable, stopped)
+//     — and terminal non-success states (failed, cancelled, reverted) — still
+//     block, so a failed earlier deployment still halts the rollout.
+//   - parallel: no earlier sibling gates a work row's copy start, bounded only
+//     by the fan-out cap below; the cutover claim orders the swaps.
+//
+// A group_finalizer's gate is not policy-aware. It waits for the work it
+// finalizes to complete (a namespace whose only change is its VSchema has no
+// such work), and then for every earlier-member sibling to complete, under
+// every policy. A finalizer never parks at the cutover
+// barrier: its drive publishes the member's change in one step, so the barrier
+// and parallel relaxations, which are safe for work only because the work then
+// parks and the cutover claim orders its swap, would let a later member's
+// VSchema go out while an earlier member's is still unapplied or has failed.
+// The finalizer therefore takes the cutover claim's completed-only order at
+// its start.
 //
 // on_failure (per-apply policy, also captured on each row at create)
-// layers on top of both policies: "halt" (the default) keeps a terminal-failed
+// layers on top of every gate: "halt" (the default) keeps a terminal-failed
 // earlier sibling blocking every later sibling, so the rollout halts on the
 // first failure. "continue" treats a terminal `failed` earlier sibling as
 // settled so it no longer blocks: later deployments are still claimed and
@@ -974,8 +1014,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// Sibling-gate args for the pending claim, cutover_policy-aware (see the
 	// gate SQL below). Under barrier, an earlier sibling stops blocking once it
 	// reaches the cutover barrier or succeeds (waiting_for_cutover, cutting_over,
-	// revert_window, completed). Under parallel there is intentionally no arm: a
-	// parallel operation matches neither branch, so no earlier sibling can make
+	// revert_window, completed), and an earlier group_finalizer counts as at the
+	// barrier while pending or running (earlierFinalizerAtBarrierArgs). Under
+	// parallel there is intentionally no arm: a parallel work row matches
+	// neither branch, so no earlier sibling can make
 	// the blocking EXISTS true and its copy starts immediately (concurrent copy).
 	// Under rolling — and any unrecognized value, which fails closed to the
 	// serial gate via NOT IN (barrier, parallel) — only a completed earlier
@@ -988,16 +1030,28 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		state.ApplyOperation.CuttingOver,
 		state.ApplyOperation.RevertWindow,
 		state.ApplyOperation.Completed,
+	)
+	queryArgs = append(queryArgs, earlierFinalizerAtBarrierArgs()...)
+	queryArgs = append(queryArgs,
 		storage.CutoverPolicyBarrier,
 		storage.CutoverPolicyParallel,
 		state.ApplyOperation.Completed,
 	)
 	queryArgs = append(queryArgs, releasedFailureExemptionArgs()...)
+	// Finalizer gate args. A group_finalizer waits for its own member's work to
+	// complete, and then for every earlier rollout member to complete, under
+	// every cutover_policy: a finalizer never parks at the cutover barrier, so
+	// its drive publishes the member's change in one step, and the only place
+	// to order that publish is its start. The completed-only earlier-member
+	// gate is the one the cutover claim uses, with the same on_failure
+	// exemption.
 	queryArgs = append(queryArgs,
 		storage.ApplyOperationKindGroupFinalizer,
 		storage.ApplyOperationKindWork,
 		state.ApplyOperation.Completed,
+		state.ApplyOperation.Completed,
 	)
+	queryArgs = append(queryArgs, releasedFailureExemptionArgs()...)
 	// Pending stop gate: a pending operation is not claimable for start while
 	// its apply has a pending stop control request. This is what makes `stop`
 	// halt remaining siblings under on_failure "continue" — without it, a
@@ -1192,6 +1246,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 									(
 										apply_operations.cutover_policy = ?
 										AND earlier.state NOT IN (?, ?, ?, ?)
+										AND NOT `+earlierFinalizerAtBarrierSQL+`
 									)
 									OR (
 										apply_operations.cutover_policy NOT IN (?, ?)
@@ -1218,6 +1273,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								END
 								AND sibling.state <> ?
 							)
+						AND NOT EXISTS (
+							SELECT 1
+							FROM apply_operations AS earlier
+							WHERE earlier.apply_id = apply_operations.apply_id
+								AND `+earlierRolloutMemberSQL+`
+								AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+								AND earlier.state <> ?
+								AND `+releasedFailureExemptionSQL+`
+						)
 						)
 				)
 				AND NOT EXISTS (
@@ -1584,11 +1648,12 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// via the copy/manual path, so recovering it here would steal legitimate work.
 	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
-	// claimable only when no earlier deployment_order sibling is still
-	// non-completed; releasedFailureExemptionArgs exempt a terminal-failed earlier
-	// sibling so it no longer blocks later cutovers under "continue", or under
-	// "pause" once a release latches the rollout open; and the pending-stop NOT
-	// EXISTS makes `stop` halt remaining cutovers even under those exemptions.
+	// claimable only when no earlier operation of the apply, whichever member
+	// it belongs to, is still non-completed; releasedFailureExemptionArgs
+	// exempt a terminal-failed earlier sibling so it no longer blocks later
+	// cutovers under "continue", or under "pause" once a release latches the
+	// rollout open; and the pending-stop NOT EXISTS makes `stop` halt remaining
+	// cutovers even under those exemptions.
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		state.ApplyOperation.Completed,
