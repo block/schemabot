@@ -2150,6 +2150,7 @@ func buildApplyTask(
 		DDLAction:      ddlChange.Operation,
 		ExecutionMode:  ddlChange.ExecutionMode,
 		ModeReason:     ddlChange.ModeReason,
+		EstimatedBytes: ddlChange.TaskEstimatedBytes(shard),
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}

@@ -195,8 +195,18 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		if pct := ui.RowCopyDisplayPercent(int(copied*100/total), copied); pct > 0 {
 			fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
 			line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
-			if reporting < len(cells)+silent {
+			partial := reporting < len(cells)+silent
+			if partial {
 				line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
+			}
+			// The planned size is every target's, including those left out of
+			// the rows, so beside partial rows it names the full span rather
+			// than reading as the reporting targets' size.
+			if size := targetsTableBytes(cells, silent); size != nil {
+				line += ui.FormatTableSizeClause(size)
+				if partial {
+					line += fmt.Sprintf(" across all %d targets", len(cells))
+				}
 			}
 			if eta > 0 {
 				floor := ""
@@ -222,6 +232,24 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase = "⊘ Cancelled"
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
+}
+
+// targetsTableBytes totals a table's planned size across the targets that run
+// it, since each target copies its own data. It is nil unless every one of
+// those targets carries an estimate: a total that left some out would
+// understate the table, and silent targets have reported nothing at all.
+func targetsTableBytes(cells []TableProgressData, silent int) *int64 {
+	if silent > 0 || len(cells) == 0 {
+		return nil
+	}
+	var total int64
+	for _, c := range cells {
+		if c.EstimatedBytes == nil {
+			return nil
+		}
+		total += *c.EstimatedBytes
+	}
+	return &total
 }
 
 // targetCoverage is the " · 40 complete, 4 running, 19 queued, 1 failed,

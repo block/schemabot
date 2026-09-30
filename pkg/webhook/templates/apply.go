@@ -30,6 +30,9 @@ type TableProgressData struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -1327,9 +1330,10 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 
 	// Show rows (no ETA) for stopped tables with progress
 	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
-		fmt.Fprintf(sb, "- Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
-			ui.FormatNumber(table.RowsTotal))
+			ui.FormatNumber(table.RowsTotal),
+			ui.FormatTableSizeClause(table.EstimatedBytes))
 	}
 }
 
@@ -1385,15 +1389,18 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	copied := ui.ClampRows(table.RowsCopied, table.RowsTotal)
+	size := ui.FormatTableSizeClause(table.EstimatedBytes)
 	if table.ETASeconds > 0 {
-		fmt.Fprintf(sb, "- Rows: %s / %s \u00b7 ETA: %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s \u00b7 ETA: %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal),
+			size,
 			ui.FormatETA(table.ETASeconds))
 	} else {
-		fmt.Fprintf(sb, "- Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(copied),
-			ui.FormatNumber(table.RowsTotal))
+			ui.FormatNumber(table.RowsTotal),
+			size)
 	}
 }
 

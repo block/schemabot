@@ -2981,6 +2981,10 @@ type TableProgress struct {
 	// Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
 	// 2s"). Empty when throttled is false.
 	ThrottleReason string `protobuf:"bytes,18,opt,name=throttle_reason,json=throttleReason,proto3" json:"throttle_reason,omitempty"`
+	// The plan's approximate on-disk footprint of the table (data plus indexes),
+	// for display beside the row counts. Unset when the plan had no estimate and
+	// for a task scoped to one shard, since the estimate covers the whole table.
+	EstimatedBytes *int64 `protobuf:"varint,19,opt,name=estimated_bytes,json=estimatedBytes,proto3,oneof" json:"estimated_bytes,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3139,6 +3143,13 @@ func (x *TableProgress) GetThrottleReason() string {
 		return x.ThrottleReason
 	}
 	return ""
+}
+
+func (x *TableProgress) GetEstimatedBytes() int64 {
+	if x != nil && x.EstimatedBytes != nil {
+		return *x.EstimatedBytes
+	}
+	return 0
 }
 
 // SettledControlRequest reports the fate of a durable control request the
@@ -4997,7 +5008,7 @@ const file_tern_proto_rawDesc = "" +
 	"\veta_seconds\x18\x05 \x01(\x03R\n" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
-	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\x99\x05\n" +
+	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\xdb\x05\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
@@ -5023,7 +5034,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\x12#\n" +
 	"\rerror_message\x18\x10 \x01(\tR\ferrorMessage\x12\x1c\n" +
 	"\tthrottled\x18\x11 \x01(\bR\tthrottled\x12'\n" +
-	"\x0fthrottle_reason\x18\x12 \x01(\tR\x0ethrottleReason\"\xb4\x01\n" +
+	"\x0fthrottle_reason\x18\x12 \x01(\tR\x0ethrottleReason\x12,\n" +
+	"\x0festimated_bytes\x18\x13 \x01(\x03H\x00R\x0eestimatedBytes\x88\x01\x01B\x12\n" +
+	"\x10_estimated_bytes\"\xb4\x01\n" +
 	"\x15SettledControlRequest\x12\x1c\n" +
 	"\toperation\x18\x01 \x01(\tR\toperation\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12#\n" +
@@ -5394,6 +5407,7 @@ func file_tern_proto_init() {
 	file_tern_proto_msgTypes[9].OneofWrappers = []any{}
 	file_tern_proto_msgTypes[11].OneofWrappers = []any{}
 	file_tern_proto_msgTypes[24].OneofWrappers = []any{}
+	file_tern_proto_msgTypes[27].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

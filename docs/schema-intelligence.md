@@ -579,7 +579,7 @@ live view:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
@@ -595,6 +595,10 @@ Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
 as zero time remaining. Throttled tasks can include `throttle_reason`.
+`estimated_bytes` is the table's on-disk size when the change was planned,
+the same figure the plan comment shows. It is fixed for the life of the apply
+and does not grow as rows copy. It is omitted when the plan had no estimate,
+and on a row for one shard of a table, since the plan measures the whole table.
 A PostgreSQL concurrent index build reports a whole-build percentage estimated
 from the server's build phase and its counters; it stays below 100 until the
 apply completes and holds its last value between phases (see
@@ -643,6 +647,7 @@ Response excerpt (illustrative values):
       "status": "running",
       "rows_copied": 6000000,
       "rows_total": 10000000,
+      "estimated_bytes": 3200000000,
       "percent_complete": 60,
       "eta_seconds": 2520,
       "throttled": true,
@@ -681,6 +686,7 @@ Response excerpt (illustrative values):
       "target": "shop-001",
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "completed",
+      "estimated_bytes": 2400000000,
       "percent_complete": 100
     },
     {
@@ -691,6 +697,7 @@ Response excerpt (illustrative values):
       "status": "running",
       "rows_copied": 2000000,
       "rows_total": 8000000,
+      "estimated_bytes": 2600000000,
       "percent_complete": 25
     }
   ]
@@ -698,7 +705,8 @@ Response excerpt (illustrative values):
 ```
 
 Both rows report the same table under the same deployment, and only `target`
-tells them apart.
+tells them apart. Each row's `estimated_bytes` is that target's own copy of the
+table.
 
 </details>
 
@@ -764,7 +772,7 @@ heap is scanned, then `building index: sorting live tuples`, then
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
-task record, and `metadata` holds the last position the engine reported; ETA
+task record along with `estimated_bytes`, and `metadata` holds the last position the engine reported; ETA
 and per-shard rows are not persisted in this view. A new attempt can display
 the prior attempt's position until its first progress save.
 
@@ -797,13 +805,14 @@ Output excerpt:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
-Here, `orders` is 60% copied with an estimated 42 minutes remaining. Copying
+Here, `orders` is 60% copied with an estimated 42 minutes remaining. The
+table measured about 3.2 GB when the change was planned. Copying
 is backing off because 21 active threads exceed the configured budget of 18.
 
 `GET /api/status` spans the registered databases. It returns the

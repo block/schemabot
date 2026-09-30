@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -787,6 +788,54 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailedTargetsAreNamed(t *test
 	assert.Contains(t, out, "\n| Target | Status |\n| --- | --- |\n| `testapp-000` | ❌ failed — Error 1062: Duplicate entry / for key |\n")
 	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
 	assert.Contains(t, out, "\n…and 5 more failed targets.\n")
+}
+
+// A table copying on several targets shows its planned size summed across
+// them, since each target copies its own data. The total is left off when any
+// target has no estimate or has reported nothing, rather than understating it.
+// A failed target's rows are left out of the sum, but its data is still part
+// of the table, so beside the partial rows the size names every target.
+func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *testing.T) {
+	sized := func(detail *ApplyStatusCommentData, bytes int64) *ApplyStatusCommentData {
+		detail.Tables[0].EstimatedBytes = &bytes
+		return detail
+	}
+	ops := []presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+	}
+
+	out := renderTargets(presentation.Derive(ops),
+		sized(targetDetail("testapp_001", state.Task.Running, addNote, 500), 1_500_000_000),
+		sized(targetDetail("testapp_002", state.Task.Running, addNote, 250), 2_000_000_000),
+	)
+	assert.Contains(t, out, "- Rows: 750 / 2,000 · ~3.5 GB · ETA: "+ui.FormatETA(500)+"\n")
+
+	out = renderTargets(presentation.Derive(ops),
+		sized(targetDetail("testapp_001", state.Task.Running, addNote, 500), 1_500_000_000),
+		targetDetail("testapp_002", state.Task.Running, addNote, 250),
+	)
+	assert.Contains(t, out, "- Rows: 750 / 2,000 · ETA: "+ui.FormatETA(500)+"\n")
+
+	withFailed := append(slices.Clone(ops), parallelTarget("primary", "testapp-003", so.Failed))
+	out = renderTargets(presentation.Derive(withFailed),
+		sized(targetDetail("testapp_001", state.Task.Running, addNote, 500), 1_500_000_000),
+		sized(targetDetail("testapp_002", state.Task.Running, addNote, 250), 1_500_000_000),
+		sized(targetDetail("testapp_003", state.Task.Failed, addNote, 0), 2_000_000_000),
+	)
+	assert.Contains(t, out, "- Rows: 750 / 2,000 across 2 of 3 targets · ~5 GB across all 3 targets · ETA: "+ui.FormatETA(500)+"\n")
+}
+
+func TestTargetsTableBytes(t *testing.T) {
+	one, two := int64(1_500_000_000), int64(2_000_000_000)
+	cells := []TableProgressData{{EstimatedBytes: &one}, {EstimatedBytes: &two}}
+
+	total := targetsTableBytes(cells, 0)
+	require.NotNil(t, total)
+	assert.Equal(t, int64(3_500_000_000), *total)
+	assert.Nil(t, targetsTableBytes(cells, 1), "a silent target has no estimate to add")
+	assert.Nil(t, targetsTableBytes([]TableProgressData{{EstimatedBytes: &one}, {}}, 0), "a target without an estimate leaves the total unknown")
+	assert.Nil(t, targetsTableBytes(nil, 0))
 }
 
 // One failed target among several still copying does not hide their progress:

@@ -494,6 +494,18 @@ type TableChange struct {
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 }
 
+// TaskEstimatedBytes returns the byte estimate a task created from this change
+// carries. The plan's estimate covers every shard of the table, so a task that
+// spans the whole table carries it, and a task scoped to one shard carries
+// none rather than a figure that would read as that shard's size.
+func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
+	if shard != "" || tc.EstimatedBytes == nil {
+		return nil
+	}
+	bytes := *tc.EstimatedBytes
+	return &bytes
+}
+
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
 // unsafe opt-in. Stored plans keep the planner's unsafe metadata; drop remains
 // fail-closed so older plans without the metadata cannot queue table deletion as
@@ -1825,6 +1837,13 @@ type Task struct {
 	RowsTotal       int64 // Total rows to copy
 	ProgressPercent int   // 0-100
 	ETASeconds      int   // Estimated seconds remaining
+	// EstimatedBytes is the planner's approximate on-disk footprint of the
+	// table (data plus indexes), copied from the plan change this task was
+	// created from so progress can show the table's scale beside its row
+	// counts. Display only and written once: progress updates never change
+	// it. Nil when the plan had no estimate, and for per-shard rows, since a
+	// plan's estimate covers the whole table.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
