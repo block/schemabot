@@ -146,7 +146,7 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 	for _, count := range p.ChangeCounts {
 		total += count
 	}
-	if total == 0 && p.VSchemaChangeCount == 0 {
+	if total == 0 && p.VSchemaChangeCount == 0 && p.FinalizeCount == 0 {
 		return "no changes"
 	}
 
@@ -163,6 +163,9 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 	}
 	if p.VSchemaChangeCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d vschema", p.VSchemaChangeCount))
+	}
+	if p.FinalizeCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d finalize", p.FinalizeCount))
 	}
 	if p.UnsafeCount > 0 {
 		parts = append(parts, markerWithCount(glyph.Attention, p.UnsafeCount))

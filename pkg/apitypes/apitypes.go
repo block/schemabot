@@ -888,6 +888,10 @@ type PlanSummaryResponse struct {
 	BlockedCount int `json:"blocked_count,omitempty"`
 	// VSchemaChangeCount is how many namespaces carry a VSchema change.
 	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
+	// FinalizeCount is how many namespaces the engine asked to finalize once
+	// their DDL lands. A finalizer is work an apply runs, so a plan whose only
+	// work is a finalizer is not a no-change plan.
+	FinalizeCount int `json:"finalize_count,omitempty"`
 }
 
 // PlansResponse is the HTTP response for GET /api/plans.
@@ -1051,7 +1055,7 @@ func (r *PlanResponse) AllChangesDirect() bool {
 		if sc == nil {
 			continue
 		}
-		if sc.HasVSchemaChange() {
+		if sc.HasVSchemaChange() || sc.NeedsFinalizer() {
 			return false
 		}
 		total += len(sc.TableChanges)
@@ -1187,15 +1191,16 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 }
 
 // HasChanges reports whether the plan carries any work an apply would execute:
-// table DDL in any namespace, or a VSchema update. Gates that decide whether a
-// plan is actionable must use this rather than counting table changes alone —
-// a VSchema-only plan has zero table changes but still requires an apply.
+// table DDL in any namespace, a VSchema update, or a finalizer the engine asked
+// for. Gates that decide whether a plan is actionable must use this rather than
+// counting table changes alone — a VSchema-only or finalizer-only plan has zero
+// table changes but still requires an apply.
 func (r *PlanResponse) HasChanges() bool {
 	for _, sc := range r.Changes {
 		if sc == nil {
 			continue
 		}
-		if len(sc.TableChanges) > 0 || sc.HasVSchemaChange() {
+		if len(sc.TableChanges) > 0 || sc.HasVSchemaChange() || sc.NeedsFinalizer() {
 			return true
 		}
 	}
