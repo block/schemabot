@@ -389,6 +389,56 @@ func TestOutputMultiEnvPlanResult_BothNoChanges(t *testing.T) {
 	assert.Equal(t, 2, noChangesCount, "Expected 2 'No schema changes detected' messages")
 }
 
+// Staging and production share a plan but a third environment drops a column.
+// The plan renders one section per environment so the third environment's
+// DROP COLUMN is shown rather than folded under the shared plan's heading.
+// When all three plans match, they still collapse into one combined section.
+func TestOutputMultiEnvPlanResult_ThreeEnvironments(t *testing.T) {
+	addIndex := func() *apitypes.PlanResponse {
+		return planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+			DDL:        "ALTER TABLE users ADD INDEX idx_email (email)",
+			ChangeType: "ALTER",
+			TableName:  "users",
+		})
+	}
+	dropColumn := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		DDL:        "ALTER TABLE users DROP COLUMN nickname",
+		ChangeType: "ALTER",
+		TableName:  "users",
+	})
+
+	t.Run("one environment differs", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    dropColumn,
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.NotContains(t, output, "Staging & Production & Sandbox")
+		assert.Contains(t, output, "\nSandbox\n     ~ users\n       ALTER TABLE users DROP COLUMN nickname;")
+		assert.Equal(t, 2, strings.Count(output, "ADD INDEX idx_email (email)"), "staging and production each render their own ADD INDEX")
+	})
+
+	t.Run("all environments match", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    addIndex(),
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.Contains(t, output, "Staging & Production & Sandbox")
+		assert.Equal(t, 1, strings.Count(output, "ADD INDEX idx_email (email)"), "the shared plan renders once")
+	})
+}
+
 func TestSortEnvironments(t *testing.T) {
 	tests := []struct {
 		name     string

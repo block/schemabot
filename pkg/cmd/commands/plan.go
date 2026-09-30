@@ -172,10 +172,11 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 	stagingHasChanges := hasResultChanges(stagingResult)
 	productionHasChanges := hasResultChanges(productionResult)
 
-	// Check if staging and production have identical plans
+	// Check if every environment has the same plan as staging, so the combined
+	// section below never hides an environment whose plan differs.
 	bothConfigured := stagingResult != nil && productionResult != nil
 	plansIdentical := bothConfigured && stagingHasChanges && productionHasChanges &&
-		planFingerprint(stagingResult) == planFingerprint(productionResult)
+		everyPlanMatches(results, stagingResult)
 
 	// Header box (title + database only, environment shown below)
 	templates.WritePlanHeader(templates.PlanHeaderData{
@@ -351,6 +352,18 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 // hasResultChanges returns true if the result has schema changes (DDL or VSchema).
 func hasResultChanges(result *apitypes.PlanResponse) bool {
 	return result != nil && result.HasChanges()
+}
+
+// everyPlanMatches reports whether every environment's plan fingerprints the
+// same as reference, which is what lets them render as one combined section.
+func everyPlanMatches(results map[string]*apitypes.PlanResponse, reference *apitypes.PlanResponse) bool {
+	want := planFingerprint(reference)
+	for _, result := range results {
+		if result == nil || planFingerprint(result) != want {
+			return false
+		}
+	}
+	return true
 }
 
 // sortEnvironments sorts environments with staging first, production second, then alphabetically.
