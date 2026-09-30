@@ -415,6 +415,18 @@ func isPlanOnlySuccessful(check *storage.Check) bool {
 		!check.HasChanges
 }
 
+// checkApplyLeasePredicate renders the lease guard a terminal check write
+// carries when the apply's driver holds its lease. It binds the apply ID, then
+// the lease token. The applies row is read through a subquery of an UPDATE on
+// checks, so the token check goes through LeaseSourceFence: it serializes
+// against a concurrent steal instead of passing against a token the
+// statement's snapshot still holds, at whatever isolation level the storage
+// session runs.
+func checkApplyLeasePredicate(d Dialect) string {
+	return " AND EXISTS (SELECT 1 FROM applies lease_apply WHERE lease_apply.id = ? AND " +
+		d.LeaseSourceFence("applies", "lease_apply", "id", "lease_token") + ")"
+}
+
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
@@ -429,12 +441,7 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		checkStatusInProgress, apply.ID, apply.ID}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 
@@ -507,12 +514,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 	}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 
@@ -579,12 +581,7 @@ func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storag
 		apply.ID, apply.ID, apply.ID, state.Task.Completed}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 

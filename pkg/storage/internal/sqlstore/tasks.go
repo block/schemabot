@@ -377,9 +377,9 @@ const shardTaskInsertColumns = `
 	started_at, completed_at, created_at, updated_at`
 
 // shardTaskInsertValues returns the placeholder list and value args for a
-// per-shard task INSERT ... SELECT, matching shardTaskInsertColumns. The caller
-// appends its own lease-guard ("FROM <lease table> WHERE ... lease_token = ?")
-// and the guard's args.
+// per-shard task INSERT ... SELECT, matching shardTaskInsertColumns.
+// shardTaskInsertStatement renders the lease guard; the caller appends the
+// guard's args.
 func shardTaskInsertValues(task *storage.Task) (string, []any) {
 	options := task.Options
 	if len(options) == 0 {
@@ -397,6 +397,19 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 		}
 }
 
+// shardTaskInsertStatement renders a lease-guarded per-shard INSERT … SELECT
+// whose only source row is the lease row, reached through leaseAlias over
+// leaseTable. It binds the values' placeholders, then the lease row's ID, then
+// the lease token. The token check goes through LeaseSourceFence so it
+// serializes against a concurrent steal instead of passing against a token the
+// statement's snapshot still holds, at whatever isolation level the storage
+// session runs.
+func shardTaskInsertStatement(d Dialect, values, leaseTable, leaseAlias string) string {
+	return "INSERT INTO tasks (" + shardTaskInsertColumns + ") SELECT " + values +
+		" FROM " + leaseTable + " " + leaseAlias +
+		" WHERE " + leaseAlias + ".id = ? AND " + d.LeaseSourceFence(leaseTable, leaseAlias, "id", "lease_token")
+}
+
 // insertShardTaskGuarded inserts a new per-shard task row only while the
 // operation lease is still current. The INSERT ... SELECT ... WHERE the
 // operation's lease_token matches means a displaced operator inserts zero rows
@@ -404,12 +417,8 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Task, opLease storage.OperationLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, opLease.OperationID, opLease.Token)
-	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
-		INSERT INTO tasks (`+shardTaskInsertColumns+`)
-		SELECT `+values+`
-		FROM apply_operations ao
-		WHERE ao.id = ? AND ao.lease_token = ?
-	`, args...)
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
+		shardTaskInsertStatement(s.dialect, values, "apply_operations", "ao"), args...)
 	if err != nil {
 		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q: %w",
 			opLease.OperationID, task.Namespace, task.TableName, task.Shard, err)
@@ -430,12 +439,8 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *storage.Task, lease storage.ApplyLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, lease.ApplyID, lease.Token)
-	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
-		INSERT INTO tasks (`+shardTaskInsertColumns+`)
-		SELECT `+values+`
-		FROM applies a
-		WHERE a.id = ? AND a.lease_token = ?
-	`, args...)
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
+		shardTaskInsertStatement(s.dialect, values, "applies", "a"), args...)
 	if err != nil {
 		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q: %w",
 			lease.ApplyID, task.Namespace, task.TableName, task.Shard, err)

@@ -92,11 +92,12 @@ type Dialect interface {
 	// joined table may be the table the statement modifies.
 	LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string
 	// LeaseSourceFence is LeaseTokenFence for the WHERE clause of an
-	// INSERT … SELECT whose source is the lease row, reached through sourceAlias
-	// over sourceTable. It carries the same serialization contract, and it must
-	// hold at every isolation level the session may run at: a dialect that
-	// reads INSERT … SELECT source rows without locks under some isolation
-	// level must lock the row explicitly.
+	// INSERT … SELECT whose source is the lease row, or of a subquery that reads
+	// the lease row inside a statement that writes another table, reached
+	// through sourceAlias over sourceTable. It carries the same serialization
+	// contract, and it must hold at every isolation level the session may run
+	// at: a dialect that reads those source rows without locks under some
+	// isolation level must lock the row explicitly.
 	LeaseSourceFence(sourceTable, sourceAlias, idColumn, tokenColumn string) string
 }
 
