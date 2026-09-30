@@ -2920,6 +2920,22 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return dispatchApplyResponse(apply, winner.ID, operationKey), nil
 	case errors.Is(err, storage.ErrApplyNotActive):
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
+		// A dispatch that names its rollout member target and one that does not
+		// derive different keys for the same target's work, so without the
+		// refusal a replay under the other shape would attach a second copy of
+		// that target's DDL instead of resolving to its operation.
+		c.logger.Warn("Apply: refusing operation whose target keying disagrees with the deployment's existing operations; dispatch is rejected",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"member_target", scope.memberTarget,
+				"plan_target", plan.Target,
+				"idempotency_key", req.IdempotencyKey,
+				"error", err)...)
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("operation %s cannot attach to apply %s: a dispatch naming its rollout member target and one that does not cannot share one deployment's apply", operationKey, apply.ApplyIdentifier),
+		}, nil
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
