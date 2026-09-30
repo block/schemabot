@@ -76,8 +76,6 @@ func TestDirectPolicyFromMetadata_Enabled(t *testing.T) {
 	assert.Zero(t, policy.MaxTableBytes, "a policy without the byte key sets no byte bound")
 }
 
-// The byte bound is an optional second bound carried alongside the row bound:
-// set, both resolve onto the policy.
 // A byte bound is a complete policy on its own.
 func TestDirectPolicyFromMetadata_ByteBound(t *testing.T) {
 	policy, err := directPolicyFromMetadata(map[string]string{
