@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -716,6 +717,8 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailedTargetsAreNamed(t *test
 // A table copying on several targets shows its planned size summed across
 // them, since each target copies its own data. The total is left off when any
 // target has no estimate or has reported nothing, rather than understating it.
+// A failed target's rows are left out of the sum, but its data is still part
+// of the table, so beside the partial rows the size names every target.
 func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *testing.T) {
 	sized := func(detail *ApplyStatusCommentData, bytes int64) *ApplyStatusCommentData {
 		detail.Tables[0].EstimatedBytes = &bytes
@@ -737,6 +740,14 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *
 		targetDetail("testapp_002", state.Task.Running, addNote, 250),
 	)
 	assert.Contains(t, out, "- Rows: 750 / 2,000 · ETA: "+ui.FormatETA(500)+"\n")
+
+	withFailed := append(slices.Clone(ops), parallelTarget("primary", "testapp-003", so.Failed))
+	out = renderTargets(presentation.Derive(withFailed),
+		sized(targetDetail("testapp_001", state.Task.Running, addNote, 500), 1_500_000_000),
+		sized(targetDetail("testapp_002", state.Task.Running, addNote, 250), 1_500_000_000),
+		sized(targetDetail("testapp_003", state.Task.Failed, addNote, 0), 2_000_000_000),
+	)
+	assert.Contains(t, out, "- Rows: 750 / 2,000 across 2 of 3 targets · ~5 GB across all 3 targets · ETA: "+ui.FormatETA(500)+"\n")
 }
 
 func TestTargetsTableBytes(t *testing.T) {

@@ -177,10 +177,19 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		if pct := ui.RowCopyDisplayPercent(int(copied*100/total), copied); pct > 0 {
 			fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
 			line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
-			if reporting < len(cells)+silent {
+			partial := reporting < len(cells)+silent
+			if partial {
 				line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
 			}
-			line += ui.FormatTableSizeClause(targetsTableBytes(cells, silent))
+			// The planned size is every target's, including those left out of
+			// the rows, so beside partial rows it names the full span rather
+			// than reading as the reporting targets' size.
+			if size := targetsTableBytes(cells, silent); size != nil {
+				line += ui.FormatTableSizeClause(size)
+				if partial {
+					line += fmt.Sprintf(" across all %d targets", len(cells))
+				}
+			}
 			if eta > 0 {
 				floor := ""
 				if unreported+silent > 0 {
