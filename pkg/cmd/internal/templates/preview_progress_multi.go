@@ -68,6 +68,8 @@ func previewCLIMultiDeployAllOutput() {
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", previewCLIMultiDeploymentApplyFailed},
 		{"HALT ON FAILURE (A SIBLING IS STILL RUNNING)", previewCLIMultiDeploymentApplyHaltedWithLiveSibling},
 		{"ALL DEPLOYMENTS COMPLETED", previewCLIMultiDeploymentApplyCompleted},
+		{"MULTI-TARGET ROLLOUT PAST A FAILED TARGET", previewCLIMultiTargetRolloutInProgress},
+		{"MULTI-TARGET ROLLOUT WAITING FOR CUTOVER", previewCLIMultiTargetRolloutWaitingForCutover},
 	}
 	for i, section := range sections {
 		if i > 0 {
@@ -76,6 +78,57 @@ func previewCLIMultiDeployAllOutput() {
 		fmt.Printf("--- %s ---\n\n", section.name)
 		section.fn()
 	}
+}
+
+// previewCLIMultiTargetRolloutInProgress is one deployment of 64 targets
+// continuing past a failed one: 40 done, 19 copying, 4 not started.
+func previewCLIMultiTargetRolloutInProgress() {
+	var ops []ProgressOperation
+	var tables []TableProgress
+	for i := range 64 {
+		target := fmt.Sprintf("payments-%03d", i+1)
+		op := ProgressOperation{Deployment: "prod", Target: target, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue}
+		table := TableProgress{Deployment: "prod", Target: target, TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", RowsTotal: 80000}
+		switch {
+		case i < 40:
+			op.State, table.Status, table.RowsCopied, table.PercentComplete = state.ApplyOperation.Completed, state.Task.Completed, 80000, 100
+		case i == 40:
+			op.State, op.ErrorMessage, op.ExternalID = state.ApplyOperation.Failed, "duplicate key name 'idx_orders_source'", "spirit-apply-041"
+			table.Status, table.RowsCopied, table.PercentComplete = state.Task.Failed, 12000, 15
+		case i < 60:
+			copied := int64(20000 + (i-41)*3000)
+			op.State, table.Status, table.RowsCopied, table.PercentComplete, table.ETASeconds = state.ApplyOperation.Running, state.Task.Running, copied, int(copied*100/80000), int64(600-(i-41)*25)
+		default:
+			op.State = state.ApplyOperation.Pending
+			ops = append(ops, op)
+			continue
+		}
+		ops = append(ops, op)
+		tables = append(tables, table)
+	}
+	data := multiDeploymentProgressData(ops, tables)
+	data.State = state.Apply.RunningDegraded
+	WriteProgress(data)
+}
+
+// previewCLIMultiTargetRolloutWaitingForCutover is three targets holding at
+// the cutover gate, one of which holds a schema of its own and so runs a
+// different change.
+func previewCLIMultiTargetRolloutWaitingForCutover() {
+	var ops []ProgressOperation
+	var tables []TableProgress
+	for i, ddl := range []string{
+		"ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL",
+		"ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL",
+		"ALTER TABLE `orders` MODIFY COLUMN `source` varchar(32) DEFAULT NULL",
+	} {
+		target := fmt.Sprintf("payments-%03d", i+1)
+		ops = append(ops, ProgressOperation{Deployment: "prod", Target: target, State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt})
+		tables = append(tables, TableProgress{Deployment: "prod", Target: target, TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.WaitingForCutover, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100})
+	}
+	data := multiDeploymentProgressData(ops, tables)
+	data.State = state.Apply.WaitingForCutover
+	WriteProgress(data)
 }
 
 func multiDeploymentProgressData(ops []ProgressOperation, tables []TableProgress) ProgressData {

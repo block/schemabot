@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -25,6 +26,21 @@ const maxShardDetail = 8
 // For large shard counts (>maxShardDetail), only shows non-terminal shards
 // plus a collapsed count for complete/queued shards.
 func FormatShardProgress(shards []ShardProgress) string {
+	return formatPartProgress(shards, presentation.ShardNoun)
+}
+
+// formatTableParts renders a table's per-part progress: its shards, or its
+// targets when the table stands for one change across a rollout's targets.
+func formatTableParts(t TableProgress) string {
+	if t.AcrossTargets {
+		return formatPartProgress(t.Shards, presentation.TargetNoun)
+	}
+	return formatPartProgress(t.Shards, presentation.ShardNoun)
+}
+
+// formatPartProgress renders the parts one table's change runs across — the
+// shards of a keyspace or the targets of a rollout — named by noun.
+func formatPartProgress(shards []ShardProgress, noun presentation.Noun) string {
 	if len(shards) == 0 {
 		return ""
 	}
@@ -33,7 +49,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 
 	c := CountShardsByStatus(shards)
 	parts := FormatShardSummaryParts(c, false)
-	fmt.Fprintf(&b, indentShardHeader+"%sShards: %d (%s)%s\n", ANSIDim, len(shards), strings.Join(parts, ", "), ANSIReset)
+	fmt.Fprintf(&b, indentShardHeader+"%s%s: %d (%s)%s\n", ANSIDim, ui.CapitalizeFirst(noun.Plural), len(shards), strings.Join(parts, ", "), ANSIReset)
 
 	// For small shard counts, show all shards
 	if len(shards) <= maxShardDetail {
@@ -97,8 +113,8 @@ func FormatShardProgress(shards []ShardProgress) string {
 		b.WriteString(formatShardLine(s))
 	}
 	if len(copying) > maxCopyingShown {
-		fmt.Fprintf(&b, indentShardMore+"%s... %d more copying shards%s\n",
-			ANSIDim, len(copying)-maxCopyingShown, ANSIReset)
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more copying %s%s\n",
+			ANSIDim, len(copying)-maxCopyingShown, noun.Plural, ANSIReset)
 	}
 
 	// Summarize remaining shards not individually shown

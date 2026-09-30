@@ -1195,13 +1195,13 @@ func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAc
 // The rollout decides whether stop still has to follow its footer from the
 // states the single-deployment footer offers stop in, so the two must agree on
 // every apply state; otherwise stop is either lost or written twice.
-func TestApplyFooterOffersStopMatchesTheApplyFooter(t *testing.T) {
+func TestOffersStopMatchesTheApplyFooter(t *testing.T) {
 	for _, field := range reflect.ValueOf(state.Apply).Fields() {
 		applyState := field.String()
 		t.Run(applyState, func(t *testing.T) {
 			var sb strings.Builder
 			writeApplyFooter(&sb, ApplyStatusCommentData{State: applyState, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit})
-			assert.Equal(t, strings.Contains(sb.String(), "schemabot stop "), applyFooterOffersStop(applyState), sb.String())
+			assert.Equal(t, strings.Contains(sb.String(), "schemabot stop "), presentation.OffersStop(applyState), sb.String())
 		})
 	}
 }

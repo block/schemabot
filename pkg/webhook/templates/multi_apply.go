@@ -254,7 +254,7 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	}
 	if !actionPending && !paused {
 		writeApplyFooter(sb, footer)
-		if applyFooterOffersStop(footer.State) {
+		if presentation.OffersStop(footer.State) {
 			return
 		}
 	}
@@ -265,7 +265,7 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	}
 	// A paused rollout always offers stop beside release; otherwise stop
 	// follows only a member that is still writing to its target.
-	if !paused && !hasStoppableLiveWork(data.Model.Deployments) {
+	if !paused && !data.Model.HasStoppableLiveWork() {
 		return
 	}
 	label, command := rolloutStopAction(footer)
@@ -313,32 +313,6 @@ func rolloutFooterData(data MultiDeploymentApplyData) ApplyStatusCommentData {
 		footer.Tables = append(footer.Tables, detail.Tables...)
 	}
 	return footer
-}
-
-// applyFooterOffersStop reports whether writeApplyFooter writes the stop (or
-// cancel) command for an apply in state s: the running family, the PlanetScale
-// setup phases, and an apply retrying a failed table.
-func applyFooterOffersStop(s string) bool {
-	return state.IsRunningApplyState(s) || state.IsState(s,
-		state.Apply.FailedRetryable,
-		state.Apply.PreparingBranch,
-		state.Apply.ApplyingBranchChanges,
-		state.Apply.ValidatingBranch,
-		state.Apply.CreatingDeployRequest,
-		state.Apply.ValidatingDeployRequest)
-}
-
-// hasStoppableLiveWork reports whether any member is still writing to its
-// target in a state where the single-deployment footer offers stop. A member
-// waiting for cutover is left out, as it is from that footer, so a rollout
-// whose members only wait for cutover keeps the cutover as its one command.
-func hasStoppableLiveWork(deployments []presentation.Deployment) bool {
-	for _, d := range deployments {
-		if applyFooterOffersStop(d.State) {
-			return true
-		}
-	}
-	return false
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived

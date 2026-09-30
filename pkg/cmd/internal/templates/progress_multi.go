@@ -3,7 +3,6 @@ package templates
 import (
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/glyph"
@@ -15,21 +14,37 @@ import (
 
 func writeMultiDeploymentProgress(data ProgressData) {
 	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+	groups := model.Groups()
+	view := RolloutView{
+		ApplyID:     data.ApplyID,
+		Environment: data.Environment,
+		Engine:      data.Engine,
+		Operations:  data.Operations,
+		Model:       model,
+		Tables:      data.Tables,
+		SetupPhase:  state.IsSetupPhase(data.State),
+	}
 
-	writeMultiDeploymentHeader(data, model)
+	writeMultiDeploymentHeader(data, model, groups)
 	writeMultiDeploymentFirstFailure(model.FirstFailure)
-	writeMultiDeploymentNextAction(model.NextAction)
 	fmt.Println()
 
-	// Derive returns one Deployment per input operation, in input order, so
-	// model.Deployments[i] is the projection of data.Operations[i]. Pairing them
-	// by index lets each section render its own operation's identifiers — a
-	// keyed apply has many operations on the same deployment name, so a
-	// name-based lookup cannot tell the sections apart.
-	for i, deployment := range model.Deployments {
-		writeDeploymentProgressSection(deployment, data.Operations[i], data)
+	// A deployment that addresses several targets renders as one rollup
+	// section; any other member keeps a section of its own. Group members
+	// index model.Deployments, which Derive returns index-parallel to
+	// data.Operations, so each section renders its own operation's
+	// identifiers — a keyed apply has many operations on the same deployment
+	// name, so a name-based lookup cannot tell the sections apart.
+	for _, g := range groups {
+		if len(g.Members) > 1 {
+			fmt.Print(FormatTargetRollup(view, g))
+			continue
+		}
+		i := g.Members[0]
+		writeDeploymentProgressSection(model.Deployments[i], data.Operations[i], data)
 	}
 	fmt.Print(FormatThrottleReference(data.Tables))
+	fmt.Print(FormatRolloutFooter(view))
 }
 
 // ProgressOperationsForPresentation maps the parsed progress operations to the
@@ -61,7 +76,7 @@ func ProgressOperationsForPresentation(ops []ProgressOperation, released bool) [
 	return presentationOps
 }
 
-func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
+func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply, groups []presentation.Group) {
 	rows := []BoxRow{}
 	if data.ApplyID != "" {
 		rows = append(rows, BoxRow{"Apply ID", data.ApplyID})
@@ -79,18 +94,10 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
 	if dur := formatApplyDuration(data.StartedAt, data.CompletedAt); dur != "-" {
 		rows = append(rows, BoxRow{"Duration", dur})
 	}
-	if counts := formatDeploymentCounts(model.Counts); counts != "" {
-		rows = append(rows, BoxRow{"Deployments", counts})
+	if counts := FormatStateCounts(model.Counts); counts != "" {
+		rows = append(rows, BoxRow{RolloutCountsUnit(groups), counts})
 	}
 	WriteBox(rows, "State", stateColorFunc(model.State))
-}
-
-func formatDeploymentCounts(counts []presentation.StateCount) string {
-	parts := make([]string, 0, len(counts))
-	for _, count := range counts {
-		parts = append(parts, fmt.Sprintf("%d %s", count.Count, count.Label))
-	}
-	return strings.Join(parts, " · ")
 }
 
 func writeMultiDeploymentFirstFailure(failure *presentation.Deployment) {
@@ -102,22 +109,6 @@ func writeMultiDeploymentFirstFailure(failure *presentation.Deployment) {
 		return
 	}
 	fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s — %s%s\n", ANSIRed, failure.Name, failure.Error, ANSIReset)
-}
-
-func writeMultiDeploymentNextAction(next presentation.NextAction) {
-	switch next.Kind {
-	case presentation.NextActionCutover:
-		fmt.Printf("\n  Next: cut over %s\n", next.Name)
-	case presentation.NextActionResume:
-		fmt.Println("\n  Next: resume apply")
-	case presentation.NextActionReviewFailure:
-		if next.Name == "" {
-			fmt.Println("\n  Next: review failure")
-			return
-		}
-		fmt.Printf("\n  Next: review failure in %s\n", next.Name)
-	case presentation.NextActionNone:
-	}
 }
 
 func writeDeploymentProgressSection(deployment presentation.Deployment, op ProgressOperation, data ProgressData) {

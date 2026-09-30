@@ -14,31 +14,51 @@ import (
 
 func (m WatchModel) multiDeploymentProgressView() string {
 	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.released))
+	groups := model.Groups()
+	view := templates.RolloutView{
+		ApplyID:     m.applyID,
+		Environment: m.environment,
+		Engine:      m.engine,
+		Operations:  m.operations,
+		Model:       model,
+		Tables:      m.tables,
+		SetupPhase:  state.IsSetupPhase(m.state),
+	}
 
 	var b strings.Builder
-	m.writeMultiDeploymentHeader(&b, model)
+	m.writeMultiDeploymentHeader(&b, model, groups)
 
-	// Derive returns one Deployment per input operation, in input order, so
-	// model.Deployments[i] projects m.operations[i]. Pairing by index lets each
-	// section render its own operation's identifiers; a deployment can own
-	// several operations, so a name-based lookup cannot tell them apart.
-	for i, deployment := range model.Deployments {
-		m.writeDeploymentSection(&b, deployment, m.operations[i])
+	// A deployment that addresses several targets renders as one rollup
+	// section, shared with the progress output; any other member keeps a
+	// section of its own. Group members index model.Deployments, which Derive
+	// returns index-parallel to m.operations, so each section renders its own
+	// operation's identifiers; a deployment can own several operations, so a
+	// name-based lookup cannot tell them apart.
+	for _, g := range groups {
+		if len(g.Members) > 1 {
+			b.WriteString(templates.FormatTargetRollup(view, g))
+			continue
+		}
+		i := g.Members[0]
+		m.writeDeploymentSection(&b, model.Deployments[i], m.operations[i])
 	}
 
 	b.WriteString(templates.FormatThrottleReference(m.tables))
+	if footer := templates.FormatRolloutFooter(view); footer != "" {
+		b.WriteString(footer + "\n")
+	}
 	m.writeMultiDeploymentFooter(&b, model)
 	return b.String()
 }
 
-func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply) {
+func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
 	if state.IsRunningApplyState(model.State) || state.IsState(model.State, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
 		b.WriteString(m.spinner.View() + model.Label + m.elapsed() + "\n")
 	} else {
 		b.WriteString(model.Label + "\n")
 	}
-	if counts := formatTUIDeploymentCounts(model.Counts); counts != "" {
-		b.WriteString(counts + "\n")
+	if counts := templates.FormatStateCounts(model.Counts); counts != "" {
+		fmt.Fprintf(b, "%s: %s\n", templates.RolloutCountsUnit(groups), counts)
 	}
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
@@ -55,14 +75,6 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 		fmt.Fprintf(b, "Environment: %s\n", m.environment)
 	}
 	b.WriteString("\n")
-}
-
-func formatTUIDeploymentCounts(counts []presentation.StateCount) string {
-	parts := make([]string, 0, len(counts))
-	for _, count := range counts {
-		parts = append(parts, fmt.Sprintf("%d %s", count.Count, count.Label))
-	}
-	return strings.Join(parts, " · ")
 }
 
 func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment, op templates.ProgressOperation) {

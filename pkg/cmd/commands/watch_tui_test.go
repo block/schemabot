@@ -725,10 +725,11 @@ func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "500")
 }
 
-// Two targets of one deployment each copy the same tables against their own
-// schema. The watch view lists each member's own copies under that member, so a
+// Two targets of one deployment each copy their own tables against their own
+// schema. The watch view rolls the deployment up the way the progress output
+// does, listing each table once under the targets that copied it, so a
 // deployment addressing several targets does not show every copy twice.
-func TestWatchModel_MultiTargetSectionsScopeTablesToTheirMember(t *testing.T) {
+func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testapp", "production", false)
 	m.applyID = "apply-multi-target"
 	m.state = state.Apply.Running
@@ -745,10 +746,15 @@ func TestWatchModel_MultiTargetSectionsScopeTablesToTheirMember(t *testing.T) {
 	view := m.View()
 
 	assertContainsInOrder(t, view,
-		"primary/testapp-001",
+		"Targets: 1 completed · 1 running",
+		"primary — 1 completed · 1 running (2 targets)",
+		"target testapp-001",
 		"users_001",
-		"primary/testapp-002",
+		"target testapp-002",
 		"users_002",
+		"To stop this schema change:",
+		"schemabot stop apply-multi-target -e production",
+		"ESC to detach",
 	)
 	assert.Equal(t, 1, strings.Count(view, "users_001"))
 	assert.Equal(t, 1, strings.Count(view, "users_002"))
