@@ -286,55 +286,101 @@ func unsizedTarget(target, table string) TargetTableSize {
 }
 
 // Each target of a rollout copies its own data. A table two targets change is
-// shown with its total and each target's size, in rollout order, so the
+// shown with its total and its largest size with that target named, so the
 // operator sees where the build runs longest rather than the reviewed
-// target's size alone. The section renders on the target-plan layout, where
-// each target group's plan is shown under its own heading.
-func TestRenderPlanComment_TwoTargetSizesShowTotalAndEachTarget(t *testing.T) {
+// target's size alone, and a collapsed breakdown lists both targets' sizes.
+func TestRenderPlanComment_TwoTargetSizesNameLargestTarget(t *testing.T) {
 	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
 		targetSize("primary/testapp_1", "orders", 1_130_000_000),
 		targetSize("primary/testapp_2", "orders", 23_400_000_000),
 	}))
 
-	assert.Contains(t, out, "📊 **Table sizes**:\n- `orders`: ~24.5 GB across 2 targets (~1.1 GB on `primary/testapp_1`, ~23.4 GB on `primary/testapp_2`)\n\n")
+	assert.Contains(t, out, "📊 **Table sizes**:\n- `orders`: ~24.5 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~1.1 GB\n\n")
+	assert.Contains(t, out, "<details>\n<summary>Size on each target</summary>\n\n"+
+		"- `orders`\n"+
+		"  - `primary/testapp_2`: ~23.4 GB\n"+
+		"  - `primary/testapp_1`: ~1.1 GB\n"+
+		"\n</details>\n\n📋 **Plan**:")
 }
 
-// When one of two targets reports no estimate, its size is named as
-// unavailable and no total is given, since the total would understate the
-// table.
+// When one of two targets reports no estimate, the known size is shown on its
+// target and the other target is named as unavailable.
 func TestRenderPlanComment_TwoTargetSizesNameTargetWithoutEstimate(t *testing.T) {
 	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
-		targetSize("primary/testapp_1", "orders", 1_130_000_000),
-		unsizedTarget("primary/testapp_2", "orders"),
+		unsizedTarget("primary/testapp_1", "orders"),
+		targetSize("primary/testapp_2", "orders", 1_130_000_000),
 	}))
 
-	assert.Contains(t, out, "- `orders`: ~1.1 GB on `primary/testapp_1`, size estimate unavailable on `primary/testapp_2`\n")
-	assert.NotContains(t, out, "across 2 targets")
+	assert.Contains(t, out, "- `orders`: ~1.1 GB on `primary/testapp_2` · size estimate unavailable on `primary/testapp_1`\n")
+	assert.Contains(t, out, "  - `primary/testapp_2`: ~1.1 GB\n  - `primary/testapp_1`: size estimate unavailable\n",
+		"a target with no estimate is listed after every sized target")
+	assert.NotContains(t, out, "largest", "one sized target has no largest or smallest to compare")
 }
 
-// Past two targets the line gives the total alone: a list of every target's
-// size would bury the figure the operator reads first.
-func TestRenderPlanComment_ThreeTargetSizesShowTotalOnly(t *testing.T) {
+// At three or more targets the line still names the largest target, which is
+// the one that bounds how long the rollout's copy runs, whatever position it
+// holds in rollout order.
+func TestRenderPlanComment_ThreeTargetSizesNameLargestTarget(t *testing.T) {
 	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
 		targetSize("primary/testapp_1", "orders", 100_000_000),
 		targetSize("primary/testapp_2", "orders", 23_400_000_000),
 		targetSize("primary/testapp_3", "orders", 1_130_000_000),
 	}))
 
-	assert.Contains(t, out, "- `orders`: ~24.6 GB across 3 targets\n")
-	assert.NotContains(t, out, "on `primary/testapp_2`", "past two targets no target is broken out")
+	assert.Contains(t, out, "- `orders`: ~24.6 GB across 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~100 MB\n")
+	assert.Contains(t, out, "- `orders`\n"+
+		"  - `primary/testapp_2`: ~23.4 GB\n"+
+		"  - `primary/testapp_3`: ~1.1 GB\n"+
+		"  - `primary/testapp_1`: ~100 MB\n")
 }
 
-// A target with no estimate is counted, since the total then covers only the
-// targets that reported one.
-func TestRenderPlanComment_ThreeTargetSizesCountTargetsWithoutEstimate(t *testing.T) {
-	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+// A target with no estimate is named, since the total then covers only the
+// targets that reported one; several such targets are counted instead.
+func TestRenderPlanComment_ThreeTargetSizesNameTargetsWithoutEstimate(t *testing.T) {
+	one := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
 		targetSize("primary/testapp_1", "orders", 1_130_000_000),
 		unsizedTarget("primary/testapp_2", "orders"),
 		targetSize("primary/testapp_3", "orders", 23_400_000_000),
 	}))
+	assert.Contains(t, one, "- `orders`: ~24.5 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_3` · smallest ~1.1 GB · size estimate unavailable on `primary/testapp_2`\n")
 
-	assert.Contains(t, out, "- `orders`: ~24.5 GB across 2 of 3 targets; 1 has no estimate\n")
+	two := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		unsizedTarget("primary/testapp_1", "orders"),
+		unsizedTarget("primary/testapp_2", "orders"),
+		targetSize("primary/testapp_3", "orders", 23_400_000_000),
+	}))
+	assert.Contains(t, two, "- `orders`: ~23.4 GB on `primary/testapp_3` · size estimate unavailable on 2 targets\n")
+}
+
+// The per-target breakdown lists at most tableSizesListedLimit target sizes,
+// largest first, since collapsed lines still count toward the comment size
+// limit, and counts the rest: the targets of the table it stopped in, then
+// the tables it did not reach.
+func TestRenderPlanComment_TableSizesByTargetIsCapped(t *testing.T) {
+	const targets = tableSizesListedLimit + 10
+	var sizes []TargetTableSize
+	for _, table := range []string{"orders", "users", "carts"} {
+		for i := range targets {
+			sizes = append(sizes, targetSize(fmt.Sprintf("primary/orders-%03d", i+1), table, int64(i+1)*1_000_000))
+		}
+	}
+	out := RenderPlanComment(multiTargetSizePlanData(sizes))
+
+	assert.Contains(t, out, fmt.Sprintf("- `orders`: ~1.8 GB across %d targets · largest ~60 MB on `primary/orders-%03d` · smallest ~1 MB\n", targets, targets))
+	assert.Contains(t, out, fmt.Sprintf("- `orders`\n  - `primary/orders-%03d`: ~60 MB\n", targets), "the breakdown leads with the largest target")
+	assert.Contains(t, out, "  - `primary/orders-011`: ~11 MB\n  - …and 10 more targets\n- …and 2 more tables\n\n</details>")
+	assert.NotContains(t, out, "  - `primary/orders-010`:", "targets past the cap are not listed")
+}
+
+// A table only one target changes is left out of the breakdown, since its
+// line already names that target; a rollout with no such table renders none.
+func TestRenderPlanComment_TableSizesByTargetSkipsSingleTargetTables(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/testapp_1", "orders", 100_000),
+		targetSize("primary/testapp_3", "users", 1_130_000_000),
+	}))
+
+	assert.NotContains(t, out, "Size on each target")
 }
 
 func TestRenderPlanComment_MultiTargetSizesUnavailableEverywhere(t *testing.T) {
@@ -389,12 +435,39 @@ func TestRenderPlanComment_MultiTargetFoldedHeadingCountsIncompleteTables(t *tes
 	assert.Contains(t, out, "📊 **Table sizes** (11 tables, largest first; 1 missing an estimate on at least one target):\n- `t11`:")
 }
 
-// A rollup that did not plan every target carries no per-target sizes, so the
-// section falls back to the reviewed plan's own.
-func TestRenderPlanComment_MultiTargetWithoutTargetSizesShowsReviewedPlan(t *testing.T) {
+// A blocked rollup carries no per-target sizes, so the section falls back to
+// the reviewed plan's own, and the heading names the reviewed target so the
+// sizes are not read as the whole rollout's.
+func TestRenderPlanComment_MultiTargetWithoutTargetSizesNamesReviewedTarget(t *testing.T) {
 	data := multiTargetSizePlanData(nil)
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()}
 	out := RenderPlanComment(data)
 
-	assert.Contains(t, out, "- `orders`: ~100 KB\n")
+	assert.Contains(t, out, "📊 **Table sizes** (reviewed target `primary/testapp_1` only; other targets not shown):\n- `orders`: ~100 KB\n\n")
+	assert.NotContains(t, out, "Size on each target")
+}
+
+// A rollup that could not be computed names no members, so the heading scopes
+// the sizes to the reviewed target without naming it.
+func TestRenderPlanComment_UncomputedRollupScopesSizesToReviewedTarget(t *testing.T) {
+	data := multiTargetSizePlanData(nil)
+	data.DeploymentDrift = &DeploymentDriftData{Computed: false}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "📊 **Table sizes** (reviewed target only; other targets not shown):\n")
+}
+
+// A folded section on the reviewed-target fallback carries both the table
+// count and the target scope in its heading.
+func TestRenderPlanComment_FoldedReviewedTargetSizesKeepScope(t *testing.T) {
+	order := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"}
+	bytes := map[string]int64{}
+	for i, name := range order {
+		bytes[name] = int64(i+1) * 1_000_000
+	}
+	data := tableSizePlanData(sizedTables(bytes, order))
+	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "📊 **Table sizes** (11 tables, largest first; reviewed target `primary/testapp_1` only; other targets not shown):\n- `k`:")
 }

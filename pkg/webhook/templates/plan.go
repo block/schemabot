@@ -1263,16 +1263,12 @@ const tableSizesInlineLimit = 10
 // folded: the largest, since they bound how long the apply runs.
 const tableSizesLargestShown = 5
 
-// tableSizesPerTargetLimit is the most rollout targets a size line breaks
-// down one by one. Past it the line gives the total alone, since a list of
-// every target's size would bury the figure the operator reads first.
-const tableSizesPerTargetLimit = 2
-
 // tableSizesListedLimit caps how many tables a folded size section lists in
-// total, visible and collapsed. Collapsed lines still count toward GitHub's
-// comment size limit, and a plan that indexes thousands of tables would
-// otherwise spend on sizes the room its DDL needs. Tables past the cap are
-// counted in the heading and in a closing line instead.
+// total, visible and collapsed, and how many target sizes the per-target
+// breakdown lists. Collapsed lines still count toward GitHub's comment size
+// limit, and a plan that indexes thousands of tables, or a rollout of many
+// targets, would otherwise spend on sizes the room its DDL needs. Entries
+// past the cap are counted in a closing line instead.
 const tableSizesListedLimit = 50
 
 // tableSizeEntry is one line of the size section: the table's display name,
@@ -1349,22 +1345,61 @@ func (e tableSizeEntry) hasAnyEstimate() bool {
 // probe when none ran. Table names carry
 // their keyspace when the plan spans more than one keyspace with sizes, so a
 // shared table name stays unambiguous.
+//
+// A rollout whose targets were all planned shows each table across every
+// target that changes it, followed by a collapsed breakdown of each target's
+// size. A rollout without per-target sizes shows the reviewed plan's sizes,
+// and the heading names the reviewed target so they are not read as the
+// whole rollout's.
 func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
 	entries := tableSizeEntries(data.Changes)
+	var scope string
 	multiTarget := data.DeploymentDrift != nil && len(data.DeploymentDrift.TableSizes) > 0
-	if multiTarget {
+	switch {
+	case multiTarget:
 		entries = targetTableSizeEntries(data.DeploymentDrift.TableSizes)
+	case data.DeploymentDrift != nil:
+		scope = reviewedTargetSizeScope(data.DeploymentDrift)
 	}
 	if !slices.ContainsFunc(entries, tableSizeEntry.hasAnyEstimate) {
 		return
 	}
 	if len(entries) <= tableSizesInlineLimit {
-		sb.WriteString("📊 **Table sizes**:\n")
+		sb.WriteString(tableSizesHeading(scope))
 		writeTableSizeLines(sb, entries)
 		sb.WriteString("\n")
-		return
+	} else {
+		entries = slices.Clone(entries)
+		slices.SortStableFunc(entries, compareTableSizesLargestFirst)
+		writeFoldedTableSizes(sb, entries, multiTarget, scope)
 	}
-	writeFoldedTableSizes(sb, entries, multiTarget)
+	if multiTarget {
+		writeTableSizesByTarget(sb, entries)
+	}
+}
+
+// tableSizesHeading renders the section's heading line, with its qualifiers,
+// if any, in parentheses.
+func tableSizesHeading(qualifiers ...string) string {
+	qualifiers = slices.DeleteFunc(qualifiers, func(q string) bool { return q == "" })
+	if len(qualifiers) == 0 {
+		return "📊 **Table sizes**:\n"
+	}
+	return fmt.Sprintf("📊 **Table sizes** (%s):\n", strings.Join(qualifiers, "; "))
+}
+
+// reviewedTargetSizeScope names the target whose sizes a rollout's section
+// shows when the rollout carries no per-target sizes: the sizes come from the
+// reviewed plan alone, and a reader would otherwise take them for every
+// target's. The reviewed target is named when the rollup identifies it.
+func reviewedTargetSizeScope(drift *DeploymentDriftData) string {
+	names := driftMemberNames(drift.Deployments)
+	for i, d := range drift.Deployments {
+		if d.Primary {
+			return fmt.Sprintf("reviewed target `%s` only; other targets not shown", names[i])
+		}
+	}
+	return "reviewed target only; other targets not shown"
 }
 
 // tableSizeEntries flattens every keyspace's sized tables into section lines,
@@ -1420,31 +1455,29 @@ func targetTableSizeEntries(sizes []TargetTableSize) []tableSizeEntry {
 }
 
 // writeFoldedTableSizes renders the size section for a plan with more tables
-// than tableSizesInlineLimit. The visible heading carries the table count and,
-// when any table is missing an estimate, how many: a size probe that failed on
-// a large table must stay visible even though its line is folded. The largest
-// tables follow, then the rest in a collapsed block, all ordered largest first.
-// Past tableSizesListedLimit the smallest tables are counted in a closing line
-// rather than listed.
-func writeFoldedTableSizes(sb *strings.Builder, entries []tableSizeEntry, multiTarget bool) {
-	sorted := slices.Clone(entries)
-	slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
-
+// than tableSizesInlineLimit, from entries ordered largest first. The visible
+// heading carries the table count and, when any table is missing an estimate,
+// how many: a size probe that failed on a large table must stay visible even
+// though its line is folded. The largest tables follow, then the rest in a
+// collapsed block. Past tableSizesListedLimit the smallest tables are counted
+// in a closing line rather than listed.
+func writeFoldedTableSizes(sb *strings.Builder, sorted []tableSizeEntry, multiTarget bool, scope string) {
 	incomplete := 0
 	for _, e := range sorted {
 		if e.incomplete() {
 			incomplete++
 		}
 	}
-	heading := fmt.Sprintf("%d tables, largest first", len(sorted))
+	count := fmt.Sprintf("%d tables, largest first", len(sorted))
+	var missing string
 	switch {
 	case incomplete == 0:
 	case multiTarget:
-		heading += fmt.Sprintf("; %d missing an estimate on at least one target", incomplete)
+		missing = fmt.Sprintf("%d missing an estimate on at least one target", incomplete)
 	default:
-		heading += fmt.Sprintf("; %d without a size estimate", incomplete)
+		missing = fmt.Sprintf("%d without a size estimate", incomplete)
 	}
-	fmt.Fprintf(sb, "📊 **Table sizes** (%s):\n", heading)
+	sb.WriteString(tableSizesHeading(count, missing, scope))
 	writeTableSizeLines(sb, sorted[:tableSizesLargestShown])
 
 	rest := sorted[tableSizesLargestShown:]
@@ -1457,6 +1490,51 @@ func writeFoldedTableSizes(sb *strings.Builder, entries []tableSizeEntry, multiT
 	sb.WriteString("\n</details>\n\n")
 }
 
+// writeTableSizesByTarget renders a collapsed breakdown of each table's size on
+// every target that changes it, largest first, in the order the section lists
+// the tables. Each target copies its own data, so the breakdown is where an
+// operator finds which targets an apply will take longest on. Tables a single
+// target changes are left out, since their line already names that target.
+// At most tableSizesListedLimit target sizes are listed across all tables; the
+// rest are counted in closing lines.
+func writeTableSizesByTarget(sb *strings.Builder, entries []tableSizeEntry) {
+	spread := slices.DeleteFunc(slices.Clone(entries), func(e tableSizeEntry) bool { return len(e.perTarget) < 2 })
+	if len(spread) == 0 {
+		return
+	}
+	sb.WriteString("<details>\n<summary>Size on each target</summary>\n\n")
+	remaining := tableSizesListedLimit
+	for i, e := range spread {
+		if remaining == 0 {
+			unlisted := len(spread) - i
+			fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
+			break
+		}
+		fmt.Fprintf(sb, "- `%s`\n", e.name)
+		targets := targetSizesLargestFirst(e.perTarget)
+		shown := min(len(targets), remaining)
+		for _, ts := range targets[:shown] {
+			fmt.Fprintf(sb, "  - `%s`: %s\n", ts.Target, formatTableSize(ts.Size))
+		}
+		if unlisted := len(targets) - shown; unlisted > 0 {
+			fmt.Fprintf(sb, "  - …and %d more %s\n", unlisted, pluralize("target", unlisted))
+		}
+		remaining -= shown
+	}
+	sb.WriteString("\n</details>\n\n")
+}
+
+// targetSizesLargestFirst orders a table's per-target sizes by bytes, largest
+// first, keeping rollout order among equal sizes. A target with no estimate
+// sorts last: its size is unknown, not small.
+func targetSizesLargestFirst(perTarget []TargetTableSize) []TargetTableSize {
+	sorted := slices.Clone(perTarget)
+	slices.SortStableFunc(sorted, func(a, b TargetTableSize) int {
+		return compareBytesLargestFirst(a.Size.EstimatedBytes, b.Size.EstimatedBytes)
+	})
+	return sorted
+}
+
 func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
 	for _, e := range entries {
 		fmt.Fprintf(sb, "- `%s`: %s\n", e.name, formatTableSizeEntry(e))
@@ -1464,10 +1542,11 @@ func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
 }
 
 // formatTableSizeEntry renders a section line's size clause. On a multi-target
-// plan a table one target changes names that target; a table two targets
-// change gives the total and each target's size; a table more targets change
-// gives the total alone. A target with no estimate is counted rather than
-// left out, since the total then understates the table.
+// plan a table one target changes names that target. A table several targets
+// change gives the total, then the largest size with its target named, since
+// copy time scales with size and the largest target bounds the rollout, then
+// the smallest size. A target with no estimate is named, or counted when
+// there are several, since the total then understates the table.
 func formatTableSizeEntry(e tableSizeEntry) string {
 	if !e.multiTarget() {
 		return formatTableSize(e.size)
@@ -1481,42 +1560,31 @@ func formatTableSizeEntry(e tableSizeEntry) string {
 		return fmt.Sprintf("size estimate unavailable on all %d targets", targets)
 	case targets == 1:
 		return fmt.Sprintf("%s on `%s`", ui.FormatApproxBytes(total), e.perTarget[0].Target)
-	case targets <= tableSizesPerTargetLimit:
-		return formatPerTargetSizes(e.perTarget)
-	case sized == targets:
-		return fmt.Sprintf("%s across %d targets", ui.FormatApproxBytes(total), targets)
+	}
+	ordered := targetSizesLargestFirst(e.perTarget)
+	largest, smallest := ordered[0], ordered[sized-1]
+	var parts []string
+	switch sized {
+	case 1:
+		parts = append(parts, fmt.Sprintf("%s on `%s`", ui.FormatApproxBytes(total), largest.Target))
+	case targets:
+		parts = append(parts, fmt.Sprintf("%s across %d targets", ui.FormatApproxBytes(total), targets))
 	default:
-		unsized := targets - sized
-		verb := "has"
-		if unsized > 1 {
-			verb = "have"
-		}
-		return fmt.Sprintf("%s across %d of %d targets; %d %s no estimate",
-			ui.FormatApproxBytes(total), sized, targets, unsized, verb)
+		parts = append(parts, fmt.Sprintf("%s across %d of %d targets", ui.FormatApproxBytes(total), sized, targets))
 	}
-}
-
-// formatPerTargetSizes renders a table's size on each of a few targets, led by
-// the total when every target reports one. A target with no estimate is
-// named as such, and the total is left off since it would understate the
-// table.
-func formatPerTargetSizes(perTarget []TargetTableSize) string {
-	var total int64
-	complete := true
-	parts := make([]string, 0, len(perTarget))
-	for _, ts := range perTarget {
-		if !hasSizeEstimate(ts.Size) {
-			complete = false
-			parts = append(parts, fmt.Sprintf("size estimate unavailable on `%s`", ts.Target))
-			continue
-		}
-		total += *ts.Size.EstimatedBytes
-		parts = append(parts, fmt.Sprintf("%s on `%s`", ui.FormatApproxBytes(*ts.Size.EstimatedBytes), ts.Target))
+	if sized > 1 {
+		parts = append(parts,
+			fmt.Sprintf("largest %s on `%s`", ui.FormatApproxBytes(*largest.Size.EstimatedBytes), largest.Target),
+			fmt.Sprintf("smallest %s", ui.FormatApproxBytes(*smallest.Size.EstimatedBytes)))
 	}
-	if !complete {
-		return strings.Join(parts, ", ")
+	switch unsized := ordered[sized:]; len(unsized) {
+	case 0:
+	case 1:
+		parts = append(parts, fmt.Sprintf("size estimate unavailable on `%s`", unsized[0].Target))
+	default:
+		parts = append(parts, fmt.Sprintf("size estimate unavailable on %d targets", len(unsized)))
 	}
-	return fmt.Sprintf("%s across %d targets (%s)", ui.FormatApproxBytes(total), len(perTarget), strings.Join(parts, ", "))
+	return strings.Join(parts, " · ")
 }
 
 // hasSizeEstimate reports that the table's on-disk footprint is known. The
@@ -1530,7 +1598,12 @@ func hasSizeEstimate(ts TableSizeData) bool {
 // section, by bytes. A table with no estimate sorts after every table with
 // one: its size is unknown, not small, and the heading already counts it.
 func compareTableSizesLargestFirst(a, b tableSizeEntry) int {
-	ab, bb := a.rankBytes(), b.rankBytes()
+	return compareBytesLargestFirst(a.rankBytes(), b.rankBytes())
+}
+
+// compareBytesLargestFirst orders two byte estimates largest first, with an
+// unknown estimate after every known one.
+func compareBytesLargestFirst(ab, bb *int64) int {
 	switch {
 	case ab == nil && bb == nil:
 		return 0

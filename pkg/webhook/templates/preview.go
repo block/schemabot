@@ -804,9 +804,10 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 }
 
 // PreviewCommentPlanRolloutTwoTargetTableSizes renders a plan comment for a
-// rollout of two independent targets that run the same index builds. With
-// two targets each size line gives the total and both targets' sizes, since
-// the reviewed target is not always the one the build takes longest on.
+// rollout of two independent targets that run the same index builds. Each
+// size line gives the total and names the target with the largest size, since
+// the reviewed target is not always the one the build takes longest on, and a
+// collapsed breakdown lists both targets' sizes.
 func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 	members := previewRolloutMembers()[:2]
 	return previewRolloutTableSizes(members, []TargetTableSize{
@@ -818,9 +819,10 @@ func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 }
 
 // PreviewCommentPlanRolloutTableSizes renders a plan comment for a rollout of
-// three independent targets that run the same index builds. Past two targets
-// each size line gives the total alone, and counts a target that reported no
-// estimate, since the total then understates the table.
+// three independent targets that run the same index builds. Each size line
+// gives the total, the largest size with its target named, and the smallest,
+// and names a target that reported no estimate, since the total then
+// understates the table. A collapsed breakdown lists every target's size.
 func PreviewCommentPlanRolloutTableSizes() string {
 	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
 		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
@@ -829,6 +831,41 @@ func PreviewCommentPlanRolloutTableSizes() string {
 		previewTargetSize("primary/testapp_2", "users", 98_000_000),
 		{Target: "primary/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
 		previewTargetSize("primary/testapp_3", "users", 104_000_000),
+	})
+}
+
+// PreviewCommentPlanRolloutReviewedTargetTableSizes renders a plan comment for
+// a rollout whose third target could not be planned. The rollout carries no
+// per-target sizes, so the section shows the reviewed plan's and names the
+// reviewed target they were read from.
+func PreviewCommentPlanRolloutReviewedTargetTableSizes() string {
+	members := previewRolloutMembers()
+	members[2].Class = "errored"
+	members[2].Detail = "diff failed; see server logs"
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`);",
+				"ALTER TABLE `users` ADD INDEX `idx_email` (`email`);",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "orders", EstimatedBytes: previewBytes(610_000_000)},
+				{Table: "users", EstimatedBytes: previewBytes(95_000_000)},
+			},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: false, Independent: true,
+			Deployments: members,
+		},
 	})
 }
 
