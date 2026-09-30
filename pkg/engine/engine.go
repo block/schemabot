@@ -687,17 +687,16 @@ const (
 	MetadataDirectExecution = "direct_execution"
 
 	// MetadataDirectExecutionMaxTableRows bounds direct execution by the
-	// target table's row count. Optional, but an enabled policy must carry
-	// this bound, the byte bound, or both, so a native table rebuild can
-	// never run unbounded. When present it must be a positive integer.
+	// target table's row count. An enabled policy carries exactly one of this
+	// bound and the byte bound, so a native table rebuild can never run
+	// unbounded. When present it must be a positive integer.
 	MetadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
 
 	// MetadataDirectExecutionMaxTableBytes bounds direct execution by the
 	// target table's on-disk footprint, data plus indexes, in bytes. Optional;
-	// when present it must be a positive integer. A statement runs directly
-	// when the table is within any bound the policy sets: with both bounds
-	// set, either one approves it. A table whose size cannot be determined
-	// stays blocked.
+	// when present it must be a positive integer, and the row bound must be
+	// absent. A statement runs directly when the table is within the bound
+	// the policy sets; a table whose size cannot be determined stays blocked.
 	MetadataDirectExecutionMaxTableBytes = "direct_execution_max_table_bytes"
 
 	// MetadataDirectExecutionLockAcquisitionTimeoutSeconds bounds, in whole
@@ -735,7 +734,8 @@ type DirectExecutionSettings struct {
 // negative included: a surface that could not read a stored bound records it
 // as negative, and the engine must see that value to refuse it, where omitting
 // it would quietly change the policy the apply was admitted under. An enabled
-// policy with neither bound renders neither key, and the engine refuses it.
+// policy with neither bound, or with both, renders as stated, and the engine
+// refuses it.
 func DirectExecutionMetadata(s DirectExecutionSettings) map[string]string {
 	if !s.Enabled {
 		return map[string]string{MetadataDirectExecution: "false"}

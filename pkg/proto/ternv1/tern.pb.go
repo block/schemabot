@@ -1280,26 +1280,26 @@ func (x *PlanRequest) GetDirectExecution() *DirectExecutionPolicy {
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
-// to run verbatim as native DDL, bounded by the target table's size in rows,
-// in bytes, or both. Engines that do not implement direct execution
+// to run verbatim as native DDL, bounded by the target table's size in rows
+// or in bytes. Engines that do not implement direct execution
 // ignore it.
 type DirectExecutionPolicy struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Whether refused statements may run directly at all.
 	Enabled bool `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
 	// A size bound on the target table's row count; zero states no row bound.
-	// An enabled policy carries this bound, max_table_bytes, or both — a grant
-	// carrying no bound is refused, never treated as unbounded — and a table
-	// whose size cannot be measured is blocked. A negative value is an unusable
-	// bound, which the engine refuses.
+	// An enabled policy carries exactly one of this bound and max_table_bytes —
+	// a grant carrying no bound is refused, never treated as unbounded — and a
+	// table whose size cannot be measured is blocked. A negative value is an
+	// unusable bound, which the engine refuses.
 	MaxTableRows int64 `protobuf:"varint,2,opt,name=max_table_rows,json=maxTableRows,proto3" json:"max_table_rows,omitempty"`
 	// How long each direct statement waits to acquire its locks before failing
 	// with a retryable busy-table error. Zero leaves the engine's own default.
 	LockAcquisitionTimeoutSeconds int64 `protobuf:"varint,3,opt,name=lock_acquisition_timeout_seconds,json=lockAcquisitionTimeoutSeconds,proto3" json:"lock_acquisition_timeout_seconds,omitempty"`
 	// A size bound on the target table's data plus index footprint, in bytes;
 	// zero states no byte bound. A refused statement runs directly when the
-	// table is within any bound the policy sets. A negative value is an
-	// unusable bound, which the engine refuses.
+	// table is within the policy's bound. A negative value is an unusable
+	// bound, which the engine refuses.
 	MaxTableBytes int64 `protobuf:"varint,4,opt,name=max_table_bytes,json=maxTableBytes,proto3" json:"max_table_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

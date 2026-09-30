@@ -1208,7 +1208,34 @@ func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 
 			err := cfg.Validate()
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution without a size bound (set max_table_rows, max_table_bytes, or both)`)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution without a size bound (set max_table_rows or max_table_bytes)`)
+		})
+	}
+}
+
+// Setting both size bounds is a startup config error, even on a disabled
+// policy: the bounds differ in strength, and a second limit on a safety policy
+// reads as a ceiling whichever way the two would combine.
+func TestServerConfig_ValidateRejectsBothDirectExecutionBounds(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled":  {Enabled: true, MaxTableRows: 100000, MaxTableBytes: "100MiB"},
+		"disabled": {MaxTableRows: 100000, MaxTableBytes: "100MiB"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution sets both max_table_rows and max_table_bytes (set exactly one`)
 		})
 	}
 }
@@ -1432,18 +1459,18 @@ func TestDirectExecutionConfig_PolicyResolvesMaxTableBytes(t *testing.T) {
 		"1TiB":       1 << 40,
 	} {
 		t.Run(raw, func(t *testing.T) {
-			direct := &DirectExecutionConfig{Enabled: true, MaxTableRows: 175000, MaxTableBytes: raw}
+			direct := &DirectExecutionConfig{Enabled: true, MaxTableBytes: raw}
 			require.NoError(t, direct.Validate("test"))
 			policy, err := direct.Policy()
 			require.NoError(t, err)
-			assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 175000, MaxTableBytes: want}, policy)
+			assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: want}, policy)
 		})
 	}
 
 	t.Run("unset", func(t *testing.T) {
 		policy, err := (&DirectExecutionConfig{Enabled: true, MaxTableRows: 175000}).Policy()
 		require.NoError(t, err)
-		assert.Zero(t, policy.MaxTableBytes, "no byte bound leaves the row bound as the only size gate")
+		assert.Zero(t, policy.MaxTableBytes, "a row-bound policy carries no byte bound")
 	})
 
 	t.Run("disabled", func(t *testing.T) {
@@ -1458,7 +1485,6 @@ func TestDirectExecutionConfig_PolicyResolvesMaxTableBytes(t *testing.T) {
 func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 	for name, direct := range map[string]*DirectExecutionConfig{
 		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
-		"enabled with both bounds":  {Enabled: true, MaxTableRows: 500000, MaxTableBytes: "100MiB"},
 		"enabled with byte bound":   {Enabled: true, MaxTableBytes: "100MiB"},
 		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
 		"disabled":                  {Enabled: false},
@@ -1539,7 +1565,7 @@ func TestServerConfig_ValidateAcceptsServerDirectExecutionAlongsideOtherEngines(
 // including one a data plane resolves per request with no registration of its
 // own, and reaches no engine that cannot honor it.
 func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
-	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, MaxTableBytes: "100MiB", LockAcquisitionTimeout: "10s"}
+	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB", LockAcquisitionTimeout: "10s"}
 	cfg := ServerConfig{DirectExecution: serverPolicy}
 
 	t.Run("registered mysql database", func(t *testing.T) {
@@ -1559,7 +1585,6 @@ func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
 			engine.MetadataDirectExecution:                              "true",
-			engine.MetadataDirectExecutionMaxTableRows:                  "10000",
 			engine.MetadataDirectExecutionMaxTableBytes:                 "104857600",
 			engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds: "10",
 		}, metadata)

@@ -158,8 +158,7 @@ type LocalConfig struct {
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
 	// with its size bounds direct_execution_max_table_rows (positive row
 	// count) and direct_execution_max_table_bytes (positive data-plus-index
-	// bytes), at least one of which is required and either of which lets a
-	// table within it run directly, and optional
+	// bytes), exactly one of which is required, and optional
 	// direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata

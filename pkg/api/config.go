@@ -1205,8 +1205,8 @@ type EnvironmentConfig struct {
 
 	// DirectExecution configures direct execution of ALTER statements that the
 	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
-	// When enabled, a refused statement whose table is within max_table_rows
-	// or max_table_bytes runs verbatim as native MySQL DDL: synchronous,
+	// When enabled, a refused statement whose table is within the policy's
+	// size bound runs verbatim as native MySQL DDL: synchronous,
 	// blocking writes to the table while it runs, and not revertible. Only
 	// valid for MySQL databases: setting this block on any other database
 	// type fails config validation, even when disabled, so a policy that can
@@ -1257,9 +1257,11 @@ type DirectExecutionConfig struct {
 	// statistics estimate with no exact corroboration, so this bound can
 	// approve a table that grew since its statistics were last sampled.
 	//
-	// Enabled requires at least one of the two bounds. With both set, a
-	// refused statement runs directly when the table is within either one;
-	// a table whose size cannot be determined is blocked.
+	// Enabled requires exactly one of the two bounds, and setting both is
+	// rejected even on a disabled policy. The bounds differ in strength, so a
+	// policy chooses one rather than combining them: a second limit reads as
+	// a ceiling, and no combination rule makes both readings true. A table
+	// whose size cannot be determined is blocked.
 	MaxTableBytes string `yaml:"max_table_bytes,omitempty"`
 
 	// LockAcquisitionTimeout bounds how long each direct statement waits to
@@ -1272,11 +1274,11 @@ type DirectExecutionConfig struct {
 }
 
 // Validate ensures a configured direct execution policy is well-formed.
-// Enabling direct execution requires max_table_rows, max_table_bytes, or both,
-// so the size gate can never be accidentally unbounded. Every bound and the
-// lock timeout are checked even while the policy is disabled, so a malformed
-// value fails at startup rather than the first time someone enables the
-// policy.
+// Enabling direct execution requires exactly one of max_table_rows and
+// max_table_bytes, so the size gate can never be accidentally unbounded. Every
+// bound and the lock timeout are checked even while the policy is disabled, so
+// a malformed value fails at startup rather than the first time someone
+// enables the policy.
 func (c *DirectExecutionConfig) Validate(context string) error {
 	if c == nil {
 		return nil
@@ -1288,8 +1290,11 @@ func (c *DirectExecutionConfig) Validate(context string) error {
 	if err != nil {
 		return fmt.Errorf("%s direct_execution: %w", context, err)
 	}
+	if c.MaxTableRows != 0 && maxBytes != 0 {
+		return fmt.Errorf("%s direct_execution sets both max_table_rows and max_table_bytes (set exactly one: max_table_rows is checked with an exact row count, max_table_bytes approves on the statistics estimate)", context)
+	}
 	if c.Enabled && c.MaxTableRows == 0 && maxBytes == 0 {
-		return fmt.Errorf("%s enables direct_execution without a size bound (set max_table_rows, max_table_bytes, or both)", context)
+		return fmt.Errorf("%s enables direct_execution without a size bound (set max_table_rows or max_table_bytes)", context)
 	}
 	if _, err := c.lockAcquisitionTimeoutSeconds(); err != nil {
 		return fmt.Errorf("%s direct_execution: %w", context, err)
@@ -3538,9 +3543,9 @@ func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
 }
 
 // validateDirectExecution ensures a configured direct execution policy is
-// well-formed. Enabling direct execution requires max_table_rows,
-// max_table_bytes, or both, so the size gate can never be accidentally
-// unbounded, and the policy
+// well-formed. Enabling direct execution requires exactly one of
+// max_table_rows and max_table_bytes, so the size gate can never be
+// accidentally unbounded, and the policy
 // is rejected on non-MySQL databases where it has no effect — a config that
 // looks like it grants direct execution must never be silently ignored.
 func (c EnvironmentConfig) validateDirectExecution(context, databaseType string) error {

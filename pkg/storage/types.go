@@ -1316,7 +1316,7 @@ type ApplyOptions struct {
 // policy its dispatch was admitted under. It mirrors the policy the caller
 // sent rather than restating the rules: the engine reading it back off the
 // metadata keys is what enforces them, including refusing an enabled policy
-// that carries no size bound.
+// that carries no size bound, or both.
 type DirectExecutionPolicy struct {
 	Enabled bool `json:"enabled"`
 	// MaxTableRows is the optional bound on the table's row count. Zero

@@ -78,20 +78,8 @@ func TestDirectPolicyFromMetadata_Enabled(t *testing.T) {
 
 // The byte bound is an optional second bound carried alongside the row bound:
 // set, both resolve onto the policy.
+// A byte bound is a complete policy on its own.
 func TestDirectPolicyFromMetadata_ByteBound(t *testing.T) {
-	policy, err := directPolicyFromMetadata(map[string]string{
-		"direct_execution":                 "true",
-		"direct_execution_max_table_rows":  "175000",
-		"direct_execution_max_table_bytes": "104857600",
-	})
-	require.NoError(t, err)
-	assert.True(t, policy.Enabled)
-	assert.Equal(t, int64(175000), policy.MaxTableRows)
-	assert.Equal(t, int64(104857600), policy.MaxTableBytes)
-}
-
-// Either size bound is a complete policy on its own.
-func TestDirectPolicyFromMetadata_ByteBoundAlone(t *testing.T) {
 	policy, err := directPolicyFromMetadata(map[string]string{
 		"direct_execution":                 "true",
 		"direct_execution_max_table_bytes": "104857600",
@@ -124,6 +112,10 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "-5"},
 			wantErr: "must be positive",
 		},
+		"both bounds": {
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "175000", "direct_execution_max_table_bytes": "104857600"},
+			wantErr: "sets both direct_execution_max_table_rows and direct_execution_max_table_bytes: a policy sets exactly one size bound",
+		},
 		"empty row bound": {
 			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "", "direct_execution_max_table_bytes": "104857600"},
 			wantErr: `parse direct_execution_max_table_rows metadata value ""`,
@@ -133,19 +125,19 @@ func TestDirectPolicyFromMetadata_Malformed(t *testing.T) {
 			wantErr: "direct_execution_max_table_rows must be positive",
 		},
 		"non-numeric byte bound": {
-			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "100MiB"},
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_bytes": "100MiB"},
 			wantErr: `parse direct_execution_max_table_bytes metadata value "100MiB"`,
 		},
 		"empty byte bound": {
-			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": ""},
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_bytes": ""},
 			wantErr: `parse direct_execution_max_table_bytes metadata value ""`,
 		},
 		"zero byte bound": {
-			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "0"},
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_bytes": "0"},
 			wantErr: "direct_execution_max_table_bytes must be positive",
 		},
 		"negative byte bound": {
-			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_rows": "1000", "direct_execution_max_table_bytes": "-1"},
+			md:      map[string]string{"direct_execution": "true", "direct_execution_max_table_bytes": "-1"},
 			wantErr: "direct_execution_max_table_bytes must be positive",
 		},
 		"unrecognized enable value": {
