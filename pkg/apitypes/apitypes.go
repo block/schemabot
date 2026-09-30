@@ -728,6 +728,9 @@ type PlanRequest struct {
 	// an apply will do to unfinished work already on the target need the
 	// grouping the apply will actually run under.
 	GroupedExecution bool `json:"grouped_execution,omitempty"`
+	// Target narrows the plan to one rollout member of the environment, named
+	// by its target or by deployment/target. Empty plans the rollout primary.
+	Target string `json:"target,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -736,6 +739,9 @@ type ApplyRequest struct {
 	Environment string            `json:"environment"`
 	Caller      string            `json:"caller,omitempty"`
 	Options     map[string]string `json:"options,omitempty"`
+	// Target narrows the apply to one rollout member, named by its target or
+	// by deployment/target. Empty applies the whole rollout.
+	Target string `json:"target,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
@@ -756,15 +762,21 @@ type PlanResponse struct {
 	Database     string `json:"database,omitempty"`
 	DatabaseType string `json:"database_type,omitempty"`
 	Environment  string `json:"environment,omitempty"`
-	// Deployment and Target together identify the primary rollout member this
-	// plan was created against (rollout index 0 at plan time). The review-time
+	// Deployment and Target together identify the rollout member this plan was
+	// created against: the primary (rollout index 0 at plan time), or for a
+	// narrowed plan the member it names. The review-time
 	// drift rollup carries both forward so it can verify the plan's baseline
 	// still maps to the primary at rollup time, rather than trusting that
 	// current config re-resolves the same primary. The deployment alone is not
 	// sufficient: one deployment can address several targets, so a member is
 	// identified by the pair.
-	Deployment  string                   `json:"deployment,omitempty"`
-	Target      string                   `json:"target,omitempty"`
+	Deployment string `json:"deployment,omitempty"`
+	Target     string `json:"target,omitempty"`
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed plan was made for. Empty for a plan of the whole rollout. A
+	// narrowed plan says nothing about the environment's other members, so it
+	// is applied to that member alone and never passes a check.
+	NarrowedTo  string                   `json:"narrowed_to,omitempty"`
 	Engine      string                   `json:"engine"`
 	Changes     []*SchemaChangeResponse  `json:"changes"`
 	LintResults []*LintViolationResponse `json:"lint_violations"`

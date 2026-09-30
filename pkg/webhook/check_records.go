@@ -225,6 +225,27 @@ func planRefusalFailsCheck(databaseType string, planResp *apitypes.PlanResponse)
 }
 
 func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, *storage.Check, error) {
+	// A plan narrowed to one rollout member says nothing about the others, so
+	// recording it would let one member's result stand for the whole rollout
+	// (MG-12). Refusing the write leaves the stored check state as the last
+	// rollout-wide round recorded it, so a narrowed plan can never move it
+	// toward passing.
+	if planResp != nil && planResp.NarrowedTo != "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		h.logger.Warn("stored check state not written: the plan was narrowed to one rollout member and cannot speak for the rollout",
+			"repo", repo, "pr", pr, "head_sha", schema.HeadSHA,
+			"environment", environment, "database_type", schema.Type, "database", schema.Database,
+			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+		return "", nil, fmt.Errorf("plan %s for repo %s pr %d environment %s database %s was narrowed to rollout member %s; a narrowed plan never records stored check state",
+			planResp.PlanID, repo, pr, environment, schema.Database, planResp.NarrowedTo)
+	}
 	headSHA := schema.HeadSHA
 	if headSHA == "" {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{

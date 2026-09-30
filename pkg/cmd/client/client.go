@@ -239,11 +239,22 @@ type PlanExclusions struct {
 // predicts about work already on the target; a caller that has not chosen yet
 // passes false, the shape an apply runs without asking for anything else.
 func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
-	return CallPlanAPIWithContext(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution)
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "")
+}
+
+// CallPlanAPIForTarget is CallPlanAPI narrowed to the one rollout member target
+// names, by its target or by deployment/target. An empty target plans the
+// whole rollout.
+func CallPlanAPIForTarget(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, target)
 }
 
 // CallPlanAPIWithContext cancels baseline planning with its caller.
 func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(ctx, endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "")
+}
+
+func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string) (*apitypes.PlanResponse, []string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -257,7 +268,7 @@ func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, env
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution)
+	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target)
 	if err != nil {
 		return nil, ignored, err
 	}
@@ -273,10 +284,10 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 // namespaces removed from schemaFiles before the call — the server needs
 // them to refuse engine shapes that cannot honor the exclusion.
 func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
-	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, ignoredNamespaces, ignoreTables, groupedExecution)
+	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, ignoredNamespaces, ignoreTables, groupedExecution, "")
 }
 
-func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
+func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool, target string) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -286,6 +297,7 @@ func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType,
 		IgnoredNamespaces: ignoredNamespaces,
 		IgnoreTables:      ignoreTables,
 		GroupedExecution:  groupedExecution,
+		Target:            target,
 	}
 	if pr != 0 {
 		prVal := int32(pr)
@@ -314,11 +326,18 @@ func CallRollbackPlanAPI(endpoint, applyID, environment string) (*apitypes.PlanR
 
 // CallApplyAPI calls the apply API and returns the typed result.
 func CallApplyAPI(endpoint, planID, environment, caller string, options map[string]string) (*apitypes.ApplyResponse, error) {
+	return CallApplyAPIForTarget(endpoint, planID, environment, caller, "", options)
+}
+
+// CallApplyAPIForTarget is CallApplyAPI narrowed to the one rollout member
+// target names. An empty target applies the whole rollout.
+func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{
 		PlanID:      planID,
 		Environment: environment,
 		Caller:      caller,
 		Options:     options,
+		Target:      target,
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {

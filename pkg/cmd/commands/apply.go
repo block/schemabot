@@ -24,6 +24,7 @@ import (
 type ApplyCmd struct {
 	SchemaDir    string        `short:"s" required:"" help:"Schema directory with schemabot.yaml and .sql files" name:"schema_dir"`
 	Environment  string        `short:"e" required:"" help:"Target environment"`
+	Target       string        `help:"Plan and apply only this rollout member of the environment: its target, or deployment/target when the name is ambiguous" name:"target"`
 	Repository   string        `help:"Repository name (optional, for tracking)"`
 	PullRequest  int           `help:"Pull request number (optional, for tracking)" name:"pull-request"`
 	AutoApprove  bool          `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
@@ -107,8 +108,8 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	var ignoredNamespaces []string
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
-		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
-			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover))
+		planResult, ignoredNamespaces, planErr = client.CallPlanAPIForTarget(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
+			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover), cmd.Target)
 		return planErr
 	})
 	if err != nil {
@@ -186,6 +187,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 2: Show the plan
 	OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
+	writeNarrowedTo(planResult)
 
 	// Show unsafe warning if --allow-unsafe was used
 	if cmd.AllowUnsafe {

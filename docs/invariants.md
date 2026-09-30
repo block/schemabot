@@ -658,7 +658,8 @@ primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); 
 refusing member work the apply's operation shape cannot carry, rather than settling that member as
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
-(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
+(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`).
 
 ## Apply state machine (ST)
 
@@ -1564,6 +1565,17 @@ rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
 (`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 `pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
+
+### RV-9: A rollout member runs only a plan made for it
+
+Each member of an apply runs the plan made against that member, or, where the environment's
+members mirror each other, the rollout primary's plan. A plan made for one member never runs on
+another: an apply narrowed to one member runs only on the member its plan was made for, and an
+apply of the whole rollout runs from the rollout primary's plan. An apply that ran on one member
+is never rolled back across the rollout. *Enforced:* member pairing at apply creation
+(`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
+`pkg/api/plan_handlers.go`); the narrowed-apply refusal in `ExecuteRollbackPlanForApply`
+(`pkg/api/plan_handlers.go`).
 
 ## Routing and authorization (AZ)
 
