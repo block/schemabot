@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"cmp"
 	"fmt"
 	"html"
 	"log/slog"
@@ -256,6 +257,23 @@ type DeploymentDriftData struct {
 	// members — members expected to match each other say nothing by matching,
 	// and a blocked rollup describes each member on its own instead.
 	Plans []DeploymentPlanGroup
+	// TableSizes is every target's size estimate for each table its own plan
+	// changes with a statement whose cost scales with the table's size, in
+	// rollout order, primary first. Each target applies to its own data, so
+	// the size section ranks a table by its largest target rather than by the
+	// reviewed plan alone. Set only for a clean rollup, where every target was
+	// planned: a target missing from the list would read as one with nothing
+	// to copy.
+	TableSizes []TargetTableSize
+}
+
+// TargetTableSize is one rollout target's size estimate for one table its plan
+// changes.
+type TargetTableSize struct {
+	// Target names the target the way an operator addresses it.
+	Target   string
+	Keyspace string
+	Size     TableSizeData
 }
 
 // DeploymentPlanGroup is the members of a rollout that would run the same plan.
@@ -381,12 +399,35 @@ type KeyspaceChangeData struct {
 	// keyspace's only work, which keeps such a plan from reading as having no
 	// changes.
 	Finalize bool
+	// TableSizes carries plan-time size estimates for the existing tables this
+	// keyspace's changes copy, rebuild, or scan, rendered in the size section
+	// after the DDL. Tables being created have no size and are omitted. An
+	// entry without a byte estimate renders an explicit "unavailable" so a
+	// failed size probe never reads as a small table, unless no table in the
+	// plan has an estimate, in which case the section is omitted (see
+	// writeTableSizesSection).
+	TableSizes []TableSizeData
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
 	// the single Statements block — so a keyspace whose shards diverge is shown
 	// faithfully. Empty for a non-sharded keyspace.
 	Shards []KeyspaceShardChange
+}
+
+// TableSizeData is one existing table's plan-time size estimate for display.
+// The estimate is approximate — sourced from engine statistics that may be
+// stale — and is rendered as such.
+type TableSizeData struct {
+	Table string
+	// ShardCount is the number of shards the change spans. Zero when the
+	// target is not sharded or the topology is unknown, which omits the shard
+	// clause entirely.
+	ShardCount int
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes), summed across shards for a sharded target. Nil renders as
+	// explicitly unavailable.
+	EstimatedBytes *int64
 }
 
 // KeyspaceShardChange is one shard's planned statements within a keyspace.
@@ -768,6 +809,10 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		writeExemptTables(sb, data.ExemptTables)
 		return
 	}
+
+	// Size context precedes the summary: how big the tables the plan will
+	// copy, rebuild, or scan are, then what the plan does.
+	writeTableSizesSection(sb, data)
 
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements))
 
@@ -1206,6 +1251,314 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 		}
 	}
 	return count
+}
+
+// tableSizesInlineLimit caps how many tables the size section lists one per
+// line. A plan that changes many tables would otherwise stand a wall of sizes
+// above the summary it introduces, so beyond the limit the section leads with
+// the count and the largest tables and folds the rest into a collapsed block.
+const tableSizesInlineLimit = 10
+
+// tableSizesLargestShown is how many tables stay visible when the section is
+// folded: the largest, since they bound how long the apply runs.
+const tableSizesLargestShown = 5
+
+// tableSizesPerTargetLimit is the most rollout targets a size line breaks
+// down one by one. Past it the line gives the total alone, since a list of
+// every target's size would bury the figure the operator reads first.
+const tableSizesPerTargetLimit = 2
+
+// tableSizesListedLimit caps how many tables a folded size section lists in
+// total, visible and collapsed. Collapsed lines still count toward GitHub's
+// comment size limit, and a plan that indexes thousands of tables would
+// otherwise spend on sizes the room its DDL needs. Tables past the cap are
+// counted in the heading and in a closing line instead.
+const tableSizesListedLimit = 50
+
+// tableSizeEntry is one line of the size section: the table's display name,
+// qualified with its keyspace when the plan spans several, and its sizes.
+type tableSizeEntry struct {
+	name string
+	// size is the table's estimate on a single-target plan.
+	size TableSizeData
+	// perTarget is each rollout target's estimate for the table, in rollout
+	// order, on a multi-target plan. Nil on a single-target plan, which names
+	// no target.
+	perTarget []TargetTableSize
+}
+
+// multiTarget reports that the line is for a table a rollout changes.
+func (e tableSizeEntry) multiTarget() bool {
+	return e.perTarget != nil
+}
+
+// totalBytes sums the table's byte estimates across the targets that report
+// one, and counts those targets.
+func (e tableSizeEntry) totalBytes() (total int64, sized int) {
+	for _, ts := range e.perTarget {
+		if !hasSizeEstimate(ts.Size) {
+			continue
+		}
+		total += *ts.Size.EstimatedBytes
+		sized++
+	}
+	return total, sized
+}
+
+// rankBytes is the figure the section ranks the table by: its estimate, or on
+// a multi-target plan the total across the targets that report one. Nil when
+// no estimate is known.
+func (e tableSizeEntry) rankBytes() *int64 {
+	if !e.multiTarget() {
+		return e.size.EstimatedBytes
+	}
+	total, sized := e.totalBytes()
+	if sized == 0 {
+		return nil
+	}
+	return &total
+}
+
+// incomplete reports that some estimate for the table is missing, so its rank
+// in the section may understate it.
+func (e tableSizeEntry) incomplete() bool {
+	if !e.multiTarget() {
+		return !hasSizeEstimate(e.size)
+	}
+	_, sized := e.totalBytes()
+	return sized < len(e.perTarget)
+}
+
+// hasAnyEstimate reports whether the line carries a byte estimate for at
+// least one target.
+func (e tableSizeEntry) hasAnyEstimate() bool {
+	if !e.multiTarget() {
+		return hasSizeEstimate(e.size)
+	}
+	_, sized := e.totalBytes()
+	return sized > 0
+}
+
+// writeTableSizesSection renders the plan's table-size info section: one line
+// per table the plan will copy, rebuild, or scan (the comment builder
+// attaches sizes only to statements whose cost scales with table size),
+// across every keyspace, placed above the plan summary. A plan of only
+// metadata-only statements renders no section at all, and neither does a plan
+// where no table has an estimate: an engine that does not estimate sizes
+// would otherwise show "unavailable" on every line, which reads as a failed
+// probe when none ran. Table names carry
+// their keyspace when the plan spans more than one keyspace with sizes, so a
+// shared table name stays unambiguous.
+func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
+	entries := tableSizeEntries(data.Changes)
+	multiTarget := data.DeploymentDrift != nil && len(data.DeploymentDrift.TableSizes) > 0
+	if multiTarget {
+		entries = targetTableSizeEntries(data.DeploymentDrift.TableSizes)
+	}
+	if !slices.ContainsFunc(entries, tableSizeEntry.hasAnyEstimate) {
+		return
+	}
+	if len(entries) <= tableSizesInlineLimit {
+		sb.WriteString("📊 **Table sizes**:\n")
+		writeTableSizeLines(sb, entries)
+		sb.WriteString("\n")
+		return
+	}
+	writeFoldedTableSizes(sb, entries, multiTarget)
+}
+
+// tableSizeEntries flattens every keyspace's sized tables into section lines,
+// in plan order.
+func tableSizeEntries(changes []KeyspaceChangeData) []tableSizeEntry {
+	keyspacesWithSizes := 0
+	for _, ks := range changes {
+		if len(ks.TableSizes) > 0 {
+			keyspacesWithSizes++
+		}
+	}
+	qualify := keyspacesWithSizes > 1
+	var entries []tableSizeEntry
+	for _, ks := range changes {
+		for _, ts := range ks.TableSizes {
+			name := ts.Table
+			if qualify {
+				name = ks.Keyspace + "." + ts.Table
+			}
+			entries = append(entries, tableSizeEntry{name: name, size: ts})
+		}
+	}
+	return entries
+}
+
+// targetTableSizeEntries groups every target's sizes into one section line per
+// table, in the order the tables first appear in rollout order, each line
+// carrying the table's estimate on every target that changes it.
+func targetTableSizeEntries(sizes []TargetTableSize) []tableSizeEntry {
+	keyspaces := make(map[string]struct{})
+	for _, ts := range sizes {
+		keyspaces[ts.Keyspace] = struct{}{}
+	}
+	qualify := len(keyspaces) > 1
+	type tableKey struct{ keyspace, table string }
+	at := make(map[tableKey]int)
+	var entries []tableSizeEntry
+	for _, ts := range sizes {
+		key := tableKey{ts.Keyspace, ts.Size.Table}
+		i, seen := at[key]
+		if !seen {
+			name := ts.Size.Table
+			if qualify {
+				name = ts.Keyspace + "." + ts.Size.Table
+			}
+			i = len(entries)
+			at[key] = i
+			entries = append(entries, tableSizeEntry{name: name, perTarget: []TargetTableSize{}})
+		}
+		entries[i].perTarget = append(entries[i].perTarget, ts)
+	}
+	return entries
+}
+
+// writeFoldedTableSizes renders the size section for a plan with more tables
+// than tableSizesInlineLimit. The visible heading carries the table count and,
+// when any table is missing an estimate, how many: a size probe that failed on
+// a large table must stay visible even though its line is folded. The largest
+// tables follow, then the rest in a collapsed block, all ordered largest first.
+// Past tableSizesListedLimit the smallest tables are counted in a closing line
+// rather than listed.
+func writeFoldedTableSizes(sb *strings.Builder, entries []tableSizeEntry, multiTarget bool) {
+	sorted := slices.Clone(entries)
+	slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
+
+	incomplete := 0
+	for _, e := range sorted {
+		if e.incomplete() {
+			incomplete++
+		}
+	}
+	heading := fmt.Sprintf("%d tables, largest first", len(sorted))
+	switch {
+	case incomplete == 0:
+	case multiTarget:
+		heading += fmt.Sprintf("; %d missing an estimate on at least one target", incomplete)
+	default:
+		heading += fmt.Sprintf("; %d without a size estimate", incomplete)
+	}
+	fmt.Fprintf(sb, "📊 **Table sizes** (%s):\n", heading)
+	writeTableSizeLines(sb, sorted[:tableSizesLargestShown])
+
+	rest := sorted[tableSizesLargestShown:]
+	fmt.Fprintf(sb, "\n<details>\n<summary>%d more %s</summary>\n\n", len(rest), pluralize("table", len(rest)))
+	listed := min(len(sorted), tableSizesListedLimit)
+	writeTableSizeLines(sb, sorted[tableSizesLargestShown:listed])
+	if unlisted := len(sorted) - listed; unlisted > 0 {
+		fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
+	}
+	sb.WriteString("\n</details>\n\n")
+}
+
+func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
+	for _, e := range entries {
+		fmt.Fprintf(sb, "- `%s`: %s\n", e.name, formatTableSizeEntry(e))
+	}
+}
+
+// formatTableSizeEntry renders a section line's size clause. On a multi-target
+// plan a table one target changes names that target; a table two targets
+// change gives the total and each target's size; a table more targets change
+// gives the total alone. A target with no estimate is counted rather than
+// left out, since the total then understates the table.
+func formatTableSizeEntry(e tableSizeEntry) string {
+	if !e.multiTarget() {
+		return formatTableSize(e.size)
+	}
+	targets := len(e.perTarget)
+	total, sized := e.totalBytes()
+	switch {
+	case sized == 0 && targets == 1:
+		return fmt.Sprintf("size estimate unavailable on `%s`", e.perTarget[0].Target)
+	case sized == 0:
+		return fmt.Sprintf("size estimate unavailable on all %d targets", targets)
+	case targets == 1:
+		return fmt.Sprintf("%s on `%s`", ui.FormatApproxBytes(total), e.perTarget[0].Target)
+	case targets <= tableSizesPerTargetLimit:
+		return formatPerTargetSizes(e.perTarget)
+	case sized == targets:
+		return fmt.Sprintf("%s across %d targets", ui.FormatApproxBytes(total), targets)
+	default:
+		unsized := targets - sized
+		verb := "has"
+		if unsized > 1 {
+			verb = "have"
+		}
+		return fmt.Sprintf("%s across %d of %d targets; %d %s no estimate",
+			ui.FormatApproxBytes(total), sized, targets, unsized, verb)
+	}
+}
+
+// formatPerTargetSizes renders a table's size on each of a few targets, led by
+// the total when every target reports one. A target with no estimate is
+// named as such, and the total is left off since it would understate the
+// table.
+func formatPerTargetSizes(perTarget []TargetTableSize) string {
+	var total int64
+	complete := true
+	parts := make([]string, 0, len(perTarget))
+	for _, ts := range perTarget {
+		if !hasSizeEstimate(ts.Size) {
+			complete = false
+			parts = append(parts, fmt.Sprintf("size estimate unavailable on `%s`", ts.Target))
+			continue
+		}
+		total += *ts.Size.EstimatedBytes
+		parts = append(parts, fmt.Sprintf("%s on `%s`", ui.FormatApproxBytes(*ts.Size.EstimatedBytes), ts.Target))
+	}
+	if !complete {
+		return strings.Join(parts, ", ")
+	}
+	return fmt.Sprintf("%s across %d targets (%s)", ui.FormatApproxBytes(total), len(perTarget), strings.Join(parts, ", "))
+}
+
+// hasSizeEstimate reports that the table's on-disk footprint is known. The
+// section shows bytes alone: they track how long a copy or index build runs
+// on every engine that reports a size.
+func hasSizeEstimate(ts TableSizeData) bool {
+	return ts.EstimatedBytes != nil
+}
+
+// compareTableSizesLargestFirst orders two section lines for the folded size
+// section, by bytes. A table with no estimate sorts after every table with
+// one: its size is unknown, not small, and the heading already counts it.
+func compareTableSizesLargestFirst(a, b tableSizeEntry) int {
+	ab, bb := a.rankBytes(), b.rankBytes()
+	switch {
+	case ab == nil && bb == nil:
+		return 0
+	case ab == nil:
+		return 1
+	case bb == nil:
+		return -1
+	default:
+		return cmp.Compare(*bb, *ab)
+	}
+}
+
+// formatTableSize renders one table's size clause: the estimated bytes and,
+// for a sharded target, the shard span. A table with no estimate is stated
+// explicitly — operators must never mistake a failed size probe for a small
+// table.
+func formatTableSize(ts TableSizeData) string {
+	if !hasSizeEstimate(ts) {
+		if ts.ShardCount > 0 {
+			return fmt.Sprintf("size estimate unavailable · %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+		}
+		return "size estimate unavailable"
+	}
+	size := ui.FormatApproxBytes(*ts.EstimatedBytes)
+	if ts.ShardCount > 0 {
+		size += fmt.Sprintf(" across %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+	}
+	return size
 }
 
 // writePlanDDLBlocks writes one fenced SQL block per statement, in plan
