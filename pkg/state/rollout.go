@@ -110,7 +110,9 @@ func finalizerOrphanedByFailedWork(op RolloutOperation, ops []RolloutOperation) 
 //
 // A finalizer key with nothing in front of the segment (the deployment-scoped
 // finalizer of a single-target plan whose only changes are finalizers) has no
-// work alongside it and finalizes none. A finalizer and its work also share a
+// work alongside it and finalizes none. Keys compare byte-for-byte, because
+// namespaces and tables are case-significant: "orders/group_finalizer" does
+// not finalize "Orders/-80/orders". A finalizer and its work also share a
 // deployment, which callers match separately. finalizerFinalizesWorkSQL
 // (pkg/storage/internal/sqlstore/apply_operations.go) is the same rule for
 // the claim query.

@@ -206,6 +206,8 @@ func TestFinalizerFinalizesWork(t *testing.T) {
 		{name: "work keyed by the scope itself", finalizer: "ns_0/group_finalizer", work: "ns_0", want: true},
 		{name: "target-scoped finalizer, other target", finalizer: "orders-001/group_finalizer", work: "orders-002"},
 		{name: "not a finalizer key", finalizer: "ns_0/-80/orders", work: "ns_0/-80/orders"},
+		{name: "namespace differing only by case", finalizer: "orders/group_finalizer", work: "Orders/-80/orders"},
+		{name: "namespace differing only by accent", finalizer: "cafe/group_finalizer", work: "café/-80/orders"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
