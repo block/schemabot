@@ -176,7 +176,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	}
 
 	shardsByKeyspace := shardStatusesByKeyspace(groupOrder, len(keyspaceOrder) > 1, released, tasksByOp)
-	tablesByKeyspace := shardedTableStatusesByKeyspace(ops, tasksByOp)
+	tablesByKeyspace := shardedTableStatusesByKeyspace(ops, tasksByOp, finalizers)
 	keyspaces := make([]templates.ShardedKeyspace, 0, len(keyspaceOrder))
 	for _, ns := range keyspaceOrder {
 		keyspaces = append(keyspaces, templates.ShardedKeyspace{
@@ -209,14 +209,35 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	return data
 }
 
-// shardedPlanView is what a sharded apply's comment reads from the
-// stored plan about its finalizer operations: each namespace's rendered
-// VSchema diff, and the namespaces finalized without a VSchema change to show. A nil
-// plan, when the stored plan could not be read, renders every finalizer as a
-// VSchema change without a diff.
+// shardedPlanView is what a sharded apply's comment reads from the stored
+// plan: each namespace's rendered VSchema diff, the namespaces finalized
+// without a VSchema change to show, and each table's planned size. A nil
+// view, when the stored plan could not be read, renders every finalizer as a
+// VSchema change without a diff and every table without a size.
 type shardedPlanView struct {
 	vschemaDiffs map[string]string
 	finalizeOnly map[string]bool
+	// tableBytes is each table's planned on-disk size, summed across its
+	// shards. The shard tasks carry no size of their own, since the plan's
+	// figure is the whole table's, so the comment reads it here and shows it
+	// on the table's line.
+	tableBytes map[shardedTableKey]int64
+}
+
+// shardedTableKey names one table of a sharded apply.
+type shardedTableKey struct{ namespace, table string }
+
+// estimatedBytes returns the table's planned size across its shards, or nil
+// when the stored plan carries no estimate for it.
+func (p *shardedPlanView) estimatedBytes(namespace, table string) *int64 {
+	if p == nil {
+		return nil
+	}
+	bytes, ok := p.tableBytes[shardedTableKey{namespace, table}]
+	if !ok {
+		return nil
+	}
+	return &bytes
 }
 
 // vschemaDiff returns the namespace's rendered VSchema diff, or "" when the
@@ -234,40 +255,43 @@ func (p *shardedPlanView) finalizesOnly(namespace string) bool {
 	return p != nil && p.finalizeOnly[namespace]
 }
 
-// resolveShardedPlanView loads what a sharded apply's comment needs to
-// know about its finalizers from the stored plan: which namespaces finalize
-// without a VSchema change, and each namespace's rendered VSchema diff — the
-// diff the engine annotated
-// at plan time and plan persistence kept (PlanMetadataVSchemaDiff), so the
-// comment shows the change the operator approved rather than a re-diff
-// against live state. Returns nil without touching storage unless the apply
-// renders the sharded layout and carries a finalizer operation — only the
-// sharded layout consumes it, and only finalizer rows read it, so any other
-// shape would pay a stored-plan read on every comment edit just to discard the
-// result. Best-effort: a plan load failure or a missing plan row contributes
-// nothing rather than blocking the comment, and a stored plan without diffs
-// (recorded before diffs were persisted) contributes no diffs.
+// resolveShardedPlanView loads what a sharded apply's comment needs from the
+// stored plan: which namespaces finalize without a VSchema change, each
+// namespace's rendered VSchema diff — the diff the engine annotated at plan
+// time and plan persistence kept (PlanMetadataVSchemaDiff), so the comment
+// shows the change the operator approved rather than a re-diff against live
+// state — and each table's planned size. Returns nil without touching storage
+// unless the apply renders a sharded layout, since any other shape would pay
+// a stored-plan read on every comment edit just to discard the result.
+// Best-effort: a plan load failure or a missing plan row contributes nothing
+// rather than blocking the comment, and a stored plan without diffs or sizes
+// (recorded before they were persisted) contributes none.
 func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedPlanView {
-	if !needsShardedPlanView(apply, ops) {
+	if !needsShardedPlanView(ops) {
 		return nil
 	}
 
 	plan, err := stor.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		slog.Warn("comment will omit VSchema diffs and render every finalizer as a VSchema change: failed to load stored plan",
+		slog.Warn("comment will omit VSchema diffs and table sizes and render every finalizer as a VSchema change: failed to load stored plan",
 			append(apply.LogAttrs(), "error", err)...)
 		return nil
 	}
 	if plan == nil {
-		slog.Warn("comment will omit VSchema diffs and render every finalizer as a VSchema change: stored plan row not found",
+		slog.Warn("comment will omit VSchema diffs and table sizes and render every finalizer as a VSchema change: stored plan row not found",
 			apply.LogAttrs()...)
 		return nil
 	}
 
-	finalizers := &shardedPlanView{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{}}
+	finalizers := &shardedPlanView{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{}, tableBytes: map[shardedTableKey]int64{}}
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
 			continue
+		}
+		for _, tc := range nsData.Tables {
+			if tc.EstimatedBytes != nil {
+				finalizers.tableBytes[shardedTableKey{namespace, tc.Table}] = *tc.EstimatedBytes
+			}
 		}
 		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
 			finalizers.vschemaDiffs[namespace] = d
@@ -280,18 +304,10 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 }
 
 // needsShardedPlanView reports whether the apply's comment consumes the
-// stored plan's finalizer view: only a sharded apply that declares a finalizer
-// operation does.
-func needsShardedPlanView(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
-	if !isShardedApply(ops) {
-		return false
-	}
-	for _, key := range applyOperationKeys(apply, ops) {
-		if _, ok := parseFinalizerOperationKey(key); ok {
-			return true
-		}
-	}
-	return false
+// stored plan view: a sharded apply does, for its finalizers and its tables'
+// sizes.
+func needsShardedPlanView(ops []*storage.ApplyOperation) bool {
+	return isShardedApply(ops)
 }
 
 // shardedPlanCacheLimit bounds how many plans a shardedPlanCache holds, so
@@ -331,7 +347,7 @@ func newShardedPlanCache() *shardedPlanCache {
 // read runs outside the lock, so a slow read for one apply does not hold up
 // another's comment.
 func (c *shardedPlanCache) resolve(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedPlanView {
-	if c == nil || !needsShardedPlanView(apply, ops) {
+	if c == nil || !needsShardedPlanView(ops) {
 		return resolveShardedPlanView(ctx, stor, apply, ops)
 	}
 	if cached := c.lookup(apply.PlanID); cached != nil {
@@ -488,8 +504,8 @@ func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, rele
 // entry carries the task-vocabulary state (and copy percent) of its (shard,
 // table) operation, and the table's aggregate is its most attention-worthy
 // shard state, so a table with one failed shard reads failed even while its
-// siblings copy.
-func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardedTableStatus {
+// siblings copy. Each table carries its planned size from the stored plan.
+func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, view *shardedPlanView) map[string][]templates.ShardedTableStatus {
 	type keyspaceTable struct{ namespace, table string }
 	type tableRollup struct {
 		shards          []templates.ShardProgressData
@@ -546,6 +562,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			RowsTotal:       r.rowsTotal,
 			ETASeconds:      r.etaSeconds,
 			ShardsReporting: r.shardsReporting,
+			EstimatedBytes:  view.estimatedBytes(key.namespace, key.table),
 			Shards:          r.shards,
 		})
 	}
@@ -770,8 +787,9 @@ func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, f
 // row carries no failure cause, the most significant operation's error stands
 // in for it, falling back to that operation's task error as the shard layout
 // does, so a failed shard or finalizer still says why. The per-shard summary is
-// left out, since each keyspace has only one shard.
-func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, tenant string) templates.ApplyStatusCommentData {
+// left out, since each keyspace has only one shard. That shard covers the
+// whole table, so each table's planned size from the stored plan is its own.
+func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, view *shardedPlanView, tenant string) templates.ApplyStatusCommentData {
 	tasksByOp := groupTasksByOperation(tasks)
 	var workTasks []*storage.Task
 	var workOps []*storage.ApplyOperation
@@ -784,6 +802,11 @@ func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.Apply
 	sort.Slice(workTasks, func(i, j int) bool { return workTasks[i].ID < workTasks[j].ID })
 
 	data := buildApplyCommentData(apply, workTasks, singleOpDisplay(workOps, displayByOp), nil, tenant)
+	for i := range data.Tables {
+		if data.Tables[i].EstimatedBytes == nil {
+			data.Tables[i].EstimatedBytes = view.estimatedBytes(data.Tables[i].Namespace, data.Tables[i].TableName)
+		}
+	}
 	if data.ErrorMessage == "" {
 		if opState, errMsg := aggregateShardState(ops, tasksByOp); isOperationFailureState(opState) {
 			data.ErrorMessage = errMsg

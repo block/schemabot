@@ -47,7 +47,7 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 	// one change on one database, so it takes the single-deployment layout.
 	if isShardedApply(ops) {
 		if rendersAsSingleShard(apply, ops, finalizers) {
-			return templates.RenderApplyStatusComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, tenant))
+			return templates.RenderApplyStatusComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, finalizers, tenant))
 		}
 		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, finalizers, tenant))
 	}
@@ -76,7 +76,7 @@ func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperati
 	// takes the single-deployment summary, as its status comment does.
 	if isShardedApply(ops) {
 		if rendersAsSingleShard(apply, ops, finalizers) {
-			return templates.RenderApplySummaryComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, tenant))
+			return templates.RenderApplySummaryComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, finalizers, tenant))
 		}
 		return templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, released, tasks, finalizers, tenant))
 	}

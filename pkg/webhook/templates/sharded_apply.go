@@ -123,6 +123,11 @@ type ShardedTableStatus struct {
 	// unstarted shards can only add rows and time).
 	ShardsReporting int
 
+	// EstimatedBytes is the table's on-disk size when it was planned, summed
+	// across its shards, shown beside the copy progress so the operator sees
+	// the scale of the copy. Nil when no estimate is known, which omits it.
+	EstimatedBytes *int64
+
 	// Shards is the per-shard state (and percent while copying) in resolved
 	// order, rendered as the compact one-line summary while the table is in
 	// flight.
@@ -641,13 +646,18 @@ func shardedCopyCoverageSuffix(t ShardedTableStatus) string {
 // rows and time.
 func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
 	if t.ShardsReporting >= len(t.Shards) {
-		writeRowsAndETA(sb, TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds})
+		writeRowsAndETA(sb, TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds, EstimatedBytes: t.EstimatedBytes})
 		return
 	}
 	line := fmt.Sprintf("- Rows: %s / %s across %d of %d shards",
 		ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)),
 		ui.FormatNumber(t.RowsTotal),
 		t.ShardsReporting, len(t.Shards))
+	// The planned size is the whole table's, so beside rows that cover only
+	// some shards it names the full span rather than reading as theirs.
+	if t.EstimatedBytes != nil {
+		line += fmt.Sprintf(" · %s across all %d shards", ui.FormatApproxBytes(*t.EstimatedBytes), len(t.Shards))
+	}
 	if t.ETASeconds > 0 {
 		line += fmt.Sprintf(" · ETA: ≥ %s", ui.FormatETA(t.ETASeconds))
 	}

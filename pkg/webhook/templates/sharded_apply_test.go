@@ -614,6 +614,38 @@ func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.
 	assert.Contains(t, out, "└ shards: ◐ -40 62% · ⏳ 80-", "the shard summary stays below the rows line")
 }
 
+// A copying table carries its planned size beside its rows. With every shard
+// reporting the line matches the single-deployment one; while later waves
+// have yet to start, the size names the whole table's shard span so it does
+// not read as the size of the reporting shards alone.
+func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
+	render := func(reporting int, second ShardProgressData) string {
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x",
+			Keyspaces: []ShardedKeyspace{{
+				Keyspace: "cdb_resolute_sharded",
+				Tables: []ShardedTableStatus{{
+					Table: "mutes", Status: state.Task.Running,
+					RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+					ShardsReporting: reporting,
+					EstimatedBytes:  new(int64(23_400_000_000)),
+					Shards: []ShardProgressData{
+						{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
+						second,
+					},
+				}},
+			}},
+		})
+	}
+
+	full := render(2, ShardProgressData{Shard: "80-", Status: state.Task.Running, PercentComplete: 54})
+	assert.Contains(t, full, "- Rows: 914,707 / 1,466,232 · ~23.4 GB · ETA: 3m 15s\n")
+
+	partial := render(1, ShardProgressData{Shard: "80-", Status: state.Task.Pending})
+	assert.Contains(t, partial, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ~23.4 GB across all 2 shards · ETA: ≥ 3m 15s\n")
+}
+
 // A copy past its estimated total with later waves still unreported names the
 // coverage on the finalizing headline too — "Finalizing copy" alone would
 // read as the whole table wrapping up while most shards have not started.

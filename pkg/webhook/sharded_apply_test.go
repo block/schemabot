@@ -324,8 +324,9 @@ func (s *stubPlanStore) GetByID(_ context.Context, _ int64) (*storage.Plan, erro
 // operator approved at plan time, and the namespaces finalized without a
 // VSchema change. Degraded storage (a load error or a missing plan row) must
 // render the comment without either rather than blocking it, older stored
-// plans without diffs contribute none, and an apply with no finalizer
-// operation must not read storage at all.
+// plans without diffs contribute none, and an apply that does not render a
+// sharded layout must not read storage at all. Each table's planned size is
+// read too, so a sharded apply without a finalizer still reads the plan.
 func TestResolveShardedPlanView(t *testing.T) {
 	shardOp := &storage.ApplyOperation{OperationKey: "ks/-40/mutes"}
 	finalizerOp := &storage.ApplyOperation{OperationKey: "ks/group_finalizer"}
@@ -340,7 +341,10 @@ func TestResolveShardedPlanView(t *testing.T) {
 			Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{}}`},
 			Finalize:  true,
 		},
-		"pay": {Finalize: true},
+		"pay": {Finalize: true, Tables: []storage.TableChange{
+			{Table: "mutes", EstimatedBytes: new(int64(23_400_000_000))},
+			{Table: "outcomes"},
+		}},
 	}}
 	finalizers := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
 	require.NotNil(t, finalizers)
@@ -348,6 +352,10 @@ func TestResolveShardedPlanView(t *testing.T) {
 		"only namespaces with a persisted diff contribute")
 	assert.Equal(t, map[string]bool{"pay": true}, finalizers.finalizeOnly,
 		"only a namespace finalized without a VSchema change is finalize-only")
+	require.NotNil(t, finalizers.estimatedBytes("pay", "mutes"))
+	assert.Equal(t, int64(23_400_000_000), *finalizers.estimatedBytes("pay", "mutes"))
+	assert.Nil(t, finalizers.estimatedBytes("pay", "outcomes"), "a table without an estimate has no size")
+	assert.Nil(t, finalizers.estimatedBytes("ks", "mutes"), "sizes are keyed by namespace")
 
 	assert.Nil(t, resolveShardedPlanView(t.Context(), &stubPlanStorage{err: errors.New("storage down")}, apply, ops),
 		"a plan load failure degrades to no diffs")
@@ -356,9 +364,11 @@ func TestResolveShardedPlanView(t *testing.T) {
 	empty := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: &storage.Plan{}}, apply, ops)
 	assert.Empty(t, empty.vschemaDiff("ks"), "a stored plan without diff metadata contributes no diffs")
 
-	// No finalizer operation → nothing to attach a diff to; the nil Storage
-	// would panic on any read, proving the resolver does not touch storage.
-	assert.Nil(t, resolveShardedPlanView(t.Context(), nil, apply, []*storage.ApplyOperation{shardOp}))
+	// A sharded apply without a finalizer still reads the plan for its
+	// tables' sizes.
+	shardOnly := resolveShardedPlanView(t.Context(), &stubPlanStorage{plan: plan}, apply, []*storage.ApplyOperation{shardOp})
+	require.NotNil(t, shardOnly)
+	assert.NotNil(t, shardOnly.estimatedBytes("pay", "mutes"))
 
 	// A shape that is not the sharded layout — here a two-deployment apply —
 	// discards the diffs downstream, so the resolver must not pay the
@@ -660,6 +670,58 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 	assert.Equal(t, int64(1000000), table.RowsTotal, "the taskless shard contributes no rows yet")
 	assert.Equal(t, int64(240), table.ETASeconds, "the ETA is the slowest reporting shard's")
 	assert.Equal(t, 2, table.ShardsReporting, "the taskless shard is not counted as reporting")
+}
+
+// Each table's planned size comes from the stored plan view, keyed by its
+// namespace, since a shard task carries no size of its own. Without a view
+// the table renders without a size.
+func TestBuildShardedApplyData_TableSizeFromStoredPlan(t *testing.T) {
+	mk := func(id int64, key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "default", OperationKey: key, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "cdb_resolute_sharded/-80/mutes"),
+		mk(2, "cdb_resolute_sharded/80-/mutes"),
+		mk(3, "cdb_resolute_sharded/-80/outcomes"),
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+	view := &shardedPlanView{tableBytes: map[shardedTableKey]int64{
+		{"cdb_resolute_sharded", "mutes"}: 23_400_000_000,
+		{"other", "outcomes"}:             1_000,
+	}}
+
+	data := buildShardedApplyData(apply, ops, false, nil, view, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 2)
+	mutes, outcomes := data.Keyspaces[0].Tables[0], data.Keyspaces[0].Tables[1]
+	assert.Equal(t, "mutes", mutes.Table)
+	require.NotNil(t, mutes.EstimatedBytes)
+	assert.Equal(t, int64(23_400_000_000), *mutes.EstimatedBytes)
+	assert.Equal(t, "outcomes", outcomes.Table)
+	assert.Nil(t, outcomes.EstimatedBytes, "a size planned for another namespace's table is not this one's")
+
+	withoutView := buildShardedApplyData(apply, ops, false, nil, nil, "")
+	assert.Nil(t, withoutView.Keyspaces[0].Tables[0].EstimatedBytes)
+}
+
+// A sharded apply that renders as one change on one database runs on the
+// shard covering the whole keyrange, so the table's planned size is its own
+// and reaches the single-deployment progress line.
+func TestBuildSingleShardApplyCommentData_TableSizeFromStoredPlan(t *testing.T) {
+	opID := int64(1)
+	ops := []*storage.ApplyOperation{{ID: opID, ApplyID: 1, Deployment: "default", OperationKey: "ks/-/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}}
+	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &opID, Shard: "-", Namespace: "ks", TableName: "mutes",
+		State: state.Task.Running, ProgressPercent: 40, RowsCopied: 400, RowsTotal: 1000, ETASeconds: 60}}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+	view := &shardedPlanView{tableBytes: map[shardedTableKey]int64{{"ks", "mutes"}: 1_130_000_000}}
+
+	data := buildSingleShardApplyCommentData(apply, ops, tasks, nil, view, "")
+
+	require.Len(t, data.Tables, 1)
+	require.NotNil(t, data.Tables[0].EstimatedBytes)
+	assert.Equal(t, int64(1_130_000_000), *data.Tables[0].EstimatedBytes)
+	assert.Contains(t, templates.RenderApplyStatusComment(data), "- Rows: 400 / 1,000 · ~1.1 GB · ETA: 1m 0s")
 }
 
 // A shard reporting copied rows without a row total has no denominator to
