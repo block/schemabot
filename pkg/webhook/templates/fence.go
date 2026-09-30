@@ -187,8 +187,23 @@ func (b *ddlBlockBudget) pointerMarker(plan storedPlanRef) string {
 // group with the given members, naming a stored plan that covers only the
 // group's targets, until the returned restore runs.
 func (b *ddlBlockBudget) forTargetGroup(members []string) (restore func()) {
+	return b.scopePlan(targetGroupPlanScope(members))
+}
+
+// forSoleTargetGroup marks the DDL rendered from here on as the plan of the
+// only group of targets a deployment's reporting targets form, rendered with
+// no heading naming its members, until the returned restore runs. unreported
+// counts the deployment's targets that have not reported, which are not known
+// to run the group's DDL.
+func (b *ddlBlockBudget) forSoleTargetGroup(members []string, unreported int) (restore func()) {
+	return b.scopePlan(soleTargetGroupPlanScope(members, unreported))
+}
+
+// scopePlan sets the scope and group note a pointer marker carries until the
+// returned restore runs.
+func (b *ddlBlockBudget) scopePlan(scope, note string) (restore func()) {
 	previousScope, previousNote := b.scope, b.groupNote
-	b.scope, b.groupNote = targetGroupPlanScope(members)
+	b.scope, b.groupNote = scope, note
 	return func() { b.scope, b.groupNote = previousScope, previousNote }
 }
 
@@ -202,6 +217,26 @@ func targetGroupPlanScope(members []string) (scope, note string) {
 		return " for this target", ""
 	}
 	return " for " + inlineCode(members[0]), "every target in this group runs the same DDL"
+}
+
+// soleTargetGroupPlanScope is how a pointer marker qualifies the plan it names
+// under a deployment whose reporting targets all run one change, where no
+// heading names the group. The marker names the target whose stored plan it
+// is, and says the others run the same DDL only of the targets known to: a
+// target that has not reported is not known to run it.
+func soleTargetGroupPlanScope(members []string, unreported int) (scope, note string) {
+	if len(members) == 0 {
+		return "", ""
+	}
+	scope = " for " + inlineCode(members[0])
+	switch {
+	case len(members) == 1:
+		return scope, ""
+	case unreported > 0:
+		return scope, "every target that has reported runs the same DDL"
+	default:
+		return scope, "every target runs the same DDL"
+	}
 }
 
 // shareAcross marks the DDL rendered from here on as one section shared by
@@ -306,7 +341,9 @@ const sqlBlockSeparator = "\n"
 // followed by the truncation marker, and the blocks after it are left out —
 // the marker says where the rest lives. When the share runs out at a block
 // boundary, so that not one byte of the next block would show, the marker
-// follows the last whole block directly rather than an empty fence.
+// follows the last whole block directly rather than an empty fence; a share
+// with no room for one byte of the first block writes the marker alone, so
+// the section never renders a fence its share cannot hold.
 func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlockBudget) {
 	share := budget.take()
 	spent := 0
@@ -316,11 +353,11 @@ func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlo
 			room -= len(sqlBlockSeparator)
 		}
 		content, truncated := fitSQLBlock(content, room)
+		if truncated && content == "" {
+			budget.writeTruncationMarker(sb)
+			break
+		}
 		if i > 0 {
-			if truncated && content == "" {
-				budget.writeTruncationMarker(sb)
-				break
-			}
 			sb.WriteString(sqlBlockSeparator)
 			spent += len(sqlBlockSeparator)
 		}

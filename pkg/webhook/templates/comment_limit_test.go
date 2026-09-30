@@ -469,6 +469,32 @@ func TestRenderWithinCommentLimitReservesEachBlocksOwnMarker(t *testing.T) {
 	assert.Greater(t, len(body), commentBodyLimit-overReservation/4, "the DDL kept the room the short markers leave")
 }
 
+// A comment whose second pass leaves a block a share too small to hold even an
+// empty code fence writes that block's marker alone, so the second pass still
+// fits: no block renders more DDL than its share.
+func TestRenderWithinCommentLimitFitsWhenSharesCannotHoldAFence(t *testing.T) {
+	const blocks, secondPassDDL = 10, 50
+	require.Less(t, secondPassDDL/blocks, len("```sql\n```\n"), "the first second-pass share is too small for an empty fence")
+	// Every block is cut on pass 1 and carries its marker there, so pass 2's
+	// DDL budget is the limit less the chrome and the markers.
+	chrome := commentBodyLimit - blocks*len(ddlTruncatedMarker) - secondPassDDL
+	passes := 0
+	body := renderWithinCommentLimit(blocks, 0, func(budget *ddlBlockBudget) string {
+		passes++
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("h", chrome))
+		for range blocks {
+			writeSQLFencedBlock(&sb, repeatedDDL(commentBodyLimit), budget)
+		}
+		return sb.String()
+	})
+
+	assert.Equal(t, 2, passes, "the second pass fits")
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Equal(t, blocks, strings.Count(body, ddlTruncatedMarker), "every block is still marked as cut")
+	assert.True(t, strings.HasPrefix(body[chrome:], ddlTruncatedMarker), "the first block, whose share cannot hold a fence, is its marker alone")
+}
+
 // Environments whose plans are the same render as one section drawn from the
 // first environment's plan, while each environment stored a plan of its own.
 // A block the section cuts names the first environment's stored plan and says

@@ -50,8 +50,8 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		first := memberDetail(data.Details, w.members[0])
 		dialect := dialectForEngine(first.Engine, data.ApplyID)
 		// The group's DDL is its first target's, so a cut block names that
-		// target's stored plan and says the rest of the group runs the same.
-		restoreGroup := budget.forTargetGroup(targetNames(data.Model, w.members))
+		// target's stored plan and says which other targets run the same.
+		restoreGroup := planScopeForWork(budget, targetNames(data.Model, w.members), len(work), silent)
 		restorePlan := budget.pointAt(first.storedPlan())
 		for _, t := range w.tables {
 			cells, targets := tableAcrossTargets(data, w.members, t)
@@ -66,6 +66,17 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		fmt.Fprintf(sb, "_%d of %d targets have not reported progress yet._\n", silent, len(g.Members))
 	}
 	writeFailedTargets(sb, data.Model, g)
+}
+
+// planScopeForWork scopes the pointer a cut block in one work group carries.
+// Under a group heading the marker speaks for the targets the heading names;
+// a sole group has no heading, so the marker names its plan's target and
+// speaks only for the targets that have reported.
+func planScopeForWork(budget *ddlBlockBudget, members []string, groups, unreported int) (restore func()) {
+	if groups > 1 {
+		return budget.forTargetGroup(members)
+	}
+	return budget.forSoleTargetGroup(members, unreported)
 }
 
 // unreportedTargets counts the targets with no table progress to show yet, so
