@@ -334,70 +334,188 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 	})
 
-	// FindNextApplyOperation_BarrierCutsOverOneTargetsShardsOneAtATime verifies
-	// what stays ordered inside one rollout member. Under barrier, both shards of
-	// payments-001 start their copies together, but they cut over one at a time:
-	// shard 80- parks behind shard -80 even though both belong to the same
-	// target. The target's finalizer waits until both shards have completed.
-	t.Run("FindNextApplyOperation_BarrierCutsOverOneTargetsShardsOneAtATime", func(t *testing.T) {
+	// FindNextApplyOperation_OrderedCutoverTakesOneTargetsShardsOneAtATime
+	// verifies what stays ordered inside one rollout member. Under barrier and
+	// under parallel, both shards of payments-001 start their copies together,
+	// but they cut over one at a time: shard 80- parks behind shard -80 even
+	// though both belong to the same target. The target's finalizer waits until
+	// both shards have completed.
+	t.Run("FindNextApplyOperation_OrderedCutoverTakesOneTargetsShardsOneAtATime", func(t *testing.T) {
+		for _, cutoverPolicy := range []string{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel} {
+			t.Run(cutoverPolicy, func(t *testing.T) {
+				testOneTargetsShardsCutOverOneAtATime(t, h, cutoverPolicy)
+			})
+		}
+	})
+
+	// FindNextApplyOperation_FinalizerWaitsOnEarlierMembers verifies that a
+	// finalizer is ordered against earlier rollout members like a cutover. A
+	// VSchema-only rollout over region-a and region-b has one finalizer per
+	// member and no work. region-b's finalizer does not start while region-a's
+	// is running, under any policy, and once region-a's fails it stays held
+	// under halt, and under pause until an operator releases the rollout, so
+	// region-b's VSchema never goes out behind a failed region-a. It starts once
+	// region-a's completes.
+	t.Run("FindNextApplyOperation_FinalizerWaitsOnEarlierMembers", func(t *testing.T) {
+		for _, tc := range []struct {
+			name          string
+			cutoverPolicy string
+			onFailure     string
+			// earlierFails fails region-a's finalizer; otherwise it completes.
+			earlierFails  bool
+			release       bool
+			laterAdmitted bool
+		}{
+			{name: "rolling_halt_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureHalt, earlierFails: true},
+			{name: "rolling_pause_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailurePause, earlierFails: true},
+			{name: "rolling_pause_released", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailurePause, earlierFails: true, release: true, laterAdmitted: true},
+			{name: "barrier_halt_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierFails: true},
+			{name: "parallel_halt_failed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierFails: true},
+			{name: "parallel_halt_completed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, laterAdmitted: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_finalizer_order_"+tc.name, storage.DatabaseTypeVitess)
+				apply := CreateApply(t, store, lock, "apply_operation_finalizer_order_"+tc.name, 915)
+				ids := make([]int64, 0, 2)
+				for _, deployment := range []string{"region-a", "region-b"} {
+					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: deployment,
+						OperationKey:  "group_finalizer",
+						OperationKind: storage.ApplyOperationKindGroupFinalizer,
+						CutoverPolicy: tc.cutoverPolicy, OnFailure: tc.onFailure,
+					})
+					require.NoError(t, err)
+					ids = append(ids, id)
+				}
+
+				first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, first)
+				require.Equal(t, ids[0], first.ID, "region-a's finalizer starts first")
+
+				held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				assert.Nil(t, held, "region-b's finalizer waits while region-a's is running under %s", tc.cutoverPolicy)
+
+				if tc.earlierFails {
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "vschema apply rejected"))
+				} else {
+					require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0]))
+				}
+				if tc.release {
+					heldBeforeRelease, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					require.NoError(t, err)
+					require.Nil(t, heldBeforeRelease, "a paused rollout holds region-b until an operator releases it")
+					_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+						ApplyID:     apply.ID,
+						Operation:   storage.ControlOperationRelease,
+						Status:      storage.ControlRequestPending,
+						RequestedBy: "operator-a",
+						Metadata:    []byte(`{}`),
+					})
+					require.NoError(t, err)
+				}
+
+				next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				if !tc.laterAdmitted {
+					assert.Nil(t, next, "region-b's VSchema is never applied behind a failed region-a under %s/%s", tc.cutoverPolicy, tc.onFailure)
+					return
+				}
+				require.NotNil(t, next, "%s admits region-b's finalizer", tc.name)
+				assert.Equal(t, ids[1], next.ID)
+				assert.Equal(t, "region-b", next.Deployment)
+			})
+		}
+	})
+
+	// FindNextApplyOperation_BarrierStartsLaterCopyPastParkedMemberFinalizer
+	// verifies that an earlier member's pending finalizer does not turn barrier
+	// into rolling. payments-001 and payments-002 each have two shards of
+	// orders and an orders finalizer. Once payments-001's shards park at the
+	// barrier, payments-002's copies start even though payments-001's finalizer
+	// is still pending. What is visible stays ordered: payments-002 does not cut
+	// over, and its finalizer does not start, until payments-001's finalizer has
+	// completed.
+	t.Run("FindNextApplyOperation_BarrierStartsLaterCopyPastParkedMemberFinalizer", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
-		lock := CreateLock(t, store, "operation_target_shard_cutover_db", storage.DatabaseTypeMySQL)
-		apply := CreateApply(t, store, lock, "apply_operation_target_shard_cutover", 914)
-		const target = "payments-001"
-		var shardIDs []int64
-		for _, shard := range []string{"-80", "80-"} {
+		lock := CreateLock(t, store, "operation_barrier_finalizer_db", storage.DatabaseTypeVitess)
+		apply := CreateApply(t, store, lock, "apply_operation_barrier_finalizer", 916)
+		shards := map[string][]int64{}
+		finalizers := map[string]int64{}
+		for _, target := range []string{"payments-001", "payments-002"} {
+			for _, shard := range []string{"-80", "80-"} {
+				id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+					ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+					OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shard, "orders")),
+					OperationKind: storage.ApplyOperationKindWork,
+					CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+				})
+				require.NoError(t, err)
+				shards[target] = append(shards[target], id)
+			}
 			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 				ApplyID: apply.ID, Deployment: "payments-a", Target: target,
-				OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shard, "orders")),
-				OperationKind: storage.ApplyOperationKindWork,
+				OperationKey:  storage.TargetOperationKey(target, "orders/group_finalizer"),
+				OperationKind: storage.ApplyOperationKindGroupFinalizer,
 				CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
 			})
 			require.NoError(t, err)
-			shardIDs = append(shardIDs, id)
+			finalizers[target] = id
 		}
-		finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-			ApplyID: apply.ID, Deployment: "payments-a", Target: target,
-			OperationKey:  storage.TargetOperationKey(target, "orders/group_finalizer"),
-			OperationKind: storage.ApplyOperationKindGroupFinalizer,
-			CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
-		})
-		require.NoError(t, err)
 
-		for _, want := range shardIDs {
-			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		// parkAtBarrier moves a claimed shard to waiting_for_cutover and
+		// releases its lease, as a copy drive does when it parks.
+		parkAtBarrier := func(t *testing.T, claimed *storage.ApplyOperation) {
+			t.Helper()
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, claimed.ID, state.ApplyOperation.WaitingForCutover))
+			released, err := store.ApplyOperations().ReleaseClaim(ctx, claimed.Lease())
 			require.NoError(t, err)
-			require.NotNil(t, claimed, "one target's shards start their copies together")
-			assert.Equal(t, want, claimed.ID)
-		}
-		for _, id := range shardIDs {
-			require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.WaitingForCutover))
+			require.True(t, released)
 		}
 
-		first, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+		for _, target := range []string{"payments-001", "payments-002"} {
+			for _, want := range shards[target] {
+				claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, claimed, "%s's copies start while every earlier member is at the barrier", target)
+				assert.Equal(t, want, claimed.ID)
+				parkAtBarrier(t, claimed)
+			}
+		}
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 		require.NoError(t, err)
-		require.NotNil(t, first)
-		assert.Equal(t, shardIDs[0], first.ID, "shard -80 cuts over first")
+		assert.Nil(t, idle, "neither finalizer starts while its target's shards are parked")
 
-		held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		for _, want := range shards["payments-001"] {
+			cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, cutover)
+			assert.Equal(t, want, cutover.ID, "payments-001 cuts over first, one shard at a time")
+			require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, want))
+		}
+
+		heldCutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
 		require.NoError(t, err)
-		assert.Nil(t, held, "shard 80- does not cut over while shard -80 of the same target is mid-cutover")
+		assert.Nil(t, heldCutover, "payments-002 does not cut over while payments-001's finalizer is pending")
 
-		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[0]))
-		finalizerEarly, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
-		require.NoError(t, err)
-		assert.Nil(t, finalizerEarly, "the finalizer waits while shard 80- has not completed")
-
-		second, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
-		require.NoError(t, err)
-		require.NotNil(t, second)
-		assert.Equal(t, shardIDs[1], second.ID, "shard 80- cuts over once shard -80 completes")
-
-		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[1]))
 		finalizer, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 		require.NoError(t, err)
-		require.NotNil(t, finalizer, "the finalizer starts once all of its target's work has completed")
-		assert.Equal(t, finalizerID, finalizer.ID)
+		require.NotNil(t, finalizer)
+		assert.Equal(t, finalizers["payments-001"], finalizer.ID, "payments-001's finalizer starts once its shards complete")
+
+		stillHeld, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, stillHeld, "payments-002 does not cut over while payments-001's finalizer is running")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, finalizers["payments-001"]))
+		next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, next)
+		assert.Equal(t, shards["payments-002"][0], next.ID, "payments-002 cuts over once payments-001 has completed")
 	})
 
 	// FindNextApplyOperation_CapsDriversPerApply verifies that one wide fan-out
@@ -775,4 +893,70 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		_, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver")
 		require.Error(t, err)
 	})
+}
+
+// testOneTargetsShardsCutOverOneAtATime seeds one target with two shards of
+// orders and an orders finalizer under an ordered cutover policy, and checks
+// that the shards copy together, cut over one at a time, and that the
+// finalizer waits for both.
+func testOneTargetsShardsCutOverOneAtATime(t *testing.T, h Harness, cutoverPolicy string) {
+	t.Helper()
+	ctx := t.Context()
+	store := h.NewStorage(t)
+	lock := CreateLock(t, store, "operation_target_shard_cutover_"+cutoverPolicy, storage.DatabaseTypeMySQL)
+	apply := CreateApply(t, store, lock, "apply_operation_target_shard_cutover_"+cutoverPolicy, 914)
+	const target = "payments-001"
+	var shardIDs []int64
+	for _, shard := range []string{"-80", "80-"} {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+			OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shard, "orders")),
+			OperationKind: storage.ApplyOperationKindWork,
+			CutoverPolicy: cutoverPolicy, OnFailure: storage.OnFailureHalt,
+		})
+		require.NoError(t, err)
+		shardIDs = append(shardIDs, id)
+	}
+	finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+		OperationKey:  storage.TargetOperationKey(target, "orders/group_finalizer"),
+		OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		CutoverPolicy: cutoverPolicy, OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+
+	for _, want := range shardIDs {
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "one target's shards start their copies together")
+		assert.Equal(t, want, claimed.ID)
+	}
+	for _, id := range shardIDs {
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.WaitingForCutover))
+	}
+
+	first, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, shardIDs[0], first.ID, "shard -80 cuts over first")
+
+	held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, held, "shard 80- does not cut over while shard -80 of the same target is mid-cutover")
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[0]))
+	finalizerEarly, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, finalizerEarly, "the finalizer waits while shard 80- has not completed")
+
+	second, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	assert.Equal(t, shardIDs[1], second.ID, "shard 80- cuts over once shard -80 completes")
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[1]))
+	finalizer, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, finalizer, "the finalizer starts once all of its target's work has completed")
+	assert.Equal(t, finalizerID, finalizer.ID)
 }
