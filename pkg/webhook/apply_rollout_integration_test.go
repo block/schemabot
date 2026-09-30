@@ -138,7 +138,7 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesAfterConfirmation(t *testing
 	assert.Contains(t, body, "The reviewed target already has this schema")
 	assert.Contains(t, body, "ADD COLUMN `email`", "the comment shows the plan us would run")
 	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
-	assert.NotContains(t, body, "No schema changes detected")
+	assert.NotContains(t, body, "✅ **No schema changes detected**", "a target still has work, so the comment never closes as a no-op")
 
 	requireNoApplies(t, svc, dbName)
 	check = rolloutCheck(t, svc, dbName)
