@@ -634,11 +634,17 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 
 	s.logger.Debug("operator driver started", "driver", driverID)
 
-	if !s.admitClaimPass(stop) {
+	// A driver that finds the gate closed returns rather than skipping a pass:
+	// skipping would only wait for the next select to pick stop. The check is a
+	// non-blocking read, so a pass that starts just before closure still runs;
+	// the ladder re-reads the gate before each of its claim queries, and a
+	// claim that lands in the instant after the last read is captured by
+	// StopOperator's claim drain.
+	if claimGateClosed(stop) {
 		s.logger.Debug("operator driver stopping before its first claim; claiming has stopped", "driver", driverID)
 		return
 	}
-	s.driveTick(ctx, driverID)
+	s.driveTick(ctx, driverID, stop)
 
 	for {
 		select {
@@ -651,33 +657,28 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 		case <-wake:
 			// select picks at random among ready cases, so a wake or tick
 			// queued before claiming stopped can still be chosen over stop.
-			if !s.admitClaimPass(stop) {
+			if claimGateClosed(stop) {
 				s.logger.Debug("operator driver stopping instead of a woken claim; claiming has stopped", "driver", driverID)
 				return
 			}
 			s.logger.Debug("operator driver woke for queued apply", "driver", driverID)
-			s.driveTick(ctx, driverID)
+			s.driveTick(ctx, driverID, stop)
 		case <-ticker.C:
-			if !s.admitClaimPass(stop) {
+			if claimGateClosed(stop) {
 				s.logger.Debug("operator driver stopping instead of a polled claim; claiming has stopped", "driver", driverID)
 				return
 			}
-			s.driveTick(ctx, driverID)
+			s.driveTick(ctx, driverID, stop)
 		}
 	}
 }
 
-// admitClaimPass serializes claim-pass admission with StopClaiming. A pass
-// admitted while the gate is open may finish after closure; once closure owns
-// operatorMu, every later admission observes the closed gate and stops.
-func (s *Service) admitClaimPass(stop <-chan struct{}) bool {
-	s.operatorMu.Lock()
-	defer s.operatorMu.Unlock()
-	return !claimGateClosed(stop)
-}
-
 // claimGateClosed reports, without blocking, whether StopClaiming has closed
-// the driver pool's claim gate.
+// the driver pool's claim gate. The read is ordered against the close on its
+// own, so it needs no lock; what no read can do is order a claim that follows
+// it against a closure that lands in between, which is why the ladder re-reads
+// the gate as late as it can before each claim query and StopOperator's claim
+// drain covers the instant that remains.
 func claimGateClosed(stop <-chan struct{}) bool {
 	select {
 	case <-stop:
@@ -694,7 +695,12 @@ func claimGateClosed(stop <-chan struct{}) bool {
 // resumeClaimedApply seam, so a panic reaching this boundary comes from the
 // claim or projection machinery itself and leaves no apply marked failed —
 // that work is retried on a later tick.
-func (s *Service) driveTick(ctx context.Context, driverID int) {
+//
+// The pass honours the claim gate as well as the context: a tick admitted
+// while claiming was still open re-reads the gate here, and the ladder reads
+// it again before each claim query, so a pass overlapping StopClaiming claims
+// nothing after the closure it can observe (AV-14).
+func (s *Service) driveTick(ctx context.Context, driverID int, stop <-chan struct{}) {
 	// The driver's select can pick a ready ticker over an equally ready
 	// ctx.Done(), so a tick can start after the operator has already been told
 	// to stop. Every claim it made would fail against the cancelled context and
@@ -703,8 +709,12 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 		s.logger.Debug("operator: skipping the claim ladder; the operator is shutting down", "driver", driverID)
 		return
 	}
+	if claimGateClosed(stop) {
+		s.logger.Debug("operator: skipping the claim ladder; claiming has stopped", "driver", driverID)
+		return
+	}
 	err := panicsafe.Call(func() error {
-		s.recoverApplies(ctx, driverID)
+		s.recoverApplies(ctx, driverID, stop)
 		return nil
 	})
 	if err == nil {
@@ -788,7 +798,12 @@ func (s *Service) markDriverBusy(ctx context.Context) func() {
 // recoverApplies claims and resumes work that needs attention. Each call
 // claims at most one unit — a pending-stop reconciliation, a barrier-parked
 // cutover, or an apply operation — to keep the drive loop responsive.
-func (s *Service) recoverApplies(ctx context.Context, driverID int) {
+//
+// The gate is re-read before each rung's claim query rather than once at the
+// top: a rung's query can find nothing to claim, and the next rung then runs
+// after time in which StopClaiming may have closed the gate. Each rung
+// therefore reads the gate as late as it can before its own query (AV-14).
+func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan struct{}) {
 	owner := driverLeaseOwner(driverID)
 
 	// Service a pending stop with no claimable operation to carry it before
@@ -802,6 +817,9 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 	// before claiming new copy work, so the high-risk ordered swaps make
 	// progress ahead of starting more copy phases. Dormant until the
 	// multi-deployment fan-out lands (nothing parks at the barrier today).
+	if s.claimGateClosedBeforeRung(stop, driverID, "cutover") {
+		return
+	}
 	if s.recoverApplyOperationCutover(ctx, driverID, owner) {
 		return
 	}
@@ -811,10 +829,27 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 	// rather than merely tidying a row. It matches nothing while any
 	// operation is still non-terminal or any driver is still heartbeating,
 	// so on a healthy plane this is a cheap no-op.
+	if s.claimGateClosedBeforeRung(stop, driverID, "projection") {
+		return
+	}
 	if s.recoverApplyOperationProjection(ctx, driverID, owner) {
 		return
 	}
+	if s.claimGateClosedBeforeRung(stop, driverID, "operation") {
+		return
+	}
 	s.recoverApplyOperation(ctx, driverID, owner)
+}
+
+// claimGateClosedBeforeRung reports whether StopClaiming closed the claim gate
+// while an earlier rung of the ladder was running, logging the rung the pass
+// stops short of so a shutdown trace shows where claiming ceased.
+func (s *Service) claimGateClosedBeforeRung(stop <-chan struct{}, driverID int, rung string) bool {
+	if !claimGateClosed(stop) {
+		return false
+	}
+	s.logger.Debug("operator: leaving the claim ladder before a rung; claiming has stopped", "driver", driverID, "rung", rung)
+	return true
 }
 
 // recoverApplyOperation claims work at the apply_operations (per-deployment)
