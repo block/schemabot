@@ -7105,7 +7105,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
      ~ users
        ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
 
-📋 **Plan**: 1 table to create, 1 table to alter, 1 VSchema change
+📋 Plan: 1 table to create, 1 table to alter, 1 VSchema change
 
 
 ```
@@ -7142,7 +7142,7 @@ Vitess plan: VSchema-only update (no table DDL changes)
           },
           "tables": {
 
-📋 **Plan**: 1 VSchema change
+📋 Plan: 1 VSchema change
 
 
 ```
@@ -7202,7 +7202,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
      ~ orders
        ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
 
-📋 **Plan**: 1 table to create, 2 tables to alter, 2 VSchema changes
+📋 Plan: 1 table to create, 2 tables to alter, 2 VSchema changes
 
 
 ```
