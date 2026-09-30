@@ -1703,9 +1703,12 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 		Shards:         protoShards,
 		// A member's diff can become the plan an apply runs on that member, so
 		// it discloses the copies that apply would continue or destroy exactly
-		// as Plan does.
+		// as Plan does. It claims to have reported them only when the engine
+		// read the target for every one: an engine that does not look, or a
+		// lookup that failed, leaves the member's copies unknown, and the
+		// caller refuses to discard what it cannot see.
 		ExistingCopies:         c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
-		ExistingCopiesReported: true,
+		ExistingCopiesReported: result.ExistingCopiesChecked,
 	}, nil
 }
 
@@ -1930,7 +1933,8 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	}
 	sort.Strings(namespaces)
 
-	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true}
+	// Copies are checked only when every namespace's plan checked its own.
+	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true, ExistingCopiesChecked: true}
 	for _, namespace := range namespaces {
 		creds, err := c.credentialsForMySQLNamespace(namespace)
 		if err != nil {
@@ -1943,6 +1947,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 		result.Changes = append(result.Changes, nsResult.Changes...)
 		result.LintViolations = append(result.LintViolations, nsResult.LintViolations...)
 		result.ExistingCopies = append(result.ExistingCopies, nsResult.ExistingCopies...)
+		result.ExistingCopiesChecked = result.ExistingCopiesChecked && nsResult.ExistingCopiesChecked
 		result.ExemptTables = append(result.ExemptTables, nsResult.ExemptTables...)
 		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
 			result.NoChanges = false

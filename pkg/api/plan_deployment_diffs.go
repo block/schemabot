@@ -45,8 +45,9 @@ type DeploymentPlanDiff struct {
 
 	// ExistingCopies are the unfinished copies on this member that applying its
 	// diff would continue or destroy. ExistingCopiesReported says the data plane
-	// looked: one that predates the disclosure leaves both unset, which is not
-	// the same as a clean target. The primary's entry leaves them unset too; its
+	// read the target for every one: one that predates the disclosure, does not
+	// look, or whose lookup failed leaves it unset, which is not the same as a
+	// clean target. The primary's entry leaves them unset too; its
 	// copies are disclosed on the reviewed plan itself.
 	ExistingCopies         []*ternv1.ExistingCopy
 	ExistingCopiesReported bool

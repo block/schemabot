@@ -2085,8 +2085,9 @@ type PlanDiffResponse struct {
 	// Unfinished work already on the target that applying this diff's changes
 	// would continue or destroy, the same disclosures PlanResponse carries.
 	ExistingCopies []*ExistingCopy `protobuf:"bytes,6,rep,name=existing_copies,json=existingCopies,proto3" json:"existing_copies,omitempty"`
-	// Set by a data plane that reports existing_copies, so a caller can tell a
-	// clean target from a data plane that never looked.
+	// Set by a data plane that read the target for every copy applying this
+	// diff could meet, so a caller can tell a clean target from a data plane
+	// that never looked or whose lookup failed.
 	ExistingCopiesReported bool `protobuf:"varint,7,opt,name=existing_copies_reported,json=existingCopiesReported,proto3" json:"existing_copies_reported,omitempty"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache

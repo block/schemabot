@@ -687,8 +687,9 @@ message PlanDiffResponse {
   // Unfinished work already on the target that applying this diff's changes
   // would continue or destroy, the same disclosures PlanResponse carries.
   repeated ExistingCopy existing_copies = 6;
-  // Set by a data plane that reports existing_copies, so a caller can tell a
-  // clean target from a data plane that never looked.
+  // Set by a data plane that read the target for every copy applying this
+  // diff could meet, so a caller can tell a clean target from a data plane
+  // that never looked or whose lookup failed.
   bool existing_copies_reported = 7;
 }
 
