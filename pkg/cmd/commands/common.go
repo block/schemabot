@@ -457,12 +457,14 @@ func resolveControlFlags(endpoint, profile, applyID, environment string) (string
 }
 
 // applyAndWatch extracts a plan ID, calls the apply API, prints status, and
-// optionally watches progress. Used by both RunApply and RunRollback.
+// optionally watches progress. It returns the apply ID the server assigned,
+// which is empty when the server accepted the apply without naming one. Used by
+// both RunApply and RunRollback.
 func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) error {
+	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
-		return fmt.Errorf("no plan_id in response")
+		return "", fmt.Errorf("no plan_id in response")
 	}
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
@@ -474,11 +476,11 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		return applyErr
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if err := checkAccepted(applyResponseWrapper{applyResult}, operation); err != nil {
-		return err
+		return "", err
 	}
 
 	applyID := applyResult.ApplyID
@@ -491,7 +493,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		}
 		enc := json.NewEncoder(os.Stdout)
 		_ = enc.Encode(result)
-		return nil
+		return applyID, nil
 	}
 
 	label := strings.ToUpper(operation[:1]) + operation[1:]
@@ -503,15 +505,15 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 
 	if !watch {
 		printWatchInstructions(applyID, database, environment)
-		return nil
+		return applyID, nil
 	}
 
 	fmt.Println("Watching progress...")
 	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
-		return err
+		return applyID, err
 	}
 
-	return nil
+	return applyID, nil
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {

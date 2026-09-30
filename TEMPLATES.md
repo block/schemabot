@@ -3086,6 +3086,17 @@ Options:
 </details>
 
 <details>
+<summary><a name="lock-kept-yield"></a><strong>Lock Kept (Yield)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql) despite --yield: apply apply-a1b2c3d4 is stopped and can still be resumed.
+   Release it once nothing is left to run: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
 <summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
 
 ```

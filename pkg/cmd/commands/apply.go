@@ -34,7 +34,7 @@ type ApplyCmd struct {
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
-	Yield        bool          `help:"Yield lock after successful completion"`
+	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
 	Output       OutputFormat  `short:"o" help:"Output format" default:"interactive" enum:"interactive,log,json"`
 	LogHeartbeat time.Duration `help:"Interval between progress heartbeats in log mode" default:"10s" name:"log-heartbeat"`
@@ -271,20 +271,102 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat); err != nil {
+	applyID, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	if err != nil {
+		if cmd.Yield && !cmd.NoLock && applyID != "" {
+			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
+		}
 		return err
 	}
 
-	// Yield lock if requested and apply was successful
 	if cmd.Yield && !cmd.NoLock {
-		if err := client.ReleaseLock(ep, cfg.Database, cfg.Type, owner); err != nil {
-			fmt.Printf("Warning: failed to release lock: %v\n", err)
-		} else {
-			templates.WriteLockReleased(cfg.Database, cfg.Type)
-		}
+		return yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID)
 	}
 
 	return nil
+}
+
+// shouldYieldLock reports whether --yield may release the database lock. The
+// parent must have settled, and so must every operation and table under it: a
+// settled parent is not proof its work stopped. A rollout projects cancelled as
+// soon as one deployment's operation is cancelled, one failed task fails its
+// operation while a sibling task keeps copying, and a stopped operation can be
+// started again. A failed parent with no operation rows at all offers no proof
+// either way and keeps the lock.
+func shouldYieldLock(progress *apitypes.ProgressResponse) bool {
+	if !state.IsState(progress.State, state.SettledApplyStates...) {
+		return false
+	}
+	if state.IsState(progress.State, state.Apply.Failed) && len(progress.Operations) == 0 {
+		return false
+	}
+	return childWorkSettled(progress)
+}
+
+// childWorkSettled reports whether every operation and table row under the
+// apply has reached a state that no driver will write again.
+func childWorkSettled(progress *apitypes.ProgressResponse) bool {
+	for _, operation := range progress.Operations {
+		if !state.IsState(operation.State, state.SettledApplyStates...) {
+			return false
+		}
+	}
+	for _, table := range progress.Tables {
+		if !state.IsTerminalTaskState(table.Status) {
+			return false
+		}
+	}
+	return true
+}
+
+// yieldLock releases the database lock for --yield once the apply has settled.
+// It reads the apply's state from the server rather than trusting how the
+// command got here: an unwatched apply, a stopped one, and a watch the operator
+// left all return without the apply having finished. Anything that is not a
+// settled state keeps the lock and says how to release it later.
+func yieldLock(ep, database, dbType, owner, environment, applyID string) error {
+	if applyID == "" {
+		templates.WriteLockKept(database, dbType, "the server returned no apply ID to check")
+		return fmt.Errorf("release lock for %s: the server returned no apply ID", database)
+	}
+	progress, err := client.GetProgress(ep, applyID)
+	if err != nil {
+		templates.WriteLockKept(database, dbType, fmt.Sprintf("the state of apply %s could not be read (%v)", applyID, err))
+		return fmt.Errorf("read apply %s before releasing lock for %s: %w", applyID, database, err)
+	}
+	if !shouldYieldLock(progress) {
+		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, environment, progress))
+		return nil
+	}
+	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
+		templates.WriteLockKept(database, dbType, fmt.Sprintf("the server did not release it (%v)", err))
+		return fmt.Errorf("release lock for %s: %w", database, err)
+	}
+	templates.WriteLockReleased(database, dbType)
+	return nil
+}
+
+// lockKeptReason says why --yield kept the lock for an apply that
+// shouldYieldLock rejected: the parent has not settled, or it has but a
+// deployment or table under it is still able to write. The settled cases point
+// at the progress command so the operator can see which row is still moving
+// before deciding to unlock.
+func lockKeptReason(applyID, environment string, progress *apitypes.ProgressResponse) string {
+	applyState := state.NormalizeState(progress.State)
+	switch {
+	case state.IsState(applyState, state.Apply.Stopped):
+		return fmt.Sprintf("apply %s is stopped and can still be resumed", applyID)
+	case state.IsState(applyState, state.NoActiveChange):
+		return fmt.Sprintf("the server reported no state for apply %s", applyID)
+	case state.IsState(applyState, state.Apply.Failed) && len(progress.Operations) == 0:
+		return fmt.Sprintf("apply %s is failed and the server reported no deployment rows to check (see %s progress -e %s %s)",
+			applyID, cliname.Name(), environment, applyID)
+	case state.IsState(applyState, state.SettledApplyStates...):
+		return fmt.Sprintf("apply %s is %s, but not every deployment and table under it has stopped yet (see %s progress -e %s %s)",
+			applyID, applyState, cliname.Name(), environment, applyID)
+	default:
+		return fmt.Sprintf("apply %s has not finished (state: %s)", applyID, applyState)
+	}
 }
 
 // OutputFormat specifies how progress output is rendered during apply watch.
