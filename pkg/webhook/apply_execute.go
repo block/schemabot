@@ -113,33 +113,105 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// A confirmation given against the comment saying the reviewed target
+	// already had this schema, which showed only the other targets' plans, does
+	// not cover changes the reviewed target has gained since: none of them were
+	// on that comment, so they never run on the strength of it. Any other
+	// confirmation was given against the reviewed target's own plan, and the
+	// gates below re-check that.
+	if storedPlan == nil && planResp.HasChanges() {
+		confirmedConverged, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, environment)
+		if roundErr != nil {
+			h.logger.Error("apply-confirm rejected: could not load the confirmed plan and its review round to compare with the reviewed target's changes; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", roundErr)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+			return
+		}
+		if confirmedConverged {
+			h.logger.Info("apply-confirm refused: the reviewed target has changes the confirmed comment did not show",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the reviewed target has changes the confirmation did not cover")
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"The comment this confirmation acts on showed the reviewed target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
+			return
+		}
+	}
+
 	// No changes (neither table DDL nor a VSchema update) — release the lock
 	// (keyed on the pending intent this handler observed, so a lock re-pinned by
 	// a newer plan is preserved) and notify. An empty primary plan speaks only
 	// for the primary where members hold schemas of their own, so the other
 	// members are planned first and their work, if any, answers.
+	//
+	// Other targets' work runs only from apply-confirm, and only when the
+	// confirmation was given against exactly that work. An automatic apply
+	// reaching here saw the reviewed target converge after its comment showed
+	// the reviewed target's plan alone, so it refuses.
 	if !planResp.HasChanges() {
-		rollout, _ := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
-		if rolloutStillPending(rollout) {
+		rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+		switch {
+		case storedPlan == nil && rolloutRunsMemberWork(rollout, rolloutPreview):
+			covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment)
+			if coverErr != nil {
+				// The confirmation is kept: nothing is known to be wrong with it,
+				// and a retry can still confirm the plans the operator reviewed.
+				h.logger.Error("apply-confirm rejected: could not verify that the confirmation covers the other targets' work; the pending confirmation is preserved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"SchemaBot could not verify the plans this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+				return
+			}
+			if !covered {
+				h.logger.Info("apply-confirm refused: the other targets' work is not what the confirmation was given against",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work is not what was confirmed")
+				h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout)
+				return
+			}
+			// The statements match the confirmed round's, but a copy can appear on
+			// a target after the comment was posted.
+			refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout)
+			if refusalErr != nil {
+				h.logger.Error("apply-confirm rejected: could not verify that the other targets' plans can run from this apply; the pending confirmation is preserved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", refusalErr)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+				return
+			}
+			if refusal != "" {
+				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
+				h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, memberWorkRefusalMessage(refusal))
+				return
+			}
+			h.logger.Info("apply-confirm: the reviewed target is already at the desired schema; running the confirmed plans of the targets that still need the change",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "pending_targets", rollout.work.names)
+		case rolloutStillPending(rollout):
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rest of the rollout is not at the desired schema")
 			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout)
 			return
+		default:
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
+			// The target already matches the PR schema — apply found nothing to do.
+			// Record the passing (no-change) check result and refresh the aggregate so
+			// the schema check reflects that the target is up to date, the same as the
+			// no-change plan path.
+			if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
+				h.logger.Error("failed to record no-changes check after apply",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
+			} else if headSHA != "" {
+				h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+			}
+			h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoChanges(database, environment))
+			return
 		}
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
-		// The target already matches the PR schema — apply found nothing to do.
-		// Record the passing (no-change) check result and refresh the aggregate so
-		// the schema check reflects that the target is up to date, the same as the
-		// no-change plan path.
-		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
-			h.logger.Error("failed to record no-changes check after apply",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
-		} else if headSHA != "" {
-			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-		}
-		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoChanges(database, environment))
-		return
 	}
-
 	// Engine-blocked changes reject the apply outright — the re-plan may have
 	// resolved a change to blocked even if the reviewed plan had none (e.g.
 	// the direct execution policy changed, or the table grew past its bound).

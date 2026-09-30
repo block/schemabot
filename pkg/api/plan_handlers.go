@@ -1677,6 +1677,15 @@ func (s *Service) createStoredApply(
 			return nil, 0, err
 		}
 	}
+	// An apply whose own plan has no work exists only to run the other members'
+	// own plans, since its reviewed target is already at the desired schema.
+	if !plan.HasWork() {
+		for _, member := range members {
+			if err := rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
 	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, members, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
 	if err != nil {
 		return nil, 0, err
@@ -1729,6 +1738,56 @@ func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOpti
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
 	}
 	return nil
+}
+
+// rejectMemberWorkAnEmptyReviewedPlanCannotCarry refuses a member's work that
+// an apply created from an empty reviewed plan cannot run as it was planned. The
+// PR apply refuses the same work before it asks for confirmation; this is the
+// check every caller creating such an apply passes through.
+func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
+	if reason := MemberWorkAConvergedReviewedPlanCannotRun(member.Plan); reason != "" {
+		return fmt.Errorf("rollout member %s: plan %s %s, which an apply whose reviewed target is already at the desired schema cannot run",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)
+	}
+	return nil
+}
+
+// MemberWorkAConvergedReviewedPlanCannotRun describes the first thing in a
+// member's plan that an apply created from an empty reviewed plan cannot run as
+// it was planned, or returns "" when there is none. The description names only
+// tables and namespaces, so it is fit for a PR comment.
+//
+// The apply's shape, whether a per-shard fan-out, a finalizer, or one work
+// operation per member, is chosen from the apply's own plan, so an empty one
+// leaves every member on one work operation per member. Per-shard changes and
+// finalizer work have no place in that shape, and a member carrying only them
+// would be settled as having nothing to do while its target never got the
+// change. Blocked changes never run. Direct-execution and unsafe changes are
+// refused whatever the command's flags: the operator consents to them against
+// the disclosure the reviewed plan's comment carries, and the member plans that
+// comment renders carry none.
+func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
+	if plan.BlockedApplyError() != nil {
+		return "carries changes its target's engine refuses"
+	}
+	if shards := changingShardsByNamespace(plan.Shards); len(shards) > 0 {
+		return "carries per-shard changes"
+	}
+	if namespaces := plan.FinalizerNamespaces(); len(namespaces) > 0 {
+		return fmt.Sprintf("finalizes namespaces %v", namespaces)
+	}
+	for _, change := range plan.FlatDDLChanges() {
+		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
+			return fmt.Sprintf("runs table %q as direct-execution DDL", change.Table)
+		}
+	}
+	if unsafe := plan.UnsafeDDLChanges(); len(unsafe) > 0 {
+		return fmt.Sprintf("carries an unsafe change for table %q", unsafe[0].Table)
+	}
+	if unsafe := plan.UnsafeVSchemaChanges(); len(unsafe) > 0 {
+		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q", unsafe[0].Namespace)
+	}
+	return ""
 }
 
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {

@@ -221,6 +221,14 @@ type PlanCommentData struct {
 	// deployment compares to the reviewed primary plan. Nil for a single-target
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
+
+	// MemberApplyRefusal says why a PR apply cannot run the other targets'
+	// plans this comment renders for a reviewed target already at the desired
+	// schema, naming only targets, tables, and namespaces. Such an apply is
+	// refused whatever its flags, so the comment offers no apply command in its
+	// place. Empty when the apply can run them, or when the comment renders the
+	// reviewed plan alone.
+	MemberApplyRefusal string
 }
 
 // ExemptTablesData describes live tables exempt from a plan verdict.
@@ -476,7 +484,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(&sb, data.DeploymentDrift, data.Changes)
-	targetPlans := rendersTargetPlans(data.DeploymentDrift)
+	targetPlans := RendersTargetPlans(data.DeploymentDrift)
 	summary := data
 	if targetPlans {
 		writeTargetPlans(&sb, data, budget, false)
@@ -494,14 +502,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// genuinely unchanged one.
 	//
 	// A reviewed target with nothing to run while other targets still have work
-	// summarizes their plans instead, without the apply footer: a PR apply runs
-	// from the reviewed plan, and an empty one does not run the other targets'
-	// plans.
-	if totalChanges == 0 {
-		if targetPlans {
-			writePlanSummary(&sb, summary, summaryStatements, summaryKeyspaceUpdates)
-			return appendAgentHint(sb.String(), data.AgentHint)
-		}
+	// is not a no-op: the comment goes on to summarize their plans and offer the
+	// apply, which runs each of those targets' own plans.
+	if totalChanges == 0 && !targetPlans {
 		writeNoChangesDetected(&sb, data)
 		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
@@ -615,6 +618,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
+	case data.MemberApplyRefusal != "":
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
 	default:
 		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
@@ -624,6 +629,14 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
+}
+
+// writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
+// apply cannot run the other targets' plans the comment renders. Offering the
+// command there would coach an apply that is refused whatever its flags.
+func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but %s.\n\n", escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " ")))
+	sb.WriteString("A PR apply whose reviewed target is already at the desired schema cannot run that or disclose it for confirmation. The schema check keeps blocking merge until every target has the change.\n")
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
@@ -1814,7 +1827,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// targets that run it, with any change a target will refuse disclosed
 		// under that plan, which says everything this line and the per-target
 		// list would.
-		if rendersTargetPlans(drift) {
+		if RendersTargetPlans(drift) {
 			return
 		}
 		// Independent members were deliberately never compared to each other, so
@@ -1954,14 +1967,14 @@ func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeDa
 	return true
 }
 
-// rendersTargetPlans reports whether the comment renders the rollout's plans one
+// RendersTargetPlans reports whether the comment renders the rollout's plans one
 // group of targets at a time instead of the reviewed plan alone: a clean
 // rollout of independent targets in which some target still has work.
 //
 // Each such target applies its own plan, so the reviewed plan describes only
 // the targets that share it. Rendering it alone would leave a reviewer to
 // approve statements the comment never showed.
-func rendersTargetPlans(drift *DeploymentDriftData) bool {
+func RendersTargetPlans(drift *DeploymentDriftData) bool {
 	return drift != nil && drift.Computed && drift.Clean && drift.Independent && changingTargetCount(drift) > 0
 }
 
@@ -2035,7 +2048,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 // carries keeps the plan-wide section: a refused change is never left unsaid
 // because the two sources disagree.
 func targetPlansDiscloseBlocked(data PlanCommentData) bool {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return false
 	}
 	for _, g := range data.DeploymentDrift.Plans {
@@ -2101,7 +2114,7 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 // countCommentDDLBlocks counts the DDL sections a plan's comment renders: the
 // reviewed plan's, or every target plan's when the rollout renders them.
 func countCommentDDLBlocks(data PlanCommentData) int {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return countPlanDDLBlocks(data.Changes)
 	}
 	count := 0
@@ -2732,7 +2745,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(sb, plan.DeploymentDrift, plan.Changes)
-	targetPlans := rendersTargetPlans(plan.DeploymentDrift)
+	targetPlans := RendersTargetPlans(plan.DeploymentDrift)
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
@@ -2750,6 +2763,10 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	if totalChanges == 0 {
 		if targetPlans {
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
+			if plan.MemberApplyRefusal != "" {
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+				sb.WriteString("\n")
+			}
 			return
 		}
 		sb.WriteString(noChangesDetected + "\n\n")
@@ -2839,11 +2856,25 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Categorize environments
 	var envsWithChanges []string
 	var envsWithErrors []string
+	// An environment whose apply would be refused says why in its own section,
+	// so the footer neither offers its apply nor calls the PR done. The
+	// environments after it wait on it: an apply of a later environment is
+	// refused until every earlier one has succeeded, so offering one would
+	// coach an apply the promotion order refuses.
+	var envsRefused []string
+	var envsBehindRefused []string
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
 			envsWithErrors = append(envsWithErrors, env)
-		} else if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
-			envsWithChanges = append(envsWithChanges, env)
+		} else if plan, ok := data.Plans[env]; ok && plan != nil {
+			switch {
+			case environmentHasWork(plan) && len(envsRefused) > 0:
+				envsBehindRefused = append(envsBehindRefused, env)
+			case environmentHasWork(plan):
+				envsWithChanges = append(envsWithChanges, env)
+			case plan.MemberApplyRefusal != "":
+				envsRefused = append(envsRefused, env)
+			}
 		}
 	}
 
@@ -2863,8 +2894,13 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	case len(envsWithChanges) == 1:
 		sb.WriteString("▶️ **To apply** these changes, comment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
-	case len(envsWithErrors) == 0:
+	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
+	}
+
+	for _, env := range envsBehindRefused {
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and this PR cannot apply %s's other targets' plans (see above).\n",
+			capitalizeFirst(env), envsRefused[0], envsRefused[0])
 	}
 
 	// Error guidance for failed environments
@@ -3102,6 +3138,18 @@ func capitalizeEnvNames(envs []string) string {
 		caps[i] = capitalizeFirst(env)
 	}
 	return strings.Join(caps, " & ")
+}
+
+// environmentHasWork reports whether an environment's plan section offers an
+// apply: its reviewed plan has changes, or its reviewed target is already at the
+// desired schema while the section renders other targets' plans that do and a
+// PR apply can run them. A section whose apply would be refused says why in the
+// section itself.
+func environmentHasWork(plan *PlanCommentData) bool {
+	if hasChanges(plan.Changes) {
+		return true
+	}
+	return RendersTargetPlans(plan.DeploymentDrift) && plan.MemberApplyRefusal == ""
 }
 
 // hasChanges returns true if there are any schema changes.

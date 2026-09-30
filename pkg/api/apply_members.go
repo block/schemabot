@@ -66,7 +66,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 		return []applyMember{{Target: targets[0], Plan: plan}}, nil
 	}
 
-	memberPlans, err := s.memberPlansForReviewRound(ctx, plan, environment)
+	memberPlans, err := s.MemberPlansForReviewRound(ctx, plan, environment)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +114,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 	return members, nil
 }
 
-// memberPlansForReviewRound loads the plans stored for the members of this
+// MemberPlansForReviewRound loads the plans stored for the members of this
 // apply's own review round, keyed by member id.
 //
 // The round is identified by the reviewed plan's identifier, which every member
@@ -132,7 +132,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 // off the end, and a member the listing dropped is indistinguishable here from
 // one the round never planned, which is reported to the operator as an
 // unplanned target and sends them to re-plan a round that was planned fine.
-func (s *Service) memberPlansForReviewRound(ctx context.Context, plan *storage.Plan, environment string) (map[string]*storage.Plan, error) {
+func (s *Service) MemberPlansForReviewRound(ctx context.Context, plan *storage.Plan, environment string) (map[string]*storage.Plan, error) {
 	if plan.PlanIdentifier == "" {
 		return nil, fmt.Errorf("apply for %s/%s addresses several targets but its plan has no identifier to match member plans against",
 			plan.Database, environment)
