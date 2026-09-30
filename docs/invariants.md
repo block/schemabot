@@ -1664,20 +1664,22 @@ published. Secret references remain references on disk.
 
 ### AZ-8: Profile registration preserves connection identity
 
-Registering a local profile must not replace a different connection, change the default profile,
+Registering a local profile must not replace a different connection, change an existing default profile,
 or overwrite a concurrent configuration update. Retrying an identical registration is safe.
 
 *Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
 
 ### AZ-9: Initialization preserves the target and existing files
 
-Initialization verifies the imported schema before publishing it and never applies changes to the
-target. It must not overwrite existing schema files or redirect an existing profile to another
-connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+Initialization verifies the imported schema before publishing it and never applies changes to an
+existing target. An explicitly requested sample is created and seeded separately before entering
+the same import-and-verify workflow. It must not overwrite existing schema files or redirect
+an existing profile to another connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
 its state so the retry uses the same execution authority.
 
 *Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
-`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
+`pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
+`pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
 
 ## Structural enforcement
 
