@@ -2546,8 +2546,10 @@ func (c *ServerConfig) HintCLIName() string {
 }
 
 // validateCLIName rejects a cli_name that cannot render as the start of an
-// inline-code command hint: one that is blank, padded, spans lines, or carries
-// a backtick that would close the code span.
+// inline-code command hint: one that is blank, padded, spans lines, carries a
+// backtick that would close the code span, or carries a format character (a
+// bidi override or zero-width character) that would make the hint an operator
+// sees differ from the command they copy.
 func validateCLIName(name string) error {
 	if name == "" {
 		return nil
@@ -2565,8 +2567,11 @@ func validateCLIName(name string) error {
 		return fmt.Errorf("cli_name must not contain a backtick: it would close the inline code a command hint renders in")
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp) {
 			return fmt.Errorf("cli_name must be a single line with no control characters")
+		}
+		if unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("cli_name must not contain format character %U: it would render differently from the command an operator copies", r)
 		}
 	}
 	return nil

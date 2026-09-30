@@ -4780,6 +4780,10 @@ func TestCLINameConfig(t *testing.T) {
 		"blank":               {"   ", "cli_name must not be blank"},
 		"padded":              {" acme schemabot", "cli_name contains leading or trailing whitespace"},
 		"multi-line":          {"acme\nschemabot", "cli_name must be a single line with no control characters"},
+		"line-separated":      {"acme\u2028schemabot", "cli_name must be a single line with no control characters"},
+		"paragraph-separated": {"acme\u2029schemabot", "cli_name must be a single line with no control characters"},
+		"bidi-overridden":     {"acme \u202eschemabot", "cli_name must not contain format character U+202E"},
+		"zero-width-spaced":   {"acme\u200bschemabot", "cli_name must not contain format character U+200B"},
 		"backtick":            {"acme` schemabot", "cli_name must not contain a backtick"},
 		"longer than the cap": {strings.Repeat("a", maxCLINameChars+1), "cli_name must be at most"},
 	} {
