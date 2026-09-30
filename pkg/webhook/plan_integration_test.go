@@ -530,7 +530,7 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 }
 
 // A plan that adds an index to an existing table renders the table's
-// approximate size in the plan comment — rows and bytes read from the target's
+// approximate on-disk size in the plan comment — read from the target's
 // statistics at plan time — so an operator sees the scale of the index build
 // before applying. Only statements whose cost scales with the table carry a
 // size line: metadata-only alters and tables being created are not listed.
@@ -613,7 +613,7 @@ func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## Schema Change Plan")
 		assert.Contains(t, body, "📊 **Table sizes**:")
-		assert.Contains(t, body, "- `items`: ~1.2k rows · ~", "the size line carries rows then a byte estimate")
+		assert.Regexp(t, "\n- `items`: ~[0-9.]+ (B|KB|MB)\n", body, "the size line carries the table's byte estimate")
 		assert.NotContains(t, body, "- `notes`:", "a column-only alter carries no size line")
 		assert.NotContains(t, body, "- `widgets`:", "a table being created is not listed in the size section")
 		sizesAt := strings.Index(body, "📊 **Table sizes**")

@@ -56,7 +56,7 @@ func previewPlanData() PlanCommentData {
 					"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 				},
 				TableSizes: []TableSizeData{
-					{Table: "products", EstimatedRows: previewRows(2_340_000), EstimatedBytes: previewRows(1_130_000_000)},
+					{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
 				},
 			},
 		},
@@ -115,10 +115,10 @@ func PreviewCommentPlanIgnoreTables() string {
 	})
 }
 
-// previewRows returns a pointer to a sample row-count estimate.
+// previewBytes returns a pointer to a sample byte estimate.
 //
 //go:fix inline
-func previewRows(n int64) *int64 {
+func previewBytes(n int64) *int64 {
 	return new(n)
 }
 
@@ -147,47 +147,46 @@ func PreviewCommentPlanColumnOnlyAlter() string {
 }
 
 // previewManyTableSizes is the table set PreviewCommentPlanManyTables indexes:
-// a spread of sizes from tens of rows to hundreds of millions, in plan
+// a spread of sizes from kilobytes to hundreds of gigabytes, in plan
 // (alphabetical) order, with two tables whose size probe returned nothing.
 var previewManyTableSizes = []struct {
 	table string
-	rows  int64
 	bytes int64
 }{
-	{"accounts", 1_240_000, 610_000_000},
-	{"addresses", 3_900_000, 1_450_000_000},
-	{"api_keys", 18_400, 6_100_000},
-	{"audit_events", 412_000_000, 186_000_000_000},
-	{"carts", 9_800_000, 3_200_000_000},
-	{"categories", 2_100, 1_600_000},
-	{"coupons", 88_000, 41_000_000},
-	{"customers", 6_700_000, 2_900_000_000},
-	{"disputes", 240_000, 150_000_000},
-	{"feature_flags", 310, 180_000},
-	{"fulfillments", 27_000_000, 11_800_000_000},
-	{"inventory", 14_500_000, 5_300_000_000},
-	{"invoices", 31_000_000, 17_400_000_000},
-	{"ledger_entries", 268_000_000, 121_000_000_000},
-	{"line_items", 144_000_000, 58_000_000_000},
-	{"locations", 9_400, 4_200_000},
-	{"notifications", 96_000_000, 44_000_000_000},
-	{"order_events", 0, 0},
-	{"orders", 52_000_000, 26_500_000_000},
-	{"payment_methods", 7_300_000, 2_600_000_000},
-	{"payments", 49_000_000, 23_100_000_000},
-	{"payouts", 1_800_000, 820_000_000},
-	{"prices", 620_000, 210_000_000},
-	{"products", 2_340_000, 1_130_000_000},
-	{"refunds", 3_100_000, 1_300_000_000},
-	{"reviews", 11_200_000, 6_900_000_000},
-	{"sessions", 0, 0},
-	{"settlements", 4_600_000, 2_100_000_000},
-	{"shipments", 25_000_000, 10_900_000_000},
-	{"subscriptions", 890_000, 470_000_000},
-	{"tax_rates", 5_600, 2_300_000},
-	{"transfers", 16_000_000, 7_700_000_000},
-	{"users", 8_200_000, 3_600_000_000},
-	{"webhooks", 1_100_000, 540_000_000},
+	{"accounts", 610_000_000},
+	{"addresses", 1_450_000_000},
+	{"api_keys", 6_100_000},
+	{"audit_events", 186_000_000_000},
+	{"carts", 3_200_000_000},
+	{"categories", 1_600_000},
+	{"coupons", 41_000_000},
+	{"customers", 2_900_000_000},
+	{"disputes", 150_000_000},
+	{"feature_flags", 180_000},
+	{"fulfillments", 11_800_000_000},
+	{"inventory", 5_300_000_000},
+	{"invoices", 17_400_000_000},
+	{"ledger_entries", 121_000_000_000},
+	{"line_items", 58_000_000_000},
+	{"locations", 4_200_000},
+	{"notifications", 44_000_000_000},
+	{"order_events", 0},
+	{"orders", 26_500_000_000},
+	{"payment_methods", 2_600_000_000},
+	{"payments", 23_100_000_000},
+	{"payouts", 820_000_000},
+	{"prices", 210_000_000},
+	{"products", 1_130_000_000},
+	{"refunds", 1_300_000_000},
+	{"reviews", 6_900_000_000},
+	{"sessions", 0},
+	{"settlements", 2_100_000_000},
+	{"shipments", 10_900_000_000},
+	{"subscriptions", 470_000_000},
+	{"tax_rates", 2_300_000},
+	{"transfers", 7_700_000_000},
+	{"users", 3_600_000_000},
+	{"webhooks", 540_000_000},
 }
 
 // PreviewCommentPlanManyTables renders a plan that adds a tenant index to every
@@ -199,9 +198,8 @@ func PreviewCommentPlanManyTables() string {
 	for _, t := range previewManyTableSizes {
 		statements = append(statements, "ALTER TABLE `"+t.table+"` ADD INDEX `idx_tenant_id` (`tenant_id`);")
 		size := TableSizeData{Table: t.table}
-		if t.rows > 0 {
-			size.EstimatedRows = previewRows(t.rows)
-			size.EstimatedBytes = previewRows(t.bytes)
+		if t.bytes > 0 {
+			size.EstimatedBytes = previewBytes(t.bytes)
 		}
 		sizes = append(sizes, size)
 	}
@@ -805,6 +803,79 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 	})
 }
 
+// PreviewCommentPlanRolloutTwoTargetTableSizes renders a plan comment for a
+// rollout of two independent targets that run the same index builds. With
+// two targets each size line gives the total and both targets' sizes, since
+// the reviewed target is not always the one the build takes longest on.
+func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
+	members := previewRolloutMembers()[:2]
+	return previewRolloutTableSizes(members, []TargetTableSize{
+		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
+		previewTargetSize("primary/testapp_1", "users", 95_000_000),
+		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+	})
+}
+
+// PreviewCommentPlanRolloutTableSizes renders a plan comment for a rollout of
+// three independent targets that run the same index builds. Past two targets
+// each size line gives the total alone, and counts a target that reported no
+// estimate, since the total then understates the table.
+func PreviewCommentPlanRolloutTableSizes() string {
+	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
+		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
+		previewTargetSize("primary/testapp_1", "users", 95_000_000),
+		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+		{Target: "primary/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
+		previewTargetSize("primary/testapp_3", "users", 104_000_000),
+	})
+}
+
+func previewTargetSize(target, table string, bytes int64) TargetTableSize {
+	return TargetTableSize{Target: target, Keyspace: "testapp", Size: TableSizeData{Table: table, EstimatedBytes: &bytes}}
+}
+
+// previewRolloutTableSizes renders a rollout whose targets all run the same
+// two index builds, with the given per-target sizes.
+func previewRolloutTableSizes(members []DeploymentDriftEntry, sizes []TargetTableSize) string {
+	var reviewedSizes []TableSizeData
+	for _, ts := range sizes {
+		if ts.Target == members[0].Deployment+"/"+members[0].Target {
+			reviewedSizes = append(reviewedSizes, ts.Size)
+		}
+	}
+	reviewed := []KeyspaceChangeData{{
+		Keyspace: "testapp",
+		Statements: []string{
+			"ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`);",
+			"ALTER TABLE `users` ADD INDEX `idx_email` (`email`);",
+		},
+		TableSizes: reviewedSizes,
+	}}
+	names := make([]string, 0, len(members))
+	for _, m := range members {
+		names = append(names, m.Deployment+"/"+m.Target)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: members,
+			Plans:       []DeploymentPlanGroup{{Members: names, Primary: true, Changes: reviewed}},
+			TableSizes:  sizes,
+		},
+	})
+}
+
 // PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
 // drift rollup could not be computed, so the plan check fails closed.
 func PreviewCommentPlanDriftUnverified() string {
@@ -1331,7 +1402,7 @@ func samplePlanChanges() []KeyspaceChangeData {
 				"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 			},
 			TableSizes: []TableSizeData{
-				{Table: "products", EstimatedRows: previewRows(2_340_000), EstimatedBytes: previewRows(1_130_000_000)},
+				{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
 			},
 		},
 	}
@@ -1635,7 +1706,7 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 				"ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier` (`loyalty_tier`);",
 			},
 			TableSizes: []TableSizeData{
-				{Table: "customers", EstimatedRows: previewRows(48_200_000), EstimatedBytes: previewRows(23_400_000_000), ShardCount: 2, LargestShardRows: previewRows(24_600_000)},
+				{Table: "customers", EstimatedBytes: previewBytes(23_400_000_000), ShardCount: 2},
 			},
 			VSchemaChanged: true,
 			VSchemaDiff: `--- a/commerce_sharded.json
@@ -1700,34 +1771,6 @@ func PreviewCommentVitessPlan() string {
 		IsMySQL:      false,
 		DatabaseType: "vitess",
 		Changes:      sampleVitessPlanChanges(),
-	})
-}
-
-// PreviewCommentVitessPlanBytesOnlySizes renders a sample Vitess plan comment
-// whose size context carries storage bytes with no row counts — the shape a
-// PlanetScale target produces, where the branch table metrics report each
-// table's bytes but nothing counts rows.
-func PreviewCommentVitessPlanBytesOnlySizes() string {
-	return RenderPlanComment(PlanCommentData{
-		Database:     "commerce",
-		SchemaName:   "commerce",
-		Environment:  "staging",
-		HeadSHA:      previewHeadSHA,
-		Repository:   previewRepository,
-		RequestedBy:  previewRequestedBy,
-		IsMySQL:      false,
-		DatabaseType: "vitess",
-		Changes: []KeyspaceChangeData{
-			{
-				Keyspace: "commerce_sharded",
-				Statements: []string{
-					"ALTER TABLE `addresses` ADD INDEX `idx_region` (`region`);",
-				},
-				TableSizes: []TableSizeData{
-					{Table: "addresses", EstimatedBytes: previewRows(48_000_000_000), ShardCount: 4},
-				},
-			},
-		},
 	})
 }
 

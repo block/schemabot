@@ -561,3 +561,58 @@ func TestMemberPlanChanges_EmptyPlanHasNoChanges(t *testing.T) {
 	assert.Empty(t, memberPlanChanges(tern.ChangeSet{}))
 	assert.True(t, templates.DeploymentPlanGroup{}.Empty())
 }
+
+// sizedMember is a planned rollout member whose plan changes the given tables
+// of the testapp namespace, each with the given statement and size estimate.
+func sizedMember(target string, changes ...*ternv1.TableChange) api.DeploymentRollupEntry {
+	return api.DeploymentRollupEntry{
+		DatabaseType: "mysql",
+		Deployment:   "primary",
+		Target:       target,
+		Class:        api.DeploymentPlanned,
+		ChangeSet:    tern.ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: changes}}},
+	}
+}
+
+func sizedChange(table, ddl string, rows, bytes int64) *ternv1.TableChange {
+	return &ternv1.TableChange{
+		Namespace:      "testapp",
+		TableName:      table,
+		Ddl:            ddl,
+		ChangeType:     ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		EstimatedRows:  new(rows),
+		EstimatedBytes: new(bytes),
+	}
+}
+
+// Each target's sizes are read from its own plan, in rollout order, so the
+// size section can total a table across the targets that change it. A table is
+// listed once per target however many statements change it, and a statement
+// whose cost does not grow with the table gets no size.
+func TestTargetTableSizes(t *testing.T) {
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+	addIndex2 := "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+	dropIndex := "ALTER TABLE `users` DROP INDEX `idx_email`"
+	rollup := api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{
+		sizedMember("testapp_1", sizedChange("orders", addIndex, 1_000, 100_000)),
+		sizedMember("testapp_2",
+			sizedChange("orders", addIndex, 48_200_000, 23_400_000_000),
+			sizedChange("orders", addIndex2, 48_200_000, 23_400_000_000),
+			sizedChange("users", dropIndex, 9_000, 900_000)),
+	}}
+
+	sizes := targetTableSizes(rollup, func(databaseType, stmt string) bool {
+		return statementCostScalesWithSize(databaseType, stmt)
+	})
+
+	require.Len(t, sizes, 2)
+	assert.Equal(t, "primary/testapp_1", sizes[0].Target)
+	assert.Equal(t, "testapp", sizes[0].Keyspace)
+	assert.Equal(t, "orders", sizes[0].Size.Table)
+	require.NotNil(t, sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, int64(100_000), *sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, "primary/testapp_2", sizes[1].Target)
+	assert.Equal(t, "orders", sizes[1].Size.Table)
+	require.NotNil(t, sizes[1].Size.EstimatedBytes)
+	assert.Equal(t, int64(23_400_000_000), *sizes[1].Size.EstimatedBytes)
+}

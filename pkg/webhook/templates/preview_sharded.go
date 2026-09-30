@@ -351,7 +351,7 @@ func PreviewCommentShardedPlanDivergent() string {
 			Keyspace:   "cdb_resolute_sharded",
 			Statements: []string{idx},
 			TableSizes: []TableSizeData{
-				{Table: "mutes", EstimatedRows: previewRows(48_200_000), ShardCount: 4, LargestShardRows: previewRows(13_100_000)},
+				{Table: "mutes", EstimatedBytes: previewBytes(22_800_000_000), ShardCount: 4},
 			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Statements: []string{idx}},

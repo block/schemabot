@@ -69,6 +69,12 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 		}, &templates.DeploymentDriftData{Computed: false}
 	}
 	preview := deploymentDriftPreview(rollup)
+	if preview != nil && rollup.Clean {
+		preview.TableSizes = targetTableSizes(rollup, func(databaseType, stmt string) bool {
+			return statementCostScalesWithSize(databaseType, stmt,
+				"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
+		})
+	}
 	if rollup.Clean {
 		return reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}, preview
 	}
@@ -197,6 +203,51 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		}
 	})
 	return groups
+}
+
+// targetTableSizes lists every rollout target's size estimate for each table
+// its own plan changes with a statement whose cost scales with the table's
+// size, in rollout order, primary first. Sizes are read from each target's own
+// plan, since each target applies to its own data. A table is listed once per
+// target however many statements change it, since each statement carries the
+// whole table's estimate. The namespace view is read, which for a sharded
+// namespace carries the estimate summed across its shards.
+func targetTableSizes(rollup api.PlanRollup, costScales func(databaseType, stmt string) bool) []templates.TargetTableSize {
+	names := rollupMemberNames(rollup)
+	var sizes []templates.TargetTableSize
+	for i, e := range rollup.Entries {
+		type tableKey struct{ namespace, table string }
+		listed := make(map[tableKey]bool)
+		for _, sc := range e.ChangeSet.Changes {
+			for _, tc := range sc.GetTableChanges() {
+				// A blank statement never reaches a clean rollup: the member
+				// carrying it fails its own comparison and classifies errored.
+				if tc.GetDdl() == "" {
+					continue
+				}
+				key := tableKey{sc.GetNamespace(), tc.GetTableName()}
+				if listed[key] {
+					continue
+				}
+				// A metadata-only statement's cost does not grow with the
+				// table, so it gets no size line.
+				if !costScales(e.DatabaseType, tc.GetDdl()) {
+					continue
+				}
+				listed[key] = true
+				sizes = append(sizes, templates.TargetTableSize{
+					Target:   names[i],
+					Keyspace: sc.GetNamespace(),
+					Size: templates.TableSizeData{
+						Table:          tc.GetTableName(),
+						ShardCount:     int(tc.GetShardCount()),
+						EstimatedBytes: tc.EstimatedBytes,
+					},
+				})
+			}
+		}
+	}
+	return sizes
 }
 
 // memberBlockedChanges lists the changes in one member's plan that its engine

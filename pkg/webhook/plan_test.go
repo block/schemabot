@@ -1316,12 +1316,31 @@ func TestBuildPlanCommentData_TableSizes(t *testing.T) {
 		"the index add and the widening carry size lines; the created table and the metadata-only column add are omitted")
 	size := data.Changes[0].TableSizes[0]
 	assert.Equal(t, "mutes", size.Table)
-	require.NotNil(t, size.EstimatedRows)
-	assert.Equal(t, rows, *size.EstimatedRows)
 	assert.Equal(t, 4, size.ShardCount)
-	require.NotNil(t, size.LargestShardRows)
-	assert.Equal(t, largest, *size.LargestShardRows)
 	require.NotNil(t, size.EstimatedBytes)
 	assert.Equal(t, bytes, *size.EstimatedBytes)
 	assert.Equal(t, "outcomes", data.Changes[0].TableSizes[1].Table)
+}
+
+// Every change to a table carries the whole table's estimate, so a table that
+// two size-scaling statements change is listed once, not once per statement.
+func TestBuildPlanCommentData_TableSizesListEachTableOnce(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	bytes := int64(23_400_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)", ChangeType: "alter", EstimatedBytes: &bytes},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `status`(`status`)", ChangeType: "alter", EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Len(t, data.Changes[0].Statements, 2, "both statements still render as DDL")
+	require.Len(t, data.Changes[0].TableSizes, 1)
+	assert.Equal(t, "mutes", data.Changes[0].TableSizes[0].Table)
 }

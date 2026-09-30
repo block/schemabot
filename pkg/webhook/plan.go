@@ -961,20 +961,18 @@ func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoP
 // full-table validation scan — using the real parser for the database's
 // dialect. Table sizes are display-only context, so a statement that cannot
 // be parsed logs a warning and renders without a size line rather than
-// failing the comment.
-func statementCostScalesWithSize(schemaResult *ghclient.SchemaRequestResult, stmt string) bool {
-	parser, err := ddl.ParserForDialect(schemapkg.DialectForDatabaseType(schemaResult.Type))
+// failing the comment. logAttrs identify the plan in those warnings.
+func statementCostScalesWithSize(databaseType, stmt string, logAttrs ...any) bool {
+	parser, err := ddl.ParserForDialect(schemapkg.DialectForDatabaseType(databaseType))
 	if err != nil {
 		slog.Warn("no statement parser for dialect; plan comment omits the table-size line",
-			"repo", schemaResult.Repository, "database", schemaResult.Database,
-			"database_type", schemaResult.Type, "error", err)
+			append(logAttrs, "database_type", databaseType, "error", err)...)
 		return false
 	}
 	scales, err := parser.CostScalesWithTableSize(stmt)
 	if err != nil {
 		slog.Warn("failed to inspect plan statement for table-size-scaling cost; plan comment omits the table-size line",
-			"repo", schemaResult.Repository, "database", schemaResult.Database,
-			"database_type", schemaResult.Type, "error", err)
+			append(logAttrs, "database_type", databaseType, "error", err)...)
 		return false
 	}
 	return scales
@@ -1050,21 +1048,26 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			Keyspace: sc.Namespace,
 			Shards:   shardsByKeyspace[sc.Namespace],
 		}
+		sized := make(map[string]bool)
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
 			// Table sizes are shown only for statements whose cost scales
 			// with the table's size — index builds, copies/rebuilds, and
 			// validation scans. Metadata-only statements carrying a size line
 			// would be noise on the plan.
-			if !statementCostScalesWithSize(schema, t.DDL) {
+			if !statementCostScalesWithSize(schema.Type, t.DDL, "repo", schema.Repository, "database", schema.Database) {
 				continue
 			}
+			// Every change to a table carries the whole table's estimate, so a
+			// table with several such statements is listed once.
+			if sized[t.TableName] {
+				continue
+			}
+			sized[t.TableName] = true
 			ksData.TableSizes = append(ksData.TableSizes, templates.TableSizeData{
-				Table:            t.TableName,
-				EstimatedRows:    t.EstimatedRows,
-				ShardCount:       t.ShardCount,
-				LargestShardRows: t.LargestShardRows,
-				EstimatedBytes:   t.EstimatedBytes,
+				Table:          t.TableName,
+				ShardCount:     t.ShardCount,
+				EstimatedBytes: t.EstimatedBytes,
 			})
 		}
 		setNamespaceWork(&ksData, sc)

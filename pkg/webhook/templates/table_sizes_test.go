@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -9,9 +10,9 @@ import (
 )
 
 // Table-size rendering in the plan comment: an info section above the plan
-// summary shows the scale of each table gaining an index — rows, on-disk
-// bytes, the shard span, and the largest single shard. A missing estimate is
-// stated explicitly so a failed size probe never reads as a small table.
+// summary shows the on-disk footprint of each table gaining an index, and the
+// shard span on a sharded target. A missing estimate is stated explicitly so a
+// failed size probe never reads as a small table.
 
 func tableSizePlanData(sizes []TableSizeData) PlanCommentData {
 	return PlanCommentData{
@@ -28,18 +29,18 @@ func tableSizePlanData(sizes []TableSizeData) PlanCommentData {
 
 func TestRenderPlanComment_TableSizes(t *testing.T) {
 	out := RenderPlanComment(tableSizePlanData([]TableSizeData{
-		{Table: "mutes", EstimatedRows: previewRows(2_340_000), EstimatedBytes: previewRows(1_130_000_000)},
+		{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
 	}))
 
 	assert.Contains(t, out, "📊 **Table sizes**:")
 	// The line ends right after the byte clause: a non-sharded target renders
 	// no shard clause.
-	assert.Contains(t, out, "- `mutes`: ~2.3M rows · ~1.1 GB\n")
+	assert.Contains(t, out, "- `mutes`: ~1.1 GB\n")
 }
 
 func TestRenderPlanComment_TableSizesRenderAbovePlanSummary(t *testing.T) {
 	data := tableSizePlanData([]TableSizeData{
-		{Table: "mutes", EstimatedRows: previewRows(2_340_000), EstimatedBytes: previewRows(1_130_000_000)},
+		{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
 	})
 	data.LintViolations = []LintViolationData{
 		{Message: "Index should be invisible first", Table: "mutes", LinterName: "invisible_index_before_drop"},
@@ -55,40 +56,14 @@ func TestRenderPlanComment_TableSizesRenderAbovePlanSummary(t *testing.T) {
 	assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
 }
 
-func TestRenderPlanComment_TableSizesWithoutBytesOmitsByteClause(t *testing.T) {
+func TestRenderPlanComment_TableSizesSharded(t *testing.T) {
 	out := RenderPlanComment(tableSizePlanData([]TableSizeData{
-		{Table: "mutes", EstimatedRows: previewRows(2_340_000)},
-	}))
-
-	assert.Contains(t, out, "- `mutes`: ~2.3M rows\n")
-}
-
-// PlanetScale's branch metrics report storage bytes with no row counts, so a
-// PlanetScale change renders its byte estimate and shard span rather than
-// falling to the size-unavailable line.
-func TestRenderPlanComment_TableSizesBytesOnly(t *testing.T) {
-	out := RenderPlanComment(tableSizePlanData([]TableSizeData{
-		{Table: "mutes", EstimatedBytes: previewRows(23_400_000_000), ShardCount: 4},
+		{Table: "mutes", EstimatedBytes: previewBytes(23_400_000_000), ShardCount: 4},
+		{Table: "orders", EstimatedBytes: previewBytes(15_249_000), ShardCount: 1},
 	}))
 
 	assert.Contains(t, out, "- `mutes`: ~23.4 GB across 4 shards\n")
-}
-
-func TestRenderPlanComment_TableSizesSharded(t *testing.T) {
-	out := RenderPlanComment(tableSizePlanData([]TableSizeData{
-		{Table: "mutes", EstimatedRows: previewRows(48_200_000), EstimatedBytes: previewRows(23_400_000_000), ShardCount: 4, LargestShardRows: previewRows(13_100_000)},
-	}))
-
-	assert.Contains(t, out, "- `mutes`: ~48.2M rows · ~23.4 GB across 4 shards (largest shard ~13.1M rows)\n")
-}
-
-func TestRenderPlanComment_TableSizesSingleShardOmitsLargest(t *testing.T) {
-	out := RenderPlanComment(tableSizePlanData([]TableSizeData{
-		{Table: "mutes", EstimatedRows: previewRows(15_249), ShardCount: 1, LargestShardRows: previewRows(15_249)},
-	}))
-
-	assert.Contains(t, out, "- `mutes`: ~15.2k rows across 1 shard\n")
-	assert.NotContains(t, out, "largest shard", "a single-shard span has no distinct largest shard")
+	assert.Contains(t, out, "- `orders`: ~15.2 MB across 1 shard\n")
 }
 
 func TestRenderPlanComment_TableSizeUnavailableIsExplicit(t *testing.T) {
@@ -110,19 +85,19 @@ func TestRenderPlanComment_TableSizesQualifiedAcrossKeyspaces(t *testing.T) {
 			{
 				Keyspace:   "commerce",
 				Statements: []string{"ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"},
-				TableSizes: []TableSizeData{{Table: "mutes", EstimatedRows: previewRows(2_340_000), EstimatedBytes: previewRows(1_130_000_000)}},
+				TableSizes: []TableSizeData{{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)}},
 			},
 			{
 				Keyspace:   "commerce_sharded",
 				Statements: []string{"ALTER TABLE `customers` ADD COLUMN `tier` varchar(20)"},
-				TableSizes: []TableSizeData{{Table: "customers", EstimatedRows: previewRows(48_200_000), EstimatedBytes: previewRows(23_400_000_000), ShardCount: 2, LargestShardRows: previewRows(24_600_000)}},
+				TableSizes: []TableSizeData{{Table: "customers", EstimatedBytes: previewBytes(23_400_000_000), ShardCount: 2}},
 			},
 		},
 	}
 	out := RenderPlanComment(data)
 
-	assert.Contains(t, out, "- `commerce.mutes`: ~2.3M rows · ~1.1 GB\n")
-	assert.Contains(t, out, "- `commerce_sharded.customers`: ~48.2M rows · ~23.4 GB across 2 shards (largest shard ~24.6M rows)\n")
+	assert.Contains(t, out, "- `commerce.mutes`: ~1.1 GB\n")
+	assert.Contains(t, out, "- `commerce_sharded.customers`: ~23.4 GB across 2 shards\n")
 }
 
 func TestRenderPlanComment_NoTableSizesOmitsSection(t *testing.T) {
@@ -131,8 +106,8 @@ func TestRenderPlanComment_NoTableSizesOmitsSection(t *testing.T) {
 	assert.False(t, strings.Contains(out, "Table sizes"), "a plan without size data renders no size section")
 }
 
-// sizedTables returns one sized table per name, each with the given bytes and
-// ten rows per byte unit so rows and bytes rank the same way.
+// sizedTables returns one sized table per name, each with the given bytes, and
+// an unsized table for a name with no bytes.
 func sizedTables(bytesByTable map[string]int64, order []string) []TableSizeData {
 	sizes := make([]TableSizeData, 0, len(order))
 	for _, name := range order {
@@ -141,7 +116,7 @@ func sizedTables(bytesByTable map[string]int64, order []string) []TableSizeData 
 			sizes = append(sizes, TableSizeData{Table: name})
 			continue
 		}
-		sizes = append(sizes, TableSizeData{Table: name, EstimatedRows: previewRows(b * 10), EstimatedBytes: previewRows(b)})
+		sizes = append(sizes, TableSizeData{Table: name, EstimatedBytes: previewBytes(b)})
 	}
 	return sizes
 }
@@ -155,8 +130,8 @@ func TestRenderPlanComment_TableSizesAtInlineLimitStayInPlanOrder(t *testing.T) 
 	}
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
-	assert.Contains(t, out, "📊 **Table sizes**:\n- `t01`: ~10M rows · ~1 MB\n- `t02`:")
-	assert.Contains(t, out, "- `t10`: ~100M rows · ~10 MB\n\n")
+	assert.Contains(t, out, "📊 **Table sizes**:\n- `t01`: ~1 MB\n- `t02`:")
+	assert.Contains(t, out, "- `t10`: ~10 MB\n\n")
 	assert.NotContains(t, out, "<details>\n<summary>", "a plan at the inline limit does not fold its sizes")
 	assert.Less(t, strings.Index(out, "`t01`"), strings.Index(out, "`t10`"), "inline sizes keep plan order")
 }
@@ -181,17 +156,17 @@ func TestRenderPlanComment_TableSizesOverInlineLimitFoldLargestFirst(t *testing.
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	want := "📊 **Table sizes** (12 tables, largest first; 2 without a size estimate):\n" +
-		"- `audit_events`: ~900M rows · ~90 MB\n" +
-		"- `ledger`: ~800M rows · ~80 MB\n" +
-		"- `payments`: ~600M rows · ~60 MB\n" +
-		"- `orders`: ~500M rows · ~50 MB\n" +
-		"- `invoices`: ~400M rows · ~40 MB\n" +
+		"- `audit_events`: ~90 MB\n" +
+		"- `ledger`: ~80 MB\n" +
+		"- `payments`: ~60 MB\n" +
+		"- `orders`: ~50 MB\n" +
+		"- `invoices`: ~40 MB\n" +
 		"\n<details>\n<summary>7 more tables</summary>\n\n" +
-		"- `users`: ~200M rows · ~20 MB\n" +
-		"- `accounts`: ~60M rows · ~6 MB\n" +
-		"- `carts`: ~30M rows · ~3 MB\n" +
-		"- `webhooks`: ~20M rows · ~2 MB\n" +
-		"- `coupons`: ~10M rows · ~1 MB\n" +
+		"- `users`: ~20 MB\n" +
+		"- `accounts`: ~6 MB\n" +
+		"- `carts`: ~3 MB\n" +
+		"- `webhooks`: ~2 MB\n" +
+		"- `coupons`: ~1 MB\n" +
 		"- `events_raw`: size estimate unavailable\n" +
 		"- `sessions`: size estimate unavailable\n" +
 		"\n</details>\n\n"
@@ -211,30 +186,169 @@ func TestRenderPlanComment_TableSizesFoldedHeadingOmitsZeroUnavailable(t *testin
 	assert.Contains(t, out, "<summary>6 more tables</summary>")
 }
 
-// The fold ranks tables with bytes by bytes, then tables reporting rows alone
-// by rows, then tables with no estimate: rows and bytes are never compared
-// with each other, so the order is the same whatever order the plan listed
-// the tables in.
+// The fold ranks tables by bytes, largest first, and tables with no estimate
+// last, so the order is the same whatever order the plan listed them in. A
+// multi-target line ranks by its total across targets.
 func TestCompareTableSizesLargestFirst(t *testing.T) {
-	bigBytes := TableSizeData{Table: "big_bytes", EstimatedRows: previewRows(100), EstimatedBytes: previewRows(10_000)}
-	smallBytes := TableSizeData{Table: "small_bytes", EstimatedRows: previewRows(5_000), EstimatedBytes: previewRows(10)}
-	bytesOnly := TableSizeData{Table: "bytes_only", EstimatedBytes: previewRows(500)}
-	manyRows := TableSizeData{Table: "many_rows", EstimatedRows: previewRows(9_000)}
-	fewRows := TableSizeData{Table: "few_rows", EstimatedRows: previewRows(3)}
-	unknown := TableSizeData{Table: "unknown"}
+	sized := func(name string, bytes int64) tableSizeEntry {
+		return tableSizeEntry{name: name, size: TableSizeData{Table: name, EstimatedBytes: previewBytes(bytes)}}
+	}
+	big := sized("big", 10_000)
+	mid := sized("mid", 500)
+	small := sized("small", 10)
+	unknown := tableSizeEntry{name: "unknown", size: TableSizeData{Table: "unknown"}}
+	spread := tableSizeEntry{name: "spread", perTarget: []TargetTableSize{
+		targetSize("primary/testapp_1", "spread", 6_000),
+		targetSize("primary/testapp_2", "spread", 6_000),
+	}}
 
-	want := []string{"big_bytes", "bytes_only", "small_bytes", "many_rows", "few_rows", "unknown"}
-	inputs := [][]TableSizeData{
-		{unknown, fewRows, manyRows, smallBytes, bytesOnly, bigBytes},
-		{manyRows, smallBytes, unknown, bigBytes, fewRows, bytesOnly},
+	want := []string{"spread", "big", "mid", "small", "unknown"}
+	inputs := [][]tableSizeEntry{
+		{unknown, small, mid, spread, big},
+		{mid, unknown, big, small, spread},
 	}
 	for _, in := range inputs {
 		sorted := slices.Clone(in)
 		slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
 		got := make([]string, 0, len(sorted))
-		for _, ts := range sorted {
-			got = append(got, ts.Table)
+		for _, e := range sorted {
+			got = append(got, e.name)
 		}
 		assert.Equal(t, want, got)
 	}
+}
+
+// multiTargetSizePlanData is a clean rollout of independent targets that all
+// run the same index build, with the given per-target sizes.
+func multiTargetSizePlanData(sizes []TargetTableSize) PlanCommentData {
+	changes := []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `orders` ADD INDEX `created_at`(`created_at`)"},
+		TableSizes: []TableSizeData{{Table: "orders", EstimatedBytes: previewBytes(100_000)}},
+	}}
+	return PlanCommentData{
+		Database:    "testapp",
+		Environment: "production",
+		IsMySQL:     true,
+		Changes:     changes,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{{
+				Members: []string{"primary/testapp_1", "primary/testapp_2", "primary/testapp_3"}, Primary: true, Changes: changes,
+			}},
+			TableSizes: sizes,
+		},
+	}
+}
+
+func targetSize(target, table string, bytes int64) TargetTableSize {
+	return TargetTableSize{Target: target, Keyspace: "testapp", Size: TableSizeData{Table: table, EstimatedBytes: previewBytes(bytes)}}
+}
+
+func unsizedTarget(target, table string) TargetTableSize {
+	return TargetTableSize{Target: target, Keyspace: "testapp", Size: TableSizeData{Table: table}}
+}
+
+// Each target of a rollout copies its own data. A table two targets change is
+// shown with its total and each target's size, in rollout order, so the
+// operator sees where the build runs longest rather than the reviewed
+// target's size alone. The section renders on the target-plan layout, where
+// each target group's plan is shown under its own heading.
+func TestRenderPlanComment_TwoTargetSizesShowTotalAndEachTarget(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/testapp_1", "orders", 1_130_000_000),
+		targetSize("primary/testapp_2", "orders", 23_400_000_000),
+	}))
+
+	assert.Contains(t, out, "📊 **Table sizes**:\n- `orders`: ~24.5 GB across 2 targets (~1.1 GB on `primary/testapp_1`, ~23.4 GB on `primary/testapp_2`)\n\n")
+}
+
+// When one of two targets reports no estimate, its size is named as
+// unavailable and no total is given, since the total would understate the
+// table.
+func TestRenderPlanComment_TwoTargetSizesNameTargetWithoutEstimate(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/testapp_1", "orders", 1_130_000_000),
+		unsizedTarget("primary/testapp_2", "orders"),
+	}))
+
+	assert.Contains(t, out, "- `orders`: ~1.1 GB on `primary/testapp_1`, size estimate unavailable on `primary/testapp_2`\n")
+	assert.NotContains(t, out, "across 2 targets")
+}
+
+// Past two targets the line gives the total alone: a list of every target's
+// size would bury the figure the operator reads first.
+func TestRenderPlanComment_ThreeTargetSizesShowTotalOnly(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/testapp_1", "orders", 100_000_000),
+		targetSize("primary/testapp_2", "orders", 23_400_000_000),
+		targetSize("primary/testapp_3", "orders", 1_130_000_000),
+	}))
+
+	assert.Contains(t, out, "- `orders`: ~24.6 GB across 3 targets\n")
+	assert.NotContains(t, out, "on `primary/testapp_2`", "past two targets no target is broken out")
+}
+
+// A target with no estimate is counted, since the total then covers only the
+// targets that reported one.
+func TestRenderPlanComment_ThreeTargetSizesCountTargetsWithoutEstimate(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/testapp_1", "orders", 1_130_000_000),
+		unsizedTarget("primary/testapp_2", "orders"),
+		targetSize("primary/testapp_3", "orders", 23_400_000_000),
+	}))
+
+	assert.Contains(t, out, "- `orders`: ~24.5 GB across 2 of 3 targets; 1 has no estimate\n")
+}
+
+func TestRenderPlanComment_MultiTargetSizesUnavailableEverywhere(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		unsizedTarget("primary/testapp_1", "orders"),
+		unsizedTarget("primary/testapp_2", "orders"),
+		unsizedTarget("primary/testapp_3", "orders"),
+		unsizedTarget("primary/testapp_3", "users"),
+	}))
+
+	assert.Contains(t, out, "- `orders`: size estimate unavailable on all 3 targets\n")
+	assert.Contains(t, out, "- `users`: size estimate unavailable on `primary/testapp_3`\n")
+}
+
+// A table only one target changes is shown on that target alone.
+func TestRenderPlanComment_MultiTargetSizesSingleTargetTable(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/testapp_1", "orders", 100_000),
+		targetSize("primary/testapp_3", "users", 1_130_000_000),
+	}))
+
+	assert.Contains(t, out, "- `orders`: ~100 KB on `primary/testapp_1`\n")
+	assert.Contains(t, out, "- `users`: ~1.1 GB on `primary/testapp_3`\n")
+}
+
+// A folded multi-target section counts every table missing an estimate on
+// any target, since its total may understate it.
+func TestRenderPlanComment_MultiTargetFoldedHeadingCountsIncompleteTables(t *testing.T) {
+	var sizes []TargetTableSize
+	for i := range 11 {
+		table := fmt.Sprintf("t%02d", i+1)
+		sizes = append(sizes, targetSize("primary/testapp_1", table, int64(i+1)*100_000))
+		if i == 0 {
+			sizes = append(sizes, unsizedTarget("primary/testapp_2", table))
+			continue
+		}
+		sizes = append(sizes, targetSize("primary/testapp_2", table, int64(i+1)*100_000))
+	}
+	out := RenderPlanComment(multiTargetSizePlanData(sizes))
+
+	assert.Contains(t, out, "📊 **Table sizes** (11 tables, largest first; 1 missing an estimate on at least one target):\n- `t11`:")
+}
+
+// A rollup that did not plan every target carries no per-target sizes, so the
+// section falls back to the reviewed plan's own.
+func TestRenderPlanComment_MultiTargetWithoutTargetSizesShowsReviewedPlan(t *testing.T) {
+	data := multiTargetSizePlanData(nil)
+	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "- `orders`: ~100 KB\n")
 }

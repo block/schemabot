@@ -186,8 +186,6 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanLint())
 	case PreviewCommentVitessPlan:
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlan())
-	case PreviewCommentVitessPlanBytesOnlySizes:
-		fmt.Print(webhooktemplates.PreviewCommentVitessPlanBytesOnlySizes())
 	case PreviewCommentVitessPlanVSchemaRemoval:
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval())
 	case PreviewCommentVitessApplyPlan:
