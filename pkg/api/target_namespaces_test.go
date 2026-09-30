@@ -238,13 +238,18 @@ func TestMemberSchemaFiles(t *testing.T) {
 
 func namespaceSelectionService(t *testing.T, client *mockTernClient, plans storage.PlanStore) *Service {
 	t.Helper()
+	return namespaceSelectionServiceWith(t, client, plans, []TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1", "ns_2"}},
+	})
+}
+
+func namespaceSelectionServiceWith(t *testing.T, client *mockTernClient, plans storage.PlanStore, targets []TargetEntry) *Service {
+	t.Helper()
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"orders": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
-				"production": {Deployment: "eu", Targets: []TargetEntry{
-					{Target: "orders-001", Namespaces: []string{"ns_0"}},
-					{Target: "orders-002", Namespaces: []string{"ns_1", "ns_2"}},
-				}},
+				"production": {Deployment: "eu", Targets: targets},
 			}},
 		},
 		TernDeployments: TernConfig{"eu": {"production": "tern-eu:9090"}},
@@ -268,8 +273,45 @@ func TestExecutePlan_PrimaryPlansOnlyItsSelectedNamespaces(t *testing.T) {
 	require.NotNil(t, client.planReq)
 	assert.Equal(t, "orders-001", client.planReq.Target)
 	assert.Equal(t, []string{"ns_0"}, slices.Sorted(maps.Keys(client.planReq.SchemaFiles)))
+	assert.Equal(t, []string{"ns_1", "ns_2"}, client.planReq.UnselectedNamespaces, "the data plane is told which declared namespaces the narrowed files withhold")
 	require.NotNil(t, plans.created)
 	assert.Equal(t, []string{"ns_0"}, slices.Sorted(maps.Keys(plans.created.SchemaFiles)))
+}
+
+// A primary whose entry selects a namespace the schema files do not declare
+// fails the plan before anything is planned or stored, rather than planning the
+// declared part of its selection and reporting it clean.
+func TestExecutePlan_PrimaryUndeclaredSelectionFails(t *testing.T) {
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary"}}
+	plans := &capturingPlanStore{}
+	svc := namespaceSelectionServiceWith(t, client, plans, []TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0", "ns_9"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1", "ns_2"}},
+	})
+
+	_, err := svc.ExecutePlan(t.Context(), threeNamespaceRequest())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target "orders-001" selects namespace "ns_9", which the schema files do not declare`)
+	assert.Nil(t, client.planReq, "nothing is planned for an undeclared selection")
+	assert.Nil(t, plans.created, "no plan is stored for an undeclared selection")
+}
+
+// Namespace coverage holds for every plan of the environment, not only the pull
+// request review. A lone target whose entry selects a subset of the declared
+// namespaces would otherwise plan, store, and report a clean plan while the
+// namespaces no entry selects are planned nowhere.
+func TestExecutePlan_UncoveredNamespaceBlocks(t *testing.T) {
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary"}}
+	plans := &capturingPlanStore{}
+	svc := namespaceSelectionServiceWith(t, client, plans, []TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+	})
+
+	_, err := svc.ExecutePlan(t.Context(), threeNamespaceRequest())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "orders" environment "production" declares namespaces [ns_1, ns_2] that no targets entry selects`)
+	assert.Nil(t, client.planReq, "nothing is planned while a namespace is unplaced")
+	assert.Nil(t, plans.created, "no plan is stored while a namespace is unplaced")
 }
 
 // A non-primary member is diffed against, and stores, only its own selection.
@@ -292,6 +334,7 @@ func TestRollupReviewTimeDrift_MemberPlansOnlyItsSelectedNamespaces(t *testing.T
 		require.NotNil(t, client.planDiffReq)
 		assert.Equal(t, "orders-002", client.planDiffReq.Target)
 		assert.Equal(t, []string{"ns_1", "ns_2"}, slices.Sorted(maps.Keys(client.planDiffReq.SchemaFiles)))
+		assert.Equal(t, []string{"ns_0"}, client.planDiffReq.UnselectedNamespaces, "the data plane is told which declared namespaces the narrowed files withhold")
 		require.Len(t, plans.created, 1)
 		assert.Equal(t, []string{"ns_1", "ns_2"}, slices.Sorted(maps.Keys(plans.created[0].SchemaFiles)))
 	})

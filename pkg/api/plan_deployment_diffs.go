@@ -135,7 +135,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 
 		schemaFiles, err := memberSchemaFiles(req, target)
 		if err != nil {
-			s.logger.Warn("rollout member selects a namespace the schema files do not declare; deployment will block the review rollup",
+			s.logger.Warn("rollout member's namespace selection cannot be planned; deployment will block the review rollup",
 				"database", req.Database,
 				"environment", req.Environment,
 				"deployment", target.Deployment,
@@ -241,6 +241,9 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		// the data plane reads the omission as intent to remove and plans DROPs
 		// for namespaces the configuration excluded on purpose.
 		IgnoredNamespaces: req.IgnoredNamespaces,
+		// A namespace the member's entry does not select is withheld the same
+		// way: it is on another target, not removed from this one.
+		UnselectedNamespaces: unselectedNamespaces(req.SchemaFiles, target),
 		// The exclusions travel with every member's diff. An ignored namespace
 		// is already absent from SchemaFiles, but an ignored table lives on the
 		// target, so a member asked without the list would diff tables the
@@ -294,6 +297,39 @@ func memberSchemaFiles(req PlanRequest, member routing.ExecutionTarget) (map[str
 			req.Database, req.Environment, member.Target, namespace, strings.Join(slices.Sorted(maps.Keys(req.SchemaFiles)), ", "))
 	}
 	return selected, nil
+}
+
+// unselectedNamespaces returns the declared namespaces a rollout member's
+// targets entry leaves out, in sorted order, or nil when it selects none and so
+// holds every declared namespace. They travel to the data plane with the
+// narrowed schema files, so an engine that diffs the whole target as one unit
+// can refuse rather than read the omission as intent to drop.
+func unselectedNamespaces(schemaFiles map[string]*ternv1.SchemaFiles, member routing.ExecutionTarget) []string {
+	if len(member.Namespaces) == 0 {
+		return nil
+	}
+	var unselected []string
+	for _, namespace := range slices.Sorted(maps.Keys(schemaFiles)) {
+		if !slices.Contains(member.Namespaces, namespace) {
+			unselected = append(unselected, namespace)
+		}
+	}
+	return unselected
+}
+
+// requireNamespaceCoverage refuses a plan when a declared namespace is held by
+// no rollout member. One that no targets entry selects has no plan anywhere, so
+// the rollout would read converged while that namespace's schema change never
+// runs. Every plan of the environment runs it, not only the pull request
+// review: a plan of a lone target whose entry selects a subset would otherwise
+// report success for a schema change it silently leaves out.
+func requireNamespaceCoverage(req PlanRequest, targets []routing.ExecutionTarget) error {
+	uncovered := uncoveredNamespaces(req, targets)
+	if len(uncovered) == 0 {
+		return nil
+	}
+	return fmt.Errorf("database %q environment %q declares namespaces [%s] that no targets entry selects; select each on the target that holds it, or list it in ignore_namespaces to keep it out of the rollout",
+		req.Database, req.Environment, strings.Join(uncovered, ", "))
 }
 
 // uncoveredNamespaces returns the declared namespaces no rollout member holds,

@@ -661,6 +661,25 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, typeErr
 	}
+	// Every declared namespace must be held by some rollout member, on every
+	// plan of the environment and not only a pull request review, so a lone
+	// target selecting a subset cannot report a clean plan that leaves the rest
+	// planned nowhere.
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve targets")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		return nil, nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if err := requireNamespaceCoverage(req, targets); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "namespace coverage")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		return nil, nil, err
+	}
 	// The primary plans, and its plan row records, only the namespaces its
 	// targets entry selects. req is this call's copy, so narrowing it here
 	// leaves the caller's request, which the other members are planned from,
@@ -683,6 +702,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"namespaces", resolvedTarget.Namespaces,
 			"declared_namespace_count", len(req.SchemaFiles))
 	}
+	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
 	req.SchemaFiles = primarySchemaFiles
 
 	prInt := 0
@@ -753,7 +773,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
-		IgnoreTables:      req.IgnoreTables,
+		// The namespaces the primary's entry leaves to other targets, so an
+		// engine that diffs the whole target as one unit refuses rather than
+		// planning their live tables as drops.
+		UnselectedNamespaces: unselected,
+		IgnoreTables:         req.IgnoreTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),

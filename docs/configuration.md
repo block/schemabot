@@ -354,7 +354,8 @@ Rules:
 - `namespaces` is an enumerated list of names, not a pattern. When present it MUST contain at least one entry; each entry must be non-empty, listed once within the entry, and free of `/`. A `namespaces` key with no list (no value, `~`, `null`, or items that are all commented out) fails validation at startup rather than reading as every namespace.
 - The target is still the rollout member, so a target may not be listed twice even with different `namespaces`.
 - A selected namespace the schema files do not declare, or one `ignore_namespaces` withholds, is an error at plan time that names the target and the namespace. For the primary target it fails the plan; for any other target it blocks the review.
-- Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects blocks the review, since no target would plan or apply it. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.
+- Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects fails every plan of the environment, whether from a pull request or the CLI, since no target would plan or apply it. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.
+- Selecting namespaces needs a target whose DSN does not name a database. A database-scoped DSN is diffed as one unit, so the namespaces an entry does not select would have their live tables planned as `DROP TABLE`; the plan refuses instead, as it does for `ignore_namespaces`.
 
 `targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the schema the files describe for it: every declared namespace, or, for a target whose entry selects namespaces, only those. What differs is what a difference between members means when one is found.
 
