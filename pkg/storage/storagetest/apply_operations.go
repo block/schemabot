@@ -599,6 +599,62 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 	})
 
+	// FindNextApplyOperation_RollingPassesOrphanedFinalizer verifies the
+	// orphaned-finalizer exemption under rolling, where a later member's copy
+	// waits for every earlier row to complete. Shard -80 of payments-001
+	// fails and shard 80- completes, which leaves payments-001's orders
+	// finalizer pending with nothing that will ever start it. Under halt
+	// payments-002 never starts. Under continue payments-002 copies and
+	// publishes its finalizer, rather than waiting on payments-001's
+	// finalizer to complete.
+	t.Run("FindNextApplyOperation_RollingPassesOrphanedFinalizer", func(t *testing.T) {
+		for _, tc := range []struct {
+			onFailure     string
+			laterAdmitted bool
+		}{
+			{onFailure: storage.OnFailureHalt},
+			{onFailure: storage.OnFailureContinue, laterAdmitted: true},
+		} {
+			t.Run(tc.onFailure, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_rolling_orphan_"+tc.onFailure, storage.DatabaseTypeVitess)
+				apply := CreateApply(t, store, lock, "apply_operation_rolling_orphan_"+tc.onFailure, 924)
+				shards, finalizers := insertShardedMembers(t, store, apply.ID, storage.CutoverPolicyRolling, tc.onFailure,
+					"payments-001", "payments-002")
+				for _, want := range shards["payments-001"] {
+					claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+					require.NoError(t, err)
+					require.NotNil(t, claimed)
+					require.Equal(t, want, claimed.ID)
+				}
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, shards["payments-001"][0], "duplicate key name 'idx_orders_source'"))
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shards["payments-001"][1]))
+
+				if !tc.laterAdmitted {
+					next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					require.NoError(t, err)
+					assert.Nil(t, next, "no payments-002 copy starts behind a failed payments-001 under halt")
+					return
+				}
+				for _, want := range shards["payments-002"] {
+					claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					require.NoError(t, err)
+					require.NotNil(t, claimed, "continue starts payments-002's copies past payments-001's orphaned finalizer")
+					require.Equal(t, want, claimed.ID)
+					require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, want))
+				}
+				finalizer, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				require.NotNil(t, finalizer, "payments-002 publishes its finalizer under continue")
+				assert.Equal(t, finalizers["payments-002"], finalizer.ID)
+				idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+				require.NoError(t, err)
+				assert.Nil(t, idle, "payments-001's finalizer never starts: shard -80 of its work failed")
+			})
+		}
+	})
+
 	// FindNextApplyOperation_BarrierHoldsLaterCopyBehindUnsettledFinalizer
 	// verifies which earlier finalizer states count as at the barrier. Both
 	// shards of payments-001 have completed. While payments-001's finalizer is
@@ -776,6 +832,111 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			require.NotNil(t, finalizer, "start resumes the finalizer once both shards have completed")
 			assert.Equal(t, finalizers["payments-001"], finalizer.ID)
 		})
+	})
+
+	// FindNextApplyOperation_StartResumesNeverStartedWorkInOrder verifies that
+	// stop and start do not reorder a rolling rollout's work. region-a's copy
+	// is running when the stop lands, so its drive stops it, and the stop
+	// moves region-b's pending copy to stopped before it ever started. On
+	// start region-a resumes at once, since it is recovering work it began.
+	// region-b stays stopped while region-a is still copying, and once
+	// region-a has failed under halt; it resumes once region-a has completed,
+	// or has failed under continue.
+	t.Run("FindNextApplyOperation_StartResumesNeverStartedWorkInOrder", func(t *testing.T) {
+		for _, tc := range []struct {
+			name           string
+			onFailure      string
+			earlierOutcome string
+			laterAdmitted  bool
+		}{
+			{name: "earlier_still_copying", onFailure: storage.OnFailureHalt},
+			{name: "earlier_completed", onFailure: storage.OnFailureHalt, earlierOutcome: state.ApplyOperation.Completed, laterAdmitted: true},
+			{name: "earlier_failed_halt", onFailure: storage.OnFailureHalt, earlierOutcome: state.ApplyOperation.Failed},
+			{name: "earlier_failed_continue", onFailure: storage.OnFailureContinue, earlierOutcome: state.ApplyOperation.Failed, laterAdmitted: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_restart_work_"+tc.name, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_restart_work_"+tc.name, 922)
+				ids := make([]int64, 0, 2)
+				for _, deployment := range []string{"region-a", "region-b"} {
+					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: deployment,
+						OperationKind: storage.ApplyOperationKindWork,
+						CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: tc.onFailure,
+					})
+					require.NoError(t, err)
+					ids = append(ids, id)
+				}
+				first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, first)
+				require.Equal(t, ids[0], first.ID)
+				stopped, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+				require.NoError(t, err)
+				require.Equal(t, int64(1), stopped, "the stop moves region-b's pending copy to stopped")
+				require.NoError(t, store.ApplyOperations().UpdateState(ctx, ids[0], state.ApplyOperation.Stopped))
+				requestControl(t, store, apply.ID, storage.ControlOperationStart)
+
+				resumed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				require.NotNil(t, resumed, "start resumes region-a's copy, which had started")
+				require.Equal(t, ids[0], resumed.ID)
+				switch tc.earlierOutcome {
+				case state.ApplyOperation.Completed:
+					require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0]))
+				case state.ApplyOperation.Failed:
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "duplicate key name"))
+				}
+
+				next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+				require.NoError(t, err)
+				if !tc.laterAdmitted {
+					assert.Nil(t, next, "start does not begin region-b's copy under %s", tc.name)
+					return
+				}
+				require.NotNil(t, next, "start resumes region-b's copy under %s", tc.name)
+				assert.Equal(t, ids[1], next.ID)
+				assert.Equal(t, state.ApplyOperation.Stopped, next.State, "the claim returns the pre-transition state")
+			})
+		}
+
+		// A row the stop caught before it started resumes only while its
+		// parent apply is claimable, as a pending row starts only then: under
+		// a stopped parent with a pending start it resumes, and under a parent
+		// that has settled failed it stays stopped even with a start pending.
+		for _, tc := range []struct {
+			parentState string
+			admitted    bool
+		}{
+			{parentState: state.Apply.Stopped, admitted: true},
+			{parentState: state.Apply.Failed},
+		} {
+			t.Run("parent_"+tc.parentState, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_restart_work_parent_"+tc.parentState, storage.DatabaseTypeMySQL)
+				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_operation_restart_work_parent_"+tc.parentState, 923, tc.parentState, "staging")
+				id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+					ApplyID: apply.ID, Deployment: "region-a",
+					OperationKind: storage.ApplyOperationKindWork,
+					CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+				})
+				require.NoError(t, err)
+				require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.Stopped))
+				requestControl(t, store, apply.ID, storage.ControlOperationStart)
+
+				next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				if !tc.admitted {
+					assert.Nil(t, next, "a row that never started does not resume under a %s parent", tc.parentState)
+					return
+				}
+				require.NotNil(t, next, "a row that never started resumes under a %s parent with a pending start", tc.parentState)
+				assert.Equal(t, id, next.ID)
+			})
+		}
 	})
 
 	// FindNextApplyOperation_CapsDriversPerApply verifies that one wide fan-out

@@ -14,7 +14,7 @@ import (
 )
 
 func writeMultiDeploymentProgress(data ProgressData) {
-	model := presentation.Derive(progressOperationsForPresentation(data.Operations, data.Released))
+	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
 
 	writeMultiDeploymentHeader(data, model)
 	writeMultiDeploymentFirstFailure(model.FirstFailure)
@@ -32,17 +32,24 @@ func writeMultiDeploymentProgress(data ProgressData) {
 	fmt.Print(FormatThrottleReference(data.Tables))
 }
 
-// progressOperationsForPresentation maps the parsed progress operations to the
-// surface-neutral presentation inputs. released is the apply-level release latch
-// (from ProgressData.Released): a released pause behaves like continue, so the
-// held siblings proceed and the aggregate runs degraded instead of paused.
-func progressOperationsForPresentation(ops []ProgressOperation, released bool) []presentation.Operation {
+// ProgressOperationsForPresentation maps the parsed progress operations to the
+// surface-neutral presentation inputs, for both the progress output and the
+// watch view. released is the apply-level release latch (from
+// ProgressData.Released): a released pause behaves like continue, so the held
+// siblings proceed and the aggregate runs degraded instead of paused. The
+// operation's key, kind and start time carry through, so the header settles
+// exactly as the stored apply state does.
+func ProgressOperationsForPresentation(ops []ProgressOperation, released bool) []presentation.Operation {
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
 			Deployment:        op.Deployment,
 			Target:            op.Target,
 			State:             op.State,
+			OperationKey:      op.OperationKey,
+			Work:              op.OperationKind == storage.ApplyOperationKindWork,
+			Finalizer:         op.OperationKind == storage.ApplyOperationKindGroupFinalizer,
+			NeverStarted:      op.StartedAt == "",
 			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
 			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,

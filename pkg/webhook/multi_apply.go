@@ -143,10 +143,17 @@ func deriveApplyPresentation(ops []*storage.ApplyOperation, released bool) prese
 // released pause behaves like continue, so the held siblings run degraded
 // instead of paused.
 func applyOperationToPresentation(op *storage.ApplyOperation, released bool) presentation.Operation {
+	// The row's key, kind and start come through the same mapping the stored
+	// derivation reads, so the header settles exactly as applies.state does.
+	rollout := op.RolloutOperation(released)
 	return presentation.Operation{
 		Deployment:        op.Deployment,
 		Target:            op.Target,
 		State:             op.State,
+		OperationKey:      rollout.OperationKey,
+		Work:              rollout.Work,
+		Finalizer:         rollout.Finalizer,
+		NeverStarted:      rollout.NeverStarted,
 		Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 		Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
 		ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,

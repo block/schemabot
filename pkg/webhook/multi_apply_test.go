@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -210,6 +211,46 @@ func TestApplyOperationToPresentation_ResolvesPolicies(t *testing.T) {
 	}, true)
 	assert.True(t, released.PauseOnFailure)
 	assert.True(t, released.Released)
+}
+
+// TestDeriveApplyPresentation_MatchesStoredVerdict verifies that the PR
+// comment header and applies.state read the same rows the same way. In a
+// targets-list rollout of payments-a under continue, shard -80 of
+// payments-001 fails and payments-002 completes, leaving payments-001's
+// finalizer pending with nothing that will start it; under an unreleased
+// pause, the same rows. Both surfaces settle failed.
+func TestDeriveApplyPresentation_MatchesStoredVerdict(t *testing.T) {
+	started := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	for _, onFailure := range []string{storage.OnFailureContinue, storage.OnFailurePause} {
+		t.Run(onFailure, func(t *testing.T) {
+			var ops []*storage.ApplyOperation
+			add := func(target, key, kind, opState string, didStart bool) {
+				op := &storage.ApplyOperation{
+					ID: int64(len(ops) + 1), Deployment: "payments-a", Target: target,
+					OperationKey: storage.TargetOperationKey(target, key), OperationKind: kind,
+					State: opState, OnFailure: onFailure,
+				}
+				if didStart {
+					op.StartedAt = &started
+				}
+				ops = append(ops, op)
+			}
+			add("payments-001", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Failed, true)
+			add("payments-001", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed, true)
+			add("payments-001", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending, false)
+			add("payments-002", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed, true)
+			add("payments-002", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed, true)
+			add("payments-002", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Completed, true)
+
+			rolloutOps := make([]state.RolloutOperation, len(ops))
+			for i, op := range ops {
+				rolloutOps[i] = op.RolloutOperation(false)
+			}
+			stored := state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps))
+			require.Equal(t, state.Apply.Failed, stored)
+			assert.Equal(t, stored, deriveApplyPresentation(ops, false).State)
+		})
+	}
 }
 
 // Tasks without an apply_operation_id (legacy rows) are not attributable to a

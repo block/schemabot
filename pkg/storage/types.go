@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // MaxRecoveryAttempts is the operator retry budget for failed_retryable
@@ -371,8 +372,10 @@ const (
 
 // OperationKeyDelimiter separates the components of an operation key. A
 // component containing it would make the key ambiguous to split, so producers
-// refuse the delimiter inside a component rather than escaping it.
-const OperationKeyDelimiter = "/"
+// refuse the delimiter inside a component rather than escaping it. It is the
+// rollout projection's delimiter, which reads a finalizer's scope back out of
+// the key (see state.OperationScope).
+const OperationKeyDelimiter = state.OperationKeyDelimiter
 
 // ShardOperationKey builds the operation key for one shard's work on one table
 // ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped

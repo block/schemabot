@@ -653,3 +653,79 @@ func TestGroups_OnlyDistinctTargetsRollUp(t *testing.T) {
 		})
 	}
 }
+
+// targetsRollout builds deployment payments-a's targets-list rollout of an
+// orders change: for each target, two shards of work keyed
+// "<target>/orders/<shard>/orders" and an orders finalizer, every row under
+// the given on_failure flags. states gives each target's -80, 80- and
+// finalizer states.
+func targetsRollout(cont, pause bool, states map[string][3]string, targets ...string) []Operation {
+	var ops []Operation
+	for _, target := range targets {
+		st := states[target]
+		for i, shard := range []string{"-80", "80-"} {
+			ops = append(ops, Operation{
+				Deployment: "payments-a", Target: target,
+				OperationKey: target + "/orders/" + shard + "/orders", Work: true,
+				State: st[i], ContinueOnFailure: cont, PauseOnFailure: pause,
+			})
+		}
+		ops = append(ops, Operation{
+			Deployment: "payments-a", Target: target,
+			OperationKey: target + "/orders/group_finalizer", Finalizer: true,
+			State: st[2], ContinueOnFailure: cont, PauseOnFailure: pause,
+		})
+	}
+	return ops
+}
+
+// TestDerive_OrphanedFinalizerSettlesLikeStorage: in a targets-list rollout,
+// shard -80 of payments-001 fails and payments-002 completes, which leaves
+// payments-001's finalizer pending with nothing that will ever start it.
+// Storage settles that rollout failed, so the header must read failed too,
+// not running (degraded) under continue or paused under an unreleased pause.
+// While the finalizer's own work is only parked, it still holds the rollout.
+func TestDerive_OrphanedFinalizerSettlesLikeStorage(t *testing.T) {
+	orphaned := map[string][3]string{
+		"payments-001": {so.Failed, so.Completed, so.Pending},
+		"payments-002": {so.Completed, so.Completed, so.Completed},
+	}
+	for _, tc := range []struct {
+		name        string
+		cont, pause bool
+	}{
+		{name: "continue", cont: true},
+		{name: "unreleased pause", pause: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := targetsRollout(tc.cont, tc.pause, orphaned, "payments-001", "payments-002")
+			got := Derive(ops)
+			assert.Equal(t, state.Apply.Failed, got.State)
+			assert.Equal(t, "failed", got.Label)
+			assert.Equal(t, NextActionReviewFailure, got.NextAction.Kind)
+			assert.Equal(t, "payments-001", got.NextAction.Target)
+		})
+	}
+
+	// payments-002's -80 is still parked at the barrier, so the rollout is
+	// still live and continue keeps it degraded.
+	live := map[string][3]string{
+		"payments-001": {so.Failed, so.Completed, so.Pending},
+		"payments-002": {so.WaitingForCutover, so.Completed, so.Pending},
+	}
+	got := Derive(targetsRollout(true, false, live, "payments-001", "payments-002"))
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+}
+
+// TestDerive_NeverStartedStoppedSettlesLikePending: region-a failed under
+// halt, and a stop caught region-b before any driver claimed it. region-b
+// counts as pending, so the header reads failed; had region-b started before
+// the stop, it would still hold the rollout degraded.
+func TestDerive_NeverStartedStoppedSettlesLikePending(t *testing.T) {
+	failedA := Operation{Deployment: "region-a", Work: true, State: so.Failed, Error: "boom"}
+	neverStarted := Operation{Deployment: "region-b", Work: true, State: so.Stopped, NeverStarted: true}
+	assert.Equal(t, state.Apply.Failed, Derive([]Operation{failedA, neverStarted}).State)
+
+	started := Operation{Deployment: "region-b", Work: true, State: so.Stopped}
+	assert.Equal(t, state.Apply.RunningDegraded, Derive([]Operation{failedA, started}).State)
+}

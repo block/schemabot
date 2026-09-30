@@ -754,9 +754,9 @@ func finalizerScopeSQL(alias string) string {
 // work it finalizes has terminally failed. Its own claim waits for that work
 // to complete, and a failed operation never runs again, so it holds the
 // rollout exactly as long as the failure that orphaned it does, and no longer.
-// finalizerOrphanedByFailedWork (pkg/api/operator.go) is the same predicate
-// over loaded rows, used by the rollout state derivation. The fragment references the earlier
-// alias; its placeholders, in order, are the finalizer kind, pending, stopped,
+// state.RolloutChildren (pkg/state/rollout.go) applies the same predicate to
+// loaded rows for every rollout state derivation. The fragment references the
+// earlier alias; its placeholders, in order, are the finalizer kind, pending, stopped,
 // the work kind and failed.
 var orphanedFinalizerSQL = `(
 	earlier.operation_kind = ?
@@ -897,6 +897,119 @@ func finalizerStartGateArgs() []any {
 		state.ApplyOperation.Completed,
 	}
 	return append(args, releasedFailureExemptionArgs()...)
+}
+
+// workStartGateSQL is the cutover_policy-aware gate a work row starts
+// through (see FindNextApplyOperation): no earlier-member sibling may block
+// it. Under barrier an earlier sibling stops blocking once it reaches the
+// cutover barrier or succeeds, and an earlier group_finalizer counts as at
+// the barrier while pending or running (earlierFinalizerAtBarrierSQL). Under
+// parallel there is intentionally no arm: a parallel work row matches neither
+// branch, so no earlier sibling can make the blocking EXISTS true and its copy
+// starts immediately. Under rolling, and any unrecognized value, which fails
+// closed to the serial gate via NOT IN (barrier, parallel), only a completed
+// earlier sibling stops blocking. The on_failure exemption applies to every
+// policy. The fragment references the apply_operations alias; see
+// workStartGateArgs for its placeholders.
+var workStartGateSQL = `NOT EXISTS (
+	SELECT 1
+	FROM apply_operations AS earlier
+	WHERE earlier.apply_id = apply_operations.apply_id
+		AND ` + earlierRolloutMemberSQL + `
+		AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+		AND (
+			(
+				apply_operations.cutover_policy = ?
+				AND earlier.state NOT IN (?, ?, ?, ?)
+				AND NOT ` + earlierFinalizerAtBarrierSQL + `
+			)
+			OR (
+				apply_operations.cutover_policy NOT IN (?, ?)
+				AND earlier.state <> ?
+			)
+		)
+		AND ` + releasedFailureExemptionSQL + `
+)`
+
+// workStartGateArgs returns the positional arguments for workStartGateSQL,
+// in placeholder order.
+func workStartGateArgs() []any {
+	args := []any{
+		storage.CutoverPolicyBarrier,
+		state.ApplyOperation.WaitingForCutover,
+		state.ApplyOperation.CuttingOver,
+		state.ApplyOperation.RevertWindow,
+		state.ApplyOperation.Completed,
+	}
+	args = append(args, earlierFinalizerAtBarrierArgs()...)
+	args = append(args,
+		storage.CutoverPolicyBarrier,
+		storage.CutoverPolicyParallel,
+		state.ApplyOperation.Completed,
+	)
+	return append(args, releasedFailureExemptionArgs()...)
+}
+
+// operationStartGateSQL is the member-order gate every claim arm that starts
+// an operation applies: a work row through workStartGateSQL, and a
+// group_finalizer through finalizerStartGateSQL. The pending arm starts rows
+// through it, and the stopped+start arm resumes through it the rows a stop
+// caught before they ever started, so a stop and start cannot reorder the
+// rollout. The fragment references the apply_operations alias; see
+// operationStartGateArgs for its placeholders.
+var operationStartGateSQL = `(
+	(
+		apply_operations.operation_kind <> ?
+		AND ` + workStartGateSQL + `
+	)
+	OR (
+		apply_operations.operation_kind = ?
+		AND ` + finalizerStartGateSQL + `
+	)
+)`
+
+// operationStartGateArgs returns the positional arguments for
+// operationStartGateSQL, in placeholder order.
+func operationStartGateArgs() []any {
+	args := []any{storage.ApplyOperationKindGroupFinalizer}
+	args = append(args, workStartGateArgs()...)
+	args = append(args, storage.ApplyOperationKindGroupFinalizer)
+	return append(args, finalizerStartGateArgs()...)
+}
+
+// claimableParentSQL renders the gate that admits an operation to start only
+// while its parent apply is itself claimable: not terminal, or stopped with a
+// pending start request (see the claimable-parent comment in
+// FindNextApplyOperation). terminalPlaceholders is the placeholder list for
+// terminalApplyStates; see claimableParentArgs for the arguments.
+func claimableParentSQL(terminalPlaceholders string) string {
+	return `EXISTS (
+	SELECT 1
+	FROM applies a
+	WHERE a.id = apply_operations.apply_id
+		AND (
+			a.state NOT IN (` + terminalPlaceholders + `)
+			OR (
+				a.state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = a.id
+						AND cr.operation = ?
+						AND cr.status = ?
+				)
+			)
+		)
+)`
+}
+
+// claimableParentArgs returns the positional arguments for
+// claimableParentSQL, in placeholder order.
+func claimableParentArgs() []any {
+	args := stringArgs(terminalApplyStates())
+	return append(args,
+		state.Apply.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 }
 
 // freshLeaseCountSQL counts the operation leases the candidate row's parent
@@ -1050,9 +1163,11 @@ func releasedFailureExemptionArgs() []any {
 // siblings under "continue" — without it a continue-exempted pending sibling
 // would still be started after the user asked to stop.
 //
-// The gate applies only to starting a pending row; an already-active row
-// re-leasing a stale heartbeat is recovering work it already started, so it
-// is never re-gated. A single-operation apply has no earlier-member
+// The gate applies to starting a row: a pending one, or one a stop moved to
+// stopped before it ever started, which start resumes through the same gate
+// (and every stopped group_finalizer). An already-active row re-leasing a
+// stale heartbeat, or a stopped work row that had started, is recovering work
+// it already began, so it is never re-gated. A single-operation apply has no earlier-member
 // sibling, so the gate is a no-op for it regardless of policy.
 //
 // Mirrors ApplyStore.ClaimApplyByID: SELECT ... FOR UPDATE SKIP LOCKED to
@@ -1100,49 +1215,22 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
-	terminalStates := terminalApplyStates()
-	terminalStatePlaceholders := placeholders(len(terminalStates))
+	parentClaimable := claimableParentSQL(placeholders(len(terminalApplyStates())))
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
 
 	queryArgs := []any{state.ApplyOperation.Pending}
-	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
-	// Sibling-gate args for the pending claim, cutover_policy-aware (see the
-	// gate SQL below). Under barrier, an earlier sibling stops blocking once it
-	// reaches the cutover barrier or succeeds (waiting_for_cutover, cutting_over,
-	// revert_window, completed), and an earlier group_finalizer counts as at the
-	// barrier while pending or running (earlierFinalizerAtBarrierArgs). Under
-	// parallel there is intentionally no arm: a parallel work row matches
-	// neither branch, so no earlier sibling can make
-	// the blocking EXISTS true and its copy starts immediately (concurrent copy).
-	// Under rolling — and any unrecognized value, which fails closed to the
-	// serial gate via NOT IN (barrier, parallel) — only a completed earlier
-	// sibling stops blocking. The trailing releasedFailureExemptionArgs drive the
-	// exemption: a terminal-failed earlier sibling no longer blocks later ones
-	// under "continue", or under "pause" once a release latches the rollout open.
-	queryArgs = append(queryArgs,
-		storage.CutoverPolicyBarrier,
-		state.ApplyOperation.WaitingForCutover,
-		state.ApplyOperation.CuttingOver,
-		state.ApplyOperation.RevertWindow,
-		state.ApplyOperation.Completed,
-	)
-	queryArgs = append(queryArgs, earlierFinalizerAtBarrierArgs()...)
-	queryArgs = append(queryArgs,
-		storage.CutoverPolicyBarrier,
-		storage.CutoverPolicyParallel,
-		state.ApplyOperation.Completed,
-	)
-	queryArgs = append(queryArgs, releasedFailureExemptionArgs()...)
-	// Finalizer gate args. A group_finalizer waits for its own member's work to
-	// complete, and then for every earlier rollout member to complete, under
-	// every cutover_policy: a finalizer never parks at the cutover barrier, so
-	// its drive publishes the member's change in one step, and the only place
-	// to order that publish is its start. The completed-only earlier-member
-	// gate is the one the cutover claim uses, with the same on_failure
-	// exemption.
-	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
-	queryArgs = append(queryArgs, finalizerStartGateArgs()...)
+	// Member-order gate for the pending claim (operationStartGateSQL): a work
+	// row starts through the cutover_policy-aware workStartGateSQL, and a
+	// group_finalizer through finalizerStartGateSQL. A group_finalizer waits
+	// for its own member's work to complete, and then for every earlier
+	// rollout member to complete, under every cutover_policy: a finalizer
+	// never parks at the cutover barrier, so its drive publishes the member's
+	// change in one step, and the only place to order that publish is its
+	// start. Both carry the on_failure exemption: a terminal-failed earlier
+	// sibling no longer blocks later ones under "continue", or under "pause"
+	// once a release latches the rollout open.
+	queryArgs = append(queryArgs, operationStartGateArgs()...)
 	// Pending stop gate: a pending operation is not claimable for start while
 	// its apply has a pending stop control request. This is what makes `stop`
 	// halt remaining siblings under on_failure "continue" — without it, a
@@ -1170,16 +1258,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//
 	// The non-stopped half is written NOT IN terminal rather than IN claimable
 	// so a future non-terminal parent state keeps its pending operations
-	// claimable. It gates only this pending arm: the stale-active,
-	// stopped+start, waiting_for_deploy+start, and failed_retryable arms
-	// recover or resume work that already started. The window where the parent
+	// claimable. It gates this pending arm and, in the stopped+start arm, the
+	// rows that arm starts rather than resumes (see claimableParentSQL). The
+	// stale-active, waiting_for_deploy+start, and failed_retryable arms, and a
+	// stopped work row that had started, recover or resume work that already
+	// started. The window where the parent
 	// terminalizes after this SELECT is handled by the driver-side parent claim
 	// refusing and reconcileUnclaimableParent settling the claimed row from the
 	// parent's state.
-	queryArgs = append(queryArgs, stringArgs(terminalStates)...)
-	queryArgs = append(queryArgs,
-		state.Apply.Stopped,
-		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, claimableParentArgs()...)
 	// Fan-out cap: a pending row is claimable only while its apply holds fewer
 	// than maxDriversPerApply fresh operation leases.
 	//
@@ -1221,15 +1308,27 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
-	// A stopped group_finalizer resumes on start only through the same gate a
-	// pending one starts through (finalizerStartGateSQL). Stop moves a
-	// finalizer that had not started to stopped, so without it a start would
-	// publish a member's VSchema before its own work completed, or behind an
-	// earlier member that failed. A finalizer that had started already passed
-	// the gate, and nothing it waits on can leave completed, so gating every
-	// stopped finalizer holds back only the ones that never started.
+	// Stop moves every row that had not started from pending to stopped, so a
+	// start that resumed those rows with no gate would start them out of
+	// member order: a later member's copy while an earlier one is still
+	// copying or has failed, or a finalizer's publish before its own work
+	// completed. A stopped row that never started (no started_at) therefore
+	// resumes only through the gates a pending row starts through: the
+	// member-order gate (operationStartGateSQL) and the claimable-parent gate.
+	// The rollout derivation counts such a row as pending
+	// (state.RolloutChild.NeverStarted), so a halt that holds it settles the
+	// rollout failed and an unreleased pause settles it paused, rather than
+	// holding it open behind a row the gate never admits.
+	//
+	// A stopped work row that had started resumes ungated: it is recovering
+	// work it already began, not starting a new member. A stopped
+	// group_finalizer is always gated, since it publishes in one step; one
+	// that had started already passed the gate, and nothing it waits on can
+	// leave completed, so the gate holds back only the ones that never
+	// started.
 	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
-	queryArgs = append(queryArgs, finalizerStartGateArgs()...)
+	queryArgs = append(queryArgs, operationStartGateArgs()...)
+	queryArgs = append(queryArgs, claimableParentArgs()...)
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
@@ -1250,11 +1349,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 
-	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID:
-	// neither carries a deployment-order gate for work, because resuming a
-	// row is recovering work it started, not starting a new deployment. A
-	// stopped group_finalizer is the exception (see finalizerStartGateSQL
-	// above): it publishes in one step, so resuming one is starting it.
+	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID.
+	// The failed_retryable clause carries no deployment-order gate, because
+	// the row already ran and resuming it is recovering work it started. The
+	// stopped+start clause gates every row a stop caught before it started,
+	// and every group_finalizer, exactly as the pending clause does (see the
+	// comment on its arguments above); only a stopped work row that had
+	// started resumes ungated.
 	//
 	//   - A stopped operation whose parent apply has a pending start request is
 	//     reclaimable so the operator can resume it, and one whose parent has a
@@ -1335,34 +1436,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		WHERE (
 			(
 				state = ?
-				AND (
-					(
-						apply_operations.operation_kind <> ?
-						AND NOT EXISTS (
-							SELECT 1
-							FROM apply_operations AS earlier
-							WHERE earlier.apply_id = apply_operations.apply_id
-								AND `+earlierRolloutMemberSQL+`
-								AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-								AND (
-									(
-										apply_operations.cutover_policy = ?
-										AND earlier.state NOT IN (?, ?, ?, ?)
-										AND NOT `+earlierFinalizerAtBarrierSQL+`
-									)
-									OR (
-										apply_operations.cutover_policy NOT IN (?, ?)
-										AND earlier.state <> ?
-									)
-								)
-								AND `+releasedFailureExemptionSQL+`
-						)
-					)
-					OR (
-						apply_operations.operation_kind = ?
-						AND `+finalizerStartGateSQL+`
-					)
-				)
+				AND `+operationStartGateSQL+`
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
@@ -1370,24 +1444,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.operation = ?
 						AND cr.status = ?
 				)
-				AND EXISTS (
-					SELECT 1
-					FROM applies a
-					WHERE a.id = apply_operations.apply_id
-						AND (
-							a.state NOT IN (%s)
-							OR (
-								a.state = ?
-								AND EXISTS (
-									SELECT 1
-									FROM apply_control_requests cr
-									WHERE cr.apply_id = a.id
-										AND cr.operation = ?
-										AND cr.status = ?
-								)
-							)
-						)
-				)
+				AND `+parentClaimable+`
 				AND `+driverCap+`
 			)
 			OR (
@@ -1414,8 +1471,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 				)
 				AND (
-					apply_operations.operation_kind <> ?
-					OR `+finalizerStartGateSQL+`
+					(
+						apply_operations.operation_kind <> ?
+						AND apply_operations.started_at IS NOT NULL
+					)
+					OR (
+						`+operationStartGateSQL+`
+						AND `+parentClaimable+`
+					)
 				)
 				AND `+driverCap+`
 			)
@@ -1476,7 +1539,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

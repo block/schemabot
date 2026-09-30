@@ -44,6 +44,18 @@ type Operation struct {
 	// State is the canonical operation state (state.ApplyOperation, == state.Apply).
 	State string
 
+	// OperationKey, Work, Finalizer and NeverStarted carry the stored row's
+	// key, kind and whether a driver ever claimed it. The aggregate reads them
+	// through state.RolloutChildren, the same rules the stored derivation
+	// applies, so a finalizer its own failed work orphaned, or a stop that
+	// caught a row before it started, settles the header exactly as it
+	// settles applies.state. Left zero, a row orphans nothing and counts as
+	// possibly started, which holds the rollout open rather than settling it.
+	OperationKey string
+	Work         bool
+	Finalizer    bool
+	NeverStarted bool
+
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
 	// sibling stops blocking a later copy once it reaches the cutover barrier or
@@ -342,14 +354,20 @@ func (a Apply) MultiDeployment() bool {
 // carrying its operation's Deployment name — and callers rely on that
 // correspondence to key results back to their inputs.
 func Derive(ops []Operation) Apply {
-	children := make([]state.RolloutChild, len(ops))
+	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
-		children[i] = state.RolloutChild{
+		rolloutOps[i] = state.RolloutOperation{
+			Deployment:        op.Deployment,
+			OperationKey:      op.OperationKey,
+			Work:              op.Work,
+			Finalizer:         op.Finalizer,
 			State:             op.State,
+			NeverStarted:      op.NeverStarted,
 			ContinueOnFailure: op.continuesPastFailure(),
 			PauseOnFailure:    op.pausesOnFailure(),
 		}
 	}
+	children := state.RolloutChildren(rolloutOps)
 
 	names := memberNames(ops)
 	deployments := make([]Deployment, len(ops))
