@@ -936,11 +936,24 @@ not.
 If the apply command finds no changes, SchemaBot plans the environment's other
 rollout members before answering. When none of them has work either, it posts a
 no-change plan comment and does not acquire a lock. When the reviewed primary is
-already at the desired schema but another target still needs the change, or a
-target could not be confirmed, the apply is refused: nothing runs, and the
-record stays `action_required` (or `failure` for drift) until every target has
-the change. A PR apply cannot yet run a change on targets other than the
-reviewed one. Apply-confirm answers an empty re-plan the same way.
+already at the desired schema but other targets still need the change,
+SchemaBot stores `action_required`, acquires the lock, and pauses for
+`apply-confirm` behind a comment that renders each of those targets' own plans.
+Confirming runs each target's plan on that target, and the record keeps
+blocking merge until every target has the change (MG-12).
+
+The apply is refused instead, with nothing run and the record left
+`action_required` (or `failure` for drift), when a target could not be
+confirmed, when the comment cannot render every target's plan, or when a
+target's plan carries work that comment cannot disclose for confirmation: an
+unsafe or direct-execution change, per-shard or finalizer work, a change its
+engine refuses, or an unfinished copy it would discard. A target whose data
+plane could not say whether it holds an unfinished copy, because it does not
+look or its lookup failed, is refused the same way. Apply-confirm asks all of
+this again against the rollout as it is at confirm, and also refuses when a
+target's statements differ from the ones the confirmed comment showed, or when
+the reviewed target has since gained changes of its own. An automatic apply
+never runs other targets' work.
 
 ### Apply confirmed
 
