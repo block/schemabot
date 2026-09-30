@@ -1,10 +1,10 @@
 // Package postgresconn opens SchemaBot-managed PostgreSQL connections:
 // centralized DSN normalization (required TLS for RDS targets, mirroring the
-// TLS mode mysqlconn injects for RDS MySQL), a UTC session timezone unless
-// the DSN sets one, plain timestamp parameters written as their UTC reading,
-// and a storage pool whose credentials survive secret
-// rotation. Use Open for target-database connections and OpenReloadable for
-// the single long-lived storage pool.
+// TLS mode mysqlconn injects for RDS MySQL), a session timezone pinned to UTC
+// on every connection whatever the DSN or PGTZ names, plain timestamp
+// parameters written as their UTC reading, and a storage pool whose
+// credentials survive secret rotation. Use Open for target-database
+// connections and OpenReloadable for the single long-lived storage pool.
 package postgresconn
 
 import (
@@ -16,10 +16,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -263,11 +265,12 @@ func Open(dsn string, opts ...Option) (*sql.DB, error) {
 // judges a DSN without dialing it, and a caller that judges in order to
 // refuse must not be told the connection is weak as well.
 func dialConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
-	cfg, err := connectionConfig(dsn, opts...)
+	cfg, discardedTimezone, err := parseConnectionConfig(dsn, opts...)
 	if err != nil {
 		return nil, err
 	}
 	warnNonVerifyingRDSTLS(cfg, dsn)
+	warnDiscardedSessionTimezone(cfg, discardedTimezone)
 	return cfg, nil
 }
 
@@ -470,28 +473,23 @@ func dsnParseError(err error) error {
 // session timezone to UTC, and applies caller-supplied options to the
 // resulting config.
 func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
+	cfg, _, err := parseConnectionConfig(dsn, opts...)
+	return cfg, err
+}
+
+// parseConnectionConfig is connectionConfig plus the explicit session
+// timezone settings the UTC pin discarded, keyed by their spelling in the DSN,
+// so a dial path can announce them. Judging paths drop them.
+func parseConnectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, map[string]string, error) {
 	normalized, err := ConnectionDSN(dsn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cfg, err := pgx.ParseConfig(normalized)
 	if err != nil {
-		return nil, dsnParseError(err)
+		return nil, nil, dsnParseError(err)
 	}
-	// Sessions use timezone=UTC so server-side now() evaluates in UTC
-	// regardless of the server's TimeZone setting. Storage compares plain
-	// timestamp columns against now() in lease-expiry and staleness
-	// predicates, so a non-UTC session would skew those comparisons; the values
-	// written into those columns are held to UTC on the client side by
-	// utcTimestampCodec. GUC names are case-insensitive on the server, while
-	// pgx preserves their spelling, so remove every explicit spelling before
-	// adding the canonical setting.
-	for key := range cfg.RuntimeParams {
-		if strings.EqualFold(key, "timezone") {
-			delete(cfg.RuntimeParams, key)
-		}
-	}
-	cfg.RuntimeParams["timezone"] = "UTC"
+	discarded := pinUTCSession(cfg)
 	// A verifying TLS config (sslmode=verify-full) against an RDS host with no
 	// explicit sslrootcert would fall back to the ambient system trust store,
 	// which does not carry the private Amazon RDS roots — every handshake would
@@ -503,7 +501,7 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	if tc := cfg.TLSConfig; tc != nil && !tc.InsecureSkipVerify && tc.RootCAs == nil && dbconn.IsRDSHost(strings.ToLower(cfg.Host)) {
 		roots, err := rdsRootPool()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		tc.RootCAs = roots
 	}
@@ -517,7 +515,70 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = defaultConnectTimeout
 	}
-	return cfg, nil
+	return cfg, discarded, nil
+}
+
+// pinUTCSession sets timezone=UTC on every session this package opens and
+// returns the explicit settings it replaced, keyed by their spelling.
+//
+// The pin is unconditional, on target connections as much as on the storage
+// pool, because it is one half of a client-side contract: utcTimestampCodec
+// writes every plain timestamp parameter as its UTC reading, and storage
+// compares those columns against the session's now() in lease-expiry and
+// staleness predicates, so the two sides have to share a zone whatever the
+// DSN, PGTZ, or the server's TimeZone setting says. On a target it is safe
+// because the sessions this package opens there only read the catalog and
+// validate; the sessions that run DDL are pg-sprite's, built from
+// ConnectionDSN, which leaves the zone alone. GUC names are case-insensitive
+// on the server, while pgx preserves their spelling, so every explicit
+// spelling is removed before the canonical setting is added.
+func pinUTCSession(cfg *pgx.ConnConfig) map[string]string {
+	discarded := map[string]string{}
+	for key, zone := range cfg.RuntimeParams {
+		if strings.EqualFold(key, "timezone") {
+			discarded[key] = zone
+			delete(cfg.RuntimeParams, key)
+		}
+	}
+	cfg.RuntimeParams["timezone"] = "UTC"
+	return discarded
+}
+
+// discardedTimezoneKey identifies one endpoint whose configured session zone
+// the UTC pin replaced. The warning is deduplicated on it for the same reasons
+// warnNonVerifyingRDSTLS deduplicates on the endpoint: a credential reload,
+// another database on the same endpoint, and a PGTZ that reaches every DSN
+// the process resolves each announce the replacement once per endpoint and
+// zone rather than once per dial.
+type discardedTimezoneKey struct {
+	addr    string
+	setting string
+	zone    string
+}
+
+var warnedDiscardedTimezone sync.Map
+
+// warnDiscardedSessionTimezone announces, once per endpoint and zone, that a
+// configured non-UTC session timezone was replaced by the pin, so an operator
+// who set one in the DSN or PGTZ can see that it has no effect. A setting
+// that already named UTC is silent: nothing about the session changed.
+func warnDiscardedSessionTimezone(cfg *pgx.ConnConfig, discarded map[string]string) {
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(int(cfg.Port)))
+	for _, setting := range slices.Sorted(maps.Keys(discarded)) {
+		zone := discarded[setting]
+		if strings.EqualFold(zone, "UTC") {
+			continue
+		}
+		key := discardedTimezoneKey{addr: addr, setting: setting, zone: zone}
+		if _, loaded := warnedDiscardedTimezone.LoadOrStore(key, struct{}{}); loaded {
+			continue
+		}
+		slog.Warn("PostgreSQL session timezone is pinned to UTC; the zone set in the DSN or PGTZ is ignored",
+			"host", addr,
+			"setting", setting,
+			"timezone", zone,
+		)
+	}
 }
 
 // rdsRootPool returns the certificate pool holding the embedded AWS RDS global

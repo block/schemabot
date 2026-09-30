@@ -18,13 +18,13 @@ func registerUTCTimestamps(_ context.Context, conn *pgx.Conn) error {
 }
 
 // registerUTCTimestampTypes replaces the codec for timestamp (without time
-// zone) and for arrays of it in m. The array type is registered again because
-// an array codec holds its element type by reference, and the default
-// timestamp[] still points at the default element codec.
+// zone) in m. That one registration also covers timestamp[]: pgx's array
+// codec plans each element's encoding by looking the element OID up in m, so
+// the default array type reaches the replacement. A composite, range, or
+// domain type with a timestamp member would hold its own codec and would need
+// registering here as well; none is in the storage schema.
 func registerUTCTimestampTypes(m *pgtype.Map) {
-	timestamp := &pgtype.Type{Name: "timestamp", OID: pgtype.TimestampOID, Codec: &utcTimestampCodec{}}
-	m.RegisterType(timestamp)
-	m.RegisterType(&pgtype.Type{Name: "_timestamp", OID: pgtype.TimestampArrayOID, Codec: &pgtype.ArrayCodec{ElementType: timestamp}})
+	m.RegisterType(&pgtype.Type{Name: "timestamp", OID: pgtype.TimestampOID, Codec: &utcTimestampCodec{}})
 }
 
 // utcTimestampCodec is pgx's timestamp codec with one change: a parameter is
