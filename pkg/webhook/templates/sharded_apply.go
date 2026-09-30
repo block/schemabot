@@ -638,10 +638,19 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus, wr
 // instead of passing a wave's fraction off as the whole table's. With every
 // shard reporting the figures are the table's and no qualifier is needed.
 func shardedCopyCoverageSuffix(t ShardedTableStatus) string {
-	if t.ShardsReporting >= len(t.Shards) {
+	if t.ShardsReporting >= t.shardTotal() {
 		return ""
 	}
-	return fmt.Sprintf(" (%s)", shardCoveragePhrase(t.ShardsReporting, len(t.Shards)))
+	return fmt.Sprintf(" (%s)", shardCoveragePhrase(t.ShardsReporting, t.shardTotal()))
+}
+
+// shardTotal is how many shards the table's copy spans: the plan's count, or
+// the shards attached so far when more have attached than the plan recorded
+// or it recorded none. Coverage is judged against it, so a table whose later
+// shard operations have yet to attach does not read as fully reported, and
+// the rows clause names the same total as the size beside it.
+func (t ShardedTableStatus) shardTotal() int {
+	return max(len(t.Shards), t.PlannedShards)
 }
 
 // writeShardedRowsAndETA writes the copying table's rows/ETA line. With every
@@ -651,14 +660,14 @@ func shardedCopyCoverageSuffix(t ShardedTableStatus) string {
 // coverage and renders the ETA as "≥" — the remaining shards can only add
 // rows and time.
 func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
-	if t.ShardsReporting >= len(t.Shards) {
+	if t.ShardsReporting >= t.shardTotal() {
 		writeRowsAndETA(sb, TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds, EstimatedBytes: t.EstimatedBytes})
 		return
 	}
 	line := fmt.Sprintf("- Rows: %s / %s across %d of %d shards",
 		ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)),
 		ui.FormatNumber(t.RowsTotal),
-		t.ShardsReporting, len(t.Shards))
+		t.ShardsReporting, t.shardTotal())
 	// The planned size is the whole table's, so beside rows that cover only
 	// some shards it names the full span rather than reading as theirs.
 	if t.EstimatedBytes != nil {

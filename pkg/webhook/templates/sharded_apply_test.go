@@ -617,8 +617,9 @@ func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.
 // A copying table carries its planned size beside its rows. With every shard
 // reporting the line matches the single-deployment one; while later waves
 // have yet to start, the size names the whole table's shard span so it does
-// not read as the size of the reporting shards alone. The span is the plan's
-// shard count, which can exceed the shard operations attached so far.
+// not read as the size of the reporting shards alone. The coverage and the
+// span both count the plan's shards, which can exceed the shard operations
+// attached so far.
 func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
 	render := func(reporting, plannedShards int, second ShardProgressData) string {
 		return RenderShardedApplyComment(ShardedApplyData{
@@ -648,8 +649,13 @@ func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
 	assert.Contains(t, partial, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ~23.4 GB across all 2 shards · ETA: ≥ 3m 15s\n")
 
 	stillAttaching := render(1, 4, ShardProgressData{Shard: "40-80", Status: state.Task.Pending})
-	assert.Contains(t, stillAttaching, "· ~23.4 GB across all 4 shards ·",
-		"the size names the plan's shards, not the operations attached so far")
+	assert.Contains(t, stillAttaching, "**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)\n")
+	assert.Contains(t, stillAttaching, "- Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s\n",
+		"the rows and the size name the plan's shards, not the operations attached so far")
+
+	attachedAllReporting := render(2, 4, ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 54})
+	assert.Contains(t, attachedAllReporting, "- Rows: 914,707 / 1,466,232 across 2 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s\n",
+		"every attached shard reporting is not full coverage while the plan's other shards have yet to attach")
 
 	unrecorded := render(1, 0, ShardProgressData{Shard: "80-", Status: state.Task.Pending})
 	assert.Contains(t, unrecorded, "· ~23.4 GB across all shards ·",
