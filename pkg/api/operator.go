@@ -2892,6 +2892,41 @@ func manifestGatedVerdict(derived string) bool {
 		state.IsState(derived, state.Apply.Reverted)
 }
 
+// finalizerOrphanedByFailedWork reports whether op is a group_finalizer that
+// nothing will ever start: it has not started (pending, or stopped before it
+// started) and work it finalizes has terminally failed. A finalizer starts only
+// once that work completes, and a failed operation never runs again, so the row
+// is dead rather than queued. The claim query's orphanedFinalizerSQL
+// (pkg/storage/internal/sqlstore/apply_operations.go) is the same predicate,
+// matching the finalizer to its work by deployment and the leading segment of
+// the operation key.
+func finalizerOrphanedByFailedWork(op *storage.ApplyOperation, ops []*storage.ApplyOperation) bool {
+	if op.OperationKind != storage.ApplyOperationKindGroupFinalizer {
+		return false
+	}
+	if !state.IsState(op.State, state.ApplyOperation.Pending, state.ApplyOperation.Stopped) {
+		return false
+	}
+	scope := finalizerScope(op.OperationKey)
+	for _, work := range ops {
+		if work.OperationKind != storage.ApplyOperationKindWork || work.Deployment != op.Deployment {
+			continue
+		}
+		if finalizerScope(work.OperationKey) == scope && state.IsState(work.State, state.ApplyOperation.Failed) {
+			return true
+		}
+	}
+	return false
+}
+
+// finalizerScope returns the scope a group_finalizer shares with the work it
+// finalizes: the operation key's leading segment, or the whole key when it has
+// no delimiter.
+func finalizerScope(operationKey string) string {
+	scope, _, _ := strings.Cut(operationKey, storage.OperationKeyDelimiter)
+	return scope
+}
+
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
 // apply_operations rows and persists it when it differs from the current value.
 //
@@ -2956,6 +2991,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 			State:             op.State,
 			ContinueOnFailure: isContinue || (isPause && released),
 			PauseOnFailure:    isPause && !released,
+			Orphaned:          finalizerOrphanedByFailedWork(op, ops),
 		}
 	}
 	base := state.DeriveApplyState(childStates)
