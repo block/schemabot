@@ -265,8 +265,9 @@ func send(t *testing.T, endpoint, method, path, token string, payload any) (int,
 // cutoverOnceRecovered requests cutover for an apply a freshly started process
 // is taking over. The stored waiting_for_cutover state is visible before the
 // new driver claims the apply and enters recovery, and cutover is rejected
-// while it recovers, so a rejection is retried only while progress reports
-// the apply as recovering.
+// while it recovers, so a rejection is retried only when the rejection itself
+// says the apply is recovering. The rejection is decided from the same apply
+// row that says so; a separate progress read can already show recovery ending.
 func cutoverOnceRecovered(t *testing.T, endpoint, id string) apitypes.ControlResponse {
 	t.Helper()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -280,10 +281,10 @@ func cutoverOnceRecovered(t *testing.T, endpoint, id string) apitypes.ControlRes
 			require.NoError(t, json.Unmarshal(data, &control), string(data))
 			return control
 		}
-		var progress apitypes.ProgressResponse
-		request(t, endpoint, http.MethodGet, fmt.Sprintf("/api/progress/apply/%s", id), testToken, nil, http.StatusOK, &progress)
 		require.Equal(t, http.StatusConflict, status, string(data))
-		require.True(t, state.IsState(progress.State, state.Apply.Recovering), "cutover rejected outside recovery (state %s): %s", progress.State, data)
+		var rejection apitypes.ErrorResponse
+		require.NoError(t, json.Unmarshal(data, &rejection), string(data))
+		require.Contains(t, rejection.Error, "recovering after restart", "cutover rejected outside recovery")
 		select {
 		case <-ticker.C:
 		case <-deadline.C:
