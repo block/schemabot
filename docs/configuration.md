@@ -351,7 +351,7 @@ Rules:
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
 - A mapping entry accepts only `target` and `namespaces`; any other key, including a misspelling such as `namespace`, fails validation at startup.
-- `namespaces` is an enumerated list of names, not a pattern. When present it MUST contain at least one entry; each entry must be non-empty, listed once within the entry, and free of `/`.
+- `namespaces` is an enumerated list of names, not a pattern. When present it MUST contain at least one entry; each entry must be non-empty, listed once within the entry, and free of `/`. A `namespaces` key with no list (no value, `~`, `null`, or items that are all commented out) fails validation at startup rather than reading as every namespace.
 - The target is still the rollout member, so a target may not be listed twice even with different `namespaces`.
 - A selected namespace the schema files do not declare, or one `ignore_namespaces` withholds, is an error at plan time that names the target and the namespace. For the primary target it fails the plan; for any other target it blocks the review.
 - Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects blocks the review, since no target would plan or apply it. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.

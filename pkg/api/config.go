@@ -1787,9 +1787,10 @@ type DeploymentTarget struct {
 // the declared namespaces it holds.
 //
 // The schema files declare a database's namespaces; an entry can only select
-// among them, never add one. Namespaces empty means the target holds every
-// declared namespace, which is what a bare-string entry means. The target stays
-// the rollout member either way, so a target listed twice is still refused.
+// among them, never add one. Namespaces nil, from a bare-string entry or a
+// mapping without the key, means the target holds every declared namespace.
+// The target stays the rollout member either way, so a target listed twice is
+// still refused.
 //
 // Example:
 //
@@ -1806,6 +1807,11 @@ type TargetEntry struct {
 // decoder's strict field checking does not reach a custom unmarshaler, so the
 // mapping's keys are checked here: a misspelled "namespaces" must fail the load
 // rather than leave the target silently covering every namespace.
+//
+// For the same reason a "namespaces" key that is present but holds no list is
+// refused. A key with no value, an explicit null, or a list whose items are all
+// commented out decodes to the same nil slice as an absent key, which would
+// read as "every declared namespace" when the author wrote a selection.
 func (e *TargetEntry) UnmarshalYAML(node *yaml.Node) error {
 	switch node.Kind {
 	case yaml.ScalarNode:
@@ -1816,16 +1822,23 @@ func (e *TargetEntry) UnmarshalYAML(node *yaml.Node) error {
 		*e = TargetEntry{Target: target}
 		return nil
 	case yaml.MappingNode:
+		var namespacesKey *yaml.Node
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			key := node.Content[i]
 			if key.Value != "target" && key.Value != "namespaces" {
 				return fmt.Errorf("line %d: field %s not found in targets entry (want target or namespaces)", key.Line, key.Value)
+			}
+			if key.Value == "namespaces" {
+				namespacesKey = key
 			}
 		}
 		type plain TargetEntry
 		var entry plain
 		if err := node.Decode(&entry); err != nil {
 			return fmt.Errorf("line %d: decode targets entry: %w", node.Line, err)
+		}
+		if namespacesKey != nil && entry.Namespaces == nil {
+			return fmt.Errorf("line %d: targets entry %q has a namespaces key with no list; list the namespaces the target holds, or omit the key to cover every namespace the schema files declare", namespacesKey.Line, entry.Target)
 		}
 		*e = TargetEntry(entry)
 		return nil

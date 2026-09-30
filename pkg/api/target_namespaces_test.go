@@ -98,6 +98,41 @@ databases:
 	assert.Contains(t, err.Error(), "a targets entry must be a target name or a mapping")
 }
 
+// A namespaces key that is present but holds no list decodes to the same nil
+// slice as an absent key. Loading it would read the author's selection as
+// "every declared namespace", including namespaces other targets hold, so the
+// load fails instead. An explicitly empty list is still a list, and is refused
+// by validation as selecting nothing.
+func TestParseServerConfig_TargetEntryRejectsNamespacesKeyWithoutList(t *testing.T) {
+	for name, namespaces := range map[string]string{
+		"no value":            "namespaces:",
+		"explicit null":       "namespaces: ~",
+		"null keyword":        "namespaces: null",
+		"items commented out": "namespaces:\n              # - ns_1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseServerConfig([]byte(`
+tern_deployments:
+  eu:
+    production: tern-eu:9090
+databases:
+  orders:
+    type: mysql
+    environments:
+      production:
+        deployment: eu
+        targets:
+          - target: orders-001
+            namespaces: [ns_0]
+          - target: orders-002
+            ` + namespaces + `
+`))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `targets entry "orders-002" has a namespaces key with no list`)
+		})
+	}
+}
+
 // A selection is an enumerated list of names, each checked where the config
 // loads: empty, repeated, and delimiter-bearing names are refused, as is a
 // target listed twice even with different selections, since the target is
