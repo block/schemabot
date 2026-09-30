@@ -27,7 +27,9 @@ package secrets
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -177,16 +179,22 @@ func resolveSecretsManager(ctx context.Context, ref string) (string, error) {
 	return secretJSONKey(secretValue, secretName, jsonKey)
 }
 
-// secretJSONKey extracts one key of a JSON-object secret as a string. A string
-// value is returned as is; any other value is returned as its JSON literal, so
-// a number keeps every digit it was stored with rather than being reformatted
-// through a float.
+// secretJSONKey extracts one key of a JSON-object secret as a string. The
+// secret must be exactly one JSON object; anything after it is rejected so a
+// corrupt or double-written secret is not read as its first half. A string
+// value is returned as is and a null is an error, since a key that holds no
+// value must not resolve to a stand-in string. Any other value is returned
+// as its JSON literal, so a number keeps every digit it was stored with rather
+// than being reformatted through a float.
 func secretJSONKey(secretValue, secretName, jsonKey string) (string, error) {
 	decoder := json.NewDecoder(strings.NewReader(secretValue))
 	decoder.UseNumber()
 	var data map[string]any
 	if err := decoder.Decode(&data); err != nil {
 		return "", fmt.Errorf("parse secret %q as JSON: %w", secretName, err)
+	}
+	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("parse secret %q as JSON: unexpected data after the JSON object", secretName)
 	}
 
 	val, ok := data[jsonKey]
@@ -199,8 +207,14 @@ func secretJSONKey(secretValue, secretName, jsonKey string) (string, error) {
 		return v, nil
 	case json.Number:
 		return v.String(), nil
+	case nil:
+		return "", fmt.Errorf("key %q in secret %q is null", jsonKey, secretName)
 	default:
-		return fmt.Sprintf("%v", v), nil
+		literal, err := json.Marshal(v)
+		if err != nil {
+			return "", fmt.Errorf("encode key %q of secret %q as JSON: %w", jsonKey, secretName, err)
+		}
+		return string(literal), nil
 	}
 }
 

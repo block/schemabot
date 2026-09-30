@@ -641,19 +641,20 @@ var ErrGitHubAppNotConfigured = errors.New("no GitHub App is configured")
 // treated as off rather than as misconfigured.
 var ErrGitHubAppCredentialsUnavailable = errors.New("GitHub App credentials are not available")
 
-// ErrInvalidGitHubAppID marks an app ID that resolved to a value that is not a
-// positive integer. It is a configuration error, distinct from an app ID that
-// is not configured at all or whose secret reference cannot be resolved yet.
+// ErrInvalidGitHubAppID marks an app ID that resolved to a value that cannot
+// be an App ID: non-numeric, negative, or out of range. It is a configuration
+// error, distinct from an app ID that is not configured at all (unset or the
+// placeholder 0) or whose secret reference cannot be resolved yet.
 var ErrInvalidGitHubAppID = errors.New("invalid GitHub App ID")
 
-// ResolveCredentials resolves the App ID and private key together and
-// classifies the outcome, so a caller can tell the three ways an App is not
-// usable apart and re-resolves nothing:
+// ResolveCredentials resolves the App ID and private key together, each read
+// once, and classifies the outcome so a caller can tell the three ways an App
+// is not usable apart:
 //   - ErrGitHubAppNotConfigured: no App ID and no private key are set.
 //   - ErrGitHubAppCredentialsUnavailable (wrapped): credentials are declared
 //     but do not resolve to a usable pair yet.
-//   - ErrInvalidGitHubAppID (wrapped): the App ID resolved to a value that is
-//     not a positive integer.
+//   - ErrInvalidGitHubAppID (wrapped): the App ID resolved to a value that
+//     cannot be an App ID (non-numeric, negative, or out of range).
 func (g *GitHubConfig) ResolveCredentials() (GitHubAppCredentials, error) {
 	appID, err := g.ResolveAppID()
 	if err != nil {
@@ -713,10 +714,10 @@ func (g *GitHubConfig) ResolveAppID() (int64, error) {
 		if errors.As(err, &numErr) {
 			cause = numErr.Err
 		}
-		return 0, fmt.Errorf("%s must be a positive integer: %w (%w)", setting, ErrInvalidGitHubAppID, cause)
+		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w (%w)", setting, ErrInvalidGitHubAppID, cause)
 	}
 	if n < 0 {
-		return 0, fmt.Errorf("%s must be a positive integer: %w", setting, ErrInvalidGitHubAppID)
+		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w", setting, ErrInvalidGitHubAppID)
 	}
 	return n, nil
 }
@@ -3172,7 +3173,7 @@ func (c *ServerConfig) ResolveGitHubAppsByID() (map[int64]ResolvedGitHubApp, err
 			return nil, fmt.Errorf("app %q: %w", name, err)
 		}
 		if id == 0 {
-			return nil, fmt.Errorf("app %q has an empty app-id", name)
+			return nil, fmt.Errorf("app %q has no app-id configured (empty or 0)", name)
 		}
 		if existing, ok := out[id]; ok {
 			return nil, fmt.Errorf("apps %q and %q resolve to the same app-id %d", existing.Name, name, id)

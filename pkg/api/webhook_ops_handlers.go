@@ -570,7 +570,7 @@ func webhookRedriveApps(cfg *ServerConfig, onlyApp string) ([]webhookRedriveApp,
 			return nil, fmt.Errorf("app %q: %w", name, err)
 		}
 		if appID == 0 {
-			return nil, fmt.Errorf("app %q has an empty app-id", name)
+			return nil, fmt.Errorf("app %q has no app-id configured (empty or 0)", name)
 		}
 		apps = append(apps, webhookRedriveApp{name: name, id: appID, config: appConfig})
 	}

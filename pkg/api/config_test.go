@@ -4419,7 +4419,19 @@ func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 		}
 		_, err := cfg.ResolveGitHubAppsByID()
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), `app "app-a" has an empty app-id`)
+		assert.Contains(t, err.Error(), `app "app-a" has no app-id configured (empty or 0)`)
+	})
+
+	t.Run("placeholder zero app-id fails closed", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "0", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), `app "app-a" has no app-id configured (empty or 0)`)
 	})
 
 	t.Run("malformed app-id fails closed naming the App", func(t *testing.T) {
