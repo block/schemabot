@@ -67,8 +67,8 @@ type BlockedChangeData struct {
 
 // DirectChangeData is a planned change the database's direct execution policy
 // routes to native MySQL DDL instead of the schema change engine. The plan
-// comment discloses its semantics — blocking, not revertible — so the
-// operator consents to them when confirming the apply.
+// comment discloses what running it that way does to the table, so the
+// operator consents to it when confirming the apply.
 type DirectChangeData struct {
 	Table  string
 	Reason string
@@ -346,9 +346,11 @@ type KeyspaceChangeData struct {
 	VSchemaChanged bool
 	VSchemaDiff    string
 
-	// Finalize marks a keyspace the engine asked to finalize after its DDL
-	// without a VSchema document to apply. The finalize is work the apply
-	// runs, so it counts as a change like a VSchema update does.
+	// Finalize marks a keyspace the engine asked to finalize after its DDL.
+	// A keyspace with DDL or a VSchema change to show finalizes as part of that
+	// work, so the finalize gets its own line and count only when it is the
+	// keyspace's only work, which keeps such a plan from reading as having no
+	// changes.
 	Finalize bool
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
@@ -463,10 +465,10 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 
 	// Direct-execution changes — statements the policy routes to native DDL.
 	// Shown on the locked apply comment too: confirming the apply is the
-	// operator's consent to their blocking, non-revertible semantics, so the
+	// operator's consent to their write-blocking semantics, so the
 	// disclosure must sit on the comment the confirmation acts on.
 	if len(data.DirectChanges) > 0 {
-		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL)
+		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, data.DeferCutover)
 	}
 
 	// Copies already on the target. Shown on the locked apply comment too:
@@ -667,29 +669,36 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 }
 
 // countChanges counts a plan's DDL statements and its keyspace-level updates:
-// each keyspace whose VSchema changes or that the engine asks to finalize.
+// each keyspace whose VSchema changes or whose only work is a finalize. A
+// finalize beside DDL is part of that DDL's work, so it adds nothing.
 func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspaceUpdates int) {
 	for _, ks := range changes {
 		totalStatements += keyspaceStatementCount(ks)
-		if ks.VSchemaChanged || ks.Finalize {
+		if ks.VSchemaChanged || finalizeIsOnlyWork(ks) {
 			keyspaceUpdates++
 		}
 	}
 	return
 }
 
-// countKeyspaceUpdates splits countChanges' keyspace-level updates into the
-// VSchema updates and the finalize-only keyspaces, for the summary labels.
+// countKeyspaceUpdates counts the summary's keyspace-level labels: the VSchema
+// updates, and the keyspaces whose only work is a finalize.
 func countKeyspaceUpdates(changes []KeyspaceChangeData) (vschemaUpdates, finalizes int) {
 	for _, ks := range changes {
 		switch {
 		case ks.VSchemaChanged:
 			vschemaUpdates++
-		case ks.Finalize:
+		case finalizeIsOnlyWork(ks):
 			finalizes++
 		}
 	}
 	return
+}
+
+// finalizeIsOnlyWork reports whether a keyspace's only work is the finalize
+// the engine asked for: no DDL and no VSchema change to show beside it.
+func finalizeIsOnlyWork(ks KeyspaceChangeData) bool {
+	return ks.Finalize && !ks.VSchemaChanged && keyspaceStatementCount(ks) == 0
 }
 
 // keyspaceStatementCount counts a keyspace's DDL statements for the summary and
@@ -1127,7 +1136,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			}
 		}
 
-		if ks.Finalize && !hasVSchemaChanges {
+		if ks.Finalize && !hasVSchemaChanges && keyspaceStatementCount(ks) == 0 {
 			sb.WriteString(keyspaceFinalizeNote)
 		}
 
@@ -1141,8 +1150,8 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	}
 }
 
-// keyspaceFinalizeNote is the plan comment's line for a keyspace the engine
-// asked to finalize without a VSchema document to apply. What finalizing does
+// keyspaceFinalizeNote is the plan comment's line for a keyspace whose only
+// work is the finalize the engine asked for. What finalizing does
 // is the engine's; the comment only says that it runs and when.
 const keyspaceFinalizeNote = "_Finalized by the engine once every shard's DDL has landed._\n\n"
 
@@ -1638,10 +1647,16 @@ func targetPlansDiscloseBlocked(data PlanCommentData) bool {
 // combinedTargetPlanChanges merges every target's plan into the one change list
 // the plan summary counts, the way a sharded keyspace's summary counts each
 // distinct statement once however many shards run it.
+//
+// A target whose only work in a keyspace is a finalize shows that finalize in
+// its own plan, so the summary counts it even when another target runs DDL in
+// the same keyspace: the keyspace is then listed a second time, with the
+// finalize alone.
 func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 	var combined []KeyspaceChangeData
 	byKeyspace := make(map[string]int)
 	seen := make(map[string]map[string]struct{})
+	finalizeOnly := make(map[string]bool)
 	for _, g := range data.DeploymentDrift.Plans {
 		if g.Empty() {
 			continue
@@ -1655,6 +1670,9 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 				seen[ks.Keyspace] = make(map[string]struct{})
 			}
 			combined[i].VSchemaChanged = combined[i].VSchemaChanged || ks.VSchemaChanged
+			if finalizeIsOnlyWork(ks) {
+				finalizeOnly[ks.Keyspace] = true
+			}
 			for _, stmt := range keyspaceStatements(ks) {
 				if _, dup := seen[ks.Keyspace][stmt]; dup {
 					continue
@@ -1663,6 +1681,17 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 				combined[i].Statements = append(combined[i].Statements, stmt)
 			}
 		}
+	}
+	for i, n := 0, len(combined); i < n; i++ {
+		ks := combined[i].Keyspace
+		if !finalizeOnly[ks] {
+			continue
+		}
+		if keyspaceStatementCount(combined[i]) == 0 && !combined[i].VSchemaChanged {
+			combined[i].Finalize = true
+			continue
+		}
+		combined = append(combined, KeyspaceChangeData{Keyspace: ks, Finalize: true})
 	}
 	return combined
 }
@@ -1712,39 +1741,32 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
-// directConsentCopy returns the header noun and consent footer for the
-// direct-execution disclosure, keyed by database type. The footer is the
-// sentence the operator consents to by confirming the apply, and what a
+// directConsentCopy returns the header noun and the consequence sentence for
+// the direct-execution disclosure, keyed by database type. The consequence is
+// what the operator consents to by confirming the apply, and what a
 // direct statement does to the table while it runs is engine-specific — an
 // engine that adopts direct execution adds its own copy here rather than
 // inheriting another engine's semantics.
 //
-// The footer names the schema change engine in full rather than "the engine".
-// It renders directly under a header noun that names the database's own native
-// DDL, so the two sit adjacent: a reader who takes the shorter form for the
-// storage engine gets the claim backwards, since the statement runs inside the
-// database and outside SchemaBot. This is the sentence that carries the
-// operator's consent to a change that cannot be reverted, so it spends the
-// words.
-func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer string) {
+// The consequence states only what sets a direct statement apart from the
+// rest of the plan. Undoing one is the same inverse schema change as for any other
+// MySQL change, none of which has a revert window, so the MySQL copy does not
+// warn about reverting.
+func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, consequence string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
-		return "native MySQL DDL",
-			"These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+		return "native MySQL DDL, not through Spirit",
+			"Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes."
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest
 	// impact rather than understate what the operator is consenting to.
 	return "native DDL",
-		"These statements run synchronously outside the schema change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+		"Each table is unavailable until its statement finishes, and the change is **not revertible**."
 }
 
-// writeDirectChanges writes the section for statements the direct execution
-// policy routes to native DDL, naming each table and the planner's reason
-// (which carries the row estimate). The fixed footer discloses the semantics
-// the operator consents to by confirming the apply.
 // writePausedApplyCause renders the cause in the same shape as the disclosures
 // around it, so a reader scanning for warnings finds this one where they find
 // the rest rather than below the plan in the footer.
@@ -1759,8 +1781,20 @@ func writePausedApplyCause(sb *strings.Builder, cause *PausedApplyCauseData) {
 	sb.WriteString("\n")
 }
 
-func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool) {
-	headerNoun, footer := directConsentCopy(databaseType, isMySQL)
+// writeDirectChanges writes the section for statements the direct execution
+// policy routes to native DDL, naming each table and the planner's reason
+// (the table's measured size). The footer discloses what the
+// operator consents to by confirming the apply. It mentions --defer-cutover
+// only on an apply that passed it: a direct statement has no cutover, so the
+// flag leaves these statements alone even though it defers the rest of the
+// plan's.
+func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL, deferCutover bool) {
+	headerNoun, consequence := directConsentCopy(databaseType, isMySQL)
+	footer := consequence
+	if deferCutover {
+		footer += " `--defer-cutover` does not apply to these direct statements: they have no cutover to defer."
+	}
+	footer += " Confirming the apply consents to this."
 	n := len(changes)
 	fmt.Fprintf(sb, "⚙️ **Direct execution**: %d %s will run as %s\n", n, pluralize("change", n), headerNoun)
 	for _, c := range changes {
@@ -2350,7 +2384,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Direct-execution changes — each environment's section discloses its own,
 	// since the policy is configured per environment.
 	if len(plan.DirectChanges) > 0 {
-		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL)
+		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL, plan.DeferCutover)
 	}
 
 	// Copies already on the target — read per environment, since each

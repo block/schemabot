@@ -308,10 +308,10 @@ ALTER TABLE `users`
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⚙️ **Direct execution**: 1 change will run as native MySQL DDL
-- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
+- `users`: the table has ~1,240 rows
 
-These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes. Confirming the apply consents to this.
 
 📋 **Plan**: **2** tables to alter
 
@@ -7105,7 +7105,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
      ~ users
        ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
 
-📋 **Plan**: 1 table to create, 1 table to alter, 1 VSchema change
+📋 Plan: 1 table to create, 1 table to alter, 1 VSchema change
 
 
 ```
@@ -7142,7 +7142,7 @@ Vitess plan: VSchema-only update (no table DDL changes)
           },
           "tables": {
 
-📋 **Plan**: 1 VSchema change
+📋 Plan: 1 VSchema change
 
 
 ```
@@ -7202,7 +7202,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
      ~ orders
        ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
 
-📋 **Plan**: 1 table to create, 2 tables to alter, 2 VSchema changes
+📋 Plan: 1 table to create, 2 tables to alter, 2 VSchema changes
 
 
 ```

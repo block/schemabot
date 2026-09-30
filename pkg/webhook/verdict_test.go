@@ -91,7 +91,7 @@ func TestBuildPlanCommentData_DirectChanges(t *testing.T) {
 			Namespace: "testapp",
 			TableChanges: []*apitypes.TableChangeResponse{
 				{TableName: "users", DDL: "ALTER TABLE `users` DROP PRIMARY KEY", ChangeType: "alter",
-					ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows"},
+					ExecutionMode: "direct", ModeReason: "the table has ~40 rows"},
 				{TableName: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` TEXT", ChangeType: "alter"},
 			},
 		}},
@@ -101,7 +101,7 @@ func TestBuildPlanCommentData_DirectChanges(t *testing.T) {
 
 	require.Len(t, data.DirectChanges, 1)
 	assert.Equal(t, "users", data.DirectChanges[0].Table)
-	assert.Equal(t, "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows", data.DirectChanges[0].Reason)
+	assert.Equal(t, "the table has ~40 rows", data.DirectChanges[0].Reason)
 	assert.Empty(t, data.DirectChanges[0].Shards)
 	assert.Empty(t, data.BlockedChanges, "a direct verdict is not a block")
 }
@@ -115,7 +115,7 @@ func TestBuildPlanCommentData_PerShardDirect(t *testing.T) {
 	directChange := func() *apitypes.TableChangeResponse {
 		return &apitypes.TableChangeResponse{
 			TableName: "mutes", DDL: dropPK, ChangeType: "alter",
-			ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows",
+			ExecutionMode: "direct", ModeReason: "the table has ~40 rows",
 		}
 	}
 	planResp := &apitypes.PlanResponse{

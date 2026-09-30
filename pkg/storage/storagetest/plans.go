@@ -324,6 +324,7 @@ func TestPlans(t *testing.T, h Harness) {
 			DirectExecution: &storage.DirectExecutionPolicy{
 				Enabled:                       true,
 				MaxTableRows:                  10000,
+				MaxTableBytes:                 100 << 20,
 				LockAcquisitionTimeoutSeconds: 5,
 			},
 			CreatedAt: time.Now().UTC().Truncate(time.Second),

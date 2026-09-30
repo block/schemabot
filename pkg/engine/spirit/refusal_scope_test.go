@@ -33,8 +33,12 @@ func TestPublishableRefusalChecks(t *testing.T) {
 		"enumSetRemoval",
 		"illegalClause",
 		"primarykey",
+		"primarykeybit",
+		"primarykeycollationstatement",
 		"primarykeyexists",
+		"primarykeyfloat",
 		"setReorder",
+		"tableidentifier",
 	}, check.ChecksInScope(check.ScopeStatement),
 		"the statement scope changed: read the check and decide whether its reason is safe to show an operator before updating this list")
 }

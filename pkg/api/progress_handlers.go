@@ -98,6 +98,8 @@ func engineName(e ternv1.Engine) string {
 		return "Spirit"
 	case ternv1.Engine_ENGINE_PLANETSCALE:
 		return "PlanetScale"
+	case ternv1.Engine_ENGINE_STRATA:
+		return "Strata"
 	case ternv1.Engine_ENGINE_POSTGRES:
 		return "PostgreSQL"
 	default:

@@ -32,7 +32,7 @@ From most to least severe:
 | 💡 | **Lint Warnings** | Advisory best-practice findings | Never | Not needed |
 
 The first two are safety gates. Direct execution is not a severity — it is a
-disclosure of *how* certain statements will run (blocking, non-revertible; see
+disclosure of *how* certain statements will run (as native DDL that blocks writes; see
 [direct-execution.md](./direct-execution.md)). Lint warnings are purely
 advisory: they never gate anything.
 
