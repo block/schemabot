@@ -100,6 +100,9 @@ and environment from the inventory. The response groups `CREATE TABLE`
 statements by namespace: a schema on MySQL or PostgreSQL, a keyspace on Vitess.
 Use `--namespace` (API: `namespaces`) to select namespaces; omit it to discover
 the non-reserved namespaces.
+Supply concrete live namespace names when selecting them. `{env}` and `$ENV`
+are schema-directory placeholders, so both are rejected in `--namespace` and
+`POST /api/pull` `namespaces` arguments.
 
 ```sh
 schemabot pull -d shop -e production
@@ -571,7 +574,7 @@ live view:
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 Use `schemabot status apply-example-73` for a single snapshot. SQL rendering
@@ -781,7 +784,7 @@ Output excerpt:
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 Here, `orders` is 60% copied with an estimated 42 minutes remaining. Copying
@@ -934,7 +937,12 @@ History records executions. Plans describe what was proposed.
 `repository`, and `pull_request` (with `repository`), plus a `last` window.
 Each summary carries the plan ID, database, database type, environment, and
 creation time, plus a count of changes by operation and how many were unsafe
-or blocked; a plan with no changes omits the counts. The repository, PR, and
+or blocked. Namespace-level work is counted separately:
+`vschema_change_count` is how many namespaces change their VSchema, and
+`finalize_count` is how many namespaces the engine asked to finalize once
+their DDL lands. A plan with no changes omits every count; a plan whose only
+work is a finalize carries `finalize_count` alone, and `list-plans` renders
+it as `1 finalize` rather than `no changes`. The repository, PR, and
 head SHA it was planned from appear when the plan came from a PR (an ad-hoc
 CLI plan has none, and older plans may lack the SHA); `deployment` names the
 primary deployment the plan was computed against, when one was recorded.
@@ -949,6 +957,61 @@ repository to inspect the proposed change at that commit. To establish what
 actually ran, inspect the apply's task DDL and outcome through progress.
 `schemabot list-plans` and `schemabot list-plans <plan_id>` render
 both, with `--json` for the raw response.
+
+Each table change can carry the planner's size estimates for the table:
+`estimated_rows`, `estimated_bytes` (data plus indexes), and, when the target
+is sharded, `shard_count` and `largest_shard_rows` (the largest single shard's
+rows). For a sharded target the row and byte figures are totals across the
+planned shards. They come from engine statistics at plan time, so treat them
+as approximate and display-only: they are not inputs to any verdict. A field
+is omitted when no estimate was available. That covers a table the plan
+creates, a failed or timed-out size read, and any shard reporting nothing
+(which omits that table's total rather than undercounting it). MySQL targets
+planned by Spirit report rows and bytes for every existing table the plan
+touches; other engines omit the fields for now.
+
+Each entry in the plan's `changes` is one namespace, and its `metadata`
+carries the namespace-level work the engine planned alongside the table DDL.
+`needs_finalizer: "true"` means the engine asked for the namespace's group
+finalizer to run once its DDL lands (for Strata, registering tables and
+seeding sequences), independently of any VSchema change. The finalizer runs
+as its own `group_finalizer` operation of the apply, so a namespace can carry
+the marker with no table changes at all, and such a plan still has work to
+apply.
+
+<details>
+<summary>Stored plan whose only work is a finalize</summary>
+
+```http
+GET /api/plans/plan-example-51
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-51",
+  "database": "payments",
+  "database_type": "strata",
+  "environment": "staging",
+  "created_at": "2026-09-01T04:55:00Z",
+  "finalize_count": 1,
+  "plan": {
+    "plan_id": "plan-example-51",
+    "engine": "strata",
+    "changes": [
+      {
+        "namespace": "payments",
+        "metadata": {
+          "needs_finalizer": "true"
+        }
+      }
+    ]
+  }
+}
+```
+
+</details>
 
 A stored plan records what the planner proposed, not what it declined to
 propose. When the planner exempts live tables from the undeclared-table
@@ -1105,21 +1168,27 @@ Response excerpt (illustrative values):
           {
             "table_name": "orders",
             "ddl": "ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32) DEFAULT NULL",
-            "change_type": "alter"
+            "change_type": "alter",
+            "estimated_rows": 2340000,
+            "estimated_bytes": 1130000000
           },
           {
             "table_name": "old_orders",
             "ddl": "DROP TABLE `old_orders`",
             "change_type": "drop",
             "is_unsafe": true,
-            "unsafe_reason": "Dropping a table permanently deletes its data"
+            "unsafe_reason": "Dropping a table permanently deletes its data",
+            "estimated_rows": 18400,
+            "estimated_bytes": 6100000
           },
           {
             "table_name": "old_order_events",
             "ddl": "DROP TABLE `old_order_events`",
             "change_type": "drop",
             "is_unsafe": true,
-            "unsafe_reason": "Dropping a table permanently deletes its data"
+            "unsafe_reason": "Dropping a table permanently deletes its data",
+            "estimated_rows": 96000,
+            "estimated_bytes": 41000000
           }
         ]
       }

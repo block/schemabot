@@ -70,8 +70,8 @@ func TestPlanUsesTheCallersStatedDirectExecutionPolicy(t *testing.T) {
 }
 
 // A caller's policy replaces the executing server's whole rather than merging
-// into it, so an enabled flag can never pair with a row bound the caller did
-// not send.
+// into it, so an enabled flag can never pair with a size bound the caller
+// did not send.
 func TestPlanReplacesTheExecutingServersPolicyWhole(t *testing.T) {
 	eng := &credentialRecordingEngine{}
 	client := directExecutionTestClient(map[string]string{
@@ -229,9 +229,12 @@ func TestDirectExecutionPolicyRoundTripsThroughTheWire(t *testing.T) {
 	resolved := &storage.DirectExecutionPolicy{
 		Enabled:                       true,
 		MaxTableRows:                  10000,
+		MaxTableBytes:                 100 << 20,
 		LockAcquisitionTimeoutSeconds: 5,
 	}
-	assert.Equal(t, resolved, DirectExecutionPolicyFromProto(DirectExecutionPolicyProto(resolved)))
+	wire := DirectExecutionPolicyProto(resolved)
+	assert.Equal(t, int64(100<<20), wire.GetMaxTableBytes())
+	assert.Equal(t, resolved, DirectExecutionPolicyFromProto(wire))
 	assert.Nil(t, DirectExecutionPolicyProto(nil))
 	assert.Nil(t, DirectExecutionPolicyFromProto(nil))
 }

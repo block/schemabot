@@ -10,7 +10,10 @@ import (
 // A diff set records each desired table once. Distinct tables are accepted,
 // a second file declaring an already declared table is refused with both file
 // names, a file declaring the same table twice is refused naming that file,
-// and table names compare exactly, the same way the differ keys them.
+// and table names compare exactly, the same way the differ keys them: a pair
+// differing only in case is two desired tables to the differ, so it is two
+// declarations here, whatever the target's lower_case_table_names would make
+// of them.
 func TestTableDeclarations_Declare(t *testing.T) {
 	t.Run("distinct tables are accepted", func(t *testing.T) {
 		var declared TableDeclarations

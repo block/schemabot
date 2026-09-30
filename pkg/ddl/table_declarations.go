@@ -17,7 +17,14 @@ type TableDeclarations struct {
 // that an earlier file, or an earlier statement of the same file, already
 // declared, naming the table and both files so the operator knows which
 // declaration to remove. Table names compare exactly, the same way the differ
-// keys them.
+// keys them, so the refusal fires for exactly the pairs the differ would have
+// collapsed into one definition and never for a pair it keeps apart. That
+// exactness is deliberate, and it bounds what is caught: `orders` and `Orders`
+// are two declarations here and two desired tables to the differ, so on a
+// target whose lower_case_table_names treats them as one table the plan
+// proposes creating the second beside the first and the apply refuses the
+// CREATE. Folding that pair belongs wherever the differ's keying is decided,
+// not here.
 func (d *TableDeclarations) Declare(file, table string) error {
 	first, declared := d.declaredBy[table]
 	if !declared {

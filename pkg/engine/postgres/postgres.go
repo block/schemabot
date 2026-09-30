@@ -262,10 +262,22 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
+		if err := refuseTableDeclaredTwice(namespace, ns.Files); err != nil {
+			return nil, err
+		}
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
+			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
+			if err != nil {
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+			}
+			if handled {
+				desiredTables[table] = true
+				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
+				continue
+			}
 			report, table, err := planPostgresDefinition(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
 				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
@@ -333,6 +345,28 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	result.NoChanges = len(result.Changes) == 0
 	result.PlanID = engine.NewPlanID()
 	return result, nil
+}
+
+// refuseTableDeclaredTwice fails the plan when two schema files in one
+// namespace declare the same table. Each file is diffed against the live table
+// on its own, so a table declared twice would get two contradictory diffs,
+// each dropping what only the other file declares; there is no single desired
+// definition to review. The error names the table and both files so the
+// operator knows which one to remove. It runs before any file is planned, and
+// applies the same rule every planner does (ddl.TableDeclarations), so a
+// duplicate declaration reads the same whichever engine refuses it.
+func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
+	var declared ddl.TableDeclarations
+	for _, filename := range sortedKeys(files) {
+		table, err := desiredTableName(files[filename])
+		if err != nil {
+			return fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+		}
+		if err := declared.Declare(filename, table); err != nil {
+			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
+		}
+	}
+	return nil
 }
 
 // captureOriginalFiles renders the live namespace as the plan's rollback

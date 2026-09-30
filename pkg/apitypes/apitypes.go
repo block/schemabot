@@ -888,6 +888,10 @@ type PlanSummaryResponse struct {
 	BlockedCount int `json:"blocked_count,omitempty"`
 	// VSchemaChangeCount is how many namespaces carry a VSchema change.
 	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
+	// FinalizeCount is how many namespaces the engine asked to finalize once
+	// their DDL lands. A finalizer is work an apply runs, so a plan whose only
+	// work is a finalizer is not a no-change plan.
+	FinalizeCount int `json:"finalize_count,omitempty"`
 }
 
 // PlansResponse is the HTTP response for GET /api/plans.
@@ -1051,7 +1055,7 @@ func (r *PlanResponse) AllChangesDirect() bool {
 		if sc == nil {
 			continue
 		}
-		if sc.HasVSchemaChange() {
+		if sc.HasVSchemaChange() || sc.NeedsFinalizer() {
 			return false
 		}
 		total += len(sc.TableChanges)
@@ -1187,15 +1191,16 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 }
 
 // HasChanges reports whether the plan carries any work an apply would execute:
-// table DDL in any namespace, or a VSchema update. Gates that decide whether a
-// plan is actionable must use this rather than counting table changes alone —
-// a VSchema-only plan has zero table changes but still requires an apply.
+// table DDL in any namespace, a VSchema update, or a finalizer the engine asked
+// for. Gates that decide whether a plan is actionable must use this rather than
+// counting table changes alone — a VSchema-only or finalizer-only plan has zero
+// table changes but still requires an apply.
 func (r *PlanResponse) HasChanges() bool {
 	for _, sc := range r.Changes {
 		if sc == nil {
 			continue
 		}
-		if len(sc.TableChanges) > 0 || sc.HasVSchemaChange() {
+		if len(sc.TableChanges) > 0 || sc.HasVSchemaChange() || sc.NeedsFinalizer() {
 			return true
 		}
 	}
@@ -1226,6 +1231,25 @@ type TableChangeResponse struct {
 	// ModeReason is the engine's reason for any non-empty ExecutionMode
 	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
+
+	// EstimatedRows is the planner's approximate row count for the table,
+	// summed across shards for sharded targets. Display only — estimates come
+	// from engine statistics and may be stale. Nil when no estimate was
+	// available at plan time.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int `json:"shard_count,omitempty"`
+
+	// LargestShardRows is the approximate row count of the largest single
+	// shard. Nil when the target is not sharded or no estimate was available.
+	LargestShardRows *int64 `json:"largest_shard_rows,omitempty"`
+
+	// EstimatedBytes is the planner's approximate on-disk footprint for the
+	// table (data plus indexes), summed across shards for sharded targets.
+	// Display only, like EstimatedRows. Nil when no estimate was available.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 }
 
 // Execution-mode verdicts a planner records on a table change. These mirror

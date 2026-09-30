@@ -156,9 +156,10 @@ type LocalConfig struct {
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly); direct_execution ("true"
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
-	// with its required companion direct_execution_max_table_rows (positive
-	// estimated-row-count bound above which direct execution is blocked) and
-	// optional direct_execution_lock_acquisition_timeout_seconds (positive bound on
+	// with its size bounds direct_execution_max_table_rows (positive row
+	// count) and direct_execution_max_table_bytes (positive data-plus-index
+	// bytes), exactly one of which is required, and optional
+	// direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
 	// (enable_experimental_autoscaling,
@@ -1573,15 +1574,17 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		}
 	}
 
-	// Don't store empty plans — no DDL changes, no VSchema changes.
-	hasVSchemaChanges := false
+	// Don't store empty plans — no DDL changes and no namespace to finalize. A
+	// namespace the engine asked to finalize is work even without DDL: skipping
+	// it would report a clean plan the apply never finalizes.
+	needsFinalizer := false
 	for _, ns := range namespaces {
-		if ns.ChangesVSchema() {
-			hasVSchemaChanges = true
+		if ns.NeedsFinalizer() {
+			needsFinalizer = true
 			break
 		}
 	}
-	if len(ddlChanges) == 0 && !hasVSchemaChanges {
+	if len(ddlChanges) == 0 && !needsFinalizer {
 		c.logger.Info("Plan: no changes, skipping storage", "plan_id", result.PlanID, "database", c.config.Database)
 		// A clean plan is the case where the disclosure matters most: it is
 		// the only evidence a reviewer has that an exempt table was seen and
@@ -1728,6 +1731,7 @@ func protoExemptTables(groups []*engine.ExemptTables) []*ternv1.ExemptTables {
 func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (changes []*ternv1.SchemaChange, violations []*ternv1.LintViolation, shards []*ternv1.ShardPlan) {
 	protoByNS := make(map[string]*ternv1.SchemaChange)
 	protoTableSeen := make(map[string]map[string]bool)
+	sizeAgg := c.aggregateShardTableSizes(result.Changes)
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
 		protoSC := protoByNS[ns]
@@ -1762,7 +1766,18 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				}
 				protoTableSeen[ns][t.Table] = true
 			}
-			protoSC.TableChanges = append(protoSC.TableChanges, protoTableChangeFromEngine(t, ns))
+			ptc := protoTableChangeFromEngine(t, ns)
+			// The kept entry is the first shard's change; give it the
+			// cross-shard size aggregates so the namespace view reports the
+			// whole table, not one shard.
+			if a := sizeAgg[ns][t.Table]; a != nil {
+				shardCount, estimatedRows, largestShardRows, estimatedBytes := a.sizes()
+				ptc.ShardCount = int32(shardCount)
+				ptc.EstimatedRows = estimatedRows
+				ptc.LargestShardRows = largestShardRows
+				ptc.EstimatedBytes = estimatedBytes
+			}
+			protoSC.TableChanges = append(protoSC.TableChanges, ptc)
 		}
 		// A SchemaChange with an empty shard targets the whole namespace
 		// (non-sharded engines) and contributes no shard rows.
@@ -2026,15 +2041,15 @@ func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationM
 	if len(namespaces) == 1 && !manifestNamesDeploymentScopedFinalizer(generationManifest, namespaces[0]) {
 		return namespaces[0], nil
 	}
-	// A deployment-scoped finalizer's drive applies every VSchema-changed
-	// namespace in the stored plan, so a deployment-scoped dispatch must cover
-	// exactly that set — a partial dispatch would silently apply namespaces the
-	// dispatcher never named.
-	planNamespaces := plan.VSchemaNamespaces()
+	// A deployment-scoped finalizer's drive finalizes every namespace in the
+	// stored plan that needs it, so a deployment-scoped dispatch must cover
+	// exactly that set — a partial dispatch would silently finalize namespaces
+	// the dispatcher never named.
+	planNamespaces := plan.FinalizerNamespaces()
 	dispatched := append([]string(nil), namespaces...)
 	sort.Strings(dispatched)
 	if !slices.Equal(dispatched, planNamespaces) {
-		return "", fmt.Errorf("group_finalizer dispatch names namespaces %v but plan %s changes VSchema in %v; a deployment-scoped dispatch must cover the plan's full VSchema set",
+		return "", fmt.Errorf("group_finalizer dispatch names namespaces %v but plan %s finalizes %v; a deployment-scoped dispatch must cover the plan's full finalizer set",
 			namespaces, plan.PlanIdentifier, planNamespaces)
 	}
 	return "", nil
@@ -2205,6 +2220,7 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 	namespaces := make(map[string]*storage.NamespacePlanData)
 	seenTable := make(map[string]map[string]bool)
 	var allShardPlans []storage.ShardPlan
+	sizeAgg := c.aggregateShardTableSizes(changes)
 	for _, sc := range changes {
 		ns := c.planNamespace(sc.Namespace)
 		nsData := namespaces[ns]
@@ -2224,7 +2240,11 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				}
 				seenTable[ns][tc.Table] = true
 			}
-			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
+			stc := storageTableChangeFromEngine(tc, "")
+			if a := sizeAgg[ns][tc.Table]; a != nil {
+				stc.ShardCount, stc.EstimatedRows, stc.LargestShardRows, stc.EstimatedBytes = a.sizes()
+			}
+			nsData.Tables = append(nsData.Tables, stc)
 		}
 		// Record each changing shard's own changes so apply-create can rebuild
 		// per-shard operation groups with per-shard DDL (a keyspace whose shards
@@ -2260,6 +2280,9 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				nsData.Metadata[key] = value
 			}
 		}
+		if sc.NeedsFinalizer() {
+			nsData.Finalize = true
+		}
 		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
 			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
 				if vs, ok := nsFiles.Files[storage.VSchemaArtifactName]; ok && vs != "" {
@@ -2285,6 +2308,10 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 // plan-time behavior (the artifact is stored only when the plan detected a
 // change). Attaching it unconditionally would create spurious vschema_update
 // tasks on DDL-only plans, since Vitess always ships a vschema.json schema file.
+//
+// A finalizer the engine asked for travels on the same change type, marked
+// needs_finalizer; see dispatchChangeFinalizesOnly for how the two are told
+// apart.
 func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, error) {
 	parser, err := c.statementParser()
 	if err != nil {
@@ -2306,6 +2333,12 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 		}
 		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
 			nsData := ensure(ch.Namespace)
+			if ch.Metadata[engine.MetadataNeedsFinalizer] == "true" {
+				nsData.Finalize = true
+			}
+			if dispatchChangeFinalizesOnly(ch) {
+				continue
+			}
 			vschemaChangedNamespaces[c.planNamespace(ch.Namespace)] = true
 			// The dispatch carries the namespace's persisted VSchema
 			// change-metadata on its VSchema change; merge it key by key
@@ -2346,6 +2379,33 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 	}
 
 	return namespaces, nil
+}
+
+// dispatchChangeFinalizesOnly reports whether a dispatched VSchema-typed change
+// asks only for the namespace's finalizer, with no VSchema document to apply:
+// it is marked needs_finalizer and carries no sign of a VSchema change. Every
+// other VSchema-typed change is a VSchema change, including one carrying no
+// metadata at all, which is how a dispatch built before the finalizer marker
+// existed says it — so that dispatch still fails closed when its vschema.json
+// is missing.
+func dispatchChangeFinalizesOnly(ch *ternv1.TableChange) bool {
+	return ch.Metadata[engine.MetadataNeedsFinalizer] == "true" && !dispatchChangeSignalsVSchema(ch)
+}
+
+// dispatchChangeSignalsVSchema reports whether a dispatched change's metadata
+// says anything about a VSchema change: the vschema_changed flag, or a recorded
+// diff, deletion, or mutation. Any one of them makes the change VSchema work,
+// so a change that pairs one with needs_finalizer still needs its artifact.
+func dispatchChangeSignalsVSchema(ch *ternv1.TableChange) bool {
+	if ch.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+		return true
+	}
+	for _, key := range []string{storage.PlanMetadataVSchemaDiff, storage.PlanMetadataVSchemaDeletions, storage.PlanMetadataVSchemaMutations} {
+		if ch.Metadata[key] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // materializedTableChangeOperation recovers the storage operation for a

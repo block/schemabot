@@ -25,8 +25,11 @@ func WriteRollbackPlan(plan *apitypes.PlanResponse, sourceApplyID string) {
 		fmt.Println(IndentSQL(ddl.FormatDDLForDialect(dialect, table.DDL), "    "))
 	}
 	for _, change := range plan.Changes {
-		if change.HasVSchemaChange() {
+		switch {
+		case change.HasVSchemaChange():
 			fmt.Printf("  %s: VSchema update\n", change.Namespace)
+		case change.NeedsFinalizer():
+			fmt.Printf("  %s: finalized by the engine once every shard's DDL has landed\n", change.Namespace)
 		}
 	}
 }
