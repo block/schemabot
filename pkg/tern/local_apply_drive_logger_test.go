@@ -90,7 +90,7 @@ func TestFailApplyWithTasks_TerminalLogCarriesApplyIdentity(t *testing.T) {
 	}
 
 	running := driveLoggerTestApply(state.Apply.Running)
-	client.failApplyWithTasks(t.Context(), running, nil, "engine failure")
+	require.NoError(t, client.failApplyWithTasks(t.Context(), running, nil, "engine failure"))
 
 	line := requireCapturedLog(t, records, "apply already in terminal state, not overwriting")
 	assertLogCarriesApplyIdentity(t, line)

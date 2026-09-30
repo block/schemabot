@@ -143,6 +143,83 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	assert.Empty(t, eng.applied, "an apply with no remaining work hands nothing to the engine")
 }
 
+// A grouped drive failed every task of an apply, then the write recording the
+// apply failed did not land, so the apply was re-claimed still running over
+// settled task rows with an operator's revert pending. The live schema of the
+// failed task's table already matches the reviewed target, so a re-plan would
+// read that task as done. The tasks carry the outcome instead: the re-claim
+// records the apply failed with the failed task's error, leaves that task
+// failed, settles the revert the failure moots, and posts the failed summary,
+// without handing anything to the engine.
+func TestResumeApplyWithTasks_SettledFailedTaskFailsTheApply(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	store.controlRequests = controlRequests
+	failed, done := tasks[0], tasks[1]
+	failed.TableName = "orders"
+	failed.State = state.Task.Failed
+	failed.ErrorMessage = "deploy request 5 not found"
+	done.State = state.Task.Completed
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, state.Apply.Failed, applies.stored.State)
+	assert.Equal(t, "deploy request 5 not found", applies.stored.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, failed.State, "a failed task stays failed")
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
+		"the failed outcome moots the pending revert")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+	assert.Empty(t, eng.applied, "an apply whose tasks are all settled hands nothing to the engine")
+}
+
+// A grouped drive failed its engine operation, but the write failing one of
+// its two tasks was refused and so was the apply's, so the apply was
+// re-claimed running with one task failed and its sibling still running. The
+// grouped tasks are one engine operation, so the failed task decides the
+// outcome: the re-claim fails the sibling with it and records the apply failed,
+// rather than re-planning the failed task to completed or re-driving the
+// operation that already failed.
+func TestResumeApplyWithTasks_GroupedFailedTaskFailsItsRunningSibling(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	apply.DatabaseType = storage.DatabaseTypeVitess
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	failed, sibling := tasks[0], tasks[1]
+	failed.TableName = "orders"
+	failed.State = state.Task.Failed
+	failed.ErrorMessage = "deploy request 5 not found"
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, state.Apply.Failed, applies.stored.State)
+	assert.Equal(t, "deploy request 5 not found", applies.stored.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, failed.State, "a failed task stays failed")
+	assert.Equal(t, state.Task.Failed, sibling.State, "the running sibling fails with its engine operation")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+	assert.Empty(t, eng.applied, "the failed engine operation is not re-driven")
+}
+
 // A grouped apply's engine reports the schema change completed while an
 // operator's revert is still pending, and the rollout projection's write of the
 // completed state fails. Storage still reports the apply running, so the drive
@@ -534,6 +611,143 @@ func (s *terminalWriteRefusingApplyStore) Update(ctx context.Context, apply *sto
 		return s.err
 	}
 	return s.snapshotApplyStore.Update(ctx, apply)
+}
+
+// permanentProgressEngine answers every progress poll with a permanent error,
+// the way a deploy request that no longer exists on the provider does.
+type permanentProgressEngine struct {
+	engine.Engine
+}
+
+func (e *permanentProgressEngine) Name() string { return "permanent-progress" }
+
+func (e *permanentProgressEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return nil, engine.NewPermanentError("deploy request 5 not found")
+}
+
+// A grouped apply's progress poll fails permanently while an operator's revert
+// is pending. Nothing re-claims a failed apply, so once the failure is stored
+// the drive itself settles the revert the failure moots and posts the terminal
+// summary. When the write recording the failure fails, storage still reports
+// the apply running: the drive exits with the write error, the in-memory apply
+// still reads running, the revert stays pending, and no summary posts.
+func TestPollForCompletionAtomic_PermanentFailureSideEffectsWaitForTheStoredFailure(t *testing.T) {
+	cases := []struct {
+		name              string
+		writeErr          error
+		wantStoredState   string
+		wantDriveState    string
+		wantRevertStatus  storage.ControlRequestStatus
+		wantTerminalCalls int
+	}{
+		{
+			name:              "failure write fails",
+			writeErr:          errors.New("storage unavailable"),
+			wantStoredState:   state.Apply.Running,
+			wantDriveState:    state.Apply.Running,
+			wantRevertStatus:  storage.ControlRequestPending,
+			wantTerminalCalls: 0,
+		},
+		{
+			name:              "failure write lands",
+			wantStoredState:   state.Apply.Failed,
+			wantDriveState:    state.Apply.Failed,
+			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantTerminalCalls: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, apply, tasks, _ := lostWorkAtomicPollFixture(&permanentProgressEngine{}, lostWorkTrustBudgetAmple)
+			store := client.storage.(*exactProgressStorage)
+			snapshot, ok := store.applies.(*snapshotApplyStore)
+			require.True(t, ok)
+			if tc.writeErr != nil {
+				store.applies = &terminalWriteRefusingApplyStore{snapshotApplyStore: snapshot, err: tc.writeErr}
+			}
+			controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+			store.controlRequests = controlRequests
+			observer := &terminalRecordingObserver{}
+			client.SetObserver(apply.ID, observer)
+
+			pollErr := client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, &engine.ResumeState{}, map[string]string{}, false)
+			if tc.writeErr != nil {
+				require.ErrorIs(t, pollErr, tc.writeErr)
+				assert.Contains(t, pollErr.Error(), apply.ApplyIdentifier, "the error names the apply the drive could not fail")
+			} else {
+				require.NoError(t, pollErr)
+			}
+
+			assert.Equal(t, tc.wantStoredState, snapshot.stored.State)
+			assert.Equal(t, tc.wantDriveState, apply.State, "the drive's apply reads terminal only when storage does")
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, tc.wantRevertStatus, controlRequests.requests[0].Status)
+			require.Len(t, observer.terminal, tc.wantTerminalCalls)
+			if tc.wantTerminalCalls > 0 {
+				assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+				assert.Contains(t, observer.terminal[0].ErrorMessage, "deploy request 5 not found")
+			}
+		})
+	}
+}
+
+// progressRecordingObserver records every progress update it is sent.
+type progressRecordingObserver struct {
+	terminalRecordingObserver
+	progress []*storage.Apply
+}
+
+func (o *progressRecordingObserver) OnProgress(apply *storage.Apply, _ []*storage.Task) {
+	cp := *apply
+	o.progress = append(o.progress, &cp)
+}
+
+// A drive fails or pauses an apply and the write recording it fails. Storage
+// still reports the apply running, so the drive's own copy must not claim
+// otherwise: it is put back to the state storage holds and the write error is
+// returned for the drive to exit on, with no apply log entry and no observer
+// update for an outcome that was never stored.
+func TestApplyFailureWrites_RefusedWriteLeavesTheApplyAsStored(t *testing.T) {
+	writeErr := errors.New("storage unavailable")
+	record := map[string]func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error{
+		"record the failure":        (*LocalClient).failApplyWithTasks,
+		"fail and post the summary": (*LocalClient).failApplyAndNotify,
+		"pause for retry":           (*LocalClient).markApplyRetryableWithTasks,
+	}
+	for name, recordOutcome := range record {
+		t.Run(name, func(t *testing.T) {
+			stored := failureLogTestApply(state.Apply.Running, 0)
+			task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
+			logs := &mockApplyLogStore{}
+			controlRequests := pendingControlRequestStore(stored.ID, storage.ControlOperationRevert)
+			client := &LocalClient{
+				config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+				storage: &mockStorage{
+					applies:         &mockApplyStore{apply: stored, updateErr: writeErr},
+					tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+					logs:            logs,
+					controlRequests: controlRequests,
+				},
+				logger: slog.Default(),
+			}
+			observer := &progressRecordingObserver{}
+			client.SetObserver(stored.ID, observer)
+
+			drive := *stored
+			err := recordOutcome(client, t.Context(), &drive, []*storage.Task{task}, "engine lost its connection to the target")
+
+			require.ErrorIs(t, err, writeErr)
+			assert.Contains(t, err.Error(), "apply-7", "the error names the apply whose outcome was not stored")
+			assert.Equal(t, state.Apply.Running, drive.State)
+			assert.Empty(t, drive.ErrorMessage)
+			assert.Nil(t, drive.CompletedAt)
+			assert.Empty(t, logs.logs, "the apply log never reports an outcome storage did not take")
+			assert.Empty(t, observer.progress)
+			assert.Empty(t, observer.terminal)
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status)
+		})
+	}
 }
 
 // A sequential drive's engine work completes and the write recording the apply
