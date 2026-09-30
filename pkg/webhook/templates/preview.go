@@ -652,6 +652,7 @@ func PreviewCommentPlanDriftClean() string {
 				{Deployment: "au", Class: "match"},
 				{Deployment: "us", Class: "match"},
 			},
+			TableSizes: previewDriftTargetSizes(),
 		},
 	})
 }
@@ -679,8 +680,20 @@ func PreviewCommentPlanDriftCleanBlocked() string {
 				{Deployment: "au", Class: "match", Blocked: 1},
 				{Deployment: "us", Class: "match"},
 			},
+			TableSizes: previewDriftTargetSizes(),
 		},
 	})
+}
+
+// previewDriftTargetSizes is each deployment's size for the table the drift
+// previews' plan indexes. A clean rollup carries every target's sizes, since
+// every target was planned.
+func previewDriftTargetSizes() []TargetTableSize {
+	return []TargetTableSize{
+		previewTargetSize("eu", "products", 1_130_000_000),
+		previewTargetSize("au", "products", 412_000_000),
+		previewTargetSize("us", "products", 8_700_000_000),
+	}
 }
 
 // PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift

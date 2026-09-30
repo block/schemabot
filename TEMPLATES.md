@@ -1665,8 +1665,18 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (reviewed target `eu` only; other targets not shown):
-- `products`: ~1.1 GB
+📊 **Table sizes**:
+- `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
+
+<details>
+<summary>Size on each target</summary>
+
+- `products`
+  - `us`: ~8.7 GB
+  - `eu`: ~1.1 GB
+  - `au`: ~412 MB
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1725,8 +1735,18 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (reviewed target `eu` only; other targets not shown):
-- `products`: ~1.1 GB
+📊 **Table sizes**:
+- `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
+
+<details>
+<summary>Size on each target</summary>
+
+- `products`
+  - `us`: ~8.7 GB
+  - `eu`: ~1.1 GB
+  - `au`: ~412 MB
+
+</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
