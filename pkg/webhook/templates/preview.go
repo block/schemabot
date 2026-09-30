@@ -2360,6 +2360,55 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentMultiTargetApplyInProgress renders a parallel rollout across
+// two deployments of 64 targets each. Each deployment rolls its targets up into
+// one section: counts by status, one line per table across its targets, and
+// the DDL once per distinct change. In us, eight targets need a second index
+// and one target failed; the rollout continues past it.
+func PreviewCommentMultiTargetApplyInProgress() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const addIndexAndColumn = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`), ADD COLUMN `note` text"
+	var ops []presentation.Operation
+	var details []*ApplyStatusCommentData
+	add := func(deployment string, i int, opState, taskState, ddl string, copied int64) {
+		target := fmt.Sprintf("orders_%03d", i)
+		op := presentation.Operation{Deployment: deployment, Target: target, State: opState, Parallel: true, ContinueOnFailure: true}
+		if opState == state.ApplyOperation.Failed {
+			op.Error = "Error 1062: Duplicate entry '12345' for key 'orders.idx_user_id'"
+		}
+		ops = append(ops, op)
+		details = append(details, sampleDeploymentDetail(target, opState, []TableProgressData{
+			{TableName: "orders", DDL: ddl, Status: taskState, RowsCopied: copied, RowsTotal: 1_466_232, ETASeconds: 195},
+		}))
+	}
+	for i := range 64 {
+		ddl := addIndex
+		if i >= 56 {
+			ddl = addIndexAndColumn
+		}
+		switch {
+		case i < 40:
+			add("us", i, state.ApplyOperation.Completed, state.Task.Completed, ddl, 1_466_232)
+		case i == 62:
+			add("us", i, state.ApplyOperation.Failed, state.Task.Failed, ddl, 402_118)
+		default:
+			add("us", i, state.ApplyOperation.Running, state.Task.Running, ddl, 914_707)
+		}
+	}
+	for i := range 64 {
+		add("eu", i, state.ApplyOperation.Running, state.Task.Running, addIndex, 183_029)
+	}
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive(ops),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     details,
+	})
+}
+
 // PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
 // members were planned independently and so run different plans: one is already
 // at the desired schema bar one index, the other still needs both. Each member's

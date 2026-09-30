@@ -18,6 +18,7 @@ package presentation
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/routing"
@@ -232,6 +233,67 @@ type Apply struct {
 	// Deployments are the per-deployment presentations in resolved deployment
 	// order (the order the caller supplies, which mirrors the rollout order).
 	Deployments []Deployment
+}
+
+// Group is one deployment's members of a rollout, so a surface can show a
+// deployment of hundreds of targets as one section.
+type Group struct {
+	Deployment string
+	// Members indexes Apply.Deployments, in resolved order.
+	Members []int
+	// Lead is the member that most needs an operator, so one failed target
+	// heads a group of running ones.
+	Lead Deployment
+	// Counts is the group's per-status histogram, in display order.
+	Counts []StateCount
+	// Open is true when any member is open.
+	Open bool
+}
+
+// Groups partitions the rollout's members by deployment, in the order each
+// deployment first appears in resolved order.
+func (a Apply) Groups() []Group {
+	var groups []Group
+	byDeployment := make(map[string]int)
+	for i, d := range a.Deployments {
+		gi, seen := byDeployment[d.Deployment]
+		if !seen {
+			gi = len(groups)
+			byDeployment[d.Deployment] = gi
+			groups = append(groups, Group{Deployment: d.Deployment, Lead: d})
+		}
+		g := &groups[gi]
+		g.Members = append(g.Members, i)
+		g.Open = g.Open || d.Open
+		if attentionRank(d.Presentation) < attentionRank(g.Lead.Presentation) {
+			g.Lead = d
+		}
+	}
+	for gi := range groups {
+		members := make([]Deployment, len(groups[gi].Members))
+		for j, i := range groups[gi].Members {
+			members[j] = a.Deployments[i]
+		}
+		groups[gi].Counts = summaryCounts(members)
+	}
+	return groups
+}
+
+// attentionOrder ranks presentations by how urgently they need an operator,
+// most urgent first and settled members last.
+var attentionOrder = []PresentationState{
+	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
+	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
+	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
+	StateCancelled, StateReverted, StateCompleted,
+}
+
+// attentionRank is ps's position in attentionOrder; unnamed states rank last.
+func attentionRank(ps PresentationState) int {
+	if i := slices.Index(attentionOrder, ps); i >= 0 {
+		return i
+	}
+	return len(attentionOrder)
 }
 
 // MultiDeployment reports whether the apply owns more than one deployment.

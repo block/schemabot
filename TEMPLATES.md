@@ -7510,13 +7510,6 @@ No schema changes found for database 'new-db'
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
----
-
-To cut over `eu`:
-```
-schemabot cutover apply-a1b2c3d4e5f6 -e production
-```
-
 - 🟢 `eu` — ready for cutover — next in order
 - 🔄 `us` — running table copy
 - ⏳ `au` — waiting for us
@@ -7524,6 +7517,7 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 
 <details open>
 <summary>🟢 eu — ready for cutover — next in order</summary>
+<dl><dd>
 
 **Database**: `payments_eu`
 
@@ -7554,14 +7548,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
----
-
-SchemaBot triggers cutover automatically — no action needed.
-
+</dd></dl>
 </details>
 
 <details open>
 <summary>🔄 us — running table copy</summary>
+<dl><dd>
 
 **Database**: `payments_us`
 
@@ -7591,30 +7583,33 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
----
-
-This command addresses the whole rollout, not just `us`.
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e production
-```
-
+</dd></dl>
 </details>
 
 <details>
 <summary>⏳ au — waiting for us</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
 
 <details>
 <summary>⏳ ca — waiting for us</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
+
+---
+
+To cut over `eu`:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e production
+```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -7637,6 +7632,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 <details open>
 <summary>🔄 us — running table copy</summary>
+<dl><dd>
 
 **Database**: `payments_us` | **Plan**: `plan_7c41f9`
 
@@ -7666,19 +7662,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
----
-
-This command addresses the whole rollout, not just `us`.
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e production
-```
-
+</dd></dl>
 </details>
 
 <details>
 <summary>⏳ eu — waiting for us</summary>
+<dl><dd>
 
 **Database**: `payments_eu` | **Plan**: `plan_3344ab`
 
@@ -7693,7 +7682,97 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
+</dd></dl>
 </details>
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-two-deployments-64-targets-each"></a><strong>Multi-target Rollout (Two Deployments, 64 Targets Each)</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Targets**: 40 completed, 87 running, 1 failed
+
+> ❌ **First failure:** <code>us/orders_062</code> — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39;
+
+- ❌ `us` — 40 completed, 23 running, 1 failed (64 targets)
+- 🔄 `eu` — 64 running (64 targets)
+
+<details open>
+<summary>❌ us — 40 completed, 23 running, 1 failed (64 targets)</summary>
+<dl><dd>
+
+Targets diverge — what applies where:
+
+<details>
+<summary><b>56 of 64 targets</b></summary>
+
+`orders_000`, `orders_001`, `orders_002`, `orders_003`, `orders_004`, `orders_005`, `orders_006`, `orders_007`, `orders_008`, `orders_009`, `orders_010`, `orders_011`, `orders_012`, `orders_013`, `orders_014`, `orders_015`, `orders_016`, `orders_017`, `orders_018`, `orders_019`, `orders_020`, `orders_021`, `orders_022`, `orders_023`, `orders_024`, `orders_025`, `orders_026`, `orders_027`, `orders_028`, `orders_029`, `orders_030`, `orders_031`, `orders_032`, `orders_033`, `orders_034`, `orders_035`, `orders_036`, `orders_037`, `orders_038`, `orders_039`, `orders_040`, `orders_041`, `orders_042`, `orders_043`, `orders_044`, `orders_045`, `orders_046`, `orders_047`, `orders_048`, `orders_049`, `orders_050`, `orders_051`, `orders_052`, `orders_053`, `orders_054`, `orders_055`
+
+</details>
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 89% · 40 of 56 targets complete
+- Rows: 73,284,592 / 82,108,992 across 56 of 56 targets · ETA: 3m 15s
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% · 0 of 8 targets complete, 1 failed
+- Rows: 6,402,949 / 10,263,624 across 7 of 8 targets · ETA: 3m 15s
+
+```sql
+ALTER TABLE `orders`
+    ADD INDEX `idx_user_id`(`user_id`),
+    ADD COLUMN `note` text;
+```
+
+
+| Target | Status |
+| --- | --- |
+| `orders_062` | ❌ failed — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39; |
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>🔄 eu — 64 running (64 targets)</summary>
+<dl><dd>
+
+**`orders`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 12% · 0 of 64 targets complete
+- Rows: 11,713,856 / 93,838,848 across 64 of 64 targets · ETA: 3m 15s
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+</dd></dl>
+</details>
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -7713,13 +7792,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 > ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
----
-
-To retry:
-```
-schemabot apply -e production
-```
-
 - ✅ `eu` — completed
 - ❌ `us` — failed
 - ⏸️ `au` — halted — us failed
@@ -7727,6 +7799,7 @@ schemabot apply -e production
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
 **Database**: `payments_eu`
 
@@ -7755,10 +7828,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 <details open>
 <summary>❌ us — failed</summary>
+<dl><dd>
 
 **Database**: `payments_us`
 
@@ -7790,30 +7865,33 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 > ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
----
+</dd></dl>
+</details>
 
-This command addresses the whole rollout, not just `us`.
+<details open>
+<summary>⏸️ au — halted — us failed</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>⏸️ ca — halted — us failed</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+---
 
 To retry:
 ```
 schemabot apply -e production
 ```
-
-</details>
-
-<details open>
-<summary>⏸️ au — halted — us failed</summary>
-
-_No details available yet._
-
-</details>
-
-<details open>
-<summary>⏸️ ca — halted — us failed</summary>
-
-_No details available yet._
-
-</details>
 
 </details>
 
@@ -7835,6 +7913,7 @@ _No details available yet._
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
 **Database**: `payments_eu`
 
@@ -7863,10 +7942,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ us — completed</summary>
+<dl><dd>
 
 **Database**: `payments_us`
 
@@ -7895,10 +7976,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ au — completed</summary>
+<dl><dd>
 
 **Database**: `payments_au`
 
@@ -7927,6 +8010,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 </details>
@@ -7949,6 +8033,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
 **Database**: `payments_eu`
 
@@ -7977,10 +8062,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ us — completed</summary>
+<dl><dd>
 
 **Database**: `payments_us`
 
@@ -8009,10 +8096,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ au — completed</summary>
+<dl><dd>
 
 **Database**: `payments_au`
 
@@ -8041,6 +8130,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 </details>
@@ -8060,13 +8150,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 > ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
----
-
-To retry:
-```
-schemabot apply -e production
-```
-
 - ✅ `eu` — completed
 - ❌ `us` — failed
 - ⏸️ `au` — halted — us failed
@@ -8074,6 +8157,7 @@ schemabot apply -e production
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
 **Database**: `payments_eu`
 
@@ -8102,10 +8186,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 <details open>
 <summary>❌ us — failed</summary>
+<dl><dd>
 
 <!-- schemabot:offer-support-channel -->
 **Database**: `payments_us`
@@ -8132,30 +8218,33 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
----
+</dd></dl>
+</details>
 
-This command addresses the whole rollout, not just `us`.
+<details open>
+<summary>⏸️ au — halted — us failed</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>⏸️ ca — halted — us failed</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+---
 
 To retry:
 ```
 schemabot apply -e production
 ```
-
-</details>
-
-<details open>
-<summary>⏸️ au — halted — us failed</summary>
-
-_No details available yet._
-
-</details>
-
-<details open>
-<summary>⏸️ ca — halted — us failed</summary>
-
-_No details available yet._
-
-</details>
 
 </details>
 
