@@ -1400,7 +1400,9 @@ type ApplyOperationStore interface {
 	// past the earlier rollout members of its apply. A member is a (deployment,
 	// target) pair, so the targets of one deployment are ordered exactly like the
 	// deployments of a map, while the operations of one member (a sharded
-	// target's per-shard work) do not gate each other.
+	// target's per-shard work) do not gate each other's start. They are still
+	// ordered at cutover, by FindNextApplyOperationCutover, and a member's
+	// finalizer still waits for the work it finalizes.
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
@@ -1414,10 +1416,12 @@ type ApplyOperationStore interface {
 	// (claims pending rows → running); this one gates the cutover phase.
 	//
 	// A waiting_for_cutover row is claimed and transitioned to cutting_over only
-	// when every earlier deployment_order sibling has reached completed (the
+	// when every earlier operation of the apply has reached completed (the
 	// cutover gate is completed-only, with the on_failure "continue" exemption
 	// for a terminal-failed earlier sibling) and no pending stop control request
-	// exists for the apply. Separately, a row already in cutting_over or
+	// exists for the apply. The gate covers every earlier operation, whichever
+	// member it belongs to, so one member's shards also cut over one at a time.
+	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
 	// driver died, which carries no ordering gate.
