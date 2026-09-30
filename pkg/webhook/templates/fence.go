@@ -51,9 +51,33 @@ func planPointerMarker(planID string) string {
 	return "_DDL truncated to fit GitHub's comment size limit; the full plan is available from the CLI with " + listPlanCommand(planID) + "._\n"
 }
 
+// sharedPlanPointerMarker is planPointerMarker for a section that renders one
+// environment's plan on behalf of several environments whose plans are the
+// same. Each environment stored its own plan, and the section can name only
+// the first, so the marker says whose plan it names and which environments run
+// the same DDL, rather than handing another environment's operator a plan that
+// reads as their own.
+func sharedPlanPointerMarker(planID string, environments []string) string {
+	named := flattenIdentifier(environments[0])
+	matching := make([]string, 0, len(environments)-1)
+	for _, env := range environments[1:] {
+		matching = append(matching, flattenIdentifier(env))
+	}
+	return "_DDL truncated to fit GitHub's comment size limit; the full " + named + " plan is available from the CLI with " + listPlanCommand(planID) +
+		" (" + strings.Join(matching, " and ") + " " + runVerb(len(matching)) + " the same DDL)._\n"
+}
+
 // listPlanCommand is the CLI command that prints the stored plan planID in full.
 func listPlanCommand(planID string) string {
 	return inlineCode("schemabot list-plans " + planID)
+}
+
+// runVerb agrees "run" with the number of environments it follows.
+func runVerb(subjects int) string {
+	if subjects == 1 {
+		return "runs"
+	}
+	return "run"
 }
 
 // fenceOverhead is the byte count of a block's fixed text beyond the two fence
@@ -88,6 +112,12 @@ type ddlBlockBudget struct {
 	// long its section's marker is.
 	markers       int
 	longestMarker int
+
+	// sharedBy lists the environments a section rendered once on behalf of
+	// several is shared by, the first being the one whose plan it renders, so
+	// a pointer marker in it says whose stored plan it names. Empty outside
+	// such a section.
+	sharedBy []string
 }
 
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
@@ -103,10 +133,28 @@ func (b *ddlBlockBudget) pointAt(planID string) (restore func()) {
 	previous := b.marker
 	b.marker = ""
 	if planID != "" {
-		b.marker = planPointerMarker(planID)
+		b.marker = b.pointerMarker(planID)
 	}
 	b.longestMarker = max(b.longestMarker, len(b.truncationMarker()))
 	return func() { b.marker = previous }
+}
+
+// pointerMarker is the marker naming the stored plan planID, saying whose plan
+// it is when the section is shared by several environments.
+func (b *ddlBlockBudget) pointerMarker(planID string) string {
+	if len(b.sharedBy) > 1 {
+		return sharedPlanPointerMarker(planID, b.sharedBy)
+	}
+	return planPointerMarker(planID)
+}
+
+// shareAcross marks the DDL rendered from here on as one section shared by
+// environments, rendered from the first one's plan, until the returned restore
+// runs.
+func (b *ddlBlockBudget) shareAcross(environments []string) (restore func()) {
+	previous := b.sharedBy
+	b.sharedBy = environments
+	return func() { b.sharedBy = previous }
 }
 
 // truncationMarker is the marker a block cut now is followed by.
