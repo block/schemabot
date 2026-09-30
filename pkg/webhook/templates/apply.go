@@ -505,8 +505,8 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 
 // writeMemberFooterAction writes a footer action, unless the comment is one
 // member's section of a rollout. Every control command addresses the whole
-// apply, so a rollout writes its one command at the bottom of the comment
-// instead of once under every member.
+// apply, so a rollout writes its commands once, in the footer at the bottom of
+// the comment, instead of under every member.
 func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, label, command string) {
 	if data.InRolloutSection {
 		return

@@ -1060,6 +1060,70 @@ func TestRenderMultiDeploymentApplyComment_PausedRolloutOffersReleaseAndStop(t *
 		"\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production --tenant acme\n```\n", out)
 }
 
+// A rollout paused after a failure while another deployment waits for its
+// cutover names the cutover, release, and stop together in one footer, so the
+// operator reads every choice under a single separator.
+func TestRenderMultiDeploymentApplyComment_PausedRolloutWithPendingCutoverSharesOneFooter(t *testing.T) {
+	pausing := func(dep, st string) presentation.Operation {
+		return presentation.Operation{Deployment: dep, State: st, PauseOnFailure: true, Parallel: true}
+	}
+	model := presentation.Derive([]presentation.Operation{pausing("us", so.WaitingForCutover), pausing("eu", so.Failed), pausing("ap", so.Pending)})
+	require.Equal(t, state.Apply.Paused, model.State)
+	require.Equal(t, presentation.NextActionCutover, model.NextAction.Kind)
+
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders_us", State: state.Apply.WaitingForCutover, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
+			{Database: "orders_eu", State: state.Apply.Failed, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
+			{Database: "orders_ap", State: state.Apply.Pending, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
+		},
+	})
+
+	footer := out[strings.LastIndex(out, "</details>"):]
+	assert.Contains(t, footer, "\n---\n\nTo cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"+
+		"\nPaused after a failure — to let the held deployments proceed:\n```\nschemabot release apply-123 -e production\n```\n"+
+		"\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n", out)
+	assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
+}
+
+// A terminal apply refuses stop and cancel, so no terminal aggregate state
+// offers either one, even while a member is still writing to its target: a
+// cancelled sibling ranks the aggregate cancelled over a sibling still copying.
+func TestRenderMultiDeploymentApplyComment_TerminalAggregateNeverOffersStop(t *testing.T) {
+	ops := []presentation.Operation{rollingOp("us", so.Cancelled), rollingOp("eu", so.Running)}
+	require.Equal(t, state.Apply.Cancelled, presentation.Derive(ops).State)
+
+	terminal := 0
+	for _, field := range reflect.ValueOf(state.Apply).Fields() {
+		aggregate := field.String()
+		if !state.IsTerminalApplyState(aggregate) {
+			continue
+		}
+		terminal++
+		for _, engine := range []string{storage.EngineSpirit, storage.EnginePlanetScale} {
+			t.Run(aggregate+"/"+engine, func(t *testing.T) {
+				model := presentation.Derive(ops)
+				model.State = aggregate
+				out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+					Model:       model,
+					ApplyID:     "apply-123",
+					Environment: "production",
+					Details: []*ApplyStatusCommentData{
+						{Database: "orders_us", State: state.Apply.Cancelled, ApplyID: "apply-123", Environment: "production", Engine: engine},
+						{Database: "orders_eu", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: engine},
+					},
+				})
+				assert.NotContains(t, out, "schemabot stop ", out)
+				assert.NotContains(t, out, "schemabot cancel ", out)
+			})
+		}
+	}
+	require.Positive(t, terminal, "the apply state registry names terminal states")
+}
+
 // A table retrying on any member makes the rollout's one footer the retry
 // guidance, not the plain stop command.
 func TestRenderMultiDeploymentApplyComment_RetryingMemberTableGetsRetryFooter(t *testing.T) {
