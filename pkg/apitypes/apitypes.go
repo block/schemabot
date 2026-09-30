@@ -1446,6 +1446,12 @@ type TableProgressResponse struct {
 	RowsTotal       int64  `json:"rows_total"`
 	PercentComplete int32  `json:"percent_complete"`
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
+	// EstimatedBytes is the plan's approximate on-disk footprint of the table
+	// (data plus indexes), for display beside the row counts. It is the
+	// table's size when planned, not a measure of copy progress. Absent when
+	// the plan had no estimate and for a task scoped to one shard, since the
+	// estimate covers the whole table.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`

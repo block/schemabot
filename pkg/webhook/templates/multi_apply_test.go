@@ -713,6 +713,44 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailedTargetsAreNamed(t *test
 	assert.Contains(t, out, "\n…and 5 more failed targets.\n")
 }
 
+// A table copying on several targets shows its planned size summed across
+// them, since each target copies its own data. The total is left off when any
+// target has no estimate or has reported nothing, rather than understating it.
+func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *testing.T) {
+	sized := func(detail *ApplyStatusCommentData, bytes int64) *ApplyStatusCommentData {
+		detail.Tables[0].EstimatedBytes = &bytes
+		return detail
+	}
+	ops := []presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+	}
+
+	out := renderTargets(presentation.Derive(ops),
+		sized(targetDetail("testapp_001", state.Task.Running, addNote, 500), 1_500_000_000),
+		sized(targetDetail("testapp_002", state.Task.Running, addNote, 250), 2_000_000_000),
+	)
+	assert.Contains(t, out, "- Rows: 750 / 2,000 · ~3.5 GB · ETA: "+ui.FormatETA(500)+"\n")
+
+	out = renderTargets(presentation.Derive(ops),
+		sized(targetDetail("testapp_001", state.Task.Running, addNote, 500), 1_500_000_000),
+		targetDetail("testapp_002", state.Task.Running, addNote, 250),
+	)
+	assert.Contains(t, out, "- Rows: 750 / 2,000 · ETA: "+ui.FormatETA(500)+"\n")
+}
+
+func TestTargetsTableBytes(t *testing.T) {
+	one, two := int64(1_500_000_000), int64(2_000_000_000)
+	cells := []TableProgressData{{EstimatedBytes: &one}, {EstimatedBytes: &two}}
+
+	total := targetsTableBytes(cells, 0)
+	require.NotNil(t, total)
+	assert.Equal(t, int64(3_500_000_000), *total)
+	assert.Nil(t, targetsTableBytes(cells, 1), "a silent target has no estimate to add")
+	assert.Nil(t, targetsTableBytes([]TableProgressData{{EstimatedBytes: &one}, {}}, 0), "a target without an estimate leaves the total unknown")
+	assert.Nil(t, targetsTableBytes(nil, 0))
+}
+
 // One failed target among several still copying does not hide their progress:
 // the table keeps its bar from the targets that are copying or done, leaves the
 // failed target's rows out of it, and counts the failure beside the coverage.

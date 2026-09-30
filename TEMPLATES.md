@@ -3771,7 +3771,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-- Rows: 321,450 / 1,466,232 · ETA: 5m 40s
+- Rows: 321,450 / 1,466,232 · ~438 MB · ETA: 5m 40s
 
 **`users`**: ⏳ Queued
 
@@ -3818,7 +3818,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
 
 **`products`**: ⏳ Queued
 
@@ -3913,7 +3913,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
 - ℹ️ _Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_
 
 **`products`**: ⏳ Queued
@@ -4102,7 +4102,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
-- Rows: 87,231 / 523,140 · ETA: 7m 0s
+- Rows: 87,231 / 523,140 · ~157 MB · ETA: 7m 0s
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4650,7 +4650,7 @@ schemabot apply -e staging
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 1,055,687 / 1,466,232
+- Rows: 1,055,687 / 1,466,232 · ~391 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5928,7 +5928,7 @@ Single table progress (default):
 
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48.61%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-       • Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+       • Rows: 3,500,000 / 7,200,000 · ~2.1 GB · ETA: 5m 30s
 
 
 ```
@@ -7560,7 +7560,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
 
 **`products`**: ⏳ Queued
 
@@ -7641,7 +7641,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~438 MB · ETA: 3m 15s
 
 **`users`**: ⏳ Queued
 
@@ -7843,7 +7843,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
 
 **`products`**: ⏳ Queued
 

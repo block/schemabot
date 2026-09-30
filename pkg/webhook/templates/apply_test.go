@@ -1592,6 +1592,53 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 	assert.NotContains(t, result, "schemabot cutover")
 }
 
+// A copying table shows its planned size beside the row counts, before the
+// ETA, and a stopped one keeps it. A table the plan had no estimate for shows
+// the row counts alone.
+func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	for _, tt := range []struct {
+		name  string
+		table TableProgressData
+		state string
+		want  string
+	}{
+		{
+			name:  "running with ETA",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n",
+		},
+		{
+			name:  "running without ETA",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n",
+		},
+		{
+			name:  "stopped",
+			state: state.Apply.Stopped,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Stopped, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n",
+		},
+		{
+			name:  "no estimate",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.table.DDL = "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+			result := RenderApplyStatusComment(ApplyStatusCommentData{
+				Database: "testapp", Environment: "staging", State: tt.state, Engine: "Spirit",
+				Tables: []TableProgressData{tt.table},
+			})
+			assert.Contains(t, result, tt.want)
+		})
+	}
+}
+
 func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",

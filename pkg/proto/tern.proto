@@ -868,6 +868,10 @@ message TableProgress {
   // Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
   // 2s"). Empty when throttled is false.
   string throttle_reason = 18;
+  // The plan's approximate on-disk footprint of the table (data plus indexes),
+  // for display beside the row counts. Unset when the plan had no estimate and
+  // for a task scoped to one shard, since the estimate covers the whole table.
+  optional int64 estimated_bytes = 19;
 }
 
 // SettledControlRequest reports the fate of a durable control request the

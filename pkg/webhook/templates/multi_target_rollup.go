@@ -180,6 +180,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			if reporting < len(cells)+silent {
 				line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
 			}
+			line += ui.FormatTableSizeClause(targetsTableBytes(cells, silent))
 			if eta > 0 {
 				floor := ""
 				if unreported+silent > 0 {
@@ -204,6 +205,24 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase = "⊘ Cancelled"
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
+}
+
+// targetsTableBytes totals a table's planned size across the targets that run
+// it, since each target copies its own data. It is nil unless every one of
+// those targets carries an estimate: a total that left some out would
+// understate the table, and silent targets have reported nothing at all.
+func targetsTableBytes(cells []TableProgressData, silent int) *int64 {
+	if silent > 0 || len(cells) == 0 {
+		return nil
+	}
+	var total int64
+	for _, c := range cells {
+		if c.EstimatedBytes == nil {
+			return nil
+		}
+		total += *c.EstimatedBytes
+	}
+	return &total
 }
 
 // targetCoverage is the " · 40 complete, 4 running, 19 queued, 1 failed,
