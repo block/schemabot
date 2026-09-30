@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -246,17 +247,7 @@ func (p *shardedFinalizerPlan) finalizesOnly(namespace string) bool {
 // nothing rather than blocking the comment, and a stored plan without diffs
 // (recorded before diffs were persisted) contributes no diffs.
 func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
-	if !isShardedApply(ops) {
-		return nil
-	}
-	hasFinalizer := false
-	for _, key := range applyOperationKeys(apply, ops) {
-		if _, ok := parseFinalizerOperationKey(key); ok {
-			hasFinalizer = true
-			break
-		}
-	}
-	if !hasFinalizer {
+	if !needsShardedFinalizerPlan(apply, ops) {
 		return nil
 	}
 
@@ -285,6 +276,72 @@ func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, appl
 		}
 	}
 	return finalizers
+}
+
+// needsShardedFinalizerPlan reports whether the apply's comment consumes the
+// stored plan's finalizer view: only a sharded apply that declares a finalizer
+// operation does.
+func needsShardedFinalizerPlan(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	if !isShardedApply(ops) {
+		return false
+	}
+	for _, key := range applyOperationKeys(apply, ops) {
+		if _, ok := parseFinalizerOperationKey(key); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// finalizerPlanCacheLimit bounds how many plans a finalizerPlanCache holds, so
+// a long-lived process does not keep every plan it has ever rendered.
+const finalizerPlanCacheLimit = 1024
+
+// finalizerPlanCache remembers what each stored plan says about its apply's
+// finalizers once a read of it has succeeded. A stored plan never changes, so
+// the first successful read stays true for every later render. The plan
+// decides whether a Strata apply's comments take the single-deployment layout,
+// and one cache is shared by every comment render in the process (each
+// driver's observer, the aggregate terminal observer, and the summary repair),
+// so a failed read in a later render cannot switch the comments back to the
+// shard layout that earlier renders did not use. A nil cache reads storage on
+// every call.
+type finalizerPlanCache struct {
+	mu     sync.Mutex
+	byPlan map[int64]*shardedFinalizerPlan
+}
+
+func newFinalizerPlanCache() *finalizerPlanCache {
+	return &finalizerPlanCache{byPlan: make(map[int64]*shardedFinalizerPlan)}
+}
+
+// resolve returns the cached finalizer view of the apply's stored plan, or
+// reads it with resolveShardedFinalizerPlan and caches a successful read. The
+// read runs outside the lock, so a slow read for one apply does not hold up
+// another's comment.
+func (c *finalizerPlanCache) resolve(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
+	if c == nil || !needsShardedFinalizerPlan(apply, ops) {
+		return resolveShardedFinalizerPlan(ctx, stor, apply, ops)
+	}
+	c.mu.Lock()
+	cached := c.byPlan[apply.PlanID]
+	c.mu.Unlock()
+	if cached != nil {
+		return cached
+	}
+	plan := resolveShardedFinalizerPlan(ctx, stor, apply, ops)
+	if plan == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.byPlan) >= finalizerPlanCacheLimit {
+		slog.Debug("finalizer plan cache is full; clearing it before caching this apply's plan",
+			append(apply.LogAttrs(), "cached_plans", len(c.byPlan))...)
+		clear(c.byPlan)
+	}
+	c.byPlan[apply.PlanID] = plan
+	return plan
 }
 
 // vschemaStatusForOperationState projects a finalizer operation's state onto

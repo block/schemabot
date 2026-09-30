@@ -886,25 +886,54 @@ func TestResolveShardedFinalizerPlanReadsTheDeclaredFinalizer(t *testing.T) {
 	assert.True(t, finalizers.finalizesOnly("ks"))
 }
 
-// A comment observer keeps the first stored plan it reads for an apply's
-// finalizers, so a later failed read renders the same layout as the edits
-// before it. A read that failed is not kept, so the next render tries again.
-func TestCommentObserverRemembersFinalizerPlan(t *testing.T) {
+// Every comment render of an apply shares its handler's finalizer plan cache.
+// The aggregate terminal observer is built fresh when the apply settles, so
+// when its own plan read fails it still takes the layout the progress comments
+// used rather than switching the final edit and summary to the shard rollup.
+func TestFinalizerPlanCacheIsSharedAcrossObservers(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: 7}
 	ops := []*storage.ApplyOperation{
 		{OperationKey: "shop_001/-/orders"},
 		{OperationKey: "shop_001/group_finalizer"},
 	}
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {Finalize: true}}}
-	o := &CommentObserver{stor: &stubPlanStorage{err: errors.New("storage down")}}
+	failing := &stubPlanStorage{err: errors.New("storage down")}
+	cache := newFinalizerPlanCache()
 
-	assert.Nil(t, o.resolveFinalizerPlan(apply, ops), "a failed read has no plan to show")
+	progress := NewCommentObserver(CommentObserverConfig{Storage: failing, finalizerPlans: cache})
+	assert.Nil(t, progress.resolveFinalizerPlan(apply, ops), "a failed read has no plan to show")
 
-	o.stor = &stubPlanStorage{plan: plan}
-	first := o.resolveFinalizerPlan(apply, ops)
+	progress.stor = &stubPlanStorage{plan: plan}
+	first := progress.resolveFinalizerPlan(apply, ops)
 	require.NotNil(t, first, "a read after a failed one tries storage again")
 	assert.True(t, first.finalizesOnly("shop_001"))
 
-	o.stor = &stubPlanStorage{err: errors.New("storage down")}
-	assert.Same(t, first, o.resolveFinalizerPlan(apply, ops), "a failed read after a successful one keeps the plan already read")
+	progress.stor = failing
+	assert.Same(t, first, progress.resolveFinalizerPlan(apply, ops), "a failed read after a successful one keeps the plan already read")
+
+	terminal := NewAggregateTerminalCommentObserver(CommentObserverConfig{Storage: failing, finalizerPlans: cache})
+	assert.Same(t, first, terminal.resolveFinalizerPlan(apply, ops), "a new observer sharing the cache keeps the plan another observer read")
+	assert.True(t, rendersAsSingleShard(apply, ops, terminal.resolveFinalizerPlan(apply, ops)))
+
+	other := &storage.Apply{ApplyIdentifier: "apply-y", PlanID: 8}
+	assert.Nil(t, terminal.resolveFinalizerPlan(other, ops), "the cache answers only for the plan it read")
+
+	separate := NewCommentObserver(CommentObserverConfig{Storage: failing})
+	assert.Nil(t, separate.resolveFinalizerPlan(apply, ops), "an observer given no cache starts with its own")
+}
+
+// A full finalizer plan cache is cleared before it takes another plan, so a
+// long-lived process holds a bounded number of plans.
+func TestFinalizerPlanCacheStaysBounded(t *testing.T) {
+	cache := newFinalizerPlanCache()
+	for id := int64(1); id <= finalizerPlanCacheLimit; id++ {
+		cache.byPlan[id] = &shardedFinalizerPlan{}
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: finalizerPlanCacheLimit + 1}
+	ops := []*storage.ApplyOperation{{OperationKey: "shop_001/-/orders"}, {OperationKey: "shop_001/group_finalizer"}}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {Finalize: true}}}
+
+	require.NotNil(t, cache.resolve(t.Context(), &stubPlanStorage{plan: plan}, apply, ops))
+	assert.Len(t, cache.byPlan, 1)
+	assert.Contains(t, cache.byPlan, apply.PlanID)
 }

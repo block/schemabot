@@ -174,12 +174,13 @@ type shardGroup struct {
 // single-deployment comment, taking the room the rest of the comment leaves.
 func RenderShardedApplyComment(data ShardedApplyData) string {
 	renderedAt := currentTimestamp()
+	formatter := newShardedDDLFormatter(data.ApplyID)
 	return renderWithinCommentLimit(countShardedDDLBlocks(data.Keyspaces), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
-		return renderShardedApplyComment(data, renderedAt, budget)
+		return renderShardedApplyComment(data, renderedAt, formatter, budget)
 	})
 }
 
-func renderShardedApplyComment(data ShardedApplyData, renderedAt string, budget *ddlBlockBudget) string {
+func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatter *shardedDDLFormatter, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
@@ -188,7 +189,7 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, budget 
 
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
-	writeShardKeyspaceSections(&sb, data, budget)
+	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeFinalizeStatus(&sb, data.Finalizes)
 
@@ -208,12 +209,13 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, budget 
 // a failure, divergent change signatures, or divergent shard outcomes. Each
 // table's DDL follows its rollup line, as in the status comment.
 func RenderShardedApplySummaryComment(data ShardedApplyData) string {
+	formatter := newShardedDDLFormatter(data.ApplyID)
 	return renderWithinCommentLimit(countShardedDDLBlocks(data.Keyspaces), applyCommentAppendReserve, func(budget *ddlBlockBudget) string {
-		return renderShardedApplySummaryComment(data, budget)
+		return renderShardedApplySummaryComment(data, formatter, budget)
 	})
 }
 
-func renderShardedApplySummaryComment(data ShardedApplyData, budget *ddlBlockBudget) string {
+func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedDDLFormatter, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
@@ -223,7 +225,7 @@ func renderShardedApplySummaryComment(data ShardedApplyData, budget *ddlBlockBud
 	}
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
-	writeShardKeyspaceSections(&sb, data, budget)
+	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeFinalizeStatus(&sb, data.Finalizes)
 	writeShardedFooter(&sb, data)
@@ -400,9 +402,8 @@ func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
 // signature (which shards moved together is invisible at the table level),
 // divergent shard outcomes (the split the operator reconciles shard by shard),
 // or a keyspace carrying no table rollup to stand in for them.
-func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, budget *ddlBlockBudget) {
+func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, formatter *shardedDDLFormatter, budget *ddlBlockBudget) {
 	keyspaces := data.Keyspaces
-	dialect := dialectForEngine(storage.EngineStrata, data.ApplyID)
 	applyHasShardFailure := false
 	for _, ks := range keyspaces {
 		if keyspaceHasShardFailure(ks.Shards) {
@@ -414,7 +415,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, budg
 		fmt.Fprintf(sb, "\n#### Keyspace %s\n\n", inlineCode(ks.Keyspace))
 		for _, t := range ks.Tables {
 			writeShardedTableLine(sb, t, func() {
-				writeShardedTableDDL(sb, shardedTableDDLGroups(ks, t.Table), len(ks.Shards), dialect, budget)
+				writeShardedTableDDL(sb, shardedTableDDLGroups(ks, t.Table), len(ks.Shards), formatter, budget)
 			})
 		}
 		needsShardDetail := applyHasShardFailure || keyspaceHasDivergentOutcome(ks.Shards)
@@ -472,16 +473,44 @@ func shardedTableDDLGroups(ks ShardedKeyspace, table string) []shardedDDLGroup {
 // single-deployment comment does; otherwise each distinct set is headed by the
 // shards that run it, as the plan comment does, so DDL that runs on only some
 // of the keyspace's shards never reads as running on all of them.
-func writeShardedTableDDL(sb *strings.Builder, groups []shardedDDLGroup, totalShards int, dialect schema.Dialect, budget *ddlBlockBudget) {
+func writeShardedTableDDL(sb *strings.Builder, groups []shardedDDLGroup, totalShards int, formatter *shardedDDLFormatter, budget *ddlBlockBudget) {
 	if len(groups) == 1 && len(groups[0].shards) == totalShards {
 		sb.WriteString("\n")
-		writeSQLFencedBlocks(sb, formatDDLBlocks(groups[0].statements, dialect), budget)
+		writeSQLFencedBlocks(sb, formatter.format(groups[0].statements), budget)
 		return
 	}
 	for _, g := range groups {
 		fmt.Fprintf(sb, "\n**%s**\n", planShardList(g.shards, totalShards))
-		writeSQLFencedBlocks(sb, formatDDLBlocks(g.statements, dialect), budget)
+		writeSQLFencedBlocks(sb, formatter.format(g.statements), budget)
 	}
+}
+
+// shardedDDLFormatter formats each distinct statement set of one sharded
+// comment once. renderWithinCommentLimit renders the comment more than once to
+// fit it, and the formatting does not depend on the room left, so each later
+// pass reuses the blocks instead of parsing the same DDL again.
+type shardedDDLFormatter struct {
+	dialect schema.Dialect
+	blocks  map[string][]string
+}
+
+func newShardedDDLFormatter(applyID string) *shardedDDLFormatter {
+	return &shardedDDLFormatter{
+		dialect: dialectForEngine(storage.EngineStrata, applyID),
+		blocks:  make(map[string][]string),
+	}
+}
+
+// format returns the statements' SQL block contents, as formatDDLBlocks
+// renders them.
+func (f *shardedDDLFormatter) format(statements []string) []string {
+	key := strings.Join(statements, "\x00")
+	if blocks, ok := f.blocks[key]; ok {
+		return blocks
+	}
+	blocks := formatDDLBlocks(statements, f.dialect)
+	f.blocks[key] = blocks
+	return blocks
 }
 
 // countShardedDDLBlocks counts the DDL blocks the sharded comment renders, one

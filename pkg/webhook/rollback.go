@@ -628,6 +628,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		SupportChannel: h.supportChannel(),
 		Tenant:         h.deploymentTenant(),
 		EngineLogs:     h.engineLogReader(),
+		finalizerPlans: h.finalizerPlans,
 		Logger:         h.logger,
 		OnTerminalHook: func(a *storage.Apply) {
 			// refreshChecksForTerminalApply routes a completed rollback straight

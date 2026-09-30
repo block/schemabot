@@ -1211,7 +1211,7 @@ func formatDDLBlocks(statements []string, dialect schema.Dialect) []string {
 	blocks := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
-		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
+		slog.Warn("DDL block cannot split create sets; multi-statement DDL will be rendered as written",
 			"dialect", dialect, "error", parserErr)
 	}
 	for _, stmt := range statements {
@@ -1220,7 +1220,7 @@ func formatDDLBlocks(statements []string, dialect schema.Dialect) []string {
 			if _, _, classifyErr := parser.Classify(stmt); classifyErr != nil {
 				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
 				if createSetErr != nil {
-					slog.Warn("plan DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
+					slog.Warn("DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
 						"dialect", dialect, "classify_error", classifyErr, "create_set_error", createSetErr)
 				} else {
 					statementsToFormat = createSet.Statements

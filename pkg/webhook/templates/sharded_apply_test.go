@@ -1089,3 +1089,25 @@ func TestRenderShardedApplyComment_CopyingTableReadsLikeVitess(t *testing.T) {
 	assert.Less(t, ddl, rows, "the rows line follows the DDL")
 	assert.Less(t, rows, shards, "the per-shard breakdown comes last")
 }
+
+// The sharded comment formats each statement set once, however many passes it
+// takes to fit the comment, and hands later passes the same blocks.
+func TestShardedDDLFormatterFormatsEachStatementSetOnce(t *testing.T) {
+	formatter := newShardedDDLFormatter("apply-x")
+	statements := []string{"ALTER TABLE `mutes` ADD COLUMN `note` varchar(255);"}
+
+	first := formatter.format(statements)
+	require.Len(t, first, 1)
+	assert.Contains(t, first[0], "ALTER TABLE `mutes`")
+	assert.Contains(t, first[0], "`note`")
+
+	second := formatter.format(statements)
+	require.Len(t, second, 1)
+	assert.Same(t, &first[0], &second[0], "a later pass reuses the blocks already formatted")
+	assert.Len(t, formatter.blocks, 1)
+
+	other := formatter.format([]string{"ALTER TABLE `blocks` ADD INDEX `created_at`(`created_at`);"})
+	require.Len(t, other, 1)
+	assert.Contains(t, other[0], "ALTER TABLE `blocks`")
+	assert.Len(t, formatter.blocks, 2)
+}
