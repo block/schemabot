@@ -1,6 +1,8 @@
 package localdemo
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,4 +15,14 @@ func TestSampleRequiresLocalDocker(t *testing.T) {
 	for _, endpoint := range []string{"ssh://production.example.com", "tcp://production.example.com:2376", "tcp://127.0.0.1.attacker.example:2376", ""} {
 		require.False(t, localDockerEndpoint(endpoint), endpoint)
 	}
+}
+
+func TestDockerErrorExplainsFailureWithoutCredentials(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "docker"), []byte("#!/bin/sh\necho \"disk full: $MYSQL_ROOT_PASSWORD\" >&2\nexit 1\n"), 0700))
+	t.Setenv("PATH", dir)
+	_, err := run(t.Context(), []string{"MYSQL_ROOT_PASSWORD=private-password"}, "create")
+	require.ErrorContains(t, err, "disk full")
+	require.ErrorContains(t, err, "[redacted]")
+	require.NotContains(t, err.Error(), "private-password")
 }

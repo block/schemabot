@@ -5,8 +5,9 @@ database. Docker supplies the database; SchemaBot handles the connection and imp
 tables. Edit a schema file, preview with `schemabot plan`, and apply when ready. The wizard prints
 the exact command and profile for your project.
 
-From this repository, `make demo` creates a temporary project and starts the MySQL sample.
-Use `make demo ENGINE=postgres` for PostgreSQL. Neither path starts Vitess. See the
+From this repository, `make demo` creates a reusable project in `.schemabot-demo/mysql` and starts the MySQL sample.
+Use `make demo ENGINE=postgres` for PostgreSQL in `.schemabot-demo/postgres`.
+Repeating either command returns you to the same project and preserves your edits. Neither path starts Vitess. See the
 [initialization guide](../docs/init.md#try-without-a-database) for lifecycle and cleanup details.
 
 The full developer environment remains available as `make demo-full`; the sections below

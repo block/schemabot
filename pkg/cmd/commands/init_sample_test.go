@@ -36,6 +36,13 @@ func TestSampleChoiceAndCancellation(t *testing.T) {
 
 func TestSampleRejectsExistingConnections(t *testing.T) {
 	for _, cmd := range []InitCmd{{Sample: true, DSN: "env:DATABASE_URL"}, {Sample: true, StorageDSN: "env:STATE"}, {Sample: true, Database: "real"}, {Sample: true, Integrated: true}, {Sample: true, Namespaces: []string{"real"}}, {Sample: true, Type: "vitess"}, {Sample: true, Environment: "production"}} {
-		require.Error(t, cmd.prepareSample(t.Context(), &Globals{}))
+		message := "--sample creates its own database and connections"
+		if cmd.Type == "vitess" {
+			message = "choose --type mysql or --type postgres"
+		}
+		if cmd.Environment == "production" {
+			message = "sample databases use the development environment"
+		}
+		require.ErrorContains(t, cmd.prepareSample(t.Context(), &Globals{}), message)
 	}
 }

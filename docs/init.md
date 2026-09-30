@@ -24,11 +24,14 @@ $ schemabot init --sample --type mysql --non-interactive --json
 ```
 
 Use `--type postgres` for PostgreSQL. Names and paths vary by project. The completion screen
-prints your next command, including its profile. Each project gets its own sample and runtime;
-retrying setup keeps your data and schema edits. Samples listen only on `127.0.0.1`.
+prints your next command, including a profile flag when needed. Each project gets its own sample and runtime;
+retrying setup keeps your data and never overwrites schema edits. Initialization only succeeds
+when the files match the live database; use `plan` to review edits you have not applied yet. Samples listen only on `127.0.0.1`.
 
 Docker retains sample data across restarts. To stop the database, run `docker stop` with the
-container name printed during setup; rerun `init --sample` in the same project to start it again.
+container name printed during setup. Start it again with `docker start <container-name>`,
+then continue with `plan` or `apply`. You do not need to rerun initialization to restart it.
+The container keeps its assigned port, so the saved connection continues to work.
 When finished, stop its SchemaBot runtime with `schemabot local stop <container-name>` before
 removing the disposable database with `docker rm -v <container-name>`. Removing the container
 permanently deletes its sample data. Your schema files remain in your project.

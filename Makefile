@@ -244,11 +244,19 @@ endif
 # Start a sample through the same onboarding path as an installed CLI.
 #   make demo                 # Create a sample MySQL project
 #   make demo ENGINE=postgres # Create a sample PostgreSQL project
-# The printed path is your demo project.
+# Reuses one project per engine under .schemabot-demo/.
 demo: build
-	@demo_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/schemabot-demo.XXXXXX"); \
+	@engine="$(or $(ENGINE),mysql)"; \
+	case "$$engine" in mysql|postgres) ;; *) echo "Choose ENGINE=mysql or ENGINE=postgres"; exit 1 ;; esac; \
+	demo_dir="$(CURDIR)/.schemabot-demo/$$engine"; \
+	mkdir -p "$$demo_dir"; \
 	echo "Demo project: $$demo_dir"; \
-	cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type $(or $(ENGINE),mysql)
+	if [ -d "$$demo_dir/schema" ]; then \
+	  echo "Your demo is already set up. Continue in that directory; your edits are preserved."; \
+	  echo "To restart a stopped database, use docker start with its sample container name (see docs/init.md)."; \
+	else \
+	  cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type "$$engine"; \
+	fi
 
 # Full developer environment, including LocalScale and multiple deployments.
 #   make demo-full              # Start and apply MySQL + Vitess schema (wipes data)

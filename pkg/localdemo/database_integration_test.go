@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,14 +24,21 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			project := t.TempDir()
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
-			sample, err := Ensure(ctx, project, engine)
+			name, err := sampleName(project, engine)
 			require.NoError(t, err)
 			t.Cleanup(func() {
 				// Teardown runs after t.Context is cancelled. Keep cleanup independent.
 				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 				defer cancel()
-				require.NoError(t, exec.CommandContext(ctx, "docker", "rm", "-fv", sample.Name).Run())
+				listed, err := exec.CommandContext(ctx, "docker", "container", "ls", "-a", "--filter", "name=^/"+name+"$", "--format", "{{.ID}}").Output()
+				require.NoError(t, err)
+				if strings.TrimSpace(string(listed)) == "" {
+					return
+				}
+				require.NoError(t, exec.CommandContext(ctx, "docker", "rm", "-fv", name).Run())
 			})
+			sample, err := Ensure(ctx, project, engine)
+			require.NoError(t, err)
 			var db *sql.DB
 			if engine == "mysql" {
 				db, err = mysqlconn.Open(sample.DSN)
@@ -48,9 +56,19 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			require.Equal(t, "pending", status)
 			_, err = db.ExecContext(ctx, "UPDATE customers SET email='changed@example.com' WHERE id=1")
 			require.NoError(t, err)
+			require.NoError(t, db.Close())
+			require.NoError(t, exec.CommandContext(ctx, "docker", "stop", "-t", "1", sample.Name).Run())
 			same, err := Ensure(ctx, project, engine)
 			require.NoError(t, err)
 			require.Equal(t, sample, same)
+			// Reconnect with the original saved DSN, without retaining a killed session.
+			if engine == "mysql" {
+				db, err = mysqlconn.Open(sample.DSN)
+			} else {
+				db, err = postgresconn.Open(sample.DSN)
+			}
+			require.NoError(t, err)
+			defer utils.CloseAndLog(db)
 			require.NoError(t, db.QueryRowContext(ctx, "SELECT email FROM customers WHERE id=1").Scan(&email))
 			require.Equal(t, "changed@example.com", email)
 		})

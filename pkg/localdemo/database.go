@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -55,16 +56,10 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 	if engine != "mysql" && engine != "postgres" {
 		return Database{}, fmt.Errorf("sample databases support mysql or postgres")
 	}
-	project, err := filepath.Abs(project)
+	name, err := sampleName(project, engine)
 	if err != nil {
 		return Database{}, err
 	}
-	project, err = filepath.EvalSymlinks(project)
-	if err != nil {
-		return Database{}, err
-	}
-	sum := sha256.Sum256([]byte(project + "\x00" + engine))
-	name := fmt.Sprintf("schemabot-sample-%x", sum[:6])
 	image, port, passwordKey := "mysql:8.4", "3306/tcp", "MYSQL_ROOT_PASSWORD"
 	env := []string{"MYSQL_DATABASE=shop"}
 	if engine == "postgres" {
@@ -104,8 +99,18 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		if _, err = rand.Read(password); err != nil {
 			return Database{}, err
 		}
+		// Pin Docker's host port so stop/start and daemon restarts keep saved DSNs valid.
+		// Docker claims the port after the listener closes; a race fails startup safely.
+		listener, err := new(net.ListenConfig).Listen(ctx, "tcp4", "127.0.0.1:0")
+		if err != nil {
+			return Database{}, fmt.Errorf("choose sample port: %w", err)
+		}
+		hostPort := listener.Addr().(*net.TCPAddr).Port
+		if err := listener.Close(); err != nil {
+			return Database{}, err
+		}
 		keyValue := passwordKey + "=" + hex.EncodeToString(password)
-		args := []string{"create", "--name", name, "--label", ownerLabel + "=" + name, "--label", "com.block.schemabot.engine=" + engine, "--restart", "unless-stopped", "-p", "127.0.0.1::" + strings.TrimSuffix(port, "/tcp"), "-e", passwordKey}
+		args := []string{"create", "--name", name, "--label", ownerLabel + "=" + name, "--label", "com.block.schemabot.engine=" + engine, "--restart", "unless-stopped", "-p", fmt.Sprintf("127.0.0.1:%d:%s", hostPort, strings.TrimSuffix(port, "/tcp")), "-e", passwordKey}
 		for _, v := range env {
 			args = append(args, "-e", v)
 		}
@@ -189,13 +194,18 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 	defer cancel()
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
+	var probeErr error
 	for {
-		if containerReady(readyCtx, name, engine) && ready(readyCtx, engine, result.StorageDSN) == nil {
+		probeErr = containerReady(readyCtx, name, engine)
+		if probeErr == nil {
+			probeErr = ready(readyCtx, engine, result.StorageDSN)
+		}
+		if probeErr == nil {
 			return result, nil
 		}
 		select {
 		case <-readyCtx.Done():
-			return Database{}, fmt.Errorf("sample %s did not become ready; inspect it with docker logs %s: %w", name, name, readyCtx.Err())
+			return Database{}, fmt.Errorf("sample %s did not become ready; inspect it with docker logs %s: %w", name, name, errors.Join(readyCtx.Err(), probeErr))
 		case <-ticker.C:
 		}
 	}
@@ -238,6 +248,28 @@ func run(ctx context.Context, env []string, args ...string) ([]byte, error) {
 	cmd.Env = append(os.Environ(), env...)
 	output, err := cmd.Output()
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			detail := strings.TrimSpace(string(exitErr.Stderr))
+			// Docker may repeat environment arguments in a diagnostic. Never expose credentials.
+			for _, entry := range env {
+				if _, value, ok := strings.Cut(entry, "="); ok && value != "" {
+					detail = strings.ReplaceAll(detail, value, "[redacted]")
+				}
+			}
+			detail = strings.Map(func(r rune) rune {
+				if r < 32 && r != '\n' && r != '\t' {
+					return -1
+				}
+				return r
+			}, detail)
+			if len(detail) > 2048 {
+				detail = detail[:2048] + "…"
+			}
+			if detail != "" {
+				return nil, fmt.Errorf("docker %s: %s: %w", args[0], detail, err)
+			}
+		}
 		return nil, fmt.Errorf("docker %s failed; check Docker and retry: %w", args[0], err)
 	}
 	return output, nil
@@ -269,7 +301,7 @@ func localDockerEndpoint(endpoint string) bool {
 
 // Probe inside the container until first-boot initialization finishes. Docker's
 // published port can accept a TCP connection before MySQL can greet a client.
-func containerReady(ctx context.Context, name, engine string) bool {
+func containerReady(ctx context.Context, name, engine string) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	args := []string{"exec", name, "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres", "-d", "schemabot"}
@@ -277,5 +309,18 @@ func containerReady(ctx context.Context, name, engine string) bool {
 		args = []string{"exec", name, "sh", "-c", `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -h127.0.0.1 -Dschemabot -Nse 'SELECT 1'`}
 	}
 	_, err := run(ctx, nil, args...)
-	return err == nil
+	return err
+}
+
+func sampleName(project, engine string) (string, error) {
+	project, err := filepath.Abs(project)
+	if err != nil {
+		return "", err
+	}
+	project, err = filepath.EvalSymlinks(project)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(project + "\x00" + engine))
+	return fmt.Sprintf("schemabot-sample-%x", sum[:6]), nil
 }
