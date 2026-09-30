@@ -2474,6 +2474,57 @@ func TestEngine_Plan_SizeProbeIsBounded(t *testing.T) {
 	require.Len(t, result.FlatTableChanges(), 1)
 }
 
+// Every statement the size probe sends runs under the probe's budget, so a
+// server that is slow to answer either one is abandoned after
+// engine.TableSizeProbeTimeout and the plan returns without sizes, well before
+// the stalled statement would have finished on its own.
+func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
+	const stall = 20 * time.Second
+	stalls := map[string]func(stmt string) string{
+		// SLEEP returns 0, so the stalled SET still sets the value the probe wants.
+		"session setting": func(stmt string) string {
+			if !strings.HasPrefix(stmt, "SET SESSION") {
+				return stmt
+			}
+			return fmt.Sprintf("SET SESSION information_schema_stats_expiry = (SELECT SLEEP(%d))", int(stall.Seconds()))
+		},
+		"statistics query": func(stmt string) string {
+			if !strings.Contains(stmt, "information_schema.tables") {
+				return stmt
+			}
+			return fmt.Sprintf("SELECT probe.* FROM (%s) AS probe, (SELECT SLEEP(%d)) AS stall", stmt, int(stall.Seconds()))
+		},
+	}
+	for name, rewrite := range stalls {
+		t.Run(name, func(t *testing.T) {
+			eng, dsn, files := planSizeProbeFixture(t)
+			var rewrote bool
+			eng.sizeProbeSQL = func(stmt string) string {
+				out := rewrite(stmt)
+				rewrote = rewrote || out != stmt
+				return out
+			}
+
+			start := time.Now()
+			result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database:    "testdb",
+				SchemaFiles: files,
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			elapsed := time.Since(start)
+
+			require.NoError(t, err, "a stalled size probe must not fail the plan")
+			require.True(t, rewrote, "the stall must reach a statement the probe sends")
+			assert.Less(t, elapsed, stall/2, "the plan must abandon the stalled statement at the probe's budget, not wait it out")
+			changes := result.FlatTableChanges()
+			require.Len(t, changes, 1)
+			assert.Equal(t, "probed_items", changes[0].Table)
+			assert.Nil(t, changes[0].EstimatedRows)
+			assert.Nil(t, changes[0].EstimatedBytes)
+		})
+	}
+}
+
 // A plan that only creates tables has no existing table to size, so it never
 // runs the size probe and never connects to the target for sizes; the created
 // table carries no estimate.
