@@ -91,7 +91,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 				"requested_by", requestedBy)
 			return false, nil
 		}
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
 		return false, nil
 	}
 
@@ -306,34 +306,33 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 			releaseErr)
 	}
 
-	// Build comment data. The source apply ID stays in the comment metadata for
-	// auditability, but rollback-confirm loads the lock-pinned rollback plan so
-	// the user does not need to repeat the apply ID.
+	commentData := h.rollbackPlanCommentData(apply, planResp, requestedBy)
+	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
+	return false, nil
+}
+
+// rollbackPlanCommentData builds the rollback plan comment for the stored
+// rollback plan planResp. The source apply ID stays in the comment metadata for
+// auditability, but rollback-confirm loads the lock-pinned rollback plan so the
+// user does not need to repeat the apply ID. The comment carries the stored
+// plan's identifier, so reversal DDL cut to fit names the command that prints
+// the plan in full: the schema files hold the desired schema, not the
+// statements that reverse it.
+func (h *Handler) rollbackPlanCommentData(apply *storage.Apply, planResp *apitypes.PlanResponse, requestedBy string) templates.PlanCommentData {
 	commentData := templates.PlanCommentData{
-		Database:     database,
-		Environment:  environment,
+		Database:     apply.Database,
+		Environment:  apply.Environment,
 		RequestedBy:  requestedBy,
-		DatabaseType: dbType,
-		IsMySQL:      dbType == "mysql",
+		DatabaseType: apply.DatabaseType,
+		IsMySQL:      apply.DatabaseType == "mysql",
 		ApplyID:      apply.ApplyIdentifier,
+		PlanID:       planResp.PlanID,
 		Tenant:       h.deploymentTenant(),
 		AgentHint:    h.agentHint(),
+		CLIName:      h.cliName(),
 	}
 
-	for _, sc := range planResp.Changes {
-		nsData := templates.KeyspaceChangeData{
-			Keyspace: sc.Namespace,
-		}
-		for _, t := range sc.TableChanges {
-			nsData.Statements = append(nsData.Statements, t.DDL)
-		}
-		if sc.HasVSchemaChange() {
-			nsData.VSchemaChanged = true
-			nsData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
-		}
-		nsData.Finalize = sc.NeedsFinalizer()
-		commentData.Changes = append(commentData.Changes, nsData)
-	}
+	commentData.Changes = rollbackKeyspaceChanges(planResp.Changes)
 
 	for _, w := range planResp.LintNonErrors() {
 		commentData.LintViolations = append(commentData.LintViolations, templates.LintViolationData{
@@ -342,9 +341,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		})
 	}
 	commentData.Errors = planResp.Errors
-
-	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
-	return false, nil
+	return commentData
 }
 
 // handleRollbackSourceError posts the user-facing answer for a source-apply
@@ -631,24 +628,15 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		return false, nil
 	}
 
-	observer := NewCommentObserver(CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		DeferCutover:   options["defer_cutover"] == "true",
-		SupportChannel: h.supportChannel(),
-		Tenant:         h.deploymentTenant(),
-		EngineLogs:     h.engineLogReader(),
-		Logger:         h.logger,
-		OnTerminalHook: func(a *storage.Apply) {
-			// refreshChecksForTerminalApply routes a completed rollback straight
-			// to action_required so the stored check state never passes through
-			// success while the PR's schema change is reverted on the target.
-			h.refreshChecksForTerminalApply(context.Background(), a, "rollback confirm")
-		},
-	})
+	observerCfg := h.commentObserverConfig(factory, repo, pr, installationID)
+	observerCfg.DeferCutover = options["defer_cutover"] == "true"
+	observerCfg.OnTerminalHook = func(a *storage.Apply) {
+		// refreshChecksForTerminalApply routes a completed rollback straight
+		// to action_required so the stored check state never passes through
+		// success while the PR's schema change is reverted on the target.
+		h.refreshChecksForTerminalApply(context.Background(), a, "rollback confirm")
+	}
+	observer := NewCommentObserver(observerCfg)
 	pendingObserver := h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, observer)
 
 	// Execute apply with the rollback plan. The caller attributes the apply to
@@ -886,4 +874,22 @@ func planHasChanges(plan *storage.Plan) bool {
 		return true
 	}
 	return len(plan.FinalizerNamespaces()) > 0
+}
+
+// rollbackKeyspaceChanges maps a rollback plan's changes onto the comment's
+// per-keyspace sections: each keyspace's DDL plus the namespace-level work the
+// engine planned beside it.
+func rollbackKeyspaceChanges(changes []*apitypes.SchemaChangeResponse) []templates.KeyspaceChangeData {
+	var out []templates.KeyspaceChangeData
+	for _, sc := range changes {
+		nsData := templates.KeyspaceChangeData{
+			Keyspace: sc.Namespace,
+		}
+		for _, t := range sc.TableChanges {
+			nsData.Statements = append(nsData.Statements, t.DDL)
+		}
+		setNamespaceWork(&nsData, sc)
+		out = append(out, nsData)
+	}
+	return out
 }

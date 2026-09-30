@@ -2129,8 +2129,8 @@ func TestDriveTick_ContainsOperationClaimPanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, ops.claims, "the driver must keep polling after each contained panic")
 }
 
@@ -2143,8 +2143,8 @@ func TestDriveTick_ContainsStopReconciliationProbePanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, applies.stopProbes, "the driver must keep probing after each contained panic")
 	assert.Zero(t, ops.claims, "the panic consumed the tick before the operation claim")
 }
@@ -2186,7 +2186,7 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 		"east/staging": client,
 	}, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 1, ops.claims)
 	assert.True(t, state.IsState(op.State, state.ApplyOperation.Failed),
 		"the poisoned operation row must be failed so it is not re-claimed")
@@ -2194,7 +2194,7 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 	assert.True(t, state.IsState(applies.apply.State, state.Apply.Failed),
 		"the parent apply must be failed under the dual-lease containment")
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, ops.claims,
 		"the driver must keep claiming after containing the panic, and the failed operation must not be claimable")
 }

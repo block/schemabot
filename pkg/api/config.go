@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
@@ -111,6 +113,14 @@ type ServerConfig struct {
 	// Deployments use it to point agents at the preferred way to drive
 	// SchemaBot (for example, a skill or internal tool to install).
 	AgentHint string `yaml:"agent_hint,omitempty"`
+
+	// CLIName is the tool name the CLI command hints in SchemaBot's PR
+	// comments start with, such as "acme schemabot" when operators run the
+	// CLI through a wrapper. It is the server-side counterpart of the CLI's
+	// --cli-name flag and takes the same value. Commands a PR author comments
+	// on the PR keep "schemabot", the bot's trigger word. Read it through
+	// HintCLIName, which applies the default.
+	CLIName string `yaml:"cli_name,omitempty"`
 
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
@@ -216,7 +226,7 @@ type ServerConfig struct {
 	// per-database config at all. A database environment's own
 	// direct_execution block replaces this policy whole rather than merging
 	// field by field, so an override can never enable direct execution while
-	// inheriting a row bound stated somewhere else, and an override that
+	// inheriting a size bound stated somewhere else, and an override that
 	// disables it is a complete opt out. Unset (the default) leaves refused
 	// statements blocked everywhere.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
@@ -237,20 +247,21 @@ type ServerConfig struct {
 	// RateLimitsConfig for the shape and defaults.
 	RateLimits RateLimitsConfig `yaml:"rate_limits,omitempty"`
 
-	// DeleteUnactionedPlanComments opts every repository this server manages
-	// into the delete-based plan comment retirement policy: a superseded plan
-	// comment no apply ever acted on is deleted from the PR timeline (its
-	// storage row survives for triage), and a superseded comment whose head
-	// an apply owns is minimized so the record stays expandable. Defaults to
-	// false, which keeps the minimize-based policy: superseded unactioned
-	// comments are minimized and apply-owned comments stay fully expanded.
+	// DeleteUnactionedPlanComments selects the plan comment retirement policy
+	// for every repository this server manages. Unset or true uses the
+	// delete-based policy: a superseded plan comment no apply ever acted on is
+	// deleted from the PR timeline (its storage row survives for triage), and
+	// a superseded comment whose head an apply owns is minimized so the record
+	// stays expandable. False keeps the minimize-based policy: superseded
+	// unactioned comments are minimized and apply-owned comments stay fully
+	// expanded.
 	//
 	// "Unactioned" means no apply ran from the comment's head — it says
 	// nothing about human engagement. Deletion is irreversible where
 	// minimizing is not: the comment's reactions are lost and any permalink
 	// to it (in chat, tickets, or other PRs) breaks, and the surviving
 	// storage row keeps the comment's identifiers, not its rendered body.
-	DeleteUnactionedPlanComments bool `yaml:"delete_unactioned_plan_comments,omitempty"`
+	DeleteUnactionedPlanComments *bool `yaml:"delete_unactioned_plan_comments,omitempty"`
 }
 
 // RateLimitsConfig groups the per-endpoint request budgets.
@@ -1152,10 +1163,17 @@ type EnvironmentConfig struct {
 	// them is drift to surface; the targets of one environment are each planned
 	// on their own, so a difference between them is ordinary and is converged.
 	//
+	// An entry is a bare target name, or a mapping that also selects which of
+	// the schema files' declared namespaces live on that target (see
+	// TargetEntry).
+	//
 	// Example:
 	//   deployment: region-a
-	//   targets: [orders-001, orders-002]
-	Targets []string `yaml:"targets,omitempty"`
+	//   targets:
+	//     - orders-001
+	//     - target: orders-002
+	//       namespaces: [orders_1]
+	Targets []TargetEntry `yaml:"targets,omitempty"`
 
 	// Deployment is the lowercase Tern deployment key for gRPC mode. Deployment
 	// names are storage identity keys compared byte-wise across storage dialects.
@@ -1181,32 +1199,35 @@ type EnvironmentConfig struct {
 	// alphabetical key order. Only meaningful alongside a Deployments map.
 	DeploymentOrder []string `yaml:"deployment_order,omitempty"`
 
-	// CutoverPolicy controls how a multi-deployment rollout sequences the copy
-	// and cutover phases of its deployments. "rolling" (the default, also used
-	// when unset) keeps today's fully serial behaviour: a later deployment does
-	// not start until every earlier sibling in deployment_order has completed.
-	// "barrier" lets later deployments run their copy phase once earlier
-	// siblings reach the cutover barrier, while cutover itself stays ordered.
-	// Only meaningful alongside a Deployments map.
+	// CutoverPolicy controls how a multi-member rollout sequences the copy and
+	// cutover phases of its members: the deployments of a Deployments map, or
+	// the targets of a Targets list, in resolved order. "rolling" (the default,
+	// also used when unset) keeps the rollout fully serial: a later member does
+	// not start until every earlier member has completed. "barrier" lets later
+	// members run their copy phase once earlier members reach the cutover
+	// barrier, while cutover itself stays ordered. "parallel" starts every
+	// member's copy without waiting on earlier members, up to the server's
+	// max_drivers_per_apply at once, and still cuts over one member at a time in
+	// order. Only meaningful alongside a Deployments map or a Targets list.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
-	// OnFailure controls multi-deployment rollout continuation when a deployment
+	// OnFailure controls multi-member rollout continuation when a member
 	// terminally fails. "halt" (the default, also used when unset) stops the
-	// rollout — later deployments in deployment_order are not started. "continue"
-	// drops a terminal-failed deployment as a blocker so the rollout attempts
-	// every deployment instead of stopping at the first failure. "pause" holds
-	// the rollout after a failure until a human releases it (via the release
-	// control op) so the remaining deployments proceed; to abort instead, use
-	// the separate stop/cancel control op. It governs only rollout continuation;
-	// the apply's pass/fail verdict and the merge gate stay fail-closed on any
-	// failed deployment. Only meaningful alongside a Deployments map.
+	// rollout — later members are not started. "continue" drops a
+	// terminal-failed member as a blocker so the rollout attempts every member
+	// instead of stopping at the first failure. "pause" holds the rollout after
+	// a failure until a human releases it (via the release control op) so the
+	// remaining members proceed; to abort instead, use the separate stop/cancel
+	// control op. It governs only rollout continuation; the apply's pass/fail
+	// verdict and the merge gate stay fail-closed on any failed member. Only
+	// meaningful alongside a Deployments map or a Targets list.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
 	// DirectExecution configures direct execution of ALTER statements that the
 	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
-	// When enabled, a refused statement whose table's estimated row count is
-	// within max_table_rows runs verbatim as native MySQL DDL: synchronous,
-	// blocking writes to the table while it runs, and not revertible. Only
+	// When enabled, a refused statement whose table is within the policy's
+	// size bound runs verbatim as native MySQL DDL: it runs synchronously and
+	// blocks writes to the table while it runs. Only
 	// valid for MySQL databases: setting this block on any other database
 	// type fails config validation, even when disabled, so a policy that can
 	// never take effect is never silently carried in config.
@@ -1244,33 +1265,61 @@ type DirectExecutionConfig struct {
 	// Enabled turns on direct execution for this environment.
 	Enabled bool `yaml:"enabled"`
 
-	// MaxTableRows is the fail-closed size bound: a refused statement runs
-	// directly only when the target table's estimated row count is at or
-	// below this bound. Statements on larger tables — or tables whose size
-	// cannot be determined — are blocked. Required (positive) when Enabled
-	// is true.
+	// MaxTableRows bounds direct execution by the target table's row count:
+	// a table whose estimated row count, confirmed by an exact bounded count,
+	// is at or below this bound qualifies. Zero sets no row bound.
 	MaxTableRows int64 `yaml:"max_table_rows,omitempty"`
 
-	// LockAcquisitionTimeout bounds how long each direct statement waits to
-	// acquire its locks before the apply fails with a retryable busy-table
-	// error — instead of queueing on the table's lock indefinitely while all
-	// new table traffic stalls behind the queued DDL. Each engine maps it to
-	// its native session lock timeout. A whole number of seconds (e.g.
-	// "10s"). Optional; the engine applies its default when omitted.
+	// MaxTableBytes bounds direct execution by the target table's data plus
+	// index footprint as information_schema reports it: a whole number
+	// followed by a binary unit (e.g. "100MiB"). A table whose estimated
+	// footprint is at or below this bound qualifies. The figure is a
+	// statistics estimate with no exact corroboration, so this bound can
+	// approve a table that grew since its statistics were last sampled.
+	//
+	// Enabled requires exactly one of the two bounds, and setting both is
+	// rejected even on a disabled policy. The bounds differ in strength, so a
+	// policy chooses one rather than combining them: a second limit reads as
+	// a ceiling, and no combination rule makes both readings true. A table
+	// whose size cannot be determined is blocked.
+	MaxTableBytes string `yaml:"max_table_bytes,omitempty"`
+
+	// LockAcquisitionTimeout bounds how long each attempt of a direct
+	// statement waits to acquire its locks, instead of queueing on the table's
+	// lock indefinitely while all new table traffic stalls behind the queued
+	// DDL. Each engine maps it to its native session lock timeout. On MySQL,
+	// once the statement has waited 90% of the bound for the table's metadata
+	// lock, it kills the transactions blocking it and retries, as Spirit does
+	// for its own DDL; it never kills while it holds the lock and runs. A
+	// blocker it does not kill (an explicit LOCK TABLES, or a transaction too
+	// large to roll back safely) fails the apply with a retryable busy-table
+	// error. A whole number of seconds (e.g. "10s").
+	// Optional; the engine applies its default when omitted.
 	LockAcquisitionTimeout string `yaml:"lock_acquisition_timeout,omitempty"`
 }
 
 // Validate ensures a configured direct execution policy is well-formed.
-// Enabling direct execution requires a positive max_table_rows bound so the
-// size gate can never be accidentally unbounded. The lock timeout is checked
-// even while the policy is disabled, so a malformed value fails at startup
-// rather than the first time someone enables the policy.
+// Enabling direct execution requires exactly one of max_table_rows and
+// max_table_bytes, so the size gate can never be accidentally unbounded. Every
+// bound and the lock timeout are checked even while the policy is disabled, so
+// a malformed value fails at startup rather than the first time someone
+// enables the policy.
 func (c *DirectExecutionConfig) Validate(context string) error {
 	if c == nil {
 		return nil
 	}
-	if c.Enabled && c.MaxTableRows <= 0 {
-		return fmt.Errorf("%s enables direct_execution but max_table_rows is %d (a positive bound is required)", context, c.MaxTableRows)
+	if c.MaxTableRows < 0 {
+		return fmt.Errorf("%s direct_execution: max_table_rows is %d (must be positive, or omitted to set no row bound)", context, c.MaxTableRows)
+	}
+	maxBytes, err := c.maxTableBytes()
+	if err != nil {
+		return fmt.Errorf("%s direct_execution: %w", context, err)
+	}
+	if c.MaxTableRows != 0 && maxBytes != 0 {
+		return fmt.Errorf("%s direct_execution sets both max_table_rows and max_table_bytes (set exactly one: max_table_rows is checked with an exact row count, max_table_bytes approves on the statistics estimate)", context)
+	}
+	if c.Enabled && c.MaxTableRows == 0 && maxBytes == 0 {
+		return fmt.Errorf("%s enables direct_execution without a size bound (set max_table_rows or max_table_bytes)", context)
 	}
 	if _, err := c.lockAcquisitionTimeoutSeconds(); err != nil {
 		return fmt.Errorf("%s direct_execution: %w", context, err)
@@ -1309,6 +1358,10 @@ func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error)
 	if !c.Enabled {
 		return &storage.DirectExecutionPolicy{Enabled: false}, nil
 	}
+	maxBytes, err := c.maxTableBytes()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution max_table_bytes: %w", err)
+	}
 	lockWaitSeconds, err := c.lockAcquisitionTimeoutSeconds()
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct_execution lock_acquisition_timeout: %w", err)
@@ -1316,8 +1369,62 @@ func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error)
 	return &storage.DirectExecutionPolicy{
 		Enabled:                       true,
 		MaxTableRows:                  c.MaxTableRows,
+		MaxTableBytes:                 maxBytes,
 		LockAcquisitionTimeoutSeconds: lockWaitSeconds,
 	}, nil
+}
+
+// maxTableBytes parses the configured byte bound. Returns (0, nil) when the
+// field is unset, leaving the row bound as the only size gate.
+func (c *DirectExecutionConfig) maxTableBytes() (int64, error) {
+	if c.MaxTableBytes == "" {
+		return 0, nil
+	}
+	n, err := parseBinaryByteSize(c.MaxTableBytes)
+	if err != nil {
+		return 0, fmt.Errorf("max_table_bytes %q: %w", c.MaxTableBytes, err)
+	}
+	return n, nil
+}
+
+// binaryByteUnits are the units a configured byte size may be written in.
+// Only binary units are accepted: "MB" means 1000² bytes to some readers and
+// 1024² to others, and a safety bound must not depend on which one the
+// author had in mind.
+var binaryByteUnits = map[string]int64{
+	"B":   1,
+	"KiB": 1 << 10,
+	"MiB": 1 << 20,
+	"GiB": 1 << 30,
+	"TiB": 1 << 40,
+}
+
+// byteSizePattern matches a whole number followed by a unit, optionally
+// separated by one space: "100MiB", "100 MiB".
+var byteSizePattern = regexp.MustCompile(`^([0-9]+) ?([A-Za-z]+)$`)
+
+// parseBinaryByteSize parses a positive byte size written as a whole number
+// and a binary unit (B, KiB, MiB, GiB, TiB) into bytes.
+func parseBinaryByteSize(raw string) (int64, error) {
+	m := byteSizePattern.FindStringSubmatch(raw)
+	if m == nil {
+		return 0, errors.New("must be a whole number followed by a unit, e.g. 100MiB")
+	}
+	multiplier, ok := binaryByteUnits[m[2]]
+	if !ok {
+		return 0, fmt.Errorf("unit %q is not one of B, KiB, MiB, GiB, TiB (decimal units such as MB are ambiguous and not accepted)", m[2])
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse number: %w", err)
+	}
+	if n <= 0 {
+		return 0, errors.New("must be positive")
+	}
+	if n > math.MaxInt64/multiplier {
+		return 0, errors.New("overflows a 64-bit byte count")
+	}
+	return n * multiplier, nil
 }
 
 // lockAcquisitionTimeoutSeconds parses the configured lock acquisition
@@ -1673,7 +1780,71 @@ type DeploymentTarget struct {
 	//   deployments:
 	//     region-a:
 	//       targets: [orders-001, orders-002]
-	Targets []string `yaml:"targets,omitempty"`
+	Targets []TargetEntry `yaml:"targets,omitempty"`
+}
+
+// TargetEntry is one entry of a targets list: a target, and optionally which of
+// the declared namespaces it holds.
+//
+// The schema files declare a database's namespaces; an entry can only select
+// among them, never add one. Namespaces nil, from a bare-string entry or a
+// mapping without the key, means the target holds every declared namespace.
+// The target stays the rollout member either way, so a target listed twice is
+// still refused.
+//
+// Example:
+//
+//	targets:
+//	  - orders-001
+//	  - target: orders-002
+//	    namespaces: [orders_1, orders_2]
+type TargetEntry struct {
+	Target     string   `yaml:"target"`
+	Namespaces []string `yaml:"namespaces,omitempty"`
+}
+
+// UnmarshalYAML accepts an entry as a bare target name or as a mapping. The
+// decoder's strict field checking does not reach a custom unmarshaler, so the
+// mapping's keys are checked here: a misspelled "namespaces" must fail the load
+// rather than leave the target silently covering every namespace.
+//
+// For the same reason a "namespaces" key that is present but holds no list is
+// refused. A key with no value, an explicit null, or a list whose items are all
+// commented out decodes to the same nil slice as an absent key, which would
+// read as "every declared namespace" when the author wrote a selection.
+func (e *TargetEntry) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		var target string
+		if err := node.Decode(&target); err != nil {
+			return fmt.Errorf("line %d: decode targets entry: %w", node.Line, err)
+		}
+		*e = TargetEntry{Target: target}
+		return nil
+	case yaml.MappingNode:
+		var namespacesKey *yaml.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if key.Value != "target" && key.Value != "namespaces" {
+				return fmt.Errorf("line %d: field %s not found in targets entry (want target or namespaces)", key.Line, key.Value)
+			}
+			if key.Value == "namespaces" {
+				namespacesKey = key
+			}
+		}
+		type plain TargetEntry
+		var entry plain
+		if err := node.Decode(&entry); err != nil {
+			return fmt.Errorf("line %d: decode targets entry: %w", node.Line, err)
+		}
+		if namespacesKey != nil && entry.Namespaces == nil {
+			return fmt.Errorf("line %d: targets entry %q has a namespaces key with no list; list the namespaces the target holds, or omit the key to cover every namespace the schema files declare", namespacesKey.Line, entry.Target)
+		}
+		*e = TargetEntry(entry)
+		return nil
+	default:
+		return fmt.Errorf("line %d: a targets entry must be a target name or a mapping with target and namespaces", node.Line)
+	}
 }
 
 // UsesTargetsList reports whether an environment spells any of its routing as a
@@ -1729,7 +1900,12 @@ func (c EnvironmentConfig) validateMultiTargetSupport(context, databaseType stri
 // into the target it came from. Refusing the name is the only point at which
 // that is still recoverable: once such a key is written, the ambiguity is in the
 // data.
-func resolveTargetList(what, target string, targets []string) ([]string, error) {
+//
+// An entry's namespaces are checked for the same reasons: each must be a
+// non-empty name, listed once, without the delimiter. Whether each one is a
+// namespace the schema files declare is only known once a plan carries them,
+// so that is checked at plan time.
+func resolveTargetList(what, target string, targets []TargetEntry) ([]TargetEntry, error) {
 	if target != "" && targets != nil {
 		return nil, fmt.Errorf("%s cannot configure both target and targets", what)
 	}
@@ -1737,13 +1913,17 @@ func resolveTargetList(what, target string, targets []string) ([]string, error) 
 		if target == "" {
 			return nil, nil
 		}
-		return []string{target}, nil
+		return []TargetEntry{{Target: target}}, nil
 	}
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("%s targets list is empty", what)
 	}
 	seen := make(map[string]bool, len(targets))
-	for i, t := range targets {
+	for i, entry := range targets {
+		t := entry.Target
+		if err := validateTargetNamespaces(fmt.Sprintf("%s targets entry %d %q", what, i, t), entry.Namespaces); err != nil {
+			return nil, err
+		}
 		if t == "" {
 			return nil, fmt.Errorf("%s targets entry %d is empty", what, i)
 		}
@@ -1756,6 +1936,33 @@ func resolveTargetList(what, target string, targets []string) ([]string, error) 
 		seen[t] = true
 	}
 	return targets, nil
+}
+
+// validateTargetNamespaces checks one targets entry's namespace selection. Nil
+// means the entry selects every declared namespace; an explicitly empty list
+// selects none, which no target can usefully mean, so it is refused rather than
+// read as either.
+func validateTargetNamespaces(what string, namespaces []string) error {
+	if namespaces == nil {
+		return nil
+	}
+	if len(namespaces) == 0 {
+		return fmt.Errorf("%s namespaces list is empty; omit it to cover every namespace the schema files declare", what)
+	}
+	seen := make(map[string]bool, len(namespaces))
+	for i, namespace := range namespaces {
+		if strings.TrimSpace(namespace) == "" {
+			return fmt.Errorf("%s namespaces entry %d is empty", what, i)
+		}
+		if strings.Contains(namespace, storage.OperationKeyDelimiter) {
+			return fmt.Errorf("%s namespaces entry %d %q contains reserved delimiter %q; a namespace is a component of the operation keys of the work it holds, so it cannot contain the character that separates their components", what, i, namespace, storage.OperationKeyDelimiter)
+		}
+		if seen[namespace] {
+			return fmt.Errorf("%s lists namespace %q more than once", what, namespace)
+		}
+		seen[namespace] = true
+	}
+	return nil
 }
 
 var defaultEnvironmentOrder = []string{"staging", "production"}
@@ -1921,6 +2128,9 @@ func (c *ServerConfig) Validate() error {
 	if err := validateAgentHint(c.AgentHint); err != nil {
 		return err
 	}
+	if err := validateCLIName(c.CLIName); err != nil {
+		return err
+	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
 	}
@@ -2016,12 +2226,15 @@ func (c *ServerConfig) Validate() error {
 			hasDSN := envConfig.HasLocalDSN()
 			hasScalarRouting := envConfig.Target != "" || envConfig.Targets != nil || envConfig.Deployment != ""
 			hasMapRouting := envConfig.Deployments != nil
+			// A rollout policy sequences an environment's members, so it needs
+			// more than one to sequence: a deployments map or a targets list.
+			hasMemberRouting := hasMapRouting || envConfig.Targets != nil
 			if len(envConfig.DeploymentOrder) > 0 && !hasMapRouting {
 				return fmt.Errorf("database %q environment %q sets deployment_order without a deployments map", name, env)
 			}
 			if envConfig.CutoverPolicy != "" {
-				if !hasMapRouting {
-					return fmt.Errorf("database %q environment %q sets cutover_policy without a deployments map", name, env)
+				if !hasMemberRouting {
+					return fmt.Errorf("database %q environment %q sets cutover_policy without a deployments map or targets list", name, env)
 				}
 				switch envConfig.CutoverPolicy {
 				case storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel:
@@ -2030,8 +2243,8 @@ func (c *ServerConfig) Validate() error {
 				}
 			}
 			if envConfig.OnFailure != "" {
-				if !hasMapRouting {
-					return fmt.Errorf("database %q environment %q sets on_failure without a deployments map", name, env)
+				if !hasMemberRouting {
+					return fmt.Errorf("database %q environment %q sets on_failure without a deployments map or targets list", name, env)
 				}
 				switch envConfig.OnFailure {
 				case storage.OnFailureHalt, storage.OnFailureContinue, storage.OnFailurePause:
@@ -2425,6 +2638,51 @@ const maxAgentHintChars = 300
 // close the comment early and render its tail on the PR page: the HTML parsing
 // spec ends a comment on the bang form as well as the plain one.
 var htmlCommentTerminators = []string{"-->", "--!>"}
+
+// maxCLINameChars bounds cli_name, which every CLI command hint in a PR
+// comment repeats.
+const maxCLINameChars = 100
+
+// HintCLIName is the tool name CLI command hints in PR comments start with:
+// the configured cli_name, or the CLI's own default when none is set.
+func (c *ServerConfig) HintCLIName() string {
+	if c == nil || c.CLIName == "" {
+		return cliname.DefaultName
+	}
+	return c.CLIName
+}
+
+// validateCLIName rejects a cli_name that cannot render as the start of an
+// inline-code command hint: one that is blank, padded, spans lines, carries a
+// backtick that would close the code span, or carries a format character (a
+// bidi override or zero-width character) that would make the hint an operator
+// sees differ from the command they copy.
+func validateCLIName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if count := utf8.RuneCountInString(name); count > maxCLINameChars {
+		return fmt.Errorf("cli_name must be at most %d characters (got %d)", maxCLINameChars, count)
+	}
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("cli_name must not be blank")
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("cli_name contains leading or trailing whitespace")
+	}
+	if strings.Contains(name, "`") {
+		return fmt.Errorf("cli_name must not contain a backtick: it would close the inline code a command hint renders in")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp) {
+			return fmt.Errorf("cli_name must be a single line with no control characters")
+		}
+		if unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("cli_name must not contain format character %U: it would render differently from the command an operator copies", r)
+		}
+	}
+	return nil
+}
 
 func validateAgentHint(hint string) error {
 	if hint == "" {
@@ -2936,11 +3194,12 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]r
 			if len(targets) == 0 {
 				return nil, fmt.Errorf("database %q environment %q deployment %q missing target", database, environment, deployment)
 			}
-			for _, target := range targets {
+			for _, entry := range targets {
 				out = append(out, routing.ExecutionTarget{
 					DatabaseType: dbConfig.Type,
 					Deployment:   deployment,
-					Target:       target,
+					Target:       entry.Target,
+					Namespaces:   slices.Clone(entry.Namespaces),
 				})
 			}
 		}
@@ -2958,11 +3217,12 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]r
 		return nil, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
 	}
 	out := make([]routing.ExecutionTarget, 0, len(targets))
-	for _, target := range targets {
+	for _, entry := range targets {
 		out = append(out, routing.ExecutionTarget{
 			DatabaseType: dbConfig.Type,
 			Deployment:   envConfig.Deployment,
-			Target:       target,
+			Target:       entry.Target,
+			Namespaces:   slices.Clone(entry.Namespaces),
 		})
 	}
 	return out, nil
@@ -2994,13 +3254,14 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 }
 
 // DeletesUnactionedPlanComments returns whether this server uses the
-// delete-based plan comment retirement policy. Unconfigured servers keep the
-// default minimize-based policy.
+// delete-based plan comment retirement policy. It is the default: only an
+// explicit delete_unactioned_plan_comments: false keeps the minimize-based
+// policy.
 func (c *ServerConfig) DeletesUnactionedPlanComments() bool {
-	if c == nil {
-		return false
+	if c == nil || c.DeleteUnactionedPlanComments == nil {
+		return true
 	}
-	return c.DeleteUnactionedPlanComments
+	return *c.DeleteUnactionedPlanComments
 }
 
 // ResolvedGitHubApp identifies which configured GitHub App owns a repository.
@@ -3461,8 +3722,9 @@ func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
 }
 
 // validateDirectExecution ensures a configured direct execution policy is
-// well-formed. Enabling direct execution requires a positive max_table_rows
-// bound so the size gate can never be accidentally unbounded, and the policy
+// well-formed. Enabling direct execution requires exactly one of
+// max_table_rows and max_table_bytes, so the size gate can never be
+// accidentally unbounded, and the policy
 // is rejected on non-MySQL databases where it has no effect — a config that
 // looks like it grants direct execution must never be silently ignored.
 func (c EnvironmentConfig) validateDirectExecution(context, databaseType string) error {

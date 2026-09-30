@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -176,4 +177,52 @@ func TestReviewDriftComment_IndependentErroredSaysCouldNotPlan(t *testing.T) {
 	summary := summarizeReviewDrift(rollup)
 	assert.Contains(t, summary, "could not plan: commerce")
 	assert.NotContains(t, summary, "drift blocks apply")
+}
+
+// Each target group names the stored plan its members run, so a comment that
+// cuts a group's DDL can point at the plan that holds all of it. A group takes
+// its first member's stored plan, and the comment names it under the group's
+// first member. The primary's group points at the reviewed plan whatever its
+// entry carries, since the primary runs the reviewed plan: the entry here holds
+// an identifier of its own so the comment is seen to ignore it.
+func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
+	wide := func(column string) string {
+		columns := make([]string, 3000)
+		for i := range columns {
+			columns[i] = fmt.Sprintf("ADD COLUMN `%s_%d` varchar(255)", column, i)
+		}
+		return "ALTER TABLE `orders` " + strings.Join(columns, ", ")
+	}
+	diffs := []api.DeploymentPlanDiff{
+		independentMemberDiff("orders-001", wide("email"), false),
+		independentMemberDiff("orders-002", wide("phone"), false),
+		independentMemberDiff("orders-003", wide("phone"), false),
+	}
+	rollup, err := api.RollupDeploymentDiffs(diffs, driftMembers(diffs), api.PlanIndependent)
+	require.NoError(t, err)
+	rollup.Entries[0].PlanIdentifier = "plan_orders_001"
+	rollup.Entries[1].PlanIdentifier = "plan_orders_002"
+	rollup.Entries[2].PlanIdentifier = "plan_orders_003"
+
+	groups := deploymentPlanGroups(rollup)
+	require.Len(t, groups, 2)
+	assert.True(t, groups[0].Primary)
+	assert.Equal(t, []string{"commerce/orders-002", "commerce/orders-003"}, groups[1].Members)
+	assert.Equal(t, "plan_orders_002", groups[1].PlanID)
+
+	body := templates.RenderPlanComment(templates.PlanCommentData{
+		Database:        "orders",
+		Environment:     "production",
+		IsMySQL:         true,
+		PlanID:          "plan_reviewed",
+		DeploymentDrift: deploymentDriftPreview(rollup),
+	})
+	primary, rest, found := strings.Cut(body, "**targets `commerce/orders-002`, `commerce/orders-003`**")
+	require.True(t, found, "the second group renders under its own heading")
+	assert.True(t, strings.Contains(primary, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_reviewed`."),
+		"the primary's cut DDL names the reviewed plan")
+	assert.False(t, strings.Contains(body, "plan_orders_001"), "the primary's own entry identifier is never named")
+	assert.True(t, strings.Contains(rest, "the full plan for `commerce/orders-002` is available from the CLI with `schemabot list-plans -e production plan_orders_002` (every target in this group runs the same DDL)."),
+		"the group's cut DDL names its first member's plan and whose it is")
+	assert.False(t, strings.Contains(body, "plan_orders_003"), "a group names only its first member's plan")
 }

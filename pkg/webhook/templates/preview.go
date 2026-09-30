@@ -55,6 +55,9 @@ func previewPlanData() PlanCommentData {
 					"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 					"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 				},
+				TableSizes: []TableSizeData{
+					{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+				},
 			},
 		},
 		LintViolations: sampleLintWarnings(),
@@ -108,6 +111,111 @@ func PreviewCommentPlanIgnoreTables() string {
 			Namespace: "testapp",
 			Tables:    []string{"flyway_schema_history"},
 			Reason:    "ignore_tables",
+		}},
+	})
+}
+
+// previewBytes returns a pointer to a sample byte estimate.
+//
+//go:fix inline
+func previewBytes(n int64) *int64 {
+	return new(n)
+}
+
+// PreviewCommentPlanColumnOnlyAlter renders a sample plan whose only alter
+// adds a plain column — a metadata-only change whose cost doesn't scale with
+// the table — so the comment carries no table-size section.
+func PreviewCommentPlanColumnOnlyAlter() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;",
+				},
+			},
+		},
+	})
+}
+
+// previewManyTableSizes is the table set PreviewCommentPlanManyTables indexes:
+// a spread of sizes from kilobytes to hundreds of gigabytes, in plan
+// (alphabetical) order, with two tables whose size probe returned nothing.
+var previewManyTableSizes = []struct {
+	table string
+	bytes int64
+}{
+	{"accounts", 610_000_000},
+	{"addresses", 1_450_000_000},
+	{"api_keys", 6_100_000},
+	{"audit_events", 186_000_000_000},
+	{"carts", 3_200_000_000},
+	{"categories", 1_600_000},
+	{"coupons", 41_000_000},
+	{"customers", 2_900_000_000},
+	{"disputes", 150_000_000},
+	{"feature_flags", 180_000},
+	{"fulfillments", 11_800_000_000},
+	{"inventory", 5_300_000_000},
+	{"invoices", 17_400_000_000},
+	{"ledger_entries", 121_000_000_000},
+	{"line_items", 58_000_000_000},
+	{"locations", 4_200_000},
+	{"notifications", 44_000_000_000},
+	{"order_events", 0},
+	{"orders", 26_500_000_000},
+	{"payment_methods", 2_600_000_000},
+	{"payments", 23_100_000_000},
+	{"payouts", 820_000_000},
+	{"prices", 210_000_000},
+	{"products", 1_130_000_000},
+	{"refunds", 1_300_000_000},
+	{"reviews", 6_900_000_000},
+	{"sessions", 0},
+	{"settlements", 2_100_000_000},
+	{"shipments", 10_900_000_000},
+	{"subscriptions", 470_000_000},
+	{"tax_rates", 2_300_000},
+	{"transfers", 7_700_000_000},
+	{"users", 3_600_000_000},
+	{"webhooks", 540_000_000},
+}
+
+// PreviewCommentPlanManyTables renders a plan that adds a tenant index to every
+// table in the schema, so the size section carries more tables than it lists
+// inline: the count and the largest tables stay visible and the rest fold.
+func PreviewCommentPlanManyTables() string {
+	statements := make([]string, 0, len(previewManyTableSizes))
+	sizes := make([]TableSizeData, 0, len(previewManyTableSizes))
+	for _, t := range previewManyTableSizes {
+		statements = append(statements, "ALTER TABLE `"+t.table+"` ADD INDEX `idx_tenant_id` (`tenant_id`);")
+		size := TableSizeData{Table: t.table}
+		if t.bytes > 0 {
+			size.EstimatedBytes = previewBytes(t.bytes)
+		}
+		sizes = append(sizes, size)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: statements,
+			TableSizes: sizes,
 		}},
 	})
 }
@@ -208,10 +316,10 @@ func PreviewCommentPlanAttributedChange() string {
 	})
 }
 
-// PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
-// for a plan whose refused statement the direct execution policy routes to
-// native MySQL DDL (execution-mode verdict "direct"), showing the disclosure
-// the operator consents to by confirming.
+// PreviewCommentPlanDirect renders a sample locked apply comment for a plan
+// whose refused statement the direct execution policy routes to native MySQL
+// DDL (execution-mode verdict "direct"), showing the disclosure of how it runs.
+// The policy approves the change, so the apply runs without a confirmation.
 func PreviewCommentPlanDirect() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -235,9 +343,8 @@ func PreviewCommentPlanDirect() string {
 			},
 		},
 		DirectChanges: []DirectChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+			{Table: "users", Reason: "the table has ~1,240 rows"},
 		},
-		PendingManualConfirmation: true,
 	})
 }
 
@@ -696,6 +803,79 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 	})
 }
 
+// PreviewCommentPlanRolloutTwoTargetTableSizes renders a plan comment for a
+// rollout of two independent targets that run the same index builds. With
+// two targets each size line gives the total and both targets' sizes, since
+// the reviewed target is not always the one the build takes longest on.
+func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
+	members := previewRolloutMembers()[:2]
+	return previewRolloutTableSizes(members, []TargetTableSize{
+		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
+		previewTargetSize("primary/testapp_1", "users", 95_000_000),
+		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+	})
+}
+
+// PreviewCommentPlanRolloutTableSizes renders a plan comment for a rollout of
+// three independent targets that run the same index builds. Past two targets
+// each size line gives the total alone, and counts a target that reported no
+// estimate, since the total then understates the table.
+func PreviewCommentPlanRolloutTableSizes() string {
+	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
+		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
+		previewTargetSize("primary/testapp_1", "users", 95_000_000),
+		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+		{Target: "primary/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
+		previewTargetSize("primary/testapp_3", "users", 104_000_000),
+	})
+}
+
+func previewTargetSize(target, table string, bytes int64) TargetTableSize {
+	return TargetTableSize{Target: target, Keyspace: "testapp", Size: TableSizeData{Table: table, EstimatedBytes: &bytes}}
+}
+
+// previewRolloutTableSizes renders a rollout whose targets all run the same
+// two index builds, with the given per-target sizes.
+func previewRolloutTableSizes(members []DeploymentDriftEntry, sizes []TargetTableSize) string {
+	var reviewedSizes []TableSizeData
+	for _, ts := range sizes {
+		if ts.Target == members[0].Deployment+"/"+members[0].Target {
+			reviewedSizes = append(reviewedSizes, ts.Size)
+		}
+	}
+	reviewed := []KeyspaceChangeData{{
+		Keyspace: "testapp",
+		Statements: []string{
+			"ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`);",
+			"ALTER TABLE `users` ADD INDEX `idx_email` (`email`);",
+		},
+		TableSizes: reviewedSizes,
+	}}
+	names := make([]string, 0, len(members))
+	for _, m := range members {
+		names = append(names, m.Deployment+"/"+m.Target)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: members,
+			Plans:       []DeploymentPlanGroup{{Members: names, Primary: true, Changes: reviewed}},
+			TableSizes:  sizes,
+		},
+	})
+}
+
 // PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
 // drift rollup could not be computed, so the plan check fails closed.
 func PreviewCommentPlanDriftUnverified() string {
@@ -811,6 +991,7 @@ func PreviewCommentOversized() string {
 	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
 		Title:         "## Schema Change Apply — Staging",
 		RenderedBytes: 84801,
+		Environment:   "staging",
 	}), previewSupportChannel())
 }
 
@@ -1221,6 +1402,9 @@ func samplePlanChanges() []KeyspaceChangeData {
 				"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 				"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 			},
+			TableSizes: []TableSizeData{
+				{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+			},
 		},
 	}
 }
@@ -1520,6 +1704,7 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 			Keyspace: "commerce_sharded",
 			Statements: []string{
 				"CREATE TABLE `addresses` (\n  `id` bigint unsigned NOT NULL,\n  `customer_id` bigint unsigned NOT NULL,\n  `street` varchar(255) NOT NULL,\n  `city` varchar(100) NOT NULL,\n  PRIMARY KEY (`id`),\n  INDEX `idx_customer_id` (`customer_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+				"ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier` (`loyalty_tier`);",
 			},
 			VSchemaChanged: true,
 			VSchemaDiff: `--- a/commerce_sharded.json
@@ -1827,19 +2012,22 @@ func PreviewCommentMultiEnvPlanDiff() string {
 func sampleApplyTables() []TableProgressData {
 	return []TableProgressData{
 		{
-			Namespace: "testapp",
-			TableName: "orders",
-			DDL:       "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
+			Namespace:      "testapp",
+			TableName:      "orders",
+			EstimatedBytes: new(int64(438_000_000)),
+			DDL:            "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
 		},
 		{
-			Namespace: "testapp",
-			TableName: "users",
-			DDL:       "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+			Namespace:      "testapp",
+			TableName:      "users",
+			EstimatedBytes: new(int64(391_000_000)),
+			DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
 		},
 		{
-			Namespace: "testapp",
-			TableName: "products",
-			DDL:       "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
+			Namespace:      "testapp",
+			TableName:      "products",
+			EstimatedBytes: new(int64(157_000_000)),
+			DDL:            "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
 		},
 	}
 }
@@ -2325,7 +2513,19 @@ func sampleDeploymentDetail(database, applyState string, tables []TableProgressD
 
 // PreviewCommentMultiDeploymentApplyInProgress renders a barrier rollout
 // mid-flight: one deployment parked ready for cutover, one copying, two queued.
+// SchemaBot cuts the parked deployment over itself, so no command is offered.
 func PreviewCommentMultiDeploymentApplyInProgress() string {
+	return previewBarrierRolloutInProgress(false)
+}
+
+// PreviewCommentMultiDeploymentApplyDeferredCutover renders the same barrier
+// rollout started with --defer-cutover: the parked deployment waits for an
+// operator, so the comment offers the cutover command.
+func PreviewCommentMultiDeploymentApplyDeferredCutover() string {
+	return previewBarrierRolloutInProgress(true)
+}
+
+func previewBarrierRolloutInProgress(deferCutover bool) string {
 	model := presentation.Derive([]presentation.Operation{
 		{Deployment: "eu", State: state.ApplyOperation.WaitingForCutover, Barrier: true},
 		{Deployment: "us", State: state.ApplyOperation.Running, Barrier: true},
@@ -2347,16 +2547,119 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	usTables[1].ETASeconds = 195
 	usTables[2].Status = state.Task.Pending
 
+	details := []*ApplyStatusCommentData{
+		sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
+		sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
+	}
+	for _, detail := range details {
+		detail.DeferCutover = deferCutover
+	}
+
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
 		ApplyID:     "apply-a1b2c3d4e5f6",
 		Environment: "production",
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-12 * time.Minute).UTC().Format(time.RFC3339),
-		Details: []*ApplyStatusCommentData{
-			sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
-			sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
-		},
+		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplyInProgress renders a parallel rollout across
+// two deployments of 64 targets each, with the apply's driver cap holding eight
+// targets in flight and the rest queued. Each deployment rolls its targets up
+// into one section: counts by status, one line per table naming the targets
+// copying it, and the DDL once per distinct change. In us, eight targets also
+// add a `note` column and one target failed; the rollout continues past it.
+func PreviewCommentMultiTargetApplyInProgress() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const addIndexAndColumn = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`), ADD COLUMN `note` text"
+	const rows = 1_466_232
+	var ops []presentation.Operation
+	var details []*ApplyStatusCommentData
+	add := func(deployment string, i int, opState, taskState, ddl string, copied, total, eta int64) {
+		target := fmt.Sprintf("orders_%03d", i)
+		op := presentation.Operation{Deployment: deployment, Target: target, State: opState, Parallel: true, ContinueOnFailure: true}
+		if opState == state.ApplyOperation.Failed {
+			op.Error = "Error 1062: Duplicate entry '12345' for key 'orders.idx_user_id'"
+		}
+		ops = append(ops, op)
+		details = append(details, sampleDeploymentDetail(target, opState, []TableProgressData{
+			{TableName: "orders", DDL: ddl, Status: taskState, RowsCopied: copied, RowsTotal: total, ETASeconds: eta},
+		}))
+	}
+	queue := func(deployment string, i int, ddl string) {
+		add(deployment, i, state.ApplyOperation.Pending, state.Task.Pending, ddl, 0, 0, 0)
+	}
+	for i := range 64 {
+		ddl := addIndex
+		if i >= 56 {
+			ddl = addIndexAndColumn
+		}
+		switch {
+		case i < 40:
+			add("us", i, state.ApplyOperation.Completed, state.Task.Completed, ddl, rows, rows, 0)
+		case i < 44:
+			add("us", i, state.ApplyOperation.Running, state.Task.Running, ddl, 914_707, rows, 195)
+		case i == 62:
+			add("us", i, state.ApplyOperation.Failed, state.Task.Failed, ddl, 402_118, rows, 0)
+		default:
+			queue("us", i, ddl)
+		}
+	}
+	for i := range 64 {
+		if i < 4 {
+			add("eu", i, state.ApplyOperation.Running, state.Task.Running, addIndex, 183_029, rows, 1_380)
+			continue
+		}
+		queue("eu", i, addIndex)
+	}
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive(ops),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     details,
+	})
+}
+
+// PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
+// members were planned independently and so run different plans: `eu` is
+// already at the desired schema bar one index, while `us` still needs all
+// three. Each member's section names the plan it runs, so a reader can tie it
+// back to the block they reviewed. The converged rollouts above name none.
+func PreviewCommentMultiDeploymentApplyDivergentPlans() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "us", State: state.ApplyOperation.Running},
+		{Deployment: "eu", State: state.ApplyOperation.Pending},
+	})
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Running
+	usTables[0].RowsCopied = 914707
+	usTables[0].RowsTotal = 1466232
+	usTables[0].PercentComplete = 62
+	usTables[0].ETASeconds = 195
+	usTables[1].Status = state.Task.Pending
+	usTables[2].Status = state.Task.Pending
+
+	euTables := sampleApplyTables()[:1]
+	euTables[0].Status = state.Task.Pending
+
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Running, usTables)
+	usDetail.PlanID = "plan_7c41f9"
+	euDetail := sampleDeploymentDetail("payments_eu", state.Apply.Pending, euTables)
+	euDetail.PlanID = "plan_3344ab"
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-6 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     []*ApplyStatusCommentData{usDetail, euDetail},
 	})
 }
 

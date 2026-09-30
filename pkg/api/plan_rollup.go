@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
@@ -118,6 +119,11 @@ type DeploymentRollupEntry struct {
 	// from — which is every member under mirrored planning, and the primary
 	// under either.
 	PlanIdentifier string
+
+	// ExistingCopies and ExistingCopiesReported carry the member's diff's copy
+	// disclosures through unchanged; see DeploymentPlanDiff.
+	ExistingCopies         []*ternv1.ExistingCopy
+	ExistingCopiesReported bool
 }
 
 // markErrored classifies a member as errored and drops the plan it was
@@ -224,9 +230,11 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 	clean := true
 	for i, d := range diffs {
 		entry := DeploymentRollupEntry{
-			DatabaseType: d.DatabaseType,
-			Deployment:   d.Deployment,
-			Target:       d.Target,
+			DatabaseType:           d.DatabaseType,
+			Deployment:             d.Deployment,
+			Target:                 d.Target,
+			ExistingCopies:         d.ExistingCopies,
+			ExistingCopiesReported: d.ExistingCopiesReported,
 		}
 		switch {
 		case d.Err != nil:
@@ -332,9 +340,11 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 	clean := true
 	for i, d := range diffs {
 		entry := DeploymentRollupEntry{
-			DatabaseType: d.DatabaseType,
-			Deployment:   d.Deployment,
-			Target:       d.Target,
+			DatabaseType:           d.DatabaseType,
+			Deployment:             d.Deployment,
+			Target:                 d.Target,
+			ExistingCopies:         d.ExistingCopies,
+			ExistingCopiesReported: d.ExistingCopiesReported,
 		}
 		switch {
 		case d.Err != nil:

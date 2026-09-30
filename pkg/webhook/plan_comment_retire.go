@@ -31,6 +31,16 @@ func (s planCommentSlot) environmentScope() string {
 	return strings.Join(envs, ",")
 }
 
+// soleEnvironment is the environment the slot's plan comment is about when it
+// covers exactly one, and empty when it covers several, so a CLI hint for the
+// comment scopes to an environment only when one is unambiguous.
+func (s planCommentSlot) soleEnvironment() string {
+	if len(s.Environments) != 1 {
+		return ""
+	}
+	return s.Environments[0]
+}
+
 // postTrackedPlanComment posts a plan comment, records it in plan_comments,
 // and retires the prior comments in the same slot that it supersedes.
 // Tracking and retirement failures never affect the posted comment: every
@@ -60,7 +70,7 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		return
 	}
 
-	commentID, nodeID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, body))
+	commentID, nodeID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, slot.soleEnvironment(), body))
 	if err != nil {
 		h.logger.Error("failed to post plan comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
@@ -223,7 +233,7 @@ func (h *Handler) retirePlanCommentsForSlot(ctx context.Context, client *ghclien
 // comment no apply ever acted on carries no record worth keeping (its DDL
 // never ran and is reproducible from the head it was rendered at) and is
 // deleted from the timeline; its storage row keeps the identifiers for
-// triage. Under the default minimize-based policy, an apply-owned comment
+// triage. Under the opt-out minimize-based policy, an apply-owned comment
 // stays fully expanded and every other superseded comment is minimized.
 // Every failure leaves the comment as it is and its row unretired, so the
 // next sweep retries it.

@@ -614,6 +614,36 @@ func TestPersistMemberPlans_StoreFailureLeavesTheMemberCarryingNoPlan(t *testing
 	assert.ErrorContains(t, rollup.Entries[1].Err, "store plan for rollout member")
 }
 
+// The primary runs the reviewed plan, which is already stored, so member plans
+// are stored for every other member and the primary is left without an
+// identifier of its own. Every member's plan here fails to store, so a store
+// attempted for the primary would reclassify it as the second member is.
+func TestPersistMemberPlans_StoresNoPlanForThePrimary(t *testing.T) {
+	alter := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers(alter)),
+		rollupDeployment("au", rollupAlterUsers(alter)),
+	}
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanIndependent)
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 2)
+	require.Equal(t, DeploymentPlanned, rollup.Entries[0].Class)
+	require.Equal(t, DeploymentPlanned, rollup.Entries[1].Class)
+
+	for i := range diffs {
+		diffs[i].Changes = []*ternv1.SchemaChange{nil}
+	}
+
+	s := &Service{logger: slog.New(slog.DiscardHandler)}
+	require.NoError(t, s.persistMemberPlans(t.Context(),
+		PlanRequest{Database: "testdb", Environment: "production"}, PlanIndependent, "plan-primary", diffs, &rollup))
+
+	assert.Equal(t, DeploymentPlanned, rollup.Entries[0].Class, "no member plan is stored for the primary")
+	assert.NoError(t, rollup.Entries[0].Err)
+	assert.Empty(t, rollup.Entries[0].PlanIdentifier)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class, "the second member's store was attempted")
+}
+
 // The member contract is enforced whatever the planning: independent planning
 // stops members being compared to each other, it does not stop a missing or
 // misidentified member from failing the rollup closed.

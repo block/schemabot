@@ -28,11 +28,11 @@ From most to least severe:
 |---|---|---|---|---|
 | ⛔ | **Cannot apply** | The engine refuses the statement outright | Always — the apply would fail | None. Rewrite the change |
 | ⚠️ | **Issues** | Unsafe (destructive) changes detected | Yes, until acknowledged | `--allow-unsafe` |
-| ⚙️ | **Direct execution** | Statements that will run as native DDL outside the schema change engine | No — it is a consent disclosure | Confirming the apply consents |
+| ⚙️ | **Direct execution** | Statements that will run as native DDL outside the schema change engine | No — the policy approved them; this discloses how they run | None needed |
 | 💡 | **Lint Warnings** | Advisory best-practice findings | Never | Not needed |
 
 The first two are safety gates. Direct execution is not a severity — it is a
-disclosure of *how* certain statements will run (blocking, non-revertible; see
+disclosure of *how* certain statements will run (as native DDL that blocks writes; see
 [direct-execution.md](./direct-execution.md)). Lint warnings are purely
 advisory: they never gate anything.
 
@@ -206,7 +206,7 @@ shadow table rather than prevent a statement from running.
 | ⛔ | Plan comment (**Cannot apply**), unsafe/blocked apply-rejection comments (**Apply rejected**), and the **Apply Blocked** headings where retrying unchanged refuses again (merged/closed PR, failing required checks, missing or untrusted prior-environment check, unlisted environment), plus CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
 | ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**), the **Check before applying** heading for destructive changes SchemaBot cannot attribute to the PR, and the stale-base **Apply rejected — base schema is newer** heading cleared by rebasing. These are the plan and apply-decision sites, not every ⚠️ on the surface — see the note below | Caution: look at this before you apply |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
-| ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
+| ⚙️ | Plan and locked apply comments (**Direct execution**) | Disclosure of how native-DDL statements run |
 | 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
 | ✅ | Plan comment | No schema changes detected |
 | ❌ | Failed apply/rollback headings, error and first-failure callouts | An attempted operation failed |

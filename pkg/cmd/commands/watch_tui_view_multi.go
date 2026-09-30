@@ -10,11 +10,10 @@ import (
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/storage"
 )
 
 func (m WatchModel) multiDeploymentProgressView() string {
-	model := presentation.Derive(tuiOperationsForPresentation(m.operations, m.released))
+	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.released))
 
 	var b strings.Builder
 	m.writeMultiDeploymentHeader(&b, model)
@@ -30,28 +29,6 @@ func (m WatchModel) multiDeploymentProgressView() string {
 	b.WriteString(templates.FormatThrottleReference(m.tables))
 	m.writeMultiDeploymentFooter(&b, model)
 	return b.String()
-}
-
-// tuiOperationsForPresentation maps the watch model's progress operations to the
-// surface-neutral presentation inputs. released is the apply-level release latch:
-// a released pause behaves like continue, so the held siblings proceed and the
-// aggregate runs degraded instead of paused.
-func tuiOperationsForPresentation(ops []templates.ProgressOperation, released bool) []presentation.Operation {
-	presentationOps := make([]presentation.Operation, 0, len(ops))
-	for _, op := range ops {
-		presentationOps = append(presentationOps, presentation.Operation{
-			Deployment:        op.Deployment,
-			Target:            op.Target,
-			State:             op.State,
-			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
-			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
-			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
-			PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
-			Released:          released,
-			Error:             op.ErrorMessage,
-		})
-	}
-	return presentationOps
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply) {

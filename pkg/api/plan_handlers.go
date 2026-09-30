@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -32,7 +33,11 @@ import (
 )
 
 const applyOperationKeyMaxLen = 255
-const finalizerOperationKeySegment = "group_finalizer"
+
+// finalizerOperationKeySegment ends every group_finalizer key. The rollout
+// projection and the claim query read the finalizer's scope back as the key in
+// front of it (state.FinalizerFinalizesWork), so it is that package's constant.
+const finalizerOperationKeySegment = state.GroupFinalizerKeySegment
 
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
@@ -591,6 +596,11 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if NamespacePlacementRefused(err) {
+			s.logger.Warn("plan rejected for namespace placement the targets entries and schema files disagree on", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
 			return
@@ -656,6 +666,49 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, typeErr
 	}
+	// Every declared namespace must be held by some rollout member, on every
+	// plan of the environment and not only a pull request review, so a lone
+	// target selecting a subset cannot report a clean plan that leaves the rest
+	// planned nowhere.
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve targets")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		return nil, nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if err := requireNamespaceCoverage(req, targets); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "namespace coverage")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		return nil, nil, err
+	}
+	// The primary plans, and its plan row records, only the namespaces its
+	// targets entry selects. req is this call's copy, so narrowing it here
+	// leaves the caller's request, which the other members are planned from,
+	// untouched.
+	primarySchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "select namespaces")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		return nil, nil, err
+	}
+	if len(resolvedTarget.Namespaces) > 0 {
+		s.logger.Info("plan covers only the namespaces the primary target's entry selects",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"target", resolvedTarget.Target,
+			"repository", req.Repository,
+			"namespaces", resolvedTarget.Namespaces,
+			"declared_namespace_count", len(req.SchemaFiles))
+	}
+	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
+	req.SchemaFiles = primarySchemaFiles
 
 	prInt := 0
 	if req.PullRequest != nil {
@@ -725,7 +778,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
-		IgnoreTables:      req.IgnoreTables,
+		// The namespaces the primary's entry leaves to other targets, so an
+		// engine that diffs the whole target as one unit refuses rather than
+		// planning their live tables as drops.
+		UnselectedNamespaces: unselected,
+		IgnoreTables:         req.IgnoreTables,
 		// Always stated, never left absent: absence tells the data plane the
 		// caller predates the grouping choice, and this caller has made one.
 		GroupedExecution: new(req.GroupedExecution),
@@ -844,6 +901,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	// targets, so the deployment alone does not identify the member.
 	planResp.Deployment = deployment
 	planResp.Target = resolvedTarget.Target
+	planResp.SelectedNamespaces = slices.Clone(resolvedTarget.Namespaces)
 	return resp, planResp, nil
 }
 
@@ -1115,6 +1173,27 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, errPlanLookupFailed) {
+			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
+			return
+		}
+		if errors.Is(err, storage.ErrPlanNotFound) {
+			s.logger.Warn("apply rejected because the stored plan does not exist", "plan_id", req.PlanID, "environment", req.Environment)
+			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, storedPlanNotFoundMessage("apply", req.PlanID))
+			return
+		}
+		if _, ok := errors.AsType[*planEnvironmentMismatchError](err); ok {
+			s.logger.Warn("apply rejected because the stored plan was created for another environment", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*planRoutingMetadataError](err); ok {
+			s.logger.Warn("apply rejected because the stored plan lacks routing metadata", "plan_id", req.PlanID,
+				"environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
 		if errors.Is(err, storage.ErrActiveApplyExists) {
 			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
@@ -1157,6 +1236,53 @@ type UnsupportedFeatureError struct {
 
 func (e *UnsupportedFeatureError) Error() string {
 	return fmt.Sprintf("database %q: %s is not supported for database_type: %s", e.Database, e.Feature, e.DatabaseType)
+}
+
+// errPlanLookupFailed marks an apply that could not read its stored plan. The
+// storage read failed, so the request is neither accepted nor known to be
+// wrong: it is a server failure, kept apart from a plan that does not exist.
+var errPlanLookupFailed = errors.New("plan lookup failed")
+
+// storedPlanLookupFailedMessage is the response for an operation whose stored
+// plan could not be read. The storage error stays in the server log; the
+// caller learns only that the read failed and that retrying is safe.
+func storedPlanLookupFailedMessage(operation, planID string) string {
+	return fmt.Sprintf("%s failed: failed to get plan %s; see server logs, then retry", operation, planID)
+}
+
+// storedPlanNotFoundMessage is the response for an operation that names a
+// plan SchemaBot has no record of.
+func storedPlanNotFoundMessage(operation, planID string) string {
+	return fmt.Sprintf("%s rejected: plan not found: %s; check the plan_id or create a new plan", operation, planID)
+}
+
+// planEnvironmentMismatchError identifies an apply that names a different
+// environment than the one its stored plan was created for. The plan was
+// reviewed for its own environment only, so the request is refused as a
+// caller error rather than applied somewhere it was not reviewed for.
+type planEnvironmentMismatchError struct {
+	PlanID               string
+	PlanEnvironment      string
+	RequestedEnvironment string
+}
+
+func (e *planEnvironmentMismatchError) Error() string {
+	return fmt.Sprintf("plan %s was created for environment %q, not %q; apply it to %q or create a plan for %q",
+		e.PlanID, e.PlanEnvironment, e.RequestedEnvironment, e.PlanEnvironment, e.RequestedEnvironment)
+}
+
+// planRoutingMetadataError identifies a stored plan that lacks one of the
+// server-side routing fields (deployment, target) the operator needs to
+// dispatch it. The plan cannot be repaired from the apply request, so the
+// caller is told to create a new plan rather than retry this one.
+type planRoutingMetadataError struct {
+	PlanID string
+	Field  string
+}
+
+func (e *planRoutingMetadataError) Error() string {
+	return fmt.Sprintf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply",
+		e.PlanID, e.Field)
 }
 
 // ExecuteApply queues an apply request in storage and returns once the work is
@@ -1235,37 +1361,54 @@ func (s *Service) EnqueueAuthorizedApply(ctx context.Context, req ApplyRequest) 
 // execution invariants every queue path requires: the plan exists, was created
 // for the requested environment, and carries the server-side routing metadata
 // (deployment, target) the operator needs to dispatch it.
+//
+// The apply counter is keyed by the plan's repository, database, and
+// deployment, so a failed or empty lookup deliberately records nothing: there
+// is no plan to attribute the failure to, and a sentinel-labelled point would
+// only dilute the per-database series. Those failures stay on the span and in
+// the handler's log line. Every invariant checked after the plan loads records
+// an error against the plan's own labels.
 func (s *Service) loadPlanForApply(ctx context.Context, span trace.Span, req ApplyRequest) (*storage.Plan, error) {
 	// Load plan first; it is the source of truth for database, type, and routing.
 	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "get plan")
-		return nil, fmt.Errorf("get plan: %w", err)
+		if errors.Is(err, storage.ErrPlanNotFound) {
+			// A store that reports a missing plan as the sentinel rather than
+			// a nil plan is still a caller error, not a storage failure.
+			span.SetStatus(otelcodes.Error, "plan not found")
+			return nil, fmt.Errorf("%w: %s", err, req.PlanID)
+		}
+		span.SetStatus(otelcodes.Error, "plan lookup failed")
+		return nil, fmt.Errorf("%w for %s: %w", errPlanLookupFailed, req.PlanID, err)
 	}
 	if plan == nil {
-		planErr := fmt.Errorf("plan not found: %s", req.PlanID)
+		planErr := fmt.Errorf("%w: %s", storage.ErrPlanNotFound, req.PlanID)
 		span.RecordError(planErr)
 		span.SetStatus(otelcodes.Error, "plan not found")
 		return nil, planErr
 	}
 	span.SetAttributes(attribute.String("database", plan.Database))
 	if plan.Environment != req.Environment {
-		applyErr := fmt.Errorf("plan %s was created for environment %q, not %q", req.PlanID, plan.Environment, req.Environment)
+		applyErr := &planEnvironmentMismatchError{
+			PlanID:               req.PlanID,
+			PlanEnvironment:      plan.Environment,
+			RequestedEnvironment: req.Environment,
+		}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "environment mismatch")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
 		return nil, applyErr
 	}
 	if plan.Deployment == "" {
-		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "deployment")
+		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "deployment"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored deployment")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
 		return nil, applyErr
 	}
 	if plan.Target == "" {
-		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "target")
+		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "target"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored target")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
@@ -1534,6 +1677,15 @@ func (s *Service) createStoredApply(
 			return nil, 0, err
 		}
 	}
+	// An apply whose own plan has no work exists only to run the other members'
+	// own plans, since its reviewed target is already at the desired schema.
+	if !plan.HasWork() {
+		for _, member := range members {
+			if err := rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
 	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, members, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
 	if err != nil {
 		return nil, 0, err
@@ -1586,6 +1738,56 @@ func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOpti
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
 	}
 	return nil
+}
+
+// rejectMemberWorkAnEmptyReviewedPlanCannotCarry refuses a member's work that
+// an apply created from an empty reviewed plan cannot run as it was planned. The
+// PR apply refuses the same work before it asks for confirmation; this is the
+// check every caller creating such an apply passes through.
+func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
+	if reason := MemberWorkAConvergedReviewedPlanCannotRun(member.Plan); reason != "" {
+		return fmt.Errorf("rollout member %s: plan %s %s, which an apply whose reviewed target is already at the desired schema cannot run",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)
+	}
+	return nil
+}
+
+// MemberWorkAConvergedReviewedPlanCannotRun describes the first thing in a
+// member's plan that an apply created from an empty reviewed plan cannot run as
+// it was planned, or returns "" when there is none. The description names only
+// tables and namespaces, so it is fit for a PR comment.
+//
+// The apply's shape, whether a per-shard fan-out, a finalizer, or one work
+// operation per member, is chosen from the apply's own plan, so an empty one
+// leaves every member on one work operation per member. Per-shard changes and
+// finalizer work have no place in that shape, and a member carrying only them
+// would be settled as having nothing to do while its target never got the
+// change. Blocked changes never run. Direct-execution and unsafe changes are
+// refused whatever the command's flags: the operator consents to them against
+// the disclosure the reviewed plan's comment carries, and the member plans that
+// comment renders carry none.
+func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
+	if plan.BlockedApplyError() != nil {
+		return "carries changes its target's engine refuses"
+	}
+	if shards := changingShardsByNamespace(plan.Shards); len(shards) > 0 {
+		return "carries per-shard changes"
+	}
+	if namespaces := plan.FinalizerNamespaces(); len(namespaces) > 0 {
+		return fmt.Sprintf("finalizes namespaces %v", namespaces)
+	}
+	for _, change := range plan.FlatDDLChanges() {
+		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
+			return fmt.Sprintf("runs table %q as direct-execution DDL", change.Table)
+		}
+	}
+	if unsafe := plan.UnsafeDDLChanges(); len(unsafe) > 0 {
+		return fmt.Sprintf("carries an unsafe change for table %q", unsafe[0].Table)
+	}
+	if unsafe := plan.UnsafeVSchemaChanges(); len(unsafe) > 0 {
+		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q", unsafe[0].Namespace)
+	}
+	return ""
 }
 
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
@@ -1939,7 +2141,7 @@ func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.
 }
 
 func finalizerOperationKey(namespace string) string {
-	return namespace + "/" + finalizerOperationKeySegment
+	return namespace + storage.OperationKeyDelimiter + finalizerOperationKeySegment
 }
 
 // newPendingApplyOperation builds one member's pending operation.
@@ -2007,6 +2209,7 @@ func buildApplyTask(
 		DDLAction:      ddlChange.Operation,
 		ExecutionMode:  ddlChange.ExecutionMode,
 		ModeReason:     ddlChange.ModeReason,
+		EstimatedBytes: ddlChange.TaskEstimatedBytes(shard),
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}

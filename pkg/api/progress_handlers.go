@@ -98,6 +98,8 @@ func engineName(e ternv1.Engine) string {
 		return "Spirit"
 	case ternv1.Engine_ENGINE_PLANETSCALE:
 		return "PlanetScale"
+	case ternv1.Engine_ENGINE_STRATA:
+		return "Strata"
 	case ternv1.Engine_ENGINE_POSTGRES:
 		return "PostgreSQL"
 	default:
@@ -168,6 +170,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			Status:              t.Status,
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
+			EstimatedBytes:      t.EstimatedBytes,
 			PercentComplete:     t.PercentComplete,
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
@@ -1174,6 +1177,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			Status:              task.State,
 			RowsCopied:          task.RowsCopied,
 			RowsTotal:           task.RowsTotal,
+			EstimatedBytes:      task.EstimatedBytes,
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,

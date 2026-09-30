@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 
@@ -15,6 +16,19 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
+
+// plannedPrimaryMember is the rollout member a primary plan was created
+// against, as the plan response recorded it: the deployment and target, and
+// the namespaces the target's entry selected. The rollup checks all three
+// against its own resolution, so a config reloaded between the plan and the
+// rollup fails closed instead of pairing this plan with a different placement.
+func plannedPrimaryMember(planResp *apitypes.PlanResponse) routing.ExecutionTarget {
+	return routing.ExecutionTarget{
+		Deployment: planResp.Deployment,
+		Target:     planResp.Target,
+		Namespaces: planResp.SelectedNamespaces,
+	}
+}
 
 // reviewTimeDrift computes the review-time drift rollup for a database and
 // environment and turns it into the check-record outcome plus the preview
@@ -68,7 +82,8 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 			summary: "drift check failed; see logs",
 		}, &templates.DeploymentDriftData{Computed: false}
 	}
-	preview := deploymentDriftPreview(rollup)
+	preview := reviewDriftPreview(rollup,
+		"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
 	if rollup.Clean {
 		return reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}, preview
 	}
@@ -84,6 +99,25 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 // PR markdown (it can carry internal hostnames, IPs, or DSN fragments) and is
 // logged server-side instead.
 const erroredDriftDetail = "diff failed; see server logs"
+
+// reviewDriftPreview builds the PR-preview rendering data for a computed
+// rollup, carrying each target's table sizes when the rollup is clean so the
+// size section totals a table across the targets that change it. A blocked
+// rollup's targets do not apply one reviewed plan, so its preview carries no
+// target sizes and the section shows the reviewed plan's. logAttrs identify
+// the plan in logs.
+func reviewDriftPreview(rollup api.PlanRollup, logAttrs ...any) *templates.DeploymentDriftData {
+	preview := deploymentDriftPreview(rollup)
+	if preview == nil {
+		return nil
+	}
+	if !rollup.Clean {
+		slog.Debug("review-time drift rollup is blocked; the size section shows the reviewed plan's sizes, not each target's", logAttrs...)
+		return preview
+	}
+	preview.TableSizes = targetTableSizes(rollup, logAttrs...)
+	return preview
+}
 
 // deploymentDriftPreview turns a computed rollup into the PR-preview rendering
 // data. It returns nil for a single-deployment database: with one deployment
@@ -161,6 +195,7 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			groups = append(groups, templates.DeploymentPlanGroup{
 				Primary: i == 0,
 				Changes: memberPlanChanges(e.ChangeSet),
+				PlanID:  e.PlanIdentifier,
 			})
 			at = len(groups) - 1
 			byPlan[e.PlanFingerprint] = at
@@ -196,6 +231,71 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		}
 	})
 	return groups
+}
+
+// targetTableSizes lists every rollout target's size estimate for each
+// existing table its own plan copies, rebuilds, or scans, in rollout order,
+// primary first. Sizes are read from each target's own plan, since each target
+// applies to its own data. A table is listed once per target however many
+// statements change it, since each statement carries the whole table's
+// estimate, and tables a target creates are left out, having no data yet. The
+// namespace view is read for the estimate, which for a sharded namespace is
+// summed across its shards, while every shard's DDL decides whether the table
+// gets a size line. logAttrs identify the plan in logs.
+func targetTableSizes(rollup api.PlanRollup, logAttrs ...any) []templates.TargetTableSize {
+	names := rollupMemberNames(rollup)
+	var sizes []templates.TargetTableSize
+	for i, e := range rollup.Entries {
+		listed := make(map[planTableRef]bool)
+		shardDDL := memberShardDDLByTable(e.ChangeSet.Shards)
+		for _, sc := range e.ChangeSet.Changes {
+			for _, tc := range sc.GetTableChanges() {
+				ref := planTableRef{sc.GetNamespace(), tc.GetTableName()}
+				tableAttrs := slices.Concat(logAttrs, []any{"target", names[i], "namespace", ref.namespace, "table", ref.table})
+				if listed[ref] {
+					slog.Debug("table already has a size line on this target; skipping its further statements", tableAttrs...)
+					continue
+				}
+				if tc.GetChangeType() == ternv1.ChangeType_CHANGE_TYPE_CREATE {
+					slog.Debug("table is created by this target's plan; it has no size to show", tableAttrs...)
+					continue
+				}
+				ddls := append([]string{tc.GetDdl()}, shardDDL[ref]...)
+				if !tableCostScalesWithSize(e.DatabaseType, ddls, tableAttrs...) {
+					slog.Debug("table's changes on this target are metadata-only; it gets no size line", tableAttrs...)
+					continue
+				}
+				listed[ref] = true
+				sizes = append(sizes, templates.TargetTableSize{
+					Target:   names[i],
+					Keyspace: ref.namespace,
+					Size: templates.TableSizeData{
+						Table:          ref.table,
+						ShardCount:     int(tc.GetShardCount()),
+						EstimatedBytes: tc.EstimatedBytes,
+					},
+				})
+			}
+		}
+	}
+	return sizes
+}
+
+// memberShardDDLByTable collects every shard's DDL for each table of one
+// rollout member's plan, so a sharded namespace's size lines are decided from
+// what each shard runs.
+func memberShardDDLByTable(shards []*ternv1.ShardPlan) map[planTableRef][]string {
+	byTable := make(map[planTableRef][]string)
+	for _, sp := range shards {
+		for _, tc := range sp.GetChanges() {
+			if tc.GetDdl() == "" {
+				continue
+			}
+			ref := planTableRef{sp.GetNamespace(), tc.GetTableName()}
+			byTable[ref] = append(byTable[ref], tc.GetDdl())
+		}
+	}
+	return byTable
 }
 
 // memberBlockedChanges lists the changes in one member's plan that its engine
@@ -266,7 +366,9 @@ func addBlockedTarget(g *templates.DeploymentPlanGroup, bc templates.BlockedChan
 // the reviewed plan in, so a group's changes can be shown the way a reviewer has
 // already read the primary's. It is a second builder of that shape, not the same
 // one: the reviewed plan is built from the plan response in buildPlanCommentData,
-// and the two have to be kept in step by hand.
+// and the two have to be kept in step by hand. Both record a namespace's
+// VSchema change and finalize through setNamespaceWork, so a member's plan
+// shows them the way the reviewed plan does.
 //
 // A sharded namespace carries its changes twice: once per shard, and once in a
 // collapsed namespace view that dedupes tables across shards. Both are kept, the
@@ -327,10 +429,7 @@ func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
 			}
 			ks.Statements = append(ks.Statements, tc.GetDdl())
 		}
-		if apitypes.HasVSchemaWork(sc.GetMetadata()) {
-			ks.VSchemaChanged = true
-			ks.VSchemaDiff = sc.GetMetadata()[apitypes.VSchemaDiffMetadataKey]
-		}
+		setNamespaceWork(&ks, &apitypes.SchemaChangeResponse{Namespace: sc.GetNamespace(), Metadata: sc.GetMetadata()})
 		changes = append(changes, ks)
 	}
 	for _, ns := range shardedNamespaces {

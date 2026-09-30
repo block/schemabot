@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // MaxRecoveryAttempts is the operator retry budget for failed_retryable
@@ -42,8 +43,9 @@ const ApplyTargetLockWait = 10 * time.Second
 // a terminal state are left for reconciliation/monitoring to surface.
 const MaxWebhookEventAttempts = 5
 
-// Cutover policies control how a multi-deployment rollout sequences the copy
-// and cutover phases of its deployments. The value is resolved from the
+// Cutover policies control how a multi-member rollout sequences the copy and
+// cutover phases of its members: the deployments of a deployments map, or the
+// targets of a targets list, each ordered the same way. The value is resolved from the
 // environment config at apply-create time and persisted on each apply_operations
 // row so the policy in force when the apply was created travels with it.
 const (
@@ -370,8 +372,10 @@ const (
 
 // OperationKeyDelimiter separates the components of an operation key. A
 // component containing it would make the key ambiguous to split, so producers
-// refuse the delimiter inside a component rather than escaping it.
-const OperationKeyDelimiter = "/"
+// refuse the delimiter inside a component rather than escaping it. It is the
+// rollout projection's delimiter, which reads a finalizer's scope back out of
+// the key (see state.FinalizerFinalizesWork).
+const OperationKeyDelimiter = state.OperationKeyDelimiter
 
 // ShardOperationKey builds the operation key for one shard's work on one table
 // ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped
@@ -469,6 +473,37 @@ type TableChange struct {
 	// ModeReason records the engine's reason for any non-empty ExecutionMode
 	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
+
+	// EstimatedRows is the planner's approximate row count for the table,
+	// summed across shards for sharded targets. Display only — estimates come
+	// from engine statistics and may be stale. Nil when no estimate was
+	// available at plan time.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int `json:"shard_count,omitempty"`
+
+	// LargestShardRows is the approximate row count of the largest single
+	// shard. Nil when the target is not sharded or no estimate was available.
+	LargestShardRows *int64 `json:"largest_shard_rows,omitempty"`
+
+	// EstimatedBytes is the planner's approximate on-disk footprint for the
+	// table (data plus indexes), summed across shards for sharded targets.
+	// Display only, like EstimatedRows. Nil when no estimate was available.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+}
+
+// TaskEstimatedBytes returns the byte estimate a task created from this change
+// carries. The plan's estimate covers every shard of the table, so a task that
+// spans the whole table carries it, and a task scoped to one shard carries
+// none rather than a figure that would read as that shard's size.
+func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
+	if shard != "" || tc.EstimatedBytes == nil {
+		return nil
+	}
+	bytes := *tc.EstimatedBytes
+	return &bytes
 }
 
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
@@ -484,6 +519,12 @@ func (tc TableChange) RequiresUnsafeOptIn() bool {
 // it is guaranteed to fail.
 func (tc TableChange) EngineBlocked() bool {
 	return strings.EqualFold(tc.ExecutionMode, "blocked")
+}
+
+// DirectExecution reports whether the planner routed this change to direct
+// execution: native DDL on the target instead of the schema change engine.
+func (tc TableChange) DirectExecution() bool {
+	return strings.EqualFold(tc.ExecutionMode, "direct")
 }
 
 // UnsafeOptInReason returns the planner-provided unsafe reason, or a generic
@@ -557,6 +598,30 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 		return false
 	}
 	return n.Artifacts[VSchemaArtifactName] != ""
+}
+
+// ShowsVSchemaChange reports whether plan and apply surfaces show this
+// namespace's VSchema change as one. It is the stored-plan counterpart of
+// apitypes.SchemaChangeResponse.ShowsVSchemaChange: a change the engine
+// generated entirely from the plan's DDL, with no diff to review, no recorded
+// deletion or mutation, and a finalize to write it, is left to the DDL and
+// that finalize.
+func (n *NamespacePlanData) ShowsVSchemaChange() bool {
+	if !n.ChangesVSchema() {
+		return false
+	}
+	return !n.vschemaChangeGeneratedFromDDL()
+}
+
+// vschemaChangeGeneratedFromDDL reports whether the stored plan marks this
+// namespace's VSchema change generated from the DDL, with no diff and no
+// deletion or mutation record, and finalizes the namespace.
+func (n *NamespacePlanData) vschemaChangeGeneratedFromDDL() bool {
+	meta := n.Metadata
+	generatedOnly := meta[PlanMetadataVSchemaGeneratedOnly] == "true"
+	noDiff := meta[PlanMetadataVSchemaDiff] == ""
+	noUnsafeRecord := meta[PlanMetadataVSchemaDeletions] == "" && meta[PlanMetadataVSchemaMutations] == ""
+	return generatedOnly && noDiff && noUnsafeRecord && n.Finalize
 }
 
 // NeedsFinalizer reports whether an apply of this namespace ends with a group
@@ -670,6 +735,25 @@ type Plan struct {
 
 	// CreatedAt is when the plan was generated.
 	CreatedAt time.Time
+}
+
+// HasWork reports whether applying the plan would change anything: a table
+// change, a namespace to finalize (a VSchema document or an engine-requested
+// finalize), or a shard with changes of its own. A plan without work is the plan
+// of a target already at the desired schema.
+func (p *Plan) HasWork() bool {
+	if p == nil {
+		return false
+	}
+	if len(p.FlatDDLChanges()) > 0 || len(p.FinalizerNamespaces()) > 0 {
+		return true
+	}
+	for _, shard := range p.Shards {
+		if len(shard.Changes) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
@@ -1277,7 +1361,10 @@ type ApplyOptions struct {
 
 	// Branch is the name of an existing PlanetScale branch to reuse.
 	// When set, the engine refreshes the branch schema from main instead
-	// of creating a new branch.
+	// of creating a new branch. The engine reads it back from the stored
+	// apply on every resume, through Map, to decide whether the deploy
+	// request it creates deletes the branch: it must survive the round trip,
+	// or a resumed drive deletes a branch the operator owns.
 	Branch string `json:"branch,omitempty"`
 
 	// DeferCutover pauses at cutover and waits for explicit trigger.
@@ -1316,10 +1403,15 @@ type ApplyOptions struct {
 // policy its dispatch was admitted under. It mirrors the policy the caller
 // sent rather than restating the rules: the engine reading it back off the
 // metadata keys is what enforces them, including refusing an enabled policy
-// that carries no row bound.
+// that carries no size bound, or both.
 type DirectExecutionPolicy struct {
-	Enabled                       bool  `json:"enabled"`
-	MaxTableRows                  int64 `json:"max_table_rows,omitempty"`
+	Enabled bool `json:"enabled"`
+	// MaxTableRows is the optional bound on the table's row count. Zero
+	// states no row bound.
+	MaxTableRows int64 `json:"max_table_rows,omitempty"`
+	// MaxTableBytes is the optional bound on the table's data plus index
+	// footprint, in bytes. Zero states no byte bound.
+	MaxTableBytes                 int64 `json:"max_table_bytes,omitempty"`
 	LockAcquisitionTimeoutSeconds int64 `json:"lock_acquisition_timeout_seconds,omitempty"`
 }
 
@@ -1333,7 +1425,12 @@ func (p *DirectExecutionPolicy) EngineMetadata() map[string]string {
 	if p == nil {
 		return nil
 	}
-	return engine.DirectExecutionMetadata(p.Enabled, p.MaxTableRows, p.LockAcquisitionTimeoutSeconds)
+	return engine.DirectExecutionMetadata(engine.DirectExecutionSettings{
+		Enabled:                       p.Enabled,
+		MaxTableRows:                  p.MaxTableRows,
+		MaxTableBytes:                 p.MaxTableBytes,
+		LockAcquisitionTimeoutSeconds: p.LockAcquisitionTimeoutSeconds,
+	})
 }
 
 // ControlOperation identifies a user-requested control operation.
@@ -1416,6 +1513,35 @@ const mirroredControlRequestMetadataKey = "mirrored_remote_rejection"
 // request row created solely to carry another plane's rejection.
 func MirroredControlRequestMetadata() []byte {
 	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
+}
+
+// cutoverRequestOperationMetadataKey binds a cutover request to the one
+// operation that is to take it. A cutover request is apply-level, so under an
+// ordered cutover policy the binding is what keeps one operator command on the
+// member whose turn it was when the command was accepted, rather than letting
+// it pass on to the next member once that one has finished.
+const cutoverRequestOperationMetadataKey = "apply_operation_id"
+
+// CutoverRequestMetadata returns the metadata that binds a cutover request to
+// the operation that is to take it.
+func CutoverRequestMetadata(applyOperationID int64) []byte {
+	return []byte(`{"` + cutoverRequestOperationMetadataKey + `":` + strconv.FormatInt(applyOperationID, 10) + `}`)
+}
+
+// CutoverOperationID returns the operation a cutover request is bound to, or 0
+// when the request names none. Metadata that does not parse is an error rather
+// than an unbound request, so a drive never takes a request it cannot read.
+func (r *ApplyControlRequest) CutoverOperationID() (int64, error) {
+	if r == nil || len(r.Metadata) == 0 {
+		return 0, nil
+	}
+	var payload struct {
+		ApplyOperationID int64 `json:"apply_operation_id"`
+	}
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return 0, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return payload.ApplyOperationID, nil
 }
 
 // ForwardingControlRequestCaller is the requester recorded for a control
@@ -1505,22 +1631,38 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 // distinct from one that states the policy disabled: the first defers to the
 // executing server's configuration, the second overrides it.
 //
-// A malformed number reads as zero rather than failing here. The engine
-// refuses an enabled policy whose row bound is not positive, so a garbled
-// bound blocks the statement instead of widening it — the one direction this
-// is allowed to fail in.
+// A malformed number does not fail here; it reads as a value the engine
+// refuses, so a garbled bound blocks the statement instead of changing the
+// policy — the one direction this is allowed to fail in. Both size bounds are
+// optional, so zero would mean "no such bound" and silently drop it; a bound
+// that is present but not a positive integer reads as -1 instead, which
+// renders back onto the metadata and the engine refuses.
 func directExecutionPolicyFromMap(options map[string]string) *DirectExecutionPolicy {
 	raw, ok := options[engine.MetadataDirectExecution]
 	if !ok {
 		return nil
 	}
-	maxRows, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionMaxTableRows], 10, 64)
 	lockWait, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds], 10, 64)
 	return &DirectExecutionPolicy{
 		Enabled:                       raw == "true",
-		MaxTableRows:                  maxRows,
+		MaxTableRows:                  storedSizeBound(options, engine.MetadataDirectExecutionMaxTableRows),
+		MaxTableBytes:                 storedSizeBound(options, engine.MetadataDirectExecutionMaxTableBytes),
 		LockAcquisitionTimeoutSeconds: lockWait,
 	}
+}
+
+// storedSizeBound reads an optional size bound back out of an options map:
+// zero when absent, -1 when present but not a positive integer.
+func storedSizeBound(options map[string]string, key string) int64 {
+	raw, ok := options[key]
+	if !ok {
+		return 0
+	}
+	bound, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || bound <= 0 {
+		return -1
+	}
+	return bound
 }
 
 // GroupsEngineExecution reports whether an apply against databaseType hands the
@@ -1714,6 +1856,13 @@ type Task struct {
 	RowsTotal       int64 // Total rows to copy
 	ProgressPercent int   // 0-100
 	ETASeconds      int   // Estimated seconds remaining
+	// EstimatedBytes is the planner's approximate on-disk footprint of the
+	// table (data plus indexes), copied from the plan change this task was
+	// created from so progress can show the table's scale beside its row
+	// counts. Display only and written once: progress updates never change
+	// it. Nil when the plan had no estimate, and for per-shard rows, since a
+	// plan's estimate covers the whole table.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64

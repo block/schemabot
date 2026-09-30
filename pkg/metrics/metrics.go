@@ -161,9 +161,10 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 // RecordPlanCommentRetirement counts the outcome of retiring one superseded
 // plan comment. Outcomes: "minimized" (hidden on GitHub but still expandable
 // as the record of what was planned), "deleted" (no apply ever acted on the
-// plan and the repository opted into deletion, so the comment is removed from
-// the timeline), "apply_owned" (kept fully expanded because an apply owns the
-// plan's head and the repository uses the minimize-based policy),
+// plan and the deployment uses the default delete-based policy, so the comment
+// is removed from the timeline), "apply_owned" (kept fully expanded because an
+// apply owns the plan's head and the deployment opted out to the
+// minimize-based policy),
 // "guard_error" (apply-ownership lookup failed, comment left untouched fail
 // closed — investigate storage), "minimize_error" / "delete_error" (the
 // GitHub call failed; retried on the next supersede — investigate GitHub API
@@ -2344,12 +2345,14 @@ func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
 // completed, failed, or stopped; refused statements the policy does not route
 // directly are blocked with the reason encoded in the outcome.
 var knownDirectExecutionOutcomes = map[string]bool{
-	"completed":               true,
-	"failed":                  true,
-	"stopped":                 true,
-	"blocked_policy_disabled": true,
-	"blocked_size_limit":      true,
-	"blocked_size_unknown":    true,
+	"completed":                      true,
+	"failed":                         true,
+	"stopped":                        true,
+	"blocked_policy_disabled":        true,
+	"blocked_size_limit":             true,
+	"blocked_size_unknown":           true,
+	"blocked_force_kill_unavailable": true,
+	"blocked_force_kill_unknown":     true,
 }
 
 // RecordDirectExecution increments the counter for a statement the
@@ -2359,7 +2362,10 @@ var knownDirectExecutionOutcomes = map[string]bool{
 // in failed means native DDL is erroring on the target (check the apply logs
 // for the statement and MySQL error), and a spike in blocked_size_unknown
 // means row estimates are unavailable (check target connectivity and
-// information_schema access).
+// information_schema access). blocked_force_kill_unavailable means the target
+// user is denied a table the kill reads (grant SELECT on performance_schema.*
+// and PROCESS); blocked_force_kill_unknown means checking those grants failed
+// (check target connectivity).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"

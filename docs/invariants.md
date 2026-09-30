@@ -240,8 +240,9 @@ logged and the drive continues. An error reading something safety-gating ends th
 and leaves the row claimable for another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
-the drive loop (`pkg/api/operator.go`), the pre-start task re-read in the sequential drive
-(`pkg/tern/local_apply_sequential.go`) and the remote progress error limit
+the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
+terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
+in the grouped drive (`pkg/tern/local_apply_grouped.go`) and the remote progress error limit
 (`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -505,7 +506,9 @@ agreement.
 Config-discovery failure, stored-check-state read failure, head-SHA ambiguity, or an in-flight
 apply must surface as a blocking or absent check, never a passing one. *Breaks if violated:* a PR
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
-publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`).
+publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`), and the
+automatic apply, which dispatches only after its pending changes are stored
+(`applyCommandCore` in `pkg/webhook/apply_handlers.go`).
 
 ### MG-2: Absence never passes
 
@@ -790,33 +793,52 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 
 ### ST-10: Rollouts respect order and fail closed on policy
 
-Multi-deployment rollouts claim operations in `deployment_order`, and a failed earlier deployment
-blocks later ones unless the config says otherwise. Once an operator releases a paused rollout it
-stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like
-`halt`, never like `continue`.
+Multi-member rollouts claim operations in member order, where a member is a (deployment, target)
+pair taken in `deployment_order` and then in each deployment's `targets` order, and a failed
+earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
+member, not per operation: one member's work never waits on its own member's work to start, and a
+later member's work waits on every earlier member's, until it completes under `rolling` or reaches
+the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Cutover
+under `barrier` and `parallel` is ordered across every operation, not per member: operations cut
+over strictly one at a time in the order the rollout created them, so two shards of one member cut
+over one after the other. A member's finalizer publishes its change without parking at the
+barrier, so it is ordered like a cutover under every policy: it starts, or resumes after a stop,
+only once all of the work it finalizes and every earlier member have completed. Work a stop caught
+before it started is ordered like pending work, so stopping and starting a rollout cannot reorder
+it. A finalizer whose
+own work has failed can never start, so it holds later members exactly where that failure does and
+no longer, and it holds no target. Once an operator releases a paused rollout it stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like `halt`, never like `continue`.
 
 Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
 claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
 the failure: the apply stays `running_degraded` until that sibling settles and only then takes
-the `failed` verdict. A sibling that is merely pending holds nothing, since the same policy is what
-stops it from ever starting. Recording the verdict over live work would take `stop` and `cancel`
+the `failed` verdict. A sibling that is merely pending, or that a stop caught before it started,
+holds nothing, since the same policy is what stops it from ever starting. Recording the verdict over live work would take `stop` and `cancel`
 away from the operator who still has work to stop. The target reservation survives it, since OW-5
 holds a rollout's targets while any of its operations is in progress.
 
 Settled rather than terminal is what decides whether a sibling still holds its deployment, under
-every policy and not only the fail-closed ones. The two differ by one state: a `stopped` sibling is
-terminal for claiming but resumable, so an operator can start it again and a driver will write to
+every policy and not only the fail-closed ones. The two differ by one state: a `stopped` sibling
+that had started is terminal for claiming but resumable, so an operator can start it again and a driver will write to
 that target. A rollout whose remaining sibling is stopped therefore stays open — `running_degraded`,
 or `paused` where a pause is holding it — until that sibling is started and finishes, or is
 cancelled. A rollout held open this way still resolves the stop that produced it, once that stop
 has reached every operation: the pending request is what `start` consults, so holding it open
 without completing the request would refuse the start the hold exists to preserve (CO-2).
-*Enforced:* the ordered-claim gate in `FindNextApplyOperation`
-(`pkg/storage/internal/sqlstore/apply_operations.go`) and the rollout state derivation
+*Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
+each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
+started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
+(`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
+storage parity suite (`pkg/storage/storagetest/apply_operations.go`); for a manually deferred cutover, the turn
+check `CutoverBlocker` (same file, sharing the automatic cutover claim's
+`earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
+(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
+(`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
-`pkg/state/apply.go`), with `completeLandedStopForHeldOpenApply` and
-`RolloutHeldByResumableChild` keeping a held-open rollout's stop resolved and its recovery claim
-quiet (`pkg/api/operator.go`).
+`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`), through which every
+projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
+`updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
+`completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 
@@ -1079,8 +1101,14 @@ control paths (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`).
 Stop is the highest-priority intent. Once accepted, no actor may knowingly advance the apply
 toward deploy, cutover, or completion until the stop is processed: forward-progress commands are
 rejected while a stop pends, and contradictory intents are rejected at acceptance rather than
-resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the cutover paths
-(`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`); conflict rejection at request intake
+resolved by drive ordering. Cancel is not forward progress: it halts at least as far as stop, so it
+is accepted while a stop pends and every drive consumes it ahead of the stop, as an escalation.
+*Enforced:* pending-stop checks in pollers and the cutover paths
+(`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`), and in the group_finalizer drive
+before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
+`pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
+(`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
+`pkg/tern/grpc_client.go`); conflict rejection at request intake
 (`pkg/api/control_handlers.go`).
 
 ### CO-5: The revert phase owns the outcome
@@ -1101,7 +1129,10 @@ a consumer that will never come. A release against a rollout that is not paused 
 cutover while one is already in flight are both refused at intake. Its effect is also scoped to
 the one change it targets: an incident-time tuning, or one operation's completion, never bleeds
 onto sibling operations or future applies. *Enforced:* queue-time eligibility gates and
-operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`).
+operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`); a cutover
+request on an ordered rollout is bound at intake to the member whose turn it is
+(`cutoverTurnForRequest`, `pkg/api/control_handlers.go`), and only that member's drive takes it
+(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`).
 
 ### CO-7: ID namespaces are never conflated
 
@@ -1460,12 +1491,13 @@ waive with.
 ### RV-3: Consent is explicit, specific, and re-checked
 
 Unsafe changes (error-severity lint findings such as table and column drops) block without
-`--allow-unsafe`. Changes an operator cannot undo mid-flight, such as direct execution's
-write-blocking DDL with no cutover and no revert, require the operator to confirm the specific
-consequences disclosed to them. The re-plan that runs just before execution re-checks that
-verdict, so a plan that changed after the confirmation stops rather than running something the
-operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
+`--allow-unsafe`. Changes that destroy work already done on the target, such as discarding an
+unfinished row copy, require the operator to confirm the specific consequences disclosed to
+them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
+after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
+`pkg/webhook/apply_gating.go`), including the re-check that other rollout members' work is what the
+confirmation was given against, that the reviewed target has gained no changes of its own since, and that the work carries no consequence it did not disclose
+(`confirmedConvergedTargetRound`, `confirmationCoversMemberWork` and `memberWorkRefusal` in `pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
@@ -1474,8 +1506,9 @@ operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/
 Whether the engine will refuse a statement, or route it to direct execution (a MySQL and Spirit
 execution mode), is recorded on the plan or stops plan creation using the engine's own checks rather than a
 reimplementation of them, and an apply on a refused plan is rejected before any lock is taken. For
-direct execution's table-size bound, a table whose size cannot be measured is blocked, and a row
-estimate is trusted only in the blocking direction: an estimate alone never approves. The verdict
+direct execution's table-size bound, a table whose size cannot be measured is blocked. A row
+estimate is trusted only in the blocking direction: the row bound approves only on an exact count.
+The byte bound has no exact corroboration and approves on its estimate. The verdict
 belongs to the target that will run the statement: a deployment that applies a plan it did not
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
@@ -1540,7 +1573,13 @@ proposal. Symlinked namespaces resolving outside the repository root, or to them
 rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
 (`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
-`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
+`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`), and
+a table declared by two desired schema files fails planning on every engine through one rule
+(`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,
+`pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
+A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
+refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
+`pkg/tern/local_client.go`).
 
 ## Routing and authorization (AZ)
 
@@ -1630,20 +1669,22 @@ published. Secret references remain references on disk.
 
 ### AZ-8: Profile registration preserves connection identity
 
-Registering a local profile must not replace a different connection, change the default profile,
+Registering a local profile must not replace a different connection, change an existing default profile,
 or overwrite a concurrent configuration update. Retrying an identical registration is safe.
 
 *Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
 
 ### AZ-9: Initialization preserves the target and existing files
 
-Initialization verifies the imported schema before publishing it and never applies changes to the
-target. It must not overwrite existing schema files or redirect an existing profile to another
-connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+Initialization verifies the imported schema before publishing it and never applies changes to an
+existing target. An explicitly requested sample is created and seeded separately before entering
+the same import-and-verify workflow. It must not overwrite existing schema files or redirect
+an existing profile to another connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
 its state so the retry uses the same execution authority.
 
 *Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
-`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
+`pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
+`pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
 
 ## Structural enforcement
 

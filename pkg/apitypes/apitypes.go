@@ -763,12 +763,18 @@ type PlanResponse struct {
 	// current config re-resolves the same primary. The deployment alone is not
 	// sufficient: one deployment can address several targets, so a member is
 	// identified by the pair.
-	Deployment  string                   `json:"deployment,omitempty"`
-	Target      string                   `json:"target,omitempty"`
-	Engine      string                   `json:"engine"`
-	Changes     []*SchemaChangeResponse  `json:"changes"`
-	LintResults []*LintViolationResponse `json:"lint_violations"`
-	Errors      []string                 `json:"errors"`
+	Deployment string `json:"deployment,omitempty"`
+	Target     string `json:"target,omitempty"`
+	// SelectedNamespaces is the namespace selection of the primary's targets
+	// entry this plan was created under, empty when the entry selects every
+	// declared namespace. The rollup checks it against the primary's selection
+	// at rollup time alongside Deployment and Target, so a reloaded placement
+	// cannot pair this plan with members resolved under a different one.
+	SelectedNamespaces []string                 `json:"selected_namespaces,omitempty"`
+	Engine             string                   `json:"engine"`
+	Changes            []*SchemaChangeResponse  `json:"changes"`
+	LintResults        []*LintViolationResponse `json:"lint_violations"`
+	Errors             []string                 `json:"errors"`
 	// Shards carries the per-shard plan for a sharded engine: each changing shard
 	// and the changes it needs. The namespace-level Changes above collapse a
 	// keyspace to one entry, so a keyspace whose shards diverge is represented
@@ -886,11 +892,15 @@ type PlanSummaryResponse struct {
 	// BlockedCount is how many of those table changes the engine will
 	// deterministically refuse (execution mode "blocked").
 	BlockedCount int `json:"blocked_count,omitempty"`
-	// VSchemaChangeCount is how many namespaces carry a VSchema change.
+	// VSchemaChangeCount is how many namespaces show a VSchema change. A
+	// VSchema change the engine generates entirely from the plan's DDL is
+	// shown as that DDL, so it is not counted here.
 	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
-	// FinalizeCount is how many namespaces the engine asked to finalize once
-	// their DDL lands. A finalizer is work an apply runs, so a plan whose only
-	// work is a finalizer is not a no-change plan.
+	// FinalizeCount is how many namespaces have nothing to run but the
+	// finalize the engine asked for. A finalize beside a namespace's DDL or
+	// VSchema change is part of that work and is not counted. A finalize is
+	// work an apply runs, so a plan whose only work is a finalize is not a
+	// no-change plan.
 	FinalizeCount int `json:"finalize_count,omitempty"`
 }
 
@@ -1231,6 +1241,25 @@ type TableChangeResponse struct {
 	// ModeReason is the engine's reason for any non-empty ExecutionMode
 	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
+
+	// EstimatedRows is the planner's approximate row count for the table,
+	// summed across shards for sharded targets. Display only — estimates come
+	// from engine statistics and may be stale. Nil when no estimate was
+	// available at plan time.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int `json:"shard_count,omitempty"`
+
+	// LargestShardRows is the approximate row count of the largest single
+	// shard. Nil when the target is not sharded or no estimate was available.
+	LargestShardRows *int64 `json:"largest_shard_rows,omitempty"`
+
+	// EstimatedBytes is the planner's approximate on-disk footprint for the
+	// table (data plus indexes), summed across shards for sharded targets.
+	// Display only, like EstimatedRows. Nil when no estimate was available.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 }
 
 // Execution-mode verdicts a planner records on a table change. These mirror
@@ -1251,8 +1280,8 @@ func (t *TableChangeResponse) EngineBlocked() bool {
 }
 
 // DirectExecution reports whether the planner's execution-mode verdict routes
-// this change to direct execution: it runs as native MySQL DDL — synchronous,
-// blocking writes to the table while it runs, and not revertible.
+// this change to direct execution: it runs synchronously as native MySQL DDL
+// and blocks writes to the table while it runs.
 func (t *TableChangeResponse) DirectExecution() bool {
 	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
 }
@@ -1423,6 +1452,12 @@ type TableProgressResponse struct {
 	RowsTotal       int64  `json:"rows_total"`
 	PercentComplete int32  `json:"percent_complete"`
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
+	// EstimatedBytes is the plan's approximate on-disk footprint of the table
+	// (data plus indexes), for display beside the row counts. It is the
+	// table's size when planned, not a measure of copy progress. Absent when
+	// the plan had no estimate and for a task scoped to one shard, since the
+	// estimate covers the whole table.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`

@@ -9,7 +9,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -192,13 +191,15 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			// Lock held by a different entity
 			h.logger.Info("apply blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 			h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-				Database:    database,
-				Environment: environment,
-				RequestedBy: requestedBy,
-				LockOwner:   existingLock.Owner,
-				LockRepo:    existingLock.Repository,
-				LockPR:      existingLock.PullRequest,
-				LockCreated: existingLock.CreatedAt,
+				Database:     database,
+				DatabaseType: dbType,
+				Environment:  environment,
+				RequestedBy:  requestedBy,
+				LockOwner:    existingLock.Owner,
+				LockRepo:     existingLock.Repository,
+				LockPR:       existingLock.PullRequest,
+				LockCreated:  existingLock.CreatedAt,
+				CLIName:      h.cliName(),
 			}))
 			return false, nil
 		}
@@ -352,13 +353,61 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// regular plan comment (no lock, no confirm footer). An empty primary plan
 	// speaks only for the primary where members hold schemas of their own, so
 	// the other members are planned first and their work, if any, answers.
-	if !planResp.HasChanges() {
-		rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
-		if rolloutStillPending(rollout) {
-			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
+	//
+	// When other targets still have work, the apply runs their own plans. It
+	// always stops for apply-confirm: the one-step gates below read only the
+	// reviewed plan, which is empty, so the operator confirms against the
+	// comment that renders every target's plan instead.
+	rollout := reviewDriftOutcome{state: driftNotEvaluated}
+	var rolloutPreview *templates.DeploymentDriftData
+	reviewedTargetConverged := !planResp.HasChanges()
+	if reviewedTargetConverged {
+		rollout, rolloutPreview = h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+	}
+	switch {
+	case !reviewedTargetConverged:
+		h.logger.Debug("apply: the reviewed target has changes of its own; the rollout round is not consulted before locking",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
+	case rolloutRunsMemberWork(rollout, rolloutPreview):
+		// Record the pending work on the check before anything else can end
+		// this apply: the preflight, the lock acquire, and the fresh-HEAD gate
+		// below all have exits of their own, and the stored check state must not
+		// be left reading as a pass from an earlier plan on any of them (MG-12).
+		// No lock is held yet, so a failure needs no release.
+		if recordErr := h.recordPendingRollout(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); recordErr != nil {
+			h.logger.Error("apply rejected: could not record the other targets' pending work on the check; published a failing aggregate from the rollout round instead",
+				"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", recordErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not record the check state for this apply, so nothing was applied. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command member-work check record %s#%d: %w", repo, pr, recordErr)
+		}
+		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout)
+		if refusalErr != nil {
+			h.logger.Error("apply rejected: could not verify that the other targets' plans can run from this apply",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", refusalErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
+		}
+		if refusal != "" {
+			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		h.logger.Info("apply: the reviewed target is already at the desired schema; other targets' own plans will run once confirmed",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "targets_pending", rollout.work.pending, "targets", rollout.work.members,
+			"pending_targets", rollout.work.names)
+	case rolloutStillPending(rollout):
+		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
+		return false, nil
+	default:
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		commentData.DeploymentDrift = rolloutPreview
 		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
@@ -376,7 +425,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -397,7 +446,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -458,7 +507,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// apply proceeds automatically and the unsafe opt-in already solicited
 	// consent for every attributed table, where the re-plan choice the
 	// disclosure coaches is no longer open.
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
@@ -467,6 +516,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	commentData.DeferCutover = result.DeferCutover
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
+	commentData.DeploymentDrift = rolloutPreview
 
 	// Re-evaluate the checks gate against the freshness-checked HEAD before
 	// executing. The early gate at the top of applyCommandCore ran against
@@ -489,36 +539,19 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// Direct-execution changes never run without explicit confirmation: the
-	// operator must consent to their blocking, non-revertible native DDL
-	// against the locked comment that discloses it, so the apply never
-	// proceeds in one step — downgrade to the two-step confirm.
-	if len(planResp.DirectChanges()) > 0 {
-		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		// The direct-execution section above names the statements and what
-		// running them costs, so the footer carries the instruction alone.
-		commentData.PendingManualConfirmation = true
-		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
-			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
-			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
-		}
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
-		if checkRunErr != nil {
-			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
-		}
-		if headSHA != "" {
-			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-		}
-		return false, nil
+	// Only other targets have work, so the apply runs their own plans, and it
+	// never does so in one step: the gates that let an apply proceed
+	// automatically read only the reviewed plan, which is empty here. The
+	// operator confirms against this comment, which renders every target's plan.
+	if reviewedTargetConverged {
+		return h.pauseForMemberWorkConfirmation(ctx, repo, pr, installationID, schemaResult, planResp, environment, rollout, commentData)
 	}
 
 	// Discarding an unfinished copy destroys work already done on the target —
 	// often hours of it — so it never happens in one step. Downgrade to the
 	// two-step confirm against the locked comment that discloses what is being
-	// thrown away, the same way a direct-execution change does: the operator
-	// spends the hours, so the operator decides, and there is no flag that
-	// converts an automatic apply into that consent.
+	// thrown away: the operator spends the hours, so the operator decides, and
+	// there is no flag that converts an automatic apply into that consent.
 	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
@@ -578,17 +611,30 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	// Store the check record before anything runs: the merge gate must block on
+	// the pending changes before the target starts changing. A storage failure
+	// releases the lock (keyed on this plan's intent) and stays retryable — the
+	// re-drive re-plans from the top, reacquires the lock, and stores again —
+	// so the apply never dispatches over unknown check state.
 	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
-		h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
+		h.logger.Error("failed to store check state for automatic apply; the merge gate does not reflect the pending changes, so nothing was dispatched and the command stays retryable",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_id", planResp.PlanID, "error", checkErr)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply check state store failure")
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				"SchemaBot could not record the check state for this apply. Nothing was applied. Retry the command, and see server logs if it persists.")
+		}
+		return true, fmt.Errorf("apply command check record %s#%d: %w", repo, pr, checkErr)
 	}
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
 	return false, nil
 }
 
@@ -833,13 +879,15 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if existingLock.Owner != lockOwner {
 		h.logger.Info("apply-confirm blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 		h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-			Database:    database,
-			Environment: environment,
-			RequestedBy: requestedBy,
-			LockOwner:   existingLock.Owner,
-			LockRepo:    existingLock.Repository,
-			LockPR:      existingLock.PullRequest,
-			LockCreated: existingLock.CreatedAt,
+			Database:     database,
+			DatabaseType: dbType,
+			Environment:  environment,
+			RequestedBy:  requestedBy,
+			LockOwner:    existingLock.Owner,
+			LockRepo:     existingLock.Repository,
+			LockPR:       existingLock.PullRequest,
+			LockCreated:  existingLock.CreatedAt,
+			CLIName:      h.cliName(),
 		}))
 		return false, nil
 	}
@@ -923,7 +971,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
 }
 

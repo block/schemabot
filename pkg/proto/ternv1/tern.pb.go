@@ -1154,8 +1154,15 @@ type PlanRequest struct {
 	// configuration decides, which with none configured leaves every statement
 	// the engine refuses blocked.
 	DirectExecution *DirectExecutionPolicy `protobuf:"bytes,14,opt,name=direct_execution,json=directExecution,proto3" json:"direct_execution,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Declared namespaces the caller left out of schema_files because the
+	// target's entry in its database's targets list selects only other
+	// namespaces. Like ignored_namespaces, they are withheld rather than
+	// removed, so the data plane refuses engine shapes that diff the whole target
+	// as one unit (a database-scoped MySQL DSN), where an unselected namespace's
+	// live tables would otherwise be planned as drops.
+	UnselectedNamespaces []string `protobuf:"bytes,15,rep,name=unselected_namespaces,json=unselectedNamespaces,proto3" json:"unselected_namespaces,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1279,23 +1286,37 @@ func (x *PlanRequest) GetDirectExecution() *DirectExecutionPolicy {
 	return nil
 }
 
+func (x *PlanRequest) GetUnselectedNamespaces() []string {
+	if x != nil {
+		return x.UnselectedNamespaces
+	}
+	return nil
+}
+
 // DirectExecutionPolicy permits statements an engine deterministically refuses
-// to run verbatim as native DDL, bounded by the target table's size. Engines
-// that do not implement direct execution ignore it.
+// to run verbatim as native DDL, bounded by the target table's size in rows
+// or in bytes. Engines that do not implement direct execution
+// ignore it.
 type DirectExecutionPolicy struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Whether refused statements may run directly at all.
 	Enabled bool `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
-	// The fail-closed size bound: a refused statement runs directly only when
-	// the target table is at or below this row count. Required (positive) when
-	// enabled — a grant carrying no bound is refused, never treated as
-	// unbounded — and a table whose size cannot be measured is blocked.
+	// A size bound on the target table's row count; zero states no row bound.
+	// An enabled policy carries exactly one of this bound and max_table_bytes —
+	// a grant carrying no bound is refused, never treated as unbounded — and a
+	// table whose size cannot be measured is blocked. A negative value is an
+	// unusable bound, which the engine refuses.
 	MaxTableRows int64 `protobuf:"varint,2,opt,name=max_table_rows,json=maxTableRows,proto3" json:"max_table_rows,omitempty"`
 	// How long each direct statement waits to acquire its locks before failing
 	// with a retryable busy-table error. Zero leaves the engine's own default.
 	LockAcquisitionTimeoutSeconds int64 `protobuf:"varint,3,opt,name=lock_acquisition_timeout_seconds,json=lockAcquisitionTimeoutSeconds,proto3" json:"lock_acquisition_timeout_seconds,omitempty"`
-	unknownFields                 protoimpl.UnknownFields
-	sizeCache                     protoimpl.SizeCache
+	// A size bound on the target table's data plus index footprint, in bytes;
+	// zero states no byte bound. A refused statement runs directly when the
+	// table is within the policy's bound. A negative value is an unusable
+	// bound, which the engine refuses.
+	MaxTableBytes int64 `protobuf:"varint,4,opt,name=max_table_bytes,json=maxTableBytes,proto3" json:"max_table_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DirectExecutionPolicy) Reset() {
@@ -1349,6 +1370,13 @@ func (x *DirectExecutionPolicy) GetLockAcquisitionTimeoutSeconds() int64 {
 	return 0
 }
 
+func (x *DirectExecutionPolicy) GetMaxTableBytes() int64 {
+	if x != nil {
+		return x.MaxTableBytes
+	}
+	return 0
+}
+
 // TableChange represents a DDL change to a table.
 type TableChange struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
@@ -1368,9 +1396,27 @@ type TableChange struct {
 	// the namespace's persisted VSchema change-metadata here so a deployment
 	// that materializes the plan from a dispatch request runs the same
 	// apply-time safety gates as one reading its own stored plan.
-	Metadata      map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Metadata map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Approximate number of rows in the table at plan time, for display only.
+	// Sourced from engine statistics (e.g. information_schema TABLE_ROWS), which
+	// may be stale — never treat it as an exact count or use it as a gate input.
+	// For sharded targets this is the sum across shards. Unset when no estimate
+	// is available (e.g. the table is being created, or statistics could not be
+	// read).
+	EstimatedRows *int64 `protobuf:"varint,10,opt,name=estimated_rows,json=estimatedRows,proto3,oneof" json:"estimated_rows,omitempty"`
+	// Number of shards this table change spans. Zero when the target is not
+	// sharded or the shard topology is unknown.
+	ShardCount int32 `protobuf:"varint,11,opt,name=shard_count,json=shardCount,proto3" json:"shard_count,omitempty"`
+	// Approximate row count of the largest single shard — the biggest chunk a
+	// shard-at-a-time apply works through at once. Unset when the target is not
+	// sharded or no estimate is available. Approximate like estimated_rows.
+	LargestShardRows *int64 `protobuf:"varint,12,opt,name=largest_shard_rows,json=largestShardRows,proto3,oneof" json:"largest_shard_rows,omitempty"`
+	// Approximate on-disk footprint of the table (data plus indexes), summed
+	// across shards for sharded targets. Unset when no estimate was available.
+	// Approximate like estimated_rows.
+	EstimatedBytes *int64 `protobuf:"varint,13,opt,name=estimated_bytes,json=estimatedBytes,proto3,oneof" json:"estimated_bytes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TableChange) Reset() {
@@ -1464,6 +1510,34 @@ func (x *TableChange) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *TableChange) GetEstimatedRows() int64 {
+	if x != nil && x.EstimatedRows != nil {
+		return *x.EstimatedRows
+	}
+	return 0
+}
+
+func (x *TableChange) GetShardCount() int32 {
+	if x != nil {
+		return x.ShardCount
+	}
+	return 0
+}
+
+func (x *TableChange) GetLargestShardRows() int64 {
+	if x != nil && x.LargestShardRows != nil {
+		return *x.LargestShardRows
+	}
+	return 0
+}
+
+func (x *TableChange) GetEstimatedBytes() int64 {
+	if x != nil && x.EstimatedBytes != nil {
+		return *x.EstimatedBytes
+	}
+	return 0
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -2007,9 +2081,16 @@ type PlanDiffResponse struct {
 	Errors         []string               `protobuf:"bytes,4,rep,name=errors,proto3" json:"errors,omitempty"`
 	// Per-shard membership and drift, populated for sharded engines. Empty for
 	// single-endpoint engines.
-	Shards        []*ShardPlan `protobuf:"bytes,5,rep,name=shards,proto3" json:"shards,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Shards []*ShardPlan `protobuf:"bytes,5,rep,name=shards,proto3" json:"shards,omitempty"`
+	// Unfinished work already on the target that applying this diff's changes
+	// would continue or destroy, the same disclosures PlanResponse carries.
+	ExistingCopies []*ExistingCopy `protobuf:"bytes,6,rep,name=existing_copies,json=existingCopies,proto3" json:"existing_copies,omitempty"`
+	// Set by a data plane that read the target for every copy applying this
+	// diff could meet, so a caller can tell a clean target from a data plane
+	// that never looked or whose lookup failed.
+	ExistingCopiesReported bool `protobuf:"varint,7,opt,name=existing_copies_reported,json=existingCopiesReported,proto3" json:"existing_copies_reported,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *PlanDiffResponse) Reset() {
@@ -2075,6 +2156,20 @@ func (x *PlanDiffResponse) GetShards() []*ShardPlan {
 		return x.Shards
 	}
 	return nil
+}
+
+func (x *PlanDiffResponse) GetExistingCopies() []*ExistingCopy {
+	if x != nil {
+		return x.ExistingCopies
+	}
+	return nil
+}
+
+func (x *PlanDiffResponse) GetExistingCopiesReported() bool {
+	if x != nil {
+		return x.ExistingCopiesReported
+	}
+	return false
 }
 
 // ApplyRequest requests execution of a previously generated plan.
@@ -2907,6 +3002,10 @@ type TableProgress struct {
 	// Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
 	// 2s"). Empty when throttled is false.
 	ThrottleReason string `protobuf:"bytes,18,opt,name=throttle_reason,json=throttleReason,proto3" json:"throttle_reason,omitempty"`
+	// The plan's approximate on-disk footprint of the table (data plus indexes),
+	// for display beside the row counts. Unset when the plan had no estimate and
+	// for a task scoped to one shard, since the estimate covers the whole table.
+	EstimatedBytes *int64 `protobuf:"varint,19,opt,name=estimated_bytes,json=estimatedBytes,proto3,oneof" json:"estimated_bytes,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3065,6 +3164,13 @@ func (x *TableProgress) GetThrottleReason() string {
 		return x.ThrottleReason
 	}
 	return ""
+}
+
+func (x *TableProgress) GetEstimatedBytes() int64 {
+	if x != nil && x.EstimatedBytes != nil {
+		return *x.EstimatedBytes
+	}
+	return 0
 }
 
 // SettledControlRequest reports the fate of a durable control request the
@@ -4739,7 +4845,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\x83\x05\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xb8\x05\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -4757,15 +4863,17 @@ const file_tern_proto_rawDesc = "" +
 	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x120\n" +
 	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x12#\n" +
 	"\rignore_tables\x18\r \x03(\tR\fignoreTables\x12I\n" +
-	"\x10direct_execution\x18\x0e \x01(\v2\x1e.tern.v1.DirectExecutionPolicyR\x0fdirectExecution\x1aT\n" +
+	"\x10direct_execution\x18\x0e \x01(\v2\x1e.tern.v1.DirectExecutionPolicyR\x0fdirectExecution\x123\n" +
+	"\x15unselected_namespaces\x18\x0f \x03(\tR\x14unselectedNamespaces\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
-	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xa0\x01\n" +
+	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xc8\x01\n" +
 	"\x15DirectExecutionPolicy\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12$\n" +
 	"\x0emax_table_rows\x18\x02 \x01(\x03R\fmaxTableRows\x12G\n" +
-	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\"\x99\x03\n" +
+	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\x12&\n" +
+	"\x0fmax_table_bytes\x18\x04 \x01(\x03R\rmaxTableBytes\"\x85\x05\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -4778,10 +4886,19 @@ const file_tern_proto_rawDesc = "" +
 	"\x0eexecution_mode\x18\a \x01(\tR\rexecutionMode\x12\x1f\n" +
 	"\vmode_reason\x18\b \x01(\tR\n" +
 	"modeReason\x12>\n" +
-	"\bmetadata\x18\t \x03(\v2\".tern.v1.TableChange.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\t \x03(\v2\".tern.v1.TableChange.MetadataEntryR\bmetadata\x12*\n" +
+	"\x0eestimated_rows\x18\n" +
+	" \x01(\x03H\x00R\restimatedRows\x88\x01\x01\x12\x1f\n" +
+	"\vshard_count\x18\v \x01(\x05R\n" +
+	"shardCount\x121\n" +
+	"\x12largest_shard_rows\x18\f \x01(\x03H\x01R\x10largestShardRows\x88\x01\x01\x12,\n" +
+	"\x0festimated_bytes\x18\r \x01(\x03H\x02R\x0eestimatedBytes\x88\x01\x01\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb0\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x11\n" +
+	"\x0f_estimated_rowsB\x15\n" +
+	"\x13_largest_shard_rowsB\x12\n" +
+	"\x10_estimated_bytes\"\xb0\x03\n" +
 	"\fSchemaChange\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x129\n" +
 	"\rtable_changes\x18\x02 \x03(\v2\x14.tern.v1.TableChangeR\ftableChanges\x12?\n" +
@@ -4826,13 +4943,15 @@ const file_tern_proto_rawDesc = "" +
 	"\x06errors\x18\x05 \x03(\tR\x06errors\x12*\n" +
 	"\x06shards\x18\x06 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
 	"\x0fexisting_copies\x18\a \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x12:\n" +
-	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\"\xf1\x01\n" +
+	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\"\xeb\x02\n" +
 	"\x10PlanDiffResponse\x12'\n" +
 	"\x06engine\x18\x01 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
 	"\x0flint_violations\x18\x03 \x03(\v2\x16.tern.v1.LintViolationR\x0elintViolations\x12\x16\n" +
 	"\x06errors\x18\x04 \x03(\tR\x06errors\x12*\n" +
-	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\"\xf5\x05\n" +
+	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
+	"\x0fexisting_copies\x18\x06 \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x128\n" +
+	"\x18existing_copies_reported\x18\a \x01(\bR\x16existingCopiesReported\"\xf5\x05\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
 	"\aoptions\x18\x02 \x03(\v2\".tern.v1.ApplyRequest.OptionsEntryR\aoptions\x12I\n" +
@@ -4912,7 +5031,7 @@ const file_tern_proto_rawDesc = "" +
 	"\veta_seconds\x18\x05 \x01(\x03R\n" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
-	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\x99\x05\n" +
+	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\xdb\x05\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
@@ -4938,7 +5057,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\x12#\n" +
 	"\rerror_message\x18\x10 \x01(\tR\ferrorMessage\x12\x1c\n" +
 	"\tthrottled\x18\x11 \x01(\bR\tthrottled\x12'\n" +
-	"\x0fthrottle_reason\x18\x12 \x01(\tR\x0ethrottleReason\"\xb4\x01\n" +
+	"\x0fthrottle_reason\x18\x12 \x01(\tR\x0ethrottleReason\x12,\n" +
+	"\x0festimated_bytes\x18\x13 \x01(\x03H\x00R\x0eestimatedBytes\x88\x01\x01B\x12\n" +
+	"\x10_estimated_bytes\"\xb4\x01\n" +
 	"\x15SettledControlRequest\x12\x1c\n" +
 	"\toperation\x18\x01 \x01(\tR\toperation\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12#\n" +
@@ -5238,67 +5359,68 @@ var file_tern_proto_depIdxs = []int32{
 	17, // 25: tern.v1.PlanDiffResponse.changes:type_name -> tern.v1.SchemaChange
 	18, // 26: tern.v1.PlanDiffResponse.lint_violations:type_name -> tern.v1.LintViolation
 	21, // 27: tern.v1.PlanDiffResponse.shards:type_name -> tern.v1.ShardPlan
-	64, // 28: tern.v1.ApplyRequest.options:type_name -> tern.v1.ApplyRequest.OptionsEntry
-	65, // 29: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
-	16, // 30: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange
-	15, // 31: tern.v1.ApplyRequest.direct_execution:type_name -> tern.v1.DirectExecutionPolicy
-	25, // 32: tern.v1.ApplyResponse.conflict:type_name -> tern.v1.ApplyConflict
-	29, // 33: tern.v1.LogsResponse.logs:type_name -> tern.v1.ApplyLog
-	31, // 34: tern.v1.TableProgress.shards:type_name -> tern.v1.ShardProgress
-	2,  // 35: tern.v1.TableProgress.change_type:type_name -> tern.v1.ChangeType
-	1,  // 36: tern.v1.ProgressResponse.state:type_name -> tern.v1.State
-	0,  // 37: tern.v1.ProgressResponse.engine:type_name -> tern.v1.Engine
-	32, // 38: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
-	66, // 39: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
-	33, // 40: tern.v1.ProgressResponse.settled_control_requests:type_name -> tern.v1.SettledControlRequest
-	67, // 41: tern.v1.StorageSchemaPlanRequest.schema_files:type_name -> tern.v1.StorageSchemaPlanRequest.SchemaFilesEntry
-	50, // 42: tern.v1.StorageSchemaReport.outstanding:type_name -> tern.v1.StorageSchemaStatement
-	50, // 43: tern.v1.StorageSchemaReport.destructive:type_name -> tern.v1.StorageSchemaStatement
-	50, // 44: tern.v1.StorageSchemaReport.manual:type_name -> tern.v1.StorageSchemaStatement
-	4,  // 45: tern.v1.StorageSchemaReport.boot_removal_policy:type_name -> tern.v1.BootRemovalPolicy
-	51, // 46: tern.v1.StorageSchemaPlanResponse.report:type_name -> tern.v1.StorageSchemaReport
-	68, // 47: tern.v1.StorageSchemaApplyRequest.schema_files:type_name -> tern.v1.StorageSchemaApplyRequest.SchemaFilesEntry
-	51, // 48: tern.v1.StorageSchemaApplyResponse.planned:type_name -> tern.v1.StorageSchemaReport
-	51, // 49: tern.v1.StorageSchemaApplyResponse.remaining:type_name -> tern.v1.StorageSchemaReport
-	9,  // 50: tern.v1.PulledNamespace.TableCatalogEntry.value:type_name -> tern.v1.TableCatalog
-	7,  // 51: tern.v1.PullSchemaResponse.NamespacesEntry.value:type_name -> tern.v1.PulledNamespace
-	5,  // 52: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	5,  // 53: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	6,  // 54: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
-	14, // 55: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
-	14, // 56: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
-	24, // 57: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
-	27, // 58: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
-	28, // 59: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
-	35, // 60: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
-	37, // 61: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
-	39, // 62: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
-	41, // 63: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
-	43, // 64: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
-	45, // 65: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
-	47, // 66: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
-	49, // 67: tern.v1.Tern.StorageSchemaPlan:input_type -> tern.v1.StorageSchemaPlanRequest
-	53, // 68: tern.v1.Tern.StorageSchemaApply:input_type -> tern.v1.StorageSchemaApplyRequest
-	13, // 69: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
-	22, // 70: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
-	23, // 71: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
-	26, // 72: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
-	34, // 73: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
-	30, // 74: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
-	36, // 75: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
-	38, // 76: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
-	40, // 77: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
-	42, // 78: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
-	44, // 79: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
-	46, // 80: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
-	48, // 81: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
-	52, // 82: tern.v1.Tern.StorageSchemaPlan:output_type -> tern.v1.StorageSchemaPlanResponse
-	54, // 83: tern.v1.Tern.StorageSchemaApply:output_type -> tern.v1.StorageSchemaApplyResponse
-	69, // [69:84] is the sub-list for method output_type
-	54, // [54:69] is the sub-list for method input_type
-	54, // [54:54] is the sub-list for extension type_name
-	54, // [54:54] is the sub-list for extension extendee
-	0,  // [0:54] is the sub-list for field type_name
+	19, // 28: tern.v1.PlanDiffResponse.existing_copies:type_name -> tern.v1.ExistingCopy
+	64, // 29: tern.v1.ApplyRequest.options:type_name -> tern.v1.ApplyRequest.OptionsEntry
+	65, // 30: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
+	16, // 31: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange
+	15, // 32: tern.v1.ApplyRequest.direct_execution:type_name -> tern.v1.DirectExecutionPolicy
+	25, // 33: tern.v1.ApplyResponse.conflict:type_name -> tern.v1.ApplyConflict
+	29, // 34: tern.v1.LogsResponse.logs:type_name -> tern.v1.ApplyLog
+	31, // 35: tern.v1.TableProgress.shards:type_name -> tern.v1.ShardProgress
+	2,  // 36: tern.v1.TableProgress.change_type:type_name -> tern.v1.ChangeType
+	1,  // 37: tern.v1.ProgressResponse.state:type_name -> tern.v1.State
+	0,  // 38: tern.v1.ProgressResponse.engine:type_name -> tern.v1.Engine
+	32, // 39: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
+	66, // 40: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
+	33, // 41: tern.v1.ProgressResponse.settled_control_requests:type_name -> tern.v1.SettledControlRequest
+	67, // 42: tern.v1.StorageSchemaPlanRequest.schema_files:type_name -> tern.v1.StorageSchemaPlanRequest.SchemaFilesEntry
+	50, // 43: tern.v1.StorageSchemaReport.outstanding:type_name -> tern.v1.StorageSchemaStatement
+	50, // 44: tern.v1.StorageSchemaReport.destructive:type_name -> tern.v1.StorageSchemaStatement
+	50, // 45: tern.v1.StorageSchemaReport.manual:type_name -> tern.v1.StorageSchemaStatement
+	4,  // 46: tern.v1.StorageSchemaReport.boot_removal_policy:type_name -> tern.v1.BootRemovalPolicy
+	51, // 47: tern.v1.StorageSchemaPlanResponse.report:type_name -> tern.v1.StorageSchemaReport
+	68, // 48: tern.v1.StorageSchemaApplyRequest.schema_files:type_name -> tern.v1.StorageSchemaApplyRequest.SchemaFilesEntry
+	51, // 49: tern.v1.StorageSchemaApplyResponse.planned:type_name -> tern.v1.StorageSchemaReport
+	51, // 50: tern.v1.StorageSchemaApplyResponse.remaining:type_name -> tern.v1.StorageSchemaReport
+	9,  // 51: tern.v1.PulledNamespace.TableCatalogEntry.value:type_name -> tern.v1.TableCatalog
+	7,  // 52: tern.v1.PullSchemaResponse.NamespacesEntry.value:type_name -> tern.v1.PulledNamespace
+	5,  // 53: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	5,  // 54: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	6,  // 55: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
+	14, // 56: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
+	14, // 57: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
+	24, // 58: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
+	27, // 59: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
+	28, // 60: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
+	35, // 61: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
+	37, // 62: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
+	39, // 63: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
+	41, // 64: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
+	43, // 65: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
+	45, // 66: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
+	47, // 67: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
+	49, // 68: tern.v1.Tern.StorageSchemaPlan:input_type -> tern.v1.StorageSchemaPlanRequest
+	53, // 69: tern.v1.Tern.StorageSchemaApply:input_type -> tern.v1.StorageSchemaApplyRequest
+	13, // 70: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
+	22, // 71: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
+	23, // 72: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
+	26, // 73: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
+	34, // 74: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
+	30, // 75: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
+	36, // 76: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
+	38, // 77: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
+	40, // 78: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
+	42, // 79: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
+	44, // 80: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
+	46, // 81: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
+	48, // 82: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
+	52, // 83: tern.v1.Tern.StorageSchemaPlan:output_type -> tern.v1.StorageSchemaPlanResponse
+	54, // 84: tern.v1.Tern.StorageSchemaApply:output_type -> tern.v1.StorageSchemaApplyResponse
+	70, // [70:85] is the sub-list for method output_type
+	55, // [55:70] is the sub-list for method input_type
+	55, // [55:55] is the sub-list for extension type_name
+	55, // [55:55] is the sub-list for extension extendee
+	0,  // [0:55] is the sub-list for field type_name
 }
 
 func init() { file_tern_proto_init() }
@@ -5307,7 +5429,9 @@ func file_tern_proto_init() {
 		return
 	}
 	file_tern_proto_msgTypes[9].OneofWrappers = []any{}
+	file_tern_proto_msgTypes[11].OneofWrappers = []any{}
 	file_tern_proto_msgTypes[24].OneofWrappers = []any{}
+	file_tern_proto_msgTypes[27].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

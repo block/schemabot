@@ -519,9 +519,151 @@ func TestMemberPlanChanges_DiffAloneIsVSchemaWork(t *testing.T) {
 	assert.NotEqual(t, empty, withDiff)
 }
 
+// A member's keyspace adds a table whose VSchema entry the engine generates
+// from the DDL, and the engine finalizes the keyspace. The member's plan shows
+// the keyspace by its DDL alone, the way the reviewed plan shows it.
+func TestMemberPlanChanges_GeneratedVSchemaChangeShowsOnlyTheDDL(t *testing.T) {
+	create := "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace:    "payments",
+		TableChanges: []*ternv1.TableChange{{TableName: "refund_notes", Ddl: create}},
+		Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey:       "true",
+			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+			apitypes.NeedsFinalizerMetadataKey:       "true",
+		},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.Equal(t, []string{create}, changes[0].Statements)
+	assert.False(t, changes[0].VSchemaChanged)
+	assert.True(t, changes[0].Finalize)
+}
+
+// A member's keyspace has nothing to run but a finalize the engine asked for.
+// That finalize is work, so the member is not shown as already at the schema.
+func TestMemberPlanChanges_FinalizeAloneIsWork(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "payments",
+		Metadata:  map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.True(t, changes[0].Finalize)
+	assert.False(t, templates.DeploymentPlanGroup{Changes: changes}.Empty())
+}
+
 // A member already at the desired schema produces no changes at all, which is
 // the group the comment names as having nothing to apply.
 func TestMemberPlanChanges_EmptyPlanHasNoChanges(t *testing.T) {
 	assert.Empty(t, memberPlanChanges(tern.ChangeSet{}))
 	assert.True(t, templates.DeploymentPlanGroup{}.Empty())
+}
+
+// sizedMember is a planned rollout member whose plan changes the given tables
+// of the testapp namespace, each with the given statement and size estimate.
+func sizedMember(target string, changes ...*ternv1.TableChange) api.DeploymentRollupEntry {
+	return api.DeploymentRollupEntry{
+		DatabaseType: "mysql",
+		Deployment:   "primary",
+		Target:       target,
+		Class:        api.DeploymentPlanned,
+		ChangeSet:    tern.ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: changes}}},
+	}
+}
+
+func sizedChange(table, ddl string, rows, bytes int64) *ternv1.TableChange {
+	return &ternv1.TableChange{
+		Namespace:      "testapp",
+		TableName:      table,
+		Ddl:            ddl,
+		ChangeType:     ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		EstimatedRows:  new(rows),
+		EstimatedBytes: new(bytes),
+	}
+}
+
+// Each target's sizes are read from its own plan, in rollout order, so the
+// size section can total a table across the targets that change it. A table is
+// listed once per target however many statements change it, and a statement
+// whose cost does not grow with the table gets no size.
+func TestTargetTableSizes(t *testing.T) {
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+	addIndex2 := "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+	dropIndex := "ALTER TABLE `users` DROP INDEX `idx_email`"
+	rollup := api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{
+		sizedMember("testapp_1", sizedChange("orders", addIndex, 1_000, 100_000)),
+		sizedMember("testapp_2",
+			sizedChange("orders", addIndex, 48_200_000, 23_400_000_000),
+			sizedChange("orders", addIndex2, 48_200_000, 23_400_000_000),
+			sizedChange("users", dropIndex, 9_000, 900_000)),
+	}}
+
+	sizes := targetTableSizes(rollup)
+
+	require.Len(t, sizes, 2)
+	assert.Equal(t, "primary/testapp_1", sizes[0].Target)
+	assert.Equal(t, "testapp", sizes[0].Keyspace)
+	assert.Equal(t, "orders", sizes[0].Size.Table)
+	require.NotNil(t, sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, int64(100_000), *sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, "primary/testapp_2", sizes[1].Target)
+	assert.Equal(t, "orders", sizes[1].Size.Table)
+	require.NotNil(t, sizes[1].Size.EstimatedBytes)
+	assert.Equal(t, int64(23_400_000_000), *sizes[1].Size.EstimatedBytes)
+}
+
+// A table a target creates has no data to size, and a sharded namespace
+// decides a table's size line from every shard's DDL rather than the one
+// statement its namespace view keeps.
+func TestTargetTableSizes_SkipsCreatedTablesAndReadsEveryShard(t *testing.T) {
+	addColumn := "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)"
+	addIndex := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	created := sizedChange("widgets", "CREATE TABLE `widgets` (`id` bigint NOT NULL, PRIMARY KEY (`id`), KEY `k` (`id`))", 0, 0)
+	created.ChangeType = ternv1.ChangeType_CHANGE_TYPE_CREATE
+	sharded := sizedMember("testapp_2", sizedChange("mutes", addColumn, 48_200_000, 23_400_000_000))
+	sharded.ChangeSet.Shards = []*ternv1.ShardPlan{
+		{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{TableName: "mutes", Ddl: addColumn}}},
+		{Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{{TableName: "mutes", Ddl: addIndex}}},
+	}
+	rollup := api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{
+		sizedMember("testapp_1", created),
+		sharded,
+	}}
+
+	sizes := targetTableSizes(rollup)
+
+	require.Len(t, sizes, 1)
+	assert.Equal(t, "primary/testapp_2", sizes[0].Target)
+	assert.Equal(t, "mutes", sizes[0].Size.Table)
+	require.NotNil(t, sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, int64(23_400_000_000), *sizes[0].Size.EstimatedBytes)
+}
+
+// A clean multi-target rollup carries each target's table sizes into the
+// preview, so the plan comment totals a table across targets. A blocked
+// rollup carries none, and the size section falls back to the reviewed plan.
+func TestReviewDriftPreview_TableSizesOnlyForCleanRollup(t *testing.T) {
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+	entries := func() []api.DeploymentRollupEntry {
+		return []api.DeploymentRollupEntry{
+			sizedMember("testapp_1", sizedChange("orders", addIndex, 1_000, 100_000)),
+			sizedMember("testapp_2", sizedChange("orders", addIndex, 48_200_000, 23_400_000_000)),
+		}
+	}
+
+	clean := reviewDriftPreview(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: entries()})
+	require.NotNil(t, clean)
+	require.Len(t, clean.TableSizes, 2)
+	assert.Equal(t, "primary/testapp_1", clean.TableSizes[0].Target)
+	assert.Equal(t, "primary/testapp_2", clean.TableSizes[1].Target)
+
+	blocked := reviewDriftPreview(api.PlanRollup{Clean: false, Planning: api.PlanIndependent, Entries: entries()})
+	require.NotNil(t, blocked)
+	assert.Empty(t, blocked.TableSizes)
+
+	single := reviewDriftPreview(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: entries()[:1]})
+	assert.Nil(t, single, "a single-target plan has no rollup preview")
 }

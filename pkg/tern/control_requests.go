@@ -95,6 +95,20 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
 }
 
+// settleRequestsForStoredOutcome settles the pending control requests that an
+// apply's durably stored terminal outcome moots. A settlement failure is
+// logged rather than returned: the outcome is stored, so the summary is owed
+// (RC-5 withholds a summary only for an outcome storage never held) and the
+// caller proceeds to release the gauge and notify the observer. The unsettled
+// requests stay pending for the operator's post-drive settlement, and an
+// operator can re-issue one; a summary that never posts has no such recovery.
+func (c *LocalClient) settleRequestsForStoredOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply) {
+	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		logger.Warn("failed to settle pending control requests for the stored terminal outcome; they stay pending for the operator's post-drive settlement and the terminal summary still posts",
+			"state", apply.State, "error", err)
+	}
+}
+
 // SettlePendingCancelForResolvedApply settles the pending cancel of an apply
 // that has reached a terminal state, whichever path drove it there. An apply
 // resolves under more than one drive shape, and every one of them owes the

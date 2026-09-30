@@ -1049,6 +1049,27 @@ func TestPlanWithEngine_RefusesIgnoredNamespacesOnDatabaseScopedMySQLDSN(t *test
 	assert.Contains(t, err.Error(), "local_fixtures")
 }
 
+// A targets entry that selects namespaces withholds the rest the same way
+// ignore_namespaces does: they live on another target, or are still on this one
+// until moved. On a database-scoped DSN their live tables would have no
+// declaring file, so the plan refuses rather than proposing to drop them.
+func TestPlanWithEngine_RefusesUnselectedNamespacesOnDatabaseScopedMySQLDSN(t *testing.T) {
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "user:pass@tcp(localhost:3306)/orders",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	_, err = client.planWithEngine(t.Context(), &ternv1.PlanRequest{
+		Database:             "orders",
+		UnselectedNamespaces: []string{"ns_1"},
+	}, "orders", schema.SchemaFiles{"ns_0": {Files: map[string]string{"orders.sql": "CREATE TABLE orders (id INT)"}}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database")
+	assert.Contains(t, err.Error(), "unselected namespaces [ns_1] would have their live tables planned as DROP TABLE")
+}
+
 func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
 	changes := []storage.TableChange{{
 		Namespace:    "testdb",
@@ -1493,7 +1514,7 @@ func TestExecuteGroupedApplySaveFailureAfterAcceptPausesForRetry(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false)
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
 
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.FailedRetryable),
 		"apply must pause for operator retry, got %s", applyStore.apply.State)
@@ -3163,6 +3184,45 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 		assert.True(t, ok, "current op row present, projection must be determined")
 		assert.Equal(t, state.Apply.RunningDegraded, got, "continue policy must hold the apply degraded until the pending sibling settles")
+	})
+
+	// In a targets-list rollout under continue, this drive's shard -80 of
+	// payments-001 has just failed while its stored row still reads running.
+	// That failure orphans payments-001's pending finalizer, and payments-002
+	// has completed, so the apply settles failed, exactly as the operator's
+	// stored derivation settles it.
+	t.Run("continue settles failed past a finalizer this drive's failure orphans", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		started := time.Now()
+		op := func(id int64, target, key, kind, opState string) *storage.ApplyOperation {
+			return &storage.ApplyOperation{
+				ID: id, Deployment: "payments-a", Target: target,
+				OperationKey: storage.TargetOperationKey(target, key), OperationKind: kind,
+				State: opState, OnFailure: storage.OnFailureContinue, StartedAt: &started,
+			}
+		}
+		pendingFinalizer := op(3, "payments-001", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending)
+		pendingFinalizer.StartedAt = nil
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						op(currentOpID, "payments-001", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Running),
+						op(2, "payments-001", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						pendingFinalizer,
+						op(4, "payments-002", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						op(5, "payments-002", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						op(6, "payments-002", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Completed),
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-orphaned-finalizer"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "current op row present, projection must be determined")
+		assert.Equal(t, state.Apply.Failed, got, "no row left can move, so the continue rollout takes its failed verdict")
 	})
 
 	// Under on_failure "pause" a terminally failed deployment holds the apply

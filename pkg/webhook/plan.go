@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
-	"github.com/block/schemabot/pkg/routing"
+	schemapkg "github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -143,12 +145,13 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Roll up every deployment's diff against the reviewed plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 
 	// Build plan comment data
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint())
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
+	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
@@ -449,6 +452,21 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+		if api.NamespacePlacementRefused(err) {
+			h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
+				"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
+			multiEnvData.Errors[env] = userFacingError(err)
+			sha, checkErr := h.storeNamespacePlacementCheck(ctx, client, repo, pr, schemaResult, env)
+			if checkErr != nil {
+				h.logger.Error("failed to store namespace placement check record; posting a failing aggregate for the environment instead",
+					"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", checkErr)
+				driftBlockUnstored[env] = namespacePlacementCheckSummary
+			}
+			if sha != "" {
+				headSHA = sha
+			}
+			continue
+		}
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
@@ -457,7 +475,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the reviewed plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -483,11 +501,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			headSHA = sha
 		}
 
-		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
+		h.annotateMemberApplyRefusal(ctx, &commentData, planResp, env, drift, repo, pr)
 		multiEnvData.Plans[env] = &commentData
 	}
 
@@ -920,6 +939,18 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 	return discarded, adopted, running
 }
 
+// setNamespaceWork records on a keyspace's comment data the namespace-level
+// work the engine planned beside its DDL: a VSchema change to show, with its
+// rendered diff, and a finalize. The plan and rollback comments both read it
+// through here so they describe the same plan the same way.
+func setNamespaceWork(ks *templates.KeyspaceChangeData, sc *apitypes.SchemaChangeResponse) {
+	if sc.ShowsVSchemaChange() {
+		ks.VSchemaChanged = true
+		ks.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
+	}
+	ks.Finalize = sc.NeedsFinalizer()
+}
+
 // planCommentDatabaseFlag returns the database a plan comment's copy-paste
 // commands name, empty when they are to stay unscoped.
 //
@@ -942,19 +973,115 @@ func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoP
 	return ""
 }
 
+// tableCostScalesWithSize reports whether any statement the plan runs against
+// a table has a cost that grows with the table: an index build, a table copy or
+// rebuild, or a full-table validation scan. It uses the real parser for the
+// database's dialect. A table's DDL can join several statements, and a sharded
+// namespace carries each shard's DDL, so every entry is split and each
+// statement inspected. Table sizes are display-only context, so DDL that cannot
+// be split or parsed logs a warning and contributes no size line rather than
+// failing the comment. logAttrs identify the plan and table in those warnings.
+func tableCostScalesWithSize(databaseType string, ddls []string, logAttrs ...any) bool {
+	parser, err := ddl.ParserForDialect(schemapkg.DialectForDatabaseType(databaseType))
+	if err != nil {
+		slog.Warn("no statement parser for dialect; plan comment omits the table-size line",
+			slices.Concat(logAttrs, []any{"database_type", databaseType, "error", err})...)
+		return false
+	}
+	for _, d := range ddls {
+		stmts, err := parser.Split(d)
+		if err != nil {
+			slog.Warn("failed to split plan DDL for table-size-scaling cost; its statements get no table-size line",
+				slices.Concat(logAttrs, []any{"database_type", databaseType, "error", err})...)
+			continue
+		}
+		for _, stmt := range stmts {
+			scales, err := parser.CostScalesWithTableSize(stmt)
+			if err != nil {
+				slog.Warn("failed to inspect plan statement for table-size-scaling cost; it gets no table-size line",
+					slices.Concat(logAttrs, []any{"database_type", databaseType, "error", err})...)
+				continue
+			}
+			if scales {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// planTableRef names a table within a plan namespace.
+type planTableRef struct{ namespace, table string }
+
+// shardDDLByTable collects every shard's DDL for each table, so a sharded
+// namespace's size lines are decided from what each shard runs rather than
+// from the one statement the namespace view keeps per table.
+func shardDDLByTable(shards []*apitypes.ShardPlanResponse) map[planTableRef][]string {
+	byTable := make(map[planTableRef][]string)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t == nil || t.DDL == "" {
+				continue
+			}
+			ref := planTableRef{sp.Namespace, t.TableName}
+			byTable[ref] = append(byTable[ref], t.DDL)
+		}
+	}
+	return byTable
+}
+
+// planTableSizes lists the size estimate of each existing table a namespace's
+// plan copies, rebuilds, or scans. Metadata-only changes get no size line,
+// since a size beside them would be noise on the plan, and neither do tables
+// the plan creates, which have no data yet. A table is listed once however
+// many statements change it, since each statement carries the whole table's
+// estimate.
+func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaChangeResponse, shardDDL map[planTableRef][]string) []templates.TableSizeData {
+	var sizes []templates.TableSizeData
+	listed := make(map[string]bool)
+	for _, t := range sc.TableChanges {
+		logAttrs := []any{"repo", schema.Repository, "database", schema.Database, "namespace", sc.Namespace, "table", t.TableName}
+		if listed[t.TableName] {
+			slog.Debug("table already has a size line; skipping its further statements", logAttrs...)
+			continue
+		}
+		if ddl.OpToStatementType(t.ChangeType) == ddl.StatementCreateTable {
+			slog.Debug("table is created by this plan; it has no size to show", logAttrs...)
+			continue
+		}
+		ddls := append([]string{t.DDL}, shardDDL[planTableRef{sc.Namespace, t.TableName}]...)
+		if !tableCostScalesWithSize(schema.Type, ddls, logAttrs...) {
+			slog.Debug("table's changes are metadata-only; it gets no size line", logAttrs...)
+			continue
+		}
+		listed[t.TableName] = true
+		sizes = append(sizes, templates.TableSizeData{
+			Table:          t.TableName,
+			ShardCount:     t.ShardCount,
+			EstimatedBytes: t.EstimatedBytes,
+		})
+	}
+	return sizes
+}
+
 // buildPlanCommentData converts plan results into template data.
-func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
+func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint, cliName string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
 		Database:          schema.Database,
 		Environment:       environment,
 		Tenant:            tenant,
 		AgentHint:         agentHint,
+		CLIName:           cliName,
 		HeadSHA:           schema.HeadSHA,
 		Repository:        schema.Repository,
 		RequestedBy:       requestedBy,
 		DatabaseType:      schema.Type,
 		IsMySQL:           schema.Type == "mysql",
 		IgnoredNamespaces: schema.IgnoredNamespaces,
+		PlanID:            planResp.PlanID,
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {
@@ -1006,20 +1133,17 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	}
 
 	// Build keyspace changes from namespace-grouped plan response
+	shardDDL := shardDDLByTable(planResp.Shards)
 	for _, sc := range planResp.Changes {
 		ksData := templates.KeyspaceChangeData{
-			Keyspace: sc.Namespace,
-			Shards:   shardsByKeyspace[sc.Namespace],
+			Keyspace:   sc.Namespace,
+			Shards:     shardsByKeyspace[sc.Namespace],
+			TableSizes: planTableSizes(schema, sc, shardDDL),
 		}
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
 		}
-		// Extract VSchema changes from metadata
-		if sc.HasVSchemaChange() {
-			ksData.VSchemaChanged = true
-			ksData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
-		}
-		ksData.Finalize = sc.NeedsFinalizer()
+		setNamespaceWork(&ksData, sc)
 		data.Changes = append(data.Changes, ksData)
 	}
 
@@ -1107,6 +1231,8 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 		}
 	}
+
+	data.AllChangesDirect = planResp.AllChangesDirect()
 
 	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 
