@@ -1118,22 +1118,33 @@ func TestRenderMultiDeploymentApplyComment_PausedRolloutWithPendingCutoverShares
 	require.Equal(t, state.Apply.Paused, model.State)
 	require.Equal(t, presentation.NextActionCutover, model.NextAction.Kind)
 
-	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
-		Model:       model,
-		ApplyID:     "apply-123",
-		Environment: "production",
-		Details: []*ApplyStatusCommentData{
-			{Database: "orders_us", State: state.Apply.WaitingForCutover, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
-			{Database: "orders_eu", State: state.Apply.Failed, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
-			{Database: "orders_ap", State: state.Apply.Pending, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
-		},
-	})
+	for _, tc := range []struct {
+		name         string
+		deferCutover bool
+		cutoverLine  string
+	}{
+		{name: "deferred", deferCutover: true, cutoverLine: "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"},
+		{name: "automatic", cutoverLine: "SchemaBot will cut over `us` next — no action needed.\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+				Model:       model,
+				ApplyID:     "apply-123",
+				Environment: "production",
+				Details: []*ApplyStatusCommentData{
+					{Database: "orders_us", State: state.Apply.WaitingForCutover, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
+					{Database: "orders_eu", State: state.Apply.Failed, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
+					{Database: "orders_ap", State: state.Apply.Pending, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
+				},
+			})
 
-	footer := out[strings.LastIndex(out, "</details>"):]
-	assert.Contains(t, footer, "\n---\n\nTo cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"+
-		"\nPaused after a failure — to let the held deployments proceed:\n```\nschemabot release apply-123 -e production\n```\n"+
-		"\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n", out)
-	assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
+			footer := out[strings.LastIndex(out, "</details>"):]
+			assert.Contains(t, footer, "\n---\n\n"+tc.cutoverLine+
+				"\nPaused after a failure — to let the held deployments proceed:\n```\nschemabot release apply-123 -e production\n```\n"+
+				"\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n", out)
+			assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
+		})
+	}
 }
 
 // A terminal apply refuses stop and cancel, so no terminal aggregate state
