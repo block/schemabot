@@ -405,6 +405,18 @@ func TargetOperationKey(target, scopedKey string) string {
 	return target + OperationKeyDelimiter + scopedKey
 }
 
+// KeyedByTarget reports whether the operation is whole-target work keyed by
+// its target alone (TargetOperationKey(target, "")), the key each target of a
+// deployment addressing several attaches its own work under. Within one apply,
+// a deployment's operations are either all keyed this way or none are: the
+// same target's work under a second key shape would run its DDL twice.
+func (op *ApplyOperation) KeyedByTarget() bool {
+	if op == nil || op.Target == "" || op.OperationKind == ApplyOperationKindGroupFinalizer {
+		return false
+	}
+	return op.OperationKey == TargetOperationKey(op.Target, "")
+}
+
 // PlanIDForOperation resolves which plan an operation executes: its own when it
 // has one, and its parent apply's otherwise. Members of one apply share the
 // apply's plan when they are planned together, and carry their own plan when

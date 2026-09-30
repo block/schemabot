@@ -160,6 +160,29 @@ func TestApplyStore_AttachOperationWithTasksRejectsDuplicateKey(t *testing.T) {
 	assert.Len(t, storedTasks, 1, "the duplicate attach must not insert its tasks")
 }
 
+// An operation keyed by its target alone cannot attach beside the fixture's
+// shard-keyed operation for the same deployment: both would carry the
+// payments target's work under different keys, so the attach fails closed
+// with ErrApplyOperationKeyingMismatch and leaves no rows behind.
+func TestApplyStore_AttachOperationWithTasksRefusesMixedTargetKeying(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	apply := createAttachFixtureApply(t, store)
+
+	operation, tasks := attachSiblingOperation(storage.TargetOperationKey("payments", ""), "")
+	require.True(t, operation.KeyedByTarget())
+	err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	require.ErrorIs(t, err, storage.ErrApplyOperationKeyingMismatch)
+
+	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, listErr)
+	assert.Len(t, ops, 1, "the refused attach must not insert its operation")
+	storedTasks, tasksErr := store.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, tasksErr)
+	assert.Len(t, storedTasks, 1, "the refused attach must not insert its tasks")
+}
+
 // Attaching to a terminal apply fails closed with ErrApplyNotActive: the
 // apply's target reservation is released and no drive will claim new work
 // under it, so accepting the operation would strand it as permanently pending.

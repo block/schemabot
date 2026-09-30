@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -487,4 +488,80 @@ func TestLocalClient_Apply_MemberTargetsShareTheDeploymentsApply(t *testing.T) {
 	ops, err = stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Len(t, ops, 2, "the refused dispatch must not attach an operation")
+}
+
+// A direct caller dispatches payments-001's plan under one idempotency key,
+// once naming payments-001 as the rollout member and once naming no member,
+// with no generation manifest to hold the key set. The two shapes derive
+// different operation keys for the same target's work, so each is refused
+// once the apply holds the other: a replay under the other shape never
+// attaches a second copy of payments-001's DDL, in either order. A sibling
+// target of the same shape still attaches.
+func TestLocalClient_Apply_MemberTargetKeyingCannotMixWithinADeployment(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	memberDispatch := func(planID, key, target string) *ternv1.ApplyRequest {
+		req := memberTargetDispatchRequest(planID, key, target)
+		req.GenerationOperationKeys = nil
+		return req
+	}
+	unnamedDispatch := func(planID, key, target string) *ternv1.ApplyRequest {
+		req := memberDispatch(planID, key, target)
+		req.Options = nil
+		return req
+	}
+	operationKeys := func(t *testing.T, stor storage.Storage, applyID string) []string {
+		t.Helper()
+		apply, err := stor.Applies().GetByApplyIdentifier(t.Context(), applyID)
+		require.NoError(t, err)
+		require.NotNil(t, apply)
+		ops, err := stor.ApplyOperations().ListByApply(t.Context(), apply.ID)
+		require.NoError(t, err)
+		keys := make([]string, 0, len(ops))
+		for _, op := range ops {
+			keys = append(keys, op.OperationKey)
+		}
+		slices.Sort(keys)
+		return keys
+	}
+	t.Run("member dispatch first", func(t *testing.T) {
+		const key = "schemabot:v1:member-keying-member-first"
+		stor, client, basePlanID := setupAttachDispatchClient(t)
+		firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+		secondPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-002")
+
+		created, err := client.Apply(t.Context(), memberDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		require.True(t, created.Accepted, "the member dispatch must create the apply: %s", created.ErrorMessage)
+		assert.Equal(t, "payments-001", created.OperationKey)
+
+		unnamed, err := client.Apply(t.Context(), unnamedDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		assert.False(t, unnamed.Accepted, "a replay naming no member must not attach payments-001's DDL a second time")
+		assert.Contains(t, unnamed.ErrorMessage, "cannot share one deployment's apply")
+
+		sibling, err := client.Apply(t.Context(), memberDispatch(secondPlanID, key, "payments-002"))
+		require.NoError(t, err)
+		require.True(t, sibling.Accepted, "a sibling member target must still attach: %s", sibling.ErrorMessage)
+		assert.Equal(t, []string{"payments-001", "payments-002"}, operationKeys(t, stor, created.ApplyId))
+	})
+
+	t.Run("unnamed dispatch first", func(t *testing.T) {
+		const key = "schemabot:v1:member-keying-unnamed-first"
+		stor, client, basePlanID := setupAttachDispatchClient(t)
+		firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+
+		created, err := client.Apply(t.Context(), unnamedDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		require.True(t, created.Accepted, "the dispatch naming no member must create the apply: %s", created.ErrorMessage)
+		assert.Empty(t, created.OperationKey)
+
+		named, err := client.Apply(t.Context(), memberDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		assert.False(t, named.Accepted, "a replay naming the member must not attach payments-001's DDL a second time")
+		assert.Contains(t, named.ErrorMessage, "cannot share one deployment's apply")
+		assert.Equal(t, []string{""}, operationKeys(t, stor, created.ApplyId))
+	})
 }
