@@ -182,7 +182,7 @@ func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []depl
 
 		target := dbName + "-" + spec.name + "-target"
 		if planning == api.PlanIndependent {
-			deployments[spec.name] = api.DeploymentTarget{Targets: []string{target}}
+			deployments[spec.name] = api.DeploymentTarget{Targets: []api.TargetEntry{{Target: target}}}
 		} else {
 			deployments[spec.name] = api.DeploymentTarget{Target: target}
 		}

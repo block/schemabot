@@ -63,6 +63,8 @@ func (s *Service) pullTargetSchema(
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
+	namespaces = s.memberPullNamespaces(req, target, namespaces)
+
 	isRemoteTarget := client.IsRemote()
 	s.logger.Info("ExecutePullSchema: calling PullSchema",
 		"database", req.Database,
@@ -133,6 +135,40 @@ func (s *Service) pullTargetSchema(
 
 	span.SetAttributes(attribute.Int("table_count", int(merged.TableCount)))
 	return merged, nil
+}
+
+// memberPullNamespaces narrows the namespaces a pull asks one target for to the
+// namespaces its targets entry selects. A target that selects none is pulled
+// exactly as requested.
+//
+// A pull of every namespace becomes one call per selected namespace, so the
+// data plane is asked for names rather than left to discover them: the
+// selection outranks a live scan, and a target DSN bound to a different
+// database refuses a named namespace instead of answering with its own. An
+// explicitly requested namespace the target does not select is left out, since
+// the configuration does not place it there.
+func (s *Service) memberPullNamespaces(req apitypes.PullSchemaRequest, target routing.ExecutionTarget, namespaces []string) []string {
+	if len(target.Namespaces) == 0 {
+		return namespaces
+	}
+	if len(namespaces) == 1 && namespaces[0] == "" {
+		return slices.Clone(target.Namespaces)
+	}
+	selected := make([]string, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		if !slices.Contains(target.Namespaces, namespace) {
+			s.logger.Info("pull skips a requested namespace the target's entry does not select",
+				"database", req.Database,
+				"environment", req.Environment,
+				"deployment", target.Deployment,
+				"target", target.Target,
+				"namespace", namespace,
+				"selected_namespaces", target.Namespaces)
+			continue
+		}
+		selected = append(selected, namespace)
+	}
+	return selected
 }
 
 // pullMemberDivergence reports every rollout member of an environment whose

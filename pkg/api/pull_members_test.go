@@ -96,7 +96,7 @@ func (c *perTargetPullClient) pulledTargets() []string {
 }
 
 func multiTargetPullEnv() EnvironmentConfig {
-	return EnvironmentConfig{Deployment: "eu", Targets: []string{"testapp-001", "testapp-002"}}
+	return EnvironmentConfig{Deployment: "eu", Targets: targetNames("testapp-001", "testapp-002")}
 }
 
 // An environment whose targets each hold their own schema has no single live
@@ -167,7 +167,7 @@ func TestExecutePullSchema_NamesEveryTargetExactlyOncePrimaryFirst(t *testing.T)
 		"testapp-002": pulledTables(map[string]string{"users": pullUsersDDL}),
 		"testapp-003": pulledTables(map[string]string{"users": pullUsersDDL}),
 	}, nil)
-	env := EnvironmentConfig{Deployment: "eu", Targets: []string{"testapp-001", "testapp-002", "testapp-003"}}
+	env := EnvironmentConfig{Deployment: "eu", Targets: targetNames("testapp-001", "testapp-002", "testapp-003")}
 	svc := pullTargetService(t, env, map[string]tern.Client{"eu/production": client})
 
 	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())

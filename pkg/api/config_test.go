@@ -2596,7 +2596,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "cutover_policy parallel and on_failure continue with a targets list are accepted",
 			envConfig: EnvironmentConfig{
 				Deployment:    "payments-a",
-				Targets:       []string{"payments-001", "payments-002"},
+				Targets:       targetNames("payments-001", "payments-002"),
 				CutoverPolicy: storage.CutoverPolicyParallel,
 				OnFailure:     storage.OnFailureContinue,
 			},
@@ -2657,7 +2657,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "environment targets list is accepted",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", "payments-002"},
+				Targets:    targetNames("payments-001", "payments-002"),
 			},
 			tern: baseTern,
 		},
@@ -2666,7 +2666,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
 				Target:     "payments-001",
-				Targets:    []string{"payments-001", "payments-002"},
+				Targets:    targetNames("payments-001", "payments-002"),
 			},
 			tern:       baseTern,
 			wantErrSub: "cannot configure both target and targets",
@@ -2676,7 +2676,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
 				Target:     "payments-001",
-				Targets:    []string{},
+				Targets:    targetNames(),
 			},
 			tern:       baseTern,
 			wantErrSub: "cannot configure both target and targets",
@@ -2685,7 +2685,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "empty environment targets list is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{},
+				Targets:    targetNames(),
 			},
 			tern:       baseTern,
 			wantErrSub: "targets list is empty",
@@ -2694,7 +2694,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "empty entry in environment targets is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", ""},
+				Targets:    targetNames("payments-001", ""),
 			},
 			tern:       baseTern,
 			wantErrSub: "targets entry 1 is empty",
@@ -2703,7 +2703,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "repeated environment target is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", "payments-001"},
+				Targets:    targetNames("payments-001", "payments-001"),
 			},
 			tern:       baseTern,
 			wantErrSub: `lists target "payments-001" more than once`,
@@ -2712,7 +2712,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "environment target containing the operation key delimiter is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", "payments/002"},
+				Targets:    targetNames("payments-001", "payments/002"),
 			},
 			tern:       baseTern,
 			wantErrSub: `targets entry 1 "payments/002" contains reserved delimiter "/"`,
@@ -2720,7 +2720,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 		{
 			name: "environment targets without a deployment is rejected",
 			envConfig: EnvironmentConfig{
-				Targets: []string{"payments-001", "payments-002"},
+				Targets: targetNames("payments-001", "payments-002"),
 			},
 			tern:       baseTern,
 			wantErrSub: "missing deployment",
@@ -2730,7 +2730,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			envConfig: EnvironmentConfig{
 				DSN:        "root@tcp(localhost)/payments",
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001"},
+				Targets:    targetNames("payments-001"),
 			},
 			tern:       baseTern,
 			wantErrSub: "cannot configure both local DSN and target/deployment(s)",
@@ -2739,7 +2739,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "deployment targets list is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments-001", "payments-002"}},
+					"payments-a": {Targets: targetNames("payments-001", "payments-002")},
 					"payments-b": {Target: "payments-003"},
 				},
 			},
@@ -2749,7 +2749,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "deployment target and targets together are rejected",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Target: "payments-001", Targets: []string{"payments-002"}},
+					"payments-a": {Target: "payments-001", Targets: targetNames("payments-002")},
 				},
 			},
 			tern:       baseTern,
@@ -2759,7 +2759,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "repeated target within one deployment is rejected",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments-001", "payments-001"}},
+					"payments-a": {Targets: targetNames("payments-001", "payments-001")},
 				},
 			},
 			tern:       baseTern,
@@ -2769,7 +2769,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "deployment target containing the operation key delimiter is rejected",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments/001", "payments-002"}},
+					"payments-a": {Targets: targetNames("payments/001", "payments-002")},
 				},
 			},
 			tern:       baseTern,
@@ -2779,8 +2779,8 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "the same target under different deployments is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments-001", "payments-002"}},
-					"payments-b": {Targets: []string{"payments-001", "payments-002"}},
+					"payments-a": {Targets: targetNames("payments-001", "payments-002")},
+					"payments-b": {Targets: targetNames("payments-001", "payments-002")},
 				},
 			},
 			tern: baseTern,
@@ -5416,7 +5416,7 @@ func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
 				Environments: map[string]EnvironmentConfig{
 					"production": {
 						Deployment: "payments-a",
-						Targets:    []string{"payments-002", "payments-001"},
+						Targets:    targetNames("payments-002", "payments-001"),
 					},
 				},
 			},
@@ -5425,7 +5425,7 @@ func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
 				Environments: map[string]EnvironmentConfig{
 					"production": {
 						Deployments: map[string]DeploymentTarget{
-							"payments-b": {Targets: []string{"payments-003", "payments-004"}},
+							"payments-b": {Targets: targetNames("payments-003", "payments-004")},
 							"payments-a": {Target: "payments-001"},
 						},
 						DeploymentOrder: []string{"payments-a", "payments-b"},
@@ -5438,7 +5438,7 @@ func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
 					"production": {
 						Deployment: "payments-a",
 						Target:     "payments-001",
-						Targets:    []string{"payments-002"},
+						Targets:    targetNames("payments-002"),
 					},
 				},
 			},
@@ -5507,9 +5507,9 @@ func TestServerConfig_MultiTargetIsMySQLOnly(t *testing.T) {
 			},
 		}
 	}
-	envTargets := EnvironmentConfig{Deployment: "payments-a", Targets: []string{"payments-001", "payments-002"}}
+	envTargets := EnvironmentConfig{Deployment: "payments-a", Targets: targetNames("payments-001", "payments-002")}
 	mapTargets := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
-		"payments-a": {Targets: []string{"payments-001", "payments-002"}},
+		"payments-a": {Targets: targetNames("payments-001", "payments-002")},
 	}}
 	mirrored := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
 		"payments-a": {Target: "payments"},
@@ -5555,9 +5555,9 @@ func TestEnvironmentConfig_UsesTargetsList(t *testing.T) {
 		{name: "deployments map of single targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
 			"a": {Target: "payments"}, "b": {Target: "payments"},
 		}}},
-		{name: "environment targets", env: EnvironmentConfig{Deployment: "a", Targets: []string{"payments-001"}}, want: true},
+		{name: "environment targets", env: EnvironmentConfig{Deployment: "a", Targets: targetNames("payments-001")}, want: true},
 		{name: "deployments entry targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
-			"a": {Target: "payments-001"}, "b": {Targets: []string{"payments-002"}},
+			"a": {Target: "payments-001"}, "b": {Targets: targetNames("payments-002")},
 		}}, want: true},
 	}
 	for _, tc := range cases {
@@ -5581,9 +5581,9 @@ func TestServerConfig_MemberPlanningFor(t *testing.T) {
 					"scalar":       {Deployment: "payments-a", Target: "payments-001"},
 					"local":        {DSN: "root@tcp(localhost)/payments"},
 					"mirrored":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}, "payments-b": {Target: "payments"}}},
-					"targets":      {Deployment: "payments-a", Targets: []string{"payments-001", "payments-002"}},
-					"map-targets":  {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: []string{"payments-001", "payments-002"}}}},
-					"mixed-shapes": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments-001"}, "payments-b": {Targets: []string{"payments-002"}}}},
+					"targets":      {Deployment: "payments-a", Targets: targetNames("payments-001", "payments-002")},
+					"map-targets":  {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetNames("payments-001", "payments-002")}}},
+					"mixed-shapes": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments-001"}, "payments-b": {Targets: targetNames("payments-002")}}},
 				},
 			},
 		},
@@ -5748,4 +5748,14 @@ func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, policy)
 	})
+}
+
+// targetNames builds a targets list of bare target names, the spelling that
+// selects no namespaces.
+func targetNames(targets ...string) []TargetEntry {
+	entries := make([]TargetEntry, 0, len(targets))
+	for _, target := range targets {
+		entries = append(entries, TargetEntry{Target: target})
+	}
+	return entries
 }

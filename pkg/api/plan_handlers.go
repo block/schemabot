@@ -660,6 +660,29 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, typeErr
 	}
+	// The primary plans, and its plan row records, only the namespaces its
+	// targets entry selects. req is this call's copy, so narrowing it here
+	// leaves the caller's request, which the other members are planned from,
+	// untouched.
+	primarySchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "select namespaces")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		return nil, nil, err
+	}
+	if len(resolvedTarget.Namespaces) > 0 {
+		s.logger.Info("plan covers only the namespaces the primary target's entry selects",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"target", resolvedTarget.Target,
+			"repository", req.Repository,
+			"namespaces", resolvedTarget.Namespaces,
+			"declared_namespace_count", len(req.SchemaFiles))
+	}
+	req.SchemaFiles = primarySchemaFiles
 
 	prInt := 0
 	if req.PullRequest != nil {
