@@ -18,13 +18,13 @@ const {chromium}=require('playwright');
   await page.goto(pathToFileURL(path.join(root,'assets/src/init-demo.html')).href);
   await page.evaluate(data=>window.setRecording(data),recording);
   const frames=[],fps=10;let previous;
-  for(let i=0;i<=(recording.apply_frames?38:recording.sample?26:42)*fps;i++){
+  for(let i=0;i<=(recording.apply_frames?30:recording.sample?26:42)*fps;i++){
    await page.evaluate(t=>window.renderFrame(t,.1),i/fps);
    const frame=path.join(tmp,String(i).padStart(4,'0')+'.png');
    const pixels=await page.screenshot();
    if(previous && pixels.equals(previous))frames[frames.length-1].delay+=10;
    else { fs.writeFileSync(frame,pixels);frames.push({path:frame,delay:10});previous=pixels; }
-   if([30,85,110,130,160,190,220,250,280,310,330,370,400].includes(i))fs.writeFileSync(path.join(tmp,'preview-'+i+'.png'),pixels);
+   if([25,45,65,85,105,145,195,225,245,280,300,400].includes(i))fs.writeFileSync(path.join(tmp,'preview-'+i+'.png'),pixels);
   }
   const palette=path.join(tmp,'palette.png');
   execFileSync('magick',[...frames.filter((_,i)=>i%5===0).map(f=>f.path),'-append','-colors','256','-unique-colors',palette]);
