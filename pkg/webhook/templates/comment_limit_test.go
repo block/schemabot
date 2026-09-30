@@ -304,7 +304,7 @@ func TestPlanCommentCutDDLNamesTheStoredPlan(t *testing.T) {
 
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
 	assert.Equal(t, 1, strings.Count(body, planPointerMarker("plan_7c41f9")))
-	assert.Contains(t, body, "`schemabot list-plans plan_7c41f9` prints the full plan.")
+	assert.Contains(t, body, "the full plan is available from the CLI with `schemabot list-plans plan_7c41f9`.")
 	assert.NotContains(t, body, ddlTruncatedMarker)
 }
 

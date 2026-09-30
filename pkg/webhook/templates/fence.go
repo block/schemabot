@@ -44,9 +44,16 @@ const ddlTruncatedMarker = "_DDL truncated to fit GitHub's comment size limit; t
 // planPointerMarker follows a DDL block that was cut to fit the budget when the
 // DDL comes from a stored plan. The schema files hold the desired schema, not
 // the statements the plan would run, so a reader who needs the statements the
-// comment could not show is pointed at the stored plan that holds them.
+// comment could not show is pointed at the stored plan that holds them. The
+// command is labelled as a CLI command because every other schemabot command a
+// plan comment names is a PR-comment command, and this one is not.
 func planPointerMarker(planID string) string {
-	return "_DDL truncated to fit GitHub's comment size limit; " + inlineCode("schemabot list-plans "+planID) + " prints the full plan._\n"
+	return "_DDL truncated to fit GitHub's comment size limit; the full plan is available from the CLI with " + listPlanCommand(planID) + "._\n"
+}
+
+// listPlanCommand is the CLI command that prints the stored plan planID in full.
+func listPlanCommand(planID string) string {
+	return inlineCode("schemabot list-plans " + planID)
 }
 
 // fenceOverhead is the byte count of a block's fixed text beyond the two fence
