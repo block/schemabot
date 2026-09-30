@@ -686,6 +686,18 @@ func TestBuildApplyOperationGroups_MemberWorkTheApplyShapeCannotCarryIsRefused(t
 		{name: "table changes reviewed, member changes only shards", reviewed: flatPlan, member: shardChangesOnlyPlan},
 		{name: "per-shard changes reviewed, member changes only tables", reviewed: shardedPlan, member: flatPlan},
 		{name: "VSchema change reviewed, member changes tables", reviewed: vschemaOnlyPlan, member: flatPlan},
+		{name: "table changes reviewed, member changes tables in one namespace and only shards in another", reviewed: flatPlan, member: func(p *storage.Plan) *storage.Plan {
+			p = flatPlan(p)
+			p.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "ledger", Changes: []storage.TableChange{{
+				Namespace: "ledger", Table: "entries", Operation: "alter", DDL: "ALTER TABLE `entries` ADD COLUMN `memo` text",
+			}}}}
+			return p
+		}},
+		{name: "VSchema change reviewed, member finalizes and changes only shards", reviewed: vschemaOnlyPlan, member: func(p *storage.Plan) *storage.Plan {
+			p = vschemaOnlyPlan(p)
+			p.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "testapp", Changes: []storage.TableChange{alter}}}
+			return p
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			applyPlan := tc.reviewed(primaryPlanRow("testapp-001"))
@@ -703,4 +715,95 @@ func TestBuildApplyOperationGroups_MemberWorkTheApplyShapeCannotCarryIsRefused(t
 			assert.Nil(t, groups)
 		})
 	}
+}
+
+// The reviewed plan chooses the apply's shape, and outside the per-shard shape
+// its own per-shard changes are only carried by table statements for the same
+// namespace. A reviewed plan whose shards change with no such statement would
+// build an operation with nothing to run on the reviewed target, so apply
+// creation refuses it, naming the reviewed target.
+func TestBuildApplyOperationGroups_ReviewedShardWorkTheApplyShapeCannotCarryIsRefused(t *testing.T) {
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+	applyPlan := primaryPlanRow("testapp-001")
+	applyPlan.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "testapp", Changes: []storage.TableChange{alter}}}
+	sibling := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+	sibling.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-001"}, Plan: applyPlan},
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}, Plan: sibling},
+	}
+
+	groups, _, err := buildApplyOperationGroups(applyPlan, applyTaskChanges(applyPlan), members,
+		"production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.Error(t, err, "built %d groups", len(groups))
+	assert.Contains(t, err.Error(), "rollout member eu/testapp-001")
+	assert.Contains(t, err.Error(), "per-shard changes in namespaces [testapp]")
+	assert.Nil(t, groups)
+}
+
+// A finalizer-only apply gives every member a finalizer. A member planned on
+// its own that already holds the change has no namespace to finalize, so its
+// finalizer is recorded as settled at creation rather than left pending for a
+// driver that could not run it, while the reviewed target's finalizer waits to
+// be driven.
+func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation(t *testing.T) {
+	applyPlan := primaryPlanRow("testapp-001")
+	applyPlan.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {
+		Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{"users":{}}}`},
+	}}
+	converged := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+	converged.ID = 11
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-001"}, Plan: applyPlan},
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}, Plan: converged},
+	}
+
+	now := pershardTestTime()
+	groups, sharded, err := buildApplyOperationGroups(applyPlan, applyTaskChanges(applyPlan), members,
+		"production", storage.ApplyOptions{}, "", "", now)
+	require.NoError(t, err)
+	assert.False(t, sharded)
+	require.Len(t, groups, 2)
+	byTarget := map[string]*storage.ApplyOperation{}
+	for _, group := range groups {
+		assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, group.Operation.OperationKind)
+		byTarget[group.Operation.Target] = group.Operation
+	}
+	assert.Equal(t, state.ApplyOperation.Pending, byTarget["testapp-001"].State, "the reviewed target's finalizer is driven")
+	assert.Nil(t, byTarget["testapp-001"].CompletedAt)
+	assert.Equal(t, state.ApplyOperation.Completed, byTarget["testapp-002"].State, "the converged member has nothing to finalize")
+	require.NotNil(t, byTarget["testapp-002"].CompletedAt)
+	assert.Equal(t, now, *byTarget["testapp-002"].CompletedAt)
+	assert.Nil(t, byTarget["testapp-002"].StartedAt, "nothing ran on the converged member")
+}
+
+// The operator consents to direct-execution DDL against the locked comment's
+// disclosure, which names only the reviewed plan's statements. A member planned
+// on its own that runs direct-execution DDL is refused even when the reviewed
+// target has work of its own.
+func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasWork(t *testing.T) {
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+	direct := alter
+	direct.ExecutionMode = "direct"
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
+	reviewed := primaryPlanRow("testapp-001")
+	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+
+	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-member-direct")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+	assert.Contains(t, err.Error(), "runs table \"users\" as direct-execution DDL")
+	applies, ok := svc.storage.Applies().(*capturingApplyStore)
+	require.True(t, ok)
+	assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
 }
