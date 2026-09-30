@@ -1201,6 +1201,13 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 // statement that is neither a single statement nor a valid create set is
 // still rendered as written, and the reason is logged for triage.
 func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
+	writeSQLFencedBlocks(sb, formatDDLBlocks(statements, dialect), budget)
+	sb.WriteString("\n")
+}
+
+// formatDDLBlocks formats each statement as the content of its own SQL block,
+// as writePlanDDLBlocks describes.
+func formatDDLBlocks(statements []string, dialect schema.Dialect) []string {
 	blocks := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
@@ -1226,8 +1233,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 		}
 		blocks = append(blocks, strings.Join(formattedCreateSet, "\n"))
 	}
-	writeSQLFencedBlocks(sb, blocks, budget)
-	sb.WriteString("\n")
+	return blocks
 }
 
 // writeShardedPlanDDL renders a sharded keyspace's DDL grouped by change: shards

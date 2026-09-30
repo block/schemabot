@@ -154,7 +154,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 				ddls = append(ddls, t.DDL)
 			}
 		}
-		cellsByKeyspace[ns] = append(cellsByKeyspace[ns], templates.ShardCell{Shard: shard, Table: table, DDL: strings.Join(ddls, "\n")})
+		cellsByKeyspace[ns] = append(cellsByKeyspace[ns], templates.ShardCell{Shard: shard, Table: table, Statements: ddls})
 		groupKey := keyspaceShard{namespace: ns, shard: shard}
 		i, seen := groupIndex[groupKey]
 		if !seen {
@@ -630,40 +630,42 @@ func shardStateRank(s string) int {
 	}
 }
 
+// fullKeyRangeShard is the name of the shard that covers a keyspace's whole
+// keyrange, which makes it the keyspace's only shard.
+const fullKeyRangeShard = "-"
+
 // rendersAsSingleShard reports whether a sharded apply reads as one change on
 // one database, so its comments take the single-deployment layout, with its
 // progress bars and DDL, instead of the shard rollup. That holds when every
-// keyspace with shard work runs on exactly one shard and every finalizer only
-// finalizes a keyspace beside its DDL, with no VSchema change to show. A
-// keyspace fanned out across shards, a VSchema change, a keyspace whose only
-// work is its finalize, and a stored plan that could not be read (nil
-// finalizers) all keep the shard layout, which is the one that renders them.
+// keyspace with shard work runs on the shard covering its whole keyrange and
+// every finalizer only finalizes a keyspace beside its DDL, with no VSchema
+// change to show. The shard is judged by its keyrange, not by how many shards
+// the apply touches: operations exist only for the shards that change, so one
+// changing shard of a keyspace with several is still a sharded change and
+// keeps the shard layout, which names it. So do a VSchema change, a keyspace
+// whose only work is its finalize, and a stored plan that could not be read
+// (nil finalizers).
 func rendersAsSingleShard(ops []*storage.ApplyOperation, finalizers *shardedFinalizerPlan) bool {
-	shardsByKeyspace := make(map[string]map[string]bool)
+	keyspacesWithWork := make(map[string]bool)
 	var finalizerKeyspaces []string
 	for _, op := range ops {
 		if ns, shard, _, ok := parseShardOperationKey(op.OperationKey); ok {
-			if shardsByKeyspace[ns] == nil {
-				shardsByKeyspace[ns] = make(map[string]bool)
+			if shard != fullKeyRangeShard {
+				return false
 			}
-			shardsByKeyspace[ns][shard] = true
+			keyspacesWithWork[ns] = true
 			continue
 		}
 		if ns, ok := parseFinalizerOperationKey(op.OperationKey); ok {
 			finalizerKeyspaces = append(finalizerKeyspaces, ns)
 		}
 	}
-	for _, shards := range shardsByKeyspace {
-		if len(shards) != 1 {
-			return false
-		}
-	}
 	for _, ns := range finalizerKeyspaces {
-		if shardsByKeyspace[ns] == nil || !finalizers.finalizesOnly(ns) {
+		if !keyspacesWithWork[ns] || !finalizers.finalizesOnly(ns) {
 			return false
 		}
 	}
-	return len(shardsByKeyspace) > 0
+	return len(keyspacesWithWork) > 0
 }
 
 // buildSingleShardApplyCommentData maps a sharded apply that rendersAsSingleShard

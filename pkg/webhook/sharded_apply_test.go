@@ -192,8 +192,8 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 
 	require.Len(t, data.Keyspaces, 1)
 	require.Len(t, data.Keyspaces[0].Cells, 1)
-	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Keyspaces[0].Cells[0].DDL,
-		"all non-empty task DDLs are joined in order")
+	assert.Equal(t, []string{"ALTER TABLE `mutes` ADD INDEX a", "ALTER TABLE `mutes` ADD INDEX b"}, data.Keyspaces[0].Cells[0].Statements,
+		"all non-empty task DDLs are kept in order")
 }
 
 // A sharded apply's finalizer operations are its keyspace VSchema changes:
@@ -848,6 +848,7 @@ func TestRendersAsSingleShard(t *testing.T) {
 		{"one shard, several tables", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/-/users")}, nil, true},
 		{"one shard in each of two keyspaces", []*storage.ApplyOperation{work("ks1/-/orders"), work("ks2/-/users")}, nil, true},
 		{"a keyspace across two shards", []*storage.ApplyOperation{work("ks/-80/orders"), work("ks/80-/orders")}, nil, false},
+		{"one changing shard of several", []*storage.ApplyOperation{work("ks/80-/orders")}, nil, false},
 		{"a VSchema change to show", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, &shardedFinalizerPlan{}, false},
 		{"an unreadable stored plan", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, nil, false},
 		{"a keyspace whose only work is its finalize", []*storage.ApplyOperation{work("ks1/-/orders"), work("ks2/group_finalizer")}, finalizesOnly("ks2"), false},
@@ -858,4 +859,27 @@ func TestRendersAsSingleShard(t *testing.T) {
 			assert.Equal(t, tc.want, rendersAsSingleShard(tc.ops, tc.finalizers))
 		})
 	}
+}
+
+// A comment observer keeps the first stored plan it reads for an apply's
+// finalizers, so a later failed read renders the same layout as the edits
+// before it. A read that failed is not kept, so the next render tries again.
+func TestCommentObserverRemembersFinalizerPlan(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{OperationKey: "shop_001/-/orders"},
+		{OperationKey: "shop_001/group_finalizer"},
+	}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {Finalize: true}}}
+	o := &CommentObserver{stor: &stubPlanStorage{err: errors.New("storage down")}}
+
+	assert.Nil(t, o.resolveFinalizerPlan(apply, ops), "a failed read has no plan to show")
+
+	o.stor = &stubPlanStorage{plan: plan}
+	first := o.resolveFinalizerPlan(apply, ops)
+	require.NotNil(t, first, "a read after a failed one tries storage again")
+	assert.True(t, first.finalizesOnly("shop_001"))
+
+	o.stor = &stubPlanStorage{err: errors.New("storage down")}
+	assert.Same(t, first, o.resolveFinalizerPlan(apply, ops), "a failed read after a successful one keeps the plan already read")
 }
