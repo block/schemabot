@@ -394,6 +394,15 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 		assert.Contains(t, err.Error(), "statement 1 is ALTER TABLE; a multi-statement DDL script must start with CREATE TABLE")
 	})
 
+	t.Run("destructive statement after CREATE TABLE is rejected", func(t *testing.T) {
+		// The first statement is a CREATE TABLE that would classify on its own,
+		// so the refusal has to come from the create set's shape rule: the
+		// trailing DROP TABLE is named as the statement that breaks it.
+		_, err := canonicalDDLForDrift(parser, "CREATE TABLE `users` (`id` bigint NOT NULL, PRIMARY KEY (`id`)); DROP TABLE `orders`")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "statement 2 is DROP TABLE; a multi-statement DDL script must be a CREATE TABLE followed only by CREATE INDEX statements on that table")
+	})
+
 	t.Run("DML is rejected", func(t *testing.T) {
 		// DML has no place in a schema change drift comparison. It must fail
 		// closed instead of canonicalizing it as if it were DDL, and the error

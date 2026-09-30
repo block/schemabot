@@ -300,12 +300,16 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", statementPreview(content), err)
 	}
-	var stmts []string
-	for _, s := range parsed {
+	stmts := make([]string, 0, len(parsed))
+	for i, s := range parsed {
+		// Each parsed entry is its own statement, so a node with no text
+		// would be a statement silently missing from the output. Callers plan
+		// and lint from this list, so that is an error rather than a skip.
 		stmt := strings.TrimSpace((*s.StmtNode).Text())
-		if stmt != "" {
-			stmts = append(stmts, stmt)
+		if stmt == "" {
+			return nil, fmt.Errorf("statement %d of %q parsed with no text", i+1, statementPreview(content))
 		}
+		stmts = append(stmts, stmt)
 	}
 	return stmts, nil
 }
