@@ -1,14 +1,19 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
@@ -139,6 +144,7 @@ func TestExecutePlan_TargetNarrowsThePlanToThatMember(t *testing.T) {
 	assert.Equal(t, DefaultDeployment+"/payments-002", resp.NarrowedTo)
 	require.NotNil(t, plans.created)
 	assert.Equal(t, "payments-002", plans.created.Target)
+	assert.Equal(t, DefaultDeployment+"/payments-002", plans.created.NarrowedTo, "the plan row records the narrowing, so apply creation can hold the plan to its member")
 }
 
 func TestExecutePlan_UnknownTargetIsRefusedBeforePlanning(t *testing.T) {
@@ -290,4 +296,251 @@ func TestExecuteRollbackPlan_NarrowedApplyIsRefused(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ran on rollout member "+DefaultDeployment+"/payments-002 only")
 	assert.Contains(t, err.Error(), "rollback of a narrowed apply is not supported")
+}
+
+// singleTargetServerConfig routes orders/production to one target, so the
+// rollout is that one member.
+func singleTargetServerConfig() *ServerConfig {
+	return &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{"production": {
+					Deployment: DefaultDeployment,
+					Target:     "orders-main",
+				}},
+			},
+		},
+		TernDeployments: TernConfig{DefaultDeployment: {"production": "localhost:9090"}},
+	}
+}
+
+func usersSchemaFiles(namespace string) map[string]*ternv1.SchemaFiles {
+	return map[string]*ternv1.SchemaFiles{
+		namespace: {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+	}
+}
+
+// Naming the only target of a single-target environment selects the whole
+// rollout, so neither the plan nor the apply is narrowed, and the apply can be
+// rolled back like any other.
+func TestTargetOfASingleTargetEnvironmentDoesNotNarrow(t *testing.T) {
+	mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-orders"}}
+	plans := &capturingPlanStore{}
+	planSvc := New(&mockStorageWithPlanLookup{plans: plans}, singleTargetServerConfig(), map[string]tern.Client{
+		DefaultDeployment + "/production": mockClient,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	resp, err := planSvc.ExecutePlan(t.Context(), PlanRequest{
+		Database: "orders", Environment: "production", Type: storage.DatabaseTypeMySQL,
+		Target: "orders-main", SchemaFiles: usersSchemaFiles("orders"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "orders-main", resp.Target)
+	assert.Empty(t, resp.NarrowedTo)
+	require.NotNil(t, plans.created)
+	assert.Empty(t, plans.created.NarrowedTo)
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	applySvc := New(&mockStorageWithApplyStores{
+		plans: &listingPlanStore{}, applies: applies, tasks: tasks, locks: &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{}, controls: &memoryControlRequestStore{},
+	}, singleTargetServerConfig(), map[string]tern.Client{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	plan := memberPlan("orders-main")
+	plan.Database = "orders"
+	apply, _, err := applySvc.createStoredApply(t.Context(), plan,
+		ApplyRequest{Environment: "production", Target: "orders-main"}, nil, "apply-orders")
+	require.NoError(t, err)
+	assert.Empty(t, apply.GetOptions().NarrowedTo, "an apply of the only member is an apply of the whole rollout")
+	require.Len(t, applies.operations, 1)
+	assert.Equal(t, "orders-main", applies.operations[0].Target)
+}
+
+// A plan narrowed to the rollout primary holds the same DDL an ordinary plan
+// of the primary would, but it was reviewed as covering that one member. Its
+// row records the narrowing, so an apply of the whole rollout from it is
+// refused rather than fanned out to members nobody reviewed it for.
+func TestCreateStoredApply_RolloutWideApplyOfAPlanNarrowedToThePrimaryIsRefused(t *testing.T) {
+	svc, applies := narrowingApplyService(t)
+	plan := memberPlan("payments-001")
+	plan.NarrowedTo = DefaultDeployment + "/payments-001"
+
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "production"}, nil, "apply-rollout-wide")
+	var mismatch *PlanMemberMismatchError
+	require.ErrorAs(t, err, &mismatch)
+	assert.True(t, mismatch.PlanNarrowed)
+	assert.Contains(t, err.Error(), "was narrowed to rollout member "+DefaultDeployment+"/payments-001")
+	assert.Contains(t, err.Error(), "apply it with target "+DefaultDeployment+"/payments-001")
+	assert.Nil(t, applies.apply, "no apply is stored for a narrowed plan applied rollout-wide")
+
+	apply, _, err := svc.createStoredApply(t.Context(), plan,
+		ApplyRequest{Environment: "production", Target: "payments-001"}, nil, "apply-narrowed")
+	require.NoError(t, err, "the plan applies to the member it was narrowed to")
+	assert.Equal(t, DefaultDeployment+"/payments-001", apply.GetOptions().NarrowedTo)
+	require.Len(t, applies.operations, 1)
+	assert.Equal(t, "payments-001", applies.operations[0].Target)
+}
+
+// A plan identifier that is already stored keeps the row already there. For a
+// narrowed plan that row must record the narrowing, or an apply could run the
+// plan across the rollout, so a row without it fails the plan.
+func TestExecutePlan_NarrowedPlanRefusedWhenItsStoredRowLacksTheNarrowing(t *testing.T) {
+	mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-narrowed"}}
+	plans := &capturingPlanStore{
+		mockPlanLookupStore: mockPlanLookupStore{plan: &storage.Plan{PlanIdentifier: "plan-narrowed", Database: "payments", Environment: "production"}},
+		createErr:           storage.ErrPlanIDExists,
+	}
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, narrowingServerConfig(), map[string]tern.Client{
+		DefaultDeployment + "/production": mockClient,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database: "payments", Environment: "production", Type: storage.DatabaseTypeMySQL,
+		Target: "payments-002", SchemaFiles: usersSchemaFiles("payments"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is narrowed to "+DefaultDeployment+"/payments-002, but its stored row records narrowing \"\"")
+
+	plans.plan.NarrowedTo = DefaultDeployment + "/payments-002"
+	_, err = svc.ExecutePlan(t.Context(), PlanRequest{
+		Database: "payments", Environment: "production", Type: storage.DatabaseTypeMySQL,
+		Target: "payments-002", SchemaFiles: usersSchemaFiles("payments"),
+	})
+	require.NoError(t, err, "a stored row that records the narrowing is the same plan delivered twice")
+}
+
+// serveNarrowing posts body to path on a mux serving svc's routes.
+func serveNarrowing(t *testing.T, svc *Service, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	return w
+}
+
+func requireInvalidRequest(t *testing.T, w *httptest.ResponseRecorder, wantMessage string) {
+	t.Helper()
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var body apitypes.ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	assert.Equal(t, apitypes.ErrCodeInvalidRequest, body.ErrorCode)
+	assert.Contains(t, body.Error, wantMessage)
+}
+
+// A target that names no member, and a plan paired with a member it was not
+// made for, are the caller's requests and answered as invalid, not as a server
+// failure, so the caller is told what to change.
+func TestApplyHandler_RefusesMisnamedAndMismatchedTargetsAsInvalidRequests(t *testing.T) {
+	cases := []struct {
+		name        string
+		planTarget  string
+		narrowedTo  string
+		body        string
+		wantMessage string
+	}{
+		{
+			name:        "unknown target",
+			planTarget:  "payments-002",
+			body:        `{"plan_id":"plan-payments-002","environment":"production","target":"payments-009"}`,
+			wantMessage: `target "payments-009" is not a rollout member`,
+		},
+		{
+			name:        "target other than the plan's member",
+			planTarget:  "payments-001",
+			body:        `{"plan_id":"plan-payments-001","environment":"production","target":"payments-002"}`,
+			wantMessage: "re-plan with target " + DefaultDeployment + "/payments-002",
+		},
+		{
+			name:        "narrowed plan applied rollout-wide",
+			planTarget:  "payments-001",
+			narrowedTo:  DefaultDeployment + "/payments-001",
+			body:        `{"plan_id":"plan-payments-001","environment":"production"}`,
+			wantMessage: "was narrowed to rollout member " + DefaultDeployment + "/payments-001",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, applies := narrowingApplyService(t)
+			plan := memberPlan(tc.planTarget)
+			plan.NarrowedTo = tc.narrowedTo
+			svc.storage.(*mockStorageWithApplyStores).plans = &listingPlanStore{mockPlanLookupStore: mockPlanLookupStore{plan: plan}}
+
+			requireInvalidRequest(t, serveNarrowing(t, svc, "/api/apply", tc.body), tc.wantMessage)
+			assert.Nil(t, applies.apply)
+		})
+	}
+}
+
+func TestPlanHandler_RefusesAnUnknownTargetAsAnInvalidRequest(t *testing.T) {
+	mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+	svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, narrowingServerConfig(), map[string]tern.Client{
+		DefaultDeployment + "/production": mockClient,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	w := serveNarrowing(t, svc, "/api/plan", `{"database":"payments","environment":"production","type":"mysql","target":"payments-009","schema_files":{"payments":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`)
+	requireInvalidRequest(t, w, `target "payments-009" is not a rollout member`)
+	assert.Nil(t, mockClient.planReq)
+}
+
+// A plan of the whole rollout is made against its primary. When the primary
+// is at the desired schema, the other members can still need the change, for
+// example after an apply narrowed to the primary landed it there alone, so the
+// plan is not returned as up to date: it carries an error naming the members
+// that were not planned. A plan with changes, a narrowed plan, and a plan of a
+// single-target environment are returned as they are.
+func TestPlanHandler_ConvergedPrimaryOfAWiderRolloutIsNotReportedUpToDate(t *testing.T) {
+	withChanges := &ternv1.PlanResponse{PlanId: "plan-changes", Changes: []*ternv1.SchemaChange{{
+		Namespace: "payments",
+		TableChanges: []*ternv1.TableChange{{
+			TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `region` varchar(16)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}}}
+	cases := []struct {
+		name       string
+		config     *ServerConfig
+		database   string
+		target     string
+		planResp   *ternv1.PlanResponse
+		wantErrors []string
+	}{
+		{
+			name:     "rollout-wide plan with a converged primary",
+			config:   narrowingServerConfig(),
+			database: "payments",
+			planResp: &ternv1.PlanResponse{PlanId: "plan-converged"},
+			wantErrors: []string{"rollout primary " + DefaultDeployment + "/payments-001 is at the desired schema, but this plan covers only the primary, and the other 2 rollout members were not planned: payments-002, payments-003. " +
+				"They can still need the change, so the rollout is not reported as up to date; plan and apply each of them with its target"},
+		},
+		{name: "rollout-wide plan with changes", config: narrowingServerConfig(), database: "payments", planResp: withChanges},
+		{name: "narrowed plan with no changes", config: narrowingServerConfig(), database: "payments", target: "payments-001", planResp: &ternv1.PlanResponse{PlanId: "plan-narrowed"}},
+		{name: "single-target environment", config: singleTargetServerConfig(), database: "orders", planResp: &ternv1.PlanResponse{PlanId: "plan-orders"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockClient := &mockTernClient{isRemote: true, planResp: tc.planResp}
+			svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, tc.config, map[string]tern.Client{
+				DefaultDeployment + "/production": mockClient,
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			body, err := json.Marshal(apitypes.PlanRequest{
+				Database: tc.database, Environment: "production", Type: storage.DatabaseTypeMySQL, Target: tc.target,
+				SchemaFiles: map[string]*apitypes.SchemaFiles{tc.database: {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}}},
+			})
+			require.NoError(t, err)
+			w := serveNarrowing(t, svc, "/api/plan", string(body))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var resp apitypes.PlanResponse
+			require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+			if tc.wantErrors == nil {
+				assert.Empty(t, resp.Errors)
+				return
+			}
+			assert.Equal(t, tc.wantErrors, resp.Errors)
+		})
+	}
 }

@@ -1600,8 +1600,9 @@ another: an apply narrowed to one member runs only on the member its plan was ma
 apply of the whole rollout runs from the rollout primary's plan. An apply that ran on one member
 is never rolled back across the rollout. *Enforced:* member pairing at apply creation
 (`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
-`pkg/api/plan_handlers.go`); the narrowed-apply refusal in `ExecuteRollbackPlanForApply`
-(`pkg/api/plan_handlers.go`).
+`pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
+(`storage.Plan.NarrowedTo`, confirmed by `requireStoredNarrowing`); the narrowed-apply refusal in
+`ExecuteRollbackPlanForApply` (`pkg/api/plan_handlers.go`).
 
 ## Routing and authorization (AZ)
 

@@ -17,7 +17,7 @@ import (
 
 // planColumns lists all columns for SELECT queries.
 const planColumns = `id, plan_identifier, database_name, database_type,
-	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at`
+	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, narrowed_to, created_at`
 
 // planListColumns matches planColumns except schema_files, which is replaced
 // by a NULL placeholder so the scan shape stays identical. schema_files holds
@@ -25,7 +25,7 @@ const planColumns = `id, plan_identifier, database_name, database_type,
 // listings never need it, so List leaves SchemaFiles unhydrated rather than
 // transferring megabytes per page.
 const planListColumns = `id, plan_identifier, database_name, database_type,
-	deployment, target, repository, pull_request, schema_path, environment, NULL AS schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at`
+	deployment, target, repository, pull_request, schema_path, environment, NULL AS schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, narrowed_to, created_at`
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
@@ -54,9 +54,9 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 	}
 
 	id, err := s.identity.InsertID(ctx, s.db, `
-		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.PrimaryPlanIdentifier, directExecutionJSON, plan.CreatedAt)
+		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, narrowed_to, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.PrimaryPlanIdentifier, directExecutionJSON, plan.NarrowedTo, plan.CreatedAt)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
 			return 0, storage.ErrPlanIDExists
@@ -268,6 +268,7 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 		&plan.HeadSHA,
 		&plan.PrimaryPlanIdentifier,
 		&directExecutionJSON,
+		&plan.NarrowedTo,
 		&plan.CreatedAt,
 	)
 	if err != nil {
