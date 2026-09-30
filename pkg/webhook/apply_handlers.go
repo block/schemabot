@@ -369,6 +369,21 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Debug("apply: the reviewed target has changes of its own; the rollout round is not consulted before locking",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
 	case rolloutRunsMemberWork(rollout, rolloutPreview):
+		// Record the pending work on the check before anything else can end
+		// this apply: the preflight, the lock acquire, and the fresh-HEAD gate
+		// below all have exits of their own, and the stored check state must not
+		// be left reading as a pass from an earlier plan on any of them (MG-12).
+		// No lock is held yet, so a failure needs no release.
+		if recordErr := h.recordPendingRollout(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); recordErr != nil {
+			h.logger.Error("apply rejected: could not record the other targets' pending work on the check; published a failing aggregate from the rollout round instead",
+				"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", recordErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not record the check state for this apply, so nothing was applied. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command member-work check record %s#%d: %w", repo, pr, recordErr)
+		}
 		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout)
 		if refusalErr != nil {
 			h.logger.Error("apply rejected: could not verify that the other targets' plans can run from this apply",
@@ -381,7 +396,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
 		if refusal != "" {
-			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, memberWorkRefusalMessage(refusal))
+			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
 		h.logger.Info("apply: the reviewed target is already at the desired schema; other targets' own plans will run once confirmed",
@@ -529,7 +544,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// automatically read only the reviewed plan, which is empty here. The
 	// operator confirms against this comment, which renders every target's plan.
 	if reviewedTargetConverged {
-		return h.pauseForMemberWorkConfirmation(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, rollout, commentData)
+		return h.pauseForMemberWorkConfirmation(ctx, repo, pr, installationID, schemaResult, planResp, environment, rollout, commentData)
 	}
 
 	// Discarding an unfinished copy destroys work already done on the target —

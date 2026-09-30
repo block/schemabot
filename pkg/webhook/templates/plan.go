@@ -221,6 +221,14 @@ type PlanCommentData struct {
 	// deployment compares to the reviewed primary plan. Nil for a single-target
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
+
+	// MemberApplyRefusal says why a PR apply cannot run the other targets'
+	// plans this comment renders for a reviewed target already at the desired
+	// schema, naming only targets, tables, and namespaces. Such an apply is
+	// refused whatever its flags, so the comment offers no apply command in its
+	// place. Empty when the apply can run them, or when the comment renders the
+	// reviewed plan alone.
+	MemberApplyRefusal string
 }
 
 // ExemptTablesData describes live tables exempt from a plan verdict.
@@ -610,6 +618,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
+	case data.MemberApplyRefusal != "":
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
 	default:
 		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
@@ -619,6 +629,14 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
+}
+
+// writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
+// apply cannot run the other targets' plans the comment renders. Offering the
+// command there would coach an apply that is refused whatever its flags.
+func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but %s.\n\n", escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " ")))
+	sb.WriteString("A PR apply whose reviewed target is already at the desired schema cannot run that or disclose it for confirmation. The schema check keeps blocking merge until every target has the change.\n")
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
@@ -2745,6 +2763,10 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	if totalChanges == 0 {
 		if targetPlans {
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
+			if plan.MemberApplyRefusal != "" {
+				sb.WriteString("\n")
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+			}
 			return
 		}
 		sb.WriteString(noChangesDetected + "\n\n")
@@ -2834,11 +2856,19 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Categorize environments
 	var envsWithChanges []string
 	var envsWithErrors []string
+	// An environment whose apply would be refused says why in its own section,
+	// so the footer neither offers its apply nor calls the PR done.
+	envsRefused := 0
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
 			envsWithErrors = append(envsWithErrors, env)
-		} else if plan, ok := data.Plans[env]; ok && plan != nil && environmentHasWork(plan) {
-			envsWithChanges = append(envsWithChanges, env)
+		} else if plan, ok := data.Plans[env]; ok && plan != nil {
+			switch {
+			case environmentHasWork(plan):
+				envsWithChanges = append(envsWithChanges, env)
+			case plan.MemberApplyRefusal != "":
+				envsRefused++
+			}
 		}
 	}
 
@@ -2858,7 +2888,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	case len(envsWithChanges) == 1:
 		sb.WriteString("▶️ **To apply** these changes, comment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
-	case len(envsWithErrors) == 0:
+	case len(envsWithErrors) == 0 && envsRefused == 0:
 		sb.WriteString("No changes to apply.\n")
 	}
 
@@ -3101,9 +3131,14 @@ func capitalizeEnvNames(envs []string) string {
 
 // environmentHasWork reports whether an environment's plan section offers an
 // apply: its reviewed plan has changes, or its reviewed target is already at the
-// desired schema while the section renders other targets' plans that do.
+// desired schema while the section renders other targets' plans that do and a
+// PR apply can run them. A section whose apply would be refused says why in the
+// section itself.
 func environmentHasWork(plan *PlanCommentData) bool {
-	return hasChanges(plan.Changes) || RendersTargetPlans(plan.DeploymentDrift)
+	if hasChanges(plan.Changes) {
+		return true
+	}
+	return RendersTargetPlans(plan.DeploymentDrift) && plan.MemberApplyRefusal == ""
 }
 
 // hasChanges returns true if there are any schema changes.

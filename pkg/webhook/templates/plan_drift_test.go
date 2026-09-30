@@ -637,6 +637,40 @@ func TestRenderMultiEnvPlanComment_OffersApplyForPendingTargets(t *testing.T) {
 	assert.NotContains(t, out, "schemabot apply -e staging")
 }
 
+// When a PR apply cannot run another target's plan, because that plan carries a
+// change the comment renders without the disclosure its consent rests on, the
+// comment says so in place of the apply command: offering it would coach an
+// apply that is refused whatever its flags.
+func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t *testing.T) {
+	data := convergedPrimaryPlanData()
+	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		"the other targets' plans are still shown")
+	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but target primary/testapp\\_2: its plan carries an unsafe change for table \"users\".")
+	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
+	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
+}
+
+// A multi-environment plan offers no apply for an environment whose other
+// targets' work a PR apply cannot run, says why in that environment's section,
+// and does not call the PR done.
+func TestRenderMultiEnvPlanComment_RefusedMemberWorkOffersNoApply(t *testing.T) {
+	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
+	refused := convergedPrimaryPlanData()
+	refused.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &refused},
+	})
+	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**")
+	assert.NotContains(t, out, "schemabot apply")
+	assert.NotContains(t, out, "No changes to apply", "a target still needs the change")
+}
+
 // convergedPrimaryPlanData is a production plan whose reviewed target,
 // primary/testapp_1, already has the schema, while primary/testapp_2 and
 // primary/testapp_3 still need a column added.

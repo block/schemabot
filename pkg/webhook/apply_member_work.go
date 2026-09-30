@@ -11,7 +11,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -52,22 +51,42 @@ func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.Ins
 // refuseRollout refuses an apply whose reviewed target is already at the
 // desired schema, recording what is pending on the check before posting message.
 func (h *Handler) refuseRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, actionName string, outcome reviewDriftOutcome, message string) {
+	if err := h.recordPendingRollout(ctx, client, repo, pr, schemaResult, planResp, environment, outcome); err != nil {
+		h.logger.Error("failed to record the pending rollout on the check; published a failing aggregate from the rollout round instead",
+			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
+			"environment", environment, "action", actionName, "error", err)
+	}
+	h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, outcome, message)
+}
+
+// postRolloutRefusal tells the operator why an apply whose reviewed target is
+// already at the desired schema did not run. The caller has already recorded
+// the pending rollout on the check.
+func (h *Handler) postRolloutRefusal(repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, actionName string, outcome reviewDriftOutcome, message string) {
 	h.logger.Info("apply refused: the reviewed target is already at the desired schema but the rest of the rollout is not",
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type,
 		"environment", environment, "action", actionName, "plan_id", planResp.PlanID,
 		"drift_blocked", outcome.blocks(), "targets_pending", outcome.work.pending, "targets", outcome.work.members,
 		"pending_targets", outcome.work.names, "refusal", message)
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, message)
+}
+
+// recordPendingRollout stores the check record for a rollout whose reviewed
+// target is already at the desired schema while something else is pending, and
+// refreshes the aggregate from it, so the PR cannot merge as if every target
+// were up to date (MG-12). A record that cannot be stored publishes a failing
+// aggregate from the rollout round instead, since refreshing would recompute
+// from a stored row that can still be a pass (MG-1), and the error is returned.
+func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, outcome reviewDriftOutcome) error {
 	headSHA, err := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, outcome)
-	switch {
-	case err != nil:
-		h.logger.Error("failed to record the pending rollout on the check; publishing a failing aggregate from the rollout round instead",
-			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
-			"environment", environment, "error", err)
+	if err != nil {
 		h.failClosedOnUnstoredRollout(ctx, client, repo, pr, schemaResult.HeadSHA, environment, outcome)
-	case headSHA != "":
+		return fmt.Errorf("store the pending rollout's check record for %s#%d environment %s database %s: %w", repo, pr, environment, schemaResult.Database, err)
+	}
+	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, message)
+	return nil
 }
 
 // memberWorkRefusal returns why the other targets' work in a rollout cannot run
@@ -108,6 +127,27 @@ func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment str
 	return "", nil
 }
 
+// annotateMemberApplyRefusal records on a plan comment why a PR apply cannot
+// run the other targets' plans it renders, when its reviewed target is already
+// at the desired schema. Such an apply is refused whatever its flags, so the
+// comment must not offer it. A refusal that cannot be computed leaves the apply
+// offered: the apply asks again before it pauses and refuses on the same
+// grounds, so the comment only ever misses a shortcut, never a gate.
+func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, repo string, pr int) {
+	if planResp.HasChanges() || !rolloutRunsMemberWork(rollout, data.DeploymentDrift) {
+		h.logger.Debug("plan comment renders no other targets' plans for a converged reviewed target; no member-work refusal to disclose",
+			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID)
+		return
+	}
+	refusal, err := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout)
+	if err != nil {
+		h.logger.Warn("could not tell whether a PR apply can run the other targets' plans; the plan comment offers the apply, which re-checks before it pauses",
+			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID, "error", err)
+		return
+	}
+	data.MemberApplyRefusal = refusal
+}
+
 // memberWorkRefusalMessage tells the operator why the other targets' work was
 // not run. The refusal names only targets, tables, and namespaces.
 func memberWorkRefusalMessage(refusal string) string {
@@ -118,38 +158,20 @@ func memberWorkRefusalMessage(refusal string) string {
 // apply-confirm, when the reviewed target is already at the desired schema and
 // other targets still have work.
 //
-// The check is stored before the comment is posted, from the rollout round, so
-// the pending work keeps the merge gate blocked whatever the operator decides
-// (MG-12). A check that cannot be stored releases the lock and publishes a
-// failing aggregate from the round instead, and the command stays retryable:
-// the pause is never acknowledged over check state that could still read as
-// passing.
+// The caller recorded the pending work on the check straight after the rollout
+// round, before taking the lock, so the merge gate is already blocked whatever
+// the operator decides and on every exit between that round and this pause
+// (MG-12).
 func (h *Handler) pauseForMemberWorkConfirmation(
-	ctx context.Context, client *ghclient.InstallationClient,
+	ctx context.Context,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
-	planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult,
+	planResp *apitypes.PlanResponse, environment string,
 	rollout reviewDriftOutcome, commentData templates.PlanCommentData,
 ) (bool, error) {
 	database, dbType := schemaResult.Database, schemaResult.Type
 	h.logger.Info("apply paused for confirmation: only targets other than the reviewed one have work",
 		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 		"plan_id", planResp.PlanID, "pending_targets", rollout.work.names)
-	headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout)
-	if checkErr != nil {
-		h.logger.Error("failed to store check state for the member-work confirmation; releasing the lock and publishing a failing aggregate from the rollout round",
-			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", database, "database_type", dbType,
-			"environment", environment, "plan_id", planResp.PlanID, "error", checkErr)
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "member-work confirmation check state store failure")
-		h.failClosedOnUnstoredRollout(ctx, client, repo, pr, schemaResult.HeadSHA, environment, rollout)
-		if !result.SuppressRetryComments {
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				"SchemaBot could not record the check state for this apply. Retry the command, and see server logs if it persists.")
-		}
-		return true, fmt.Errorf("apply command member-work confirmation check record %s#%d: %w", repo, pr, checkErr)
-	}
-	if headSHA != "" {
-		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-	}
 	commentData.PendingManualConfirmation = true
 	commentData.PausedApplyCause = &templates.PausedApplyCauseData{
 		Heading: "The reviewed target already has this schema",

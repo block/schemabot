@@ -758,7 +758,10 @@ deployment that diverged or could not be verified fails the check closed, and
 the comment explains the failure. A rollout of independent targets whose
 reviewed target is already at the desired schema, while another target is not,
 keeps the check pending (MG-12), and the comment is the only place that shows
-the plans those targets still need.
+the plans those targets still need. It offers `schemabot apply` for them, unless
+a PR apply would refuse one of those plans whatever its flags (see
+[Apply requested](#apply-requested) below); the comment then says why in place of
+the apply command.
 
 ### PR touches no managed schema files
 
@@ -937,7 +940,9 @@ If the apply command finds no changes, SchemaBot plans the environment's other
 rollout members before answering. When none of them has work either, it posts a
 no-change plan comment and does not acquire a lock. When the reviewed primary is
 already at the desired schema but other targets still need the change,
-SchemaBot stores `action_required`, acquires the lock, and pauses for
+SchemaBot stores `action_required` before anything else can end the apply, so an
+apply that loses the lock race or fails a later gate still leaves the record
+blocking. It then acquires the lock and pauses for
 `apply-confirm` behind a comment that renders each of those targets' own plans.
 Confirming runs each target's plan on that target, and the record keeps
 blocking merge until every target has the change (MG-12).

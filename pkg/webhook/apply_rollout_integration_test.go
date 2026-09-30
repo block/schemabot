@@ -29,6 +29,8 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/checkpoint"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // runRolloutCommand drives one PR comment command against the rollout fixture
@@ -477,4 +479,164 @@ func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 			requireNoApplies(t, svc, tc.dbName)
 		})
 	}
+}
+
+// lockRaceStorage answers every conditional lock acquire as if another owner
+// took the lock between the apply's pre-check and its acquire.
+type lockRaceStorage struct {
+	storage.Storage
+}
+
+func (s *lockRaceStorage) Locks() storage.LockStore {
+	return &lockRaceLockStore{LockStore: s.Storage.Locks()}
+}
+
+type lockRaceLockStore struct {
+	storage.LockStore
+}
+
+func (s *lockRaceLockStore) AcquireIfPendingPlanID(context.Context, *storage.Lock, string) error {
+	return storage.ErrLockHeld
+}
+
+// The reviewed primary (eu) already has the column and us does not, and the PR
+// carries a passing check from an earlier plan. The apply loses the lock race
+// after the rollout round found us's work, so it exits before pausing for
+// confirmation. The stored check state must already record us's pending work
+// by then: an apply that ends early never leaves the earlier pass standing.
+func TestE2EConvergedPrimaryApplyLosingTheLockRecordsPendingWork(t *testing.T) {
+	dbName := "webhook_rollout_lock_race"
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		return &lockRaceStorage{Storage: st}
+	})
+	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+		Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "abc123", Environment: driftEnv,
+		DatabaseType: "mysql", DatabaseName: dbName, Status: checkStatusCompleted, Conclusion: "success",
+	}))
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Failed to acquire lock")
+	assert.NotContains(t, body, "schemabot apply-confirm", "an apply that lost the lock offers no confirmation")
+
+	requireNoApplies(t, svc, dbName)
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the earlier pass is replaced")
+	assert.True(t, check.HasChanges)
+}
+
+// seedUsersCopy puts an unfinished copy of `users` on a target: the shadow table
+// the engine builds rows into, plus a checkpoint recording a different statement
+// than the one the PR's plan hands the engine, so applying that plan discards it.
+func seedUsersCopy(t *testing.T, physicalDB string) {
+	t.Helper()
+	db := openDriftDB(t, driftDSN(t, physicalDB))
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(
+		"CREATE TABLE `%s` (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)", utils.NewTableName("users")))
+	require.NoError(t, err, "seed shadow table")
+
+	cp := checkpoint.NewTable(db, utils.CheckpointTableName("users"), checkpoint.Transient)
+	require.NoError(t, cp.Create(t.Context()), "create checkpoint table")
+	require.NoError(t, cp.Write(t.Context(), checkpoint.Record{
+		Statement:       "ALTER TABLE `users` ADD INDEX `idx_name` (`name`)",
+		CopierWatermark: `{"Key":["id"],"LowerBound":3952903346}`,
+		Position:        "mysql-bin.024891:19443021",
+	}), "write checkpoint row")
+}
+
+// The reviewed primary (eu) already has the column and us does not, but us
+// holds an unfinished copy of `users` made for a different statement, so
+// applying us's plan throws that copy away. The comment the operator would
+// confirm carries no copy disclosure for another target, so the apply refuses
+// before pausing: it takes no lock, runs nothing, leaves the copy in place, and
+// the check keeps blocking merge.
+func TestE2EConvergedPrimaryRefusesToDiscardAnotherTargetsCopy(t *testing.T) {
+	dbName := "webhook_rollout_member_copy"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	seedUsersCopy(t, dbName+"_us")
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "nothing was applied")
+	assert.Contains(t, body, "target us: applying its plan discards the unfinished copy of users",
+		"the refusal names the target and the table whose copy would be lost")
+	assert.NotContains(t, body, "schemabot apply-confirm", "a refused apply offers no confirmation")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+	requireUsersCopyIntact(t, dbName+"_us")
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
+}
+
+// The reviewed primary (eu) already has the column and us does not, so the
+// apply pauses on a comment that shows us's plan. Before the operator confirms,
+// an unfinished copy of `users` made for a different statement appears on us.
+// The confirmed comment disclosed no copy, so apply-confirm refuses, runs
+// nothing, leaves the copy in place, and releases the pending confirmation.
+func TestE2EApplyConfirmRefusesToDiscardACopyThatAppearedOnAnotherTarget(t *testing.T) {
+	dbName := "webhook_rollout_member_copy_confirm"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	awaitCommentContaining(t, apply, "Confirmation required")
+
+	seedUsersCopy(t, dbName+"_us")
+
+	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
+	assert.Contains(t, body, "target us: applying its plan discards the unfinished copy of users")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+	requireUsersCopyIntact(t, dbName+"_us")
+}
+
+// requireUsersCopyIntact asserts the unfinished copy seeded by seedUsersCopy is
+// still on the target, so a refused apply provably discarded nothing.
+func requireUsersCopyIntact(t *testing.T, physicalDB string) {
+	t.Helper()
+	db := openDriftDB(t, driftDSN(t, physicalDB))
+	for _, table := range []string{utils.NewTableName("users"), utils.CheckpointTableName("users")} {
+		var count int
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+			physicalDB, table).Scan(&count))
+		assert.Equal(t, 1, count, "the refused apply left %s on the target", table)
+	}
+}
+
+// The reviewed primary (eu) already has the column, and bringing us to the PR's
+// schema also drops a column only us carries. An apply from this PR refuses that
+// work whatever its flags, so the plan comment shows us's plan and says why it
+// cannot be applied from here instead of offering an apply command that would
+// be refused. The check keeps blocking merge on us's work.
+func TestE2EPlanOffersNoApplyForAnotherTargetsRefusedWork(t *testing.T) {
+	dbName := "webhook_rollout_plan_member_unsafe"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersWithLegacySchema},
+	}, api.PlanIndependent)
+
+	plan := runRolloutCommand(t, svc, dbName, "schemabot plan -e "+driftEnv)
+	body := awaitCommentContaining(t, plan, "This PR cannot apply the other targets' plans")
+	assert.Contains(t, body, "DROP COLUMN `legacy`", "the comment still shows the plan us would run")
+	assert.Contains(t, body, "its plan carries an unsafe change for table \"users\"")
+	assert.NotContains(t, body, "schemabot apply -e", "an apply that is refused whatever its flags is never offered")
+
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, "action_required", check.Conclusion)
 }
