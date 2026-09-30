@@ -810,6 +810,12 @@ message ProgressRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // When set, scopes the answer to one operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, each with its own operation,
+  // so a member's progress is its operation's state and tables rather than
+  // the whole apply's. Empty asks about the whole apply.
+  string apply_operation_id = 3;
 }
 
 message LogsRequest {
@@ -920,6 +926,11 @@ message ProgressResponse {
   map<string, string> metadata = 10;
   // Control requests on this apply that have reached a terminal status.
   repeated SettledControlRequest settled_control_requests = 11;
+  // The apply_operation_id the answer is scoped to, echoed from the request.
+  // A caller that asked about one operation must refuse an answer without its
+  // id: a data plane that ignores the scope answers for the whole apply, and
+  // reading that as one member's state reports its siblings' work as its own.
+  string apply_operation_id = 12;
 }
 
 // CutoverRequest triggers the cutover phase.
@@ -933,6 +944,11 @@ message CutoverRequest {
   // may not be the one the operator talked to, and the request is what names
   // the requester in the PR notice and the apply log.
   string caller = 3;
+  // When set, cuts over only this operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, and one member's turn to cut
+  // over is not its siblings' turn. Empty cuts over the apply's parked work.
+  string apply_operation_id = 4;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.

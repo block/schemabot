@@ -854,6 +854,25 @@ const earlierRolloutMemberSQL = `(
 	OR earlier.target <> apply_operations.target
 )`
 
+// rolloutMembersOrderedHereSQL holds when this store is the plane that orders
+// the candidate's rollout members, which is every apply except one a remote
+// dispatch created. A dispatched apply carries the idempotency key its
+// dispatcher stamped, and every operation of it arrived as its own dispatch
+// that the dispatcher had already admitted under the rollout's cutover and
+// on_failure policy. Ordering those operations a second time here, under the
+// rolling and halt defaults their rows carry, would serialize a parallel
+// rollout and hold a later member pending behind an earlier one the
+// dispatcher already settled. The copy-start gate therefore leaves member
+// order to the dispatcher on such an apply; the cutovers it sends name the
+// operation they are for. The fragment references the apply_operations alias
+// and takes no placeholders.
+const rolloutMembersOrderedHereSQL = `NOT EXISTS (
+	SELECT 1
+	FROM applies AS dispatched
+	WHERE dispatched.id = apply_operations.apply_id
+		AND dispatched.idempotency_key IS NOT NULL
+)`
+
 // earlierSiblingHoldsCutoverSQL is the cutover-order rule: an earlier sibling
 // (lower created_at, id — deployment_order as materialized at apply-create)
 // holds a later operation's cutover until it has completed, unless
@@ -932,6 +951,7 @@ func finalizerStartGateSQL(d Dialect) string {
 		FROM apply_operations AS earlier
 		WHERE earlier.apply_id = apply_operations.apply_id
 			AND ` + earlierRolloutMemberSQL + `
+			AND ` + rolloutMembersOrderedHereSQL + `
 			AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 			AND earlier.state <> ?
 			AND ` + releasedFailureExemptionSQL(d) + `
@@ -968,6 +988,7 @@ func workStartGateSQL(d Dialect) string {
 	FROM apply_operations AS earlier
 	WHERE earlier.apply_id = apply_operations.apply_id
 		AND ` + earlierRolloutMemberSQL + `
+		AND ` + rolloutMembersOrderedHereSQL + `
 		AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 		AND (
 			(

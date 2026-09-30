@@ -2577,9 +2577,15 @@ type ProgressRequest struct {
 	// Apply ID for the schema change to inspect.
 	ApplyId string `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// Environment: "staging" or "production".
-	Environment   string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Environment string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	// When set, scopes the answer to one operation of the apply: the
+	// apply_operation_id a dispatch returned in ApplyResponse. The rollout
+	// members of one deployment share its apply, each with its own operation,
+	// so a member's progress is its operation's state and tables rather than
+	// the whole apply's. Empty asks about the whole apply.
+	ApplyOperationId string `protobuf:"bytes,3,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ProgressRequest) Reset() {
@@ -2622,6 +2628,13 @@ func (x *ProgressRequest) GetApplyId() string {
 func (x *ProgressRequest) GetEnvironment() string {
 	if x != nil {
 		return x.Environment
+	}
+	return ""
+}
+
+func (x *ProgressRequest) GetApplyOperationId() string {
+	if x != nil {
+		return x.ApplyOperationId
 	}
 	return ""
 }
@@ -3262,8 +3275,13 @@ type ProgressResponse struct {
 	Metadata     map[string]string      `protobuf:"bytes,10,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Control requests on this apply that have reached a terminal status.
 	SettledControlRequests []*SettledControlRequest `protobuf:"bytes,11,rep,name=settled_control_requests,json=settledControlRequests,proto3" json:"settled_control_requests,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// The apply_operation_id the answer is scoped to, echoed from the request.
+	// A caller that asked about one operation must refuse an answer without its
+	// id: a data plane that ignores the scope answers for the whole apply, and
+	// reading that as one member's state reports its siblings' work as its own.
+	ApplyOperationId string `protobuf:"bytes,12,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ProgressResponse) Reset() {
@@ -3366,6 +3384,13 @@ func (x *ProgressResponse) GetSettledControlRequests() []*SettledControlRequest 
 	return nil
 }
 
+func (x *ProgressResponse) GetApplyOperationId() string {
+	if x != nil {
+		return x.ApplyOperationId
+	}
+	return ""
+}
+
 // CutoverRequest triggers the cutover phase.
 type CutoverRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -3377,9 +3402,14 @@ type CutoverRequest struct {
 	// plane that accepted it. The plane that records the durable control request
 	// may not be the one the operator talked to, and the request is what names
 	// the requester in the PR notice and the apply log.
-	Caller        string `protobuf:"bytes,3,opt,name=caller,proto3" json:"caller,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Caller string `protobuf:"bytes,3,opt,name=caller,proto3" json:"caller,omitempty"`
+	// When set, cuts over only this operation of the apply: the
+	// apply_operation_id a dispatch returned in ApplyResponse. The rollout
+	// members of one deployment share its apply, and one member's turn to cut
+	// over is not its siblings' turn. Empty cuts over the apply's parked work.
+	ApplyOperationId string `protobuf:"bytes,4,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *CutoverRequest) Reset() {
@@ -3429,6 +3459,13 @@ func (x *CutoverRequest) GetEnvironment() string {
 func (x *CutoverRequest) GetCaller() string {
 	if x != nil {
 		return x.Caller
+	}
+	return ""
+}
+
+func (x *CutoverRequest) GetApplyOperationId() string {
+	if x != nil {
+		return x.ApplyOperationId
 	}
 	return ""
 }
@@ -4980,10 +5017,11 @@ const file_tern_proto_rawDesc = "" +
 	"\bapply_id\x18\x03 \x01(\tR\aapplyId\x12,\n" +
 	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\x12#\n" +
 	"\roperation_key\x18\x05 \x01(\tR\foperationKey\x122\n" +
-	"\bconflict\x18\x06 \x01(\v2\x16.tern.v1.ApplyConflictR\bconflict\"N\n" +
+	"\bconflict\x18\x06 \x01(\v2\x16.tern.v1.ApplyConflictR\bconflict\"|\n" +
 	"\x0fProgressRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
-	"\venvironment\x18\x02 \x01(\tR\venvironment\"\xa8\x01\n" +
+	"\venvironment\x18\x02 \x01(\tR\venvironment\x12,\n" +
+	"\x12apply_operation_id\x18\x03 \x01(\tR\x10applyOperationId\"\xa8\x01\n" +
 	"\vLogsRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x1a\n" +
@@ -5053,7 +5091,7 @@ const file_tern_proto_rawDesc = "" +
 	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\x12\x1d\n" +
 	"\n" +
 	"settled_at\x18\x04 \x01(\tR\tsettledAt\x12!\n" +
-	"\frequested_by\x18\x05 \x01(\tR\vrequestedBy\"\x97\x04\n" +
+	"\frequested_by\x18\x05 \x01(\tR\vrequestedBy\"\xc5\x04\n" +
 	"\x10ProgressResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12$\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x0e.tern.v1.StateR\x05state\x12'\n" +
@@ -5066,15 +5104,17 @@ const file_tern_proto_rawDesc = "" +
 	"\fcompleted_at\x18\b \x01(\tR\vcompletedAt\x12C\n" +
 	"\bmetadata\x18\n" +
 	" \x03(\v2'.tern.v1.ProgressResponse.MetadataEntryR\bmetadata\x12X\n" +
-	"\x18settled_control_requests\x18\v \x03(\v2\x1e.tern.v1.SettledControlRequestR\x16settledControlRequests\x1a;\n" +
+	"\x18settled_control_requests\x18\v \x03(\v2\x1e.tern.v1.SettledControlRequestR\x16settledControlRequests\x12,\n" +
+	"\x12apply_operation_id\x18\f \x01(\tR\x10applyOperationId\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\t\x10\n" +
-	"R\x06volume\"e\n" +
+	"R\x06volume\"\x93\x01\n" +
 	"\x0eCutoverRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
-	"\x06caller\x18\x03 \x01(\tR\x06caller\"R\n" +
+	"\x06caller\x18\x03 \x01(\tR\x06caller\x12,\n" +
+	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\"R\n" +
 	"\x0fCutoverResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"L\n" +
