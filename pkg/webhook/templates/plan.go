@@ -2764,8 +2764,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		if targetPlans {
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
 			if plan.MemberApplyRefusal != "" {
-				sb.WriteString("\n")
 				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+				sb.WriteString("\n")
 			}
 			return
 		}
@@ -2857,17 +2857,23 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	var envsWithChanges []string
 	var envsWithErrors []string
 	// An environment whose apply would be refused says why in its own section,
-	// so the footer neither offers its apply nor calls the PR done.
-	envsRefused := 0
+	// so the footer neither offers its apply nor calls the PR done. The
+	// environments after it wait on it: an apply of a later environment is
+	// refused until every earlier one has succeeded, so offering one would
+	// coach an apply the promotion order refuses.
+	var envsRefused []string
+	var envsBehindRefused []string
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
 			envsWithErrors = append(envsWithErrors, env)
 		} else if plan, ok := data.Plans[env]; ok && plan != nil {
 			switch {
+			case environmentHasWork(plan) && len(envsRefused) > 0:
+				envsBehindRefused = append(envsBehindRefused, env)
 			case environmentHasWork(plan):
 				envsWithChanges = append(envsWithChanges, env)
 			case plan.MemberApplyRefusal != "":
-				envsRefused++
+				envsRefused = append(envsRefused, env)
 			}
 		}
 	}
@@ -2888,8 +2894,13 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	case len(envsWithChanges) == 1:
 		sb.WriteString("▶️ **To apply** these changes, comment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
-	case len(envsWithErrors) == 0 && envsRefused == 0:
+	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
+	}
+
+	for _, env := range envsBehindRefused {
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and this PR cannot apply %s's other targets' plans (see above).\n",
+			capitalizeFirst(env), envsRefused[0], envsRefused[0])
 	}
 
 	// Error guidance for failed environments

@@ -671,6 +671,42 @@ func TestRenderMultiEnvPlanComment_RefusedMemberWorkOffersNoApply(t *testing.T) 
 	assert.NotContains(t, out, "No changes to apply", "a target still needs the change")
 }
 
+// An environment whose other targets' work a PR apply cannot run holds back
+// every environment after it: the promotion order refuses a later
+// environment's apply until the earlier one succeeds, so the comment offers
+// none and says what production waits on. An environment before the refused
+// one is still offered.
+func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testing.T) {
+	withChanges := func(env string) *PlanCommentData {
+		return &PlanCommentData{Environment: env, IsMySQL: true, Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}}}
+	}
+	refused := func(env string) *PlanCommentData {
+		data := convergedPrimaryPlanData()
+		data.Environment = env
+		data.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
+		return &data
+	}
+	render := func(staging, production *PlanCommentData) string {
+		return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+			Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": staging, "production": production},
+		})
+	}
+
+	out := render(refused("staging"), withChanges("production"))
+	assert.NotContains(t, out, "schemabot apply", "production's apply would be refused until staging succeeds")
+	assert.Contains(t, out, "⚠️ **Production** applies only after staging, and this PR cannot apply staging's other targets' plans (see above).")
+
+	out = render(withChanges("staging"), refused("production"))
+	assert.Contains(t, out, "▶️ **To apply** these changes, comment:\n```\nschemabot apply -e staging\n```\n")
+	assert.NotContains(t, out, "schemabot apply -e production")
+	assert.NotContains(t, out, "applies only after")
+}
+
 // convergedPrimaryPlanData is a production plan whose reviewed target,
 // primary/testapp_1, already has the schema, while primary/testapp_2 and
 // primary/testapp_3 still need a column added.
