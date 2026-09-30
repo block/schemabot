@@ -489,36 +489,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// Direct-execution changes never run without explicit confirmation: the
-	// operator must consent to their write-blocking native DDL
-	// against the locked comment that discloses it, so the apply never
-	// proceeds in one step — downgrade to the two-step confirm.
-	if len(planResp.DirectChanges()) > 0 {
-		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		// The direct-execution section above names the statements and what
-		// running them costs, so the footer carries the instruction alone.
-		commentData.PendingManualConfirmation = true
-		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
-			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
-			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
-		}
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
-		if checkRunErr != nil {
-			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
-		}
-		if headSHA != "" {
-			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-		}
-		return false, nil
-	}
-
 	// Discarding an unfinished copy destroys work already done on the target —
 	// often hours of it — so it never happens in one step. Downgrade to the
 	// two-step confirm against the locked comment that discloses what is being
-	// thrown away, the same way a direct-execution change does: the operator
-	// spends the hours, so the operator decides, and there is no flag that
-	// converts an automatic apply into that consent.
+	// thrown away: the operator spends the hours, so the operator decides, and
+	// there is no flag that converts an automatic apply into that consent.
 	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
@@ -578,17 +553,30 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	// Store the check record before anything runs: the merge gate must block on
+	// the pending changes before the target starts changing. A storage failure
+	// releases the lock (keyed on this plan's intent) and stays retryable — the
+	// re-drive re-plans from the top, reacquires the lock, and stores again —
+	// so the apply never dispatches over unknown check state.
 	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
-		h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
+		h.logger.Error("failed to store check state for automatic apply; the merge gate does not reflect the pending changes, so nothing was dispatched and the command stays retryable",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_id", planResp.PlanID, "error", checkErr)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply check state store failure")
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				"SchemaBot could not record the check state for this apply. Nothing was applied. Retry the command, and see server logs if it persists.")
+		}
+		return true, fmt.Errorf("apply command check record %s#%d: %w", repo, pr, checkErr)
 	}
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
 	return false, nil
 }
 
@@ -923,7 +911,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
 }
 

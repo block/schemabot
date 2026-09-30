@@ -505,7 +505,9 @@ agreement.
 Config-discovery failure, stored-check-state read failure, head-SHA ambiguity, or an in-flight
 apply must surface as a blocking or absent check, never a passing one. *Breaks if violated:* a PR
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
-publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`).
+publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`), and the
+automatic apply, which dispatches only after its pending changes are stored
+(`applyCommandCore` in `pkg/webhook/apply_handlers.go`).
 
 ### MG-2: Absence never passes
 
@@ -1460,11 +1462,10 @@ waive with.
 ### RV-3: Consent is explicit, specific, and re-checked
 
 Unsafe changes (error-severity lint findings such as table and column drops) block without
-`--allow-unsafe`. Changes an operator cannot undo mid-flight, such as direct execution's
-write-blocking DDL with no cutover to defer, require the operator to confirm the specific
-consequences disclosed to them. The re-plan that runs just before execution re-checks that
-verdict, so a plan that changed after the confirmation stops rather than running something the
-operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
+`--allow-unsafe`. Changes that destroy work already done on the target, such as discarding an
+unfinished row copy, require the operator to confirm the specific consequences disclosed to
+them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
+after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).

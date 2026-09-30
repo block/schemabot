@@ -922,12 +922,16 @@ fails, it also publishes a failing aggregate check.
 ### Apply requested
 
 `schemabot apply -e <environment>` re-plans before acquiring a lock. If changes
-exist and pass safety checks, SchemaBot acquires a lock, posts the plan
-comment, stores `action_required`, updates the aggregate, and submits the apply
-in the same step. It pauses for `apply-confirm` instead, keeping the lock
-pinned to that plan, when the plan contains direct-execution changes, when
-applying would discard an unfinished copy, or when the plan it just stored
-cannot be read back for the drift check.
+exist and pass safety checks, SchemaBot acquires a lock, stores
+`action_required`, updates the aggregate, posts the plan comment, and submits
+the apply in the same step. If storing `action_required` fails, nothing is
+submitted: SchemaBot releases the lock and posts an error, and the command can
+be retried. It pauses for `apply-confirm` instead, keeping the lock pinned to
+that plan, when applying would discard an unfinished copy, or when the plan it
+just stored cannot be read back for the drift check. The re-plan that runs just
+before submitting pauses it the same way when the DDL differs from the stored
+plan, or when it routes a change to direct execution that the stored plan did
+not.
 
 If the apply command finds no changes, SchemaBot plans the environment's other
 rollout members before answering. When none of them has work either, it posts a

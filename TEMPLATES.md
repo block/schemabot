@@ -311,22 +311,14 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
 - `users`: the table has ~1,240 rows
 
-Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes. Confirming the apply consents to this.
+Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.
 
 📋 **Plan**: **2** tables to alter
 
 
 ---
 
-**Confirmation required** — review the plan above, then confirm manually:
-```
-schemabot apply-confirm -e staging
-```
-
-🔓 To discard this plan and unlock, comment:
-```
-schemabot unlock
-```
+**Applying automatically**
 
 </details>
 
