@@ -507,15 +507,18 @@ func (v *ExecutionVerdicts) record(ctx context.Context, change *engine.TableChan
 // table's metadata lock essentially indefinitely, and every query arriving
 // after the queued DDL queues behind it — a single long-running transaction
 // would turn a direct statement into a table-wide stall. A short bound keeps
-// that stall short: at 90% of it the statement kills the transactions
-// blocking the lock and retries, as Spirit does for its own DDL. A blocker it
-// will not kill, an explicit LOCK TABLES or a transaction heavier than
+// that stall short: once the statement has waited 90% of it for the lock, it
+// kills the transactions blocking it and retries, as Spirit does for its own
+// DDL. It never kills while it holds the lock and runs, so traffic to the
+// table during a rebuild is left alone. A blocker it will not kill, an
+// explicit LOCK TABLES or a transaction heavier than
 // dbconn.TransactionWeightThreshold, makes the apply fail with a retryable
-// "table is busy" error once the attempts run out.
+// "table is busy" error.
 const defaultDirectLockAcquisitionTimeoutSeconds = 10
 
 // directMaxAttempts is how many times a direct statement tries to take its
-// lock before the apply fails as busy.
+// lock before the apply fails as busy. An explicit LOCK TABLES ends the
+// attempts after the first, since the kill never ends one.
 const directMaxAttempts = 3
 
 // directExecutionPoolSize caps the pool direct statements run on: one
@@ -682,8 +685,8 @@ func openDirectExecutionDB(ctx context.Context, dsn string, lockWaitSeconds int6
 }
 
 // directForceExecConfig is the dbconn configuration direct statements run
-// under: Spirit's kill at 90% of the lock wait, both lock waits taken from the
-// policy, and directMaxAttempts attempts.
+// under: Spirit's kill (once the statement has waited 90% of the lock wait),
+// both lock waits taken from the policy, and directMaxAttempts attempts.
 func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
 	cfg := dbconn.NewDBConfig()
 	cfg.LockWaitTimeout = int(lockWaitSeconds)

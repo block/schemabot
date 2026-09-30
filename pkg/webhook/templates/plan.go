@@ -1732,7 +1732,7 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer st
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
 		return "native MySQL DDL",
-			"These statements run synchronously outside the schema change engine: transactions blocking a table's metadata lock are killed so its statement can start, writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+			"These statements run synchronously outside the schema change engine: transactions blocking a table's metadata lock are killed so its statement can take the lock, writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest

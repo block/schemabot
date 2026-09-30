@@ -35,17 +35,21 @@ lock behind any open transaction that has touched the table, and by default
 MySQL lets it queue essentially forever — with every query arriving after it
 queueing behind the DDL, stalling all traffic to the table. Direct statements
 run on a session with a short `lock_wait_timeout`, and they handle a blocker
-the way Spirit handles one for its own DDL: at 90% of the bound, the statement
-kills the transactions holding the table's metadata lock, found through
-`performance_schema`, and tries again, up to 3 attempts. Two kinds of
-blocker are never killed, because killing them is unsafe: a session holding
-an explicit `LOCK TABLES`, and a transaction too large to roll back without
-harming the database. While one of those holds the lock, every attempt times
-out and the apply fails with a retryable "table is busy" error instead of
-stalling. Between attempts the statement waits up to 30 seconds for killed
-sessions to finish rolling back, so an apply can spend up to about
-3 × (bound + 30s) on one statement, though table traffic stalls only during
-the attempts themselves. The bound is configurable per policy via the
+the way Spirit handles one for its own DDL: once the statement has waited 90%
+of the bound for the table's metadata lock, it kills the transactions holding
+that lock, found through `performance_schema`, and tries again, up to 3
+attempts. That covers a statement queued from the start and a rebuild waiting
+to upgrade its lock to finish. While the statement holds the lock and runs,
+nothing is killed: the sessions reading and writing the table beside a rebuild
+are not blocking it. Two kinds of blocker are never killed, because killing
+them is unsafe: a session holding an explicit `LOCK TABLES`, and a transaction
+too large to roll back without harming the database. An explicit table lock
+fails the apply after the first attempt; a large transaction fails it once
+the attempts run out. Either way the apply fails with a retryable "table is
+busy" error instead of stalling. Between attempts the statement waits up to
+30 seconds for killed sessions to finish rolling back, so an apply can spend
+up to about 3 × (bound + 30s) on one statement, though table traffic stalls
+only during the attempts themselves. The bound is configurable per policy via the
 `lock_acquisition_timeout` config field; the engine applies a short default
 when it is not set.
 

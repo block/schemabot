@@ -810,11 +810,11 @@ func directReshapeTable(t *testing.T, db *sql.DB, name string) {
 
 // runDirectReshape drives an apply whose only statement reshapes table's
 // primary key under an enabled direct execution policy with the given lock
-// bound, and returns the schema change's final state and error message. The
+// bound and row limit, and returns the schema change's final state and error message. The
 // apply runs under a bounded context: if it stalls past it, the schema change
 // ends stopped rather than completed or failed, and the caller's assertions
 // on the state diagnose the stall.
-func runDirectReshape(t *testing.T, dsn, tableName string, lockWaitSeconds int64) (engine.State, string) {
+func runDirectReshape(t *testing.T, dsn, tableName string, lockWaitSeconds, maxTableRows int64) (engine.State, string) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	eng := New(Config{Logger: logger})
@@ -835,7 +835,7 @@ func runDirectReshape(t *testing.T, dsn, tableName string, lockWaitSeconds int64
 	defer cancel()
 	stmt := fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)", sqlescape.EscapeIdentifier(tableName))
 	eng.executeSchemaChange(ctx, host, username, password, database, []string{stmt}, false,
-		directPolicy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
+		directPolicy{Enabled: true, MaxTableRows: maxTableRows, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()
@@ -882,7 +882,7 @@ func TestEngine_ExecuteAlterPhase_KillsMetadataLockBlocker(t *testing.T) {
 
 	const lockWaitSeconds = 2
 	started := time.Now()
-	state, errorMessage := runDirectReshape(t, dsn, "direct_blocked", lockWaitSeconds)
+	state, errorMessage := runDirectReshape(t, dsn, "direct_blocked", lockWaitSeconds, 100000)
 	elapsed := time.Since(started)
 
 	require.Equal(t, engine.StateCompleted, state, "the apply completes once the blocker is killed: %s", errorMessage)
@@ -919,7 +919,7 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 	require.NoError(t, locker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&lockerID))
 
 	const lockWaitSeconds = 1
-	state, errorMessage := runDirectReshape(t, dsn, "direct_locked", lockWaitSeconds)
+	state, errorMessage := runDirectReshape(t, dsn, "direct_locked", lockWaitSeconds, 100000)
 
 	assert.Equal(t, engine.StateFailed, state)
 	assert.Contains(t, errorMessage, `Table "direct_locked" is busy`)
@@ -1174,4 +1174,81 @@ func TestExecutionVerdicts_UnreadableTableFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "read current definition")
 	assert.Empty(t, change.ExecutionMode)
 	assert.Empty(t, change.ModeReason)
+}
+
+// A direct statement only kills sessions while it is waiting for its metadata
+// lock. Once it holds the lock and is rebuilding the table, concurrent
+// application traffic is expected and is not blocking it. A transaction that
+// starts after the rebuild begins, reads the table, and commits before the
+// rebuild ends must survive, even though the rebuild outlasts the kill delay.
+func TestEngine_ExecuteAlterPhase_SparesTrafficDuringRebuild(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	const tableName = "direct_rebuild"
+	dropTablesOnCleanup(t, db, tableName)
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_rebuild (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		pad VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id),
+		KEY pad_idx (pad),
+		KEY tenant_pad_idx (tenant_id, pad)
+	)`)
+	require.NoError(t, err, "create the table")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO direct_rebuild (tenant_id, pad) SELECT 1, REPEAT(MD5(RAND()), 7)")
+	require.NoError(t, err, "seed the first row")
+	for range 19 {
+		_, err = db.ExecContext(t.Context(), "INSERT INTO direct_rebuild (tenant_id, pad) SELECT tenant_id + 1, REPEAT(MD5(RAND()), 7) FROM direct_rebuild")
+		require.NoError(t, err, "double the table")
+	}
+
+	type result struct {
+		state        engine.State
+		errorMessage string
+	}
+	done := make(chan result, 1)
+	started := time.Now()
+	go func() {
+		state, errorMessage := runDirectReshape(t, dsn, tableName, 1, 1<<20)
+		t.Logf("direct apply finished after %s", time.Since(started))
+		done <- result{state, errorMessage}
+	}()
+
+	// alterState reports what the ALTER is doing. "altering table" is the
+	// rebuild itself: the ALTER has taken its lock and not yet asked to
+	// upgrade it, so no session can be blocking it. Earlier states come before
+	// the lock is taken, and the final upgrade waits on every open reader,
+	// the bystander included, which the statement is right to kill.
+	alterState := func() string {
+		var state string
+		err := db.QueryRowContext(t.Context(), `SELECT COALESCE(MAX(state), '') FROM information_schema.processlist
+			WHERE info LIKE 'ALTER TABLE `+"`direct_rebuild`"+`%'`).Scan(&state)
+		require.NoError(t, err, "read the ALTER's state")
+		return state
+	}
+	require.Eventually(t, func() bool { return alterState() == "altering table" },
+		10*time.Second, 10*time.Millisecond, "the ALTER starts rebuilding")
+
+	bystanderConn, err := db.Conn(t.Context())
+	require.NoError(t, err, "acquire the bystander session")
+	defer utils.CloseAndLog(bystanderConn)
+	bystander, err := bystanderConn.BeginTx(t.Context(), nil)
+	require.NoError(t, err, "begin the bystander transaction")
+	defer func() { _ = bystander.Rollback() }()
+	var rows int
+	require.NoError(t, bystander.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM direct_rebuild WHERE id = 1").Scan(&rows))
+	// Hold the transaction across the kill delay, then commit while the
+	// rebuild is still running.
+	time.Sleep(1200 * time.Millisecond)
+	stillRebuilding := alterState() == "altering table"
+	commitErr := bystander.Commit()
+
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(30 * time.Second):
+		require.FailNow(t, "the direct apply did not finish")
+	}
+	require.True(t, stillRebuilding, "the rebuild must outlast the bystander, without waiting on it, for this scenario")
+	require.Equal(t, engine.StateCompleted, r.state, "the apply completes: %s", r.errorMessage)
+	assert.NoError(t, commitErr, "a transaction that never blocked the statement is not killed")
 }
