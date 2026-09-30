@@ -57,6 +57,9 @@ type memberWork struct {
 	// names are the members with work, the way an operator addresses them, in
 	// rollout order.
 	names []string
+	// others counts the members with work other than the reviewed primary,
+	// whose work runs from plans of their own rather than the reviewed plan.
+	others int
 }
 
 // memberWorkOf counts the work in a rollup. A nil rollup is one that was not
@@ -76,6 +79,9 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	for i, entry := range rollup.Entries {
 		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
 			work.names = append(work.names, names[i])
+			if i > 0 {
+				work.others++
+			}
 		}
 	}
 	work.pending = len(work.names)

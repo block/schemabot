@@ -653,8 +653,10 @@ every path that records a check from a plan plans the other members first. A mem
 be planned is unknown work, never none. *Breaks if violated:* a PR merges green while a target still
 lacks its schema change. *Enforced:* member work counted into the stored check state
 (`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
-in `pkg/api`); the rollout round the apply command and apply-confirm run before answering an empty
-primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); the failing
+in `pkg/api`); the rollout round the apply command and apply-confirm run before answering any
+primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); apply creation
+refusing member work the apply's operation shape cannot carry, rather than settling that member as
+done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
 (`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
 

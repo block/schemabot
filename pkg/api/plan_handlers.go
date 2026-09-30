@@ -1688,7 +1688,13 @@ func buildApplyOperationGroups(
 	// externally-authoritative engine (e.g. PlanetScale) — whose plans never
 	// carry per-shard changes — is never fanned out, regardless of transport.
 	keys := newMemberOperationKeys(members)
-	if canBuildShardedOperationGroups(plan, taskChanges) {
+	shape := operationShapeOf(plan, taskChanges)
+	for _, member := range members {
+		if err := rejectMemberWorkOutsideShape(member, plan, shape); err != nil {
+			return nil, false, err
+		}
+	}
+	if shape == operationShapeSharded {
 		groups, err := buildShardedApplyOperationGroups(plan, members, keys, environment, applyOpts, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, false, err
@@ -1706,7 +1712,7 @@ func buildApplyOperationGroups(
 	// stands up one branch covering the whole deployment and validates every
 	// keyspace in it, so splitting the namespaces across operations would have
 	// each drive validating keyspaces whose VSchema it never applied.
-	if len(taskChanges) == 0 && len(plan.FinalizerNamespaces()) > 0 {
+	if shape == operationShapeFinalizer {
 		groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
 		for _, member := range members {
 			operationKey, err := keys.qualify(member, finalizerOperationKeySegment)
@@ -1787,6 +1793,73 @@ func settleConvergedMemberOperations(groups []*storage.ApplyOperationWithTasks, 
 		group.Operation.State = state.ApplyOperation.Completed
 		group.Operation.CompletedAt = &now
 	}
+}
+
+// operationShape is how an apply's work is laid out as operations. One shape is
+// chosen per apply, from the apply's own plan, and every member is built into
+// it.
+type operationShape int
+
+const (
+	// operationShapePerMember is one work operation per member carrying that
+	// member's table changes, with any VSchema change riding inside the work.
+	operationShapePerMember operationShape = iota
+	// operationShapeSharded is one work operation per changing shard and table,
+	// plus a finalizer per namespace that needs one.
+	operationShapeSharded
+	// operationShapeFinalizer is one task-less finalizer per member.
+	operationShapeFinalizer
+)
+
+func (s operationShape) String() string {
+	switch s {
+	case operationShapeSharded:
+		return "per-shard operations"
+	case operationShapeFinalizer:
+		return "a namespace finalizer only"
+	default:
+		return "one table-by-table work operation per target"
+	}
+}
+
+// operationShapeOf is the shape a plan's work is laid out in when it is the
+// apply's own plan.
+func operationShapeOf(plan *storage.Plan, taskChanges []storage.TableChange) operationShape {
+	switch {
+	case canBuildShardedOperationGroups(plan, taskChanges):
+		return operationShapeSharded
+	case len(taskChanges) == 0 && len(plan.FinalizerNamespaces()) > 0:
+		return operationShapeFinalizer
+	default:
+		return operationShapePerMember
+	}
+}
+
+// rejectMemberWorkOutsideShape refuses a member whose own plan has work the
+// apply's shape has no place for.
+//
+// A member planned against its own live schema can need a different shape than
+// the reviewed plan: a target whose only change is its VSchema, one with
+// per-shard changes under a reviewed plan without them, or the reverse. Built
+// into the apply's shape anyway, that work gets no operation at all, or an
+// operation with no tasks that is settled as done, and the member reads as
+// converged while its target never got the change. So the member must need the
+// same shape, and under the per-member shape it must carry table statements to
+// build its work from. A member with no work fits every shape.
+func rejectMemberWorkOutsideShape(member applyMember, applyPlan *storage.Plan, shape operationShape) error {
+	if member.Plan == applyPlan || !member.Plan.HasWork() {
+		return nil
+	}
+	memberChanges := applyTaskChanges(member.Plan)
+	if needs := operationShapeOf(member.Plan, memberChanges); needs != shape {
+		return fmt.Errorf("rollout member %s: plan %s needs %s, but this apply runs %s, chosen from the reviewed plan %s, so the apply was not created rather than mark the target done without its change",
+			member.MemberID(), member.Plan.PlanIdentifier, needs, shape, applyPlan.PlanIdentifier)
+	}
+	if shape == operationShapePerMember && len(memberChanges) == 0 {
+		return fmt.Errorf("rollout member %s: plan %s has per-shard changes with no table statements to run them from, and this apply runs %s, so the apply was not created rather than mark the target done without its change",
+			member.MemberID(), member.Plan.PlanIdentifier, shape)
+	}
+	return nil
 }
 
 // buildNamespaceFinalizerOperations builds one task-less group_finalizer per

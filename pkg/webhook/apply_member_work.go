@@ -27,27 +27,29 @@ func rolloutStillPending(outcome reviewDriftOutcome) bool {
 	return outcome.blocks() || outcome.work.pending > 0
 }
 
-// rolloutRunsMemberWork reports whether a PR apply whose reviewed target is
-// already at the desired schema runs the other targets' own plans: the rollout
-// round passed its contract, some target still has work, and the comment the
-// operator confirms renders every target's plan. A pending rollout that fails
-// any of the three is refused instead, since the apply would otherwise run
-// statements the comment never showed (RV-1).
+// rolloutRunsMemberWork reports whether a PR apply runs other targets' own
+// plans alongside the reviewed one: the rollout round passed its contract, some
+// target other than the reviewed one has work, and the comment the operator
+// confirms renders every target's plan. Work on another target under any other
+// shape is refused instead, since the apply would otherwise run statements the
+// comment never showed (RV-1).
 func rolloutRunsMemberWork(outcome reviewDriftOutcome, preview *templates.DeploymentDriftData) bool {
-	return !outcome.blocks() && outcome.work.pending > 0 && templates.RendersTargetPlans(preview)
+	return !outcome.blocks() && outcome.work.others > 0 && templates.RendersTargetPlans(preview)
 }
 
-// refusePendingRollout answers an apply whose reviewed target is already at the
-// desired schema while the rest of the rollout is not known to be, and the apply
-// cannot run what is pending: drift blocks, or the pending work is not what the
-// operator was shown.
+// refusePendingRollout answers an apply that cannot run what the rollout has
+// pending: drift blocks, the rest of the rollout is not known to be at the
+// desired schema, or the other targets' work is not what the operator was shown.
+// reviewedTargetConverged says whether the reviewed target itself was already at
+// the desired schema, which decides what the operator is told.
 //
 // The apply does not run, and the check records what is pending so the PR
 // cannot merge as if every target were up to date (MG-12).
-func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, actionName string, outcome reviewDriftOutcome) {
-	h.logger.Info("apply refused: the reviewed target is already at the desired schema but the rest of the rollout is not",
+func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, actionName string, outcome reviewDriftOutcome, reviewedTargetConverged bool) {
+	h.logger.Info("apply refused: the rollout has work this apply cannot run",
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type,
 		"environment", environment, "action", actionName, "plan_id", planResp.PlanID,
+		"reviewed_target_converged", reviewedTargetConverged,
 		"drift_blocked", outcome.blocks(), "targets_pending", outcome.work.pending, "targets", outcome.work.members,
 		"pending_targets", outcome.work.names)
 	headSHA, err := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, outcome)
@@ -60,12 +62,12 @@ func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.Ins
 	case headSHA != "":
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, pendingRolloutMessage(outcome))
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, pendingRolloutMessage(outcome, reviewedTargetConverged))
 }
 
 // pauseForMemberWorkConfirmation holds the lock this apply acquired for an
-// apply-confirm, when the reviewed target is already at the desired schema and
-// other targets still have work.
+// apply-confirm, when targets other than the reviewed one have work, whether or
+// not the reviewed target has work of its own.
 //
 // The check is stored before the comment is posted, from the rollout round, so
 // the pending work keeps the merge gate blocked whatever the operator decides
@@ -77,12 +79,12 @@ func (h *Handler) pauseForMemberWorkConfirmation(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult,
-	rollout reviewDriftOutcome, commentData templates.PlanCommentData,
+	rollout reviewDriftOutcome, commentData templates.PlanCommentData, reviewedTargetConverged bool,
 ) (bool, error) {
 	database, dbType := schemaResult.Database, schemaResult.Type
-	h.logger.Info("apply paused for confirmation: only targets other than the reviewed one have work",
+	h.logger.Info("apply paused for confirmation: targets other than the reviewed one have work",
 		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-		"plan_id", planResp.PlanID, "pending_targets", rollout.work.names)
+		"plan_id", planResp.PlanID, "reviewed_target_converged", reviewedTargetConverged, "pending_targets", rollout.work.names)
 	headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout)
 	if checkErr != nil {
 		h.logger.Error("failed to store check state for the member-work confirmation; releasing the lock and publishing a failing aggregate from the rollout round",
@@ -101,9 +103,12 @@ func (h *Handler) pauseForMemberWorkConfirmation(
 	}
 	commentData.PendingManualConfirmation = true
 	commentData.PausedApplyCause = &templates.PausedApplyCauseData{
-		Heading: "The reviewed target already has this schema",
+		Heading: "Each target runs its own plan",
 		Remedy: "Nothing has run. Confirming runs each target's own plan shown above; " +
 			"a target already at the desired schema runs nothing.",
+	}
+	if reviewedTargetConverged {
+		commentData.PausedApplyCause.Heading = "The reviewed target already has this schema"
 	}
 	if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
 		templates.RenderPlanComment(commentData), "member-work confirmation disclosure post failure"); postErr != nil {
@@ -134,22 +139,30 @@ func (h *Handler) failClosedOnUnstoredRollout(ctx context.Context, client *ghcli
 // pendingRolloutMessage explains a refused apply to the operator. The drift
 // summary names only configured members and is already clamped for markdown,
 // so it is safe to render; the raw causes stay in the server logs.
-func pendingRolloutMessage(outcome reviewDriftOutcome) string {
-	if outcome.blocks() {
+func pendingRolloutMessage(outcome reviewDriftOutcome, reviewedTargetConverged bool) string {
+	const rerun = "Run apply again for this environment to review and confirm each target's own plan."
+	switch {
+	case outcome.blocks() && reviewedTargetConverged:
 		return fmt.Sprintf("The reviewed target already has this schema, but SchemaBot could not confirm that the other targets do (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", outcome.summary)
+	case outcome.blocks():
+		return fmt.Sprintf("SchemaBot could not confirm the plan of every target (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", outcome.summary)
+	case reviewedTargetConverged:
+		return fmt.Sprintf("The reviewed target already has this schema, but %s: %s. The plans those targets would run were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
+	default:
+		return fmt.Sprintf("Targets other than the reviewed one have plans of their own (%s: %s), and those plans were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
 	}
-	return fmt.Sprintf("The reviewed target already has this schema, but %s: %s. The plans those targets would run were not on the comment this apply acts on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.", outcome.work.summary(), strings.Join(outcome.work.names, ", "))
 }
 
 // confirmationCoversMemberWork reports whether the pending confirmation an
 // apply-confirm acts on was given against the member work it is about to run,
 // with a reason for the log when it was not.
 //
-// Only one comment pins an empty reviewed plan: the one the apply command posts
-// when the reviewed target is already at the desired schema and other targets
-// still have work, and that comment renders every target's plan. A pinned plan
-// with work of its own was confirmed against a comment that showed the reviewed
-// target's plan alone, so no other target's work was on it.
+// A pending confirmation covers another target's work only through the
+// rollout round stored with the pinned plan. The apply command runs that round
+// before pinning, and whenever another target has work it pauses on a comment
+// that renders every target's plan, so a round whose members have work is one
+// whose plans the operator was shown. A pin without such a round covers no other
+// target's work.
 //
 // The members are planned again at confirm, and a target's schema can change in
 // between. So each member with work now must have been planned with the same
@@ -163,9 +176,6 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	}
 	if pinned == nil {
 		return false, "the confirmed plan no longer exists", nil
-	}
-	if pinned.HasWork() {
-		return false, "the confirmed plan has work on the reviewed target, so its comment showed no other target's plan", nil
 	}
 	current, err := plans.Get(ctx, currentPlanID)
 	if err != nil {

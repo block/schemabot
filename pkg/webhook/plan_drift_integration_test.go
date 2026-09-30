@@ -176,7 +176,7 @@ func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []depl
 			Database:  dbName,
 			Type:      "mysql",
 			TargetDSN: physicalDSN,
-		}, st, logger)
+		}, &deploymentPlanStorage{Storage: st, deployment: spec.name}, logger)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = client.Close() })
 
@@ -214,6 +214,30 @@ func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []depl
 	svc := api.New(svcStorage, serverConfig, ternClients, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc
+}
+
+// deploymentPlanStorage is the storage one deployment's planner shares with the
+// service. The planner stores the plan row for a plan with changes before the
+// service does, keyed by its configured database, and the service keeps the
+// row already there. A planner serving one deployment of several stamps its
+// row with that deployment, so the row is the one the service would store.
+type deploymentPlanStorage struct {
+	storage.Storage
+	deployment string
+}
+
+func (s *deploymentPlanStorage) Plans() storage.PlanStore {
+	return &deploymentPlanStore{PlanStore: s.Storage.Plans(), deployment: s.deployment}
+}
+
+type deploymentPlanStore struct {
+	storage.PlanStore
+	deployment string
+}
+
+func (s *deploymentPlanStore) Create(ctx context.Context, plan *storage.Plan) (int64, error) {
+	plan.Deployment = s.deployment
+	return s.PlanStore.Create(ctx, plan)
 }
 
 // runDriftPlan drives one `schemabot plan -e production` webhook for the review
