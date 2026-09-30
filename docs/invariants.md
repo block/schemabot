@@ -1593,8 +1593,8 @@ a table declared by two desired schema files fails planning on every engine thro
 `pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
 A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
 refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
-`pkg/tern/local_client.go`), and a plan proposing to drop a table that a namespace the target does
-not select declares is refused whatever the data plane build (`refuseDropsOfUnselectedTables` in
+`pkg/tern/local_client.go`), and a plan proposing to drop a table in a namespace the target does
+not select is refused whatever the data plane build (`refuseDropsOfUnselectedTables` in
 `pkg/api/plan_unselected_drops.go`, for the primary and every member).
 
 ### RV-9: A rollout member runs only a plan made for it
