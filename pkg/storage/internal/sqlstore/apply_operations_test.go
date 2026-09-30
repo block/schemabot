@@ -3683,6 +3683,66 @@ func TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesMemberO
 	}
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_DispatchedMemberFinalizerLeavesMemberOrderToTheDispatcher
+// verifies the finalizer start gate's half of the same rule. payments-002's
+// work has completed and its group_finalizer is pending while payments-001 is
+// still copying. On an apply a dispatcher created, payments-002's finalizer
+// starts, since the dispatcher already ordered the members; on an apply
+// ordered here it waits for payments-001. Either way it still waits for its
+// own target's work, which member order never relaxes.
+func TestApplyOperationStore_FindNextApplyOperation_DispatchedMemberFinalizerLeavesMemberOrderToTheDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		idempotencyKey string
+		ownWorkState   string
+		wantClaimed    bool
+	}{
+		{name: "apply ordered here", ownWorkState: state.ApplyOperation.Completed, wantClaimed: false},
+		{name: "dispatched apply", idempotencyKey: "schemabot:v1:dispatched", ownWorkState: state.ApplyOperation.Completed, wantClaimed: true},
+		{name: "dispatched apply with its own work still copying", idempotencyKey: "schemabot:v1:dispatched", ownWorkState: state.ApplyOperation.Running, wantClaimed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_op_member_finalizer_order", 1)
+			if tc.idempotencyKey != "" {
+				_, err := testDB.ExecContext(ctx, `UPDATE applies SET idempotency_key = ? WHERE id = ?`, tc.idempotencyKey, apply.ID)
+				require.NoError(t, err)
+			}
+
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-001", OperationKey: "payments-001",
+				State: state.ApplyOperation.Running,
+			})
+			require.NoError(t, err)
+			_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002",
+				State: tc.ownWorkState,
+			})
+			require.NoError(t, err)
+			finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002",
+				OperationKey:  storage.TargetOperationKey("payments-002", "group_finalizer"),
+				OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			})
+			require.NoError(t, err)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.wantClaimed {
+				assert.Nil(t, claimed, "payments-002's finalizer must wait")
+				return
+			}
+			require.NotNil(t, claimed, "a dispatched member's finalizer starts once its own work has completed")
+			assert.Equal(t, finalizerID, claimed.ID)
+			assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+		})
+	}
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling
 // verifies that parallel drops copy-phase ordering entirely: a terminal-failed
 // earlier sibling does not block a later deployment's copy start, because the
