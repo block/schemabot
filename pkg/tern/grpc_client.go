@@ -1895,7 +1895,7 @@ func (s applyTaskScope) remoteOperationScope() (string, error) {
 		return "", nil
 	}
 	if s.operation.ExternalOperationID == "" {
-		return "", fmt.Errorf("rollout member target %s (apply_operation %d) has no remote operation id recorded; refusing to address the whole remote apply its sibling targets share", s.memberTarget, s.operation.ID)
+		return "", fmt.Errorf("rollout member target %s (apply_operation %d) records remote apply %s but no remote operation id, so its progress, cutover and control calls cannot be scoped apart from its sibling targets' and are refused. SchemaBot records both ids in one write, so this row was changed outside it: look up target %s's operation in remote apply %s on the data plane and record its id as this apply_operation's external_operation_id, then the next drive resumes it", s.memberTarget, s.operation.ID, s.operation.RemoteApplyID(), s.memberTarget, s.operation.RemoteApplyID())
 	}
 	return s.operation.ExternalOperationID, nil
 }
@@ -2160,7 +2160,12 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	if remoteOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != remoteOperationID {
 		return fmt.Errorf("apply_operation %d already has remote apply_operation id %q; refusing to overwrite with %q", op.ID, current.ExternalOperationID, remoteOperationID)
 	}
-	if err := c.storage.ApplyOperations().SaveExternalID(ctx, apply.ID, op.ID, remoteID); err != nil {
+	// Both ids land in one write. A member target that recorded its remote
+	// apply without its remote operation would be stuck: it is never
+	// dispatched again, because it already has a remote apply, and its
+	// progress, cutover and control calls are refused, because nothing tells
+	// its operation apart from its sibling targets'.
+	if err := c.storage.ApplyOperations().SaveExternalID(ctx, apply.ID, op.ID, remoteID, remoteOperationID); err != nil {
 		// The store re-verifies the deployment invariant under row locks inside
 		// the writing transaction, so a sibling dispatch that persisted between
 		// the guard's read above and this write still cannot give the deployment
@@ -2179,9 +2184,6 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	}
 	op.ExternalID = remoteID
 	if remoteOperationID != "" {
-		if err := c.storage.ApplyOperations().SaveExternalOperationID(ctx, op.ID, remoteOperationID); err != nil {
-			return fmt.Errorf("store remote apply_operation id for apply_operation %d: %w", op.ID, err)
-		}
 		op.ExternalOperationID = remoteOperationID
 	}
 	c.applyLogger(apply).InfoContext(ctx, "stored remote gRPC apply identifiers for operation",

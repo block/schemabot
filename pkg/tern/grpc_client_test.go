@@ -1007,6 +1007,10 @@ type mockApplyOperationStore struct {
 	ops          map[int64]*storage.ApplyOperation
 	saveErr      error
 	savedResumes []*storage.EngineResumeState
+	// operationIDWriteErr fails any SaveExternalID that carries a remote
+	// operation id, standing in for a pod that dies before that id reaches
+	// storage.
+	operationIDWriteErr error
 }
 
 func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
@@ -1084,21 +1088,12 @@ func (m *mockApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg
 	return nil
 }
 
-func (m *mockApplyOperationStore) SaveExternalOperationID(_ context.Context, operationID int64, externalOperationID string) error {
+func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID, externalOperationID string) error {
 	if m.saveErr != nil {
 		return m.saveErr
 	}
-	op, ok := m.ops[operationID]
-	if !ok {
-		return storage.ErrApplyOperationNotFound
-	}
-	op.ExternalOperationID = externalOperationID
-	return nil
-}
-
-func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID string) error {
-	if m.saveErr != nil {
-		return m.saveErr
+	if externalOperationID != "" && m.operationIDWriteErr != nil {
+		return m.operationIDWriteErr
 	}
 	op, ok := m.ops[operationID]
 	if !ok {
@@ -1108,6 +1103,9 @@ func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, ope
 		return fmt.Errorf("apply_operation %d does not belong to apply %d: %w", operationID, applyID, storage.ErrApplyOperationNotFound)
 	}
 	op.ExternalID = externalID
+	if externalOperationID != "" {
+		op.ExternalOperationID = externalOperationID
+	}
 	return nil
 }
 
