@@ -253,3 +253,55 @@ func TestReviewDriftComment_IndependentDisclosesDirectMember(t *testing.T) {
 		})
 	}
 }
+
+// A target can carry the same verdict on one table in more than one namespace:
+// orders-001 runs `users` directly in both `ns_0` and `ns_1`, while orders-002
+// runs the same statements through Spirit. The disclosure names orders-001
+// once, and still names it, so orders-002 is not reported as running
+// write-blocking DDL, or as refusing a change, that it does not.
+func TestReviewDriftComment_VerdictInTwoNamespacesNamesItsTargetOnce(t *testing.T) {
+	const alter = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	for _, tc := range []struct {
+		mode, reason, line string
+	}{
+		{engine.ExecutionModeDirect, "table is 12 MiB, within the direct execution bound", "- `users` on target `commerce/orders-001`: table is 12 MiB, within the direct execution bound\n"},
+		{engine.ExecutionModeBlocked, "", "- `users` on target `commerce/orders-001`\n"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			memberDiff := func(target, mode string) api.DeploymentPlanDiff {
+				diff := api.DeploymentPlanDiff{DatabaseType: "mysql", Deployment: "commerce", Target: target}
+				for _, ns := range []string{"ns_0", "ns_1"} {
+					diff.Changes = append(diff.Changes, &ternv1.SchemaChange{
+						Namespace: ns,
+						TableChanges: []*ternv1.TableChange{{
+							TableName: "users", Ddl: alter, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+							Namespace: ns, ExecutionMode: mode, ModeReason: tc.reason,
+						}},
+					})
+				}
+				return diff
+			}
+			diffs := []api.DeploymentPlanDiff{memberDiff("orders-001", tc.mode), memberDiff("orders-002", "")}
+
+			rollup, err := api.RollupDeploymentDiffs(diffs, driftMembers(diffs), api.PlanIndependent)
+			require.NoError(t, err)
+			groups := deploymentPlanGroups(rollup)
+			require.Len(t, groups, 1, "one DDL, one group")
+			verdicts := groups[0].BlockedChanges
+			if tc.mode == engine.ExecutionModeDirect {
+				verdicts = nil
+				for _, dc := range groups[0].DirectChanges {
+					verdicts = append(verdicts, templates.BlockedChangeData(dc))
+				}
+			}
+			require.Len(t, verdicts, 1, "one table, one reason")
+			assert.Equal(t, []string{"commerce/orders-001"}, verdicts[0].Targets, "the target is named once, and the one that runs through Spirit is not named")
+			assert.Equal(t, 2, verdicts[0].TotalTargets)
+
+			out := templates.RenderPlanComment(templates.PlanCommentData{
+				Database: "orders", Environment: "production", IsMySQL: true, DeploymentDrift: deploymentDriftPreview(rollup),
+			})
+			assert.Contains(t, out, tc.line, "the disclosure names only the target that carries the verdict")
+		})
+	}
+}

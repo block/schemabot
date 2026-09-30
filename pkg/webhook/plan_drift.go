@@ -373,12 +373,20 @@ type modeChange interface {
 
 // addModeTarget records that a target carries one of its group's verdicts,
 // folding it into the group's entry for the same change when another target
-// already carries it.
+// already carries it. A target is listed once however many of its changes
+// fold into the entry, such as the same table in two namespaces: the list is
+// compared against the group's size to decide whether every target carries
+// the verdict, so a repeated name would credit it to targets that do not.
 func addModeTarget[T modeChange](list *[]T, change T, target string) {
 	bc := templates.BlockedChangeData(change)
 	for i := range *list {
 		existing := templates.BlockedChangeData((*list)[i])
 		if existing.Table == bc.Table && existing.Reason == bc.Reason && slices.Equal(existing.Shards, bc.Shards) {
+			if slices.Contains(existing.Targets, target) {
+				slog.Debug("target already carries this verdict in its group; not listing it twice",
+					"target", target, "table", bc.Table)
+				return
+			}
 			existing.Targets = append(existing.Targets, target)
 			(*list)[i] = T(existing)
 			return
