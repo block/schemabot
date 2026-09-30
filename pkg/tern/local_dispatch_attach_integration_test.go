@@ -384,17 +384,18 @@ func TestLocalClient_Apply_AttachNotBlockedByOwnSiblingTasks(t *testing.T) {
 }
 
 // memberTargetDispatchRequest is the whole-target dispatch the control plane
-// sends for one target of a deployment that addresses several: the target's
-// own idempotency key, a manifest declaring only its own operation, and the
-// target named so the data plane keys the operation by it.
+// sends for one target of a deployment that addresses several: the
+// deployment's idempotency key, a manifest declaring every target's operation,
+// and the target named so the data plane keys the operation by it.
 func memberTargetDispatchRequest(planID, key, target string) *ternv1.ApplyRequest {
 	return &ternv1.ApplyRequest{
 		PlanId:                  planID,
 		Environment:             localClientTestEnvironment,
 		Database:                "testdb",
 		Type:                    "mysql",
+		Target:                  target,
 		IdempotencyKey:          key,
-		GenerationOperationKeys: []string{target},
+		GenerationOperationKeys: []string{"payments-001", "payments-002"},
 		Options:                 map[string]string{dispatchMemberTargetOption: target},
 		DdlChanges: []*ternv1.TableChange{{
 			Namespace:  "testdb",
@@ -405,49 +406,85 @@ func memberTargetDispatchRequest(planID, key, target string) *ternv1.ApplyReques
 	}
 }
 
+// storeMemberTargetPlan stores a copy of a plan produced for one target, as the
+// planner stores each target's own plan of a deployment that addresses
+// several, and returns its identifier.
+func storeMemberTargetPlan(t *testing.T, stor storage.Storage, planID, target string) string {
+	t.Helper()
+	plan, err := stor.Plans().Get(t.Context(), planID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	member := *plan
+	member.ID = 0
+	member.PlanIdentifier = planID + "-" + target
+	member.Target = target
+	_, err = stor.Plans().Create(t.Context(), &member)
+	require.NoError(t, err)
+	return member.PlanIdentifier
+}
+
 // A deployment addressing targets payments-001 and payments-002 dispatches
-// each target as its own whole-target operation. The data plane keys the
-// operation by the target, which is the key the planner stored and the
-// manifest declares, and echoes it; a replay resolves to the same operation.
-// A dispatch for payments-002 that arrives under payments-001's idempotency
-// key is refused by the manifest instead of being answered with
-// payments-001's operation, so one target is never tracked as another.
-func TestLocalClient_Apply_MemberTargetDispatchKeysItsOperationByTarget(t *testing.T) {
+// both under the deployment's one idempotency key, as the shards of a Vitess
+// deployment are. The first dispatch creates the remote apply and the second
+// attaches its own operation to it: the data plane keys each operation by its
+// target, echoes that key, and returns a distinct operation id, and
+// payments-001's pending work does not refuse payments-002 as a conflict,
+// because it belongs to the apply payments-002 attaches to. A replay of
+// either resolves to that target's own operation. A dispatch naming
+// payments-002 but carrying payments-001's plan is refused before it can run
+// that plan, so one target is never tracked as, or run as, another.
+func TestLocalClient_Apply_MemberTargetsShareTheDeploymentsApply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	stor, client, planID := setupAttachDispatchClient(t)
+	stor, client, basePlanID := setupAttachDispatchClient(t)
 	ctx := t.Context()
 	const key = "schemabot:v1:member-target-test"
+	firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+	secondPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-002")
 
-	first, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-001"))
+	first, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, key, "payments-001"))
 	require.NoError(t, err)
-	require.True(t, first.Accepted, "the member dispatch must be accepted: %s", first.ErrorMessage)
+	require.True(t, first.Accepted, "the first target's dispatch must be accepted: %s", first.ErrorMessage)
 	assert.Equal(t, "payments-001", first.OperationKey, "the response must echo the target-qualified operation key")
+
+	second, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlanID, key, "payments-002"))
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "the second target must attach to the deployment's apply: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId, "both targets share the deployment's one apply")
+	assert.Equal(t, "payments-002", second.OperationKey)
+	assert.NotEqual(t, first.ApplyOperationId, second.ApplyOperationId, "each target owns its own operation")
 
 	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
 	require.NoError(t, err)
 	require.NotNil(t, apply)
-	assert.Equal(t, []string{"payments-001"}, apply.ExpectedOperationKeys)
+	assert.Equal(t, []string{"payments-001", "payments-002"}, apply.ExpectedOperationKeys)
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
-	require.Len(t, ops, 1)
-	assert.Equal(t, "payments-001", ops[0].OperationKey)
-	assert.Equal(t, strconv.FormatInt(ops[0].ID, 10), first.ApplyOperationId)
+	require.Len(t, ops, 2)
+	byKey := map[string]*storage.ApplyOperation{}
+	for _, op := range ops {
+		byKey[op.OperationKey] = op
+	}
+	require.Contains(t, byKey, "payments-001")
+	require.Contains(t, byKey, "payments-002")
+	assert.Equal(t, strconv.FormatInt(byKey["payments-001"].ID, 10), first.ApplyOperationId)
+	assert.Equal(t, strconv.FormatInt(byKey["payments-002"].ID, 10), second.ApplyOperationId)
+	assert.Equal(t, "payments-001", byKey["payments-001"].Target)
+	assert.Equal(t, "payments-002", byKey["payments-002"].Target)
 
-	replay, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-001"))
+	replay, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlanID, key, "payments-002"))
 	require.NoError(t, err)
 	require.True(t, replay.Accepted, "replay must be accepted: %s", replay.ErrorMessage)
-	assert.Equal(t, first.ApplyOperationId, replay.ApplyOperationId, "replay must resolve to the original operation")
-	assert.Equal(t, "payments-001", replay.OperationKey)
+	assert.Equal(t, second.ApplyOperationId, replay.ApplyOperationId, "a replay resolves to that target's own operation")
+	assert.Equal(t, "payments-002", replay.OperationKey)
 
-	aliased, err := client.Apply(ctx, memberTargetDispatchRequest(planID, key, "payments-002"))
-	require.NoError(t, err)
-	assert.False(t, aliased.Accepted, "a sibling target under another target's key must not be answered with that target's operation")
-	assert.Contains(t, aliased.ErrorMessage, "generation manifest")
+	_, err = client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, key, "payments-002"))
+	require.Error(t, err, "a target dispatched under its sibling's plan must be refused")
+	assert.Contains(t, err.Error(), `which was produced for target "payments-001"`)
 
 	ops, err = stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
-	assert.Len(t, ops, 1, "the refused dispatch must not attach an operation")
+	assert.Len(t, ops, 2, "the refused dispatch must not attach an operation")
 }
