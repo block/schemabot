@@ -415,6 +415,11 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	if stmtType, _, err := p.Classify(raw); err == nil {
 		return canonicalDriftStatement(p, raw, stmtType)
 	}
+	// Classify accepts one statement only, so a multi-statement script reaches
+	// ParseCreateSet, and its admitted shapes are what keep drift closed: a
+	// CREATE TABLE followed only by CREATE INDEX statements on that table. Any
+	// other sequence is refused at the first statement outside that shape, so
+	// a trailing statement cannot hide behind the classification of the first.
 	createSet, err := ddl.ParseCreateSet(p, raw)
 	if err != nil {
 		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
