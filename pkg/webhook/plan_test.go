@@ -1308,7 +1308,7 @@ func TestBuildPlanCommentData_TableSizes(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	assert.Len(t, data.Changes[0].Statements, 4, "all statements still render as DDL")
@@ -1337,7 +1337,7 @@ func TestBuildPlanCommentData_TableSizesListEachTableOnce(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	assert.Len(t, data.Changes[0].Statements, 2, "both statements still render as DDL")
@@ -1363,7 +1363,7 @@ func TestBuildPlanCommentData_TableSizesInspectEachJoinedStatement(t *testing.T)
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].TableSizes, 1, "only the table whose joined DDL builds an index carries a size line")
@@ -1386,7 +1386,7 @@ func TestBuildPlanCommentData_TableSizesSkipCreatedTables(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	assert.Empty(t, data.Changes[0].TableSizes)
@@ -1412,7 +1412,7 @@ func TestBuildPlanCommentData_TableSizesReadEveryShard(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].TableSizes, 1)
