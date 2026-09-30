@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -718,8 +719,8 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 	assert.NotContains(t, cutover, "\n## Injected")
 	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
 
-	// The stop footer names the member whose section it closes, in prose under
-	// the command an operator is about to paste.
+	// The stop footer names the member whose section it closes, in prose ahead
+	// of the command an operator is about to paste.
 	footer := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
 		ApplyID:     "apply-123",
@@ -730,13 +731,18 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 		},
 	})
 	assert.NotContains(t, footer, "\n## Injected")
-	assert.Contains(t, footer, "Stopping applies to every target in this rollout, not just `` us` ## Injected [click](https://example.invalid) ``.")
+	assert.Contains(t, footer, rolloutScopeLine+", not just `` us` ## Injected [click](https://example.invalid) ``.")
 }
 
-// stop and cancel address the apply, not one member of it, and the CLI offers no
-// way to narrow them. A member's section therefore says how far its own stop
-// command reaches, so an operator reading one target's body does not send a
-// command believing it stops that target alone.
+// rolloutScopeLine opens the sentence a member's footer carries when the
+// apply fans out across several members.
+const rolloutScopeLine = "Each command below applies to every deployment in this rollout"
+
+// Control commands address the apply, not one member of it, and the CLI offers
+// no way to narrow them. A member's section therefore says how far its stop
+// command reaches, ahead of the command rather than after it, so an operator
+// who copies the command from one target's section has already read that it
+// stops every target.
 func TestRenderMultiDeploymentApplyComment_StopFooterNamesTheWholeRollout(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		memberOp("primary", "testapp-001", so.Running),
@@ -752,13 +758,12 @@ func TestRenderMultiDeploymentApplyComment_StopFooterNamesTheWholeRollout(t *tes
 		},
 	})
 
-	assert.Contains(t, out, "To stop this schema change:")
-	assert.Contains(t, out, "Stopping applies to every target in this rollout, not just `primary/testapp-001`.")
-	assert.Contains(t, out, "Stopping applies to every target in this rollout, not just `primary/testapp-002`.")
+	assert.Contains(t, out, "---\n\n"+rolloutScopeLine+", not just `primary/testapp-001`.\n\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```")
+	assert.Contains(t, out, "---\n\n"+rolloutScopeLine+", not just `primary/testapp-002`.\n\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```")
 }
 
-// On an engine whose control command is cancel, the sentence follows the command
-// it qualifies rather than keeping the stop vocabulary.
+// On an engine whose control command is cancel, the sentence qualifies the
+// cancel command the same way.
 func TestRenderMultiDeploymentApplyComment_CancelFooterNamesTheWholeRollout(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		rollingOp("primary", so.Running),
@@ -774,9 +779,83 @@ func TestRenderMultiDeploymentApplyComment_CancelFooterNamesTheWholeRollout(t *t
 		},
 	})
 
-	assert.Contains(t, out, "To cancel this schema change:")
-	assert.Contains(t, out, "Cancelling applies to every target in this rollout, not just `primary`.")
-	assert.NotContains(t, out, "Stopping applies to every target")
+	assert.Contains(t, out, rolloutScopeLine+", not just `primary`.\n\nTo cancel this schema change:\n```\nschemabot cancel apply-123 -e production\n```")
+}
+
+// A stopped rollout's terminal summary renders each member's section through
+// the summary renderer, and its resume command is apply-wide too.
+func TestRenderMultiDeploymentApplySummaryComment_ResumeFooterNamesTheWholeRollout(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("us", so.Stopped),
+		rollingOp("eu", so.Stopped),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders_us", State: state.Apply.Stopped, ApplyID: "apply-123", Environment: "production"},
+			{Database: "orders_eu", State: state.Apply.Stopped, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+
+	assert.Contains(t, out, rolloutScopeLine+", not just `us`.\n\nPaused — to resume from where it stopped:\n```\nschemabot start apply-123 -e production\n```")
+	assert.Contains(t, out, rolloutScopeLine+", not just `eu`.\n\nPaused — to resume from where it stopped:")
+}
+
+// Every command a member's footer offers addresses the whole apply, in every
+// state and on every engine, including states added after this test: none takes
+// a member selector. So wherever a member's section prints a command, the scope
+// sentence is in the same footer ahead of it.
+func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
+	scope := rolloutScopeLine + ", not just `us`.\n\n"
+	for _, field := range reflect.ValueOf(state.Apply).Fields() {
+		applyState := field.String()
+		for _, engine := range []string{storage.EngineSpirit, storage.EnginePlanetScale} {
+			data := ApplyStatusCommentData{
+				Database:      "orders_us",
+				State:         applyState,
+				ApplyID:       "apply-123",
+				Environment:   "production",
+				Engine:        engine,
+				DeferCutover:  true,
+				RolloutWide:   true,
+				RolloutMember: "us",
+			}
+			// The retrying-table variant of an active state has its own
+			// footer label.
+			retrying := data
+			retrying.Tables = []TableProgressData{{TableName: "users", Status: state.Apply.FailedRetryable}}
+			renders := map[string]string{
+				"status":          RenderApplyStatusComment(data),
+				"status/retrying": RenderApplyStatusComment(retrying),
+				"summary":         RenderApplySummaryComment(data),
+			}
+			for surface, out := range renders {
+				t.Run(applyState+"/"+engine+"/"+surface, func(t *testing.T) {
+					assertEveryCommandCarriesScope(t, out, scope)
+				})
+			}
+		}
+	}
+}
+
+// assertEveryCommandCarriesScope checks that each schemabot command block in
+// out sits in a footer that opens with scope.
+func assertEveryCommandCarriesScope(t *testing.T, out, scope string) {
+	t.Helper()
+	const command = "```\nschemabot "
+	for at := 0; ; {
+		i := strings.Index(out[at:], command)
+		if i < 0 {
+			return
+		}
+		i += at
+		footerStart := strings.LastIndex(out[:i], "\n---\n")
+		require.GreaterOrEqual(t, footerStart, 0, "a command renders outside any footer:\n%s", out)
+		assert.Contains(t, out[footerStart:i], scope, "a command renders without the rollout scope sentence:\n%s", out)
+		at = i + len(command)
+	}
 }
 
 // A single-deployment apply has nothing for the command to reach past, so the
@@ -793,11 +872,26 @@ func TestRenderMultiDeploymentApplyComment_SoleMemberHasNoRolloutScopeLine(t *te
 	})
 
 	assert.Contains(t, out, "To stop this schema change:")
-	assert.NotContains(t, out, "applies to every target in this rollout")
+	assert.NotContains(t, out, rolloutScopeLine)
 }
 
-// The single-deployment comment is rendered by the same footer code, and carries
-// no member name, so it keeps the unqualified command it has always shown.
+// A member that reaches the renderer without a name still gets the sentence:
+// whether it renders depends on the rollout having several members, not on
+// the name that qualifies it.
+func TestRenderApplyStatusComment_UnnamedRolloutMemberKeepsScopeLine(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "orders",
+		State:       state.Apply.Running,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		RolloutWide: true,
+	})
+
+	assert.Contains(t, out, rolloutScopeLine+".\n\nTo stop this schema change:")
+}
+
+// The single-deployment comment is rendered by the same footer code and is not
+// part of a rollout, so it keeps the unqualified command it has always shown.
 func TestRenderApplyStatusComment_NoRolloutScopeLine(t *testing.T) {
 	out := RenderApplyStatusComment(ApplyStatusCommentData{
 		Database:    "orders",
@@ -807,5 +901,5 @@ func TestRenderApplyStatusComment_NoRolloutScopeLine(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "To stop this schema change:")
-	assert.NotContains(t, out, "applies to every target in this rollout")
+	assert.NotContains(t, out, rolloutScopeLine)
 }

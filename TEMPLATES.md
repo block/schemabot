@@ -7597,12 +7597,12 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
+Each command below applies to every deployment in this rollout, not just `us`.
+
 To stop this schema change:
 ```
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
-
-Stopping applies to every target in this rollout, not just `us`.
 
 </details>
 
@@ -7720,6 +7720,8 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 > ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
+
+Each command below applies to every deployment in this rollout, not just `us`.
 
 To retry:
 ```
@@ -8076,6 +8078,8 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 
 ---
+
+Each command below applies to every deployment in this rollout, not just `us`.
 
 To retry:
 ```

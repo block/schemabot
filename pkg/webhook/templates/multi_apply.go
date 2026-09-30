@@ -276,12 +276,10 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		if detail := memberDetail(data.Details, i); detail != nil {
 			body := *detail
 			body.DerivedStatus = siblingDerivedStatus(d)
-			// The member's own name, so its footer can say that the apply-wide
-			// stop and cancel commands under it reach past this section. Left
-			// empty when there is nothing else for them to reach.
-			if fanOut {
-				body.RolloutMember = d.Name
-			}
+			// A footer inside one of several sections says that its apply-wide
+			// commands reach past the section, naming the member it heads.
+			body.RolloutWide = fanOut
+			body.RolloutMember = d.Name
 			sb.WriteString(stripLeadingHeading(renderDetail(body)))
 		} else {
 			sb.WriteString("_No details available yet._\n")
