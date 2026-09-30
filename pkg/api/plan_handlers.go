@@ -600,7 +600,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.ExecutePlan(r.Context(), req)
+	planProto, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
@@ -631,8 +631,8 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.refuseUpToDateForUnplannedMembers(req, resp); err != nil {
-		s.logger.Error("plan failed: rollout members could not be resolved to check the plan's coverage", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+	if err := s.refuseUpToDateForUnconvergedMembers(r.Context(), req, planProto, resp); err != nil {
+		s.logger.Error("plan failed: the other rollout members could not be planned to check the plan's coverage", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
@@ -640,18 +640,20 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-// refuseUpToDateForUnplannedMembers keeps a plan of a whole rollout from
-// reading as "up to date" when only its primary was planned.
+// refuseUpToDateForUnconvergedMembers keeps a plan of a whole rollout from
+// reading as "up to date" while another member still needs a change.
 //
 // A plan requested through the API is made against the rollout primary, and
 // the other members run the primary's plan. A primary with nothing to change
 // says nothing about the other members: one can still lack the change, for
-// instance after an apply narrowed to the primary landed it there alone. An
-// empty plan would tell the caller the rollout is up to date and leave those
-// members behind, so it is returned with an error that names the members that
-// were not planned and how to plan them. A plan with changes is left as it is:
-// applying it runs on every member.
-func (s *Service) refuseUpToDateForUnplannedMembers(req PlanRequest, resp *apitypes.PlanResponse) error {
+// instance after an apply narrowed to the primary landed it there alone. So
+// when the primary is clean, every other member is diffed against its own live
+// schema, without storing a plan for it. The plan reads as up to date only when
+// every member is: a member that still has work, or whose diff failed, turns
+// the plan into an error naming it and how to plan it. A plan with changes is
+// left as it is: applying it runs on every member, each verified against the
+// plan it runs.
+func (s *Service) refuseUpToDateForUnconvergedMembers(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, resp *apitypes.PlanResponse) error {
 	if req.Target != "" || len(resp.Errors) > 0 || resp.HasChanges() {
 		return nil
 	}
@@ -662,17 +664,61 @@ func (s *Service) refuseUpToDateForUnplannedMembers(req PlanRequest, resp *apity
 	if len(members) <= 1 {
 		return nil
 	}
-	unplanned := rolloutMemberSelectors(members)[1:]
-	s.logger.Warn("plan of a whole rollout refused as up to date: only the primary was planned, and it has no changes",
+	primary := routing.ExecutionTarget{Deployment: resp.Deployment, Target: resp.Target, Namespaces: resp.SelectedNamespaces}
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primary, members)
+	if err != nil {
+		return fmt.Errorf("plan the other rollout members of %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if len(diffs) != len(members) {
+		return fmt.Errorf("plan the other rollout members of %s/%s: %d member diffs for %d members", req.Database, req.Environment, len(diffs), len(members))
+	}
+
+	selectors := rolloutMemberSelectors(members)
+	var withWork, unplanned []string
+	for i := 1; i < len(diffs); i++ {
+		diff := diffs[i]
+		if diff.Err != nil {
+			s.logger.Warn("rollout member could not be planned; the plan of the whole rollout is not reported as up to date",
+				"database", req.Database,
+				"environment", req.Environment,
+				"repository", req.Repository,
+				"plan_id", resp.PlanID,
+				"member", members[i].MemberID(),
+				"error", diff.Err)
+			unplanned = append(unplanned, selectors[i])
+			continue
+		}
+		if (tern.ChangeSet{Changes: diff.Changes, Shards: diff.Shards}).HasWork() {
+			withWork = append(withWork, selectors[i])
+		}
+	}
+	if len(withWork) == 0 && len(unplanned) == 0 {
+		s.logger.Info("plan of a whole rollout is up to date: the primary and every other member are at the desired schema",
+			"database", req.Database,
+			"environment", req.Environment,
+			"repository", req.Repository,
+			"plan_id", resp.PlanID,
+			"members", len(members))
+		return nil
+	}
+	s.logger.Warn("plan of a whole rollout refused as up to date: the primary has no changes, but other members are not at the desired schema",
 		"database", req.Database,
 		"environment", req.Environment,
 		"repository", req.Repository,
 		"plan_id", resp.PlanID,
 		"primary", members[0].MemberID(),
-		"unplanned_members", len(unplanned))
-	resp.Errors = append(resp.Errors, fmt.Sprintf(
-		"rollout primary %s is at the desired schema, but this plan covers only the primary, and the other %d rollout members were not planned: %s. They can still need the change, so the rollout is not reported as up to date; plan and apply each of them with its target",
-		members[0].MemberID(), len(unplanned), listSelectors(unplanned)))
+		"members_with_changes", len(withWork),
+		"members_not_planned", len(unplanned))
+	if len(withWork) > 0 {
+		resp.Errors = append(resp.Errors, fmt.Sprintf(
+			"rollout primary %s is at the desired schema, but %d other rollout members still need changes: %s. The rollout is not up to date; plan and apply each of them with its target",
+			members[0].MemberID(), len(withWork), listSelectors(withWork)))
+	}
+	if len(unplanned) > 0 {
+		resp.Errors = append(resp.Errors, fmt.Sprintf(
+			"rollout primary %s is at the desired schema, but %d other rollout members could not be planned: %s. The rollout is not reported as up to date until each of them is planned; see the server logs for why",
+			members[0].MemberID(), len(unplanned), listSelectors(unplanned)))
+	}
 	return nil
 }
 
@@ -2972,6 +3018,9 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
+	if err := s.refuseRollbackAfterPrimaryMoved(apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
+		return nil, err
+	}
 	// Client resolution is a config lookup: a deployment that cannot resolve a
 	// Tern client resolves the same way on every attempt, so the failure is
 	// terminal until an operator fixes the routing configuration.
@@ -3051,6 +3100,35 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	}
 
 	return planResponseFromProto(resp), nil
+}
+
+// refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply
+// whose rollout primary is no longer the environment's first member.
+//
+// A rollback plan is made against the member the forward apply ran its plan
+// from, and a rollout-wide apply runs only from the current primary's plan
+// (RV-9). Once a reorder moves another member to the front, the
+// rollback plan can no longer be applied to the rollout, and applying it to its
+// own member alone would revert that member and leave the others on the
+// forward schema. The rollback is refused here, before a plan is made, with
+// the one remedy that reverts every member: restore the rollout order the
+// apply ran under. A configuration that cannot resolve the environment is left to apply
+// creation, which then runs the plan on its stored member only when the
+// rollout has no other.
+func (s *Service) refuseRollbackAfterPrimaryMoved(apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
+	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
+	if err != nil {
+		s.logger.Debug("rollback primary check skipped: config did not resolve the rollout members; apply creation holds the plan to its stored member",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if len(members) <= 1 || (members[0].Deployment == applyPrimary.Deployment && members[0].Target == applyPrimary.Target) {
+		return nil
+	}
+	s.logger.Warn("rollback refused: the rollout primary changed since the apply ran",
+		append(apply.LogAttrs(), "apply_primary", applyPrimary.MemberID(), "rollout_primary", members[0].MemberID())...)
+	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order, or the order of the targets list) so %s is first, then retry the rollback",
+		apply.ApplyIdentifier, applyPrimary.MemberID(), members[0].MemberID(), applyPrimary.MemberID(), applyPrimary.MemberID())
 }
 
 func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bool {

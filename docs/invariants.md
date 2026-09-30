@@ -1601,8 +1601,8 @@ apply of the whole rollout runs from the rollout primary's plan. An apply that r
 is never rolled back across the rollout. *Enforced:* member pairing at apply creation
 (`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
 `pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
-(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply refusal in
-`ExecuteRollbackPlanForApply` (`pkg/api/plan_handlers.go`).
+(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply
+and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`).
 
 ## Routing and authorization (AZ)
 
