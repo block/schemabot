@@ -482,6 +482,8 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 	}
 	var stateMsg string
 	switch {
+	case state.IsState(active.State, state.Apply.Pending):
+		stateMsg = "A schema change is queued and has not started yet."
 	case state.IsState(active.State, state.Apply.WaitingForDeploy):
 		stateMsg = "A schema change is waiting for deploy."
 	case state.IsState(active.State, state.Apply.WaitingForCutover):

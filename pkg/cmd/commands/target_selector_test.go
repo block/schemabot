@@ -191,23 +191,42 @@ func TestApplyCmd_UnsafeRetryKeepsTarget(t *testing.T) {
 // there blocks a targeted apply to any of them. The apply is refused with the
 // in-progress guidance before the plan is shown, the lock taken, or anything
 // submitted.
+// A schema change still queued on the deployment holds it as much as a running
+// one does.
 func TestApplyCmd_TargetRefusedWhileItsDeploymentHasAnActiveSchemaChange(t *testing.T) {
-	recorded, endpoint := newNarrowedPlanServer(t, narrowedPlan(createUsers()),
-		&apitypes.ActiveApplyResponse{ApplyID: "apply-running", Database: "testdb", Environment: "production", Deployment: "prod", State: "waiting_for_cutover"})
+	cases := []struct {
+		state   string
+		wantMsg string
+		cutover bool
+	}{
+		{state: "waiting_for_cutover", wantMsg: "A schema change is waiting for cutover.", cutover: true},
+		{state: "pending", wantMsg: "A schema change is queued and has not started yet."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			recorded, endpoint := newNarrowedPlanServer(t, narrowedPlan(createUsers()),
+				&apitypes.ActiveApplyResponse{ApplyID: "apply-running", Database: "testdb", Environment: "production", Deployment: "prod", State: tc.state})
 
-	cmd := targetedApplyCmd(t)
-	cmd.NoLock = false
-	cmd.Output = OutputFormatInteractive
-	var runErr error
-	out := stripAnsi(captureStdout(func() {
-		runErr = cmd.Run(&Globals{Endpoint: endpoint})
-	}))
+			cmd := targetedApplyCmd(t)
+			cmd.NoLock = false
+			cmd.Output = OutputFormatInteractive
+			var runErr error
+			out := stripAnsi(captureStdout(func() {
+				runErr = cmd.Run(&Globals{Endpoint: endpoint})
+			}))
 
-	require.Error(t, runErr)
-	assert.Equal(t, "schema change already in progress", runErr.Error())
-	assert.Contains(t, out, "A schema change is waiting for cutover.")
-	assert.Contains(t, out, "cutover -e production apply-running")
-	recorded.mu.Lock()
-	defer recorded.mu.Unlock()
-	assert.Equal(t, []string{"/api/plan", "/api/status"}, recorded.paths, "nothing is locked or applied while the deployment is busy")
+			require.Error(t, runErr)
+			assert.Equal(t, "schema change already in progress", runErr.Error())
+			assert.Contains(t, out, tc.wantMsg)
+			assert.Contains(t, out, "status apply-running")
+			if tc.cutover {
+				assert.Contains(t, out, "cutover -e production apply-running")
+			} else {
+				assert.NotContains(t, out, "cutover -e production")
+			}
+			recorded.mu.Lock()
+			defer recorded.mu.Unlock()
+			assert.Equal(t, []string{"/api/plan", "/api/status"}, recorded.paths, "nothing is locked or applied while the deployment is busy")
+		})
+	}
 }
