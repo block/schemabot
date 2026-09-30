@@ -1877,13 +1877,15 @@ func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 // leaves every member on one work operation per member. Per-shard changes and
 // finalizer work have no place in that shape, and a member carrying only them
 // would be settled as having nothing to do while its target never got the
-// change. Blocked changes never run. Direct-execution and unsafe changes are
-// refused whatever the command's flags: the operator consents to them against
-// the disclosure the reviewed plan's comment carries, and the member plans that
-// comment renders carry none. Apply creation refuses a member's own
-// direct-execution statement, and an unsafe change the reviewed plan does not
-// carry, whether or not the reviewed plan is empty (rejectMemberDirectExecution,
-// rejectMemberUndisclosedUnsafe).
+// change. Blocked changes never run. Unsafe changes are refused whatever the
+// command's flags: the operator consents to them against the disclosure the
+// reviewed plan's comment carries, and the member plans that comment renders
+// carry none. Apply creation refuses an unsafe change the reviewed plan does
+// not carry whether or not the reviewed plan is empty
+// (rejectMemberUndisclosedUnsafe). A direct-execution change is not refused:
+// the plan comment discloses it under the member that runs it, and
+// apply-confirm re-checks that each member's statements and execution modes
+// are the ones confirmed.
 func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 	if plan.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
@@ -1893,11 +1895,6 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 	}
 	if namespaces := plan.FinalizerNamespaces(); len(namespaces) > 0 {
 		return fmt.Sprintf("finalizes namespaces %v", namespaces)
-	}
-	for _, change := range plan.FlatDDLChanges() {
-		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
-			return fmt.Sprintf("runs table %q as direct-execution DDL", change.Table)
-		}
 	}
 	if unsafe := plan.UnsafeDDLChanges(); len(unsafe) > 0 {
 		return fmt.Sprintf("carries an unsafe change for table %q", unsafe[0].Table)
@@ -1909,23 +1906,18 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 }
 
 // rejectMemberDirectExecution refuses a member planned on its own whose plan
-// runs direct-execution DDL. The operator consents to that write-blocking native
-// DDL against the disclosure on the locked comment, which names the reviewed
-// plan's direct-execution statements and no other target's, so a member's own
-// direct-execution statement has no consent behind it. A member running the
-// apply's plan runs exactly the statements that disclosure names.
-//
-// This holds even when the reviewed plan runs the identical statement directly,
-// unlike an unsafe change the reviewed plan also carries
-// (rejectMemberUndisclosedUnsafe). An unsafe change's consequence is the
-// statement's own, so disclosing it for one target discloses it for every
-// target running it. A direct statement's consequence is its table's: it blocks
-// that table's writes for as long as the statement runs, and the disclosure
-// names the reviewed target's table with the size the planner measured there.
-// Another target's copy of the table was measured on its own and can be any
-// size under the bound, which the disclosure never showed.
+// runs direct-execution DDL, in an apply whose reviewed plan has work of its
+// own. A member running the apply's plan runs exactly the statements the
+// reviewed plan's disclosure names. An apply whose reviewed plan is empty runs
+// only the members' own plans, from a confirmation of the comment that
+// discloses each member's direct changes under the member that runs it, with
+// each member's statements and execution modes re-checked at confirm, so a
+// member's direct change runs there.
 func rejectMemberDirectExecution(member applyMember, applyPlan *storage.Plan) error {
 	if member.Plan == applyPlan {
+		return nil
+	}
+	if !applyPlan.HasWork() {
 		return nil
 	}
 	for _, change := range member.Plan.FlatDDLChanges() {

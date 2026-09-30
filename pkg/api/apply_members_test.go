@@ -657,11 +657,37 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.
 	assert.Contains(t, tasks[0].DDL, "ADD COLUMN `email`")
 }
 
+// A member's own plan can run a statement as direct-execution DDL while the
+// reviewed target is already converged. The plan comment discloses that change
+// under the member that runs it, and confirming is the operator's consent to it,
+// so apply creation builds the member's task with the direct verdict intact.
+func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.T) {
+	member := memberPlanWithChange(storage.TableChange{
+		Namespace:     "testapp",
+		Table:         "users",
+		Operation:     "alter",
+		DDL:           "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		ExecutionMode: "direct",
+		ModeReason:    "table is 12 MiB, within the direct execution bound",
+	})
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{member}})
+
+	_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production"}, nil, "apply-converged-primary")
+	require.NoError(t, err)
+
+	applies, ok := svc.storage.Applies().(*capturingApplyStore)
+	require.True(t, ok)
+	tasks := applies.taskStore.tasks
+	require.Len(t, tasks, 1, "only the member that needs the column gets work")
+	assert.Equal(t, "users", tasks[0].TableName)
+	assert.Equal(t, "direct", tasks[0].ExecutionMode)
+	assert.Equal(t, "table is 12 MiB, within the direct execution bound", tasks[0].ModeReason)
+}
+
 // An apply created from a reviewed plan with no work gives every member one work
 // operation, so member work that needs another shape is refused rather than
-// settled as done. So are direct-execution DDL and unsafe changes, even under
-// the opt-in, whose consent is given against a disclosure the empty reviewed
-// plan does not carry.
+// settled as done. So are unsafe changes, even under the opt-in, whose consent
+// is given against a disclosure the empty reviewed plan does not carry.
 func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -691,15 +717,6 @@ func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *te
 				return plan
 			},
 			want: "finalizes namespaces [testapp]",
-		},
-		{
-			name: "direct execution",
-			member: func() *storage.Plan {
-				direct := alter
-				direct.ExecutionMode = "direct"
-				return memberPlanWithChange(direct)
-			},
-			want: "runs table \"users\" as direct-execution DDL",
 		},
 		{
 			name: "unsafe change under the opt-in",
