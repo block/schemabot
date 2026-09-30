@@ -3,6 +3,7 @@ package commands
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/cmd/client"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/require"
 )
@@ -45,4 +46,14 @@ func TestSampleRejectsExistingConnections(t *testing.T) {
 		}
 		require.ErrorContains(t, cmd.prepareSample(t.Context(), &Globals{}), message)
 	}
+}
+
+func TestInitAfterSampleUsesIndependentProfile(t *testing.T) {
+	t.Setenv("SCHEMABOT_PROFILE", "")
+	cfg := &client.Config{DefaultProfile: "sample", Profiles: map[string]client.Profile{"sample": {LocalRuntime: "schemabot-sample-example"}}}
+	require.Equal(t, "local", initProfileName(cfg, "", "local"))
+	require.Equal(t, "sample", initProfileName(cfg, "", "schemabot-sample-example"))
+	require.Equal(t, "sample", initProfileName(cfg, "sample", "local"))
+	t.Setenv("SCHEMABOT_PROFILE", "explicit")
+	require.Equal(t, "explicit", initProfileName(cfg, "", "local"))
 }

@@ -14,7 +14,7 @@ then choose MySQL or PostgreSQL. Docker must be running. SchemaBot starts a loca
 container, seeds `customers` and `orders`, and uses the same import and verification flow.
 No connection string is needed.
 
-![Start a sample database, edit its schema, and preview a change](../assets/init-sample-demo.gif)
+![Start a sample database, review and apply a change, then verify the result](../assets/init-sample-demo.gif)
 
 For scripts, select the sample explicitly:
 
@@ -31,10 +31,14 @@ when the files match the live database; use `plan` to review edits you have not 
 Docker retains sample data across restarts. To stop the database, run `docker stop` with the
 container name printed during setup. Start it again with `docker start <container-name>`,
 then continue with `plan` or `apply`. You do not need to rerun initialization to restart it.
-The container keeps its assigned port, so the saved connection continues to work.
+The container keeps its assigned port, so the saved connection continues to work. If another
+process takes that port while the sample is stopped, stop that process and retry `docker start`;
+do not remove the sample to resolve a port conflict.
 When finished, stop its SchemaBot runtime with `schemabot local stop <container-name>` before
 removing the disposable database with `docker rm -v <container-name>`. Removing the container
-permanently deletes its sample data. Your schema files remain in your project.
+permanently deletes its sample data. Your schema files remain in your project. After deleting
+a sample, start a new sample in a fresh project directory; the old project's saved connection
+belongs to the deleted database. Use `make demo DEMO_DIR=/absolute/path/to/new-project` to choose a fresh demo project.
 
 ## Before you start
 

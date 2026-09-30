@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record the real wizard and first plan using disposable databases.
 
-Requires pyte (pip install pyte). No apply is issued.
+Requires pyte (pip install pyte). Applies only to disposable --sample databases.
 With --sample, Docker provisions a MySQL or PostgreSQL sample with customers and
 orders; recording edits customers.email. No connection environment variables are needed.
 Without --sample, set DATABASE_URL and SCHEMABOT_STORAGE_DSN to demo databases.
@@ -24,6 +24,61 @@ import select
 import subprocess
 import tempfile
 import time
+
+def record_apply(command, work, env):
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
+    screen = pyte.Screen(88, 24)
+    stream = pyte.Stream(screen)
+    decoder = codecs.getincrementaldecoder('utf-8')('replace')
+    process = subprocess.Popen(command, cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    frames, pending = [], []
+    confirmed = False
+    started = time.monotonic()
+    try:
+        while time.monotonic() - started < 90:
+            if pending and time.monotonic() >= pending[0][0]:
+                _, key = pending.pop(0)
+                os.write(master, key.encode())
+            readable, _, _ = select.select([master], [], [], .03)
+            if readable:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as exc:
+                    if exc.errno == errno.EIO: break
+                    raise
+                if not data: break
+                chunk = decoder.decode(data)
+                if '\x1b]11;' in chunk:
+                    os.write(master, b'\x1b]11;rgb:ffff/ffff/ffff\x1b\\')
+                stream.feed(chunk)
+                rows = []
+                for row in range(screen.lines):
+                    spans = []
+                    for col in range(screen.columns):
+                        cell = screen.buffer[row][col]
+                        style = [cell.fg, cell.bold]
+                        if spans and spans[-1]['style'] == style: spans[-1]['text'] += cell.data
+                        else: spans.append({'style': style, 'text': cell.data})
+                    while spans and not spans[-1]['text'].rstrip(): spans.pop()
+                    if spans: spans[-1]['text'] = spans[-1]['text'].rstrip()
+                    rows.append(spans or [{'style': ['default', False], 'text': ' '}])
+                frames.append({'time': round(time.monotonic()-started, 3), 'rows': rows})
+                if not confirmed and "Only 'yes'" in '\n'.join(screen.display):
+                    now = time.monotonic()
+                    pending = [(now+1.2+i*.15, c) for i,c in enumerate('yes\r')]
+                    confirmed = True
+            if process.poll() is not None and not readable: break
+        process.wait(timeout=5)
+        if process.returncode: raise RuntimeError('Apply failed: '+ '\n'.join(screen.display))
+        if not confirmed: raise RuntimeError('Apply did not request confirmation')
+        return frames, '\n'.join(screen.display)
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--sample', action='store_true')
@@ -138,11 +193,18 @@ try:
     plan_args = ['plan', '-s', 'schema', '-e', 'development']
     plan = subprocess.run([binary, *plan_args], cwd=work, env=env, text=True, capture_output=True, check=True)
     output = {'sample': args.sample, 'init_command': 'schemabot init', 'plan_command': 'schemabot ' + ' '.join(plan_args), 'engine': args.engine, 'schema_file': schema_file, 'wizard': '\n'.join(screen.display).strip(), 'wizard_frames': [f for f in frames if any('SchemaBot' in ''.join(s['text'] for s in r) for r in f['rows']) or f['time'] > 1], 'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=schema_file, tofile=schema_file)), 'plan': plan.stdout, 'plan_stderr': plan.stderr}
+    if args.sample:
+        apply_args = ['apply', '-s', 'schema', '-e', 'development']
+        apply_frames, applied = record_apply([binary, *apply_args], work, env)
+        clean_plan = subprocess.run([binary, *plan_args], cwd=work, env=env, text=True, capture_output=True, check=True, timeout=30)
+        if 'ALTER TABLE' in clean_plan.stdout or 'no schema changes detected' not in clean_plan.stdout.lower():
+            raise RuntimeError('Expected a clean plan after applying the sample change: ' + clean_plan.stdout)
+        output.update(apply_command='schemabot ' + ' '.join(apply_args), apply=applied, apply_frames=apply_frames, clean_plan=clean_plan.stdout)
     # One generated frame per line keeps updates reviewable without expanding
     # every terminal cell into thousands of lines of JSON.
     fields = []
     for key, value in output.items():
-        encoded = ('[\n' + ',\n'.join(json.dumps(frame, separators=(',', ':')) for frame in value) + '\n]') if key == 'wizard_frames' else json.dumps(value)
+        encoded = ('[\n' + ',\n'.join(json.dumps(frame, separators=(',', ':')) for frame in value) + '\n]') if key in ('wizard_frames', 'apply_frames') else json.dumps(value)
         fields.append(json.dumps(key) + ': ' + encoded)
     Path(args.output).write_text('{\n' + ',\n'.join(fields) + '\n}\n')
     print('\n'.join(screen.display))

@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/block/mysql"
 	"github.com/block/schemabot/pkg/mysqlconn"
@@ -99,6 +100,15 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		if _, err = rand.Read(password); err != nil {
 			return Database{}, err
 		}
+		images, err := run(ctx, nil, "image", "ls", "--quiet", image)
+		if err != nil {
+			return Database{}, err
+		}
+		if strings.TrimSpace(string(images)) == "" {
+			if _, err := run(ctx, nil, "pull", image); err != nil {
+				return Database{}, err
+			}
+		}
 		// Pin Docker's host port so stop/start and daemon restarts keep saved DSNs valid.
 		// Docker claims the port after the listener closes; a race fails startup safely.
 		listener, err := new(net.ListenConfig).Listen(ctx, "tcp4", "127.0.0.1:0")
@@ -148,7 +158,7 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 	if !c.State.Running {
 		report("Starting your sample database")
 		if _, err = run(ctx, nil, "start", name); err != nil {
-			return Database{}, err
+			return Database{}, fmt.Errorf("start sample %s: %w; if its port is in use, stop the process using that port and retry docker start %s; keep the container to preserve your data and saved connection", name, err, name)
 		}
 	}
 	c, err = inspect(ctx, name)
@@ -264,7 +274,11 @@ func run(ctx context.Context, env []string, args ...string) ([]byte, error) {
 				return r
 			}, detail)
 			if len(detail) > 2048 {
-				detail = detail[:2048] + "…"
+				end := 2048
+				for !utf8.RuneStart(detail[end]) {
+					end--
+				}
+				detail = detail[:end] + "…"
 			}
 			if detail != "" {
 				return nil, fmt.Errorf("docker %s: %s: %w", args[0], detail, err)

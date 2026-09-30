@@ -3,7 +3,9 @@ package localdemo
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 )
@@ -25,4 +27,15 @@ func TestDockerErrorExplainsFailureWithoutCredentials(t *testing.T) {
 	require.ErrorContains(t, err, "disk full")
 	require.ErrorContains(t, err, "[redacted]")
 	require.NotContains(t, err.Error(), "private-password")
+}
+
+func TestDockerErrorTruncationPreservesUTF8(t *testing.T) {
+	dir := t.TempDir()
+	diagnostic := strings.Repeat("a", 2047) + "数据库"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "docker"), []byte("#!/bin/sh\necho '"+diagnostic+"' >&2\nexit 1\n"), 0700))
+	t.Setenv("PATH", dir)
+	_, err := run(t.Context(), nil, "info")
+	require.Error(t, err)
+	require.True(t, utf8.ValidString(err.Error()))
+	require.Contains(t, err.Error(), "…")
 }

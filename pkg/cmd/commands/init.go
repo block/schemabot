@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -118,7 +119,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
-	profile := client.ResolveProfileName(cfg, g.Profile)
+	profile := initProfileName(cfg, g.Profile, cmd.Runtime)
 	if existing, ok := cfg.Profiles[profile]; ok && !reflect.DeepEqual(existing, client.Profile{LocalRuntime: cmd.Runtime}) {
 		return nil, fmt.Errorf("profile %q already has a different connection; choose another --profile", profile)
 	}
@@ -369,4 +370,15 @@ func retainedInitError(err error) error {
 		return fmt.Errorf("setup cancelled; runtime registration is retained for retry: %w", err)
 	}
 	return fmt.Errorf("initialization incomplete; runtime registration is retained for retry: %w", err)
+}
+
+// A configured sample default is useful for plan/apply, but must not capture
+// onboarding for a different runtime. Explicit profile selections still win.
+func initProfileName(cfg *client.Config, flag, runtime string) string {
+	selection := client.ResolveProfile(cfg, flag)
+	existing := cfg.Profiles[selection.Name]
+	if !selection.Explicit() && strings.HasPrefix(existing.LocalRuntime, "schemabot-sample-") && existing.LocalRuntime != runtime {
+		return runtime
+	}
+	return selection.Name
 }

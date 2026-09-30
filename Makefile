@@ -248,15 +248,10 @@ endif
 demo: build
 	@engine="$(or $(ENGINE),mysql)"; \
 	case "$$engine" in mysql|postgres) ;; *) echo "Choose ENGINE=mysql or ENGINE=postgres"; exit 1 ;; esac; \
-	demo_dir="$(CURDIR)/.schemabot-demo/$$engine"; \
+	demo_dir="$(if $(DEMO_DIR),$(abspath $(DEMO_DIR)),$(CURDIR)/.schemabot-demo/$$engine)"; \
 	mkdir -p "$$demo_dir"; \
 	echo "Demo project: $$demo_dir"; \
-	if [ -d "$$demo_dir/schema" ]; then \
-	  echo "Your demo is already set up. Continue in that directory; your edits are preserved."; \
-	  echo "To restart a stopped database, use docker start with its sample container name (see docs/init.md)."; \
-	else \
-	  cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type "$$engine"; \
-	fi
+	cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type "$$engine"
 
 # Full developer environment, including LocalScale and multiple deployments.
 #   make demo-full              # Start and apply MySQL + Vitess schema (wipes data)

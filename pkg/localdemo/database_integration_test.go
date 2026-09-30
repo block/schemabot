@@ -5,6 +5,7 @@ package localdemo
 import (
 	"context"
 	"database/sql"
+	"net"
 	"os/exec"
 	"strings"
 	"testing"
@@ -58,6 +59,17 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, db.Close())
 			require.NoError(t, exec.CommandContext(ctx, "docker", "stop", "-t", "1", sample.Name).Run())
+			c, err := inspect(ctx, sample.Name)
+			require.NoError(t, err)
+			// NetworkSettings may omit stopped bindings; inspect the configured host port.
+			port, err := run(ctx, nil, "inspect", "--format", "{{range .HostConfig.PortBindings}}{{(index . 0).HostPort}}{{end}}", sample.Name)
+			require.NoError(t, err)
+			require.False(t, c.State.Running)
+			occupied, err := new(net.ListenConfig).Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strings.TrimSpace(string(port))))
+			require.NoError(t, err)
+			_, startErr := Ensure(ctx, project, engine)
+			require.NoError(t, occupied.Close())
+			require.ErrorContains(t, startErr, "keep the container to preserve your data")
 			same, err := Ensure(ctx, project, engine)
 			require.NoError(t, err)
 			require.Equal(t, sample, same)

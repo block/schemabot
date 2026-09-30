@@ -69,7 +69,7 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 		return nil, provisionErr
 	}
 	if !cmd.NonInteractive && !cmd.JSON && ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout) {
-		_, err = runInitProgress(setupCtx, provision, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+		_, err = runInitProgress(setupCtx, "sample database", provision, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
 	} else {
 		_, err = provision(setupCtx, func(stage string) {
 			if !cmd.JSON {
