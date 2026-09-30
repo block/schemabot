@@ -79,3 +79,41 @@ func TestPlanRollup_MemberCopyAtStake(t *testing.T) {
 	assert.Equal(t, 1, at, "a member whose data plane did not report copies cannot be shown to have none")
 	assert.Contains(t, reason, "did not report")
 }
+
+// A member's copy disclosure travels from its data plane's PlanDiff response,
+// through the review rollup, to the member the PR apply refuses on: a member
+// reporting a copy its plan discards is the one at stake, a member reporting a
+// clean target is not, and a member whose data plane read nothing (a PostgreSQL
+// or PlanetScale target, or an older data plane) is at stake as an unknown.
+func TestRollupReviewTimeDrift_MemberCopyDisclosureReachesTheRollup(t *testing.T) {
+	discard := &ternv1.ExistingCopy{Namespace: "testapp", Disposition: "discard", Reason: "statement_differs", Tables: []string{"users"}}
+	cases := []struct {
+		name       string
+		copies     []*ternv1.ExistingCopy
+		reported   bool
+		wantAt     int
+		wantReason string
+	}{
+		{name: "reported copy the plan discards", copies: []*ternv1.ExistingCopy{discard}, reported: true, wantAt: 1,
+			wantReason: `applying its plan discards the unfinished copy of users in namespace "testapp"`},
+		{name: "reported clean target", reported: true, wantAt: -1},
+		{name: "data plane did not read the target", wantAt: 1,
+			wantReason: "its data plane did not report whether applying its plan discards an unfinished copy"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			diff := alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")
+			diff.ExistingCopies = tc.copies
+			diff.ExistingCopiesReported = tc.reported
+			svc := multiTargetService(t, &mockTernClient{planDiffResp: diff}, &recordingPlanStore{})
+
+			rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}, multiTargetMember("testapp-001"))
+			require.NoError(t, err)
+			require.True(t, rollup.Clean)
+
+			at, reason := rollup.MemberCopyAtStake()
+			assert.Equal(t, tc.wantAt, at)
+			assert.Equal(t, tc.wantReason, reason)
+		})
+	}
+}
