@@ -1247,20 +1247,13 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 	// plan is delivered twice, or when the planner stored the row itself, and
 	// re-storing it keeps that row rather than failing. A member's identifier is
 	// minted here per call, so it never collides and this only ever forgives the
-	// supplied kind. A kept row of a narrowed plan must also record the
-	// narrowing.
+	// supplied kind.
 	_, err = s.storage.Plans().Create(ctx, storedPlan)
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, storage.ErrPlanIDExists):
-		if err := s.keepStoredPlanOnRoute(ctx, storedPlan); err != nil {
-			return err
-		}
-		if route.NarrowedTo == "" {
-			return nil
-		}
-		return s.requireStoredNarrowing(ctx, planIdentifier, route.NarrowedTo)
+		return s.keepStoredPlanOnRoute(ctx, storedPlan)
 	default:
 		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
 	}
@@ -1272,13 +1265,18 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 // A planner sharing this storage, such as a local client or a target router
 // serving this server's own requests, stores the row for a plan with changes
 // before the service does, stamped with the route it knows: the database it was
-// configured with as the deployment, and the target it resolved. The service
-// keeps that row, so the row has to name the member: an apply finds the
-// reviewed target among the rollout's members by the plan's deployment and
+// configured with as the deployment, the target it resolved, and no narrowing.
+// The service keeps that row, so the row has to name the member: an apply finds
+// the reviewed target among the rollout's members by the plan's deployment and
 // target, and a row stamped with anything else reads as a member with no stored
-// plan, refused after the operator has confirmed. A row for another database or
-// environment is not this plan at all, and fails the plan rather than being
-// taken for it.
+// plan, refused after the operator has confirmed. The row of a plan narrowed to
+// one member also has to record the narrowing, since that is what holds an
+// apply of the plan to that member rather than letting it run across the
+// rollout.
+//
+// A row for another database or environment is not this plan at all, and a row
+// that already records a different narrowing was held to other members; either
+// fails the plan rather than being taken for it.
 func (s *Service) keepStoredPlanOnRoute(ctx context.Context, plan *storage.Plan) error {
 	plans := s.storage.Plans()
 	existing, err := plans.Get(ctx, plan.PlanIdentifier)
@@ -1292,38 +1290,32 @@ func (s *Service) keepStoredPlanOnRoute(ctx context.Context, plan *storage.Plan)
 		return fmt.Errorf("plan %s for database %q environment %q collides with a stored plan for database %q environment %q",
 			plan.PlanIdentifier, plan.Database, plan.Environment, existing.Database, existing.Environment)
 	}
-	if existing.Deployment == plan.Deployment && existing.Target == plan.Target {
+	if storedNarrowingConflicts(existing.NarrowedTo, plan.NarrowedTo) {
+		s.logger.Error("plan refused: the row already stored under its identifier records a different narrowing, so it is not this plan",
+			"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", plan.Environment,
+			"narrowed_to", plan.NarrowedTo, "stored_narrowed_to", existing.NarrowedTo)
+		return fmt.Errorf("plan %s narrowed to %q collides with a stored plan narrowed to %q; plan again", plan.PlanIdentifier, plan.NarrowedTo, existing.NarrowedTo)
+	}
+	if existing.Deployment == plan.Deployment && existing.Target == plan.Target && existing.NarrowedTo == plan.NarrowedTo {
 		return nil
 	}
 	s.logger.Info("plan row stored by the planner names a different route; restamping it with the rollout member it was planned for",
 		"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", plan.Environment,
-		"stored_deployment", existing.Deployment, "stored_target", existing.Target,
-		"deployment", plan.Deployment, "target", plan.Target)
-	if err := plans.UpdateRoute(ctx, plan.PlanIdentifier, plan.Deployment, plan.Target); err != nil {
+		"stored_deployment", existing.Deployment, "stored_target", existing.Target, "stored_narrowed_to", existing.NarrowedTo,
+		"deployment", plan.Deployment, "target", plan.Target, "narrowed_to", plan.NarrowedTo)
+	if err := plans.UpdateRoute(ctx, plan.PlanIdentifier, plan.Deployment, plan.Target, plan.NarrowedTo); err != nil {
 		return fmt.Errorf("restamp plan %s with its rollout member: %w", plan.PlanIdentifier, err)
 	}
 	return nil
 }
 
-// requireStoredNarrowing confirms that a narrowed plan whose row was already
-// stored records the narrowing. The narrowing is what holds an apply of the
-// plan to its one member, so a row written without it would let the plan run
-// across the rollout; the plan is refused rather than returned for review.
-func (s *Service) requireStoredNarrowing(ctx context.Context, planIdentifier, narrowedTo string) error {
-	existing, err := s.storage.Plans().Get(ctx, planIdentifier)
-	if err != nil {
-		return fmt.Errorf("read back stored plan %s to confirm its narrowing to %s: %w", planIdentifier, narrowedTo, err)
-	}
-	if existing == nil {
-		return fmt.Errorf("plan %s was reported as already stored, but no row was found to confirm its narrowing to %s", planIdentifier, narrowedTo)
-	}
-	if existing.NarrowedTo != narrowedTo {
-		s.logger.Error("narrowed plan refused: its stored row does not record the narrowing, so an apply could run it across the rollout",
-			"plan_id", planIdentifier, "database", existing.Database, "environment", existing.Environment,
-			"narrowed_to", narrowedTo, "stored_narrowed_to", existing.NarrowedTo)
-		return fmt.Errorf("plan %s is narrowed to %s, but its stored row records narrowing %q; plan again", planIdentifier, narrowedTo, existing.NarrowedTo)
-	}
-	return nil
+// storedNarrowingConflicts reports whether a row already stored under a plan's
+// identifier records a narrowing other than the one the plan was made under. A
+// row with no narrowing is the planner's own write and takes the plan's. A row
+// with one was already held to a member, and neither widening it to the whole
+// rollout nor moving it to another member leaves it the same plan.
+func storedNarrowingConflicts(stored, planned string) bool {
+	return stored != "" && stored != planned
 }
 
 // handleApply handles POST /api/apply requests.
