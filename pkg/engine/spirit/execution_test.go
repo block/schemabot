@@ -26,6 +26,32 @@ func TestClassifyRunnerError(t *testing.T) {
 		assert.ErrorAs(t, classifiedErr, &permanentErr)
 	})
 
+	// The lockless checksum reports a proven divergence with its own sentinel,
+	// and a lossy ALTER under it fails with that verdict on every attempt, so
+	// it is permanent exactly as the snapshot checksum's verdict is.
+	t.Run("lockless permanent divergence is permanent", func(t *testing.T) {
+		runnerErr := fmt.Errorf("checksum failed: %w",
+			fmt.Errorf("%w: chunk `id` >= 1 AND `id` < 1001", checksum.ErrPermanentDivergence))
+
+		classifiedErr := classifyRunnerError(runnerErr)
+
+		assert.False(t, engine.IsRetryable(classifiedErr))
+		assert.ErrorIs(t, classifiedErr, checksum.ErrPermanentDivergence)
+	})
+
+	// Running out of lockless passes proves nothing about the data, only that
+	// ranges kept changing under the checksum, so a later attempt may verify
+	// them and the failure stays retryable.
+	t.Run("lockless unresolved verification remains retryable", func(t *testing.T) {
+		runnerErr := fmt.Errorf("checksum failed: %w",
+			fmt.Errorf("%w after 10 passes", checksum.ErrVerificationUnresolved))
+
+		classifiedErr := classifyRunnerError(runnerErr)
+
+		require.Same(t, runnerErr, classifiedErr)
+		assert.True(t, engine.IsRetryable(classifiedErr))
+	})
+
 	t.Run("checksum attempt errors remain retryable", func(t *testing.T) {
 		runnerErr := fmt.Errorf("checksum failed after several attempts: %w", checksum.ErrAttemptsExhausted)
 

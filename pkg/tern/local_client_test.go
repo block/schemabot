@@ -1493,7 +1493,7 @@ func TestExecuteGroupedApplySaveFailureAfterAcceptPausesForRetry(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false)
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
 
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.FailedRetryable),
 		"apply must pause for operator retry, got %s", applyStore.apply.State)

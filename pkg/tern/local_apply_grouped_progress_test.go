@@ -116,7 +116,7 @@ func TestPollForCompletionAtomic_LostEngineWorkTargetConverged(t *testing.T) {
 	}
 	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.Completed, apply.State, "a converged target settles the apply through the normal completed flow")
 	require.NotNil(t, apply.CompletedAt)
@@ -152,7 +152,7 @@ func TestPollForCompletionAtomic_LostEngineWorkTargetNotConverged(t *testing.T) 
 	}
 	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "a lost change the target still needs pauses the apply for retry, never fails it permanently")
 	assert.Nil(t, apply.CompletedAt, "a retryable apply carries no completion timestamp")
@@ -181,7 +181,7 @@ func TestPollForCompletionAtomic_LostEngineWorkVerificationErrorsAreBounded(t *t
 	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
 	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unverifiable target pauses the apply retryable, never permanently failed")
 	assert.Contains(t, apply.ErrorMessage, "could not be verified")
@@ -210,7 +210,7 @@ func TestPollForCompletionAtomic_StaleEngineSnapshotSelfHeals(t *testing.T) {
 	}
 	client, apply, tasks, taskStore := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.Completed, apply.State)
 	for _, task := range tasks {
@@ -247,7 +247,7 @@ func TestPollForCompletionAtomic_LostEngineWorkLeavesSettledTasksUntouched(t *te
 	payments.State = state.Task.Completed
 	payments.CompletedAt = &completedEarlier
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Task.FailedRetryable, orders.State, "the in-flight task still settles from the target read")
 	assert.Equal(t, state.Task.Completed, payments.State, "a terminal task is never re-settled")
@@ -273,7 +273,7 @@ func TestPollForCompletionAtomic_LostEngineWorkNeverCompletesRevertPhaseTasks(t 
 	}
 	client, apply, tasks, _ := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetReached, state.Task.Reverting)
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "a lost revert pauses the apply for retry, never completes it")
 	for _, task := range tasks {
@@ -301,7 +301,7 @@ func TestPollForCompletionAtomic_LostEngineWorkSettlesRevertPhaseTasksWhenVerifi
 	forward.State = state.Task.Running
 	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unverifiable target pauses the apply retryable, never permanently failed")
 	assert.Equal(t, state.Task.FailedRetryable, reverting.State, "a lost revert rests retryable without ever reading the target")
@@ -336,7 +336,8 @@ func TestPollForCompletionAtomic_LostWorkSettlementRefusedByLeaseLossExits(t *te
 			st := client.storage.(*exactProgressStorage)
 			st.tasks = refusing
 
-			client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+			require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false),
+				"a drive displaced by lease loss hands the apply back without an error")
 
 			// The ticks inside the trust budget still project the tasks' own
 			// in-flight state onto the apply; what a displaced driver must never
@@ -373,7 +374,7 @@ func TestPollForCompletionAtomic_LostEngineWorkNeverCompletesShardTasksOnWholeNa
 	tasks[0].Shard = "-80"
 	tasks[1].Shard = "80-"
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unattributable shard settles the apply retryable, never completed")
 	assert.Nil(t, apply.CompletedAt, "a retryable apply carries no completion timestamp")
@@ -409,7 +410,7 @@ func TestPollForCompletionAtomic_LostEngineWorkSettlesShardTasksOnPerShardReplan
 	orders.Shard = "-80"
 	payments.Shard = "-80"
 
-	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "the shard still needing a change pauses the apply for retry")
 	assert.Equal(t, state.Task.FailedRetryable, orders.State, "the table this shard still needs is retryable")

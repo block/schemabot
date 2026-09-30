@@ -626,14 +626,11 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	applyID, ok := applyResp["apply_id"].(string)
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
 
-	// The engine classifies the duplicate-row failure retryable, so the remote
-	// operator would re-run the whole engine attempt until the recovery budget
-	// is spent, and the control plane correctly keeps polling through those
-	// pauses — a bounded sequence of full engine runs far longer than a test
-	// deadline should cover. Spend the budget on the remote apply row up front
-	// so the first retryable failure goes through the real expiry pass
-	// immediately, settling the remote apply and its tasks to the same terminal
-	// states exhaustion would reach, with the engine error intact.
+	// A duplicate-row failure fails the same way on every attempt, so the
+	// remote's engine reports it not retryable and the remote operator settles
+	// it failed on the first engine run without spending its recovery budget.
+	// The remote apply row is read at the end to prove that no recovery claim
+	// re-ran the copy.
 	ternDB, err := sql.Open("block-mysql", ternStorageDSN)
 	require.NoError(t, err, "open tern storage db")
 	t.Cleanup(func() { utils.CloseAndLog(ternDB) })
@@ -651,18 +648,9 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 		},
 		func() string { return "apply never recorded a remote apply id" },
 	)
-	spendResult, err := ternDB.ExecContext(ctx,
-		"UPDATE applies SET attempt = ? WHERE apply_identifier = ?",
-		storage.MaxRecoveryAttempts, remoteApplyID)
-	require.NoError(t, err, "spend the remote apply's recovery budget")
-	spent, err := spendResult.RowsAffected()
-	require.NoError(t, err, "read spent recovery budget rows")
-	require.EqualValues(t, 1, spent, "expected to spend the recovery budget on remote apply %s", remoteApplyID)
 
-	// Step 3: Wait for the apply to fail on the duplicate rows. With the
-	// recovery budget spent, the first retryable failure expires to permanent
-	// failed instead of entering the recovery loop, so the deadline covers a
-	// single engine run plus the expiry pass.
+	// Step 3: Wait for the apply to fail on the duplicate rows. The failure is
+	// permanent, so the deadline covers a single engine run.
 	waitForState(t, "http://"+schemabotAddr, applyID, "failed", 30*time.Second)
 
 	// Step 4: Wait for the local apply record to be updated by pollForCompletion.
@@ -679,6 +667,14 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 		},
 	)
 	require.NotEmpty(t, storedApply.ErrorMessage, "failed apply record should carry the engine error")
+
+	// The remote apply settled failed on its first engine run: no recovery
+	// claim re-ran the copy.
+	var remoteAttempt int
+	require.NoError(t, ternDB.QueryRowContext(ctx,
+		"SELECT attempt FROM applies WHERE apply_identifier = ?", remoteApplyID).Scan(&remoteAttempt),
+		"read remote apply attempt")
+	assert.Zero(t, remoteAttempt, "remote apply %s was re-run by recovery", remoteApplyID)
 
 	// Step 5: The failed table's own engine error must be on SchemaBot's stored
 	// task row — the record the PR comment and CLI render from. Progress reads

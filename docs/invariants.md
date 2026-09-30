@@ -240,8 +240,9 @@ logged and the drive continues. An error reading something safety-gating ends th
 and leaves the row claimable for another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
-the drive loop (`pkg/api/operator.go`), the pre-start task re-read in the sequential drive
-(`pkg/tern/local_apply_sequential.go`) and the remote progress error limit
+the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
+terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
+in the grouped drive (`pkg/tern/local_apply_grouped.go`) and the remote progress error limit
 (`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -1542,7 +1543,10 @@ proposal. Symlinked namespaces resolving outside the repository root, or to them
 rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
 (`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
-`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
+`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`), and
+a table declared by two desired schema files fails planning on every engine through one rule
+(`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,
+`pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
 
 ## Routing and authorization (AZ)
 

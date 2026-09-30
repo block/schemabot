@@ -26,12 +26,16 @@ import (
 // write-thread autoscaler grow above its starting value.
 const maxCommitLatency = 100 * time.Millisecond
 
-// classifyRunnerError marks runner failures that reproduce after every
-// completed checksum attempt as permanent so operator retries are not spent
-// repeating a lossy schema change. Attempts that errored before establishing
-// row differences remain retryable.
+// classifyRunnerError marks runner failures that are verdicts about the data
+// as permanent, so operator retries are not spent repeating a lossy schema
+// change: the snapshot checksum found row differences on every completed
+// attempt, or the lockless checksum proved a divergence the copy cannot heal.
+// Attempts that errored before establishing row differences remain retryable,
+// and so does the lockless checksum's pass budget running out: that verdict
+// proves no divergence, only that ranges were still changing too fast to
+// verify, which a later attempt against a quieter table can resolve.
 func classifyRunnerError(err error) error {
-	if errors.Is(err, checksum.ErrDifferencesExhausted) {
+	if errors.Is(err, checksum.ErrDifferencesExhausted) || errors.Is(err, checksum.ErrPermanentDivergence) {
 		return &engine.PermanentError{Err: err}
 	}
 	return err
