@@ -603,6 +603,14 @@ engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
 request fields such as `branch_name` and `deploy_request_url`. Spirit applies
 currently report progress on the table entries and do not report position fields.
+`engine` names the engine running the apply, in one of two forms depending on
+where the response comes from. While the data plane reports the apply's
+progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
+`PostgreSQL`. A response served from SchemaBot's storage carries the stored
+engine name instead: `spirit`, `planetscale`, `strata`, or `postgres`. Storage
+serves a settled, retryable-failed, resuming, or multi-deployment apply, and a
+remote apply the data plane has not yet been handed. `Unknown` means the data
+plane reported an engine this server does not recognize.
 
 <details>
 <summary>Request and response example</summary>
@@ -618,7 +626,7 @@ Response excerpt (illustrative values):
   "apply_id": "apply-example-73",
   "database": "shop",
   "environment": "production",
-  "engine": "spirit",
+  "engine": "Spirit",
   "state": "running",
   "tables": [
     {
@@ -700,7 +708,7 @@ Response excerpt (illustrative values):
   "apply_id": "apply-example-74",
   "database": "shop",
   "environment": "production",
-  "engine": "postgres",
+  "engine": "PostgreSQL",
   "state": "running",
   "metadata": {
     "phase": "preflight",
