@@ -393,7 +393,8 @@ func TestMultiEnvPlanCommentSharedSectionSaysWhosePlanItNames(t *testing.T) {
 // A shared section that renders target groups cuts each group's DDL under a
 // marker naming that group's stored plan, which holds only the group's
 // targets, so the marker says the plan is for these targets rather than
-// calling it the environment's full plan.
+// calling it the environment's full plan, agreeing in number with the group
+// heading above it.
 func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
 	withTargets := func(env, planID, memberPlanID string) PlanCommentData {
 		plan := greenfieldPlan(env, "orders", 150)
@@ -405,10 +406,11 @@ func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
 				{Deployment: "primary", Target: "orders_2", Class: "planned"},
+				{Deployment: "primary", Target: "orders_3", Class: "planned"},
 			},
 			Plans: []DeploymentPlanGroup{
 				{Members: []string{"primary/orders_1"}, Primary: true, Changes: plan.Changes},
-				{Members: []string{"primary/orders_2"}, Changes: second, PlanID: memberPlanID},
+				{Members: []string{"primary/orders_2", "primary/orders_3"}, Changes: second, PlanID: memberPlanID},
 			},
 		}
 		return plan
@@ -425,7 +427,10 @@ func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
 
 	require.Contains(t, body, "### Staging & Production")
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
-	assert.Contains(t, body, "the full staging plan for these targets is available from the CLI with `schemabot list-plans plan_staging_member_2` (production runs the same DDL).")
+	first, rest, found := strings.Cut(body, "**targets `primary/orders_2`, `primary/orders_3`**")
+	require.True(t, found, body)
+	assert.Contains(t, first, "the full staging plan for this target is available from the CLI with `schemabot list-plans plan_staging1` (production runs the same DDL).")
+	assert.Contains(t, rest, "the full staging plan for these targets is available from the CLI with `schemabot list-plans plan_staging_member_2` (production runs the same DDL).")
 	assert.NotContains(t, body, "the full staging plan is available")
 }
 
@@ -486,9 +491,9 @@ func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
 	middle, last, found := strings.Cut(rest, "**target `primary/orders_3`**")
 	require.True(t, found, body)
 
-	assert.Contains(t, first, scopedPlanPointerMarker("plan_reviewed", targetGroupPlanScope))
+	assert.Contains(t, first, scopedPlanPointerMarker("plan_reviewed", targetGroupPlanScope(1)))
 	assert.NotContains(t, first, "plan_member_2")
-	assert.Contains(t, middle, "the full plan for these targets is available from the CLI with `schemabot list-plans plan_member_2`.")
+	assert.Contains(t, middle, "the full plan for this target is available from the CLI with `schemabot list-plans plan_member_2`.")
 	assert.NotContains(t, middle, "plan_reviewed")
 	assert.Contains(t, last, ddlTruncatedMarker)
 	assert.NotContains(t, last, "list-plans")
