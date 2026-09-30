@@ -217,3 +217,14 @@ func TestRoundCoversWork(t *testing.T) {
 	assert.False(t, covered)
 	assert.Equal(t, "target eu/payments-002 has work the confirmed round did not plan", reason)
 }
+
+// When the reviewed target has work too, the refusal counts every target that
+// needs the change, the reviewed one included, and never calls that list the
+// targets other than the reviewed one.
+func TestPendingRolloutMessageNamesTheTargetsThatNeedTheChange(t *testing.T) {
+	outcome := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 2, others: 1, names: []string{"eu", "us"}}}
+
+	assert.Equal(t,
+		"2 of 2 targets need this change: eu, us. The plans of the targets other than the reviewed one were not on the comment this apply acts on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		pendingRolloutMessage(outcome, false))
+}

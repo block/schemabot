@@ -242,7 +242,7 @@ func pendingRolloutMessage(outcome reviewDriftOutcome, reviewedTargetConverged b
 	case reviewedTargetConverged:
 		return fmt.Sprintf("The reviewed target already has this schema, but %s: %s. The plans those targets would run were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
 	default:
-		return fmt.Sprintf("Targets other than the reviewed one have plans of their own (%s: %s), and those plans were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
+		return fmt.Sprintf("%s: %s. The plans of the targets other than the reviewed one were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
 	}
 }
 
