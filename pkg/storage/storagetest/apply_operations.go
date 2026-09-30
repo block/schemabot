@@ -167,11 +167,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			require.NoError(t, err)
 			require.NotNil(t, claimed, "target %d is next in order", i+1)
 			assert.Equal(t, id, claimed.ID)
-			assert.Equal(t, fmt.Sprintf("payments-00%d", i+1), claimed.Target)
+			assert.Equal(t, fmt.Sprintf("payments-%03d", i+1), claimed.Target)
 
 			blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 			require.NoError(t, err)
-			assert.Nil(t, blocked, "no later target starts while payments-00%d is still running", i+1)
+			assert.Nil(t, blocked, "no later target starts while payments-%03d is still running", i+1)
 
 			require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, id))
 		}
@@ -247,9 +247,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "operation_target_parallel_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_operation_target_parallel", 912)
+		require.GreaterOrEqual(t, storage.DefaultMaxDriversPerApply, 2,
+			"the cutover half needs two targets parked behind the first")
 		targets := make([]string, storage.DefaultMaxDriversPerApply+1)
 		for i := range targets {
-			targets[i] = fmt.Sprintf("payments-00%d", i+1)
+			targets[i] = fmt.Sprintf("payments-%03d", i+1)
 		}
 		ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyParallel, storage.OnFailureHalt, targets...)
 
@@ -286,7 +288,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
 		require.NoError(t, err)
 		require.NotNil(t, next)
-		assert.Equal(t, ids[last], next.ID)
+		assert.Equal(t, ids[2], next.ID, "the next target in list order cuts over once the earlier one completes")
 	})
 
 	// FindNextApplyOperation_RollingKeepsOneTargetsShardsTogether verifies that
