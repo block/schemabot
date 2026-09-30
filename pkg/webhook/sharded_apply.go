@@ -89,14 +89,14 @@ type shardWorkGroup struct {
 // `-40` failed") reference shards. Finalizer operations are not shard work:
 // each one becomes a VSchema change — its keyspace from the operation key, its
 // display status from the operation state, and its diff from the stored plan
-// (finalizers, see resolveShardedFinalizerPlan) — rendered in the comment's
+// (finalizers, see resolveShardedPlanView) — rendered in the comment's
 // VSchema section. A keyspace the stored plan finalizes without a VSchema
 // change renders in the Finalize section instead, so the comment does not
 // claim a VSchema change the plan never carried. A
 // failed finalizer's error also stands in for the apply-level failure cause
 // when the apply row carries none, since a finalizer failure is
 // operation-scoped and leaves no failed shard row to name it.
-func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, finalizers *shardedFinalizerPlan, tenant string) templates.ShardedApplyData {
+func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, finalizers *shardedPlanView, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 	// Sort each operation's tasks by id so the joined DDL (and the change
 	// signature derived from it) is deterministic without depending on the
@@ -209,19 +209,19 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	return data
 }
 
-// shardedFinalizerPlan is what a sharded apply's comment reads from the
+// shardedPlanView is what a sharded apply's comment reads from the
 // stored plan about its finalizer operations: each namespace's rendered
 // VSchema diff, and the namespaces finalized without a VSchema change to show. A nil
 // plan, when the stored plan could not be read, renders every finalizer as a
 // VSchema change without a diff.
-type shardedFinalizerPlan struct {
+type shardedPlanView struct {
 	vschemaDiffs map[string]string
 	finalizeOnly map[string]bool
 }
 
 // vschemaDiff returns the namespace's rendered VSchema diff, or "" when the
 // stored plan carries none.
-func (p *shardedFinalizerPlan) vschemaDiff(namespace string) string {
+func (p *shardedPlanView) vschemaDiff(namespace string) string {
 	if p == nil {
 		return ""
 	}
@@ -230,11 +230,11 @@ func (p *shardedFinalizerPlan) vschemaDiff(namespace string) string {
 
 // finalizesOnly reports whether the stored plan finalizes the namespace
 // without a VSchema change to show.
-func (p *shardedFinalizerPlan) finalizesOnly(namespace string) bool {
+func (p *shardedPlanView) finalizesOnly(namespace string) bool {
 	return p != nil && p.finalizeOnly[namespace]
 }
 
-// resolveShardedFinalizerPlan loads what a sharded apply's comment needs to
+// resolveShardedPlanView loads what a sharded apply's comment needs to
 // know about its finalizers from the stored plan: which namespaces finalize
 // without a VSchema change, and each namespace's rendered VSchema diff — the
 // diff the engine annotated
@@ -247,8 +247,8 @@ func (p *shardedFinalizerPlan) finalizesOnly(namespace string) bool {
 // result. Best-effort: a plan load failure or a missing plan row contributes
 // nothing rather than blocking the comment, and a stored plan without diffs
 // (recorded before diffs were persisted) contributes no diffs.
-func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
-	if !needsShardedFinalizerPlan(apply, ops) {
+func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedPlanView {
+	if !needsShardedPlanView(apply, ops) {
 		return nil
 	}
 
@@ -264,7 +264,7 @@ func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, appl
 		return nil
 	}
 
-	finalizers := &shardedFinalizerPlan{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{}}
+	finalizers := &shardedPlanView{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{}}
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
 			continue
@@ -279,10 +279,10 @@ func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, appl
 	return finalizers
 }
 
-// needsShardedFinalizerPlan reports whether the apply's comment consumes the
+// needsShardedPlanView reports whether the apply's comment consumes the
 // stored plan's finalizer view: only a sharded apply that declares a finalizer
 // operation does.
-func needsShardedFinalizerPlan(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+func needsShardedPlanView(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
 	if !isShardedApply(ops) {
 		return false
 	}
@@ -294,11 +294,11 @@ func needsShardedFinalizerPlan(apply *storage.Apply, ops []*storage.ApplyOperati
 	return false
 }
 
-// finalizerPlanCacheLimit bounds how many plans a finalizerPlanCache holds, so
+// shardedPlanCacheLimit bounds how many plans a shardedPlanCache holds, so
 // a long-lived process does not keep every plan it has ever rendered.
-const finalizerPlanCacheLimit = 1024
+const shardedPlanCacheLimit = 1024
 
-// finalizerPlanCache remembers what each stored plan says about its apply's
+// shardedPlanCache remembers what each stored plan says about its apply's
 // finalizers once a read of it has succeeded. A stored plan never changes, so
 // the first successful read stays true for every later render. The plan
 // decides whether a Strata apply's comments take the single-deployment layout,
@@ -309,35 +309,35 @@ const finalizerPlanCacheLimit = 1024
 // cache evicts the plan rendered longest ago, so an apply still in flight,
 // which renders on every progress tick, keeps its entry. A nil cache reads
 // storage on every call.
-type finalizerPlanCache struct {
+type shardedPlanCache struct {
 	mu sync.Mutex
 	// recent orders the cached plans from most to least recently rendered.
 	recent *list.List
 	byPlan map[int64]*list.Element
 }
 
-// finalizerPlanCacheEntry is one cached plan in finalizerPlanCache.recent.
-type finalizerPlanCacheEntry struct {
+// shardedPlanCacheEntry is one cached plan in shardedPlanCache.recent.
+type shardedPlanCacheEntry struct {
 	planID int64
-	plan   *shardedFinalizerPlan
+	plan   *shardedPlanView
 }
 
-func newFinalizerPlanCache() *finalizerPlanCache {
-	return &finalizerPlanCache{recent: list.New(), byPlan: make(map[int64]*list.Element)}
+func newShardedPlanCache() *shardedPlanCache {
+	return &shardedPlanCache{recent: list.New(), byPlan: make(map[int64]*list.Element)}
 }
 
 // resolve returns the cached finalizer view of the apply's stored plan, or
-// reads it with resolveShardedFinalizerPlan and caches a successful read. The
+// reads it with resolveShardedPlanView and caches a successful read. The
 // read runs outside the lock, so a slow read for one apply does not hold up
 // another's comment.
-func (c *finalizerPlanCache) resolve(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
-	if c == nil || !needsShardedFinalizerPlan(apply, ops) {
-		return resolveShardedFinalizerPlan(ctx, stor, apply, ops)
+func (c *shardedPlanCache) resolve(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedPlanView {
+	if c == nil || !needsShardedPlanView(apply, ops) {
+		return resolveShardedPlanView(ctx, stor, apply, ops)
 	}
 	if cached := c.lookup(apply.PlanID); cached != nil {
 		return cached
 	}
-	plan := resolveShardedFinalizerPlan(ctx, stor, apply, ops)
+	plan := resolveShardedPlanView(ctx, stor, apply, ops)
 	if plan == nil {
 		return nil
 	}
@@ -346,7 +346,7 @@ func (c *finalizerPlanCache) resolve(ctx context.Context, stor storage.Storage, 
 
 // lookup returns the cached plan for planID, marking it the most recently
 // rendered, or nil when it is not cached.
-func (c *finalizerPlanCache) lookup(planID int64) *shardedFinalizerPlan {
+func (c *shardedPlanCache) lookup(planID int64) *shardedPlanView {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.byPlan[planID]
@@ -354,26 +354,26 @@ func (c *finalizerPlanCache) lookup(planID int64) *shardedFinalizerPlan {
 		return nil
 	}
 	c.recent.MoveToFront(el)
-	return el.Value.(*finalizerPlanCacheEntry).plan
+	return el.Value.(*shardedPlanCacheEntry).plan
 }
 
 // store caches a plan read for the apply and returns the cached plan: the one
 // passed in, or the one a concurrent render stored first. When the cache is
 // over its limit it evicts the plan rendered longest ago.
-func (c *finalizerPlanCache) store(apply *storage.Apply, plan *shardedFinalizerPlan) *shardedFinalizerPlan {
+func (c *shardedPlanCache) store(apply *storage.Apply, plan *shardedPlanView) *shardedPlanView {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.byPlan[apply.PlanID]; ok {
 		c.recent.MoveToFront(el)
-		return el.Value.(*finalizerPlanCacheEntry).plan
+		return el.Value.(*shardedPlanCacheEntry).plan
 	}
-	c.byPlan[apply.PlanID] = c.recent.PushFront(&finalizerPlanCacheEntry{planID: apply.PlanID, plan: plan})
-	if c.recent.Len() > finalizerPlanCacheLimit {
+	c.byPlan[apply.PlanID] = c.recent.PushFront(&shardedPlanCacheEntry{planID: apply.PlanID, plan: plan})
+	if c.recent.Len() > shardedPlanCacheLimit {
 		oldest := c.recent.Back()
-		evicted := oldest.Value.(*finalizerPlanCacheEntry).planID
+		evicted := oldest.Value.(*shardedPlanCacheEntry).planID
 		c.recent.Remove(oldest)
 		delete(c.byPlan, evicted)
-		slog.Debug("finalizer plan cache is full; evicted the plan rendered longest ago",
+		slog.Debug("sharded plan cache is full; evicted the plan rendered longest ago",
 			append(apply.LogAttrs(), "evicted_plan_id", evicted)...)
 	}
 	return plan
@@ -740,7 +740,7 @@ const fullKeyRangeShard = "-"
 // only those attached so far, so an apply whose operations attach over time
 // takes one layout from its first comment rather than switching as its
 // siblings appear.
-func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, finalizers *shardedFinalizerPlan) bool {
+func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, finalizers *shardedPlanView) bool {
 	keyspacesWithWork := make(map[string]bool)
 	var finalizerKeyspaces []string
 	for _, key := range applyOperationKeys(apply, ops) {
