@@ -251,32 +251,62 @@ type Group struct {
 }
 
 // Groups partitions the rollout's members by deployment, in the order each
-// deployment first appears in resolved order.
+// deployment first appears in resolved order. A deployment's members form one
+// group only when each is a distinct named target; members that divide one
+// target's work, or carry no target at all, are not targets to count, so each
+// stays a group of its own.
 func (a Apply) Groups() []Group {
-	var groups []Group
-	byDeployment := make(map[string]int)
+	var order []string
+	byDeployment := make(map[string][]int)
 	for i, d := range a.Deployments {
-		gi, seen := byDeployment[d.Deployment]
-		if !seen {
-			gi = len(groups)
-			byDeployment[d.Deployment] = gi
-			groups = append(groups, Group{Deployment: d.Deployment, Lead: d})
+		if _, seen := byDeployment[d.Deployment]; !seen {
+			order = append(order, d.Deployment)
 		}
-		g := &groups[gi]
-		g.Members = append(g.Members, i)
+		byDeployment[d.Deployment] = append(byDeployment[d.Deployment], i)
+	}
+	var groups []Group
+	for _, deployment := range order {
+		members := byDeployment[deployment]
+		if a.membersAreDistinctTargets(members) {
+			groups = append(groups, a.group(deployment, members))
+			continue
+		}
+		for _, i := range members {
+			groups = append(groups, a.group(deployment, []int{i}))
+		}
+	}
+	return groups
+}
+
+// membersAreDistinctTargets reports whether every member names a target of its
+// own, which is what makes the members a deployment's targets.
+func (a Apply) membersAreDistinctTargets(members []int) bool {
+	seen := make(map[string]bool, len(members))
+	for _, i := range members {
+		target := a.Deployments[i].Target
+		if target == "" || seen[target] {
+			return false
+		}
+		seen[target] = true
+	}
+	return true
+}
+
+// group builds deployment's group from members, headed by the member most in
+// need of an operator.
+func (a Apply) group(deployment string, members []int) Group {
+	g := Group{Deployment: deployment, Members: members, Lead: a.Deployments[members[0]]}
+	ds := make([]Deployment, len(members))
+	for j, i := range members {
+		d := a.Deployments[i]
+		ds[j] = d
 		g.Open = g.Open || d.Open
 		if attentionRank(d.Presentation) < attentionRank(g.Lead.Presentation) {
 			g.Lead = d
 		}
 	}
-	for gi := range groups {
-		members := make([]Deployment, len(groups[gi].Members))
-		for j, i := range groups[gi].Members {
-			members[j] = a.Deployments[i]
-		}
-		groups[gi].Counts = summaryCounts(members)
-	}
-	return groups
+	g.Counts = summaryCounts(ds)
+	return g
 }
 
 // attentionOrder ranks presentations by how urgently they need an operator,

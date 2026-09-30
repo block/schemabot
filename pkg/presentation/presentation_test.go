@@ -629,3 +629,27 @@ func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
 	assert.Equal(t, []StateCount{{"completed", 1}}, eu.Counts)
 	assert.False(t, eu.Open)
 }
+
+// Members that are not distinct targets, such as keyed operations with no
+// target or several operations dividing one target's work, are not rolled up:
+// each stays a group of its own, so no surface counts them as targets.
+func TestGroups_OnlyDistinctTargetsRollUp(t *testing.T) {
+	for name, ops := range map[string][]Operation{
+		"no target": {
+			{Deployment: "primary", State: so.Running, Parallel: true},
+			{Deployment: "primary", State: so.Running, Parallel: true},
+		},
+		"one target's work": {
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			groups := Derive(ops).Groups()
+			require.Len(t, groups, 2)
+			assert.Equal(t, []int{0}, groups[0].Members)
+			assert.Equal(t, []int{1}, groups[1].Members)
+			assert.Equal(t, "primary", groups[1].Deployment)
+		})
+	}
+}
