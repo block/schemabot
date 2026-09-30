@@ -1092,7 +1092,8 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 // diff RPC.
 //
 // An identifier that is already stored is not an error: a re-plan of unchanged
-// content re-stores the same plan, and the row already there is that plan.
+// content re-stores the same plan, and the row already there is that plan. It is
+// held to this member's route, though (keepStoredPlanOnRoute).
 func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, route storedPlanRoute) error {
 	if planIdentifier == "" {
 		return fmt.Errorf("store plan for database %s deployment %q target %q: plan has no identifier", req.Database, route.Deployment, route.Target)
@@ -1138,11 +1139,56 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 	}
 	storedPlan.RecordIgnoreTables(req.IgnoreTables)
 	// An identifier the planner supplied can already name a stored row when a
-	// plan is delivered twice, and re-storing it is a no-op rather than a
-	// failure. A member's identifier is minted here per call, so it never
-	// collides and this only ever forgives the supplied kind.
-	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
+	// plan is delivered twice, or when the planner stored the row itself, and
+	// re-storing it keeps that row rather than failing. A member's identifier is
+	// minted here per call, so it never collides and this only ever forgives the
+	// supplied kind.
+	_, err = s.storage.Plans().Create(ctx, storedPlan)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, storage.ErrPlanIDExists):
+		return s.keepStoredPlanOnRoute(ctx, storedPlan)
+	default:
 		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
+	}
+}
+
+// keepStoredPlanOnRoute holds the row already stored under a plan's identifier
+// to the rollout member the service planned it for.
+//
+// A planner sharing this storage, such as a local client or a target router
+// serving this server's own requests, stores the row for a plan with changes
+// before the service does, stamped with the route it knows: the database it was
+// configured with as the deployment, and the target it resolved. The service
+// keeps that row, so the row has to name the member: an apply finds the
+// reviewed target among the rollout's members by the plan's deployment and
+// target, and a row stamped with anything else reads as a member with no stored
+// plan, refused after the operator has confirmed. A row for another database or
+// environment is not this plan at all, and fails the plan rather than being
+// taken for it.
+func (s *Service) keepStoredPlanOnRoute(ctx context.Context, plan *storage.Plan) error {
+	plans := s.storage.Plans()
+	existing, err := plans.Get(ctx, plan.PlanIdentifier)
+	if err != nil {
+		return fmt.Errorf("load plan %s already stored under its identifier: %w", plan.PlanIdentifier, err)
+	}
+	if existing == nil {
+		return fmt.Errorf("plan %s was reported as already stored, but no row carries its identifier", plan.PlanIdentifier)
+	}
+	if existing.Database != plan.Database || existing.Environment != plan.Environment {
+		return fmt.Errorf("plan %s for database %q environment %q collides with a stored plan for database %q environment %q",
+			plan.PlanIdentifier, plan.Database, plan.Environment, existing.Database, existing.Environment)
+	}
+	if existing.Deployment == plan.Deployment && existing.Target == plan.Target {
+		return nil
+	}
+	s.logger.Info("plan row stored by the planner names a different route; restamping it with the rollout member it was planned for",
+		"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", plan.Environment,
+		"stored_deployment", existing.Deployment, "stored_target", existing.Target,
+		"deployment", plan.Deployment, "target", plan.Target)
+	if err := plans.UpdateRoute(ctx, plan.PlanIdentifier, plan.Deployment, plan.Target); err != nil {
+		return fmt.Errorf("restamp plan %s with its rollout member: %w", plan.PlanIdentifier, err)
 	}
 	return nil
 }
