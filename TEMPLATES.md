@@ -311,22 +311,14 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
 - `users`: the table has ~1,240 rows
 
-Writes to each table are blocked until its statement finishes. Confirming the apply consents to this.
+Writes to each table are blocked until its statement finishes.
 
 📋 **Plan**: **2** tables to alter
 
 
 ---
 
-**Confirmation required** — review the plan above, then confirm manually:
-```
-schemabot apply-confirm -e staging
-```
-
-🔓 To discard this plan and unlock, comment:
-```
-schemabot unlock
-```
+**Applying automatically**
 
 </details>
 

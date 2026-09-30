@@ -17,7 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -44,18 +43,13 @@ func appPrimaryKeyColumns(t *testing.T, dbName, tableName string) []string {
 	return cols
 }
 
-// With the direct execution policy enabled, an apply whose plan routes a
-// change to native MySQL DDL never runs automatically: the locked plan comment
-// discloses the direct change and pauses the automatic apply, and a subsequent
-// apply-confirm — the operator's consent against that disclosure — executes
-// the change so the reshaped primary key actually lands on the target. The
-// primary-key reshape is also an unsafe operation, so both commands carry
-// --allow-unsafe; the direct downgrade layers on top of the unsafe gate
-// rather than replacing it. An apply-confirm that carries --defer-cutover is
-// rejected (an all-direct plan has no cutover to defer) but preserves the
-// pending confirmation, so a re-run without the flag still executes.
-func TestE2EDirectPlanDowngradesToConfirmThenApplies(t *testing.T) {
-	dbName := "webhook_direct_confirm"
+// With the direct execution policy enabled, the policy is the approval: an
+// apply whose plan routes a change to native MySQL DDL runs in one step, with
+// no apply-confirm, and the reshaped primary key lands on the target. The
+// primary-key reshape is also an unsafe change, so the apply still carries
+// --allow-unsafe; the unsafe gate is independent of direct execution.
+func TestE2EDirectPlanAppliesInOneStep(t *testing.T) {
+	dbName := "webhook_direct_apply"
 	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{
 		engineMetadata: map[string]string{
 			"direct_execution":                "true",
@@ -87,85 +81,30 @@ func TestE2EDirectPlanDowngradesToConfirmThenApplies(t *testing.T) {
 	h.ServeHTTP(rr, applyReq)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	select {
-	case body := <-result.comments:
-		assert.Contains(t, body, "⚙️ **Direct execution**", "the locked comment discloses the direct change")
-		assert.Contains(t, body, "will run as native MySQL DDL")
-		assert.Contains(t, body, "**Confirmation required** — review the plan above, then confirm manually:")
-		assert.NotContains(t, body, glyph.Attention,
-			"the direct-execution disclosure above carries its own glyph and names the statement")
-	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the downgraded plan comment")
-	}
-
-	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
-	require.NoError(t, err)
-	require.NotNil(t, lock, "the downgraded apply holds the lock for the confirm step")
-	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
-
-	assert.Equal(t, []string{"id"}, appPrimaryKeyColumns(t, dbName, "users"),
-		"the paused apply must not have touched the target")
-
-	// --defer-cutover has nothing to defer on this all-direct plan, so the
-	// confirm is rejected — but the rejection must not discard the pending
-	// confirmation: the lock keeps pinning the disclosed plan so a bare
-	// re-run of apply-confirm still executes it.
-	flaggedConfirmReq := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply-confirm -e staging --allow-unsafe --defer-cutover",
-		isPR:    true,
-	}, nil)
-
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, flaggedConfirmReq)
-	require.Equal(t, http.StatusOK, rr.Code)
-
-	select {
-	case body := <-result.comments:
-		assert.Contains(t, body, "`--defer-cutover` has no effect on this plan")
-		assert.Contains(t, body, "The pending confirmation is preserved")
-		assert.Contains(t, body, "schemabot apply-confirm -e staging")
-	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the defer-cutover rejection comment")
-	}
-
-	preserved, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
-	require.NoError(t, err)
-	require.NotNil(t, preserved, "the rejected confirm must keep the pending confirmation locked")
-	assert.Equal(t, lock.Owner, preserved.Owner)
-	assert.Equal(t, lock.PendingPlanID, preserved.PendingPlanID,
-		"the lock must still pin the plan the operator confirmed against")
-	assert.Equal(t, []string{"id"}, appPrimaryKeyColumns(t, dbName, "users"),
-		"the rejected confirm must not have executed the direct change")
-
-	confirmReq := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply-confirm -e staging --allow-unsafe",
-		isPR:    true,
-	}, nil)
-
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, confirmReq)
-	require.Equal(t, http.StatusOK, rr.Code)
-
-	// The direct statement is synchronous and the table is empty, so the apply
-	// may terminalize before the first progress poll: accept either a progress
-	// comment followed by a summary, or the summary directly.
-	select {
-	case body := <-result.comments:
-		hasProgress := strings.Contains(body, "Schema Change Status")
-		hasApplied := strings.Contains(body, "Schema Change Applied")
-		require.True(t, hasProgress || hasApplied,
-			"expected progress or applied comment, got: %s", body[:min(len(body), 200)])
-		if hasProgress {
-			select {
-			case summary := <-result.comments:
-				assert.Contains(t, summary, "Schema Change Applied")
-			case <-time.After(webhookIntegrationPollDeadline):
-				t.Fatal("timed out waiting for the apply summary comment")
+	// The apply posts its locked plan comment, which carries the direct
+	// disclosure, and then runs. The direct statement is synchronous and the
+	// table is empty, so the apply may terminalize before the first progress
+	// poll: after the locked comment, accept either a progress comment
+	// followed by a summary, or the summary directly.
+	sawDisclosure := false
+	sawApplied := false
+	deadline := time.After(webhookIntegrationPollDeadline)
+	for !sawApplied {
+		select {
+		case body := <-result.comments:
+			assert.NotContains(t, body, "**Confirmation required**", "a direct change needs no apply-confirm")
+			if strings.Contains(body, "⚙️ **Direct execution**") {
+				sawDisclosure = true
+				assert.Contains(t, body, "will run as native MySQL DDL, not through Spirit")
 			}
+			if strings.Contains(body, "Schema Change Applied") {
+				sawApplied = true
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the direct apply to complete")
 		}
-	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for any apply comment")
 	}
+	assert.True(t, sawDisclosure, "the apply's locked comment discloses the direct change")
 
 	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
 	require.NoError(t, err)
@@ -189,7 +128,7 @@ func TestE2EDirectPlanDowngradesToConfirmThenApplies(t *testing.T) {
 		"expected the stored check to transition to success after the direct apply completes")
 
 	assert.Equal(t, []string{"id", "tenant_id"}, appPrimaryKeyColumns(t, dbName, "users"),
-		"the confirmed direct apply reshaped the primary key on the target")
+		"the direct apply reshaped the primary key on the target")
 }
 
 // --defer-cutover on a plan whose every change runs as native MySQL DDL is

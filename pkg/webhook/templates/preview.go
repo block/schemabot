@@ -208,10 +208,10 @@ func PreviewCommentPlanAttributedChange() string {
 	})
 }
 
-// PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
-// for a plan whose refused statement the direct execution policy routes to
-// native MySQL DDL (execution-mode verdict "direct"), showing the disclosure
-// the operator consents to by confirming.
+// PreviewCommentPlanDirect renders a sample locked apply comment for a plan
+// whose refused statement the direct execution policy routes to native MySQL
+// DDL (execution-mode verdict "direct"), showing the disclosure of how it runs.
+// The policy approves the change, so the apply runs without a confirmation.
 func PreviewCommentPlanDirect() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -237,7 +237,6 @@ func PreviewCommentPlanDirect() string {
 		DirectChanges: []DirectChangeData{
 			{Table: "users", Reason: "the table has ~1,240 rows"},
 		},
-		PendingManualConfirmation: true,
 	})
 }
 

@@ -165,24 +165,6 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Direct-execution changes never run from the automatic apply path: the
-	// operator must confirm the write-blocking native DDL against
-	// the locked plan comment that discloses it, so downgrade to manual
-	// confirmation.
-	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
-		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		// The direct-execution disclosure is already on this comment, naming
-		// the statements and what running them costs.
-		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil); err != nil {
-			h.logger.Error("failed to post the direct-execution downgrade comment",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-				"environment", environment, "error", err)
-		}
-		return
-	}
-
 	// The copy on the target is read fresh on every plan, so this re-plan can
 	// discover a discard the comment behind this apply never showed: another
 	// apply can start a copy, or an adopted copy's checkpoint can age out,

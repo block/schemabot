@@ -8,10 +8,10 @@ import (
 )
 
 // A statement the direct execution policy routes to native MySQL DDL is
-// disclosed in its own ⚙️ section, naming the table and the planner's reason
-// (which carries the row estimate), with a fixed footer on the semantics the
-// operator consents to. The section also renders on the locked apply comment —
-// confirming against that comment is the consent.
+// disclosed in its own ⚙️ section, naming the table and its measured size,
+// with a footer on what running it does to the table. The policy approves the
+// change, so the section asks for no confirmation, and it also renders on the
+// locked apply comment of the apply that runs it.
 func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
@@ -27,14 +27,15 @@ func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 	plan := RenderPlanComment(data)
 	assert.Contains(t, plan, "⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit")
 	assert.Contains(t, plan, "`users`: the table has ~1,240 rows")
-	assert.Contains(t, plan, "Writes to each table are blocked until its statement finishes. Confirming the apply consents to this.")
+	assert.Contains(t, plan, "Writes to each table are blocked until its statement finishes.\n")
+	assert.NotContains(t, plan, "Confirming the apply", "the policy approves a direct change, so the disclosure asks for no confirmation")
 	assert.NotContains(t, plan, "revertible", "a MySQL direct change is undone like any other MySQL change, so no revert warning is shown")
 	assert.NotContains(t, plan, "--defer-cutover", "a plan with no --defer-cutover apply behind it does not mention the flag")
 
 	data.IsLocked = true
 	apply := RenderPlanComment(data)
 	assert.Contains(t, apply, "⚙️ **Direct execution**", "the locked apply comment keeps the direct disclosure")
-	assert.Contains(t, apply, "Confirming the apply consents to this.")
+	assert.Contains(t, apply, "Writes to each table are blocked until its statement finishes.\n")
 	assert.NotContains(t, apply, "--defer-cutover")
 }
 
@@ -57,7 +58,7 @@ func TestRenderPlanComment_DirectNotesDeferCutoverOnlyWhenPassed(t *testing.T) {
 	}
 
 	apply := RenderPlanComment(data)
-	assert.Contains(t, apply, "Writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer. Confirming the apply consents to this.")
+	assert.Contains(t, apply, "Writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer.\n")
 }
 
 func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {

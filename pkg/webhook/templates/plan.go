@@ -67,8 +67,7 @@ type BlockedChangeData struct {
 
 // DirectChangeData is a planned change the database's direct execution policy
 // routes to native MySQL DDL instead of the schema change engine. The plan
-// comment discloses what running it that way does to the table, so the
-// operator consents to it when confirming the apply.
+// comment discloses what running it that way does to the table.
 type DirectChangeData struct {
 	Table  string
 	Reason string
@@ -464,9 +463,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	}
 
 	// Direct-execution changes — statements the policy routes to native DDL.
-	// Shown on the locked apply comment too: confirming the apply is the
-	// operator's consent to their write-blocking semantics, so the
-	// disclosure must sit on the comment the confirmation acts on.
+	// The policy approves them, so the plan only discloses how they run; the
+	// locked apply comment repeats it so the apply shows what it is running.
 	if len(data.DirectChanges) > 0 {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, data.DeferCutover)
 	}
@@ -1742,8 +1740,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 }
 
 // directConsentCopy returns the header noun and the consequence sentence for
-// the direct-execution disclosure, keyed by database type. The consequence is
-// what the operator consents to by confirming the apply, and what a
+// the direct-execution disclosure, keyed by database type. What a
 // direct statement does to the table while it runs is engine-specific — an
 // engine that adopts direct execution adds its own copy here rather than
 // inheriting another engine's semantics.
@@ -1762,7 +1759,7 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, consequen
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest
-	// impact rather than understate what the operator is consenting to.
+	// impact rather than understate what the change does.
 	return "native DDL",
 		"Each table is unavailable until its statement finishes, and the change is **not revertible**."
 }
@@ -1783,8 +1780,8 @@ func writePausedApplyCause(sb *strings.Builder, cause *PausedApplyCauseData) {
 
 // writeDirectChanges writes the section for statements the direct execution
 // policy routes to native DDL, naming each table and the planner's reason
-// (the table's measured size). The footer discloses what the
-// operator consents to by confirming the apply. It mentions --defer-cutover
+// (the table's measured size). The footer says what running them does to the
+// table. It mentions --defer-cutover
 // only on an apply that passed it: a direct statement has no cutover, so the
 // flag leaves these statements alone even though it defers the rest of the
 // plan's.
@@ -1794,7 +1791,6 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 	if deferCutover {
 		footer += " `--defer-cutover` does not apply to these direct statements: they have no cutover to defer."
 	}
-	footer += " Confirming the apply consents to this."
 	n := len(changes)
 	fmt.Fprintf(sb, "⚙️ **Direct execution**: %d %s will run as %s\n", n, pluralize("change", n), headerNoun)
 	for _, c := range changes {

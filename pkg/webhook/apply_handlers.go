@@ -489,30 +489,6 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// Direct-execution changes never run without explicit confirmation: the
-	// operator must consent to their write-blocking native DDL
-	// against the locked comment that discloses it, so the apply never
-	// proceeds in one step — downgrade to the two-step confirm.
-	if len(planResp.DirectChanges()) > 0 {
-		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		// The direct-execution section above names the statements and what
-		// running them costs, so the footer carries the instruction alone.
-		commentData.PendingManualConfirmation = true
-		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
-			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
-			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
-		}
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
-		if checkRunErr != nil {
-			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
-		}
-		if headSHA != "" {
-			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-		}
-		return false, nil
-	}
-
 	// Discarding an unfinished copy destroys work already done on the target —
 	// often hours of it — so it never happens in one step. Downgrade to the
 	// two-step confirm against the locked comment that discloses what is being

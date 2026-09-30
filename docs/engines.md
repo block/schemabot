@@ -51,7 +51,7 @@ stay put, where this page moves as engines gain features.
 |---|---|---|---|
 | **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
-| **Escape hatch for refused statements** | direct execution: opt-in, size-bounded, separately confirmed | none, excluded by design | none, native execution is already the only path |
+| **Escape hatch for refused statements** | direct execution: opt-in and size-bounded | none, excluded by design | none, native execution is already the only path |
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
 | **Deferred cutover** | yes | yes | planned |
@@ -227,7 +227,7 @@ This is a third path, MySQL only, and it is deliberately hard to turn on. Some s
 never run through a copy: dropping a primary key and adding a foreign key are the usual examples.
 By default they block the apply. An operator can enable a policy, per environment, that lets those
 statements run as ordinary MySQL DDL instead. The policy covers only tables under a configured row
-count, and the PR asks for a second, explicit confirmation before anything runs.
+count, and the plan comment discloses each statement that will run this way.
 
 What runs then is not an online change. It is synchronous, it blocks writes to the table for its
 full duration, nothing throttles it, and nothing checkpoints it. The row
