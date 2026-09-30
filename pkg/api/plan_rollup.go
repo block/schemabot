@@ -177,11 +177,14 @@ type PlanRollup struct {
 // each was planned against its own live schema, so every member that produced a
 // usable diff classifies Planned.
 //
-// Under either planning every member's change set is canonicalized exactly once
-// with tern.Canonicalize, and the comparisons and grouping keys the rollup
-// publishes are read off those canonical forms. That is also the gate a member's
-// content passes: change content SchemaBot cannot read fails the member closed
-// there, before anything is concluded from it.
+// Under either planning, a member whose change set is read at all is
+// canonicalized exactly once with tern.Canonicalize, and the comparisons and
+// grouping keys the rollup publishes are read off those canonical forms. That is
+// also the gate its content passes: change content SchemaBot cannot read fails
+// the member closed there, before anything is concluded from it. A member that
+// errors before that step (a producer error, a mirrored member behind an
+// unusable baseline, or a mirrored member whose dialect differs from the
+// primary's) fails closed without its change set being parsed.
 //
 // The result fails closed under either planning: a contract mismatch, or any
 // member that errored, makes the rollup not Clean. Under PlanMirrored a
