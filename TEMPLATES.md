@@ -7597,7 +7597,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-Each command below applies to every deployment in this rollout, not just `us`.
+Each command below addresses the whole rollout, not just `us`.
 
 To stop this schema change:
 ```
@@ -7721,7 +7721,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-Each command below applies to every deployment in this rollout, not just `us`.
+Each command below addresses the whole rollout, not just `us`.
 
 To retry:
 ```
@@ -8079,7 +8079,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-Each command below applies to every deployment in this rollout, not just `us`.
+Each command below addresses the whole rollout, not just `us`.
 
 To retry:
 ```

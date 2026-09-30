@@ -503,17 +503,19 @@ func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, l
 // it has does. The sentence leads the footer, ahead of the command, because a
 // code block is copied from its copy button and the eye does not travel past
 // it. It names no command, so one sentence covers a footer that offers two and
-// cannot disagree with the command it qualifies. It stops being needed when
-// control commands can address one member.
+// cannot disagree with the command it qualifies. It says what the commands
+// address rather than what they change, because the effect is not always
+// rollout-wide: a cutover lands only on the members ready for it. It stops
+// being needed when control commands can address one member.
 func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData) {
 	if !data.RolloutWide {
 		return
 	}
 	if data.RolloutMember == "" {
-		sb.WriteString("Each command below applies to every deployment in this rollout.\n\n")
+		sb.WriteString("Each command below addresses the whole rollout.\n\n")
 		return
 	}
-	fmt.Fprintf(sb, "Each command below applies to every deployment in this rollout, not just %s.\n\n", inlineCode(data.RolloutMember))
+	fmt.Fprintf(sb, "Each command below addresses the whole rollout, not just %s.\n\n", inlineCode(data.RolloutMember))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window

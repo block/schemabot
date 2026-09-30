@@ -736,7 +736,7 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 
 // rolloutScopeLine opens the sentence a member's footer carries when the
 // apply fans out across several members.
-const rolloutScopeLine = "Each command below applies to every deployment in this rollout"
+const rolloutScopeLine = "Each command below addresses the whole rollout"
 
 // Control commands address the apply, not one member of it, and the CLI offers
 // no way to narrow them. A member's section therefore says how far its stop
