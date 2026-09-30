@@ -556,6 +556,9 @@ type capturingTernServer struct {
 // for the dispatch shapes these tests exercise, minus the stored-plan
 // validation a real data plane performs before answering.
 func dispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
+	if target, err := dispatchMemberTarget(req); err != nil || target != "" {
+		return target
+	}
 	if len(req.TargetShards) == 1 {
 		changes, err := scopedDispatchDDLChanges(req.DdlChanges)
 		if err != nil {
