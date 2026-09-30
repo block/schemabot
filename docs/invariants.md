@@ -1542,7 +1542,10 @@ proposal. Symlinked namespaces resolving outside the repository root, or to them
 rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
 (`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
-`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
+`pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`), and
+a table declared by two desired schema files fails planning on every engine through one rule
+(`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,
+`pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
 
 ## Routing and authorization (AZ)
 

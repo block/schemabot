@@ -526,11 +526,17 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 	exemptTables := exemptWithheldTables(ignored, req, database, withheld)
 
-	// Build list of desired table schemas from all namespaces
+	// Build list of desired table schemas from all namespaces. Every namespace
+	// is diffed as one set against the database, so a table two schema files
+	// declare, in one namespace or across them, is refused; files are read in
+	// sorted order so the refusal names the same pair on every run.
 	var desiredSchemas []table.TableSchema
+	var declared ddl.TableDeclarations
 	declaredByNamespace := make(map[string][]string, len(req.SchemaFiles))
-	for namespace, ns := range req.SchemaFiles {
-		for filename, content := range ns.Files {
+	for _, namespace := range slices.Sorted(maps.Keys(req.SchemaFiles)) {
+		ns := req.SchemaFiles[namespace]
+		for _, filename := range slices.Sorted(maps.Keys(ns.Files)) {
+			content := ns.Files[filename]
 			stmts, err := ddl.SplitStatements(content)
 			if err != nil {
 				return nil, fmt.Errorf("split statements in %s/%s: %w", namespace, filename, err)
@@ -543,6 +549,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				// Validate semantic correctness (e.g., index columns exist)
 				if err := ddl.ValidateCreateTable(ct); err != nil {
 					return nil, fmt.Errorf("SQL usage error in %s/%s: %w", namespace, filename, err)
+				}
+				if err := declared.Declare(namespace+"/"+filename, ct.TableName); err != nil {
+					return nil, err
 				}
 				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: ct.TableName, Schema: stmt})
 				declaredByNamespace[namespace] = append(declaredByNamespace[namespace], ct.TableName)

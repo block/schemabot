@@ -352,19 +352,19 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // on its own, so a table declared twice would get two contradictory diffs,
 // each dropping what only the other file declares; there is no single desired
 // definition to review. The error names the table and both files so the
-// operator knows which one to remove. It runs before any file is planned.
+// operator knows which one to remove. It runs before any file is planned, and
+// applies the same rule every planner does (ddl.TableDeclarations), so a
+// duplicate declaration reads the same whichever engine refuses it.
 func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
-	declaredBy := make(map[string]string, len(files))
+	var declared ddl.TableDeclarations
 	for _, filename := range sortedKeys(files) {
 		table, err := desiredTableName(files[filename])
 		if err != nil {
 			return fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 		}
-		if first, declared := declaredBy[table]; declared {
-			return fmt.Errorf("plan PostgreSQL namespace %q: table %q is declared by both schema files %q and %q. Declare each table in exactly one schema file",
-				namespace, table, first, filename)
+		if err := declared.Declare(filename, table); err != nil {
+			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
 		}
-		declaredBy[table] = filename
 	}
 	return nil
 }
