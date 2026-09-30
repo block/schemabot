@@ -46,17 +46,23 @@ them is unsafe: a session holding an explicit `LOCK TABLES`, and a transaction
 too large to roll back without harming the database. An explicit table lock
 fails the apply after the first attempt; a large transaction fails it once
 the attempts run out. Either way the apply fails with a retryable "table is
-busy" error instead of stalling. Between attempts the statement waits up to
-30 seconds for killed sessions to finish rolling back, so an apply can spend
-up to about 3 × (bound + 30s) on one statement, though table traffic stalls
-only during the attempts themselves. The bound is configurable per policy via the
+busy" error instead of stalling. Every attempt runs the statement from the
+start: when a rebuild times out waiting to upgrade its lock at the end, MySQL
+rolls the rebuild back, and the next attempt rebuilds the table again. Between
+attempts the statement waits up to 30 seconds for killed sessions to finish
+rolling back, so an apply can spend up to 3 runs of the statement plus about
+3 × (bound + 30s) on one statement. Writes are blocked for as long as each
+run blocks them, and table traffic stalls behind the lock wait during each
+attempt. The bound is configurable per policy via the
 `lock_acquisition_timeout` config field; the engine applies a short default
 when it is not set.
 
-The kill needs `SELECT` on `performance_schema` to find the blockers, and
-`CONNECTION_ADMIN` (or `SUPER`) to kill sessions of other users. A target
-whose SchemaBot user cannot read `performance_schema` blocks the statement at
-plan time rather than running it without the kill. A missing kill privilege
+The kill needs `SELECT` on `performance_schema` and `PROCESS` to find the
+blockers (`PROCESS` covers `information_schema.innodb_trx`, which it reads to
+spare large transactions), and `CONNECTION_ADMIN` (or `SUPER`) to kill
+sessions of other users. A target whose SchemaBot user is denied either of
+the first two blocks the statement at plan time rather than running it
+without the kill. A missing kill privilege
 surfaces only when a blocker is found: the kill fails, the attempts time out,
 and the apply fails as busy.
 
@@ -305,13 +311,14 @@ Every routing outcome increments
 `schemabot.direct_execution.statements_total` with the database and an
 `outcome` attribute: `completed`, `failed`, or `stopped` for executed
 statements; `blocked_policy_disabled`, `blocked_size_limit`,
-`blocked_size_unknown`, or `blocked_force_kill_unavailable` for statements the
-policy did not route. `blocked_size_limit` covers either bound; the server log
+`blocked_size_unknown`, `blocked_force_kill_unavailable`, or
+`blocked_force_kill_unknown` for statements the policy did not route. `blocked_size_limit` covers either bound; the server log
 line for the verdict says which bound blocked and carries the measured
 estimate. Direct executions are rare, operator-consented events — a spike in
 `failed` means native DDL is erroring on the target (check the apply logs for
 the statement and MySQL error), a spike in `blocked_size_unknown` means table
 size statistics are unavailable (check target connectivity and
-`information_schema` access), and `blocked_force_kill_unavailable` means the
-SchemaBot user cannot read `performance_schema` on the target (grant `SELECT`
-on `performance_schema.*`).
+`information_schema` access), `blocked_force_kill_unavailable` means the
+SchemaBot user is denied a table the kill reads on the target (grant `SELECT`
+on `performance_schema.*` and `PROCESS`), and `blocked_force_kill_unknown`
+means checking those grants failed (check target connectivity).

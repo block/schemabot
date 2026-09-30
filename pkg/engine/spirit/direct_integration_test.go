@@ -504,10 +504,13 @@ func TestEngine_ResolveRefusedMode_FailedRowCountBlocks(t *testing.T) {
 	})
 	_, err = db.ExecContext(t.Context(), "GRANT INSERT ON `testdb`.`direct_count_denied` TO '"+user+"'@'%'")
 	require.NoError(t, err, "grant insert on direct_count_denied")
-	// The kill that direct execution relies on reads performance_schema; the
-	// grant keeps the byte-bound control below from blocking on that instead.
+	// The kill that direct execution relies on reads performance_schema and
+	// innodb_trx; the grants keep the byte-bound control below from blocking
+	// on those instead.
 	_, err = db.ExecContext(t.Context(), "GRANT SELECT ON `performance_schema`.* TO '"+user+"'@'%'")
 	require.NoError(t, err, "grant select on performance_schema")
+	_, err = db.ExecContext(t.Context(), "GRANT PROCESS ON *.* TO '"+user+"'@'%'")
+	require.NoError(t, err, "grant process")
 
 	host, _, _, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
@@ -925,8 +928,8 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 	assert.Contains(t, errorMessage, `Table "direct_locked" is busy`)
 	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts.", lockWaitSeconds, directMaxAttempts))
 	assert.Contains(t, errorMessage, "not a session holding an explicit LOCK TABLES")
-	assert.Contains(t, errorMessage, "unless its database user has CONNECTION_ADMIN",
-		"a kill refused for lack of privilege lands on this same message, so it names that remedy too")
+	assert.Contains(t, errorMessage, "unless its database user has PROCESS and CONNECTION_ADMIN",
+		"a kill that fails for lack of privilege lands on this same message, so it names that remedy too")
 	assert.Contains(t, errorMessage, "Retry when those sessions have finished")
 	assert.NotContains(t, errorMessage, "Lock wait timeout exceeded",
 		"the driver's own words are for the server log, not the pull request")
@@ -951,38 +954,97 @@ func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 	host, _, _, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
 
-	const user, password = "direct_nokill", "direct_nokill_pw"
-	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE USER '%s'@'%%' IDENTIFIED BY '%s'", user, password))
-	require.NoError(t, err, "create a user without performance_schema access")
-	// The test context is cancelled before cleanup runs, so the drop gets its
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+	// The test context is cancelled before cleanup runs, so each drop gets its
 	// own bounded context that outlives it.
 	cleanupCtx := context.WithoutCancel(t.Context())
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(cleanupCtx, 10*time.Second)
-		defer cancel()
-		_, err := db.ExecContext(ctx, fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", user))
-		assert.NoError(t, err, "drop user %s", user)
-	})
-	_, err = db.ExecContext(t.Context(), fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%%'", sqlescape.EscapeIdentifier(database), user))
-	require.NoError(t, err, "grant the user its database, and nothing else")
+	for _, tc := range []struct {
+		name string
+		// grants are given on top of the user's own database.
+		grants      []string
+		wantMode    string
+		wantOutcome string
+	}{
+		{
+			name:        "no performance_schema access",
+			wantMode:    engine.ExecutionModeBlocked,
+			wantOutcome: "blocked_force_kill_unavailable",
+		},
+		{
+			// MySQL checks PROCESS for innodb_trx only when it fills the
+			// table, so a probe that can return no rows never asks for it.
+			name:        "no PROCESS",
+			grants:      []string{"SELECT ON performance_schema.*"},
+			wantMode:    engine.ExecutionModeBlocked,
+			wantOutcome: "blocked_force_kill_unavailable",
+		},
+		{
+			name:     "both grants",
+			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*"},
+			wantMode: engine.ExecutionModeDirect,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := fmt.Sprintf("direct_nokill_%d", len(tc.grants))
+			const password = "direct_nokill_pw"
+			_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE USER '%s'@'%%' IDENTIFIED BY '%s'", user, password))
+			require.NoError(t, err, "create user %s", user)
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(cleanupCtx, 10*time.Second)
+				defer cancel()
+				_, err := db.ExecContext(ctx, fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", user))
+				assert.NoError(t, err, "drop user %s", user)
+			})
+			_, err = db.ExecContext(t.Context(), fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%%'", sqlescape.EscapeIdentifier(database), user))
+			require.NoError(t, err, "grant the user its database")
+			for _, grant := range tc.grants {
+				_, err = db.ExecContext(t.Context(), fmt.Sprintf("GRANT %s TO '%s'@'%%'", grant, user))
+				require.NoError(t, err, "grant %s", grant)
+			}
 
-	target := &lazyTargetDB{dsn: targetDSN(host, user, password, database)}
+			target := &lazyTargetDB{dsn: targetDSN(host, user, password, database)}
+			defer target.close()
+			for name, policy := range map[string]directPolicy{
+				"row bound":  {Enabled: true, MaxTableRows: 100000},
+				"byte bound": {Enabled: true, MaxTableBytes: 100 << 20},
+			} {
+				t.Run(name, func(t *testing.T) {
+					decision := eng.resolveRefusedMode(t.Context(), target, policy,
+						database, "direct_nokill", "dropping primary key is not supported")
+					assert.Equal(t, tc.wantMode, decision.mode)
+					assert.Equal(t, tc.wantOutcome, decision.outcome)
+					if tc.wantOutcome != "" {
+						assert.Equal(t, "dropping primary key is not supported"+blockedForceKillUnavailableReason, decision.modeReason)
+					}
+				})
+			}
+		})
+	}
+}
+
+// A check of the kill's grants that fails without the target denying one, here
+// on a cancelled context, says nothing about the grants. The statement is
+// still blocked, but as unknown, with a reason that asks for a fresh plan
+// rather than a grant the user may already have.
+func TestRequireForceKill_FailedCheckBlocksAsUnknown(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
 	defer target.close()
+	_, err = target.get(t.Context())
+	require.NoError(t, err, "connect to the target as the size gate would")
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	eng := New(Config{Logger: logger})
-	for name, policy := range map[string]directPolicy{
-		"row bound":  {Enabled: true, MaxTableRows: 100000},
-		"byte bound": {Enabled: true, MaxTableBytes: 100 << 20},
-	} {
-		t.Run(name, func(t *testing.T) {
-			decision := eng.resolveRefusedMode(t.Context(), target, policy,
-				database, "direct_nokill", "dropping primary key is not supported")
-			assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
-			assert.Equal(t, "blocked_force_kill_unavailable", decision.outcome)
-			assert.Equal(t, "dropping primary key is not supported"+blockedForceKillUnavailableReason, decision.modeReason)
-		})
-	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	decision := eng.requireForceKill(ctx, target, database, "orders", "dropping primary key is not supported",
+		refusedModeDecision{mode: engine.ExecutionModeDirect})
+	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
+	assert.Equal(t, "blocked_force_kill_unknown", decision.outcome)
+	assert.Equal(t, "dropping primary key is not supported"+blockedForceKillUnknownReason, decision.modeReason)
 }
 
 // Routing classifies each statement against its table's current definition,

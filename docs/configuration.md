@@ -770,15 +770,18 @@ DDL. It never kills while it holds the lock and runs, so traffic to a table
 being rebuilt is left alone. A session holding an explicit `LOCK TABLES`, or a
 transaction too large to roll back safely, is never killed; while one holds
 the lock the apply fails with a retryable "table is busy" error, after one
-attempt for an explicit table lock. Traffic to the table can stall for up to
-one bound per attempt, and between attempts the statement waits up to 30
-seconds for killed sessions to roll back. A lower bound shortens the stall
+attempt for an explicit table lock. Every attempt runs the statement from the
+start, so a rebuild that times out waiting to upgrade its lock at the end is
+rolled back and runs again. Traffic to the table can stall for up to one bound
+per attempt, and between attempts the statement waits up to 30 seconds for
+killed sessions to roll back. A lower bound shortens the stall
 and gives a blocker less time to finish before it is killed; the value must
 be a whole number of seconds (at least `1s`).
 
-The kill reads `performance_schema` to find the blocking sessions, so the
-SchemaBot user needs `SELECT` on `performance_schema.*` for a statement to
-run directly; without it the statement is blocked at plan time. Killing
+The kill reads `performance_schema` and `information_schema.innodb_trx` to
+find the blocking sessions, so the SchemaBot user needs `SELECT` on
+`performance_schema.*` and `PROCESS` for a statement to run directly; without
+either the statement is blocked at plan time. Killing
 another user's session also needs `CONNECTION_ADMIN` (or `SUPER`); without it
 the kill fails and a blocked apply fails as busy.
 

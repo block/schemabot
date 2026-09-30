@@ -217,12 +217,61 @@ type refusedModeDecision struct {
 // uncertainty blocks.
 const blockedSizeUnknownReason = "; direct execution is enabled but the table's size is unavailable"
 
-// blockedForceKillUnavailableReason is the mode-reason suffix when SchemaBot
-// cannot read the performance_schema lock tables it uses to find the sessions
-// blocking a direct statement's metadata lock. The cause itself, typically a
-// missing SELECT grant, stays in the server log; the reason names the grant
-// that fixes it and the fresh plan that picks the grant up.
-const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot cannot read the performance_schema lock tables it uses to end sessions blocking the statement: grant its database user SELECT on performance_schema, then plan again"
+// blockedForceKillUnavailableReason is the mode-reason suffix when the target
+// denies SchemaBot the tables it reads to find the sessions blocking a direct
+// statement's metadata lock: the performance_schema lock tables, and
+// information_schema.innodb_trx, which needs PROCESS. The denial itself stays
+// in the server log; the reason names the grants that fix it and the fresh
+// plan that picks them up.
+const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot cannot read the lock and transaction tables it uses to end sessions blocking the statement: grant its database user SELECT on performance_schema and PROCESS, then plan again"
+
+// blockedForceKillUnknownReason is the mode-reason suffix when checking those
+// tables failed for a reason other than a denied grant, such as a lost
+// connection or a deadline. Nothing is known to be missing, so the reason asks
+// for a fresh plan rather than naming a grant.
+const blockedForceKillUnknownReason = "; direct execution is enabled but SchemaBot could not check that it can end sessions blocking the statement: plan again"
+
+// Access-denied errors MySQL returns when a grant the kill depends on is
+// missing: ER_DBACCESS_DENIED_ERROR (1044), ER_TABLEACCESS_DENIED_ERROR
+// (1142), ER_COLUMNACCESS_DENIED_ERROR (1143), and
+// ER_SPECIFIC_ACCESS_DENIED_ERROR (1227), which reading innodb_trx without
+// PROCESS returns.
+const (
+	erDBAccessDenied       = 1044
+	erTableAccessDenied    = 1142
+	erColumnAccessDenied   = 1143
+	erSpecificAccessDenied = 1227
+)
+
+// isAccessDenied reports whether err is MySQL refusing a grant, as opposed to
+// a probe that could not run at all.
+func isAccessDenied(err error) bool {
+	return mysqlerr.Is(err, erDBAccessDenied, erTableAccessDenied, erColumnAccessDenied, erSpecificAccessDenied)
+}
+
+// innodbTrxProbe reads information_schema.innodb_trx, which the kill joins to
+// spare heavy transactions. MySQL checks PROCESS for that table only when it
+// fills it, and it skips the fill for a query that can return no rows, so the
+// LIMIT 0 probe in dbconn.CheckForceKillPrivileges passes for a user without
+// PROCESS. LIMIT 1 forces the fill. This retires once Spirit's own probe
+// forces it.
+const innodbTrxProbe = "SELECT 1 FROM information_schema.innodb_trx LIMIT 1"
+
+// checkInnodbTrxAccess runs innodbTrxProbe and drains it, so a denied PROCESS
+// grant surfaces here rather than when the kill first runs.
+func checkInnodbTrxAccess(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, innodbTrxProbe)
+	if err != nil {
+		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
+	}
+	return nil
+}
 
 // resolveRefusedMode decides whether the policy routes a refused statement to
 // direct execution. The table runs directly when it is within the one size
@@ -258,29 +307,50 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 }
 
 // requireForceKill blocks a statement the size gate approved when SchemaBot
-// cannot read the performance_schema tables it uses to find the sessions
-// blocking the statement's metadata lock. Without them the kill could only
-// fail at apply time, after the operator confirmed, leaving the statement
-// queued on the lock while table traffic stalls behind it. The statement is
-// blocked rather than run without the kill.
+// cannot read the tables it uses to find the sessions blocking the
+// statement's metadata lock. Without them the kill could only fail at apply
+// time, after the operator confirmed, leaving the statement queued on the lock
+// while table traffic stalls behind it. The statement is blocked rather than
+// run without the kill: as unavailable when the target denies a grant, and as
+// unknown when the check itself could not run.
 func (e *Engine) requireForceKill(ctx context.Context, target *lazyTargetDB, database, tableName, refusalReason string, approved refusedModeDecision) refusedModeDecision {
-	blocked := refusedModeDecision{
+	unavailable := refusedModeDecision{
 		mode:       engine.ExecutionModeBlocked,
 		modeReason: refusalReason + blockedForceKillUnavailableReason,
 		outcome:    "blocked_force_kill_unavailable",
+	}
+	unknown := refusedModeDecision{
+		mode:       engine.ExecutionModeBlocked,
+		modeReason: refusalReason + blockedForceKillUnknownReason,
+		outcome:    "blocked_force_kill_unknown",
 	}
 	// The size gate approved only after connecting, so this is the cached
 	// connection; an error here still blocks rather than run without the kill.
 	db, err := target.get(ctx)
 	if err != nil {
-		e.logger.Warn("direct execution blocked: cannot connect to target to check the performance_schema grant",
+		e.logger.Warn("direct execution blocked: cannot connect to target to check the grants the kill needs",
 			"database", database, "table", tableName, "error", err)
-		return blocked
+		return unknown
 	}
-	if err := dbconn.CheckForceKillPrivileges(ctx, db); err != nil {
-		e.logger.Warn("direct execution blocked: cannot read the performance_schema tables used to end sessions blocking the statement",
-			"database", database, "table", tableName, "error", err)
-		return blocked
+	for _, probe := range []struct {
+		tables string
+		run    func(context.Context, *sql.DB) error
+	}{
+		{"performance_schema lock tables", dbconn.CheckForceKillPrivileges},
+		{"information_schema.innodb_trx", checkInnodbTrxAccess},
+	} {
+		err := probe.run(ctx, db)
+		if err == nil {
+			continue
+		}
+		if isAccessDenied(err) {
+			e.logger.Warn("direct execution blocked: the target denies a grant the kill needs to end sessions blocking the statement",
+				"database", database, "table", tableName, "tables", probe.tables, "error", err)
+			return unavailable
+		}
+		e.logger.Warn("direct execution blocked: checking the grants the kill needs failed",
+			"database", database, "table", tableName, "tables", probe.tables, "error", err)
+		return unknown
 	}
 	return approved
 }
@@ -754,7 +824,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 				// deployment's own configuration, so this sentence is safe to
 				// show on the pull request that asked for the change.
 				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
-					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely, and it cannot kill another user's session unless its database user has CONNECTION_ADMIN. Retry when those sessions have finished, or grant CONNECTION_ADMIN if the server log shows the kill was refused.",
+					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely, and it cannot find or kill another user's session unless its database user has PROCESS and CONNECTION_ADMIN. Retry when those sessions have finished, or grant PROCESS and CONNECTION_ADMIN if the server log shows the kill failed.",
 					ds.table, lockWaitSeconds, forceExecConfig.MaxRetries))
 				return false
 			}

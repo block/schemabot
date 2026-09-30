@@ -91,7 +91,7 @@ Every row of the matrix, in a line each.
 | **Cutover** | The swap: moving traffic from the original table to the new one. It is the shortest phase of a copy, but it is a phase and not an instant, and it is the part that takes a lock. |
 | **Deferred cutover** | Holding a finished copy at that point until an operator asks for the swap, instead of swapping as soon as the copy is ready. |
 | **Revert window** | A period after cutover in which the original table still exists, so the change can be undone. |
-| **Direct execution** | Running a statement as ordinary DDL against the database, with no copy. Two separate bounds apply: a configured timeout caps how long it waits to acquire the lock, so a busy table fails fast instead of queueing behind an open transaction, and a table size limit in the policy is what bounds how long writes are blocked once it has the lock. |
+| **Direct execution** | Running a statement as ordinary DDL against the database, with no copy. Two separate bounds apply: a configured timeout caps how long it waits to acquire the lock, and the transactions blocking it are killed before that timeout runs out; a table size limit in the policy bounds how long writes are blocked once it has the lock. |
 | **Throttling** | Holding the copy back while the database is under pressure. |
 | **Adaptive pacing** | Continuously adjusting how hard the copy pushes based on how the database is responding, rather than only starting and stopping it. |
 | **Quarantine** | Renaming a dropped table aside and keeping it for a while instead of dropping it outright. |
