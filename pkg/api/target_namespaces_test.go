@@ -1,9 +1,13 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"testing"
 
@@ -292,6 +296,7 @@ func TestExecutePlan_PrimaryUndeclaredSelectionFails(t *testing.T) {
 	_, err := svc.ExecutePlan(t.Context(), threeNamespaceRequest())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `target "orders-001" selects namespace "ns_9", which the schema files do not declare`)
+	assert.True(t, NamespacePlacementRefused(err), "the refusal is typed so callers can fail a merge gate and answer 400 on it")
 	assert.Nil(t, client.planReq, "nothing is planned for an undeclared selection")
 	assert.Nil(t, plans.created, "no plan is stored for an undeclared selection")
 }
@@ -310,8 +315,30 @@ func TestExecutePlan_UncoveredNamespaceBlocks(t *testing.T) {
 	_, err := svc.ExecutePlan(t.Context(), threeNamespaceRequest())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "orders" environment "production" declares namespaces [ns_1, ns_2] that no targets entry selects`)
+	assert.True(t, NamespacePlacementRefused(err), "the refusal is typed so callers can fail a merge gate and answer 400 on it")
 	assert.Nil(t, client.planReq, "nothing is planned while a namespace is unplaced")
 	assert.Nil(t, plans.created, "no plan is stored while a namespace is unplaced")
+}
+
+// An uncovered namespace is a defect in the caller's schema files or the
+// server's config, so POST /api/plan answers it as a bad request naming the
+// namespaces rather than as a server failure.
+func TestPlanHandler_UncoveredNamespaceIsBadRequest(t *testing.T) {
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary"}}
+	svc := namespaceSelectionServiceWith(t, client, &capturingPlanStore{}, []TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+	})
+	body, err := json.Marshal(threeNamespaceRequest())
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.handlePlan(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `declares namespaces [ns_1, ns_2] that no targets entry selects`)
+	assert.Nil(t, client.planReq, "nothing is planned while a namespace is unplaced")
 }
 
 // A non-primary member is diffed against, and stores, only its own selection.
@@ -357,24 +384,12 @@ func TestRollupReviewTimeDrift_MemberPlansOnlyItsSelectedNamespaces(t *testing.T
 	})
 }
 
-// A declared namespace that no targets entry selects would be planned and
-// applied nowhere while every member's plan read clean, so the rollup blocks
-// before any member is diffed or stored. A member selecting nothing holds every
-// declared namespace, so its presence covers the whole set.
-func TestRollupReviewTimeDrift_UncoveredNamespaceBlocks(t *testing.T) {
-	primary := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
-	reviewed := &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}
-	client := &mockTernClient{planDiffResp: &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}}
-	plans := &recordingPlanStore{}
-	svc := namespaceSelectionService(t, client, plans)
+// A declared namespace is covered when some member selects it, and a member
+// selecting nothing holds every declared namespace, so its presence covers the
+// whole set.
+func TestUncoveredNamespaces(t *testing.T) {
 	req := threeNamespaceRequest()
 	req.SchemaFiles["ns_3"] = req.SchemaFiles["ns_0"]
-
-	_, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewed, primary)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), `database "orders" environment "production" declares namespaces [ns_3] that no targets entry selects`)
-	assert.Nil(t, client.planDiffReq, "no member is diffed while a namespace is unplaced")
-	assert.Empty(t, plans.created, "no member plan is stored while a namespace is unplaced")
 
 	assert.Empty(t, uncoveredNamespaces(req, []routing.ExecutionTarget{
 		{Target: "orders-001", Namespaces: []string{"ns_0"}},
@@ -387,9 +402,9 @@ func TestRollupReviewTimeDrift_UncoveredNamespaceBlocks(t *testing.T) {
 }
 
 // The reviewed primary plan covers the namespaces its entry selected when it
-// was planned. A config reloaded before the rollup with a different selection
-// for the same target would pair that plan with members placed under the new
-// one, so the rollup fails closed rather than trusting the target name alone.
+// was planned. A primary member reported with a different selection for the
+// same target would pair that plan with members placed under another one, so
+// the rollup fails closed rather than trusting the target name alone.
 func TestRollupReviewTimeDrift_PrimarySelectionChangedFailsClosed(t *testing.T) {
 	plannedUnder := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0", "ns_1"}}
 	reviewed := &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}

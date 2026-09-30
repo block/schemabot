@@ -125,6 +125,25 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 	return headSHA, err
 }
 
+// namespacePlacementCheckSummary is the stored Change column for an environment
+// whose plan was refused by namespace placement. The plan comment carries the
+// refusal in full.
+const namespacePlacementCheckSummary = "namespace placement refused the plan; see the plan comment"
+
+// storeNamespacePlacementCheck stores a failing check for an environment whose
+// plan was refused because its targets entries and the schema files disagree on
+// namespace placement (api.NamespacePlacementRefused). That environment has no
+// plan, so without this row the aggregate folds only the environments that did
+// plan and can pass while a namespace is planned and applied nowhere (MG-12).
+// The row carries the review-time drift block: the rollout cannot be confirmed
+// to converge, and a later plan whose placement agrees clears it the way a
+// clean rollup clears drift.
+func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) (string, error) {
+	blocked := reviewDriftOutcome{state: driftBlocked, summary: namespacePlacementCheckSummary}
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
+	return headSHA, err
+}
+
 // storeManualPlanCheckRecord stores per-database check state after a manual
 // plan and then reconciles same-head apply-owned stored check state when the manual
 // plan proves the target already matches the PR schema.

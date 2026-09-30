@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -95,9 +96,10 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the reviewed plan was created against %q", req.Database, req.Environment, targets[0].MemberID(), primaryMember.MemberID())
 		}
 		// The reviewed plan covers only the namespaces the primary selected when
-		// it was planned. A config reloaded since then with a different selection
-		// would pair that plan with members planned under the new placement,
-		// leaving a namespace in neither or in both, so it fails closed too.
+		// it was planned, as the caller reports them. A primary member whose
+		// selection differs from the placement resolved here would pair that plan
+		// with members planned under another placement, leaving a namespace in
+		// neither or in both, so it fails closed too.
 		if !slices.Equal(targets[0].Namespaces, primaryMember.Namespaces) {
 			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout member %s now selects namespaces [%s] but the reviewed plan was created for [%s]; the environment's placement changed since the plan, so re-run it",
 				req.Database, req.Environment, primaryMember.MemberID(), strings.Join(targets[0].Namespaces, ", "), strings.Join(primaryMember.Namespaces, ", "))
@@ -290,13 +292,46 @@ func memberSchemaFiles(req PlanRequest, member routing.ExecutionTarget) (map[str
 			selected[namespace] = files
 			continue
 		}
+		selectionErr := &NamespaceSelectionError{Database: req.Database, Environment: req.Environment, Target: member.Target, Namespace: namespace}
 		if slices.Contains(req.IgnoredNamespaces, namespace) {
-			return nil, fmt.Errorf("database %q environment %q target %q selects namespace %q, which ignore_namespaces withholds from this plan; remove it from one of the two", req.Database, req.Environment, member.Target, namespace)
+			selectionErr.reason = "ignore_namespaces withholds from this plan; remove it from one of the two"
+			return nil, selectionErr
 		}
-		return nil, fmt.Errorf("database %q environment %q target %q selects namespace %q, which the schema files do not declare (declared: %s); a targets entry can only select namespaces the schema directory declares",
-			req.Database, req.Environment, member.Target, namespace, strings.Join(slices.Sorted(maps.Keys(req.SchemaFiles)), ", "))
+		selectionErr.reason = fmt.Sprintf("the schema files do not declare (declared: %s); a targets entry can only select namespaces the schema directory declares",
+			strings.Join(slices.Sorted(maps.Keys(req.SchemaFiles)), ", "))
+		return nil, selectionErr
 	}
 	return selected, nil
+}
+
+// NamespaceSelectionError reports a targets entry selecting a namespace the
+// plan does not carry: one the schema files do not declare, or one
+// ignore_namespaces withholds.
+type NamespaceSelectionError struct {
+	Database    string
+	Environment string
+	Target      string
+	Namespace   string
+	// reason completes "selects namespace %q, which ..." with why the plan
+	// lacks it and what to change.
+	reason string
+}
+
+func (e *NamespaceSelectionError) Error() string {
+	return fmt.Sprintf("database %q environment %q target %q selects namespace %q, which %s", e.Database, e.Environment, e.Target, e.Namespace, e.reason)
+}
+
+// NamespacePlacementRefused reports whether a plan was refused because the
+// environment's targets entries and the schema files disagree about where
+// namespaces live: a declared namespace no entry selects, or an entry selecting
+// one the plan does not carry. Either is a defect in the config or the schema
+// files, not a server failure: every plan reproduces it until one of them
+// changes. A caller that gates a merge on the plan must fail that environment's
+// check closed on it, since the refused environment has no plan to fold.
+func NamespacePlacementRefused(err error) bool {
+	var coverageErr *NamespaceCoverageError
+	var selectionErr *NamespaceSelectionError
+	return errors.As(err, &coverageErr) || errors.As(err, &selectionErr)
 }
 
 // unselectedNamespaces returns the declared namespaces a rollout member's
@@ -328,8 +363,21 @@ func requireNamespaceCoverage(req PlanRequest, targets []routing.ExecutionTarget
 	if len(uncovered) == 0 {
 		return nil
 	}
-	return fmt.Errorf("database %q environment %q declares namespaces [%s] that no targets entry selects; select each on the target that holds it, or list it in ignore_namespaces to keep it out of the rollout",
-		req.Database, req.Environment, strings.Join(uncovered, ", "))
+	return &NamespaceCoverageError{Database: req.Database, Environment: req.Environment, Uncovered: uncovered}
+}
+
+// NamespaceCoverageError reports declared namespaces that no targets entry of
+// the environment selects, so no target would plan or apply them.
+type NamespaceCoverageError struct {
+	Database    string
+	Environment string
+	// Uncovered is the declared namespaces no entry selects, in sorted order.
+	Uncovered []string
+}
+
+func (e *NamespaceCoverageError) Error() string {
+	return fmt.Sprintf("database %q environment %q declares namespaces [%s] that no targets entry selects; select each on the target that holds it, or list it in ignore_namespaces to keep it out of the rollout",
+		e.Database, e.Environment, strings.Join(e.Uncovered, ", "))
 }
 
 // uncoveredNamespaces returns the declared namespaces no rollout member holds,

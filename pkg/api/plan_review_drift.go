@@ -28,6 +28,11 @@ import (
 // deployment and target that plan was created against; the producer fails
 // closed if that pair no longer maps to rollout index 0 at rollup time.
 //
+// Namespace coverage is not checked again here. primaryPlan comes from
+// ExecutePlanProto, which refuses a request declaring a namespace no member
+// selects, and an environment's members cannot change while the server runs:
+// registration only adds databases and environments.
+//
 // The database/environment is resolved once here to the configured member set
 // in rollout order, then shared with the producer. The resolved order is also
 // passed to RollupDeploymentDiffs as the expected set so the rollup can enforce
@@ -45,13 +50,6 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 	planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("resolve member planning for %s/%s: %w", req.Database, req.Environment, err)
-	}
-
-	// ExecutePlanProto checked coverage for the primary's plan, but the config
-	// may have been reloaded since, so the member set resolved here is checked
-	// again before any member is diffed.
-	if err := requireNamespaceCoverage(req, targets); err != nil {
-		return PlanRollup{}, err
 	}
 
 	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryMember, targets)

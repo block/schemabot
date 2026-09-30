@@ -451,6 +451,21 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+		if api.NamespacePlacementRefused(err) {
+			h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
+				"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
+			multiEnvData.Errors[env] = userFacingError(err)
+			sha, checkErr := h.storeNamespacePlacementCheck(ctx, client, repo, pr, schemaResult, env)
+			if checkErr != nil {
+				h.logger.Error("failed to store namespace placement check record; posting a failing aggregate for the environment instead",
+					"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", checkErr)
+				driftBlockUnstored[env] = namespacePlacementCheckSummary
+			}
+			if sha != "" {
+				headSHA = sha
+			}
+			continue
+		}
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)

@@ -42,6 +42,7 @@ func (c *namespaceSelectingTernClient) PlanDiff(_ context.Context, req *ternv1.P
 
 func (c *namespaceSelectingTernClient) IsRemote() bool   { return true }
 func (c *namespaceSelectingTernClient) Endpoint() string { return "tern-eu:9090" }
+func (c *namespaceSelectingTernClient) Close() error     { return nil }
 
 // A pull request plan on an environment whose primary selects namespaces runs
 // the primary's plan and the review-time rollup the way the webhook does: the
