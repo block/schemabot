@@ -4,9 +4,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -119,4 +122,54 @@ func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
 
 	rollup.Entries[1].ExistingCopies = nil
 	assert.Empty(t, memberWorkOf(&rollup).copyAtStake, "a member that reported a clean target puts nothing at stake")
+}
+
+// A PostgreSQL targets rollout whose reviewed target already has the schema
+// while another target still needs a column. The engine does not read a target
+// for unfinished copies, so the member's plan comes back without that
+// disclosure, and a PR apply refuses its work whatever its flags. The plan
+// comment still shows that target's plan, says why it cannot be applied from
+// the PR, and offers no apply command, in the single- and the
+// multi-environment comment alike.
+func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
+	alter := &ternv1.SchemaChange{Namespace: "public", TableChanges: []*ternv1.TableChange{{
+		Namespace:  "public",
+		TableName:  "orders",
+		Ddl:        "ALTER TABLE orders ADD COLUMN region varchar(16)",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+	}}}
+	member := func(target string, changes ...*ternv1.SchemaChange) api.DeploymentPlanDiff {
+		return api.DeploymentPlanDiff{DatabaseType: "postgres", Deployment: "primary", Target: target, Changes: changes}
+	}
+	diffs := []api.DeploymentPlanDiff{member("payments-001"), member("payments-002", alter)}
+	rollup, err := api.RollupDeploymentDiffs(diffs, []routing.ExecutionTarget{
+		{Deployment: "primary", Target: "payments-001"},
+		{Deployment: "primary", Target: "payments-002"},
+	}, api.PlanIndependent)
+	require.NoError(t, err)
+	require.True(t, rollup.Clean)
+
+	outcome := reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}
+	data := templates.PlanCommentData{
+		Database: "payments", DatabaseType: "postgres", Environment: "production",
+		DeploymentDrift: deploymentDriftPreview(rollup),
+	}
+	h := &Handler{logger: testLogger()}
+	h.annotateMemberApplyRefusal(t.Context(), &data, &apitypes.PlanResponse{PlanID: "plan-reviewed", Database: "payments"}, "production", outcome, "octocat/payments", 7)
+	assert.Equal(t, "target primary/payments-002: its data plane did not report whether applying its plan discards an unfinished copy", data.MemberApplyRefusal)
+
+	single := templates.RenderPlanComment(data)
+	assert.Contains(t, single, "ALTER TABLE orders ADD COLUMN region varchar(16)", "the other target's plan is still shown")
+	assert.Contains(t, single, "**This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but target primary/payments-002: its data plane did not report")
+	assert.NotContains(t, single, "schemabot apply", "an apply that is refused whatever its flags is never offered")
+
+	staging := &templates.PlanCommentData{Database: "payments", DatabaseType: "postgres", Environment: "staging"}
+	multi := templates.RenderMultiEnvPlanComment(templates.MultiEnvPlanCommentData{
+		Database: "payments", DatabaseType: "postgres",
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*templates.PlanCommentData{"staging": staging, "production": &data},
+	})
+	assert.Contains(t, multi, "**This PR cannot apply the other targets' plans**")
+	assert.NotContains(t, multi, "schemabot apply")
+	assert.NotContains(t, multi, "No changes to apply", "a target still needs the change")
 }
