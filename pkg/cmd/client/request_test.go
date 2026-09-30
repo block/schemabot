@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"net/http"
@@ -351,44 +352,106 @@ func TestAuthTokenWithheldWhenRedirectProvenanceIsUnknown(t *testing.T) {
 	assert.Empty(t, homeAuth, "an untraceable same-origin redirect is treated as having left the origin")
 }
 
-// An authenticated request to an https SchemaBot server that redirects to
-// plaintext http is refused before the plaintext request is sent, and the
-// refusal names the security reason rather than a connection failure.
-func TestAuthTokenRefusesHTTPSDowngradeRedirect(t *testing.T) {
+// captureWarnings redirects the transport's warning stream into a buffer for
+// the test and restores the process stream afterwards.
+func captureWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	prev := warnWriter
+	t.Cleanup(func() { warnWriter = prev })
+	var buf bytes.Buffer
+	warnWriter = &buf
+	return &buf
+}
+
+// An https SchemaBot server that redirects to plaintext http has sent the
+// request to another origin: the redirect is followed, as any cross-origin
+// redirect is, and the plaintext server never sees the token. The operator is
+// told on stderr why the request went on unauthenticated.
+func TestAuthTokenWithheldFromHTTPSDowngradeRedirect(t *testing.T) {
+	var gotAuth string
 	var reached bool
 	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reached = true
+		gotAuth = r.Header.Get("Authorization")
 	}))
 	t.Cleanup(plaintext.Close)
 	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
+	warnings := captureWarnings(t)
 
 	err := getThrough(t, tokenClient(source.Client().Transport, "tok-abc123"), source.URL+"/api/status")
-	require.ErrorIs(t, err, ErrInsecureTokenTransport)
-	assert.False(t, reached, "no plaintext request is sent")
+	require.NoError(t, err)
+	assert.True(t, reached, "the downgrade redirect is followed")
+	assert.Empty(t, gotAuth)
+	sourceURL, err := url.Parse(source.URL)
+	require.NoError(t, err)
+	plaintextURL, err := url.Parse(plaintext.URL)
+	require.NoError(t, err)
+	assert.Equal(t, "Warning: not sending the auth token for "+requestOrigin(sourceURL)+
+		" to redirect target "+requestOrigin(plaintextURL)+
+		" because it is on another origin; the request continues unauthenticated\n", warnings.String())
 }
 
-func TestCallerAuthorizationRefusesHTTPSDowngradeRedirect(t *testing.T) {
-	plaintext := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+// An Authorization header the caller set itself is withheld across the same
+// downgrade redirect, so a credential the transport did not attach is not sent
+// somewhere the transport's own token would not go.
+func TestCallerAuthorizationWithheldFromHTTPSDowngradeRedirect(t *testing.T) {
+	var gotAuth string
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+	}))
 	t.Cleanup(plaintext.Close)
 	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, source.URL+"/api/status", nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer caller-token")
 	resp, err := tokenClient(source.Client().Transport, "").Do(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, gotAuth)
+}
+
+// Two loopback servers on different ports are two origins. The token may be
+// sent to either over plaintext, since both are local, but it belongs to the one
+// the command addressed and does not follow a redirect to the other.
+func TestAuthTokenWithheldBetweenLoopbackPorts(t *testing.T) {
+	var gotAuth string
+	var reached bool
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(other.Close)
+	source := redirectServer(t, httptest.NewServer, func() string { return other.URL })
+
+	err := getThrough(t, tokenClient(http.DefaultTransport, "tok-abc123"), source.URL+"/api/status")
+	require.NoError(t, err)
+	assert.True(t, reached, "the redirect to the other loopback port is followed")
+	assert.Empty(t, gotAuth)
+}
+
+// The local-runtime credential is bound to the endpoint's origin, so a request
+// that spells the same server differently still carries it, and a request to
+// any other server is refused before it is sent.
+func TestLocalAuthBoundToNormalizedOrigin(t *testing.T) {
+	var gotAuth string
+	srv := captureAuthServer(t, &gotAuth)
+	prevToken, prevOrigin := authTransport.token, authTransport.origin
+	t.Cleanup(func() { authTransport.token, authTransport.origin = prevToken, prevOrigin })
+	srvURL, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	SetLocalAuth("local-tok", "HTTP://"+srvURL.Host+"/")
+
+	resp, err := sendThroughTransport(t, srv.URL+"/api/status", "")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, "Bearer local-tok", gotAuth)
+
+	resp, err = sendThroughTransport(t, "http://127.0.0.1:1/api/status", "")
 	if resp != nil {
 		require.NoError(t, resp.Body.Close())
 	}
-	require.ErrorIs(t, err, ErrInsecureTokenTransport)
-}
-
-func TestUnauthenticatedRequestFollowsHTTPSDowngradeRedirect(t *testing.T) {
-	var reached bool
-	plaintext := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true }))
-	t.Cleanup(plaintext.Close)
-	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
-
-	require.NoError(t, getThrough(t, tokenClient(source.Client().Transport, ""), source.URL+"/api/status"))
-	assert.True(t, reached)
+	require.ErrorContains(t, err, "refusing to forward local runtime credentials to another endpoint")
 }
 
 func TestRequestOriginNormalizesDefaultPortAndCase(t *testing.T) {
