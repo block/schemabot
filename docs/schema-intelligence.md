@@ -938,11 +938,15 @@ History records executions. Plans describe what was proposed.
 Each summary carries the plan ID, database, database type, environment, and
 creation time, plus a count of changes by operation and how many were unsafe
 or blocked. Namespace-level work is counted separately:
-`vschema_change_count` is how many namespaces change their VSchema, and
-`finalize_count` is how many namespaces the engine asked to finalize once
-their DDL lands. A plan with no changes omits every count; a plan whose only
-work is a finalize carries `finalize_count` alone, and `list-plans` renders
-it as `1 finalize` rather than `no changes`. The repository, PR, and
+`vschema_change_count` is how many namespaces show a VSchema change, and
+`finalize_count` is how many namespaces have nothing to run but the finalize
+the engine asked for. A finalize beside a namespace's DDL or VSchema change is
+part of that work, so it is not counted, and a namespace whose VSchema change
+the engine generates entirely from the plan's DDL has nothing to review, so it
+is counted by its DDL alone. A plan with no changes omits every count; a plan
+whose only work is a finalize carries `finalize_count` alone, and
+`list-plans` renders it as `1 finalize` rather than `no changes`. The
+repository, PR, and
 head SHA it was planned from appear when the plan came from a PR (an ad-hoc
 CLI plan has none, and older plans may lack the SHA); `deployment` names the
 primary deployment the plan was computed against, when one was recorded.
@@ -977,7 +981,10 @@ finalizer to run once its DDL lands (for Strata, registering tables and
 seeding sequences), independently of any VSchema change. The finalizer runs
 as its own `group_finalizer` operation of the apply, so a namespace can carry
 the marker with no table changes at all, and such a plan still has work to
-apply.
+apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
+engine generates the namespace's whole VSchema change from the plan's DDL, so
+there is no VSchema diff to review; plans show such a namespace by its DDL
+alone.
 
 <details>
 <summary>Stored plan whose only work is a finalize</summary>
@@ -1004,6 +1011,55 @@ Response excerpt (illustrative values):
         "namespace": "payments",
         "metadata": {
           "needs_finalizer": "true"
+        }
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>Stored plan whose VSchema change is generated from its DDL</summary>
+
+```http
+GET /api/plans/plan-example-52
+```
+
+The namespace still reports `vschema_changed`, but the plan counts it by its
+`create` alone, with no `vschema_change_count` and no `finalize_count`.
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-52",
+  "database": "payments",
+  "database_type": "strata",
+  "environment": "staging",
+  "created_at": "2026-09-01T05:10:00Z",
+  "change_counts": {
+    "create": 1
+  },
+  "plan": {
+    "plan_id": "plan-example-52",
+    "engine": "strata",
+    "changes": [
+      {
+        "namespace": "payments",
+        "table_changes": [
+          {
+            "table_name": "refund_notes",
+            "namespace": "payments",
+            "ddl": "CREATE TABLE `refund_notes` (\n  `id` bigint unsigned NOT NULL,\n  `note` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n)",
+            "change_type": "create"
+          }
+        ],
+        "metadata": {
+          "needs_finalizer": "true",
+          "vschema_changed": "true",
+          "vschema_generated_only": "true"
         }
       }
     ]

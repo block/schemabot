@@ -1732,8 +1732,12 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 	protoByNS := make(map[string]*ternv1.SchemaChange)
 	protoTableSeen := make(map[string]map[string]bool)
 	sizeAgg := c.aggregateShardTableSizes(result.Changes)
+	vschemaWorkUnexplained := make(map[string]bool)
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
+		if reportsVSchemaWorkWithoutGeneratedOnly(sc) {
+			vschemaWorkUnexplained[ns] = true
+		}
 		protoSC := protoByNS[ns]
 		if protoSC == nil {
 			protoSC = &ternv1.SchemaChange{
@@ -1789,6 +1793,13 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 			shards = append(shards, protoSP)
 		}
 	}
+	// The generated-only marker says a namespace has no hand-written VSchema
+	// change, which one shard cannot vouch for on another's behalf: when any
+	// change reports VSchema work without the marker, the merged namespace
+	// drops it and renders as it would without it.
+	for ns := range vschemaWorkUnexplained {
+		delete(protoByNS[ns].Metadata, engine.MetadataVSchemaGeneratedOnly)
+	}
 
 	violations = make([]*ternv1.LintViolation, len(result.LintViolations))
 	for i, w := range result.LintViolations {
@@ -1802,6 +1813,14 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 	}
 
 	return changes, violations, shards
+}
+
+// reportsVSchemaWorkWithoutGeneratedOnly reports whether an engine change
+// annotates VSchema work, as a rendered diff or the changed flag, without also
+// saying that work is entirely generated from the plan's DDL.
+func reportsVSchemaWorkWithoutGeneratedOnly(sc engine.SchemaChange) bool {
+	reportsWork := sc.Metadata[storage.PlanMetadataVSchemaDiff] != "" || sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true"
+	return reportsWork && sc.Metadata[engine.MetadataVSchemaGeneratedOnly] != "true"
 }
 
 func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
@@ -2219,10 +2238,14 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, []storage.ShardPlan) {
 	namespaces := make(map[string]*storage.NamespacePlanData)
 	seenTable := make(map[string]map[string]bool)
+	vschemaWorkUnexplained := make(map[string]bool)
 	var allShardPlans []storage.ShardPlan
 	sizeAgg := c.aggregateShardTableSizes(changes)
 	for _, sc := range changes {
 		ns := c.planNamespace(sc.Namespace)
+		if reportsVSchemaWorkWithoutGeneratedOnly(sc) {
+			vschemaWorkUnexplained[ns] = true
+		}
 		nsData := namespaces[ns]
 		if nsData == nil {
 			nsData = &storage.NamespacePlanData{}
@@ -2293,6 +2316,12 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				}
 			}
 		}
+	}
+	// As in the plan response (see planResultToProtoChanges), one shard's
+	// generated-only marker does not speak for a sibling that reports VSchema
+	// work without it.
+	for ns := range vschemaWorkUnexplained {
+		delete(namespaces[ns].Metadata, storage.PlanMetadataVSchemaGeneratedOnly)
 	}
 	return namespaces, allShardPlans
 }

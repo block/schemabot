@@ -519,6 +519,42 @@ func TestMemberPlanChanges_DiffAloneIsVSchemaWork(t *testing.T) {
 	assert.NotEqual(t, empty, withDiff)
 }
 
+// A member's keyspace adds a table whose VSchema entry the engine generates
+// from the DDL, and the engine finalizes the keyspace. The member's plan shows
+// the keyspace by its DDL alone, the way the reviewed plan shows it.
+func TestMemberPlanChanges_GeneratedVSchemaChangeShowsOnlyTheDDL(t *testing.T) {
+	create := "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace:    "payments",
+		TableChanges: []*ternv1.TableChange{{TableName: "refund_notes", Ddl: create}},
+		Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey:       "true",
+			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+			apitypes.NeedsFinalizerMetadataKey:       "true",
+		},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.Equal(t, []string{create}, changes[0].Statements)
+	assert.False(t, changes[0].VSchemaChanged)
+	assert.True(t, changes[0].Finalize)
+}
+
+// A member's keyspace has nothing to run but a finalize the engine asked for.
+// That finalize is work, so the member is not shown as already at the schema.
+func TestMemberPlanChanges_FinalizeAloneIsWork(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "payments",
+		Metadata:  map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.True(t, changes[0].Finalize)
+	assert.False(t, templates.DeploymentPlanGroup{Changes: changes}.Empty())
+}
+
 // A member already at the desired schema produces no changes at all, which is
 // the group the comment names as having nothing to apply.
 func TestMemberPlanChanges_EmptyPlanHasNoChanges(t *testing.T) {

@@ -209,7 +209,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 
 // shardedFinalizerPlan is what a sharded apply's comment reads from the
 // stored plan about its finalizer operations: each namespace's rendered
-// VSchema diff, and the namespaces finalized without a VSchema change. A nil
+// VSchema diff, and the namespaces finalized without a VSchema change to show. A nil
 // plan, when the stored plan could not be read, renders every finalizer as a
 // VSchema change without a diff.
 type shardedFinalizerPlan struct {
@@ -227,7 +227,7 @@ func (p *shardedFinalizerPlan) vschemaDiff(namespace string) string {
 }
 
 // finalizesOnly reports whether the stored plan finalizes the namespace
-// without changing its VSchema.
+// without a VSchema change to show.
 func (p *shardedFinalizerPlan) finalizesOnly(namespace string) bool {
 	return p != nil && p.finalizeOnly[namespace]
 }
@@ -280,7 +280,7 @@ func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, appl
 		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
 			finalizers.vschemaDiffs[namespace] = d
 		}
-		if nsData.Finalize && !nsData.ChangesVSchema() {
+		if nsData.Finalize && !nsData.ShowsVSchemaChange() {
 			finalizers.finalizeOnly[namespace] = true
 		}
 	}

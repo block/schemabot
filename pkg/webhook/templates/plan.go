@@ -346,9 +346,11 @@ type KeyspaceChangeData struct {
 	VSchemaChanged bool
 	VSchemaDiff    string
 
-	// Finalize marks a keyspace the engine asked to finalize after its DDL
-	// without a VSchema document to apply. The finalize is work the apply
-	// runs, so it counts as a change like a VSchema update does.
+	// Finalize marks a keyspace the engine asked to finalize after its DDL.
+	// A keyspace with DDL or a VSchema change to show finalizes as part of that
+	// work, so the finalize gets its own line and count only when it is the
+	// keyspace's only work, which keeps such a plan from reading as having no
+	// changes.
 	Finalize bool
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
@@ -667,29 +669,36 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 }
 
 // countChanges counts a plan's DDL statements and its keyspace-level updates:
-// each keyspace whose VSchema changes or that the engine asks to finalize.
+// each keyspace whose VSchema changes or whose only work is a finalize. A
+// finalize beside DDL is part of that DDL's work, so it adds nothing.
 func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspaceUpdates int) {
 	for _, ks := range changes {
 		totalStatements += keyspaceStatementCount(ks)
-		if ks.VSchemaChanged || ks.Finalize {
+		if ks.VSchemaChanged || finalizeIsOnlyWork(ks) {
 			keyspaceUpdates++
 		}
 	}
 	return
 }
 
-// countKeyspaceUpdates splits countChanges' keyspace-level updates into the
-// VSchema updates and the finalize-only keyspaces, for the summary labels.
+// countKeyspaceUpdates counts the summary's keyspace-level labels: the VSchema
+// updates, and the keyspaces whose only work is a finalize.
 func countKeyspaceUpdates(changes []KeyspaceChangeData) (vschemaUpdates, finalizes int) {
 	for _, ks := range changes {
 		switch {
 		case ks.VSchemaChanged:
 			vschemaUpdates++
-		case ks.Finalize:
+		case finalizeIsOnlyWork(ks):
 			finalizes++
 		}
 	}
 	return
+}
+
+// finalizeIsOnlyWork reports whether a keyspace's only work is the finalize
+// the engine asked for: no DDL and no VSchema change to show beside it.
+func finalizeIsOnlyWork(ks KeyspaceChangeData) bool {
+	return ks.Finalize && !ks.VSchemaChanged && keyspaceStatementCount(ks) == 0
 }
 
 // keyspaceStatementCount counts a keyspace's DDL statements for the summary and
@@ -1127,7 +1136,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			}
 		}
 
-		if ks.Finalize && !hasVSchemaChanges {
+		if ks.Finalize && !hasVSchemaChanges && keyspaceStatementCount(ks) == 0 {
 			sb.WriteString(keyspaceFinalizeNote)
 		}
 
@@ -1141,8 +1150,8 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	}
 }
 
-// keyspaceFinalizeNote is the plan comment's line for a keyspace the engine
-// asked to finalize without a VSchema document to apply. What finalizing does
+// keyspaceFinalizeNote is the plan comment's line for a keyspace whose only
+// work is the finalize the engine asked for. What finalizing does
 // is the engine's; the comment only says that it runs and when.
 const keyspaceFinalizeNote = "_Finalized by the engine once every shard's DDL has landed._\n\n"
 
@@ -1638,10 +1647,16 @@ func targetPlansDiscloseBlocked(data PlanCommentData) bool {
 // combinedTargetPlanChanges merges every target's plan into the one change list
 // the plan summary counts, the way a sharded keyspace's summary counts each
 // distinct statement once however many shards run it.
+//
+// A target whose only work in a keyspace is a finalize shows that finalize in
+// its own plan, so the summary counts it even when another target runs DDL in
+// the same keyspace: the keyspace is then listed a second time, with the
+// finalize alone.
 func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 	var combined []KeyspaceChangeData
 	byKeyspace := make(map[string]int)
 	seen := make(map[string]map[string]struct{})
+	finalizeOnly := make(map[string]bool)
 	for _, g := range data.DeploymentDrift.Plans {
 		if g.Empty() {
 			continue
@@ -1655,6 +1670,9 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 				seen[ks.Keyspace] = make(map[string]struct{})
 			}
 			combined[i].VSchemaChanged = combined[i].VSchemaChanged || ks.VSchemaChanged
+			if finalizeIsOnlyWork(ks) {
+				finalizeOnly[ks.Keyspace] = true
+			}
 			for _, stmt := range keyspaceStatements(ks) {
 				if _, dup := seen[ks.Keyspace][stmt]; dup {
 					continue
@@ -1663,6 +1681,17 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 				combined[i].Statements = append(combined[i].Statements, stmt)
 			}
 		}
+	}
+	for i, n := 0, len(combined); i < n; i++ {
+		ks := combined[i].Keyspace
+		if !finalizeOnly[ks] {
+			continue
+		}
+		if keyspaceStatementCount(combined[i]) == 0 && !combined[i].VSchemaChanged {
+			combined[i].Finalize = true
+			continue
+		}
+		combined = append(combined, KeyspaceChangeData{Keyspace: ks, Finalize: true})
 	}
 	return combined
 }
