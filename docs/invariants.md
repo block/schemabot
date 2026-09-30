@@ -1461,9 +1461,9 @@ waive with.
 
 Unsafe changes (error-severity lint findings such as table and column drops) block without
 `--allow-unsafe`. Changes that destroy work already done on the target, such as discarding an
-unfinished row copy, require the operator to confirm the specific consequences disclosed to them. The re-plan that runs just before execution re-checks that
-verdict, so a plan that changed after the confirmation stops rather than running something the
-operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
+unfinished row copy, require the operator to confirm the specific consequences disclosed to
+them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
+after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
