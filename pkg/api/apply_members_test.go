@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -451,30 +450,102 @@ func TestCreateStoredApply_BlockedMemberPlanIsRefused(t *testing.T) {
 	assert.Contains(t, err.Error(), "orders")
 }
 
-// The unsafe opt-in is the operator's, and it is asked for per apply rather than
-// per member. A member whose own plan drops a table therefore needs the same
-// opt-in the primary's would, or the drop runs on the strength of an approval
-// that was never given for it.
-func TestCreateStoredApply_UnsafeMemberPlanNeedsTheOptIn(t *testing.T) {
-	member := memberPlanWithChange(storage.TableChange{
+// The unsafe opt-in is the operator's, given against the disclosure on the
+// comment it confirms, and that disclosure lists the reviewed plan's unsafe
+// changes. A member whose own plan drops the same table the reviewed plan drops
+// runs it under the opt-in, and needs the opt-in exactly as the reviewed plan
+// does.
+func TestCreateStoredApply_DisclosedUnsafeMemberChangeNeedsTheOptIn(t *testing.T) {
+	drop := storage.TableChange{
 		Namespace: "testapp",
 		Table:     "legacy_orders",
 		Operation: "drop",
 		DDL:       "DROP TABLE `legacy_orders`",
-	})
-	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{member}})
-	primary := primaryPlanRow("testapp-001")
+	}
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(drop)}})
+	reviewed := primaryPlanRow("testapp-001")
+	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{drop}}}
 
-	_, _, err := svc.createStoredApply(t.Context(), primary, ApplyRequest{Environment: "production"}, nil, "apply-unsafe-member")
+	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-unsafe-member")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
 	assert.Contains(t, err.Error(), "legacy_orders")
 	assert.Contains(t, err.Error(), "allow_unsafe")
 
-	_, _, err = svc.createStoredApply(t.Context(), primary, ApplyRequest{Environment: "production"},
+	_, _, err = svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"},
 		map[string]string{"allow_unsafe": "true"}, "apply-unsafe-member-opted-in")
-	assert.NotContains(t, fmt.Sprint(err), "allow_unsafe",
-		"the opt-in the operator gave covers every member's plan")
+	require.NoError(t, err, "the opt-in covers a member's unsafe change the disclosure named")
+}
+
+// A member planned against a schema of its own can carry an unsafe change the
+// reviewed plan does not: us has drifted and drops a column eu never had. The
+// comment's unsafe disclosure names only the reviewed plan's changes, so the
+// operator's opt-in was never given for us's drop, and apply creation refuses
+// it even under the opt-in, rather than give retry advice that could never
+// succeed.
+func TestCreateStoredApply_UndisclosedUnsafeMemberChangeIsRefusedUnderTheOptIn(t *testing.T) {
+	reviewedDrop := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` DROP COLUMN `nickname`",
+		IsUnsafe:  true,
+	}
+	memberDrop := reviewedDrop
+	memberDrop.DDL = "ALTER TABLE `users` DROP COLUMN `nickname`, DROP COLUMN `legacy_id`"
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(memberDrop)}})
+	reviewed := primaryPlanRow("testapp-001")
+	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{reviewedDrop}}}
+
+	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"},
+		map[string]string{"allow_unsafe": "true"}, "apply-undisclosed-unsafe")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+	assert.Contains(t, err.Error(), "carries an unsafe change for table \"users\" that the reviewed plan plan-primary does not carry")
+	assert.NotContains(t, err.Error(), "retry with allow_unsafe", "no opt-in covers a change the disclosure never named")
+	applies, ok := svc.storage.Applies().(*capturingApplyStore)
+	require.True(t, ok)
+	assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
+}
+
+// The preflight a PR apply runs before it pauses asks of each member what apply
+// creation asks, so a confirmation is never pinned for work creation refuses.
+func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
+	alter := storage.TableChange{Namespace: "testapp", Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}
+	drop := storage.TableChange{Namespace: "testapp", Table: "legacy_orders", Operation: "drop", DDL: "DROP TABLE `legacy_orders`"}
+	planWith := func(changes ...storage.TableChange) *storage.Plan {
+		plan := primaryPlanRow("testapp-001")
+		plan.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: changes}}
+		return plan
+	}
+	direct := alter
+	direct.ExecutionMode = "direct"
+	blocked := alter
+	blocked.ExecutionMode = "blocked"
+	shardOnly := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+	shardOnly.Shards = []storage.ShardPlan{{Namespace: "testapp", Shard: "-80", Changes: []storage.TableChange{alter}}}
+
+	for _, tc := range []struct {
+		name     string
+		reviewed *storage.Plan
+		member   *storage.Plan
+		want     string
+	}{
+		{name: "same work", reviewed: planWith(alter), member: planWith(alter), want: ""},
+		{name: "disclosed unsafe change", reviewed: planWith(alter, drop), member: planWith(alter, drop), want: ""},
+		{name: "undisclosed unsafe change", reviewed: planWith(alter), member: planWith(alter, drop), want: `carries an unsafe change for table "legacy_orders"`},
+		{name: "direct execution", reviewed: planWith(alter), member: planWith(direct), want: `runs table "users" as direct-execution DDL`},
+		{name: "blocked change", reviewed: planWith(alter), member: planWith(blocked), want: "carries changes its target's engine refuses"},
+		{name: "work outside the shape", reviewed: planWith(alter), member: shardOnly, want: "has per-shard changes in namespaces [testapp]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MemberWorkTheReviewedPlanCannotRun(tc.reviewed, tc.member)
+			if tc.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Contains(t, got, tc.want)
+		})
+	}
 }
 
 // A converged member is settled at creation because the rollout still has work

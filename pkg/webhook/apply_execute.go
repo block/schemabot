@@ -182,7 +182,9 @@ func (h *Handler) executeApply(
 			return
 		}
 		// The statements match the confirmed round's, but a copy can appear on
-		// a target after the comment was posted.
+		// a target after the comment was posted, and work the apply cannot run
+		// is refused here, releasing the confirmation, rather than at apply
+		// creation, which would leave it pinned.
 		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, reviewedTargetConverged)
 		if refusalErr != nil {
 			h.logger.Error("apply-confirm rejected: could not verify that the other targets' plans can run from this apply; the pending confirmation is preserved",
