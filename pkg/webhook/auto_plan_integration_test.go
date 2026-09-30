@@ -988,7 +988,7 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 // the full webhook path: a synchronize delivery whose auto-plan resolves to no
 // changes posts no plan comment (the check run alone reports the green state),
 // and the outcome supersedes the slot's plan comments from prior heads — their
-// pending DDL and apply prompt no longer match the branch, so they collapse
+// pending DDL and apply prompt no longer match the branch, so they are retired
 // even though no new comment replaces them. No apply acted on the prior head,
 // so its comment is deleted rather than minimized.
 func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
