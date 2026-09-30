@@ -2556,7 +2556,10 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 // target of a deployment that addresses several targets. The control plane
 // sets it only for such a deployment, whose stored operation keys the planner
 // qualified with the target, so the data plane qualifies the key it derives
-// the same way. It is absent for every other dispatch.
+// the same way. The targets share the deployment's idempotency key and so its
+// one remote apply, as shards do, and the target-qualified key is what lets
+// each target attach its own operation rather than replay a sibling's. It is
+// absent for every other dispatch.
 const dispatchMemberTargetOption = "member_target"
 
 // dispatchScope is the execution shape derived from a dispatch request: the
@@ -2598,6 +2601,16 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 	memberTarget, err := dispatchMemberTarget(req)
 	if err != nil {
 		return dispatchScope{}, err
+	}
+	// A member dispatch runs only a plan produced for its own target. Both
+	// planes resolve the dispatch's plan by the operation it drives, and the
+	// data-plane router routes the dispatch to the database of the plan's
+	// target, so a plan naming another target means the named target and the
+	// database the DDL would run on disagree. The operation would then be
+	// stored and echoed under one target's key while its DDL ran on another's,
+	// so the dispatch is refused.
+	if memberTarget != "" && plan.Target != memberTarget {
+		return dispatchScope{}, fmt.Errorf("dispatch for rollout member target %q runs plan %s, which was produced for target %q; refusing to run one target's plan on another target's database", memberTarget, plan.PlanIdentifier, plan.Target)
 	}
 	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges(), memberTarget: memberTarget}
 	if len(req.TargetShards) > 0 {

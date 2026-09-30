@@ -25,9 +25,9 @@ func TestApplyOperationRemoteApplyID(t *testing.T) {
 	})
 }
 
-func TestMemberRemoteApplyID(t *testing.T) {
+func TestDeploymentRemoteApplyID(t *testing.T) {
 	t.Run("no operations", func(t *testing.T) {
-		id, err := MemberRemoteApplyID(nil, &ApplyOperation{Deployment: "west"})
+		id, err := DeploymentRemoteApplyID(nil, "west")
 		require.NoError(t, err)
 		assert.Empty(t, id)
 	})
@@ -37,7 +37,7 @@ func TestMemberRemoteApplyID(t *testing.T) {
 			{ID: 1, Deployment: "west", OperationKey: "ns/-80/users"},
 			{ID: 2, Deployment: "west", OperationKey: "ns/80-/users"},
 		}
-		id, err := MemberRemoteApplyID(ops, &ApplyOperation{Deployment: "west"})
+		id, err := DeploymentRemoteApplyID(ops, "west")
 		require.NoError(t, err)
 		assert.Empty(t, id)
 	})
@@ -48,7 +48,7 @@ func TestMemberRemoteApplyID(t *testing.T) {
 			{ID: 2, Deployment: "west", ExternalID: "apply-remote-1"},
 			{ID: 3, Deployment: "west"},
 		}
-		id, err := MemberRemoteApplyID(ops, &ApplyOperation{Deployment: "west"})
+		id, err := DeploymentRemoteApplyID(ops, "west")
 		require.NoError(t, err)
 		assert.Equal(t, "apply-remote-1", id)
 	})
@@ -58,7 +58,7 @@ func TestMemberRemoteApplyID(t *testing.T) {
 			{ID: 1, Deployment: "west", EngineResumeContext: "apply-remote-1"},
 			{ID: 2, Deployment: "west", ExternalID: "apply-remote-1"},
 		}
-		id, err := MemberRemoteApplyID(ops, &ApplyOperation{Deployment: "west"})
+		id, err := DeploymentRemoteApplyID(ops, "west")
 		require.NoError(t, err)
 		assert.Equal(t, "apply-remote-1", id)
 	})
@@ -69,37 +69,9 @@ func TestMemberRemoteApplyID(t *testing.T) {
 			{ID: 2, Deployment: "east", ExternalID: "apply-remote-east"},
 			{ID: 3, Deployment: "south", ExternalID: "apply-remote-south"},
 		}
-		id, err := MemberRemoteApplyID(ops, &ApplyOperation{Deployment: "east"})
+		id, err := DeploymentRemoteApplyID(ops, "east")
 		require.NoError(t, err)
 		assert.Equal(t, "apply-remote-east", id)
-	})
-
-	// A deployment addressing several targets is one member per target: each
-	// target keeps its own remote apply, and a disagreement inside one target
-	// still fails closed.
-	t.Run("sibling targets of one deployment keep their own remote applies", func(t *testing.T) {
-		first := &ApplyOperation{ID: 1, Deployment: "default", Target: "payments-001", OperationKey: "payments-001", ExternalID: "apply-remote-001"}
-		second := &ApplyOperation{ID: 2, Deployment: "default", Target: "payments-002", OperationKey: "payments-002", ExternalID: "apply-remote-002"}
-		ops := []*ApplyOperation{first, second}
-		id, err := MemberRemoteApplyID(ops, second)
-		require.NoError(t, err)
-		assert.Equal(t, "apply-remote-002", id)
-
-		ops = append(ops, &ApplyOperation{ID: 3, Deployment: "default", Target: "payments-002", OperationKey: "payments-002/extra", ExternalID: "apply-remote-001"})
-		_, err = MemberRemoteApplyID(ops, second)
-		require.Error(t, err, "two remote applies for one target must fail closed")
-		assert.Contains(t, err.Error(), "apply_operation 3")
-	})
-
-	// A deployment addressing one target is one member whatever its rows name,
-	// so a row that records no target stays in the deployment's one member.
-	t.Run("a single-target deployment is one member", func(t *testing.T) {
-		ops := []*ApplyOperation{
-			{ID: 1, Deployment: "west", Target: "west-db", ExternalID: "apply-remote-1"},
-			{ID: 2, Deployment: "west", ExternalID: "apply-remote-2"},
-		}
-		_, err := MemberRemoteApplyID(ops, ops[0])
-		require.Error(t, err, "a target-less row of a single-target deployment is still the same member")
 	})
 
 	t.Run("disagreeing siblings fail closed", func(t *testing.T) {
@@ -107,7 +79,7 @@ func TestMemberRemoteApplyID(t *testing.T) {
 			{ID: 1, Deployment: "west", ExternalID: "apply-remote-1"},
 			{ID: 2, Deployment: "west", ExternalID: "apply-remote-2"},
 		}
-		id, err := MemberRemoteApplyID(ops, &ApplyOperation{Deployment: "west"})
+		id, err := DeploymentRemoteApplyID(ops, "west")
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "apply-remote-1")

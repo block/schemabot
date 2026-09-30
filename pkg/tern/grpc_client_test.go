@@ -550,6 +550,7 @@ type capturingTernServer struct {
 	stopRefusal       string // when set, Stop answers Accepted=false with this reason
 	cancelRefusal     string // when set, Cancel answers Accepted=false with this reason
 	omitOperationKey  bool   // emulate a data plane that does not echo the operation key
+	echoOperationKey  string // when set, echoed in place of the derived key, emulating a response for another operation
 }
 
 // dispatchOperationKeyEcho mirrors the data plane's operation key derivation
@@ -588,13 +589,17 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 	}
 	operationID := s.remoteOperationID
 	omitOperationKey := s.omitOperationKey
+	echoOperationKey := s.echoOperationKey
 	err := s.applyErr
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 	operationKey := ""
-	if !omitOperationKey {
+	switch {
+	case echoOperationKey != "":
+		operationKey = echoOperationKey
+	case !omitOperationKey:
 		operationKey = dispatchOperationKeyEcho(req)
 	}
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID, ApplyOperationId: operationID, OperationKey: operationKey}, nil

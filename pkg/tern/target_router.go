@@ -88,8 +88,13 @@ type TargetRouter struct {
 	// retiring holds replaced generations that still own an apply or serve
 	// an in-flight request.
 	retiring map[*targetClientGeneration]struct{}
-	// applyOwners maps an apply identifier to the generation that owns it.
-	applyOwners map[string]*targetClientGeneration
+	// applyOwners maps an apply identifier, then the route target a drive of
+	// it runs on, to the generation that owns that target's share of the apply.
+	// The targets of a deployment that addresses several share one apply, as
+	// shards do, but each target is its own route with its own connection, so
+	// each target's operations are owned, and driven, by that target's
+	// generation and never by a sibling's.
+	applyOwners map[string]map[string]*targetClientGeneration
 	// sweepAt is the applyOwners size at which the next ownership sweep runs.
 	// Ownership is otherwise released only by a rotation or by a request for
 	// the apply, and a finished apply usually gets neither, so the sweep also
@@ -205,7 +210,7 @@ func NewTargetRouter(config TargetRouterConfig) (*TargetRouter, error) {
 		current:               make(map[targetClientKey]*targetClientGeneration),
 		creating:              make(map[targetClientKey]chan struct{}),
 		retiring:              make(map[*targetClientGeneration]struct{}),
-		applyOwners:           make(map[string]*targetClientGeneration),
+		applyOwners:           make(map[string]map[string]*targetClientGeneration),
 		sweepAt:               minimumSweepThreshold,
 		activeObservers:       make(map[int64]ProgressObserver),
 		pendingObservers:      make(map[targetClientKey]ProgressObserver),
@@ -739,11 +744,11 @@ func (r *TargetRouter) awaitingFirstDrive(apply *storage.Apply, owner *targetCli
 func (r *TargetRouter) adoptDrive(ctx context.Context, apply *storage.Apply, gen *targetClientGeneration) *targetClientGeneration {
 	applyIdentifier := apply.ApplyIdentifier
 	r.mu.Lock()
-	prior := r.applyOwners[applyIdentifier]
+	prior := r.applyOwners[applyIdentifier][gen.key.target]
 	switch {
 	case prior == nil || prior == gen:
 		gen.owned[applyIdentifier] = ownershipDriving
-		r.applyOwners[applyIdentifier] = gen
+		r.setOwnerLocked(applyIdentifier, gen)
 		sweep := r.sweepDueLocked()
 		r.mu.Unlock()
 		if sweep {
@@ -764,7 +769,7 @@ func (r *TargetRouter) adoptDrive(ctx context.Context, apply *storage.Apply, gen
 	default:
 		closePrior := r.releaseOwnershipLocked(prior, applyIdentifier)
 		gen.owned[applyIdentifier] = ownershipDriving
-		r.applyOwners[applyIdentifier] = gen
+		r.setOwnerLocked(applyIdentifier, gen)
 		r.mu.Unlock()
 		r.logger.Info("target router: queued apply was dispatched on a replaced client generation; driving it on the current generation",
 			append(apply.LogAttrs(), "dispatched_dsn_hash", prior.dsnHash, "drive_dsn_hash", gen.dsnHash)...)
@@ -859,7 +864,7 @@ func (r *TargetRouter) Close() error {
 	}
 	r.current = make(map[targetClientKey]*targetClientGeneration)
 	r.retiring = make(map[*targetClientGeneration]struct{})
-	r.applyOwners = make(map[string]*targetClientGeneration)
+	r.applyOwners = make(map[string]map[string]*targetClientGeneration)
 	r.activeObservers = make(map[int64]ProgressObserver)
 	r.sweepAt = minimumSweepThreshold
 	r.mu.Unlock()
@@ -1208,7 +1213,7 @@ func (r *TargetRouter) closeGeneration(gen *targetClientGeneration) {
 // moves ownership off the generation that has it.
 func (r *TargetRouter) recordDispatch(ctx context.Context, gen *targetClientGeneration, applyIdentifier string) {
 	r.mu.Lock()
-	if prior := r.applyOwners[applyIdentifier]; prior != nil && prior != gen {
+	if prior := r.applyOwners[applyIdentifier][gen.key.target]; prior != nil && prior != gen {
 		r.mu.Unlock()
 		r.logger.Debug("target router: apply already owned by another client generation; leaving ownership with it",
 			"apply_id", applyIdentifier, "owner_dsn_hash", prior.dsnHash, "requested_dsn_hash", gen.dsnHash)
@@ -1216,7 +1221,7 @@ func (r *TargetRouter) recordDispatch(ctx context.Context, gen *targetClientGene
 	}
 	if _, owned := gen.owned[applyIdentifier]; !owned {
 		gen.owned[applyIdentifier] = ownershipQueued
-		r.applyOwners[applyIdentifier] = gen
+		r.setOwnerLocked(applyIdentifier, gen)
 	}
 	sweep := r.sweepDueLocked()
 	r.mu.Unlock()
@@ -1237,7 +1242,7 @@ func (r *TargetRouter) sweepDueLocked() bool {
 // current generation and its connection identity.
 func (r *TargetRouter) ownerOf(apply *storage.Apply) *targetClientGeneration {
 	r.mu.Lock()
-	owner := r.applyOwners[apply.ApplyIdentifier]
+	owner := r.routeOwnerLocked(apply)
 	if owner == nil {
 		r.mu.Unlock()
 		return nil
@@ -1257,11 +1262,51 @@ func (r *TargetRouter) ownerOf(apply *storage.Apply) *targetClientGeneration {
 	return nil
 }
 
+// routeOwnerLocked returns the generation that owns the share of a stored
+// apply its route target drives, or nil when none does. A drive scoped to one
+// target of a deployment that addresses several (see operationScopedApply)
+// names that target, and is only ever handed that target's generation: a
+// sibling target's generation connects to a different database. An apply that
+// names no target predates target routing and has at most one owner, which is
+// returned. The caller holds r.mu.
+func (r *TargetRouter) routeOwnerLocked(apply *storage.Apply) *targetClientGeneration {
+	owners := r.applyOwners[apply.ApplyIdentifier]
+	if target := apply.GetOptions().Target; target != "" {
+		return owners[target]
+	}
+	if len(owners) > 1 {
+		r.logger.Warn("target router: apply names no target but more than one target's client generation owns it; routing it by its stored plan instead of picking one",
+			append(apply.LogAttrs(), "owner_count", len(owners))...)
+		return nil
+	}
+	for _, owner := range owners {
+		return owner
+	}
+	return nil
+}
+
+// setOwnerLocked records gen as the owner of its route target's share of an
+// apply. The caller holds r.mu.
+func (r *TargetRouter) setOwnerLocked(applyIdentifier string, gen *targetClientGeneration) {
+	owners := r.applyOwners[applyIdentifier]
+	if owners == nil {
+		owners = make(map[string]*targetClientGeneration, 1)
+		r.applyOwners[applyIdentifier] = owners
+	}
+	owners[gen.key.target] = gen
+}
+
 // releaseOwnershipLocked drops an apply from its owner and reports whether
-// the owner must now be closed. The caller holds r.mu.
+// the owner must now be closed. Only the owner's own target share is dropped:
+// a sibling target of the same apply keeps its owner. The caller holds r.mu.
 func (r *TargetRouter) releaseOwnershipLocked(owner *targetClientGeneration, applyIdentifier string) bool {
 	delete(owner.owned, applyIdentifier)
-	delete(r.applyOwners, applyIdentifier)
+	if owners := r.applyOwners[applyIdentifier]; owners[owner.key.target] == owner {
+		delete(owners, owner.key.target)
+		if len(owners) == 0 {
+			delete(r.applyOwners, applyIdentifier)
+		}
+	}
 	return r.retireIfIdleLocked(owner)
 }
 
@@ -1313,13 +1358,15 @@ func (r *TargetRouter) sweepOwnership(ctx context.Context) {
 	r.mu.Lock()
 	var settled []*targetClientGeneration
 	released := 0
-	for applyIdentifier, owner := range r.applyOwners {
+	for applyIdentifier, owners := range r.applyOwners {
 		if _, driving := active[applyIdentifier]; driving {
 			continue
 		}
 		released++
-		if r.releaseOwnershipLocked(owner, applyIdentifier) {
-			settled = append(settled, owner)
+		for _, owner := range owners {
+			if r.releaseOwnershipLocked(owner, applyIdentifier) {
+				settled = append(settled, owner)
+			}
 		}
 	}
 	r.setNextSweepLocked(len(r.applyOwners))

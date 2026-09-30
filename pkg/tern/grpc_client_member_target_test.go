@@ -33,8 +33,8 @@ type memberTargetFixture struct {
 }
 
 const (
-	memberFixtureFirstDDL  = "ALTER TABLE orders ADD COLUMN note varchar(255)"
-	memberFixtureSecondDDL = "ALTER TABLE orders ADD COLUMN note varchar(255), ADD INDEX idx_note (note)"
+	memberFixtureFirstDDL  = "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)"
+	memberFixtureSecondDDL = "ALTER TABLE `orders` ADD COLUMN `note` varchar(255), ADD INDEX `idx_note` (`note`)"
 )
 
 func newMemberTargetFixture(t *testing.T, client *GRPCClient) memberTargetFixture {
@@ -78,15 +78,16 @@ func newMemberTargetFixture(t *testing.T, client *GRPCClient) memberTargetFixtur
 	return memberTargetFixture{apply: apply, operations: operations, plans: plans, first: first, second: second}
 }
 
-// Two targets of one deployment are two rollout members, and a data-plane
-// apply drives one target, so each dispatches to its own remote apply: the
-// dispatches carry distinct idempotency keys, each declares only its own
-// target's operation key as the generation manifest, and each names its
-// target so the data plane derives the operation key the planner stored. Each
-// operation then records its own remote apply id, which the member-scoped
-// guard accepts instead of refusing the second as a deployment's second apply.
-func TestGRPCClient_SiblingTargetsOfOneDeploymentDispatchTheirOwnRemoteApplies(t *testing.T) {
-	server := &capturingTernServer{remoteApplyID: "remote-001"}
+// The targets of one deployment share its one remote apply, exactly as the
+// shards of a Vitess deployment do. Both dispatches carry the deployment's
+// idempotency key and declare both targets' operation keys as the generation
+// manifest, so the first creates the remote apply and the second attaches to
+// it. Each names its target, so the data plane derives a distinct,
+// target-qualified operation key for each and the two never resolve to the
+// same remote operation. Both operations record the one remote apply id, and
+// each records the remote operation id the data plane gave its own operation.
+func TestGRPCClient_SiblingTargetsOfOneDeploymentShareItsRemoteApply(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-payments", remoteOperationID: "remote-op-001"}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
 	fx := newMemberTargetFixture(t, client)
@@ -102,22 +103,42 @@ func TestGRPCClient_SiblingTargetsOfOneDeploymentDispatchTheirOwnRemoteApplies(t
 
 	firstReq := drive(fx.first)
 	server.mu.Lock()
-	server.remoteApplyID = "remote-002"
+	server.remoteOperationID = "remote-op-002"
 	server.mu.Unlock()
 	secondReq := drive(fx.second)
 
-	assert.NotEqual(t, firstReq.IdempotencyKey, secondReq.IdempotencyKey,
-		"sibling targets must not share a key, or the data plane replays the first target's apply as the second's")
-	assert.Equal(t, []string{"payments-001"}, firstReq.GenerationOperationKeys)
-	assert.Equal(t, []string{"payments-002"}, secondReq.GenerationOperationKeys,
-		"a target's manifest must not declare its sibling target, whose work never arrives at this remote apply")
+	assert.Equal(t, firstReq.IdempotencyKey, secondReq.IdempotencyKey,
+		"sibling targets share the deployment's key, and so its one remote apply")
+	assert.Equal(t, []string{"payments-001", "payments-002"}, firstReq.GenerationOperationKeys)
+	assert.Equal(t, []string{"payments-001", "payments-002"}, secondReq.GenerationOperationKeys,
+		"the manifest declares every target's operation, so the shared remote apply waits for both")
 	assert.Equal(t, "payments-001", firstReq.Options[dispatchMemberTargetOption])
 	assert.Equal(t, "payments-002", secondReq.Options[dispatchMemberTargetOption])
 
-	assert.Equal(t, "remote-001", fx.operations.ops[fx.first].ExternalID)
-	assert.Equal(t, "remote-002", fx.operations.ops[fx.second].ExternalID,
-		"each target records its own remote apply id")
+	firstKey, err := dispatchOperationKey(fx.plans.byID[fx.apply.PlanID], firstReq)
+	require.NoError(t, err)
+	secondKey, err := dispatchOperationKey(fx.plans.byID[fx.operations.ops[fx.second].PlanID], secondReq)
+	require.NoError(t, err)
+	assert.Equal(t, "payments-001", firstKey)
+	assert.Equal(t, "payments-002", secondKey, "each target derives its own operation key, so it attaches its own operation")
+
+	first, second := fx.operations.ops[fx.first], fx.operations.ops[fx.second]
+	assert.Equal(t, "remote-payments", first.ExternalID)
+	assert.Equal(t, "remote-payments", second.ExternalID, "both targets record the deployment's one remote apply")
+	assert.Equal(t, "remote-op-001", first.ExternalOperationID)
+	assert.Equal(t, "remote-op-002", second.ExternalOperationID, "each target records its own remote operation")
 	assert.Empty(t, fx.apply.ExternalID, "a multi-operation dispatch must not write the parent apply external_id")
+}
+
+// dispatchOperationKey derives a dispatch's operation key the way both planes
+// do: from the dispatch's plan and request shape.
+func dispatchOperationKey(plan *storage.Plan, req *ternv1.ApplyRequest) (string, error) {
+	scope, err := deriveDispatchScope(plan, req)
+	if err != nil {
+		return "", err
+	}
+	key, _, err := operationIdentityForDispatch(scope)
+	return key, err
 }
 
 // Each target of a deployment that addresses several is dispatched to the one
@@ -204,11 +225,13 @@ func TestMemberTargetDispatchRoutesToItsOwnTargetOnTheDataPlane(t *testing.T) {
 	assert.Equal(t, "payments-001", fx.apply.GetOptions().Target, "the drive scopes a copy of the apply, never the stored row")
 }
 
-// A data plane that predates member targets derives an empty key for a
-// whole-target dispatch and echoes it. The control plane derives the target
-// from the request it sent, so the empty echo is refused: the response's
-// remote ids are never persisted, and the dispatch fails for an operator
-// instead of being tracked as this target's apply.
+// A data plane that predates member targets ignores the target the dispatch
+// names and derives the empty whole-deployment key, which for the second
+// target resolves to the first target's operation of the shared remote apply.
+// The control plane derives the target from the request it sent, so the echo
+// is refused: the response's remote ids are never persisted, and the dispatch
+// fails for an operator instead of tracking one target's operation as
+// another's.
 func TestGRPCClient_MemberTargetDispatchFailsClosedAgainstDataPlaneWithoutTargetKeys(t *testing.T) {
 	server := &capturingTernServer{remoteApplyID: "remote-old", omitOperationKey: true}
 	client, cleanup := testCapturingGRPCClient(t, server)
@@ -223,51 +246,75 @@ func TestGRPCClient_MemberTargetDispatchFailsClosedAgainstDataPlaneWithoutTarget
 
 	require.NotNil(t, server.getApplyRequest(), "the dispatch itself must have been sent")
 	assert.Empty(t, fx.operations.ops[fx.second].ExternalID, "the unverified response's remote apply id must not be persisted")
+	assert.Empty(t, fx.operations.ops[fx.second].ExternalOperationID)
 	assert.Empty(t, fx.apply.ExternalID)
 }
 
-// A single-target apply and a deployments-map apply key their dispatches
-// exactly as they always have, so an apply in flight across an upgrade
-// re-dispatches under the key it first used and resolves to its existing
-// remote apply. Only a member target adds to the key.
+// A response that answers payments-002's dispatch with payments-001's
+// operation of the shared remote apply is refused: the echoed key names the
+// sibling target, not the one this dispatch drives, so neither the remote
+// apply id nor the sibling's remote operation id is recorded on payments-002.
+func TestGRPCClient_MemberTargetDispatchRefusesASiblingTargetsEcho(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-payments", remoteOperationID: "remote-op-001", echoOperationKey: "payments-001"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fx := newMemberTargetFixture(t, client)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, fx.apply, fx.second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `echoed operation key "payments-001", expected "payments-002"`)
+
+	second := fx.operations.ops[fx.second]
+	assert.Empty(t, second.ExternalID, "a response addressing the sibling target's operation must not be persisted")
+	assert.Empty(t, second.ExternalOperationID, "the sibling target's remote operation id must never be recorded as this target's")
+}
+
+// The targets of one deployment key their generation-zero dispatches on the
+// deployment alone, exactly as its shards do, so they land on one remote
+// apply; that key is the one a single-target deployment has always used, and a
+// whole-apply drive keeps its own. A deliberate retry (the operation's attempt
+// above zero) keys on the operation, so each target's retry gets a remote
+// apply of its own and never lands on the other target's.
 func TestRemoteApplyIdempotencyKey_MemberTarget(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-abc123"}
 	legacyKey := func(parts ...string) string {
 		sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 		return "schemabot:v1:" + hex.EncodeToString(sum[:])
 	}
-	scope := func(target, memberTarget string) applyTaskScope {
+	scope := func(target, operationKey, memberTarget string, attempt int) applyTaskScope {
 		return applyTaskScope{
 			applyOperationID: 1,
-			operation:        &storage.ApplyOperation{Deployment: "default", Target: target, OperationKey: "orders/-80/orders"},
+			operation:        &storage.ApplyOperation{Deployment: "default", Target: target, OperationKey: operationKey, Attempt: attempt},
 			multiOperation:   true,
 			memberTarget:     memberTarget,
 		}
 	}
+	deploymentKey := legacyKey("schemabot-remote-apply-v1", "apply-abc123", "deployment", "default", "0")
 
-	assert.Equal(t,
-		legacyKey("schemabot-remote-apply-v1", "apply-abc123", "deployment", "default", "0"),
-		remoteApplyIdempotencyKey(apply, scope("payments-001", "")),
-		"a deployment addressing one target keeps its deployment key, whatever target its rows name")
+	assert.Equal(t, deploymentKey, remoteApplyIdempotencyKey(apply, scope("payments-001", "payments-001", "payments-001", 0)))
+	assert.Equal(t, deploymentKey, remoteApplyIdempotencyKey(apply, scope("payments-002", "payments-002", "payments-002", 0)),
+		"sibling targets share the deployment's key, and so its one remote apply")
+	assert.Equal(t, deploymentKey, remoteApplyIdempotencyKey(apply, scope("payments-001", "orders/-80/orders", "", 0)),
+		"a shard of a single-target deployment keys on the deployment as it always has")
 	assert.Equal(t,
 		legacyKey("schemabot-remote-apply-v1", "apply-abc123", "whole", "0"),
 		remoteApplyIdempotencyKey(apply, wholeApplyTaskScope()),
 		"a whole-apply drive keeps its whole-apply key")
 
-	first := remoteApplyIdempotencyKey(apply, scope("payments-001", "payments-001"))
-	second := remoteApplyIdempotencyKey(apply, scope("payments-002", "payments-002"))
-	assert.NotEqual(t, first, second, "sibling targets of one deployment key separately")
-	assert.NotEqual(t, remoteApplyIdempotencyKey(apply, scope("payments-001", "")), first,
-		"a member target is part of the key")
-	assert.Equal(t, first, remoteApplyIdempotencyKey(apply, scope("payments-001", "payments-001")),
-		"a member's key is stable across re-dispatch")
+	firstRetry := remoteApplyIdempotencyKey(apply, scope("payments-001", "payments-001", "payments-001", 1))
+	secondRetry := remoteApplyIdempotencyKey(apply, scope("payments-002", "payments-002", "payments-002", 1))
+	assert.Equal(t, legacyKey("schemabot-remote-apply-v1", "apply-abc123", "deployment", "default", "1", "operation", "payments-001"), firstRetry)
+	assert.NotEqual(t, firstRetry, secondRetry, "a retried target keys on its own operation")
 }
 
-// The claim-time scope decides the member from the apply's operation rows: a
-// deployment addressing several targets makes each target its own member, with
-// its own manifest, while a deployment addressing one target stays one member
-// and names no member target. A row of a multi-target deployment that names no
-// target has no member and is refused rather than dispatched under a guess.
+// The claim-time scope decides the member target from the apply's operation
+// rows: a deployment addressing several targets names the claimed operation's
+// target, and its manifest declares every target's operation, since they all
+// attach to the deployment's one remote apply. A deployment addressing one
+// target names no member target. A row of a multi-target deployment that names
+// no target is refused rather than dispatched under a guessed key.
 func TestLoadOperationApplyTaskScope_MemberTarget(t *testing.T) {
 	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
 		1: {ID: 1, ApplyID: 100, Deployment: "default", Target: "payments-001", OperationKey: "payments-001"},
@@ -281,7 +328,7 @@ func TestLoadOperationApplyTaskScope_MemberTarget(t *testing.T) {
 	scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, 2)
 	require.NoError(t, err)
 	assert.Equal(t, "payments-002", scope.memberTarget)
-	assert.Equal(t, []string{"payments-002"}, scope.generationOperationKeys())
+	assert.Equal(t, []string{"payments-001", "payments-002"}, scope.generationOperationKeys())
 
 	east, err := client.loadOperationApplyTaskScope(t.Context(), apply, 3)
 	require.NoError(t, err)
@@ -298,9 +345,10 @@ func TestLoadOperationApplyTaskScope_MemberTarget(t *testing.T) {
 // helpers. A whole-target dispatch naming a member target derives the target
 // itself, which is the key the planner stored; one naming none derives the
 // empty key it always has. A shard or finalizer dispatch naming a member target
-// is refused, and so is a target that could not be split back out of a key.
+// is refused, and so is a target that could not be split back out of a key,
+// and so is a member target the dispatch's plan was not produced for.
 func TestOperationIdentityForDispatch_MemberTarget(t *testing.T) {
-	plan := &storage.Plan{PlanIdentifier: "plan-members"}
+	plan := &storage.Plan{PlanIdentifier: "plan-members", Target: "payments-001"}
 	changes := []*ternv1.TableChange{{
 		Namespace:  "payments",
 		TableName:  "orders",
@@ -332,4 +380,77 @@ func TestOperationIdentityForDispatch_MemberTarget(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "operation key delimiter")
 
+	_, err = derive(&ternv1.ApplyRequest{DdlChanges: changes, Options: map[string]string{dispatchMemberTargetOption: "payments-002"}})
+	require.Error(t, err, "a target must never run a plan produced for its sibling")
+	assert.Contains(t, err.Error(), `runs plan plan-members, which was produced for target "payments-001"`)
+}
+
+// The data plane serves the targets of one deployment from one shared apply,
+// but each target is its own route with its own connection. payments-001's
+// operation is already driving on its route's client when payments-002's
+// operation is claimed. The operator scopes that drive to payments-002 (see
+// operationScopedApply), and the router must hand it payments-002's client:
+// the client that already owns the apply for payments-001 connects to a
+// different database. Each target keeps its own owner for the rest of the
+// apply, so a later drive of payments-001 returns to its own client.
+func TestTargetRouterDrivesEachTargetOfASharedApplyOnItsOwnConnection(t *testing.T) {
+	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
+		"payments-001": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(10.0.0.1:3306)/"},
+		"payments-002": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(10.0.0.2:3306)/"},
+	}})
+	require.NoError(t, err)
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-shared-targets",
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "payments-001"})
+	store := targetRouterApplyStore{
+		byID:         map[int64]*storage.Apply{apply.ID: apply},
+		byIdentifier: map[string]*storage.Apply{apply.ApplyIdentifier: apply},
+	}
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, store, nil, created)
+
+	clientFor := func(dsn string) *targetRouterRecordingClient {
+		for _, client := range created {
+			if client.targetDSN == dsn {
+				return client
+			}
+		}
+		return nil
+	}
+	drive := func(target string, operationID int64) {
+		for _, client := range created {
+			client.resumeApply = nil
+		}
+		scoped := operationScopedApply(apply, &storage.ApplyOperation{ID: operationID, Deployment: "payments", Target: target})
+		require.NoError(t, router.ResumeApplyOperation(t.Context(), scoped, operationID))
+	}
+
+	drive("payments-001", 41)
+	first := clientFor("root@tcp(10.0.0.1:3306)/")
+	require.NotNil(t, first)
+	require.NotNil(t, first.resumeApply, "payments-001's operation drives on payments-001's connection")
+
+	drive("payments-002", 42)
+	second := clientFor("root@tcp(10.0.0.2:3306)/")
+	require.NotNil(t, second, "payments-002's operation must get a client for its own route")
+	require.NotNil(t, second.resumeApply, "payments-002's operation drives on payments-002's connection")
+	assert.Equal(t, "payments-002", second.resumeApply.GetOptions().Target)
+	assert.Nil(t, first.resumeApply, "payments-002's operation must never drive on the connection that owns payments-001's share")
+
+	drive("payments-001", 41)
+	require.NotNil(t, first.resumeApply, "payments-001 keeps its own owner")
+	assert.Nil(t, second.resumeApply)
+
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	owners := router.applyOwners[apply.ApplyIdentifier]
+	require.Len(t, owners, 2, "each target of the shared apply has an owner of its own")
+	assert.Equal(t, "payments-001", owners["payments-001"].key.target)
+	assert.Equal(t, "payments-002", owners["payments-002"].key.target)
 }
