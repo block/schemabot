@@ -36,7 +36,8 @@ window.renderFrame=(t,dt)=>{
    [1.5,s=>s.includes('Applying changes')&&!s.includes('Apply complete!')],
    [2.5,s=>s.includes('Apply complete!')]
   ]:[
-   [1.5,s=>s.includes('What would you like to try?')],
+   [.5,s=>s.includes('What would you like to try?')&&s.includes('› Connect my database')],
+   [1,s=>s.includes('What would you like to try?')&&s.includes('› Try a sample database')],
    [.7,s=>s.includes('Choose your sample database')&&s.includes('› MySQL')],
    [1.8,s=>s.includes('Choose your sample database')&&s.includes('› PostgreSQL')],
    [1,s=>s.includes('/  sample database')],

@@ -588,3 +588,12 @@ func TestInitWizardDetectsExistingProjectBeforeReview(t *testing.T) {
 	require.Equal(t, "postgres", explicit.fields[0].value)
 	require.Equal(t, "other", explicit.fields[1].value)
 }
+
+func TestInitProgressHeading(t *testing.T) {
+	for _, heading := range []string{"sample database", "connect and verify"} {
+		t.Run(heading, func(t *testing.T) {
+			m := &initProgress{heading: heading, width: 72, stages: []string{"A stage whose wording can change"}}
+			require.Contains(t, m.View(), "SchemaBot  /  "+heading)
+		})
+	}
+}

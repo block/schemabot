@@ -27,6 +27,9 @@ import (
 	"github.com/block/spirit/pkg/utils"
 )
 
+// NamePrefix identifies project-owned sample runtimes and containers.
+const NamePrefix = "schemabot-sample-"
+
 const ownerLabel = "com.block.schemabot.sample"
 
 type Database struct {
@@ -102,11 +105,11 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		}
 		images, err := run(ctx, nil, "image", "ls", "--quiet", image)
 		if err != nil {
-			return Database{}, err
+			return Database{}, fmt.Errorf("inspect sample image %s: %w", image, err)
 		}
 		if strings.TrimSpace(string(images)) == "" {
 			if _, err := run(ctx, nil, "pull", image); err != nil {
-				return Database{}, err
+				return Database{}, fmt.Errorf("pull sample image %s: %w", image, err)
 			}
 		}
 		// Pin Docker's host port so stop/start and daemon restarts keep saved DSNs valid.
@@ -158,6 +161,9 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 	if !c.State.Running {
 		report("Starting your sample database")
 		if _, err = run(ctx, nil, "start", name); err != nil {
+			if c.State.Status == "created" {
+				return Database{}, fmt.Errorf("start new sample %s: %w; resolve the Docker error and retry setup", name, err)
+			}
 			return Database{}, fmt.Errorf("start sample %s: %w; if its port is in use, stop the process using that port and retry docker start %s; keep the container to preserve your data and saved connection", name, err, name)
 		}
 	}
@@ -336,5 +342,5 @@ func sampleName(project, engine string) (string, error) {
 		return "", err
 	}
 	sum := sha256.Sum256([]byte(project + "\x00" + engine))
-	return fmt.Sprintf("schemabot-sample-%x", sum[:6]), nil
+	return fmt.Sprintf("%s%x", NamePrefix, sum[:6]), nil
 }

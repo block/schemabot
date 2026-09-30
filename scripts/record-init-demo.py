@@ -192,7 +192,7 @@ try:
     schema.write_text(after)
     plan_args = ['plan', '-s', 'schema', '-e', 'development']
     plan = subprocess.run([binary, *plan_args], cwd=work, env=env, text=True, capture_output=True, check=True)
-    output = {'sample': args.sample, 'init_command': 'schemabot init', 'plan_command': 'schemabot ' + ' '.join(plan_args), 'engine': args.engine, 'schema_file': schema_file, 'wizard': '\n'.join(screen.display).strip(), 'wizard_frames': [f for f in frames if any('SchemaBot' in ''.join(s['text'] for s in r) for r in f['rows']) or f['time'] > 1], 'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=schema_file, tofile=schema_file)), 'plan': plan.stdout, 'plan_stderr': plan.stderr}
+    output = {'sample': args.sample, 'init_command': 'schemabot init', 'plan_command': 'schemabot ' + ' '.join(plan_args), 'engine': args.engine, 'schema_file': schema_file, 'wizard': '\n'.join(screen.display).strip(), 'wizard_frames': frames, 'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile=schema_file, tofile=schema_file)), 'plan': plan.stdout, 'plan_stderr': plan.stderr}
     if args.sample:
         apply_args = ['apply', '-s', 'schema', '-e', 'development']
         apply_frames, applied = record_apply([binary, *apply_args], work, env)

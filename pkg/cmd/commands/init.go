@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/localdemo"
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/localsetup"
 )
@@ -238,6 +239,9 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if cmd.ReuseSchema && baseline != nil && len(baseline.Errors) == 0 && hasResultChanges(baseline) {
+		return nil, fmt.Errorf("your existing schema files differ from the live database; your edits were preserved. Review them with %s plan -s %s -e %s --profile %s instead of rerunning setup:\n  %s", cliname.Name(), initShellArg(cmd.SchemaDir), initShellArg(cmd.Environment), initShellArg(profile), strings.Join(describeOnboardPlanChanges(baseline), "\n  "))
+	}
 	cmd.reportProgress("Saving your schema files and connection...")
 	if err := publishVerifiedInitSchema(stage, root, baseline, cmd.Database, cmd.Environment); err != nil {
 		return nil, err
@@ -377,7 +381,7 @@ func retainedInitError(err error) error {
 func initProfileName(cfg *client.Config, flag, runtime string) string {
 	selection := client.ResolveProfile(cfg, flag)
 	existing := cfg.Profiles[selection.Name]
-	if !selection.Explicit() && strings.HasPrefix(existing.LocalRuntime, "schemabot-sample-") && existing.LocalRuntime != runtime {
+	if !selection.Explicit() && strings.HasPrefix(existing.LocalRuntime, localdemo.NamePrefix) && existing.LocalRuntime != runtime {
 		return runtime
 	}
 	return selection.Name
