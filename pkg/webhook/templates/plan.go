@@ -396,10 +396,12 @@ type KeyspaceChangeData struct {
 	// changes.
 	Finalize bool
 	// TableSizes carries plan-time size estimates for the existing tables this
-	// keyspace's changes touch, rendered above the DDL so an operator sees the
-	// scale of each table before reading the statements. Tables being created
-	// have no size and are omitted; an entry without a row estimate renders an
-	// explicit "unavailable" so absence is never silent.
+	// keyspace's changes copy, rebuild, or scan, rendered in the size section
+	// after the DDL. Tables being created have no size and are omitted. An
+	// entry without a byte estimate renders an explicit "unavailable" so a
+	// failed size probe never reads as a small table, unless no table in the
+	// plan has an estimate, in which case the section is omitted (see
+	// writeTableSizesSection).
 	TableSizes []TableSizeData
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
@@ -1262,6 +1264,13 @@ const tableSizesLargestShown = 5
 // every target's size would bury the figure the operator reads first.
 const tableSizesPerTargetLimit = 2
 
+// tableSizesListedLimit caps how many tables a folded size section lists in
+// total, visible and collapsed. Collapsed lines still count toward GitHub's
+// comment size limit, and a plan that indexes thousands of tables would
+// otherwise spend on sizes the room its DDL needs. Tables past the cap are
+// counted in the heading and in a closing line instead.
+const tableSizesListedLimit = 50
+
 // tableSizeEntry is one line of the size section: the table's display name,
 // qualified with its keyspace when the plan spans several, and its sizes.
 type tableSizeEntry struct {
@@ -1316,11 +1325,24 @@ func (e tableSizeEntry) incomplete() bool {
 	return sized < len(e.perTarget)
 }
 
+// hasAnyEstimate reports whether the line carries a byte estimate for at
+// least one target.
+func (e tableSizeEntry) hasAnyEstimate() bool {
+	if !e.multiTarget() {
+		return hasSizeEstimate(e.size)
+	}
+	_, sized := e.totalBytes()
+	return sized > 0
+}
+
 // writeTableSizesSection renders the plan's table-size info section: one line
 // per table the plan will copy, rebuild, or scan (the comment builder
 // attaches sizes only to statements whose cost scales with table size),
 // across every keyspace, placed above the plan summary. A plan of only
-// metadata-only statements renders no section at all. Table names carry
+// metadata-only statements renders no section at all, and neither does a plan
+// where no table has an estimate: an engine that does not estimate sizes
+// would otherwise show "unavailable" on every line, which reads as a failed
+// probe when none ran. Table names carry
 // their keyspace when the plan spans more than one keyspace with sizes, so a
 // shared table name stays unambiguous.
 func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
@@ -1329,7 +1351,7 @@ func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
 	if multiTarget {
 		entries = targetTableSizeEntries(data.DeploymentDrift.TableSizes)
 	}
-	if len(entries) == 0 {
+	if !slices.ContainsFunc(entries, tableSizeEntry.hasAnyEstimate) {
 		return
 	}
 	if len(entries) <= tableSizesInlineLimit {
@@ -1398,6 +1420,8 @@ func targetTableSizeEntries(sizes []TargetTableSize) []tableSizeEntry {
 // when any table is missing an estimate, how many: a size probe that failed on
 // a large table must stay visible even though its line is folded. The largest
 // tables follow, then the rest in a collapsed block, all ordered largest first.
+// Past tableSizesListedLimit the smallest tables are counted in a closing line
+// rather than listed.
 func writeFoldedTableSizes(sb *strings.Builder, entries []tableSizeEntry, multiTarget bool) {
 	sorted := slices.Clone(entries)
 	slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
@@ -1421,7 +1445,11 @@ func writeFoldedTableSizes(sb *strings.Builder, entries []tableSizeEntry, multiT
 
 	rest := sorted[tableSizesLargestShown:]
 	fmt.Fprintf(sb, "\n<details>\n<summary>%d more %s</summary>\n\n", len(rest), pluralize("table", len(rest)))
-	writeTableSizeLines(sb, rest)
+	listed := min(len(sorted), tableSizesListedLimit)
+	writeTableSizeLines(sb, sorted[tableSizesLargestShown:listed])
+	if unlisted := len(sorted) - listed; unlisted > 0 {
+		fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
+	}
 	sb.WriteString("\n</details>\n\n")
 }
 

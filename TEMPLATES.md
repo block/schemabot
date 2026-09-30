@@ -1107,9 +1107,6 @@ CREATE TABLE `addresses` (
 ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 ```
 
-📊 **Table sizes**:
-- `customers`: ~23.4 GB across 2 shards
-
 📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
@@ -1302,9 +1299,6 @@ CREATE TABLE `addresses` (
 ```sql
 ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 ```
-
-📊 **Table sizes**:
-- `customers`: ~23.4 GB across 2 shards
 
 📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
@@ -3416,9 +3410,6 @@ CREATE TABLE `addresses` (
 ```sql
 ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 ```
-
-📊 **Table sizes**:
-- `customers`: ~23.4 GB across 2 shards
 
 📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
@@ -8739,14 +8730,19 @@ Shards diverge — what applies where:
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
+```sql
+ALTER TABLE `outcomes` ADD INDEX `status`(`status`);
+```
+
 **shard `-40`**
 
 No schema changes detected
 
 📊 **Table sizes**:
 - `mutes`: size estimate unavailable · 3 shards
+- `outcomes`: ~4.2 GB across 3 shards
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **2** tables to alter
 
 
 ---

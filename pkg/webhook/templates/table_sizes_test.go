@@ -12,7 +12,8 @@ import (
 // Table-size rendering in the plan comment: an info section above the plan
 // summary shows the on-disk footprint of each table gaining an index, and the
 // shard span on a sharded target. A missing estimate is stated explicitly so a
-// failed size probe never reads as a small table.
+// failed size probe never reads as a small table, but a plan where no table has
+// an estimate renders no section, since its engine did not estimate sizes.
 
 func tableSizePlanData(sizes []TableSizeData) PlanCommentData {
 	return PlanCommentData{
@@ -68,12 +69,25 @@ func TestRenderPlanComment_TableSizesSharded(t *testing.T) {
 
 func TestRenderPlanComment_TableSizeUnavailableIsExplicit(t *testing.T) {
 	out := RenderPlanComment(tableSizePlanData([]TableSizeData{
+		{Table: "audits", EstimatedBytes: previewBytes(1_130_000_000)},
 		{Table: "mutes", ShardCount: 3},
 		{Table: "orders"},
 	}))
 
 	assert.Contains(t, out, "- `mutes`: size estimate unavailable · 3 shards\n")
 	assert.Contains(t, out, "- `orders`: size estimate unavailable\n")
+}
+
+// An engine that does not estimate sizes leaves every table without one, and
+// "unavailable" on every line would read as a failed probe when none ran.
+func TestRenderPlanComment_NoEstimatesOmitsSection(t *testing.T) {
+	out := RenderPlanComment(tableSizePlanData([]TableSizeData{
+		{Table: "mutes", ShardCount: 3},
+		{Table: "orders"},
+	}))
+
+	assert.NotContains(t, out, "Table sizes")
+	assert.NotContains(t, out, "size estimate unavailable")
 }
 
 func TestRenderPlanComment_TableSizesQualifiedAcrossKeyspaces(t *testing.T) {
@@ -134,6 +148,27 @@ func TestRenderPlanComment_TableSizesAtInlineLimitStayInPlanOrder(t *testing.T) 
 	assert.Contains(t, out, "- `t10`: ~10 MB\n\n")
 	assert.NotContains(t, out, "<details>\n<summary>", "a plan at the inline limit does not fold its sizes")
 	assert.Less(t, strings.Index(out, "`t01`"), strings.Index(out, "`t10`"), "inline sizes keep plan order")
+}
+
+// A folded section lists at most tableSizesListedLimit tables, since collapsed
+// lines still count toward the comment size limit, and counts the rest in a
+// closing line. The heading still counts every table.
+func TestRenderPlanComment_TableSizesFoldedListIsCapped(t *testing.T) {
+	const tables = tableSizesListedLimit + 25
+	order := make([]string, 0, tables)
+	bytes := map[string]int64{}
+	for i := range tables {
+		name := fmt.Sprintf("t%03d", i)
+		order = append(order, name)
+		bytes[name] = int64(tables-i) * 1_000_000
+	}
+	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
+
+	assert.Contains(t, out, fmt.Sprintf("📊 **Table sizes** (%d tables, largest first):\n", tables))
+	assert.Contains(t, out, fmt.Sprintf("<summary>%d more tables</summary>", tables-tableSizesLargestShown))
+	assert.Contains(t, out, fmt.Sprintf("- `t%03d`:", tableSizesListedLimit-1), "the smallest listed table is the last under the cap")
+	assert.NotContains(t, out, fmt.Sprintf("- `t%03d`:", tableSizesListedLimit), "tables past the cap are not listed")
+	assert.Contains(t, out, "- …and 25 more tables\n\n</details>")
 }
 
 // A plan that changes more tables than the inline limit leads with the count,
@@ -304,6 +339,7 @@ func TestRenderPlanComment_ThreeTargetSizesCountTargetsWithoutEstimate(t *testin
 
 func TestRenderPlanComment_MultiTargetSizesUnavailableEverywhere(t *testing.T) {
 	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/testapp_1", "accounts", 100_000),
 		unsizedTarget("primary/testapp_1", "orders"),
 		unsizedTarget("primary/testapp_2", "orders"),
 		unsizedTarget("primary/testapp_3", "orders"),
@@ -312,6 +348,16 @@ func TestRenderPlanComment_MultiTargetSizesUnavailableEverywhere(t *testing.T) {
 
 	assert.Contains(t, out, "- `orders`: size estimate unavailable on all 3 targets\n")
 	assert.Contains(t, out, "- `users`: size estimate unavailable on `primary/testapp_3`\n")
+}
+
+// A multi-target plan where no target estimated any table renders no section.
+func TestRenderPlanComment_MultiTargetNoEstimatesOmitsSection(t *testing.T) {
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		unsizedTarget("primary/testapp_1", "orders"),
+		unsizedTarget("primary/testapp_2", "orders"),
+	}))
+
+	assert.NotContains(t, out, "Table sizes")
 }
 
 // A table only one target changes is shown on that target alone.

@@ -1344,3 +1344,81 @@ func TestBuildPlanCommentData_TableSizesListEachTableOnce(t *testing.T) {
 	require.Len(t, data.Changes[0].TableSizes, 1)
 	assert.Equal(t, "mutes", data.Changes[0].TableSizes[0].Table)
 }
+
+// A table's DDL can join several statements, as a PostgreSQL change set does.
+// Each statement is inspected on its own, so an index build joined after a
+// metadata-only column add still carries the table's size line.
+func TestBuildPlanCommentData_TableSizesInspectEachJoinedStatement(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "postgres"}
+	bytes := int64(1_130_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email text;\nCREATE INDEX idx_email ON users (email);",
+					ChangeType: "alter", EstimatedBytes: &bytes},
+				{TableName: "accounts", DDL: "ALTER TABLE accounts ADD COLUMN nickname text;\nALTER TABLE accounts DROP COLUMN legacy;",
+					ChangeType: "alter", EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].TableSizes, 1, "only the table whose joined DDL builds an index carries a size line")
+	assert.Equal(t, "users", data.Changes[0].TableSizes[0].Table)
+	require.NotNil(t, data.Changes[0].TableSizes[0].EstimatedBytes)
+	assert.Equal(t, bytes, *data.Changes[0].TableSizes[0].EstimatedBytes)
+}
+
+// A table the plan creates has no data to size, even when its create set
+// builds an index on it.
+func TestBuildPlanCommentData_TableSizesSkipCreatedTables(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "postgres"}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "sessions", DDL: "CREATE TABLE sessions (id bigint PRIMARY KEY, user_id bigint);\nCREATE INDEX idx_user ON sessions (user_id);",
+					ChangeType: "create"},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Empty(t, data.Changes[0].TableSizes)
+}
+
+// A sharded namespace decides a table's size line from every shard's DDL, so
+// an index build that only some shards run still shows the table's size.
+func TestBuildPlanCommentData_TableSizesReadEveryShard(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "testapp", Type: "strata"}
+	bytes := int64(23_400_000_000)
+	addColumn := "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)"
+	addIndex := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testapp_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: addColumn, ChangeType: "alter", ShardCount: 2, EstimatedBytes: &bytes},
+			},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "testapp_sharded", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: addColumn, ChangeType: "alter"}}},
+			{Namespace: "testapp_sharded", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: addIndex, ChangeType: "alter"}}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].TableSizes, 1)
+	size := data.Changes[0].TableSizes[0]
+	assert.Equal(t, "mutes", size.Table)
+	assert.Equal(t, 2, size.ShardCount)
+	require.NotNil(t, size.EstimatedBytes)
+	assert.Equal(t, bytes, *size.EstimatedBytes)
+}

@@ -1705,9 +1705,6 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 				"CREATE TABLE `addresses` (\n  `id` bigint unsigned NOT NULL,\n  `customer_id` bigint unsigned NOT NULL,\n  `street` varchar(255) NOT NULL,\n  `city` varchar(100) NOT NULL,\n  PRIMARY KEY (`id`),\n  INDEX `idx_customer_id` (`customer_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 				"ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier` (`loyalty_tier`);",
 			},
-			TableSizes: []TableSizeData{
-				{Table: "customers", EstimatedBytes: previewBytes(23_400_000_000), ShardCount: 2},
-			},
 			VSchemaChanged: true,
 			VSchemaDiff: `--- a/commerce_sharded.json
 +++ b/commerce_sharded.json

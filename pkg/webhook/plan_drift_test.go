@@ -601,9 +601,7 @@ func TestTargetTableSizes(t *testing.T) {
 			sizedChange("users", dropIndex, 9_000, 900_000)),
 	}}
 
-	sizes := targetTableSizes(rollup, func(databaseType, stmt string) bool {
-		return statementCostScalesWithSize(databaseType, stmt)
-	})
+	sizes := targetTableSizes(rollup)
 
 	require.Len(t, sizes, 2)
 	assert.Equal(t, "primary/testapp_1", sizes[0].Target)
@@ -615,4 +613,57 @@ func TestTargetTableSizes(t *testing.T) {
 	assert.Equal(t, "orders", sizes[1].Size.Table)
 	require.NotNil(t, sizes[1].Size.EstimatedBytes)
 	assert.Equal(t, int64(23_400_000_000), *sizes[1].Size.EstimatedBytes)
+}
+
+// A table a target creates has no data to size, and a sharded namespace
+// decides a table's size line from every shard's DDL rather than the one
+// statement its namespace view keeps.
+func TestTargetTableSizes_SkipsCreatedTablesAndReadsEveryShard(t *testing.T) {
+	addColumn := "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)"
+	addIndex := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	created := sizedChange("widgets", "CREATE TABLE `widgets` (`id` bigint NOT NULL, PRIMARY KEY (`id`), KEY `k` (`id`))", 0, 0)
+	created.ChangeType = ternv1.ChangeType_CHANGE_TYPE_CREATE
+	sharded := sizedMember("testapp_2", sizedChange("mutes", addColumn, 48_200_000, 23_400_000_000))
+	sharded.ChangeSet.Shards = []*ternv1.ShardPlan{
+		{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{TableName: "mutes", Ddl: addColumn}}},
+		{Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{{TableName: "mutes", Ddl: addIndex}}},
+	}
+	rollup := api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{
+		sizedMember("testapp_1", created),
+		sharded,
+	}}
+
+	sizes := targetTableSizes(rollup)
+
+	require.Len(t, sizes, 1)
+	assert.Equal(t, "primary/testapp_2", sizes[0].Target)
+	assert.Equal(t, "mutes", sizes[0].Size.Table)
+	require.NotNil(t, sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, int64(23_400_000_000), *sizes[0].Size.EstimatedBytes)
+}
+
+// A clean multi-target rollup carries each target's table sizes into the
+// preview, so the plan comment totals a table across targets. A blocked
+// rollup carries none, and the size section falls back to the reviewed plan.
+func TestReviewDriftPreview_TableSizesOnlyForCleanRollup(t *testing.T) {
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+	entries := func() []api.DeploymentRollupEntry {
+		return []api.DeploymentRollupEntry{
+			sizedMember("testapp_1", sizedChange("orders", addIndex, 1_000, 100_000)),
+			sizedMember("testapp_2", sizedChange("orders", addIndex, 48_200_000, 23_400_000_000)),
+		}
+	}
+
+	clean := reviewDriftPreview(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: entries()})
+	require.NotNil(t, clean)
+	require.Len(t, clean.TableSizes, 2)
+	assert.Equal(t, "primary/testapp_1", clean.TableSizes[0].Target)
+	assert.Equal(t, "primary/testapp_2", clean.TableSizes[1].Target)
+
+	blocked := reviewDriftPreview(api.PlanRollup{Clean: false, Planning: api.PlanIndependent, Entries: entries()})
+	require.NotNil(t, blocked)
+	assert.Empty(t, blocked.TableSizes)
+
+	single := reviewDriftPreview(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: entries()[:1]})
+	assert.Nil(t, single, "a single-target plan has no rollup preview")
 }
