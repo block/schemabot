@@ -37,7 +37,17 @@ const commentFitPasses = 3
 
 // ddlTruncatedMarker follows a DDL block that was cut to fit the budget, so an
 // operator knows the statement shown is incomplete and where to look instead.
+// It is the marker for DDL whose stored plan is not known; DDL from a stored
+// plan names the command that prints that plan instead (planPointerMarker).
 const ddlTruncatedMarker = "_DDL truncated to fit GitHub's comment size limit; the desired schema is in this PR's schema files._\n"
+
+// planPointerMarker follows a DDL block that was cut to fit the budget when the
+// DDL comes from a stored plan. The schema files hold the desired schema, not
+// the statements the plan would run, so a reader who needs the statements the
+// comment could not show is pointed at the stored plan that holds them.
+func planPointerMarker(planID string) string {
+	return "_DDL truncated to fit GitHub's comment size limit; " + inlineCode("schemabot list-plans "+planID) + " prints the full plan._\n"
+}
 
 // fenceOverhead is the byte count of a block's fixed text beyond the two fence
 // runs and the content: the info string, the newline after each fence, and the
@@ -54,12 +64,49 @@ func fenceOverhead(info string) int {
 type ddlBlockBudget struct {
 	remaining  int
 	blocksLeft int
+
+	// marker is what follows a block cut to fit, set by the section rendering
+	// the DDL through pointAt. Empty means ddlTruncatedMarker.
+	marker string
+	// markers counts the markers the render has written, and longestMarker is
+	// the longest marker any section of the render could write, so a comment
+	// that fits by cutting DDL reserves room for every block's marker however
+	// long its section's marker is.
+	markers       int
+	longestMarker int
 }
 
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
 // render the given number of DDL blocks into at most limit bytes of DDL.
 func newDDLBlockBudget(blocks, limit int) *ddlBlockBudget {
-	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks}
+	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks, longestMarker: len(ddlTruncatedMarker)}
+}
+
+// pointAt makes a block cut from here on name the stored plan planID, until
+// the returned restore runs. An empty planID means the DDL has no stored plan
+// to point at, and a cut block keeps ddlTruncatedMarker.
+func (b *ddlBlockBudget) pointAt(planID string) (restore func()) {
+	previous := b.marker
+	b.marker = ""
+	if planID != "" {
+		b.marker = planPointerMarker(planID)
+	}
+	b.longestMarker = max(b.longestMarker, len(b.truncationMarker()))
+	return func() { b.marker = previous }
+}
+
+// truncationMarker is the marker a block cut now is followed by.
+func (b *ddlBlockBudget) truncationMarker() string {
+	if b.marker == "" {
+		return ddlTruncatedMarker
+	}
+	return b.marker
+}
+
+// writeTruncationMarker writes the marker for a block cut to fit and counts it.
+func (b *ddlBlockBudget) writeTruncationMarker(sb *strings.Builder) {
+	sb.WriteString(b.truncationMarker())
+	b.markers++
 }
 
 // newUnboundedDDLBudget opens a budget no DDL can exhaust, for a render that is
@@ -90,8 +137,8 @@ func renderWithinCommentLimit(blocks, reserve int, render func(*ddlBlockBudget) 
 			return body
 		}
 		spent := ddlLimit - budget.remaining
-		unmarked := max(blocks-strings.Count(body, ddlTruncatedMarker), 0)
-		ddlLimit = max(spent-over-unmarked*len(ddlTruncatedMarker), 0)
+		unmarked := max(blocks-budget.markers, 0)
+		ddlLimit = max(spent-over-unmarked*budget.longestMarker, 0)
 	}
 	return body
 }
@@ -118,7 +165,7 @@ func (b *ddlBlockBudget) spend(size int) {
 // its own backtick run cannot close the block early and inject markdown into
 // the surrounding comment. The closing fence always matches the opening one.
 // Content that would render past the block's share of budget is cut and the
-// block is followed by a visible marker.
+// block is followed by a visible marker naming where the rest lives.
 func writeSQLFencedBlock(sb *strings.Builder, content string, budget *ddlBlockBudget) {
 	writeSQLFencedBlocks(sb, []string{content}, budget)
 }
@@ -148,7 +195,7 @@ func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlo
 		content, truncated := fitSQLBlock(content, room)
 		if i > 0 {
 			if truncated && content == "" {
-				sb.WriteString(ddlTruncatedMarker)
+				budget.writeTruncationMarker(sb)
 				break
 			}
 			sb.WriteString(sqlBlockSeparator)
@@ -157,7 +204,7 @@ func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlo
 		spent += sqlBlockSize(content)
 		writeFencedBlock(sb, "sql", content)
 		if truncated {
-			sb.WriteString(ddlTruncatedMarker)
+			budget.writeTruncationMarker(sb)
 			break
 		}
 	}

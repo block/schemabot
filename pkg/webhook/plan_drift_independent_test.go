@@ -177,3 +177,26 @@ func TestReviewDriftComment_IndependentErroredSaysCouldNotPlan(t *testing.T) {
 	assert.Contains(t, summary, "could not plan: commerce")
 	assert.NotContains(t, summary, "drift blocks apply")
 }
+
+// Each target group names the stored plan its members run, so a comment that
+// cuts a group's DDL can point at the plan that holds all of it. A group takes
+// its first member's stored plan; the primary's group carries none of its own,
+// since the primary runs the reviewed plan.
+func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
+	diffs := []api.DeploymentPlanDiff{
+		independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false),
+		independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false),
+		independentMemberDiff("orders-003", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false),
+	}
+	rollup, err := api.RollupDeploymentDiffs(diffs, driftMembers(diffs), api.PlanIndependent)
+	require.NoError(t, err)
+	rollup.Entries[1].PlanIdentifier = "plan_orders_002"
+	rollup.Entries[2].PlanIdentifier = "plan_orders_003"
+
+	groups := deploymentPlanGroups(rollup)
+	require.Len(t, groups, 2)
+	assert.True(t, groups[0].Primary)
+	assert.Empty(t, groups[0].PlanID)
+	assert.Equal(t, []string{"commerce/orders-002", "commerce/orders-003"}, groups[1].Members)
+	assert.Equal(t, "plan_orders_002", groups[1].PlanID)
+}
