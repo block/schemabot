@@ -47,8 +47,8 @@ const ddlTruncatedMarker = "_DDL truncated to fit GitHub's comment size limit; t
 // comment could not show is pointed at the stored plan that holds them. The
 // command is labelled as a CLI command because every other schemabot command a
 // plan comment names is a PR-comment command, and this one is not.
-func planPointerMarker(planID string) string {
-	return planPointer("plan", planID, nil)
+func planPointerMarker(plan storedPlanRef) string {
+	return planPointer("plan", plan, nil)
 }
 
 // sharedPlanPointerMarker is planPointerMarker for a section that renders one
@@ -57,15 +57,15 @@ func planPointerMarker(planID string) string {
 // the first, so the marker says whose plan it names and which environments run
 // the same DDL, rather than handing another environment's operator a plan that
 // reads as their own.
-func sharedPlanPointerMarker(planID string, environments []string) string {
-	return planPointer(flattenIdentifier(environments[0])+" plan", planID, []string{sameEnvironmentDDLNote(environments[1:])})
+func sharedPlanPointerMarker(plan storedPlanRef, environments []string) string {
+	return planPointer(flattenIdentifier(environments[0])+" plan", plan, []string{sameEnvironmentDDLNote(environments[1:])})
 }
 
-// planPointer is a pointer marker naming the stored plan planID, described as
+// planPointer is a pointer marker naming the stored plan ref, described as
 // plan ("plan", "staging plan for this target"), with notes saying who else
 // runs the same DDL.
-func planPointer(plan, planID string, notes []string) string {
-	marker := "_DDL truncated to fit GitHub's comment size limit; the full " + plan + " is available from the CLI with " + listPlanCommand(planID)
+func planPointer(plan string, ref storedPlanRef, notes []string) string {
+	marker := "_DDL truncated to fit GitHub's comment size limit; the full " + plan + " is available from the CLI with " + ref.listCommand()
 	if len(notes) > 0 {
 		marker += " (" + strings.Join(notes, "; ") + ")"
 	}
@@ -82,9 +82,20 @@ func sameEnvironmentDDLNote(environments []string) string {
 	return strings.Join(matching, " and ") + " " + runVerb(len(matching)) + " the same DDL"
 }
 
-// listPlanCommand is the CLI command that prints the stored plan planID in full.
-func listPlanCommand(planID string) string {
-	return inlineCode("schemabot list-plans " + planID)
+// storedPlanRef names a stored plan the way the CLI reaches it: the tool name
+// the deployment's operators run the CLI as, the environment the plan was made
+// for, and the plan's identifier. An empty id means the DDL has no stored plan.
+type storedPlanRef struct {
+	cliName     string
+	environment string
+	id          string
+}
+
+// listCommand is the CLI command that prints the stored plan in full, scoped
+// to the plan's environment so a wrapper that routes by environment reaches
+// the server that stored it.
+func (p storedPlanRef) listCommand() string {
+	return inlineCode(cliCommand(p.cliName, "list-plans "+environmentFlag(p.environment)+" "+p.id))
 }
 
 // runVerb agrees "run" with the number of environments it follows.
@@ -150,33 +161,35 @@ func newDDLBlockBudget(blocks, limit int) *ddlBlockBudget {
 	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks, longestMarker: len(ddlTruncatedMarker)}
 }
 
-// pointAt makes a block cut from here on name the stored plan planID, until
-// the returned restore runs. An empty planID means the DDL has no stored plan
-// to point at, and a cut block keeps ddlTruncatedMarker.
-func (b *ddlBlockBudget) pointAt(planID string) (restore func()) {
+// pointAt makes a block cut from here on name the stored plan, until the
+// returned restore runs. A plan with no id means the DDL has no stored plan to
+// point at, and a cut block keeps ddlTruncatedMarker. The marker is built here
+// and its length charged from the same text, so a cli name or environment of
+// any length is reserved exactly.
+func (b *ddlBlockBudget) pointAt(plan storedPlanRef) (restore func()) {
 	previous := b.marker
 	b.marker = ""
-	if planID != "" {
-		b.marker = b.pointerMarker(planID)
+	if plan.id != "" {
+		b.marker = b.pointerMarker(plan)
 	}
 	b.longestMarker = max(b.longestMarker, len(b.truncationMarker()))
 	return func() { b.marker = previous }
 }
 
-// pointerMarker is the marker naming the stored plan planID, saying whose plan
-// it is when the section is shared by several environments or renders a
-// target group of several members.
-func (b *ddlBlockBudget) pointerMarker(planID string) string {
-	plan := "plan"
+// pointerMarker is the marker naming the stored plan, saying whose plan it is
+// when the section is shared by several environments or renders a target group
+// of several members.
+func (b *ddlBlockBudget) pointerMarker(plan storedPlanRef) string {
+	description := "plan"
 	var notes []string
 	if b.groupNote != "" {
 		notes = append(notes, b.groupNote)
 	}
 	if len(b.sharedBy) > 1 {
-		plan = flattenIdentifier(b.sharedBy[0]) + " plan"
+		description = flattenIdentifier(b.sharedBy[0]) + " plan"
 		notes = append(notes, sameEnvironmentDDLNote(b.sharedBy[1:]))
 	}
-	return planPointer(plan+b.scope, planID, notes)
+	return planPointer(description+b.scope, plan, notes)
 }
 
 // forTargetGroup marks the DDL rendered from here on as the plan of a target

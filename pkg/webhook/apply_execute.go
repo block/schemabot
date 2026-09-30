@@ -147,7 +147,7 @@ func (h *Handler) executeApply(
 	// Release the lock: no retry of this command can succeed, so holding it
 	// would only force a manual unlock after the schema is rewritten.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
@@ -261,7 +261,7 @@ func (h *Handler) executeApply(
 
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -296,27 +296,17 @@ func (h *Handler) executeApply(
 
 	// Set observer before queuing the apply so ExecuteApply can register it on
 	// the durable apply row before operator dispatch starts.
-	observer := NewCommentObserver(CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		DeferCutover:   options["defer_cutover"] == "true",
-		SupportChannel: h.supportChannel(),
-		Tenant:         h.deploymentTenant(),
-		EngineLogs:     h.engineLogReader(),
-		finalizerPlans: h.finalizerPlans,
-		Logger:         h.logger,
-		OnTerminalHook: func(apply *storage.Apply) {
-			// refreshChecksForTerminalApply routes a completed rollback straight
-			// to action_required. The observer registered here can be consumed by
-			// a rollback apply (pending observers share a per-target key), so the
-			// terminal ordering must honor the rollback intent from the durable
-			// apply, not from the command that registered the observer.
-			h.refreshChecksForTerminalApply(context.Background(), apply, "apply command")
-		},
-	})
+	observerCfg := h.commentObserverConfig(factory, repo, pr, installationID)
+	observerCfg.DeferCutover = options["defer_cutover"] == "true"
+	observerCfg.OnTerminalHook = func(apply *storage.Apply) {
+		// refreshChecksForTerminalApply routes a completed rollback straight
+		// to action_required. The observer registered here can be consumed by
+		// a rollback apply (pending observers share a per-target key), so the
+		// terminal ordering must honor the rollback intent from the durable
+		// apply, not from the command that registered the observer.
+		h.refreshChecksForTerminalApply(context.Background(), apply, "apply command")
+	}
+	observer := NewCommentObserver(observerCfg)
 	h.service.SetPendingObserver(database, "", environment, observer)
 
 	applyReq := api.ApplyRequest{
@@ -425,7 +415,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
 	cause *templates.PausedApplyCauseData,
 ) error {
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true

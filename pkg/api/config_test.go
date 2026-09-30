@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -4735,6 +4736,63 @@ func TestAgentHintConfig(t *testing.T) {
 		err := cfg.Validate()
 		assert.ErrorContains(t, err, "agent_hint contains leading or trailing whitespace")
 	})
+}
+
+// cli_name starts every CLI command hint a PR comment renders, inside inline
+// code, so an unset name renders the CLI's own default and a name that could
+// not render as the start of a pasteable command is refused at startup.
+func TestCLINameConfig(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("defaults to the CLI's own name", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "schemabot", cfg.HintCLIName())
+		assert.Equal(t, cliname.DefaultName, cfg.HintCLIName())
+		assert.Equal(t, "schemabot", (*ServerConfig)(nil).HintCLIName(), "an unwired config renders the default")
+	})
+
+	t.Run("a wrapper name is rendered as configured", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("cli_name: acme schemabot\n"), &cfg))
+		assert.Equal(t, "acme schemabot", cfg.HintCLIName())
+
+		valid := validConfig()
+		valid.CLIName = cfg.CLIName
+		require.NoError(t, valid.Validate())
+	})
+
+	for name, tc := range map[string]struct {
+		value string
+		error string
+	}{
+		"blank":               {"   ", "cli_name must not be blank"},
+		"padded":              {" acme schemabot", "cli_name contains leading or trailing whitespace"},
+		"multi-line":          {"acme\nschemabot", "cli_name must be a single line with no control characters"},
+		"line-separated":      {"acme\u2028schemabot", "cli_name must be a single line with no control characters"},
+		"paragraph-separated": {"acme\u2029schemabot", "cli_name must be a single line with no control characters"},
+		"bidi-overridden":     {"acme \u202eschemabot", "cli_name must not contain format character U+202E"},
+		"zero-width-spaced":   {"acme\u200bschemabot", "cli_name must not contain format character U+200B"},
+		"backtick":            {"acme` schemabot", "cli_name must not contain a backtick"},
+		"longer than the cap": {strings.Repeat("a", maxCLINameChars+1), "cli_name must be at most"},
+	} {
+		t.Run("refuses a "+name+" name", func(t *testing.T) {
+			cfg := validConfig()
+			cfg.CLIName = tc.value
+			assert.ErrorContains(t, cfg.Validate(), tc.error)
+		})
+	}
 }
 
 func TestPendingDropsTargetsResolveEachPass(t *testing.T) {

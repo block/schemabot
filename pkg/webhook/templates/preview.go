@@ -810,6 +810,7 @@ func PreviewCommentOversized() string {
 	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
 		Title:         "## Schema Change Apply — Staging",
 		RenderedBytes: 84801,
+		Environment:   "staging",
 	}), previewSupportChannel())
 }
 

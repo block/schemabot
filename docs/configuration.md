@@ -24,6 +24,7 @@
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Agent Hint](#agent-hint)
+- [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
@@ -1297,6 +1298,37 @@ imperative instructions.
 The hint must be a single bounded line and must not contain an HTML comment
 terminator (`-->` or `--!>`), which would end the comment early and render the
 rest of the hint on the PR page. When omitted, plan comments are unchanged.
+
+## CLI Name
+
+PR comments name CLI commands an operator runs in a terminal, such as the
+command that prints a stored plan in full when a comment cuts its DDL. When
+operators run the CLI through a wrapper, set `cli_name` to the wrapper's
+invocation so a pasted hint reaches the wrapper instead of an unconfigured
+binary:
+
+```yaml
+cli_name: "acme schemabot"
+```
+
+This is the server-side counterpart of the CLI's `--cli-name` flag (see
+[Wrap the CLI for your team](cli.md#wrap-the-cli-for-your-team)); set the same
+value in both places. Each hint is also scoped to its environment, so a
+wrapper that routes by environment reaches the server that wrote it:
+
+```text
+_DDL truncated to fit GitHub's comment size limit; the full plan is available from the CLI with `acme schemabot list-plans -e staging plan_abc`._
+```
+
+Only terminal commands take the name. Commands a PR author comments on the
+PR, such as `schemabot plan` and `schemabot apply -e staging`, keep
+`schemabot`, the word the bot answers to. Terminal commands also never
+carry `--tenant`: the tenant routes PR comments, and the CLI reaches a
+tenant deployment through its endpoint or profile, so a tenant deployment's
+`cli_name` names the wrapper that points there. When omitted, hints start with
+`schemabot`. The name must be a single line of at most 100 characters with no
+backtick and no leading or trailing whitespace, because it renders inside
+inline code.
 
 ## Repository Allowlist
 
