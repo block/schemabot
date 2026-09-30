@@ -1718,8 +1718,9 @@ func (s *Service) createStoredApply(
 	// nothing about that member's — and the tasks built below come from the
 	// member's. Members that run the apply's plan re-clear the same checks here,
 	// which is a no-op rather than a second verdict.
-	for _, member := range members {
-		if err := rejectUnapplyableMemberPlan(member, plan, applyOpts); err != nil {
+	names := applyMemberDisplayNames(members)
+	for i, member := range members {
+		if err := rejectUnapplyableMemberPlan(member, names[i], plan, applyOpts); err != nil {
 			return nil, 0, err
 		}
 		if err := rejectMemberDirectExecution(member, plan); err != nil {
@@ -1772,6 +1773,54 @@ func (s *Service) createStoredApply(
 	return apply, storedApplyID, nil
 }
 
+// MemberPlanRefusal is why apply creation refused one rollout member's own plan.
+type MemberPlanRefusal int
+
+const (
+	// MemberPlanBlocked is a change the member's engine refuses to execute.
+	MemberPlanBlocked MemberPlanRefusal = iota
+	// MemberPlanUnsafe is an unsafe change the apply was not given the unsafe
+	// opt-in for.
+	MemberPlanUnsafe
+)
+
+// MemberPlanRefusedError is apply creation refusing one rollout member's own
+// plan. It names the member the way an operator addresses it and the table or
+// namespace the refused change is on, so a caller can tell the operator which
+// target stopped the apply from fields SchemaBot controls, without presenting
+// the underlying error.
+type MemberPlanRefusedError struct {
+	// MemberID is the member's full identifier, for logs.
+	MemberID string
+	// Target is the member the way the plan comment names it.
+	Target  string
+	Refusal MemberPlanRefusal
+	// Table is the refused change's table, empty for a VSchema change.
+	Table string
+	// Namespace is the refused VSchema change's namespace, empty for a table
+	// change.
+	Namespace string
+	Err       error
+}
+
+func (e *MemberPlanRefusedError) Error() string {
+	return fmt.Sprintf("rollout member %s: %v", e.MemberID, e.Err)
+}
+
+func (e *MemberPlanRefusedError) Unwrap() error {
+	return e.Err
+}
+
+// applyMemberDisplayNames names each member the way the plan comment does, so a
+// refusal names the target the operator already read it under.
+func applyMemberDisplayNames(members []applyMember) []string {
+	targets := make([]routing.ExecutionTarget, len(members))
+	for i, m := range members {
+		targets[i] = m.Target
+	}
+	return routing.DisplayNames(targets)
+}
+
 // rejectUnapplyableMemberPlan runs a rollout member's own plan through the same
 // admission checks the apply's plan cleared, naming the member so an operator
 // reading the refusal knows which target's plan carries the change rather than
@@ -1781,14 +1830,26 @@ func (s *Service) createStoredApply(
 // no opt-in can make a statement the engine refuses executable. An unsafe change
 // the reviewed plan's disclosure never named rejects before the opt-in is
 // consulted, since no opt-in covers it.
-func rejectUnapplyableMemberPlan(member applyMember, applyPlan *storage.Plan, applyOpts storage.ApplyOptions) error {
+func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *storage.Plan, applyOpts storage.ApplyOptions) error {
+	refused := func(refusal MemberPlanRefusal, table, namespace string, err error) error {
+		return &MemberPlanRefusedError{
+			MemberID: member.MemberID(), Target: target, Refusal: refusal,
+			Table: table, Namespace: namespace, Err: err,
+		}
+	}
 	if err := member.Plan.BlockedApplyError(); err != nil {
-		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+		return refused(MemberPlanBlocked, member.Plan.BlockedChanges()[0].Table, "", err)
 	}
 	if err := rejectMemberUndisclosedUnsafe(member, applyPlan); err != nil {
 		return err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
+		if unsafeChanges := member.Plan.UnsafeDDLChanges(); len(unsafeChanges) > 0 {
+			return refused(MemberPlanUnsafe, unsafeChanges[0].Table, "", err)
+		}
+		if vschemaChanges := member.Plan.UnsafeVSchemaChanges(); len(vschemaChanges) > 0 {
+			return refused(MemberPlanUnsafe, "", vschemaChanges[0].Namespace, err)
+		}
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
 	}
 	return nil

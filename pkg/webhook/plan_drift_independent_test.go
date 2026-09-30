@@ -226,3 +226,25 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 		"the group's cut DDL names its first member's plan and whose it is")
 	assert.False(t, strings.Contains(body, "plan_orders_003"), "a group names only its first member's plan")
 }
+
+// A target's own plan can route a statement to direct execution when the
+// reviewed target's does not, because the verdict belongs to the target that
+// runs it. Confirming the apply is the operator's consent to that write-blocking
+// DDL, so the disclosure renders under the target that carries it, the way the
+// reviewed plan's own direct changes are disclosed, and once rather than again
+// plan-wide.
+func TestReviewDriftComment_IndependentDisclosesDirectMember(t *testing.T) {
+	diffs := []api.DeploymentPlanDiff{
+		independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false),
+		independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false),
+	}
+	direct := diffs[1].Changes[0].TableChanges[0]
+	direct.ExecutionMode = engine.ExecutionModeDirect
+	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
+
+	rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
+	require.True(t, rollup.Clean)
+	assert.Contains(t, out, "**target `commerce/orders-002`**\n\n```sql\nALTER TABLE `orders` ADD COLUMN `phone` varchar(32);\n```\n\n⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit\n- `orders`: table is 12 MiB, within the direct execution bound\n",
+		"the direct change is disclosed under the target and DDL that carry it")
+	assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the target that runs nothing directly carries no disclosure")
+}

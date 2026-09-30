@@ -1500,8 +1500,9 @@ after the confirmation stops rather than running something the operator never sa
 `pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
 reviewed target's included, is what the confirmation was given against and carries no consequence
 it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags, direct-execution DDL
-and unsafe changes that the disclosure never named in a plan it did not come from (`rejectMemberDirectExecution`
+`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), each member's own direct changes disclosed under that
+member's plan (`deploymentPlanGroups` in `pkg/webhook/plan_drift.go`), and apply creation refusing, whatever the flags,
+a member's own direct-execution DDL where the reviewed plan has work of its own and unsafe changes that the disclosure never named in a plan it did not come from (`rejectMemberDirectExecution`
 and `rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).

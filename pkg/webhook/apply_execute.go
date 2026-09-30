@@ -508,8 +508,10 @@ type dispatchMessages struct {
 // expected race whose answer is lockIntentChanged, and an unsupported feature
 // is rejected before anything is stored and would be refused the same way on
 // retry, so the operator sees the feature error followed by the command to
-// re-issue without the option that asked for it. Everything else is an
-// internal error whose text stays in server logs behind the fixed line.
+// re-issue without the option that asked for it. A rollout member's refused
+// plan is named by target and table from fields SchemaBot controls. Everything
+// else is an internal error whose text stays in server logs behind the fixed
+// line.
 func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		return msgs.lockIntentChanged
@@ -524,6 +526,9 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 			}
 		}
 		return strings.Join(parts, " ")
+	}
+	if refused, ok := errors.AsType[*api.MemberPlanRefusedError](err); ok {
+		return templates.MemberPlanRefusedDetail(refused.Target, refused.Table, refused.Namespace, refused.Refusal == api.MemberPlanUnsafe)
 	}
 	return msgs.internal
 }
