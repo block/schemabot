@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,9 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestWebhookRollbackDispatch(t *testing.T) {
@@ -377,4 +380,43 @@ func TestWebhookApplyDispatch(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "apply started")
+}
+
+// A rollback plan comment carries the stored rollback plan's identifier, so
+// reversal DDL cut to fit the comment names the command that prints the
+// rollback plan in full rather than the schema files, which hold the desired
+// schema and not the statements that reverse it.
+func TestRollbackPlanCommentData_CarriesPlanID(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_5d2e8a",
+		Database:        "orders",
+		Environment:     "production",
+		DatabaseType:    "mysql",
+	}
+	columns := make([]string, 4000)
+	for i := range columns {
+		columns[i] = "DROP COLUMN `note_" + strings.Repeat("x", 8) + "`"
+	}
+	planResp := &apitypes.PlanResponse{
+		PlanID: "plan_rb_7c41f9",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "orders",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:  "orders",
+				DDL:        "ALTER TABLE `orders` " + strings.Join(columns, ", "),
+				ChangeType: "alter",
+			}},
+		}},
+	}
+
+	data := (&Handler{}).rollbackPlanCommentData(apply, planResp, "testuser")
+	assert.Equal(t, "plan_rb_7c41f9", data.PlanID)
+
+	// The body holds the whole cut statement, so the markers are checked by
+	// presence rather than dumped on failure.
+	body := templates.RenderRollbackPlanComment(data)
+	assert.True(t, strings.Contains(body, "the full plan is available from the CLI with `schemabot list-plans plan_rb_7c41f9`."),
+		"cut rollback DDL names the stored rollback plan")
+	assert.False(t, strings.Contains(body, "the desired schema is in this PR's schema files"),
+		"cut rollback DDL does not point at the schema files")
 }

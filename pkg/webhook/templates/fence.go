@@ -37,13 +37,76 @@ const commentFitPasses = 3
 
 // ddlTruncatedMarker follows a DDL block that was cut to fit the budget, so an
 // operator knows the statement shown is incomplete and where to look instead.
+// It is the marker for DDL whose stored plan is not known; DDL from a stored
+// plan names the command that prints that plan instead (planPointerMarker).
 const ddlTruncatedMarker = "_DDL truncated to fit GitHub's comment size limit; the desired schema is in this PR's schema files._\n"
+
+// planPointerMarker follows a DDL block that was cut to fit the budget when the
+// DDL comes from a stored plan. The schema files hold the desired schema, not
+// the statements the plan would run, so a reader who needs the statements the
+// comment could not show is pointed at the stored plan that holds them. The
+// command is labelled as a CLI command because every other schemabot command a
+// plan comment names is a PR-comment command, and this one is not.
+func planPointerMarker(planID string) string {
+	return planPointer("plan", planID, nil)
+}
+
+// sharedPlanPointerMarker is planPointerMarker for a section that renders one
+// environment's plan on behalf of several environments whose plans are the
+// same. Each environment stored its own plan, and the section can name only
+// the first, so the marker says whose plan it names and which environments run
+// the same DDL, rather than handing another environment's operator a plan that
+// reads as their own.
+func sharedPlanPointerMarker(planID string, environments []string) string {
+	return planPointer(flattenIdentifier(environments[0])+" plan", planID, []string{sameEnvironmentDDLNote(environments[1:])})
+}
+
+// planPointer is a pointer marker naming the stored plan planID, described as
+// plan ("plan", "staging plan for this target"), with notes saying who else
+// runs the same DDL.
+func planPointer(plan, planID string, notes []string) string {
+	marker := "_DDL truncated to fit GitHub's comment size limit; the full " + plan + " is available from the CLI with " + listPlanCommand(planID)
+	if len(notes) > 0 {
+		marker += " (" + strings.Join(notes, "; ") + ")"
+	}
+	return marker + "._\n"
+}
+
+// sameEnvironmentDDLNote says which environments a shared section's plan also
+// stands for.
+func sameEnvironmentDDLNote(environments []string) string {
+	matching := make([]string, 0, len(environments))
+	for _, env := range environments {
+		matching = append(matching, flattenIdentifier(env))
+	}
+	return strings.Join(matching, " and ") + " " + runVerb(len(matching)) + " the same DDL"
+}
+
+// listPlanCommand is the CLI command that prints the stored plan planID in full.
+func listPlanCommand(planID string) string {
+	return inlineCode("schemabot list-plans " + planID)
+}
+
+// runVerb agrees "run" with the number of environments it follows.
+func runVerb(subjects int) string {
+	if subjects == 1 {
+		return "runs"
+	}
+	return "run"
+}
 
 // fenceOverhead is the byte count of a block's fixed text beyond the two fence
 // runs and the content: the info string, the newline after each fence, and the
-// newline that terminates content when it lacks one.
-func fenceOverhead(info string) int {
-	return len(info) + len("\n") + len("\n") + len("\n")
+// newline writeFencedBlock adds to content that lacks one. It is exact rather
+// than an upper bound, because the fit loop cuts the DDL by the overshoot
+// measured against what the budget was charged, and a block charged more than
+// it wrote would let the next pass overshoot by the difference.
+func fenceOverhead(info, content string) int {
+	overhead := len(info) + len("\n") + len("\n")
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		overhead += len("\n")
+	}
+	return overhead
 }
 
 // ddlBlockBudget shares one comment's DDL budget across the blocks the comment
@@ -54,12 +117,110 @@ func fenceOverhead(info string) int {
 type ddlBlockBudget struct {
 	remaining  int
 	blocksLeft int
+
+	// marker is what follows a block cut to fit, set by the section rendering
+	// the DDL through pointAt. Empty means ddlTruncatedMarker.
+	marker string
+	// markers counts the markers the render has written, and longestMarker is
+	// the longest marker any section of the render could write, so a comment
+	// that fits by cutting DDL reserves room for every block's marker however
+	// long its section's marker is.
+	markers       int
+	longestMarker int
+
+	// sharedBy lists the environments a section rendered once on behalf of
+	// several is shared by, the first being the one whose plan it renders, so
+	// a pointer marker in it says whose stored plan it names. Empty outside
+	// such a section.
+	sharedBy []string
+
+	// scope qualifies the plan a pointer marker names when the DDL is one
+	// target group's plan rather than the whole plan, so the reader knows
+	// the stored plan holds only those targets' statements. Empty otherwise.
+	scope string
+	// groupNote follows the command in a pointer marker under a target group
+	// of several members, whose stored plan is its first member's, saying the
+	// rest of the group runs the same DDL. Empty otherwise.
+	groupNote string
 }
 
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
 // render the given number of DDL blocks into at most limit bytes of DDL.
 func newDDLBlockBudget(blocks, limit int) *ddlBlockBudget {
-	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks}
+	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks, longestMarker: len(ddlTruncatedMarker)}
+}
+
+// pointAt makes a block cut from here on name the stored plan planID, until
+// the returned restore runs. An empty planID means the DDL has no stored plan
+// to point at, and a cut block keeps ddlTruncatedMarker.
+func (b *ddlBlockBudget) pointAt(planID string) (restore func()) {
+	previous := b.marker
+	b.marker = ""
+	if planID != "" {
+		b.marker = b.pointerMarker(planID)
+	}
+	b.longestMarker = max(b.longestMarker, len(b.truncationMarker()))
+	return func() { b.marker = previous }
+}
+
+// pointerMarker is the marker naming the stored plan planID, saying whose plan
+// it is when the section is shared by several environments or renders a
+// target group of several members.
+func (b *ddlBlockBudget) pointerMarker(planID string) string {
+	plan := "plan"
+	var notes []string
+	if b.groupNote != "" {
+		notes = append(notes, b.groupNote)
+	}
+	if len(b.sharedBy) > 1 {
+		plan = flattenIdentifier(b.sharedBy[0]) + " plan"
+		notes = append(notes, sameEnvironmentDDLNote(b.sharedBy[1:]))
+	}
+	return planPointer(plan+b.scope, planID, notes)
+}
+
+// forTargetGroup marks the DDL rendered from here on as the plan of a target
+// group with the given members, naming a stored plan that covers only the
+// group's targets, until the returned restore runs.
+func (b *ddlBlockBudget) forTargetGroup(members []string) (restore func()) {
+	previousScope, previousNote := b.scope, b.groupNote
+	b.scope, b.groupNote = targetGroupPlanScope(members)
+	return func() { b.scope, b.groupNote = previousScope, previousNote }
+}
+
+// targetGroupPlanScope is how a pointer marker under a target group's DDL
+// qualifies the plan it names. A group's stored plan is its first member's, so
+// under a group of several the marker names that member and says the rest of
+// the group runs the same DDL, rather than calling one member's plan the
+// group's.
+func targetGroupPlanScope(members []string) (scope, note string) {
+	if len(members) <= 1 {
+		return " for this target", ""
+	}
+	return " for " + inlineCode(members[0]), "every target in this group runs the same DDL"
+}
+
+// shareAcross marks the DDL rendered from here on as one section shared by
+// environments, rendered from the first one's plan, until the returned restore
+// runs.
+func (b *ddlBlockBudget) shareAcross(environments []string) (restore func()) {
+	previous := b.sharedBy
+	b.sharedBy = environments
+	return func() { b.sharedBy = previous }
+}
+
+// truncationMarker is the marker a block cut now is followed by.
+func (b *ddlBlockBudget) truncationMarker() string {
+	if b.marker == "" {
+		return ddlTruncatedMarker
+	}
+	return b.marker
+}
+
+// writeTruncationMarker writes the marker for a block cut to fit and counts it.
+func (b *ddlBlockBudget) writeTruncationMarker(sb *strings.Builder) {
+	sb.WriteString(b.truncationMarker())
+	b.markers++
 }
 
 // newUnboundedDDLBudget opens a budget no DDL can exhaust, for a render that is
@@ -90,8 +251,8 @@ func renderWithinCommentLimit(blocks, reserve int, render func(*ddlBlockBudget) 
 			return body
 		}
 		spent := ddlLimit - budget.remaining
-		unmarked := max(blocks-strings.Count(body, ddlTruncatedMarker), 0)
-		ddlLimit = max(spent-over-unmarked*len(ddlTruncatedMarker), 0)
+		unmarked := max(blocks-budget.markers, 0)
+		ddlLimit = max(spent-over-unmarked*budget.longestMarker, 0)
 	}
 	return body
 }
@@ -118,7 +279,7 @@ func (b *ddlBlockBudget) spend(size int) {
 // its own backtick run cannot close the block early and inject markdown into
 // the surrounding comment. The closing fence always matches the opening one.
 // Content that would render past the block's share of budget is cut and the
-// block is followed by a visible marker.
+// block is followed by a visible marker naming where the rest lives.
 func writeSQLFencedBlock(sb *strings.Builder, content string, budget *ddlBlockBudget) {
 	writeSQLFencedBlocks(sb, []string{content}, budget)
 }
@@ -148,7 +309,7 @@ func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlo
 		content, truncated := fitSQLBlock(content, room)
 		if i > 0 {
 			if truncated && content == "" {
-				sb.WriteString(ddlTruncatedMarker)
+				budget.writeTruncationMarker(sb)
 				break
 			}
 			sb.WriteString(sqlBlockSeparator)
@@ -157,7 +318,7 @@ func writeSQLFencedBlocks(sb *strings.Builder, contents []string, budget *ddlBlo
 		spent += sqlBlockSize(content)
 		writeFencedBlock(sb, "sql", content)
 		if truncated {
-			sb.WriteString(ddlTruncatedMarker)
+			budget.writeTruncationMarker(sb)
 			break
 		}
 	}
@@ -190,7 +351,7 @@ func fenceLength(content string) int {
 // sqlBlockSize is the byte count of the block writeSQLFencedBlock renders for
 // content: the content, both fence runs, and the fixed text around them.
 func sqlBlockSize(content string) int {
-	return len(content) + 2*fenceLength(content) + fenceOverhead("sql")
+	return len(content) + 2*fenceLength(content) + fenceOverhead("sql", content)
 }
 
 // fitSQLBlock returns the longest prefix of content whose rendered block fits

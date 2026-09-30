@@ -306,16 +306,27 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 			releaseErr)
 	}
 
-	// Build comment data. The source apply ID stays in the comment metadata for
-	// auditability, but rollback-confirm loads the lock-pinned rollback plan so
-	// the user does not need to repeat the apply ID.
+	commentData := h.rollbackPlanCommentData(apply, planResp, requestedBy)
+	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
+	return false, nil
+}
+
+// rollbackPlanCommentData builds the rollback plan comment for the stored
+// rollback plan planResp. The source apply ID stays in the comment metadata for
+// auditability, but rollback-confirm loads the lock-pinned rollback plan so the
+// user does not need to repeat the apply ID. The comment carries the stored
+// plan's identifier, so reversal DDL cut to fit names the command that prints
+// the plan in full: the schema files hold the desired schema, not the
+// statements that reverse it.
+func (h *Handler) rollbackPlanCommentData(apply *storage.Apply, planResp *apitypes.PlanResponse, requestedBy string) templates.PlanCommentData {
 	commentData := templates.PlanCommentData{
-		Database:     database,
-		Environment:  environment,
+		Database:     apply.Database,
+		Environment:  apply.Environment,
 		RequestedBy:  requestedBy,
-		DatabaseType: dbType,
-		IsMySQL:      dbType == "mysql",
+		DatabaseType: apply.DatabaseType,
+		IsMySQL:      apply.DatabaseType == "mysql",
 		ApplyID:      apply.ApplyIdentifier,
+		PlanID:       planResp.PlanID,
 		Tenant:       h.deploymentTenant(),
 		AgentHint:    h.agentHint(),
 	}
@@ -329,9 +340,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		})
 	}
 	commentData.Errors = planResp.Errors
-
-	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
-	return false, nil
+	return commentData
 }
 
 // handleRollbackSourceError posts the user-facing answer for a source-apply

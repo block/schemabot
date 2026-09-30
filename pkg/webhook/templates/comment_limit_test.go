@@ -292,3 +292,242 @@ func TestRenderWithinCommentLimitCutsDDLByTheOvershoot(t *testing.T) {
 		assert.Greater(t, len(body), commentBodyLimit-4096-64)
 	})
 }
+
+// renderPointedBlocks renders a comment of chrome bytes of non-DDL text and
+// the given DDL blocks, each drawn from the stored plan planID so a block cut
+// to fit carries the pointer marker, counting the passes the fit loop takes.
+func renderPointedBlocks(chrome int, blocks []string, planID string) (body string, passes int) {
+	body = renderWithinCommentLimit(len(blocks), 0, func(budget *ddlBlockBudget) string {
+		passes++
+		defer budget.pointAt(planID)()
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("h", chrome))
+		for _, block := range blocks {
+			writeSQLFencedBlock(&sb, block, budget)
+		}
+		return sb.String()
+	})
+	return body, passes
+}
+
+// repeatedDDL returns at least size bytes of DDL with no backtick run, so a
+// block holding any prefix of it keeps the shortest fence.
+func repeatedDDL(size int) string {
+	const statement = "CREATE TABLE t (id int);\n"
+	return strings.Repeat(statement, size/len(statement)+1)
+}
+
+// The second pass of the fit loop charges each block the pass cuts for the
+// marker it will carry, however long its section's marker is, and charges no
+// block twice for a marker it already carries. So a comment whose DDL is cut
+// into several blocks fits on the second pass, and the DDL keeps the room the
+// markers leave rather than a marker's worth per block besides.
+func TestRenderWithinCommentLimitChargesEachCutBlockOneMarker(t *testing.T) {
+	planID := "plan_" + strings.Repeat("7c41f9", 8)
+	pointer := planPointerMarker(planID)
+	require.Greater(t, len(pointer), len(ddlTruncatedMarker)+32, "the pointer marker outgrows the plain marker, so charging the plain one would undercharge")
+
+	t.Run("blocks first cut on the second pass are charged the pointer marker", func(t *testing.T) {
+		// Pass 1 offers every block the whole limit, so none is cut and none
+		// carries a marker; the chrome then pushes the body over, and pass 2
+		// cuts all of them.
+		blocks := []string{
+			repeatedDDL(commentBodyLimit / 8), repeatedDDL(commentBodyLimit / 8),
+			repeatedDDL(commentBodyLimit / 8), repeatedDDL(commentBodyLimit / 8),
+		}
+		body, passes := renderPointedBlocks(commentBodyLimit/2+2048, blocks, planID)
+
+		assert.Equal(t, 2, passes, "the second pass reserved room for every marker it wrote")
+		assert.Equal(t, len(blocks), strings.Count(body, pointer))
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+	})
+
+	t.Run("blocks already cut on the first pass are not charged again", func(t *testing.T) {
+		// Every block is cut on pass 1 and carries its pointer marker there,
+		// so pass 2 cuts the DDL by the overshoot alone.
+		blocks := []string{
+			repeatedDDL(commentBodyLimit), repeatedDDL(commentBodyLimit),
+			repeatedDDL(commentBodyLimit), repeatedDDL(commentBodyLimit),
+		}
+		body, passes := renderPointedBlocks(1000, blocks, planID)
+
+		assert.Equal(t, 2, passes)
+		assert.Equal(t, len(blocks), strings.Count(body, pointer))
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+		assert.Greater(t, len(body), commentBodyLimit-len(pointer), "the DDL gave up only the overshoot, not a second marker's worth per block")
+	})
+}
+
+// Environments whose plans are the same render as one section drawn from the
+// first environment's plan, while each environment stored a plan of its own.
+// A block the section cuts names the first environment's stored plan and says
+// so, so another environment's operator knows the plan it names is not theirs
+// and that theirs runs the same DDL.
+func TestMultiEnvPlanCommentSharedSectionSaysWhosePlanItNames(t *testing.T) {
+	staging := greenfieldPlan("staging", "events", 200)
+	production := greenfieldPlan("production", "events", 200)
+	staging.Changes[0].Keyspace, production.Changes[0].Keyspace = "ledger", "ledger"
+	staging.PlanID, production.PlanID = "plan_staging1", "plan_production1"
+	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "ledger",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	require.Contains(t, body, "### Staging & Production")
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Contains(t, body, "the full staging plan is available from the CLI with `schemabot list-plans plan_staging1` (production runs the same DDL).")
+	assert.Equal(t, 1, strings.Count(body, sharedPlanPointerMarker("plan_staging1", []string{"staging", "production"})))
+	assert.NotContains(t, body, planPointerMarker("plan_staging1"))
+	assert.NotContains(t, body, ddlTruncatedMarker)
+
+	t.Run("more than one matching environment", func(t *testing.T) {
+		assert.Equal(t,
+			"_DDL truncated to fit GitHub's comment size limit; the full staging plan is available from the CLI with `schemabot list-plans plan_staging1` (production and sandbox run the same DDL)._\n",
+			sharedPlanPointerMarker("plan_staging1", []string{"staging", "production", "sandbox"}))
+	})
+}
+
+// A shared section that renders target groups cuts each group's DDL under a
+// marker naming that group's stored plan, which holds only the group's
+// targets, so the marker scopes the plan to the group rather than calling it
+// the environment's full plan. A group of several stored its first member's
+// plan, so the marker names that member and says the rest of the group runs
+// the same DDL.
+func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
+	withTargets := func(env, planID, memberPlanID string) PlanCommentData {
+		plan := greenfieldPlan(env, "orders", 150)
+		plan.PlanID = planID
+		second := greenfieldPlan(env, "orders_eu", 150).Changes
+		plan.Changes[0].Keyspace, second[0].Keyspace = "orders", "orders"
+		plan.DeploymentDrift = &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "orders_2", Class: "planned"},
+				{Deployment: "primary", Target: "orders_3", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/orders_1"}, Primary: true, Changes: plan.Changes},
+				{Members: []string{"primary/orders_2", "primary/orders_3"}, Changes: second, PlanID: memberPlanID},
+			},
+		}
+		return plan
+	}
+	staging := withTargets("staging", "plan_staging1", "plan_staging_member_2")
+	production := withTargets("production", "plan_production1", "plan_production_member_2")
+	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "orders",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	require.Contains(t, body, "### Staging & Production")
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	first, rest, found := strings.Cut(body, "**targets `primary/orders_2`, `primary/orders_3`**")
+	require.True(t, found, body)
+	assert.Contains(t, first, "the full staging plan for this target is available from the CLI with `schemabot list-plans plan_staging1` (production runs the same DDL).")
+	assert.Contains(t, rest, "the full staging plan for `primary/orders_2` is available from the CLI with `schemabot list-plans plan_staging_member_2` (every target in this group runs the same DDL; production runs the same DDL).")
+	assert.NotContains(t, body, "the full staging plan is available")
+}
+
+// DDL cut to fit the comment comes from a stored plan, so the marker under it
+// names the command that prints that plan in full rather than sending the
+// reader to the schema files, which hold the desired schema and not the
+// statements the plan would run.
+func TestPlanCommentCutDDLNamesTheStoredPlan(t *testing.T) {
+	data := greenfieldPlan("production", "events", 200)
+	data.PlanID = "plan_7c41f9"
+	body := RenderPlanComment(data)
+
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Equal(t, 1, strings.Count(body, planPointerMarker("plan_7c41f9")))
+	assert.Contains(t, body, "the full plan is available from the CLI with `schemabot list-plans plan_7c41f9`.")
+	assert.NotContains(t, body, ddlTruncatedMarker)
+}
+
+// A plan whose DDL fits in full is shown in full, so the comment points at no
+// stored plan: there is nothing it could not show.
+func TestPlanCommentUncutDDLNamesNoStoredPlan(t *testing.T) {
+	data := greenfieldPlan("production", "events", 41)
+	data.PlanID = "plan_7c41f9"
+	body := RenderPlanComment(data)
+
+	assert.NotContains(t, body, "list-plans")
+	assert.NotContains(t, body, ddlTruncatedMarker)
+}
+
+// A rollout whose targets run different plans renders each group's plan, and
+// every member's plan is stored as its own row. When the comment cuts the DDL,
+// each group's marker names the plan that group runs: the primary's group the
+// reviewed plan, another group its first member's plan, and a group whose plan
+// was not stored falls back to the schema files.
+func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
+	primary := greenfieldPlan("production", "orders", 150)
+	primary.PlanID = "plan_reviewed"
+	second := greenfieldPlan("production", "orders_eu", 150).Changes
+	third := greenfieldPlan("production", "orders_ap", 150).Changes
+	primary.DeploymentDrift = &DeploymentDriftData{
+		Computed: true, Clean: true, Independent: true,
+		Deployments: []DeploymentDriftEntry{
+			{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+			{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			{Deployment: "primary", Target: "orders_3", Class: "planned"},
+		},
+		Plans: []DeploymentPlanGroup{
+			{Members: []string{"primary/orders_1"}, Primary: true, Changes: primary.Changes},
+			{Members: []string{"primary/orders_2"}, Changes: second, PlanID: "plan_member_2"},
+			{Members: []string{"primary/orders_3"}, Changes: third},
+		},
+	}
+	body := RenderPlanComment(primary)
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+	first, rest, found := strings.Cut(body, "**target `primary/orders_2`**")
+	require.True(t, found, body)
+	middle, last, found := strings.Cut(rest, "**target `primary/orders_3`**")
+	require.True(t, found, body)
+
+	assert.Contains(t, first, "the full plan for this target is available from the CLI with `schemabot list-plans plan_reviewed`.")
+	assert.NotContains(t, first, "plan_member_2")
+	assert.Contains(t, middle, "the full plan for this target is available from the CLI with `schemabot list-plans plan_member_2`.")
+	assert.NotContains(t, middle, "plan_reviewed")
+	assert.Contains(t, last, ddlTruncatedMarker)
+	assert.NotContains(t, last, "list-plans")
+}
+
+// A group of several targets stored one plan per member and renders its first
+// member's, so a cut block's marker names that member as the owner of the plan
+// it points at and says the rest of the group runs the same DDL. The primary's
+// group names the reviewed plan, which is the primary member's own.
+func TestPlanCommentCutTargetGroupNamesWhosePlanItPointsAt(t *testing.T) {
+	primary := greenfieldPlan("production", "orders", 150)
+	primary.PlanID = "plan_reviewed"
+	second := greenfieldPlan("production", "orders_eu", 150).Changes
+	primary.DeploymentDrift = &DeploymentDriftData{
+		Computed: true, Clean: true, Independent: true,
+		Deployments: []DeploymentDriftEntry{
+			{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+			{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			{Deployment: "primary", Target: "orders_3", Class: "planned"},
+			{Deployment: "primary", Target: "orders_4", Class: "planned"},
+		},
+		Plans: []DeploymentPlanGroup{
+			{Members: []string{"primary/orders_1", "primary/orders_2"}, Primary: true, Changes: primary.Changes},
+			{Members: []string{"primary/orders_3", "primary/orders_4"}, Changes: second, PlanID: "plan_member_3"},
+		},
+	}
+	body := RenderPlanComment(primary)
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+	first, rest, found := strings.Cut(body, "**targets `primary/orders_3`, `primary/orders_4`**")
+	require.True(t, found, body)
+	assert.Contains(t, first, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_1` is available from the CLI with `schemabot list-plans plan_reviewed` (every target in this group runs the same DDL)._\n")
+	assert.Contains(t, rest, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_3` is available from the CLI with `schemabot list-plans plan_member_3` (every target in this group runs the same DDL)._\n")
+	assert.NotContains(t, body, "for these targets")
+	assert.NotContains(t, body, ddlTruncatedMarker)
+}
