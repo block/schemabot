@@ -1018,6 +1018,56 @@ Response excerpt (illustrative values):
 
 </details>
 
+<details>
+<summary>Stored plan whose VSchema change is generated from its DDL</summary>
+
+```http
+GET /api/plans/plan-example-52
+```
+
+The namespace still reports `vschema_changed`, but the plan counts it under
+`finalize_count` and has no `vschema_change_count`.
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-52",
+  "database": "payments",
+  "database_type": "strata",
+  "environment": "staging",
+  "created_at": "2026-09-01T05:10:00Z",
+  "change_counts": {
+    "create": 1
+  },
+  "finalize_count": 1,
+  "plan": {
+    "plan_id": "plan-example-52",
+    "engine": "strata",
+    "changes": [
+      {
+        "namespace": "payments",
+        "table_changes": [
+          {
+            "table_name": "refund_notes",
+            "namespace": "payments",
+            "ddl": "CREATE TABLE `refund_notes` (\n  `id` bigint unsigned NOT NULL,\n  `note` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n)",
+            "change_type": "create"
+          }
+        ],
+        "metadata": {
+          "needs_finalizer": "true",
+          "vschema_changed": "true",
+          "vschema_generated_only": "true"
+        }
+      }
+    ]
+  }
+}
+```
+
+</details>
+
 A stored plan records what the planner proposed, not what it declined to
 propose. When the planner exempts live tables from the undeclared-table
 verdict, that disclosure (`exempt_tables`, grouped by namespace with the table
