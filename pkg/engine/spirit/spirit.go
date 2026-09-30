@@ -96,6 +96,11 @@ type Engine struct {
 	// context when the probe starts. A non-nil error fails the probe, so tests
 	// can prove a failed or slow probe never fails or stalls a plan.
 	sizeProbeFault func(ctx context.Context) error
+
+	// sizeProbeSQL is a test seam that rewrites each statement the size probe
+	// sends, given the probe's context, so tests can make the server slow to
+	// answer and prove every statement runs under the probe's budget.
+	sizeProbeSQL func(ctx context.Context, stmt string) string
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -1226,6 +1231,15 @@ func (e *Engine) plannedTableNames(database string, changes []spiritlint.Planned
 	return names
 }
 
+// sizeProbeStatement returns stmt as the size probe sends it: unchanged
+// outside tests, rewritten by the sizeProbeSQL seam inside them.
+func (e *Engine) sizeProbeStatement(ctx context.Context, stmt string) string {
+	if e.sizeProbeSQL == nil {
+		return stmt
+	}
+	return e.sizeProbeSQL(ctx, stmt)
+}
+
 // fetchTableSizeEstimates reads the approximate row count and on-disk
 // footprint of the named base tables from information_schema, through the
 // plan's own lazily opened connection to the target. The read is scoped to the
@@ -1257,7 +1271,7 @@ func (e *Engine) fetchTableSizeEstimates(ctx context.Context, target *lazyTarget
 		return nil, fmt.Errorf("acquire connection for size estimates: %w", err)
 	}
 	defer utils.CloseAndLog(conn)
-	if _, err := conn.ExecContext(ctx, "SET SESSION information_schema_stats_expiry = 0"); err != nil {
+	if _, err := conn.ExecContext(ctx, e.sizeProbeStatement(ctx, "SET SESSION information_schema_stats_expiry = 0")); err != nil {
 		return nil, fmt.Errorf("disable cached statistics for size estimates: %w", err)
 	}
 
@@ -1273,7 +1287,7 @@ func (e *Engine) fetchTableSizeEstimates(ctx context.Context, target *lazyTarget
 		  AND table_name IN (?` + strings.Repeat(", ?", len(tables)-1) + `)`
 	requested := requestedTableNames(tables)
 
-	rows, err := conn.QueryContext(ctx, query, args...)
+	rows, err := conn.QueryContext(ctx, e.sizeProbeStatement(ctx, query), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query size estimates for tables %v: %w", tables, err)
 	}
