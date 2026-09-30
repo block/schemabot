@@ -465,6 +465,33 @@ This confirms that the live schema matches your files. Commit the files so
 your repository records the schema you now run. If your team uses GitHub
 merge gates, follow the [PR workflow](pre-merge-workflow.md) instead.
 
+### Apply to one target of a rollout
+
+An environment can fan out to several targets, from a `targets:` list or a
+`deployments:` map. `plan` and `apply` cover the whole rollout by default.
+Pass `--target` to plan and apply one member only, for example to land a
+change on one target before the rest:
+
+```console
+$ schemabot apply -s ./schema -e production --target payments-002
+...
+Target: prod/payments-002 (this plan covers only this rollout member)
+
+Do you want to apply these changes? Only 'yes' will be accepted: yes
+```
+
+`--target` takes the target's name, or `deployment/target` when two
+deployments address a target of the same name; an ambiguous bare name is
+refused. An unknown name is refused with the list of valid targets. `plan`
+takes the same flag and needs `-e` with it.
+
+A narrowed plan speaks for its one target. It never records a GitHub check
+result, so a narrowed plan or apply cannot pass a PR merge gate while other
+targets still need the change. A narrowed plan is only applied to the target
+it was made for, and a narrowed apply cannot be rolled back with `rollback`:
+restore that target by planning and applying the previous schema with the
+same `--target`.
+
 ### Understand a refusal
 
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.

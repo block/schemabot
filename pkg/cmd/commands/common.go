@@ -456,6 +456,15 @@ func resolveControlFlags(endpoint, profile, applyID, environment string) (string
 	return ep, nil
 }
 
+// writeNarrowedTo tells the operator a plan covers one rollout member, so a
+// plan with no changes is not read as the whole environment being up to date.
+func writeNarrowedTo(planResult *apitypes.PlanResponse) {
+	if planResult == nil || planResult.NarrowedTo == "" {
+		return
+	}
+	fmt.Printf("Target: %s (this plan covers only this rollout member)\n", planResult.NarrowedTo)
+}
+
 // applyAndWatch extracts a plan ID, calls the apply API, prints status, and
 // optionally watches progress. Used by both RunApply and RunRollback.
 func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
@@ -470,7 +479,9 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	var applyResult *apitypes.ApplyResponse
 	err := withLoading("Submitting schema change...", format != OutputFormatJSON, func() error {
 		var applyErr error
-		applyResult, applyErr = client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
+		// A narrowed plan is applied to the member it was made for and nowhere
+		// else; the server refuses to run it rollout-wide.
+		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, options)
 		return applyErr
 	})
 	if err != nil {
