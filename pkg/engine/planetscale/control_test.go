@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -73,10 +74,20 @@ type cancelDeployRequestClient struct {
 	cancelErr error
 	dr        *ps.DeployRequest
 	getErr    error
+	closeErr  error
+	closed    []*ps.CloseDeployRequestRequest
 }
 
 func (c *cancelDeployRequestClient) CancelDeployRequest(context.Context, *ps.CancelDeployRequestRequest) (*ps.DeployRequest, error) {
 	return nil, c.cancelErr
+}
+
+func (c *cancelDeployRequestClient) CloseDeployRequest(_ context.Context, req *ps.CloseDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.closed = append(c.closed, req)
+	if c.closeErr != nil {
+		return nil, c.closeErr
+	}
+	return &ps.DeployRequest{Number: req.Number, State: deployRequestClosed, DeploymentState: c.dr.DeploymentState}, nil
 }
 
 func (c *cancelDeployRequestClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
@@ -201,6 +212,119 @@ func TestCancel_AlreadyClosedDeployRequest(t *testing.T) {
 		var psErr *ps.Error
 		assert.ErrorAs(t, err, &psErr, "the not-found error must stay in the unwrap chain")
 	})
+}
+
+// A deferred deploy waiting for its start holds a deploy request that is ready
+// but not deployed, and PlanetScale rejects a cancel there because cancel only
+// reaches a queued or running deploy. Both cancel and stop must close that
+// deploy request instead and report success, so the apply settles rather than
+// retrying a rejection that can never clear. A deploy request an earlier
+// attempt already closed settles without closing again, and a failed close
+// stays a plain error carrying both refusals.
+func TestCancelAndStop_CloseUndeployedDeployRequest(t *testing.T) {
+	meta, err := encodePSMetadata(&psMetadata{
+		BranchName:       "schemabot-mydb-abc",
+		DeployRequestID:  42,
+		DeployRequestURL: "https://example.test/deploys/42",
+		DeferredDeploy:   true,
+	})
+	require.NoError(t, err)
+
+	controlReq := func() *engine.ControlRequest {
+		return &engine.ControlRequest{
+			Database:    "mydb",
+			ResumeState: &engine.ResumeState{Metadata: meta},
+			Credentials: &engine.Credentials{Metadata: map[string]string{
+				"organization": "org",
+				"token_name":   "tn",
+				"token_value":  "tv",
+			}},
+		}
+	}
+	newEngine := func(client *cancelDeployRequestClient) *Engine {
+		return NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+			func(_, _ string) (psclient.PSClient, error) {
+				return client, nil
+			})
+	}
+	notDeployedErr := errors.New("cannot cancel: deploy request is in state \"ready\"")
+
+	operations := []struct {
+		name string
+		run  func(e *Engine, req *engine.ControlRequest) (*engine.ControlResult, error)
+	}{
+		{name: "cancel", run: func(e *Engine, req *engine.ControlRequest) (*engine.ControlResult, error) {
+			return e.Cancel(t.Context(), req)
+		}},
+		{name: "stop", run: func(e *Engine, req *engine.ControlRequest) (*engine.ControlResult, error) {
+			return e.Stop(t.Context(), req)
+		}},
+	}
+
+	for _, op := range operations {
+		for _, undeployedState := range []string{deployState.Pending, deployState.Ready} {
+			t.Run(op.name+" closes an open deploy request in state "+undeployedState, func(t *testing.T) {
+				client := &cancelDeployRequestClient{
+					cancelErr: notDeployedErr,
+					dr:        &ps.DeployRequest{Number: 42, State: "open", DeploymentState: undeployedState},
+				}
+
+				result, err := op.run(newEngine(client), controlReq())
+
+				require.NoError(t, err)
+				assert.True(t, result.Accepted)
+				assert.Equal(t, "Deploy request #42 closed before it was deployed", result.Message)
+				require.Len(t, client.closed, 1, "the undeployed deploy request must be closed exactly once")
+				assert.Equal(t, "org", client.closed[0].Organization)
+				assert.Equal(t, "mydb", client.closed[0].Database)
+				assert.Equal(t, uint64(42), client.closed[0].Number)
+			})
+		}
+
+		t.Run(op.name+" settles a deploy request an earlier attempt already closed", func(t *testing.T) {
+			client := &cancelDeployRequestClient{
+				cancelErr: notDeployedErr,
+				dr:        &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: deployState.Ready},
+			}
+
+			result, err := op.run(newEngine(client), controlReq())
+
+			require.NoError(t, err)
+			assert.True(t, result.Accepted)
+			assert.Equal(t, "Deploy request #42 already closed before it was deployed", result.Message)
+			assert.Empty(t, client.closed, "an already-closed deploy request must not be closed again")
+		})
+
+		t.Run(op.name+" surfaces a failed close with both refusals", func(t *testing.T) {
+			client := &cancelDeployRequestClient{
+				cancelErr: notDeployedErr,
+				dr:        &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.Ready},
+				closeErr:  errors.New("deploy request is deploying"),
+			}
+
+			_, err := op.run(newEngine(client), controlReq())
+
+			require.Error(t, err)
+			assert.False(t, engine.IsAlreadyCompleted(err))
+			assert.Contains(t, err.Error(), `close undeployed deploy request #42 in deployment state "ready"`)
+			assert.Contains(t, err.Error(), "deploy request is deploying")
+			assert.Contains(t, err.Error(), `cannot cancel: deploy request is in state "ready"`)
+		})
+
+		t.Run(op.name+" does not close a deploy request that reports a deploy", func(t *testing.T) {
+			deployedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+			client := &cancelDeployRequestClient{
+				cancelErr: notDeployedErr,
+				dr:        &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.Ready, DeployedAt: &deployedAt},
+			}
+
+			_, err := op.run(newEngine(client), controlReq())
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `cancel deploy request #42 rejected in deployment state "ready" after it reported a deploy`)
+			assert.Empty(t, client.closed, "a deploy request that reports a deploy must never be closed")
+		})
+	}
 }
 
 // applyDeployRequestErrorClient fails every cutover attempt with a fixed error.

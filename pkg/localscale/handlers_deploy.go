@@ -147,18 +147,23 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	var branch, ddlJSON, deployState, createdAtRaw string
 	var vschemaDataSQL sql.NullString
 	var autoCutover, deployed bool
+	var closedAtRaw sql.NullString
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state, created_at
+		`SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state, created_at, closed_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		org, database, number,
-	).Scan(&branch, &ddlJSON, &vschemaDataSQL, &autoCutover, &deployed, &deployState, &createdAtRaw)
+	).Scan(&branch, &ddlJSON, &vschemaDataSQL, &autoCutover, &deployed, &deployState, &createdAtRaw, &closedAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
 	}
 	createdAt, err := deployRequestCreatedAt(createdAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
+	}
+
+	if deployRequestStateFor(closedAtRaw) == deployRequestClosed {
+		return newHTTPError(http.StatusConflict, "cannot deploy: deploy request %d is closed", number)
 	}
 
 	if deployState == dr.Pending {
@@ -224,14 +229,16 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 		return nil
 	}
 
-	// Atomically mark as deployed — deployed=FALSE prevents double-deploy races.
+	// Atomically mark as deployed — deployed=FALSE prevents double-deploy races,
+	// and closed_at IS NULL keeps a deploy from landing on a deploy request a
+	// concurrent close already retired.
 	// Include timestamp to ensure uniqueness across reset-state cycles
 	// (which truncate deploy_requests and reset auto-increment numbering).
 	migrationContext := fmt.Sprintf("localscale:%d_%d", number, time.Now().UnixMilli()%1000000)
 	result, err := s.metadataDB.ExecContext(r.Context(),
 		`UPDATE localscale_deploy_requests
 		 SET deployed = TRUE, migration_context = ?, instant_ddl = ?, deployment_state = ?
-		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE`,
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE AND closed_at IS NULL`,
 		migrationContext, body.InstantDDL, dr.Submitting, org, database, number,
 	)
 	if err != nil {
@@ -239,7 +246,7 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
-		return newHTTPError(http.StatusConflict, "deploy request already deployed")
+		return newHTTPError(http.StatusConflict, "deploy request already deployed or closed")
 	}
 
 	resp := deployResponse(number, branch, dr.Submitting, createdAt)
@@ -340,12 +347,13 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 
 	var branch, intoBranch, state, createdAtRaw string
 	var instantEligible, instantDDL, autoCutover bool
+	var closedAtRaw sql.NullString
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at
+		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at, closed_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		org, database, number,
-	).Scan(&branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw)
+	).Scan(&branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw, &closedAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
 	}
@@ -358,6 +366,7 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 		"number":           number,
 		"branch":           branch,
 		"into_branch":      intoBranch,
+		"state":            deployRequestStateFor(closedAtRaw),
 		"deployment_state": state,
 		"created_at":       createdAt,
 		"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
@@ -366,6 +375,13 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 			"instant_ddl":          instantDDL,
 			"auto_cutover":         autoCutover,
 		},
+	}
+	if closedAtRaw.Valid && closedAtRaw.String != "" {
+		closedAt, err := time.Parse(storedTimestampLayout, closedAtRaw.String)
+		if err != nil {
+			return newHTTPError(http.StatusInternalServerError, "parse deploy request %d closed_at %q: %v", number, closedAtRaw.String, err)
+		}
+		resp["closed_at"] = closedAt.UTC().Format(time.RFC3339)
 	}
 	s.writeJSON(w, resp)
 	return nil
