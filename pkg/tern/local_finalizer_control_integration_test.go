@@ -430,3 +430,94 @@ func TestLocalClient_FinalizerWithPendingStopAndCancelSettlesCancelled(t *testin
 	f.requireRequestPending(t, storage.ControlOperationStop)
 	f.requireParentUntouched(t)
 }
+
+// failingFinalizerWritesStorage fails the finalizer drive's chosen storage
+// writes, standing in for a pod that dies or loses its database connection at
+// that point of the drive.
+type failingFinalizerWritesStorage struct {
+	storage.Storage
+	failMarkCompletedOnce bool
+	failSaveResumeState   bool
+}
+
+func (s *failingFinalizerWritesStorage) ApplyOperations() storage.ApplyOperationStore {
+	return &failingFinalizerWritesOperations{ApplyOperationStore: s.Storage.ApplyOperations(), parent: s}
+}
+
+type failingFinalizerWritesOperations struct {
+	storage.ApplyOperationStore
+	parent *failingFinalizerWritesStorage
+}
+
+func (o *failingFinalizerWritesOperations) MarkCompleted(ctx context.Context, id int64) error {
+	if o.parent.failMarkCompletedOnce {
+		o.parent.failMarkCompletedOnce = false
+		return fmt.Errorf("mark apply_operation %d completed: connection lost", id)
+	}
+	return o.ApplyOperationStore.MarkCompleted(ctx, id)
+}
+
+func (o *failingFinalizerWritesOperations) SaveEngineResumeState(ctx context.Context, id int64, rs *storage.EngineResumeState) error {
+	if o.parent.failSaveResumeState {
+		return fmt.Errorf("save engine resume state for apply_operation %d: connection lost", id)
+	}
+	return o.ApplyOperationStore.SaveEngineResumeState(ctx, id, rs)
+}
+
+// ns_0's finalizer publishes its VSchema on a synchronous engine, which reports
+// no resume state, and the drive dies before it records the finalizer
+// completed. The operator then cancels, and a later drive picks the row up.
+// The VSchema is already live, so that drive must not record the finalizer
+// cancelled over it: it re-applies the idempotent VSchema from the plan and
+// records the finalizer completed, leaving the cancel for the rollout to
+// resolve as outrun.
+func TestLocalClient_RedrivenFinalizerWithPendingCancelReappliesPublishedVSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	wrapper := &failingFinalizerWritesStorage{failMarkCompletedOnce: true}
+	f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{
+		wrapStorage: func(stor storage.Storage) storage.Storage {
+			wrapper.Storage = stor
+			return wrapper
+		},
+	})
+
+	require.Error(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID),
+		"the first drive fails recording the finalizer completed")
+	require.Len(t, f.eng.applies(), 1, "the first drive published ns_0's VSchema")
+	require.Equal(t, state.ApplyOperation.Running, f.finalizerState(t))
+
+	f.requestPending(t, storage.ControlOperationCancel)
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
+
+	applies := f.eng.applies()
+	require.Len(t, applies, 2, "the re-drive re-applies the published VSchema rather than settling over it")
+	assert.Nil(t, applies[1].ResumeState, "the engine reported no resume state, so the re-drive applies from the plan")
+	require.Len(t, applies[1].Changes, 1)
+	assert.Equal(t, "ns_0", applies[1].Changes[0].Namespace)
+	assert.Equal(t, state.ApplyOperation.Completed, f.finalizerState(t))
+	f.requireRequestPending(t, storage.ControlOperationCancel)
+}
+
+// A drive that cannot record handing ns_0's finalizer to the engine stops
+// before the engine call, so no VSchema is ever live without a record a later
+// drive can see.
+func TestLocalClient_FinalizerDoesNotApplyWhenHandoffCannotBeRecorded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	wrapper := &failingFinalizerWritesStorage{failSaveResumeState: true}
+	f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{
+		wrapStorage: func(stor storage.Storage) storage.Storage {
+			wrapper.Storage = stor
+			return wrapper
+		},
+	})
+
+	err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "record engine handoff")
+	assert.Empty(t, f.eng.applies(), "the VSchema must not reach the engine without a handoff record")
+	assert.Equal(t, state.ApplyOperation.Running, f.finalizerState(t), "the row stays running for a later drive to retry")
+}

@@ -1831,18 +1831,20 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	}
 
 	var resumeState *engine.ResumeState
+	handedToEngine := false
 	stored, getErr := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID)
 	switch {
 	case errors.Is(getErr, storage.ErrEngineResumeStateNotFound):
-		// No persisted resume state yet — this is the finalizer's first drive, so
-		// start fresh.
+		// No drive has recorded handing this finalizer's work to the engine, so
+		// this drive is the first to reach it and starts fresh.
 	case getErr != nil:
 		// A storage read failure must not be treated as "fresh": proceeding would
 		// risk the engine restarting or duplicating in-flight VSchema work after a
 		// transient DB error. Fail closed for the operator to retry.
 		return failClosed(fmt.Errorf("load engine resume state for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, getErr))
 	case stored != nil:
-		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+		handedToEngine = true
+		resumeState = finalizerEngineResumeState(stored)
 	}
 
 	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
@@ -1852,14 +1854,29 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	// An operator's pending cancel or stop decides whether this finalizer may
 	// hand its VSchema to the engine at all, the same way a work operation's
 	// drive consumes pending commands before it resumes its tasks. The read is
-	// the drive's last storage access before the engine call, after the start
-	// is durable, so every command committed before the engine is reached is
-	// seen here. A command committed after it arrives while the finalizer is
-	// already handing its work to the engine: that is the in-flight case, and
-	// the apply's terminal settlement resolves it as outrun rather than
-	// dropping it.
-	if standDown, err := c.finalizerStandsDownForPendingControl(ctx, apply, op, namespace, resumeState != nil); standDown || err != nil {
+	// the drive's last read before the engine call, after the start is durable,
+	// so every command committed before the engine is reached is seen here. A
+	// command committed after it arrives while the finalizer is already handing
+	// its work to the engine: that is the in-flight case, and the apply's
+	// terminal settlement resolves it as outrun rather than dropping it.
+	if standDown, err := c.finalizerStandsDownForPendingControl(ctx, apply, op, namespace, handedToEngine); standDown || err != nil {
 		return err
+	}
+
+	// Record the handoff before the engine is reached, so a later drive of this
+	// row knows the VSchema may already be live even when the engine reports no
+	// resume state of its own (a synchronous apply, or a deploy that has not yet
+	// produced one) or a later save of that state fails. The record is what
+	// keeps a re-drive from settling the row cancelled or stopped over work the
+	// engine already carried out, so a failure to write it stops the drive
+	// before the engine call; the row stays running for a later drive to retry.
+	if !handedToEngine {
+		if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+			ApplyOperationID: op.ID,
+			Metadata:         finalizerEngineHandoffMetadata,
+		}); err != nil {
+			return fmt.Errorf("record engine handoff for group_finalizer apply_operation %d (apply %s) before applying its VSchema: %w", op.ID, apply.ApplyIdentifier, err)
+		}
 	}
 
 	c.logger.Info("driving group_finalizer",
@@ -1928,10 +1945,12 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 // the command belongs to the whole apply: sibling operations still have to
 // consume it, and the rollout projection completes it once the apply resolves.
 //
-// inFlight reports that the finalizer already handed its work to the engine
-// (engine resume state is recorded). Settling storage then would record a
-// cancel or stop over a VSchema deploy the engine is still carrying out, so the
-// drive keeps following that work to the outcome the engine reports.
+// inFlight reports that an earlier drive already handed the finalizer's work
+// to the engine (engine resume state, or the handoff record written before the
+// engine call, is stored). The engine may have published the VSchema or still
+// be deploying it, so settling storage would record a cancel or stop over work
+// that is live. The drive instead re-applies or reattaches and records the
+// outcome the engine reports.
 func (c *LocalClient) finalizerStandsDownForPendingControl(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, namespace string, inFlight bool) (bool, error) {
 	for _, operation := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
 		controlReq, err := pendingControlRequest(ctx, c.storage, apply, operation)
@@ -1954,8 +1973,11 @@ func (c *LocalClient) finalizerStandsDownForPendingControl(ctx context.Context, 
 		if err := c.settleFinalizerOperation(ctx, op, settledState); err != nil {
 			return true, fmt.Errorf("settle group_finalizer apply_operation %d (apply %s) %s for pending %s: %w", op.ID, apply.ApplyIdentifier, settledState, operation, err)
 		}
+		// The drive's MarkStarted already moved the row to running, so running is
+		// the state this settle writes over, whatever the claim loaded.
+		previousState := state.ApplyOperation.Running
 		c.logger.Info("group_finalizer settled for a pending command before it applied anything; the rollout projection completes the command",
-			append(logAttrs, "previous_operation_state", op.State, "operation_state", settledState)...)
+			append(logAttrs, "previous_operation_state", previousState, "operation_state", settledState)...)
 		logEvent := storage.LogEventCancelRequested
 		if operation == storage.ControlOperationStop {
 			logEvent = storage.LogEventStopRequested
@@ -1966,10 +1988,34 @@ func (c *LocalClient) finalizerStandsDownForPendingControl(ctx context.Context, 
 			eventMsg += callerApplyLogSuffix(caller)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, logEvent, storage.LogSourceSchemaBot,
-			eventMsg, op.State, settledState)
+			eventMsg, previousState, settledState)
 		return true, nil
 	}
 	return false, nil
+}
+
+// finalizerEngineHandoffMetadata is the engine resume state a group_finalizer
+// drive records immediately before its first engine call. It marks the row as
+// handed to the engine until the engine reports resume state of its own, which
+// replaces it.
+const finalizerEngineHandoffMetadata = `{"group_finalizer_engine_handoff":"true"}`
+
+// finalizerEngineResumeState is the resume state a re-drive hands the engine,
+// from what an earlier drive of the finalizer stored. A bare handoff record
+// carries nothing the engine can resume from, so the drive re-applies the
+// VSchema from the plan, which is idempotent; anything else is the engine's own
+// state and is passed back unchanged.
+func finalizerEngineResumeState(stored *storage.EngineResumeState) *engine.ResumeState {
+	if isFinalizerHandoffRecordOnly(stored) {
+		return nil
+	}
+	return &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+}
+
+// isFinalizerHandoffRecordOnly reports that the stored resume state is the
+// drive's own handoff record, with nothing the engine reported since.
+func isFinalizerHandoffRecordOnly(stored *storage.EngineResumeState) bool {
+	return stored.MigrationContext == "" && stored.Metadata == finalizerEngineHandoffMetadata
 }
 
 // finalizerSettledStateForControl is the operation state a never-started
