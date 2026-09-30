@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -294,7 +295,7 @@ func (h *Handler) executeApply(
 			h.refreshChecksForTerminalApply(context.Background(), apply, "apply command")
 		},
 	})
-	h.service.SetPendingObserver(database, "", environment, observer)
+	pendingObserver := h.service.SetPendingObserver(database, "", environment, observer)
 
 	applyReq := api.ApplyRequest{
 		PlanID:                planResp.PlanID,
@@ -308,14 +309,14 @@ func (h *Handler) executeApply(
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
-		h.service.ClearPendingObserver(database, "", environment, observer)
+		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(err))
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, err))
 		return
 	}
 
 	if !applyResp.Accepted {
-		h.service.ClearPendingObserver(database, "", environment, observer)
+		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Info("apply rejected by engine", "repo", repo, "pr", pr, "database", database, "environment", environment, "error", applyResp.ErrorMessage)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, "The apply was not accepted. See SchemaBot server logs for details.")
 		return
@@ -324,7 +325,7 @@ func (h *Handler) executeApply(
 	// ExecuteApply rejects accepted applies unless SchemaBot stored its own
 	// apply row. Keep this guard fail-closed in case that invariant changes.
 	if applyID <= 0 {
-		h.service.ClearPendingObserver(database, "", environment, observer)
+		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Error("accepted apply did not return an apply id",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
@@ -372,28 +373,68 @@ func (h *Handler) executeApply(
 	}
 }
 
-func applyExecutionErrorMessage(err error) string {
-	return dispatchErrorMessage(err,
-		"The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again.",
-		"Failed to execute apply. See SchemaBot server logs for details.")
+func applyExecutionErrorMessage(command, environment string, err error) string {
+	return dispatchErrorMessage(err, dispatchMessages{
+		command:     command,
+		environment: environment,
+		lockIntentChanged: "The pending schema change changed while this command was running. " +
+			"The apply was rejected; review the latest plan and run the command again.",
+		internal: "Failed to execute apply. See SchemaBot server logs for details.",
+	})
+}
+
+// dispatchMessages carries the command-specific words dispatchErrorMessage
+// renders around the shared classification of a failed dispatch.
+type dispatchMessages struct {
+	// command and environment name the PR command to re-issue in a remedy,
+	// for example `schemabot rollback-confirm -e staging`.
+	command     string
+	environment string
+	// lockIntentChanged is the whole message for a lock intent change; its
+	// recovery differs between apply and rollback.
+	lockIntentChanged string
+	// afterRefusal, when set, follows the remedy for a refused feature and
+	// says what the refusal left in place for the re-issued command to use.
+	afterRefusal string
+	// internal is the fixed line for every failure whose text belongs in
+	// server logs.
+	internal string
 }
 
 // dispatchErrorMessage renders the PR-facing detail for a failed apply or
 // rollback dispatch. Two failures are deterministic and carry their own
 // recovery, so they are named rather than sanitized: a lock intent change is an
-// expected race whose answer is lockIntentMsg, and an unsupported feature is
-// rejected before anything runs and would fail the same way on retry, so the
-// operator sees the feature error itself. Everything else is an internal error
-// whose text stays in server logs behind fallback.
-func dispatchErrorMessage(err error, lockIntentMsg, fallback string) string {
+// expected race whose answer is lockIntentChanged, and an unsupported feature
+// is rejected before anything is stored and would be refused the same way on
+// retry, so the operator sees the feature error followed by the command to
+// re-issue without the option that asked for it. Everything else is an
+// internal error whose text stays in server logs behind the fixed line.
+func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
-		return lockIntentMsg
+		return msgs.lockIntentChanged
 	}
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {
-		return featureErr.Error()
+		parts := []string{featureErr.Error() + "."}
+		if remedy := unsupportedFeatureRemedy(featureErr.Feature, msgs.command, msgs.environment); remedy != "" {
+			parts = append(parts, remedy)
+			if msgs.afterRefusal != "" {
+				parts = append(parts, msgs.afterRefusal)
+			}
+		}
+		return strings.Join(parts, " ")
 	}
-	return fallback
+	return msgs.internal
+}
+
+// unsupportedFeatureRemedy names the command to re-issue without the option
+// that asked for a feature the database type refused. Features no PR command
+// option requests have no remedy: the operator cannot change the request.
+func unsupportedFeatureRemedy(feature schema.Feature, command, environment string) string {
+	if feature != schema.FeatureDeferredCutover {
+		return ""
+	}
+	return fmt.Sprintf("Run `schemabot %s -e %s` again without `--defer-cutover`.", command, environment)
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an
