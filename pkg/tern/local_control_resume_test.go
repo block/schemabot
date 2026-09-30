@@ -1664,3 +1664,107 @@ func TestResumeApplyWithTasks_StartStaysPendingWhenStoppedTaskRequeueFails(t *te
 	require.NoError(t, err)
 	assert.NotNil(t, startReq, "the start request stays pending for the next claim")
 }
+
+// selectiveUpdateFailingTaskStore refuses the update of one task, named by its
+// identifier, and lets every other task's update through, so a test can land
+// one requeue and refuse the next.
+type selectiveUpdateFailingTaskStore struct {
+	*exactProgressTaskStore
+	failIdentifier string
+	updateErr      error
+}
+
+func (s *selectiveUpdateFailingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if task.TaskIdentifier == s.failIdentifier {
+		return s.updateErr
+	}
+	return s.exactProgressTaskStore.Update(ctx, task)
+}
+
+// A grouped Vitess apply over `users` and `orders` was stopped and the operator
+// asked to start it again. The first task's requeue lands and the second's is
+// refused. The requeue happens above the grouped branch, so the same exit
+// applies: the start stays pending, the apply row stays stopped, and nothing is
+// handed to the engine. The requeue that landed stays pending, so the next
+// claim skips it and requeues only the task still stopped.
+func TestResumeApplyWithTasks_StartStaysPendingWhenGroupedStoppedTaskRequeueFails(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	enginePlan := alterUsersEmailPlan()
+	enginePlan.Changes[0].TableChanges = append(enginePlan.Changes[0].TableChanges, engine.TableChange{
+		Table:     "orders",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `orders` ADD COLUMN `name` varchar(255)",
+	})
+	c := newPlanMaterializeClientWithPlan(store, enginePlan)
+	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+	c.spiritEngine = eng
+	c.heartbeatInterval = time.Hour
+
+	plan := &storage.Plan{ID: 5}
+	apply := &storage.Apply{
+		ID:              24,
+		ApplyIdentifier: "apply-grouped-start-requeue-refused",
+		PlanID:          plan.ID,
+		Database:        "testapp",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	tasks := []*storage.Task{
+		{
+			ID:             1,
+			ApplyID:        apply.ID,
+			TaskIdentifier: "task_email",
+			Database:       "testapp",
+			Namespace:      "testapp",
+			TableName:      "users",
+			DDLAction:      "alter",
+			DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			State:          state.Task.Stopped,
+		},
+		{
+			ID:             2,
+			ApplyID:        apply.ID,
+			TaskIdentifier: "task_name",
+			Database:       "testapp",
+			Namespace:      "testapp",
+			TableName:      "orders",
+			DDLAction:      "alter",
+			DDL:            "ALTER TABLE `orders` ADD COLUMN `name` varchar(255)",
+			State:          state.Task.Stopped,
+		},
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	c.storage = &exactProgressStorage{
+		plans:   &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }},
+		applies: applies,
+		tasks: &selectiveUpdateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: tasks},
+			failIdentifier:         "task_name",
+			updateErr:              storageErr,
+		},
+		controlRequests: controlRequests,
+		logs:            &mockApplyLogStore{},
+	}
+
+	err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorContains(t, err, "requeue stopped task task_name for start of apply apply-grouped-start-requeue-refused")
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Pending), "the requeue that landed stays pending, got %s", tasks[0].State)
+	assert.True(t, state.IsState(tasks[1].State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", tasks[1].State)
+	assert.Empty(t, eng.applied, "nothing is handed to the engine")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Stopped), "the drive exits before writing the apply running; stored state was %q", stored.State)
+	assert.Nil(t, stored.CompletedAt)
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "the start request stays pending for the next claim")
+}
