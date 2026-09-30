@@ -408,8 +408,11 @@ func TargetOperationKey(target, scopedKey string) string {
 // KeyedByTarget reports whether the operation is whole-target work keyed by
 // its target alone (TargetOperationKey(target, "")), the key each target of a
 // deployment addressing several attaches its own work under. Within one apply,
-// a deployment's operations are either all keyed this way or none are: the
-// same target's work under a second key shape would run its DDL twice.
+// a deployment's work operations are either all keyed this way or none are:
+// the same target's work under a second key shape would run its DDL twice. A
+// group_finalizer is never reported as keyed this way, because its key alone
+// cannot say whether it leads with a target; ApplyOptions.OperationKeysLeadWithTarget
+// records that for the apply.
 func (op *ApplyOperation) KeyedByTarget() bool {
 	if op == nil || op.Target == "" || op.OperationKind == ApplyOperationKindGroupFinalizer {
 		return false
@@ -1409,6 +1412,16 @@ type ApplyOptions struct {
 	// recorded at creation and never read from caller options, so a rollback
 	// can tell an apply that changed one member from one that changed them all.
 	NarrowedTo string `json:"narrowed_to,omitempty"`
+
+	// OperationKeysLeadWithTarget marks an apply whose operations are each
+	// keyed behind their own target (storage.TargetOperationKey): a data-plane
+	// apply that the targets of one deployment share, one operation each. It is
+	// recorded when the apply is created, from the dispatch that names its
+	// rollout member target, and never read from caller options. Without it a
+	// reader could not tell "orders/group_finalizer" apart as target orders'
+	// deployment-scoped finalizer or namespace orders' finalizer until a sibling
+	// target's operation had attached.
+	OperationKeysLeadWithTarget bool `json:"operation_keys_lead_with_target,omitempty"`
 }
 
 // DirectExecutionPolicy is an apply's durable record of the direct execution

@@ -561,9 +561,22 @@ type capturingTernServer struct {
 // for the dispatch shapes these tests exercise, minus the stored-plan
 // validation a real data plane performs before answering.
 func dispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
-	if target, err := dispatchMemberTarget(req); err != nil || target != "" {
-		return target
+	target, err := dispatchMemberTarget(req)
+	if err != nil {
+		return ""
 	}
+	if target == "" {
+		return unqualifiedDispatchOperationKeyEcho(req)
+	}
+	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
+		return storage.TargetOperationKey(target, unqualifiedDispatchOperationKeyEcho(req))
+	}
+	return target
+}
+
+// unqualifiedDispatchOperationKeyEcho is a dispatch's operation key within its
+// target: the shard key, the finalizer key, or empty for whole-target work.
+func unqualifiedDispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
 	if len(req.TargetShards) == 1 {
 		changes, err := scopedDispatchDDLChanges(req.DdlChanges)
 		if err != nil {

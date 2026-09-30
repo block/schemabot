@@ -344,8 +344,9 @@ func TestLoadOperationApplyTaskScope_MemberTarget(t *testing.T) {
 // Both planes derive a dispatch's operation key from the request with the same
 // helpers. A whole-target dispatch naming a member target derives the target
 // itself, which is the key the planner stored; one naming none derives the
-// empty key it always has. A shard or finalizer dispatch naming a member target
-// is refused, and so is a target that could not be split back out of a key,
+// empty key it always has. A shard dispatch naming a member target is refused
+// (see TestOperationIdentityForDispatch_MemberTargetFinalizer for finalizers),
+// and so is a target that could not be split back out of a key,
 // and so is a member target the dispatch's plan was not produced for.
 func TestOperationIdentityForDispatch_MemberTarget(t *testing.T) {
 	plan := &storage.Plan{PlanIdentifier: "plan-members", Target: "payments-001"}
@@ -374,7 +375,7 @@ func TestOperationIdentityForDispatch_MemberTarget(t *testing.T) {
 
 	_, err = derive(&ternv1.ApplyRequest{DdlChanges: changes, TargetShards: []string{"-80"}, Options: map[string]string{dispatchMemberTargetOption: "payments-001"}})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "only whole-target work is keyed by target")
+	assert.Contains(t, err.Error(), `dispatch for member target "payments-001" is shard-scoped`)
 
 	_, err = derive(&ternv1.ApplyRequest{DdlChanges: changes, Options: map[string]string{dispatchMemberTargetOption: "payments/001"}})
 	require.Error(t, err)

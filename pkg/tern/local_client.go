@@ -2065,8 +2065,10 @@ func vschemaOnlyDispatchNamespaces(changes []*ternv1.TableChange) []string {
 // only VSchema change is one namespace arrive identically. The dispatch's
 // generation manifest names the dispatcher's actual operation keys, so when
 // one is present it resolves the shape; without one the dispatch keeps the
-// namespace-scoped reading.
-func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationManifest []string) (string, error) {
+// namespace-scoped reading. A dispatch for a rollout member target reads the
+// manifest's keys behind that target, since every key of its deployment leads
+// with the target it belongs to.
+func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationManifest []string, memberTarget string) (string, error) {
 	if len(namespaces) == 0 {
 		return "", fmt.Errorf("group_finalizer dispatch names no namespaces")
 	}
@@ -2075,7 +2077,7 @@ func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationM
 			return "", fmt.Errorf("group_finalizer dispatch for namespace %q: %w", namespace, err)
 		}
 	}
-	if len(namespaces) == 1 && !manifestNamesDeploymentScopedFinalizer(generationManifest, namespaces[0]) {
+	if len(namespaces) == 1 && !manifestNamesDeploymentScopedFinalizer(generationManifest, namespaces[0], memberTarget) {
 		return namespaces[0], nil
 	}
 	// A deployment-scoped finalizer's drive finalizes every namespace in the
@@ -2099,15 +2101,23 @@ func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationM
 // set, so the operation created here must carry a key from that set — the
 // manifest is the completion authority for the apply, and a key outside it is
 // refused at creation. An empty manifest (a dispatch without generation
-// tracking) resolves nothing and keeps the namespace-scoped reading.
-func manifestNamesDeploymentScopedFinalizer(generationManifest []string, namespace string) bool {
+// tracking) resolves nothing and keeps the namespace-scoped reading. A member
+// target's finalizer keys lead with the target (storage.TargetOperationKey), so
+// both keys are looked up behind it.
+func manifestNamesDeploymentScopedFinalizer(generationManifest []string, namespace, memberTarget string) bool {
 	if len(generationManifest) == 0 {
 		return false
 	}
-	if slices.Contains(generationManifest, namespace+finalizerOperationKeySuffix) {
+	namespaceKey := namespace + finalizerOperationKeySuffix
+	deploymentKey := finalizerDeploymentScopedKey
+	if memberTarget != "" {
+		namespaceKey = storage.TargetOperationKey(memberTarget, namespaceKey)
+		deploymentKey = storage.TargetOperationKey(memberTarget, deploymentKey)
+	}
+	if slices.Contains(generationManifest, namespaceKey) {
 		return false
 	}
-	return slices.Contains(generationManifest, finalizerDeploymentScopedKey)
+	return slices.Contains(generationManifest, deploymentKey)
 }
 
 // shardScopedDispatchOperationKey builds the operation key for a shard-scoped
@@ -2627,7 +2637,7 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 		return scope, nil
 	}
 	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
-		namespace, err := finalizerDispatchScope(plan, namespaces, req.GenerationOperationKeys)
+		namespace, err := finalizerDispatchScope(plan, namespaces, req.GenerationOperationKeys, memberTarget)
 		if err != nil {
 			return dispatchScope{}, err
 		}
@@ -2652,11 +2662,16 @@ func dispatchMemberTarget(req *ternv1.ApplyRequest) (string, error) {
 // operationIdentityForDispatch returns the operation key and kind the dispatch
 // scope stores on its apply_operations row.
 //
-// A dispatch naming a rollout member target covers that whole target, and its
-// key is the target itself: the key the planner stored for the member, so the
-// operation attaches under a key its generation manifest declares. A
-// shard-scoped or finalizer dispatch that names one is refused, because the
-// shard and finalizer readers parse keys that carry no target.
+// A dispatch naming a rollout member target carries the key the planner stored
+// for that member, so the operation attaches under a key its generation
+// manifest declares. Whole-target work is keyed by the target itself, and a
+// group_finalizer by its finalizer key behind the target
+// ("orders-001/ns_0/group_finalizer", or "orders-001/group_finalizer" when
+// deployment-scoped). The finalizer drive parses that shape because the apply
+// records that its keys lead with a target
+// (storage.ApplyOptions.OperationKeysLeadWithTarget). A shard-scoped dispatch
+// that names one is refused, because the task loaders match a shard-tagged task
+// to its operation by a key that carries no target.
 //
 // A shard-scoped dispatch tags its tasks with the target shard, so its
 // operation row must carry the matching shard operation key: the task loaders
@@ -2672,8 +2687,11 @@ func dispatchMemberTarget(req *ternv1.ApplyRequest) (string, error) {
 // on the empty task set.
 func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationKind string, err error) {
 	if scope.memberTarget != "" {
-		if scope.shard != "" || scope.finalizer {
-			return "", "", fmt.Errorf("dispatch for member target %q is shard-scoped or a group_finalizer; only whole-target work is keyed by target", scope.memberTarget)
+		if scope.shard != "" {
+			return "", "", fmt.Errorf("dispatch for member target %q is shard-scoped; the task loaders match shard work by keys that carry no target, so only whole-target work and group_finalizers are keyed by target", scope.memberTarget)
+		}
+		if scope.finalizer {
+			return storage.TargetOperationKey(scope.memberTarget, finalizerKeyForScope(scope)), storage.ApplyOperationKindGroupFinalizer, nil
 		}
 		return storage.TargetOperationKey(scope.memberTarget, ""), "", nil
 	}
@@ -2685,13 +2703,18 @@ func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationK
 		return operationKey, "", nil
 	}
 	if scope.finalizer {
-		operationKey = finalizerDeploymentScopedKey
-		if scope.finalizerNamespace != "" {
-			operationKey = scope.finalizerNamespace + finalizerOperationKeySuffix
-		}
-		return operationKey, storage.ApplyOperationKindGroupFinalizer, nil
+		return finalizerKeyForScope(scope), storage.ApplyOperationKindGroupFinalizer, nil
 	}
 	return "", "", nil
+}
+
+// finalizerKeyForScope is a finalizer dispatch's key within its target: its
+// namespace's finalizer key, or the deployment-scoped key when it names none.
+func finalizerKeyForScope(scope dispatchScope) string {
+	if scope.finalizerNamespace == "" {
+		return finalizerDeploymentScopedKey
+	}
+	return scope.finalizerNamespace + finalizerOperationKeySuffix
 }
 
 // buildDispatchTasks constructs the task rows for a dispatch scope's DDL
@@ -2854,6 +2877,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	if refusal := c.validateDispatchAgainstManifest(ctx, req, apply, operationKey); refusal != nil {
 		return refusal, nil
 	}
+	if keysLeadWithTarget := apply.GetOptions().OperationKeysLeadWithTarget; keysLeadWithTarget != (scope.memberTarget != "") {
+		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey,
+			fmt.Errorf("apply %s records operation keys leading with their target = %t, but this dispatch names member target %q", apply.ApplyIdentifier, keysLeadWithTarget, scope.memberTarget)), nil
+	}
 
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
@@ -2874,6 +2901,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	applyOpts := storage.ApplyOptionsFromMap(req.Options)
 	applyOpts.Target = plan.Target
 	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
+	applyOpts.OperationKeysLeadWithTarget = scope.memberTarget != ""
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -2921,21 +2949,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	case errors.Is(err, storage.ErrApplyNotActive):
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
-		// A dispatch that names its rollout member target and one that does not
-		// derive different keys for the same target's work, so without the
-		// refusal a replay under the other shape would attach a second copy of
-		// that target's DDL instead of resolving to its operation.
-		c.logger.Warn("Apply: refusing operation whose target keying disagrees with the deployment's existing operations; dispatch is rejected",
-			append(apply.LogAttrs(),
-				"operation_key", operationKey,
-				"member_target", scope.memberTarget,
-				"plan_target", plan.Target,
-				"idempotency_key", req.IdempotencyKey,
-				"error", err)...)
-		return &ternv1.ApplyResponse{
-			Accepted:     false,
-			ErrorMessage: fmt.Sprintf("operation %s cannot attach to apply %s: a dispatch naming its rollout member target and one that does not cannot share one deployment's apply", operationKey, apply.ApplyIdentifier),
-		}, nil
+		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey, err), nil
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
@@ -2953,6 +2967,25 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	c.wakeOperatorForQueuedApply(apply)
 
 	return dispatchApplyResponse(apply, operation.ID, operationKey), nil
+}
+
+// refuseAttachKeyingMismatch rejects an attach whose key shape disagrees with
+// the apply's: a dispatch that names its rollout member target and one that
+// does not derive different keys for the same target's work, so without the
+// refusal a replay under the other shape would attach a second copy of that
+// target's DDL or VSchema change instead of resolving to its operation.
+func (c *LocalClient) refuseAttachKeyingMismatch(req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, operationKey string, cause error) *ternv1.ApplyResponse {
+	c.logger.Warn("Apply: refusing operation whose target keying disagrees with the deployment's existing operations; dispatch is rejected",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"member_target", scope.memberTarget,
+			"plan_target", plan.Target,
+			"idempotency_key", req.IdempotencyKey,
+			"error", cause)...)
+	return &ternv1.ApplyResponse{
+		Accepted:     false,
+		ErrorMessage: fmt.Sprintf("operation %s cannot attach to apply %s: a dispatch naming its rollout member target and one that does not cannot share one deployment's apply", operationKey, apply.ApplyIdentifier),
+	}
 }
 
 // Apply executes a previously generated plan.
@@ -3103,6 +3136,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// the server's configuration exists to bound. A request that states none
 	// clears the field, so the executing server's configuration decides.
 	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
+	// The apply records whether its operations are keyed behind their target,
+	// so its finalizer drive reads "orders-001/group_finalizer" as target
+	// orders-001's deployment-scoped finalizer even before a sibling target
+	// attaches, and every later attach is held to the same key shape.
+	applyOpts.OperationKeysLeadWithTarget = scope.memberTarget != ""
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
