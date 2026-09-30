@@ -520,6 +520,8 @@ func TestLocalClient_MemberTargetFinalizerStoresTargetAndResolvesItsScope(t *tes
 		return &ternv1.ApplyRequest{
 			PlanId:                  planID,
 			Environment:             localClientTestEnvironment,
+			Database:                "testdb",
+			Type:                    storage.DatabaseTypeMySQL,
 			IdempotencyKey:          idempotencyKey,
 			GenerationOperationKeys: manifest,
 			DdlChanges: []*ternv1.TableChange{
