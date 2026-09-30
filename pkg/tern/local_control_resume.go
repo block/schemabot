@@ -1998,7 +1998,10 @@ func (c *LocalClient) finalizerStandsDownForPendingControl(ctx context.Context, 
 // drive records immediately before its first engine call. It marks the row as
 // handed to the engine until the engine reports resume state of its own, which
 // replaces it.
-const finalizerEngineHandoffMetadata = `{"group_finalizer_engine_handoff":"true"}`
+const finalizerEngineHandoffMetadata = `{"` + finalizerEngineHandoffKey + `":"true"}`
+
+// finalizerEngineHandoffKey is the one field of the handoff record.
+const finalizerEngineHandoffKey = "group_finalizer_engine_handoff"
 
 // finalizerEngineResumeState is the resume state a re-drive hands the engine,
 // from what an earlier drive of the finalizer stored. A bare handoff record
@@ -2013,9 +2016,18 @@ func finalizerEngineResumeState(stored *storage.EngineResumeState) *engine.Resum
 }
 
 // isFinalizerHandoffRecordOnly reports that the stored resume state is the
-// drive's own handoff record, with nothing the engine reported since.
+// drive's own handoff record, with nothing the engine reported since. The
+// metadata is compared as JSON, not as text: a JSON storage column returns it
+// re-serialized, so the stored bytes need not match what the drive wrote.
 func isFinalizerHandoffRecordOnly(stored *storage.EngineResumeState) bool {
-	return stored.MigrationContext == "" && stored.Metadata == finalizerEngineHandoffMetadata
+	if stored.MigrationContext != "" {
+		return false
+	}
+	var fields map[string]string
+	if err := json.Unmarshal([]byte(stored.Metadata), &fields); err != nil {
+		return false
+	}
+	return len(fields) == 1 && fields[finalizerEngineHandoffKey] == "true"
 }
 
 // finalizerSettledStateForControl is the operation state a never-started
