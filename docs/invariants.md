@@ -1531,7 +1531,9 @@ verdicts were judged under recorded on the plan row and read at admission in pla
 resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`); in a rollout, each
 member's own direct changes disclosed under that member's plan (`deploymentPlanGroups` in
 `pkg/webhook/plan_drift.go`), with apply-confirm refusing a member whose execution modes differ
-from the confirmed round's (`roundCoversWork` in `pkg/webhook/apply_member_work.go`).
+from the confirmed round's (`roundCoversWork` in `pkg/webhook/apply_member_work.go`), and apply
+creation refusing a member's own direct change for any caller other than that confirmed
+apply-confirm (`rejectUnconfirmedMemberDirectExecution` in `pkg/api/plan_handlers.go`).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 

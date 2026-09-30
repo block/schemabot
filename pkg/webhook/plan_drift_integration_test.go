@@ -54,6 +54,9 @@ type deploymentSpec struct {
 	name         string
 	liveSchema   string
 	dropDatabase bool
+	// engineMetadata is forwarded to the deployment's LocalClient, enabling
+	// per-deployment engine settings such as the direct execution policy.
+	engineMetadata map[string]string
 }
 
 // openDriftDB opens a MySQL connection for the drift fixtures, verifies it with
@@ -176,6 +179,7 @@ func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []depl
 			Database:  dbName,
 			Type:      "mysql",
 			TargetDSN: physicalDSN,
+			Metadata:  spec.engineMetadata,
 		}, st, logger)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = client.Close() })

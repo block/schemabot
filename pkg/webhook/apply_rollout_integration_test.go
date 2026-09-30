@@ -44,6 +44,18 @@ func runRolloutCommand(t *testing.T, svc *api.Service, dbName, command string) *
 // capture of what SchemaBot posts in response.
 func runRolloutWebhook(t *testing.T, svc *api.Service, dbName string, req *http.Request) *planFlowResult {
 	t.Helper()
+	return runRolloutWebhookWithFiles(t, svc, dbName, req, map[string]string{"users.sql": usersWithEmailSchema})
+}
+
+// runRolloutCommandWithFiles is runRolloutCommand for a PR whose schema files
+// are files.
+func runRolloutCommandWithFiles(t *testing.T, svc *api.Service, dbName, command string, files map[string]string) *planFlowResult {
+	t.Helper()
+	return runRolloutWebhookWithFiles(t, svc, dbName, buildWebhookRequest(t, webhookPayloadOpts{comment: command, isPR: true}, nil), files)
+}
+
+func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, req *http.Request, files map[string]string) *planFlowResult {
+	t.Helper()
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -55,7 +67,7 @@ func runRolloutWebhook(t *testing.T, svc *api.Service, dbName string, req *http.
 	client.BaseURL = baseURL
 
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": usersWithEmailSchema}, schemabotConfig, dbName)
+	result := setupFakeGitHubForPlan(t, mux, files, schemabotConfig, dbName)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger)
@@ -255,6 +267,77 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 	}
 	assert.Contains(t, byOperation, byDeployment["eu"].ID)
 	assert.Contains(t, byOperation, byDeployment["us"].ID)
+}
+
+// Two targets planned against schemas of their own, both on the direct
+// execution policy, both reshaping the users primary key: the schema change
+// engine refuses the reshape and the policy routes it to native DDL on each
+// target. The comment the operator confirms discloses that direct change under
+// the targets that run it, so apply-confirm creates one apply in which us's
+// task carries us's own direct verdict.
+func TestE2EApplyConfirmRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
+	dbName := "webhook_rollout_direct"
+	preReshape := "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `tenant_id` bigint unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+		{name: "us", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	files := map[string]string{"users.sql": pkSwapSchema}
+
+	runRolloutCommandWithFiles(t, svc, dbName, "schemabot plan -e "+driftEnv, files)
+
+	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
+	body := awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
+		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied") || strings.Contains(body, "Failed to execute apply")
+	})
+	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
+	assert.Contains(t, body, "**targets `eu`, `us`**")
+	assert.Contains(t, body, "**Direct execution**", "the comment discloses the direct change under the targets that run it")
+	requireNoApplies(t, svc, dbName)
+
+	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe", files)
+
+	var created *storage.Apply
+	require.Eventually(t, func() bool {
+		applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+		if err != nil {
+			return false
+		}
+		for _, a := range applies {
+			if a.Database == dbName {
+				created = a
+				return true
+			}
+		}
+		select {
+		case posted := <-confirm.comments:
+			require.NotContains(t, posted, "Failed to execute apply", "the confirmation must create the apply")
+		default:
+		}
+		return false
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "the confirmation creates an apply")
+
+	operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
+	require.NoError(t, err)
+	deploymentOf := map[int64]string{}
+	for _, op := range operations {
+		deploymentOf[op.ID] = op.Deployment
+	}
+	tasks, err := svc.Storage().Tasks().GetByApplyID(t.Context(), created.ID)
+	require.NoError(t, err)
+	modes := map[string]string{}
+	for _, task := range tasks {
+		require.NotNil(t, task.ApplyOperationID)
+		modes[deploymentOf[*task.ApplyOperationID]] = task.ExecutionMode
+	}
+	assert.Equal(t, map[string]string{"eu": "direct", "us": "direct"}, modes, "each target's task carries its own plan's verdict")
 }
 
 // Two targets planned against schemas of their own, both needing the column.

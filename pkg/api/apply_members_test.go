@@ -509,6 +509,13 @@ func TestCreateStoredApply_UndisclosedUnsafeMemberChangeIsRefusedUnderTheOptIn(t
 		"the reviewed plan drops a column from users too, so the refusal says the statements differ")
 	assert.Contains(t, err.Error(), "the disclosure on reviewed plan plan-primary never named it")
 	assert.NotContains(t, err.Error(), "retry with allow_unsafe", "no opt-in covers a change the disclosure never named")
+	refused, ok := errors.AsType[*MemberPlanRefusedError](err)
+	require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
+	assert.Equal(t, MemberPlanUndisclosedUnsafe, refused.Refusal)
+	assert.Equal(t, "eu/testapp-002", refused.Target, "the target is named the way the plan comment names it")
+	assert.Equal(t, "eu/testapp-002", refused.MemberID)
+	assert.Equal(t, "users", refused.Table)
+	assert.Empty(t, refused.Namespace)
 	applies, ok := svc.storage.Applies().(*capturingApplyStore)
 	require.True(t, ok)
 	assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
@@ -655,8 +662,8 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.
 
 // A member's own plan can run a statement as direct-execution DDL while the
 // reviewed target is already converged. The plan comment discloses that change
-// under the member that runs it, so apply creation builds the member's task with
-// the direct verdict intact.
+// under the member that runs it, so an apply-confirm of that comment builds the
+// member's task with the direct verdict intact.
 func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.T) {
 	member := memberPlanWithChange(storage.TableChange{
 		Namespace:     "testapp",
@@ -668,7 +675,7 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.
 	})
 	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{member}})
 
-	_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production"}, nil, "apply-converged-primary")
+	_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production", ConfirmedMemberWork: true}, nil, "apply-converged-primary")
 	require.NoError(t, err)
 
 	applies, ok := svc.storage.Applies().(*capturingApplyStore)
@@ -898,7 +905,7 @@ func TestCreateStoredApply_ReviewedPlanWithWorkRunsAMembersDirectChange(t *testi
 	reviewed := primaryPlanRow("testapp-001")
 	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
 
-	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-member-direct")
+	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production", ConfirmedMemberWork: true}, nil, "apply-member-direct")
 	require.NoError(t, err)
 
 	applies, ok := svc.storage.Applies().(*capturingApplyStore)
@@ -919,6 +926,50 @@ func TestCreateStoredApply_ReviewedPlanWithWorkRunsAMembersDirectChange(t *testi
 	}
 	assert.Equal(t, map[string]string{"testapp-001": "", "testapp-002": "direct"}, modes,
 		"each target's task carries its own plan's verdict")
+}
+
+// A caller other than a pull request apply-confirm was shown the reviewed plan
+// alone: a direct API caller that posts the reviewed plan's id never saw the
+// other target's own plan, nor that it runs orders as write-blocking native
+// DDL. Apply creation refuses that member's direct change for it, whether or
+// not the reviewed target has work, even when the reviewed plan runs the same
+// statement directly, and stores nothing.
+func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) {
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "orders",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)",
+	}
+	direct := alter
+	direct.ExecutionMode = "DIRECT"
+	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
+	withWork := primaryPlanRow("testapp-001")
+	withWork.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+	// The reviewed plan names the reviewed target's table at the size measured
+	// there, so the reviewed plan running the identical statement directly
+	// discloses nothing about the other target's copy of the table.
+	withDirect := primaryPlanRow("testapp-001")
+	withDirect.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{direct}}}
+
+	for name, reviewed := range map[string]*storage.Plan{
+		"reviewed target has work":             withWork,
+		"reviewed target runs it directly too": withDirect,
+		"reviewed target converged":            primaryPlanRow("testapp-001"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
+
+			_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-unconfirmed-direct")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+			assert.Contains(t, err.Error(), "runs table \"orders\" as direct-execution DDL")
+			assert.Contains(t, err.Error(), "shown only the reviewed plan plan-primary")
+			applies, ok := svc.storage.Applies().(*capturingApplyStore)
+			require.True(t, ok)
+			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
+		})
+	}
 }
 
 // Two PostgreSQL targets map the namespace to differently named physical

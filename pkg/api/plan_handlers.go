@@ -543,6 +543,13 @@ type ApplyRequest struct {
 	// direct API callers cannot assert a lock intent through JSON.
 	ExpectedLockOwner     string `json:"-"`
 	ExpectedPendingPlanID string `json:"-"`
+	// ConfirmedMemberWork is an internal webhook guard, set only by a pull
+	// request apply-confirm that checked the confirmation against every other
+	// target's statements and execution modes, on a comment disclosing each
+	// target's direct changes under that target. Without it, apply creation
+	// refuses another target's direct-execution change: no other caller was
+	// shown it. Direct API callers cannot assert it through JSON.
+	ConfirmedMemberWork bool `json:"-"`
 }
 
 // handlePlan handles POST /api/plan requests.
@@ -1719,17 +1726,23 @@ func (s *Service) createStoredApply(
 	// member's. Members that run the apply's plan re-clear the same checks here,
 	// which is a no-op rather than a second verdict.
 	//
-	// A member's direct-execution verdict is not refused, whether or not the
-	// reviewed plan has work. It is the verdict of the target that runs the
-	// statement (RV-4). Member plans are written only by a pull request review,
-	// and a pull request apply runs them only from apply-confirm on the comment
-	// disclosing each target's direct changes under that target, after
-	// re-checking each target's statements and execution modes against the
-	// confirmed round. So a member's task carries its own verdict, as disclosed.
+	// A member's direct-execution verdict is the verdict of the target that
+	// runs the statement (RV-4), so its task carries it, whether or not the
+	// reviewed plan has work. Only a pull request apply-confirm has disclosed
+	// it: that comment names each target's direct changes under that target,
+	// and the confirm re-checks each target's statements and execution modes
+	// against the confirmed round before it creates the apply. Any other caller
+	// was shown the reviewed plan alone, so a member's direct change is refused
+	// for it.
 	names := applyMemberDisplayNames(members)
 	for i, member := range members {
-		if err := rejectUnapplyableMemberPlan(member, names[i], plan, applyOpts); err != nil {
+		if err := rejectUnapplyableMemberPlan(member, names[i], plan); err != nil {
 			return nil, 0, err
+		}
+		if !req.ConfirmedMemberWork {
+			if err := rejectUnconfirmedMemberDirectExecution(member, plan); err != nil {
+				return nil, 0, err
+			}
 		}
 	}
 	// An apply whose own plan has no work exists only to run the other members'
@@ -1784,9 +1797,10 @@ type MemberPlanRefusal int
 const (
 	// MemberPlanBlocked is a change the member's engine refuses to execute.
 	MemberPlanBlocked MemberPlanRefusal = iota
-	// MemberPlanUnsafe is an unsafe change the apply was not given the unsafe
-	// opt-in for.
-	MemberPlanUnsafe
+	// MemberPlanUndisclosedUnsafe is an unsafe change the reviewed plan does
+	// not carry, so the disclosure the operator confirmed never named it and no
+	// opt-in covers it.
+	MemberPlanUndisclosedUnsafe
 )
 
 // MemberPlanRefusedError is apply creation refusing one rollout member's own
@@ -1832,32 +1846,65 @@ func applyMemberDisplayNames(members []applyMember) []string {
 // looking for it in the plan they reviewed.
 //
 // Blocked changes reject before unsafe ones for the same reason they do there:
-// no opt-in can make a statement the engine refuses executable. An unsafe change
-// the reviewed plan's disclosure never named rejects before the opt-in is
-// consulted, since no opt-in covers it.
-func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *storage.Plan, applyOpts storage.ApplyOptions) error {
-	refused := func(refusal MemberPlanRefusal, table, namespace string, err error) error {
-		return &MemberPlanRefusedError{
-			MemberID: member.MemberID(), Target: target, Refusal: refusal,
-			Table: table, Namespace: namespace, Err: err,
-		}
-	}
+// no opt-in can make a statement the engine refuses executable.
+//
+// The unsafe opt-in itself needs no second check here. The apply's plan cleared
+// it before the members were resolved, and a member's unsafe change passes only
+// when the apply's plan carries the same change, so it clears the opt-in the
+// apply's plan cleared.
+func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *storage.Plan) error {
 	if err := member.Plan.BlockedApplyError(); err != nil {
-		return refused(MemberPlanBlocked, member.Plan.BlockedChanges()[0].Table, "", err)
-	}
-	if err := rejectMemberUndisclosedUnsafe(member, applyPlan); err != nil {
-		return err
-	}
-	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
-		if unsafeChanges := member.Plan.UnsafeDDLChanges(); len(unsafeChanges) > 0 {
-			return refused(MemberPlanUnsafe, unsafeChanges[0].Table, "", err)
+		return &MemberPlanRefusedError{
+			MemberID: member.MemberID(), Target: target, Refusal: MemberPlanBlocked,
+			Table: member.Plan.BlockedChanges()[0].Table, Err: err,
 		}
-		if vschemaChanges := member.Plan.UnsafeVSchemaChanges(); len(vschemaChanges) > 0 {
-			return refused(MemberPlanUnsafe, "", vschemaChanges[0].Namespace, err)
-		}
-		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	return rejectMemberUndisclosedUnsafe(member, target, applyPlan)
+}
+
+// rejectUnconfirmedMemberDirectExecution refuses a member planned on its own
+// whose plan runs direct-execution DDL, for an apply whose caller was not
+// shown that member's plan. A member running the apply's plan runs exactly the
+// statements, and the verdicts, the caller was shown.
+//
+// This holds even when the reviewed plan runs the identical statement directly,
+// unlike an unsafe change the reviewed plan also carries
+// (rejectMemberUndisclosedUnsafe). An unsafe change's consequence is the
+// statement's own, so disclosing it for one target discloses it for every
+// target running it. A direct statement's consequence is its table's: it blocks
+// that table's writes for as long as the statement runs, and the reviewed plan
+// names the reviewed target's table with the size the planner measured there.
+// Another target's copy of the table was measured on its own and can be any
+// size under the bound. Only the pull request comment shows that target's
+// verdict, with its own measured reason, under that target.
+func rejectUnconfirmedMemberDirectExecution(member applyMember, applyPlan *storage.Plan) error {
+	if member.Plan == applyPlan {
+		return nil
+	}
+	if table := firstDirectExecutionTable(member.Plan); table != "" {
+		return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, which runs only from a pull request apply-confirm on the comment that discloses it under that target; this apply's caller was shown only the reviewed plan %s",
+			member.MemberID(), member.Plan.PlanIdentifier, table, applyPlan.PlanIdentifier)
 	}
 	return nil
+}
+
+// firstDirectExecutionTable returns the table of the first change the plan
+// routes to direct execution, across namespace-level and per-shard changes, or
+// "" when it routes none.
+func firstDirectExecutionTable(plan *storage.Plan) string {
+	for _, change := range plan.FlatDDLChanges() {
+		if change.DirectExecution() {
+			return change.Table
+		}
+	}
+	for _, shard := range plan.Shards {
+		for _, change := range shard.Changes {
+			if change.DirectExecution() {
+				return change.Table
+			}
+		}
+	}
+	return ""
 }
 
 // rejectMemberWorkAnEmptyReviewedPlanCannotCarry refuses a member's work that
@@ -1883,10 +1930,10 @@ func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 // finalizer work have no place in that shape, and a member carrying only them
 // would be settled as having nothing to do while its target never got the
 // change. Blocked changes never run. Unsafe changes are refused whatever the
-// command's flags: the operator consents to them against the disclosure the
-// reviewed plan's comment carries, and the member plans that comment renders
-// carry none. Apply creation refuses an unsafe change the reviewed plan does
-// not carry whether or not the reviewed plan is empty
+// command's flags, by the same rule that holds when the reviewed plan has work:
+// a member's unsafe change runs only when the reviewed plan carries the same
+// change, since the operator consents against the reviewed plan's unsafe
+// disclosure, and an empty reviewed plan carries none
 // (rejectMemberUndisclosedUnsafe). A direct-execution change is not refused:
 // the plan comment discloses it under the member that runs it, and
 // apply-confirm re-checks that each member's statements and execution modes
@@ -1918,15 +1965,46 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 // member's unsafe change runs under the opt-in only when the reviewed plan
 // carries the same change, which the disclosure named (RV-3). A member running
 // the apply's plan runs exactly the changes that disclosure names.
-func rejectMemberUndisclosedUnsafe(member applyMember, applyPlan *storage.Plan) error {
+//
+// The refusal is a MemberPlanRefusedError naming the target, the way the plan
+// comment names it, and the change's table or namespace.
+func rejectMemberUndisclosedUnsafe(member applyMember, target string, applyPlan *storage.Plan) error {
 	if member.Plan == applyPlan {
 		return nil
 	}
-	if reason := UndisclosedMemberUnsafeChange(applyPlan, member.Plan); reason != "" {
-		return fmt.Errorf("rollout member %s: plan %s %s, so the disclosure on reviewed plan %s never named it and no opt-in covers it",
-			member.MemberID(), member.Plan.PlanIdentifier, reason, applyPlan.PlanIdentifier)
+	change, ok := firstUndisclosedMemberUnsafeChange(applyPlan, member.Plan)
+	if !ok {
+		return nil
 	}
-	return nil
+	return &MemberPlanRefusedError{
+		MemberID: member.MemberID(), Target: target, Refusal: MemberPlanUndisclosedUnsafe,
+		Table: change.Table, Namespace: change.Namespace,
+		Err: fmt.Errorf("plan %s %s, so the disclosure on reviewed plan %s never named it and no opt-in covers it",
+			member.Plan.PlanIdentifier, change.description(), applyPlan.PlanIdentifier),
+	}
+}
+
+// undisclosedUnsafeChange is an unsafe change in a member's own plan that the
+// reviewed plan does not carry: a table change, or, when Table is empty, a
+// namespace's VSchema change.
+type undisclosedUnsafeChange struct {
+	Table string
+	// Namespace is the VSchema change's namespace, empty for a table change.
+	Namespace string
+	// StatementDiffers is set for a table change on a table the reviewed plan
+	// also changes unsafely, with a statement that is not the one it discloses.
+	StatementDiffers bool
+}
+
+func (c undisclosedUnsafeChange) description() string {
+	switch {
+	case c.Table != "" && c.StatementDiffers:
+		return fmt.Sprintf("carries an unsafe change for table %q whose statement differs from the one the reviewed plan discloses for that table", c.Table)
+	case c.Table != "":
+		return fmt.Sprintf("carries an unsafe change for table %q that the reviewed plan does not carry", c.Table)
+	default:
+		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q that the reviewed plan does not carry", c.Namespace)
+	}
 }
 
 // UndisclosedMemberUnsafeChange describes the first unsafe change in a member's
@@ -1944,6 +2022,17 @@ func rejectMemberUndisclosedUnsafe(member applyMember, applyPlan *storage.Plan) 
 // reviewed ALTER also adds, runs a statement the disclosure never showed, and
 // the description says the statements differ so the operator knows which.
 func UndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) string {
+	change, ok := firstUndisclosedMemberUnsafeChange(reviewed, member)
+	if !ok {
+		return ""
+	}
+	return change.description()
+}
+
+// firstUndisclosedMemberUnsafeChange returns the first unsafe change in the
+// member's own plan that the reviewed plan does not carry, and whether there
+// is one. UndisclosedMemberUnsafeChange states the rule.
+func firstUndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) (undisclosedUnsafeChange, bool) {
 	disclosed := reviewed.UnsafeDDLChanges()
 	for _, change := range member.UnsafeDDLChanges() {
 		if slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
@@ -1951,20 +2040,18 @@ func UndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) string {
 		}) {
 			continue
 		}
-		if slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
+		differs := slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
 			return named.Namespace == change.Namespace && named.Table == change.Table
-		}) {
-			return fmt.Sprintf("carries an unsafe change for table %q whose statement differs from the one the reviewed plan discloses for that table", change.Table)
-		}
-		return fmt.Sprintf("carries an unsafe change for table %q that the reviewed plan does not carry", change.Table)
+		})
+		return undisclosedUnsafeChange{Table: change.Table, StatementDiffers: differs}, true
 	}
 	disclosedVSchema := reviewed.UnsafeVSchemaChanges()
 	for _, change := range member.UnsafeVSchemaChanges() {
 		if !slices.Contains(disclosedVSchema, change) {
-			return fmt.Sprintf("carries an unsafe VSchema change in namespace %q that the reviewed plan does not carry", change.Namespace)
+			return undisclosedUnsafeChange{Namespace: change.Namespace}, true
 		}
 	}
-	return ""
+	return undisclosedUnsafeChange{}, false
 }
 
 func sameUnsafeTableChange(databaseType string, a, b storage.TableChange) bool {
