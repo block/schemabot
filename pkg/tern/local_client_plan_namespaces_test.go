@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -13,10 +14,13 @@ import (
 )
 
 func planNamespacesTestClient() *LocalClient {
-	return &LocalClient{config: LocalConfig{
-		Database: "commerce",
-		Type:     storage.DatabaseTypeVitess,
-	}}
+	return &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		logger: slog.New(slog.DiscardHandler),
+	}
 }
 
 // TestNormalizeSchemaFilesKeepsEmptyNamespace proves a namespace that
@@ -326,6 +330,75 @@ func TestNamespacesFromEngineChangesKeepsNonShardedStatementOrder(t *testing.T) 
 	for _, tc := range tables {
 		assert.Equal(t, "users", tc.Table)
 	}
+}
+
+// A sharded keyspace's generated-only VSchema marker reaches the plan response
+// when every shard that reports VSchema work carries it, including when only
+// one shard reports the keyspace's VSchema work at all. When a shard reports
+// VSchema work without the marker, the merged keyspace drops it, so the plan
+// comment never claims a keyspace has no hand-written VSchema change on the
+// word of one shard alone.
+func TestPlanResultToProtoChangesKeepsGeneratedOnlyMarkerOnlyWhenShardsAgree(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	generated := map[string]string{
+		storage.PlanMetadataVSchemaChanged:  "true",
+		engine.MetadataVSchemaGeneratedOnly: "true",
+	}
+	plan := func(first, second map[string]string) map[string]string {
+		t.Helper()
+		changes, _, _ := client.planResultToProtoChanges(&engine.PlanResult{
+			Changes: []engine.SchemaChange{
+				{Namespace: "payments", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: first},
+				{Namespace: "payments", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: second},
+			},
+		})
+		require.Len(t, changes, 1)
+		return changes[0].Metadata
+	}
+
+	assert.Equal(t, "true", plan(generated, generated)[engine.MetadataVSchemaGeneratedOnly], "every shard agrees")
+	assert.Equal(t, "true", plan(nil, generated)[engine.MetadataVSchemaGeneratedOnly], "the only shard reporting VSchema work carries the marker")
+
+	unexplained := plan(map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, generated)
+	assert.NotContains(t, unexplained, engine.MetadataVSchemaGeneratedOnly, "a shard reports VSchema work without the marker")
+	assert.Equal(t, "true", unexplained[storage.PlanMetadataVSchemaChanged], "the VSchema change itself still reaches the plan")
+
+	diffed := plan(generated, map[string]string{storage.PlanMetadataVSchemaDiff: "+    \"refunds\": {}"})
+	assert.NotContains(t, diffed, engine.MetadataVSchemaGeneratedOnly, "a shard renders a VSchema diff")
+}
+
+// The stored plan keeps a sharded keyspace's generated-only VSchema marker by
+// the same rule as the plan response: only when every shard that reports
+// VSchema work carries it.
+func TestNamespacesFromEngineChangesKeepsGeneratedOnlyMarkerOnlyWhenShardsAgree(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	generated := map[string]string{
+		storage.PlanMetadataVSchemaChanged:  "true",
+		engine.MetadataVSchemaGeneratedOnly: "true",
+	}
+	stored := func(first, second map[string]string) map[string]string {
+		t.Helper()
+		namespaces, _ := client.namespacesFromEngineChanges([]engine.SchemaChange{
+			{Namespace: "payments", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: first},
+			{Namespace: "payments", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: second},
+		}, nil)
+		require.Contains(t, namespaces, "payments")
+		return namespaces["payments"].Metadata
+	}
+
+	assert.Equal(t, generated, stored(generated, generated), "every shard agrees")
+	assert.Equal(t, generated, stored(nil, generated), "the only shard reporting VSchema work carries the marker")
+	assert.Equal(t, map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, stored(map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, generated), "a shard reports VSchema work without the marker")
 }
 
 // TestPlanResultToProtoChangesKeepsNonShardedStatementOrder verifies the plan

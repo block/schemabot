@@ -68,12 +68,23 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		tables = append(tables, pendingdrops.TableMove{SchemaName: target.schema, TableName: target.table})
 	}
 
-	moved, err := pendingdrops.MoveTables(ctx, db, tables, time.Now())
-	if err != nil {
+	// The destinations are recorded before the RENAME is issued, not after it
+	// returns. A RENAME that is waiting on a metadata lock when the schema
+	// change is stopped is abandoned by the client with a context error, yet
+	// the server still completes it once the lock is released, so the table
+	// ends up in pending drops with nothing to say this attempt put it there.
+	// Recording first keeps the replay honest either way: if the RENAME never
+	// landed the source table still exists and is quarantined again, which
+	// overwrites the record; if it landed the recorded copy exists and the
+	// replay skips the table.
+	moved := pendingdrops.Destinations(tables, time.Now())
+	for _, table := range moved {
+		e.recordQuarantinedDrop(table)
+	}
+	if err := pendingdrops.MoveTablesTo(ctx, db, moved); err != nil {
 		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
 	}
 	for _, table := range moved {
-		e.recordQuarantinedDrop(table)
 		e.logger.Info("DROP TABLE intercepted: table quarantined in pending drops and recoverable until the retention period expires",
 			"database", table.SchemaName,
 			"table", table.TableName,
@@ -92,13 +103,19 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 
 // resolveMissingDropTarget decides what to do with a DROP TABLE target that is
 // no longer in the target database. The DROP phase replays from its first
-// statement when a stopped schema change resumes, so a table this schema
-// change already quarantined is found missing on the replay. That is the state
-// the plan asked for, with the data in pending drops, so it is skipped. IF
-// EXISTS tolerates any other missing table, as MySQL does. A missing table
-// this schema change never quarantined fails the statement: SchemaBot holds no
-// copy of it, and reporting the drop done would tell an operator the data is
-// recoverable when it is not.
+// statement when a stopped schema change resumes through the engine's own
+// Start, so a table this attempt already quarantined is found missing on the
+// replay. That is the state the plan asked for, with the data in pending
+// drops, so it is skipped. IF EXISTS tolerates any other missing table, as
+// MySQL does. A missing table this attempt never quarantined fails the
+// statement: SchemaBot holds no copy of it, and reporting the drop done would
+// tell an operator the data is recoverable when it is not.
+//
+// The record lives on the running schema change, in this process. A resume
+// that goes through Apply, on this server or another, starts with an empty
+// record; the driver plans that resume again against the live schema first,
+// so a table an earlier attempt quarantined is no longer in its diff and this
+// path never sees it.
 func (e *Engine) resolveMissingDropTarget(ctx context.Context, db *sql.DB, target dropTarget, ifExists bool) error {
 	logger := e.changeLogger()
 	if prior, ok := e.quarantinedDrop(target); ok {
@@ -107,11 +124,18 @@ func (e *Engine) resolveMissingDropTarget(ctx context.Context, db *sql.DB, targe
 			return fmt.Errorf("check recorded pending drops table `%s` exists: %w", prior.QuarantineTable, err)
 		}
 		if !exists {
+			// The record is written before the RENAME, so a missing copy means
+			// either that retention has removed a copy that did land or that
+			// the RENAME never landed and the table went missing some other
+			// way. Neither leaves SchemaBot holding the data, so the statement
+			// fails rather than report a drop that is final as recoverable.
 			return engine.OperatorErrorf(nil,
-				"DROP TABLE target `%s` does not exist and its recorded pending drops copy is no longer available",
-				target.table)
+				"DROP TABLE target `%s` does not exist and the pending drops copy this attempt recorded for it, `%s`.`%s`, is not present: "+
+					"either the pending drops retention period has removed it or the quarantine never completed. "+
+					"The drop is final and its data is not recoverable through SchemaBot; plan the schema change again against the live schema before resuming it, so a table that is already gone is not dropped again",
+				target.table, prior.QuarantineSchema, prior.QuarantineTable)
 		}
-		logger.Info("DROP TABLE target was already quarantined by this schema change, skipping quarantine",
+		logger.Info("DROP TABLE target was already quarantined by this attempt, skipping quarantine",
 			"database", target.schema,
 			"table", target.table,
 			"quarantine_database", prior.QuarantineSchema,
@@ -130,18 +154,27 @@ func (e *Engine) resolveMissingDropTarget(ctx context.Context, db *sql.DB, targe
 		return nil
 	}
 	return engine.OperatorErrorf(nil,
-		"DROP TABLE target `%s` does not exist and was not quarantined by this schema change",
+		"DROP TABLE target `%s` does not exist and was not quarantined by this attempt of the schema change",
 		target.table)
 }
 
-// recordQuarantinedDrop remembers that the running schema change moved a
+// recordQuarantinedDrop remembers that the running schema change is moving a
 // table into pending drops, so a replay of the DROP phase recognizes the
-// table as its own work rather than as a table that vanished.
+// table as its own work rather than as a table that vanished. The record is
+// keyed by the exact source schema and table names the DROP statement
+// carries, the same exact matching the differ applies to table names. A
+// replay re-parses the same statement text, so the key matches; a statement
+// edited between attempts to spell the name in a different case, which MySQL
+// treats as the same table under lower_case_table_names=1, misses the record
+// and takes the failing path.
 func (e *Engine) recordQuarantinedDrop(table pendingdrops.QuarantinedTable) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		// Only a concurrent Drain clears the tracked change while a
+		// quarantine is in flight. Losing the record is not a reason to fail
+		// the quarantine itself; the consequence is confined to a later replay.
 		e.logger.Warn("no running schema change to record quarantined table on; a replayed DROP phase will fail on this table",
 			"database", table.SchemaName,
 			"table", table.TableName,

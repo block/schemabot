@@ -330,9 +330,9 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 
 // HasAutoConfirmFlag reports whether the command carries the `-y` / `--yes`
 // flag. No comment command takes it: a comment has no prompt to skip, and the
-// gates that stop an apply — direct-execution changes, a discarded copy — stop
-// it because the operator has to see what they are consenting to, which a flag
-// cannot express. The dispatcher uses this to say so rather than accept the
+// gates that stop an apply — a discarded copy, a re-plan that differs from the
+// comment the operator was shown — stop it because the operator has to see
+// what they are consenting to, which a flag cannot express. The dispatcher uses this to say so rather than accept the
 // flag and ignore it, which would read as consent that was never recorded.
 // This is distinct from the CLI's own `-y` (`--auto-approve`), which skips an
 // interactive terminal prompt that genuinely exists.

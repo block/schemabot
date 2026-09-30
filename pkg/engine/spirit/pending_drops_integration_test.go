@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -447,6 +449,18 @@ func TestEngine_ResumeDropPhase_SkipsTableAlreadyQuarantined(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 
+	// The apply log is how an operator learns where a skipped table's data
+	// went, so the skip must reach it with the quarantine table name.
+	var applyLog struct {
+		mu    sync.Mutex
+		lines []string
+	}
+	eng.SetLogCallback(func(_ slog.Level, table, msg string) {
+		applyLog.mu.Lock()
+		defer applyLog.mu.Unlock()
+		applyLog.lines = append(applyLog.lines, table+": "+msg)
+	})
+
 	plan := []string{
 		"DROP TABLE `resume_quarantined_first`",
 		"DROP TABLE `resume_quarantined_second`",
@@ -464,6 +478,98 @@ func TestEngine_ResumeDropPhase_SkipsTableAlreadyQuarantined(t *testing.T) {
 	require.Len(t, quarantined, 2, "each table is quarantined exactly once: %v", quarantined)
 	assert.Contains(t, quarantined[0]+" "+quarantined[1], "_resume_quarantined_first")
 	assert.Contains(t, quarantined[0]+" "+quarantined[1], "_resume_quarantined_second")
+
+	var firstCopy string
+	for _, name := range quarantined {
+		if strings.HasSuffix(name, "_resume_quarantined_first") {
+			firstCopy = name
+		}
+	}
+	applyLog.mu.Lock()
+	defer applyLog.mu.Unlock()
+	assert.Contains(t, applyLog.lines,
+		fmt.Sprintf("resume_quarantined_first: table already quarantined as `%s`.`%s` earlier in this schema change; nothing left to quarantine",
+			pendingdrops.Database, firstCopy),
+		"the skip must tell the apply log where the table was quarantined: %v", applyLog.lines)
+}
+
+// A stop lands while the quarantine RENAME is waiting on a metadata lock. The
+// client abandons the statement with a context error, but the server still
+// completes the RENAME once the lock is released, so the table is in pending
+// drops although the first attempt never saw the RENAME succeed. The replayed
+// DROP must recognize that copy as this attempt's own work rather than fail on
+// a table it reports it never quarantined while the retention clock runs on
+// the copy.
+func TestEngine_ResumeDropPhase_StopDuringBlockedRename(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `stop_mid_rename` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create stop_mid_rename")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	eng := New(Config{Logger: slog.Default()})
+	eng.installRunningSchemaChange(&runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		host:     host,
+		username: username,
+		password: password,
+	})
+
+	// A READ lock held on another connection makes the RENAME wait for its
+	// exclusive metadata lock.
+	locker, err := db.Conn(t.Context())
+	require.NoError(t, err, "open locking connection")
+	t.Cleanup(func() {
+		cleanupCtx := context.WithoutCancel(t.Context())
+		_, _ = locker.ExecContext(cleanupCtx, "UNLOCK TABLES")
+		_ = locker.Close()
+	})
+	_, err = locker.ExecContext(t.Context(), "LOCK TABLES `stop_mid_rename` READ")
+	require.NoError(t, err, "lock stop_mid_rename")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	firstAttempt := make(chan error, 1)
+	go func() {
+		firstAttempt <- eng.quarantineDroppedTables(ctx, host, username, password, database, "DROP TABLE `stop_mid_rename`")
+	}()
+
+	waitFor(t, "the RENAME to block on the metadata lock", func() bool {
+		var waiting int
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE 'RENAME TABLE%stop_mid_rename%'").Scan(&waiting))
+		return waiting > 0
+	})
+	cancel()
+	require.Error(t, <-firstAttempt, "the stopped attempt must report that its RENAME did not complete")
+
+	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
+	require.NoError(t, err, "release the metadata lock")
+	waitFor(t, "the server-side RENAME to complete", func() bool {
+		exists, err := tableExistsInSchema(t.Context(), db, database, "stop_mid_rename")
+		require.NoError(t, err)
+		return !exists
+	})
+	require.Len(t, listQuarantinedTables(t, db), 1, "the stopped RENAME still quarantined the table")
+
+	err = eng.quarantineDroppedTables(t.Context(), host, username, password, database, "DROP TABLE `stop_mid_rename`")
+	require.NoError(t, err, "the replayed DROP must skip the table its own stopped attempt quarantined")
+	assert.Len(t, listQuarantinedTables(t, db), 1, "the replay must not quarantine the table a second time")
+}
+
+// waitFor polls condition until it holds or the deadline passes.
+func waitFor(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !condition() {
+		require.True(t, time.Now().Before(deadline), "timed out waiting for %s", what)
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // A resumed DROP phase reaches a table that is missing although this schema
@@ -504,7 +610,7 @@ func TestEngine_ResumeDropPhase_FailsOnMissingTableItNeverQuarantined(t *testing
 	}
 	state, reason := resumeStoppedDropPhase(t, eng, dsn, nil, plan)
 	assert.Equal(t, engine.StateFailed, state)
-	assert.Contains(t, reason, "`resume_vanished_first` does not exist and was not quarantined by this schema change")
+	assert.Contains(t, reason, "`resume_vanished_first` does not exist and was not quarantined by this attempt of the schema change")
 
 	var count int
 	err = db.QueryRowContext(t.Context(),
@@ -518,7 +624,8 @@ func TestEngine_ResumeDropPhase_FailsOnMissingTableItNeverQuarantined(t *testing
 
 // A replay record does not make a missing DROP target safe after retention has
 // removed the recorded pending drops copy. The engine fails closed rather than
-// reporting the table as recoverable.
+// reporting the table as recoverable, and the message names the copy it was
+// looking for, retention as the likely cause, and what unblocks the change.
 func TestEngine_ResumeDropPhase_FailsWhenRecordedCopyWasRemoved(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -546,5 +653,9 @@ func TestEngine_ResumeDropPhase_FailsWhenRecordedCopyWasRemoved(t *testing.T) {
 	message, ok := engine.OperatorMessageOf(err)
 	require.True(t, ok, "error must carry an operator message")
 	assert.Contains(t, message,
-		"DROP TABLE target `removed_copy` does not exist and its recorded pending drops copy is no longer available")
+		"DROP TABLE target `removed_copy` does not exist and the pending drops copy this attempt recorded for it, `"+
+			pendingdrops.Database+"`.`20260101000000_removed_copy`, is not present")
+	assert.Contains(t, message, "retention period has removed it")
+	assert.Contains(t, message, "plan the schema change again against the live schema before resuming it")
+	assert.Empty(t, listQuarantinedTables(t, db), "a failed replay must not quarantine anything")
 }

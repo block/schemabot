@@ -746,10 +746,19 @@ the PR. For each affected database and environment, SchemaBot stores an internal
 per-database record and then publishes or updates the aggregate check on the PR
 head SHA.
 
-If auto-plan finds changes, the internal records become `action_required` and
-the aggregate blocks. If auto-plan finds no changes, the records become
-`success` and the aggregate passes. Auto-plan skips the PR comment when every
-environment has no changes and no errors, but it still writes the check state.
+If auto-plan finds changes on any rollout member, the internal records become
+`action_required` and the aggregate blocks. If no member has changes, the
+records become `success` and the aggregate passes. Auto-plan skips the PR
+comment when no member in any environment has changes and nothing errored,
+but it still writes the check state.
+
+Two cases keep the comment even though no environment's reviewed plan has
+changes, because the reviewer needs to be told why the check is not passing. A
+deployment that diverged or could not be verified fails the check closed, and
+the comment explains the failure. A rollout of independent targets whose
+reviewed target is already at the desired schema, while another target is not,
+keeps the check pending (MG-12), and the comment is the only place that shows
+the plans those targets still need.
 
 ### PR touches no managed schema files
 
@@ -913,8 +922,16 @@ fails, it also publishes a failing aggregate check.
 ### Apply requested
 
 `schemabot apply -e <environment>` re-plans before acquiring a lock. If changes
-exist and pass safety checks, SchemaBot acquires a lock, posts a confirmation
-comment, stores `action_required`, and updates the aggregate.
+exist and pass safety checks, SchemaBot acquires a lock, stores
+`action_required`, updates the aggregate, posts the plan comment, and submits
+the apply in the same step. If storing `action_required` fails, nothing is
+submitted: SchemaBot releases the lock and posts an error, and the command can
+be retried. It pauses for `apply-confirm` instead, keeping the lock pinned to
+that plan, when applying would discard an unfinished copy, or when the plan it
+just stored cannot be read back for the drift check. The re-plan that runs just
+before submitting pauses it the same way when the DDL differs from the stored
+plan, or when it routes a change to direct execution that the stored plan did
+not.
 
 If the apply command finds no changes, SchemaBot plans the environment's other
 rollout members before answering. When none of them has work either, it posts a
@@ -935,11 +952,16 @@ The pinned plan is the only record of which environment the operator reviewed,
 so the confirmation is refused when that record cannot vouch for the command:
 
 - If the lock pins no plan SchemaBot can load, nothing is applied and the
-  comment asks for a fresh `schemabot apply -e <environment>`, which pins a new
-  plan.
+  comment asks for a fresh `schemabot apply -e <environment>`. That command
+  replaces the unloadable pin with a new plan and applies it in one step,
+  pausing for `apply-confirm` only when that plan needs confirmation, and it
+  answers to the environment ordering gate like any apply.
 - If the pinned plan was made for a different environment than `-e` names,
   nothing is applied; the comment gives the `apply-confirm` command for the
-  planned environment and the `apply` command for the requested one.
+  planned environment, which keeps the pinned plan, and says what the `apply`
+  command for the requested environment does instead: it drops the pinned
+  plan and plans and applies the requested environment in one step, subject
+  to the same ordering gate.
 - If a prior environment in the rollout order has pending changes again, the
   same block that stops `schemabot apply` stops the confirmation.
 

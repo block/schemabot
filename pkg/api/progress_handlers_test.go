@@ -223,3 +223,19 @@ func TestTableProgressResponseEncodesTarget(t *testing.T) {
 	require.Len(t, decoded.Tables, 1)
 	assert.Equal(t, "testapp-002", decoded.Tables[0].Target)
 }
+
+// Every engine the data plane can report has a display name, so a plan or
+// progress response never names its engine "Unknown".
+func TestEngineNameNamesEveryEngine(t *testing.T) {
+	want := map[ternv1.Engine]string{
+		ternv1.Engine_ENGINE_SPIRIT:      "Spirit",
+		ternv1.Engine_ENGINE_PLANETSCALE: "PlanetScale",
+		ternv1.Engine_ENGINE_STRATA:      "Strata",
+		ternv1.Engine_ENGINE_POSTGRES:    "PostgreSQL",
+	}
+	require.Len(t, want, len(ternv1.Engine_name), "every proto engine needs an expected display name here")
+	for value := range ternv1.Engine_name {
+		engine := ternv1.Engine(value)
+		assert.Equal(t, want[engine], engineName(engine), "engine %s", engine)
+	}
+}

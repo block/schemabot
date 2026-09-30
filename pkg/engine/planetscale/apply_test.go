@@ -840,13 +840,15 @@ type branchResumeClient struct {
 	psclient.PSClient
 	deployCalls int
 	lastDeploy  *ps.PerformDeployRequest
+	lastCreate  *ps.CreateDeployRequestRequest
 }
 
 func (c *branchResumeClient) GetBranch(_ context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
 	return &ps.DatabaseBranch{Name: req.Branch, Ready: true}, nil
 }
 
-func (c *branchResumeClient) CreateDeployRequest(_ context.Context, _ *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+func (c *branchResumeClient) CreateDeployRequest(_ context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.lastCreate = req
 	return &ps.DeployRequest{
 		Number:          77,
 		HtmlURL:         "https://app/dr/77",
@@ -912,6 +914,52 @@ func TestResumeApply_BranchResumeDecidesInstantDDLAndAnnouncesDecline(t *testing
 				assert.Contains(t, declines[0], "DROP COLUMN")
 				assert.Contains(t, declines[0], "revert window")
 			}
+		})
+	}
+}
+
+// A resume that creates the deploy request a crashed drive never created hands
+// the branch to that deploy request for deletion only when SchemaBot created
+// the branch. An apply run against an operator-supplied branch keeps that
+// branch after the deploy, exactly as a fresh drive would; a branch SchemaBot
+// generated is still deleted by the deploy request.
+func TestResumeApply_BranchResumeDeletesOnlySchemaBotBranch(t *testing.T) {
+	tests := []struct {
+		name           string
+		branch         string
+		options        map[string]string
+		wantAutoDelete bool
+	}{
+		{
+			name:           "an operator-supplied branch is kept after the deploy",
+			branch:         "my-dev-branch",
+			options:        map[string]string{"branch": "my-dev-branch"},
+			wantAutoDelete: false,
+		},
+		{
+			name:           "a branch SchemaBot generated is deleted by the deploy request",
+			branch:         "schemabot-testdb-crash",
+			options:        nil,
+			wantAutoDelete: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &branchResumeClient{}
+
+			req := resumeRequest(t, &psMetadata{BranchName: tt.branch}, "apply-1a2b3c4d5e6f7890")
+			req.Options = tt.options
+
+			result, err := e.resumeApply(t.Context(), client, "org", req)
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.True(t, result.Accepted)
+			require.NotNil(t, client.lastCreate)
+			assert.Equal(t, tt.branch, client.lastCreate.Branch)
+			assert.Equal(t, "main", client.lastCreate.IntoBranch)
+			assert.Equal(t, tt.wantAutoDelete, client.lastCreate.AutoDeleteBranch)
 		})
 	}
 }

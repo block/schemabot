@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -106,7 +107,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	// Disclose ignore_namespaces once per distinct resolution: entries resolve
 	// from config alone and differ between environments only when they use
-	// $ENV, so several environments usually share one notice.
+	// {env} or $ENV, so several environments usually share one notice.
 	disclosed := make(map[string]bool)
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]
@@ -226,14 +227,24 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		return
 	}
 
-	// Collect VSchema changes from metadata
+	// Collect VSchema changes from metadata, and the namespaces the engine
+	// asked to finalize: a finalize is work the apply runs, so a plan made only
+	// of finalizes must not read as "no changes". finalizeOnly holds those with
+	// no VSchema change to show; the summary counts the ones with no DDL either.
 	var vschemaChanges []templates.VSchemaChange
+	finalize := map[string]bool{}
+	finalizeOnly := map[string]bool{}
 	for _, sc := range result.Changes {
-		if sc.HasVSchemaChange() {
+		if sc.NeedsFinalizer() {
+			finalize[renderedNamespace(sc.Namespace, result.Database)] = true
+		}
+		if sc.ShowsVSchemaChange() {
 			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
 				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
 			})
+		} else if sc.NeedsFinalizer() {
+			finalizeOnly[renderedNamespace(sc.Namespace, result.Database)] = true
 		}
 	}
 
@@ -246,7 +257,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// the summary counts what the block shows — and for a sharded plan that is
 	// every distinct per-shard statement, the same set the PR comment counts.
 	tables := result.RenderedTables()
-	if len(tables) == 0 && len(vschemaChanges) == 0 {
+	if len(tables) == 0 && len(vschemaChanges) == 0 && len(finalizeOnly) == 0 {
 		templates.WriteNoChanges()
 		templates.WriteExemptTables(result.ExemptTables)
 		return
@@ -255,10 +266,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// Collect DDL changes (filter out internal Spirit tables), grouped by namespace
 	namespaceMap := make(map[string][]templates.DDLChange)
 	for _, tbl := range ddl.FilterInternalTablesTyped(tables) {
-		ns := tbl.Namespace
-		if ns == "" {
-			ns = result.Database
-		}
+		ns := renderedNamespace(tbl.Namespace, result.Database)
 		namespaceMap[ns] = append(namespaceMap[ns], templates.DDLChange{
 			ChangeType: tbl.ChangeType,
 			Namespace:  ns,
@@ -281,8 +289,8 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 
 	// Render DDL + VSchema changes grouped by namespace/keyspace
 	isVitess := state.IsPlanetScaleEngine(result.Engine)
-	if len(allChanges) > 0 || len(vschemaChanges) > 0 {
-		// Collect all namespaces (from DDL and VSchema)
+	if len(allChanges) > 0 || len(vschemaChanges) > 0 || len(finalizeOnly) > 0 {
+		// Collect all namespaces (from DDL, VSchema, and finalizes)
 		allNamespaces := make(map[string]bool)
 		for ns := range namespaceMap {
 			allNamespaces[ns] = true
@@ -290,12 +298,16 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		for _, vc := range vschemaChanges {
 			allNamespaces[vc.Keyspace] = true
 		}
+		for ns := range finalizeOnly {
+			allNamespaces[ns] = true
+		}
 
 		var nsChanges []templates.NamespaceChange
 		for ns := range allNamespaces {
 			nc := templates.NamespaceChange{
 				Namespace: ns,
 				Changes:   namespaceMap[ns],
+				Finalize:  finalize[ns],
 			}
 			if diff, ok := vsDiffByKS[ns]; ok {
 				nc.VSchemaChanged = true
@@ -319,10 +331,17 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteLintViolations(lintViolations)
 	}
 
-	// Write summary
+	// Write summary. A namespace with DDL finalizes as part of that work, so
+	// only a finalize that is the namespace's only work is counted.
+	finalizes := 0
+	for ns := range finalizeOnly {
+		if len(namespaceMap[ns]) == 0 {
+			finalizes++
+		}
+	}
 	switch {
-	case len(vschemaChanges) > 0:
-		templates.WritePlanSummaryWithVSchema(allChanges, vschemaChanges)
+	case len(vschemaChanges) > 0 || finalizes > 0:
+		templates.WritePlanSummaryWithKeyspaceUpdates(allChanges, vschemaChanges, finalizes)
 	default:
 		templates.WritePlanSummary(allChanges)
 	}
@@ -372,13 +391,23 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	for _, tbl := range result.RenderedTables() {
 		ddls = append(ddls, tbl.DDL)
 	}
-	var vschemas []string
+	namespacesWithDDL := map[string]bool{}
+	for _, tbl := range ddl.FilterInternalTablesTyped(result.RenderedTables()) {
+		namespacesWithDDL[renderedNamespace(tbl.Namespace, result.Database)] = true
+	}
+	// A finalize beside DDL or a VSchema change renders as that work alone, so
+	// only a finalize that is its namespace's only work distinguishes one
+	// plan's output from another.
+	var vschemas, finalizes []string
 	for _, sc := range result.Changes {
-		if sc.HasVSchemaChange() {
+		if sc.ShowsVSchemaChange() {
 			vschemas = append(vschemas, sc.Namespace+":"+sc.Metadata[apitypes.VSchemaDiffMetadataKey])
 		}
+		if sc.NeedsFinalizer() && !sc.ShowsVSchemaChange() && !namespacesWithDDL[renderedNamespace(sc.Namespace, result.Database)] {
+			finalizes = append(finalizes, sc.Namespace)
+		}
 	}
-	if len(ddls) == 0 && len(vschemas) == 0 {
+	if len(ddls) == 0 && len(vschemas) == 0 && len(finalizes) == 0 {
 		return "no-changes"
 	}
 
@@ -393,14 +422,25 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	// Sort to make the fingerprint order-independent
 	sort.Strings(ddls)
 	sort.Strings(vschemas)
+	finalizes = slices.Compact(slices.Sorted(slices.Values(finalizes)))
 	sort.Strings(exempt)
 
 	data, _ := json.Marshal(struct {
-		DDLs     []string `json:"ddls"`
-		VSchemas []string `json:"vschemas"`
-		Exempt   []string `json:"exempt"`
-	}{ddls, vschemas, exempt})
+		DDLs      []string `json:"ddls"`
+		VSchemas  []string `json:"vschemas"`
+		Finalizes []string `json:"finalizes"`
+		Exempt    []string `json:"exempt"`
+	}{ddls, vschemas, finalizes, exempt})
 	return string(data)
+}
+
+// renderedNamespace is the namespace a plan's output lists a change under: a
+// change with no namespace belongs to the database itself.
+func renderedNamespace(namespace, database string) string {
+	if namespace == "" {
+		return database
+	}
+	return namespace
 }
 
 // OutputPlanResult prints the plan result in a format similar to PR comments.

@@ -70,10 +70,16 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
 **A resumed schema change does not quarantine a table twice.** Before resuming,
 SchemaBot plans again against the live schema. A table an earlier attempt moved
 into `_pending_drops` is no longer part of the diff, so its completed DROP is
-not sent to the engine again. If the engine replays a stopped DROP phase on the
-same server, it also verifies that its recorded pending drops copy still exists
-before skipping the missing source table. Any other missing table still fails
-unless the statement says `IF EXISTS`.
+not sent to the engine again. If the engine replays a stopped DROP phase in the
+same process, through its own start path, it skips a missing source table only
+when this attempt recorded moving that table and the recorded copy still
+exists. The record is written before the rename is issued, so a rename the
+server completes after a stop has abandoned it is still recognized on the
+replay. The record does not outlive the process; a resume on another server
+relies on the re-plan above. Any other missing table still fails unless the
+statement says `IF EXISTS`, and a recorded copy that retention has since
+removed fails too: the drop is final, and the message says so and asks for the
+schema change to be planned again against the live schema.
 
 **Cancelling a schema change quarantines its copy too.** A cancelled change
 leaves a shadow table holding every row copied so far, and — if it had already

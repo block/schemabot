@@ -44,6 +44,58 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
 }
 
+// An engine's namespace-level metadata reaches the plan comment's keyspace
+// data: the VSchema change and its diff, and the finalize. A VSchema change the
+// engine generates from the DDL and finalizes carries only the finalize, and
+// a namespace that carries only DDL gets neither.
+func TestSetNamespaceWork_CarriesVSchemaAndFinalizeMetadata(t *testing.T) {
+	var generated templates.KeyspaceChangeData
+	setNamespaceWork(&generated, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaChangedMetadataKey:       "true",
+		apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+		apitypes.NeedsFinalizerMetadataKey:       "true",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{Finalize: true}, generated)
+
+	var generatedUnfinalized templates.KeyspaceChangeData
+	setNamespaceWork(&generatedUnfinalized, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaChangedMetadataKey:       "true",
+		apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{VSchemaChanged: true}, generatedUnfinalized, "with no finalize to show, the VSchema change stays visible")
+
+	var diffed templates.KeyspaceChangeData
+	setNamespaceWork(&diffed, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaDiffMetadataKey: "+    \"refunds\": {}",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{VSchemaChanged: true, VSchemaDiff: "+    \"refunds\": {}"}, diffed)
+
+	var ddlOnly templates.KeyspaceChangeData
+	setNamespaceWork(&ddlOnly, &apitypes.SchemaChangeResponse{Namespace: "payments_001"})
+	assert.Equal(t, templates.KeyspaceChangeData{}, ddlOnly)
+}
+
+// A rollback that recreates a table the forward apply dropped also updates the
+// keyspace's VSchema entries from the DDL alone, so the rollback comment
+// carries the keyspace's DDL and finalize with no VSchema change, as the plan
+// comment would.
+func TestRollbackKeyspaceChanges_CarriesNamespaceWork(t *testing.T) {
+	got := rollbackKeyspaceChanges([]*apitypes.SchemaChangeResponse{{
+		Namespace:    "payments_001",
+		TableChanges: []*apitypes.TableChangeResponse{{TableName: "refund_notes", DDL: refundNotesDDL, ChangeType: "CREATE"}},
+		Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey:       "true",
+			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+			apitypes.NeedsFinalizerMetadataKey:       "true",
+		},
+	}})
+	assert.Equal(t, []templates.KeyspaceChangeData{{
+		Keyspace:   "payments_001",
+		Statements: []string{refundNotesDDL},
+		Finalize:   true,
+	}}, got)
+}
+
 // A divergent sharded plan, including a malformed shard row with no DDL,
 // must produce the same UX-6 totals in the CLI and PR comment selections.
 func TestPlanSummarySelectionsAgreeForDivergentShards(t *testing.T) {
