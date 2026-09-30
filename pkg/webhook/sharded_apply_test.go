@@ -23,11 +23,15 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running,
 		Caller: "github:morgo@block/example#11890",
 	}
-	op := &storage.ApplyOperation{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/-40/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
-	oid := int64(1)
-	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER TABLE `mutes` ADD INDEX a"}}
+	var ops []*storage.ApplyOperation
+	var tasks []*storage.Task
+	for i, shard := range []string{"-80", "80-"} {
+		oid := int64(i + 1)
+		ops = append(ops, &storage.ApplyOperation{ID: oid, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/" + shard + "/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt})
+		tasks = append(tasks, &storage.Task{ID: oid, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: shard, DDL: "ALTER TABLE `mutes` ADD INDEX a"})
+	}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "")
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "")
 
 	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
@@ -759,4 +763,99 @@ func TestShardedCommentShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 
 	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, finalizers, "")
 	assert.NotContains(t, body, "VSchema")
+}
+
+// singleShardStrataApply is a Strata apply of one CREATE TABLE on a keyspace
+// with one shard, which the engine finalizes beside the DDL: one shard work
+// operation and one finalizer operation, as the data plane fans it out.
+func singleShardStrataApply(applyState, workState, finalizerState string) (*storage.Apply, []*storage.ApplyOperation, []*storage.Task) {
+	started := time.Unix(1700000000, 0).UTC()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-s1", Database: "shop", Environment: "staging", Engine: storage.EngineStrata,
+		DatabaseType: storage.DatabaseTypeStrata, State: applyState, Caller: "octocat", StartedAt: &started,
+	}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "shop_001/-/orders", State: workState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{ID: 2, ApplyID: 1, Deployment: "cake", OperationKey: "shop_001/group_finalizer", State: finalizerState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+	}
+	oid := int64(1)
+	taskState := state.Task.Running
+	if state.IsState(workState, state.ApplyOperation.Completed) {
+		taskState = state.Task.Completed
+	}
+	tasks := []*storage.Task{{
+		ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "shop_001", TableName: "orders", Shard: "-",
+		DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", State: taskState,
+	}}
+	return apply, ops, tasks
+}
+
+// finalizesOnly is the stored plan's verdict that the keyspace's finalize has
+// no VSchema change to show.
+func finalizesOnly(keyspace string) *shardedFinalizerPlan {
+	return &shardedFinalizerPlan{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{keyspace: true}}
+}
+
+// A Strata apply on a keyspace with one shard and no VSchema change to show
+// reads like a MySQL apply: its status comment shows the table's progress and
+// DDL under its keyspace, and its summary lists the applied DDL, with no shard
+// counts and no finalize section.
+func TestFormatApplyComment_SingleShardStrataReadsLikeMySQL(t *testing.T) {
+	apply, ops, tasks := singleShardStrataApply(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
+	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "")
+	assert.Contains(t, status, "**Keyspace `shop_001`**")
+	assert.Contains(t, status, "CREATE TABLE `orders`")
+	assert.NotContains(t, status, "**Shards**:")
+	assert.NotContains(t, status, "Finalize")
+
+	apply, ops, tasks = singleShardStrataApply(state.Apply.Completed, state.ApplyOperation.Completed, state.ApplyOperation.Completed)
+	summary := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "")
+	assert.Contains(t, summary, "Apply details (1 table)")
+	assert.Contains(t, summary, "CREATE TABLE `orders`")
+	assert.NotContains(t, summary, "**Shards**:")
+	assert.NotContains(t, summary, "Finalize")
+}
+
+// A finalize is not shown beside the keyspace's DDL, but when it fails it is
+// what failed the apply, so the single-shard comment still names its error.
+func TestFormatApplySummaryComment_SingleShardStrataShowsAFailedFinalize(t *testing.T) {
+	const finalizeErr = "apply VSchema for shop_001: keyspace not found"
+	apply, ops, tasks := singleShardStrataApply(state.Apply.Failed, state.ApplyOperation.Completed, state.ApplyOperation.Failed)
+	ops[1].ErrorMessage = finalizeErr
+
+	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "")
+
+	assert.Contains(t, out, finalizeErr)
+	assert.Contains(t, out, "CREATE TABLE `orders`")
+	assert.NotContains(t, out, "**Shards**:")
+}
+
+// Only an apply whose every keyspace runs on one shard, with each finalize
+// sitting beside that keyspace's DDL and no VSchema change to show, renders
+// like a MySQL apply. Anything the single-deployment layout cannot render
+// keeps the shard layout.
+func TestRendersAsSingleShard(t *testing.T) {
+	work := func(key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{Deployment: "cake", OperationKey: key}
+	}
+	cases := []struct {
+		name       string
+		ops        []*storage.ApplyOperation
+		finalizers *shardedFinalizerPlan
+		want       bool
+	}{
+		{"one shard beside its finalize", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, finalizesOnly("ks"), true},
+		{"one shard, several tables", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/-/users")}, nil, true},
+		{"one shard in each of two keyspaces", []*storage.ApplyOperation{work("ks1/-/orders"), work("ks2/-/users")}, nil, true},
+		{"a keyspace across two shards", []*storage.ApplyOperation{work("ks/-80/orders"), work("ks/80-/orders")}, nil, false},
+		{"a VSchema change to show", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, &shardedFinalizerPlan{}, false},
+		{"an unreadable stored plan", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, nil, false},
+		{"a keyspace whose only work is its finalize", []*storage.ApplyOperation{work("ks1/-/orders"), work("ks2/group_finalizer")}, finalizesOnly("ks2"), false},
+		{"no shard work", nil, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, rendersAsSingleShard(tc.ops, tc.finalizers))
+		})
+	}
 }

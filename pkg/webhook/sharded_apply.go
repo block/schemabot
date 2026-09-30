@@ -135,7 +135,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 					Diff:      finalizers.vschemaDiff(finalizerNS),
 				})
 			}
-			if finalizerError == "" && isFinalizerFailureState(op.State) && op.ErrorMessage != "" {
+			if finalizerError == "" && isOperationFailureState(op.State) && op.ErrorMessage != "" {
 				finalizerError = op.ErrorMessage
 			}
 			continue
@@ -308,7 +308,7 @@ func vschemaStatusForOperationState(applyState, opState string) string {
 		return "applied"
 	case state.IsState(opState, state.ApplyOperation.Running):
 		return "applying"
-	case isFinalizerFailureState(opState):
+	case isOperationFailureState(opState):
 		return "failed"
 	case state.IsState(opState, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted):
 		return "cancelled"
@@ -321,10 +321,10 @@ func vschemaStatusForOperationState(applyState, opState string) string {
 	}
 }
 
-// isFinalizerFailureState reports whether a finalizer operation's state carries
+// isOperationFailureState reports whether an operation's state carries
 // an operator-facing error — a terminal failure or an automatic retry after
 // one, mirroring the shard-failure vocabulary.
-func isFinalizerFailureState(opState string) bool {
+func isOperationFailureState(opState string) bool {
 	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
@@ -628,4 +628,69 @@ func shardStateRank(s string) int {
 	default:
 		return 3
 	}
+}
+
+// rendersAsSingleShard reports whether a sharded apply reads as one change on
+// one database, so its comments take the single-deployment layout, with its
+// progress bars and DDL, instead of the shard rollup. That holds when every
+// keyspace with shard work runs on exactly one shard and every finalizer only
+// finalizes a keyspace beside its DDL, with no VSchema change to show. A
+// keyspace fanned out across shards, a VSchema change, a keyspace whose only
+// work is its finalize, and a stored plan that could not be read (nil
+// finalizers) all keep the shard layout, which is the one that renders them.
+func rendersAsSingleShard(ops []*storage.ApplyOperation, finalizers *shardedFinalizerPlan) bool {
+	shardsByKeyspace := make(map[string]map[string]bool)
+	var finalizerKeyspaces []string
+	for _, op := range ops {
+		if ns, shard, _, ok := parseShardOperationKey(op.OperationKey); ok {
+			if shardsByKeyspace[ns] == nil {
+				shardsByKeyspace[ns] = make(map[string]bool)
+			}
+			shardsByKeyspace[ns][shard] = true
+			continue
+		}
+		if ns, ok := parseFinalizerOperationKey(op.OperationKey); ok {
+			finalizerKeyspaces = append(finalizerKeyspaces, ns)
+		}
+	}
+	for _, shards := range shardsByKeyspace {
+		if len(shards) != 1 {
+			return false
+		}
+	}
+	for _, ns := range finalizerKeyspaces {
+		if shardsByKeyspace[ns] == nil || !finalizers.finalizesOnly(ns) {
+			return false
+		}
+	}
+	return len(shardsByKeyspace) > 0
+}
+
+// buildSingleShardApplyCommentData maps a sharded apply that rendersAsSingleShard
+// onto the single-deployment comment data: the shard operations' tables and the
+// lone shard operation's display projection when there is one. A finalize
+// beside a keyspace's DDL is not shown, the same as in the plan. When the apply
+// row carries no failure cause, the most significant operation's error stands
+// in for it, falling back to that operation's task error as the shard layout
+// does, so a failed shard or finalizer still says why. The per-shard summary is
+// left out, since each keyspace has only one shard.
+func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, tenant string) templates.ApplyStatusCommentData {
+	tasksByOp := groupTasksByOperation(tasks)
+	var workTasks []*storage.Task
+	var workOps []*storage.ApplyOperation
+	for _, op := range ops {
+		if _, _, _, ok := parseShardOperationKey(op.OperationKey); ok {
+			workOps = append(workOps, op)
+			workTasks = append(workTasks, tasksByOp[op.ID]...)
+		}
+	}
+	sort.Slice(workTasks, func(i, j int) bool { return workTasks[i].ID < workTasks[j].ID })
+
+	data := buildApplyCommentData(apply, workTasks, singleOpDisplay(workOps, displayByOp), nil, tenant)
+	if data.ErrorMessage == "" {
+		if opState, errMsg := aggregateShardState(ops, tasksByOp); isOperationFailureState(opState) {
+			data.ErrorMessage = errMsg
+		}
+	}
+	return data
 }
