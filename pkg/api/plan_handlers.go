@@ -1718,12 +1718,17 @@ func (s *Service) createStoredApply(
 	// nothing about that member's — and the tasks built below come from the
 	// member's. Members that run the apply's plan re-clear the same checks here,
 	// which is a no-op rather than a second verdict.
+	//
+	// A member's direct-execution verdict is not refused, whether or not the
+	// reviewed plan has work. It is the verdict of the target that runs the
+	// statement (RV-4). Member plans are written only by a pull request review,
+	// and a pull request apply runs them only from apply-confirm on the comment
+	// disclosing each target's direct changes under that target, after
+	// re-checking each target's statements and execution modes against the
+	// confirmed round. So a member's task carries its own verdict, as disclosed.
 	names := applyMemberDisplayNames(members)
 	for i, member := range members {
 		if err := rejectUnapplyableMemberPlan(member, names[i], plan, applyOpts); err != nil {
-			return nil, 0, err
-		}
-		if err := rejectMemberDirectExecution(member, plan); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -1903,30 +1908,6 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q", unsafe[0].Namespace)
 	}
 	return ""
-}
-
-// rejectMemberDirectExecution refuses a member planned on its own whose plan
-// runs direct-execution DDL, in an apply whose reviewed plan has work of its
-// own. A member running the apply's plan runs exactly the statements the
-// reviewed plan's disclosure names. An apply whose reviewed plan is empty runs
-// only the members' own plans, from a confirmation of the comment that
-// discloses each member's direct changes under the member that runs it, with
-// each member's statements and execution modes re-checked at confirm, so a
-// member's direct change runs there.
-func rejectMemberDirectExecution(member applyMember, applyPlan *storage.Plan) error {
-	if member.Plan == applyPlan {
-		return nil
-	}
-	if !applyPlan.HasWork() {
-		return nil
-	}
-	for _, change := range member.Plan.FlatDDLChanges() {
-		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
-			return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, which the reviewed plan's disclosure does not name: it discloses no other target's statements",
-				member.MemberID(), member.Plan.PlanIdentifier, change.Table)
-		}
-	}
-	return nil
 }
 
 // rejectMemberUndisclosedUnsafe refuses a member planned on its own whose plan
@@ -2220,20 +2201,16 @@ func memberWorkOutsideShape(memberPlan, applyPlan *storage.Plan, shape operation
 
 // MemberWorkTheReviewedPlanCannotRun describes the first thing in a member's
 // own plan that apply creation refuses when the apply is created from reviewed,
-// or returns "" when there is none: a blocked change, direct-execution DDL, an
-// unsafe change the reviewed plan's disclosure does not name, or work the
-// apply's shape has no place for. It asks what createStoredApply asks of each
-// member, so a caller can refuse before it pins a confirmation that apply
-// creation would refuse. The description names only tables, namespaces, and
-// the apply's shape, so it is fit for a PR comment.
+// or returns "" when there is none: a blocked change, an unsafe change the
+// reviewed plan's disclosure does not name, or work the apply's shape has no
+// place for. It asks what createStoredApply asks of each member, so a caller
+// can refuse before it pins a confirmation that apply creation would refuse. A
+// member's direct-execution change is not among them: the comment discloses it
+// under the target that runs it. The description names only tables,
+// namespaces, and the apply's shape, so it is fit for a PR comment.
 func MemberWorkTheReviewedPlanCannotRun(reviewed, member *storage.Plan) string {
 	if member.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
-	}
-	for _, change := range member.FlatDDLChanges() {
-		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
-			return fmt.Sprintf("runs table %q as direct-execution DDL", change.Table)
-		}
 	}
 	if reason := UndisclosedMemberUnsafeChange(reviewed, member); reason != "" {
 		return reason
