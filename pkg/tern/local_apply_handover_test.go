@@ -251,7 +251,8 @@ func TestExecuteApplySequential_StartsNoFurtherTaskUntilTheTerminalWriteLands(t 
 				logger: slog.Default(),
 			}
 
-			client.executeApplySequential(t.Context(), apply, []*storage.Task{first, second}, &storage.Plan{}, nil)
+			require.NoError(t, client.executeApplySequential(t.Context(), apply, []*storage.Task{first, second}, &storage.Plan{}, nil),
+				"a refused task write ends the drive as a hand-back, not a drive error")
 
 			storedApply, err := applies.Get(t.Context(), apply.ID)
 			require.NoError(t, err)

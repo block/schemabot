@@ -336,7 +336,8 @@ func TestPollForCompletionAtomic_LostWorkSettlementRefusedByLeaseLossExits(t *te
 			st := client.storage.(*exactProgressStorage)
 			st.tasks = refusing
 
-			client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+			require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false),
+				"a drive displaced by lease loss hands the apply back without an error")
 
 			// The ticks inside the trust budget still project the tasks' own
 			// in-flight state onto the apply; what a displaced driver must never
