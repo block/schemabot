@@ -503,10 +503,9 @@ func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, l
 // it has does. The sentence leads the footer, ahead of the command, because a
 // code block is copied from its copy button and the eye does not travel past
 // it. It names no command, so one sentence covers a footer that offers two and
-// cannot disagree with the command it qualifies. It says what the commands
-// address rather than what they change, because the effect is not always
-// rollout-wide: a cutover lands only on the members ready for it. It stops
-// being needed when control commands can address one member.
+// cannot disagree with the command it qualifies. Cutover footers do not carry
+// it, because one cutover lands on one member rather than on the whole
+// rollout. It stops being needed when control commands can address one member.
 func writeRolloutWideControlScope(sb *strings.Builder, data ApplyStatusCommentData) {
 	if !data.RolloutWide {
 		return
@@ -1395,11 +1394,14 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 // explanatory guidance pointing at the right next step.
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
+	// Cutover footers carry no rollout scope sentence: a cutover lands on one
+	// member rather than on the whole rollout, so the sentence would overstate
+	// what the command does.
 	case state.Apply.WaitingForDeploy:
-		writeMemberFooterAction(sb, data, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.WaitingForCutover:
 		if data.DeferCutover {
-			writeMemberFooterAction(sb, data, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+			writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 		} else {
 			sb.WriteString("\n---\n\n")
 			sb.WriteString("SchemaBot triggers cutover automatically — no action needed.\n")
