@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
@@ -267,7 +268,7 @@ func targetTableSizes(rollup api.PlanRollup, logAttrs ...any) []templates.Target
 					continue
 				}
 				ddls := append([]string{tc.GetDdl()}, shardDDL[ref]...)
-				if !tableCostScalesWithSize(e.DatabaseType, ddls, tableAttrs...) {
+				if !ddl.TableCostScalesWithSize(e.DatabaseType, ddls, tableAttrs...) {
 					slog.Debug("table's changes on this target are metadata-only; it gets no size line", tableAttrs...)
 					continue
 				}
