@@ -863,8 +863,10 @@ type PlanRolloutResponse struct {
 // PlanMemberTableSizeResponse is one rollout member's plan-time size estimate
 // for one table its plan changes.
 type PlanMemberTableSizeResponse struct {
-	// Target is the member's operator-facing name, as Groups name it.
-	Target    string `json:"target"`
+	// Member is the member's operator-facing display name, as Groups and
+	// Attention name it: the deployment alone for a single-target deployment,
+	// deployment/target when a deployment addresses several targets.
+	Member    string `json:"member"`
 	Namespace string `json:"namespace"`
 	Table     string `json:"table"`
 	// EstimatedBytes is the table's approximate on-disk footprint (data plus

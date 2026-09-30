@@ -266,7 +266,7 @@ func memberTableSizes(member string, e DeploymentRollupEntry) []*apitypes.PlanMe
 			}
 			listed[ref] = true
 			sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{
-				Target:         member,
+				Member:         member,
 				Namespace:      ref.namespace,
 				Table:          ref.table,
 				EstimatedBytes: tc.EstimatedBytes,

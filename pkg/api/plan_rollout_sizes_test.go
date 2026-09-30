@@ -48,7 +48,7 @@ func TestPlanRolloutResponse_ListsEachMembersOwnTableSizes(t *testing.T) {
 	assert.Equal(t, []string{"prod/orders-001", "prod/orders-002"}, resp.Groups[0].Members)
 	large, small := int64(310_000_000_000), int64(41_000_000_000)
 	assert.Equal(t, []*apitypes.PlanMemberTableSizeResponse{
-		{Target: "prod/orders-001", Namespace: "ns_0", Table: "orders", EstimatedBytes: &large},
-		{Target: "prod/orders-002", Namespace: "ns_0", Table: "orders", EstimatedBytes: &small},
+		{Member: "prod/orders-001", Namespace: "ns_0", Table: "orders", EstimatedBytes: &large},
+		{Member: "prod/orders-002", Namespace: "ns_0", Table: "orders", EstimatedBytes: &small},
 	}, resp.TableSizes)
 }

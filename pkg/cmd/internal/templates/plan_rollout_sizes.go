@@ -55,7 +55,7 @@ func FormatRolloutTableSizes(noun presentation.Noun, sizes []*apitypes.PlanMembe
 	}
 	members := make(map[string]bool)
 	for _, s := range sizes {
-		members[s.Target] = true
+		members[s.Member] = true
 	}
 	label := noun.Plural
 	if len(members) == 1 {
@@ -121,11 +121,11 @@ func formatRolloutTableSize(noun presentation.Noun, t rolloutTableSize) string {
 	sized, total := t.sized()
 	switch {
 	case len(sized) == 0 && members == 1:
-		return "size estimate unavailable on " + t.perMember[0].Target
+		return "size estimate unavailable on " + t.perMember[0].Member
 	case len(sized) == 0:
 		return fmt.Sprintf("size estimate unavailable on all %d %s", members, noun.Plural)
 	case members == 1:
-		return fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), t.perMember[0].Target)
+		return fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), t.perMember[0].Member)
 	}
 	largest, smallest := sized[0], sized[0]
 	for _, s := range sized[1:] {
@@ -142,7 +142,7 @@ func formatRolloutTableSize(noun presentation.Noun, t rolloutTableSize) string {
 	}
 	parts := []string{
 		totalClause,
-		fmt.Sprintf("largest %s on %s", ui.FormatApproxBytes(*largest.EstimatedBytes), largest.Target),
+		fmt.Sprintf("largest %s on %s", ui.FormatApproxBytes(*largest.EstimatedBytes), largest.Member),
 		"smallest " + ui.FormatApproxBytes(*smallest.EstimatedBytes),
 	}
 	if unsized := members - len(sized); unsized > 0 {

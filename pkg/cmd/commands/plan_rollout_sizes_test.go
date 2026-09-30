@@ -29,10 +29,10 @@ func TestWritePlanBody_TwelveTargetRolloutShowsTableSizes(t *testing.T) {
 		case "orders-001":
 			bytes = 41_000_000_000
 		}
-		sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{Target: target, Namespace: "ns_0", Table: "orders", EstimatedBytes: &bytes})
+		sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{Member: target, Namespace: "ns_0", Table: "orders", EstimatedBytes: &bytes})
 	}
 	refunds := int64(2_500_000_000)
-	sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{Target: "orders-003", Namespace: "ns_0", Table: "refunds", EstimatedBytes: &refunds})
+	sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{Member: "orders-003", Namespace: "ns_0", Table: "refunds", EstimatedBytes: &refunds})
 
 	plan := &apitypes.PlanResponse{
 		Database: "orders",
@@ -75,9 +75,9 @@ func TestWritePlanBody_RolloutTableSizesCountMissingEstimates(t *testing.T) {
 				{Members: []string{"orders-001", "orders-002", "orders-003"}, Primary: true, Changes: addColumnTo("region")},
 			},
 			TableSizes: []*apitypes.PlanMemberTableSizeResponse{
-				{Target: "orders-001", Namespace: "ns_0", Table: "orders", EstimatedBytes: &small},
-				{Target: "orders-002", Namespace: "ns_0", Table: "orders", EstimatedBytes: &large},
-				{Target: "orders-003", Namespace: "ns_0", Table: "orders"},
+				{Member: "orders-001", Namespace: "ns_0", Table: "orders", EstimatedBytes: &small},
+				{Member: "orders-002", Namespace: "ns_0", Table: "orders", EstimatedBytes: &large},
+				{Member: "orders-003", Namespace: "ns_0", Table: "orders"},
 			},
 		},
 	}
