@@ -1611,11 +1611,15 @@ A request names a database and an environment. It never names the place those re
 target and which deployment stand behind that name, and therefore which physical database is
 changed and with whose credentials, comes from configuration the server owns. A plan request and
 an apply request have no field for it, so a caller cannot supply one, and a caller who is wrong
-about the topology cannot be wrong in a way that lands anywhere.
+about the topology cannot be wrong in a way that lands anywhere. A request may select one rollout
+member of the environment by name, but the server resolves that name against the members its own
+configuration defines, and a name it does not define is refused.
 
 That route is resolved once, when the plan is made, and stored on the plan. The apply reads it
 back off the plan rather than resolving the name a second time, so configuration that changes
-between review and apply cannot quietly move the change to a different database. A plan missing
+between review and apply cannot quietly move the change to a different database. An apply that
+selects a member resolves the selection only to hold it against the plan's stored route, and is
+refused when the two differ. A plan missing
 its stored route is not re-resolved as a convenience: the apply is refused and asks for a fresh
 plan, because re-resolving is exactly the step that could produce a different answer than the one
 the operator reviewed.
@@ -1625,7 +1629,8 @@ it count as a source for a database only because server config says so, verified
 made and verified again before the apply runs. Config that cannot answer the question is a
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
 to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
-allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), the PostgreSQL
+allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), rollout member
+selection (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
 apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 

@@ -64,13 +64,19 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// Generate owner for locking (used later if we have changes to apply)
 	owner := client.GenerateCLIOwner()
 
-	// Check for existing active schema change
+	// Check for existing active schema change. The preflight asks about the
+	// whole database and environment, but a targeted apply reserves only its
+	// member's deployment, and one running on another deployment does not
+	// conflict with it. So a targeted apply leaves the conflict to the server's
+	// deployment reservation, which knows the member it resolves to.
 	var active *client.ActiveSchemaChange
-	err = withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
-		var checkErr error
-		active, checkErr = client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
-		return checkErr
-	})
+	if cmd.Target == "" {
+		err = withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
+			var checkErr error
+			active, checkErr = client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
+			return checkErr
+		})
+	}
 	if err != nil {
 		// Ignore status preflight errors; apply is still guarded server-side.
 	} else if active != nil && active.State != "" {
@@ -146,6 +152,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// Check if there are any changes (DDL or VSchema)
 	if !planResult.HasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")
+		writeNarrowedTo(planResult)
 		// Apply returns here without rendering a plan body, so this is the one
 		// place an operator whose target has nothing to reconcile learns which
 		// live tables the plan was not shown. Every other path reaches the
@@ -158,7 +165,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Check for unsafe changes
 	if len(planResult.UnsafeChanges()) > 0 && !cmd.AllowUnsafe {
-		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir)
+		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target)
 	}
 
 	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
@@ -481,13 +488,21 @@ func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
 }
 
 // blockUnsafeApply displays the plan and an error when unsafe changes are detected without --allow-unsafe.
-func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir string) error {
+// A plan narrowed to one rollout member keeps its target in the retry command,
+// so following the advice re-runs the change on that member and not across the
+// whole rollout.
+func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string) error {
 	// First show the plan so user can see what changes are proposed
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
+	writeNarrowedTo(planResult)
 
 	// Then show the unsafe changes warning
 	unsafeChanges := planResult.UnsafeChanges()
-	templates.WriteUnsafeChangesBlocked(unsafeChanges, fmt.Sprintf("apply -s %s -e %s --allow-unsafe", schemaDir, environment))
+	retry := fmt.Sprintf("apply -s %s -e %s", schemaDir, environment)
+	if target != "" {
+		retry += " --target " + target
+	}
+	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry+" --allow-unsafe")
 	return ErrSilent
 }
 

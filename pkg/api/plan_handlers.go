@@ -1304,6 +1304,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		if _, ok := errors.AsType[*PlanMemberMismatchError](err); ok {
+			s.logger.Warn("apply rejected because its plan was made for a different rollout member than the apply would run on", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
 		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "apply failed: "+err.Error())
 		return
@@ -1892,6 +1897,16 @@ func (s *Service) applyTargets(plan *storage.Plan, req ApplyRequest) ([]routing.
 		if err != nil {
 			return nil, err
 		}
+		if !planIsForMember(plan, member) {
+			return nil, &PlanMemberMismatchError{
+				Database:    plan.Database,
+				Environment: req.Environment,
+				PlanID:      plan.PlanIdentifier,
+				PlanMember:  planMemberID(plan),
+				ApplyMember: member.MemberID(),
+				Narrowed:    true,
+			}
+		}
 		s.logger.Info("apply narrowed to one rollout member; the rest of the rollout is not touched",
 			"plan_id", plan.PlanIdentifier,
 			"database", plan.Database,
@@ -1926,18 +1941,53 @@ func (s *Service) applyTargets(plan *storage.Plan, req ApplyRequest) ([]routing.
 		return targets, nil
 	}
 	if !planIsForMember(plan, resolved[0]) {
-		return nil, fmt.Errorf("apply for %s/%s runs the whole rollout, but plan %s was made for rollout member %s, not the rollout primary %s; apply it with target %s, or plan the whole environment",
-			plan.Database, req.Environment, plan.PlanIdentifier,
-			routing.ExecutionTarget{Deployment: plan.Deployment, Target: plan.Target}.MemberID(),
-			resolved[0].MemberID(),
-			routing.ExecutionTarget{Deployment: plan.Deployment, Target: plan.Target}.MemberID())
+		return nil, &PlanMemberMismatchError{
+			Database:    plan.Database,
+			Environment: req.Environment,
+			PlanID:      plan.PlanIdentifier,
+			PlanMember:  planMemberID(plan),
+			ApplyMember: resolved[0].MemberID(),
+		}
 	}
 	return resolved, nil
+}
+
+// PlanMemberMismatchError reports an apply whose plan was made for a different
+// rollout member than the one the apply would run it on: a narrowed apply that
+// names a member other than its plan's, or a rollout-wide apply of a plan made
+// for a member other than the rollout primary. It is the caller's request that
+// pairs the two, not a server failure, and the message names the selector that
+// would pair them.
+type PlanMemberMismatchError struct {
+	Database    string
+	Environment string
+	PlanID      string
+	// PlanMember is the MemberID the plan was made for.
+	PlanMember string
+	// ApplyMember is the MemberID the apply would run the plan on: the named
+	// member for a narrowed apply, the rollout primary otherwise.
+	ApplyMember string
+	// Narrowed is true when the apply named a member.
+	Narrowed bool
+}
+
+func (e *PlanMemberMismatchError) Error() string {
+	if e.Narrowed {
+		return fmt.Sprintf("apply for %s/%s names rollout member %s, but plan %s was made for %s; re-plan with target %s, or apply the plan with target %s",
+			e.Database, e.Environment, e.ApplyMember, e.PlanID, e.PlanMember, e.ApplyMember, e.PlanMember)
+	}
+	return fmt.Sprintf("apply for %s/%s runs the whole rollout, but plan %s was made for rollout member %s, not the rollout primary %s; apply it with target %s, or plan the whole environment",
+		e.Database, e.Environment, e.PlanID, e.PlanMember, e.ApplyMember, e.PlanMember)
 }
 
 // planIsForMember reports whether a plan was made against the given member.
 func planIsForMember(plan *storage.Plan, member routing.ExecutionTarget) bool {
 	return plan.Deployment == member.Deployment && plan.Target == member.Target
+}
+
+// planMemberID names the rollout member a plan was made for.
+func planMemberID(plan *storage.Plan) string {
+	return routing.ExecutionTarget{Deployment: plan.Deployment, Target: plan.Target}.MemberID()
 }
 
 // rejectUnapplyableMemberPlan runs a rollout member's own plan through the same

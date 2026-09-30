@@ -224,9 +224,11 @@ func TestCreateStoredApply_TargetMustNameThePlansOwnMember(t *testing.T) {
 
 	_, _, err := svc.createStoredApply(t.Context(), memberPlan("payments-001"),
 		ApplyRequest{Environment: "production", Target: "payments-002"}, nil, "apply-mismatched")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "payments-002")
-	assert.Contains(t, err.Error(), "re-plan")
+	var mismatch *PlanMemberMismatchError
+	require.ErrorAs(t, err, &mismatch, "a mismatched pairing is the caller's request, reported as invalid rather than a server failure")
+	assert.Equal(t, DefaultDeployment+"/payments-001", mismatch.PlanMember)
+	assert.Equal(t, DefaultDeployment+"/payments-002", mismatch.ApplyMember)
+	assert.Contains(t, err.Error(), "re-plan with target "+DefaultDeployment+"/payments-002")
 	assert.Nil(t, applies.apply, "no apply is stored for a mismatched member")
 }
 
@@ -248,7 +250,9 @@ func TestCreateStoredApply_RolloutWideApplyOfANonPrimaryPlanIsRefused(t *testing
 
 	_, _, err := svc.createStoredApply(t.Context(), memberPlan("payments-002"),
 		ApplyRequest{Environment: "production"}, nil, "apply-rollout-wide")
-	require.Error(t, err)
+	var mismatch *PlanMemberMismatchError
+	require.ErrorAs(t, err, &mismatch)
+	assert.Equal(t, DefaultDeployment+"/payments-001", mismatch.ApplyMember, "a rollout-wide apply runs from the rollout primary's plan")
 	assert.Contains(t, err.Error(), "runs the whole rollout")
 	assert.Contains(t, err.Error(), "apply it with target "+DefaultDeployment+"/payments-002")
 	assert.Nil(t, applies.apply)
