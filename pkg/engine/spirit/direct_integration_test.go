@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -500,6 +502,13 @@ func TestEngine_ResolveRefusedMode_FailedRowCountBlocks(t *testing.T) {
 	})
 	_, err = db.ExecContext(t.Context(), "GRANT INSERT ON `testdb`.`direct_count_denied` TO '"+user+"'@'%'")
 	require.NoError(t, err, "grant insert on direct_count_denied")
+	// The kill that direct execution relies on reads performance_schema and
+	// innodb_trx; the grants keep the byte-bound control below from blocking
+	// on those instead.
+	_, err = db.ExecContext(t.Context(), "GRANT SELECT ON `performance_schema`.* TO '"+user+"'@'%'")
+	require.NoError(t, err, "grant select on performance_schema")
+	_, err = db.ExecContext(t.Context(), "GRANT PROCESS ON *.* TO '"+user+"'@'%'")
+	require.NoError(t, err, "grant process")
 
 	host, _, _, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
@@ -785,78 +794,255 @@ func TestEngine_ExecuteAlterPhase_AboveBoundFailsFast(t *testing.T) {
 	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_grew"), "the target is untouched")
 }
 
-// A direct statement never stalls behind a busy table: when an open
-// transaction holds the table's metadata lock, the session's bounded lock
-// wait expires and the apply fails fast with an operator-actionable
-// busy-table error — instead of queueing on the lock indefinitely with all
-// new table traffic queueing behind the DDL. The bound comes from the
-// policy's configured lock wait, and the failure message reports that
-// configured value.
-func TestEngine_ExecuteAlterPhase_BusyTableFailsFast(t *testing.T) {
-	dsn, db := setupTestMySQL(t)
-	dropTablesOnCleanup(t, db, "direct_busy")
-
-	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_busy (
+// directReshapeTable creates a small table whose primary key a direct
+// statement can reshape, dropped when the test ends.
+func directReshapeTable(t *testing.T, db *sql.DB, name string) {
+	t.Helper()
+	dropTablesOnCleanup(t, db, name)
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(`CREATE TABLE %s (
 		id INT NOT NULL AUTO_INCREMENT,
 		tenant_id INT NOT NULL,
 		PRIMARY KEY (id)
-	)`)
-	require.NoError(t, err, "create direct_busy table")
-	_, err = db.ExecContext(t.Context(), `INSERT INTO direct_busy (tenant_id) VALUES (1)`)
-	require.NoError(t, err, "insert data")
+	)`, sqlescape.EscapeIdentifier(name)))
+	require.NoError(t, err, "create %s table", name)
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO %s (tenant_id) VALUES (1), (2), (3)", sqlescape.EscapeIdentifier(name)))
+	require.NoError(t, err, "insert into %s", name)
+}
 
-	// Hold the table's metadata lock: a transaction that has read the table
-	// keeps its shared MDL until the transaction ends, so the ALTER's
-	// exclusive MDL request queues behind it for as long as it stays open.
-	holder, err := db.BeginTx(t.Context(), nil)
-	require.NoError(t, err, "begin lock-holding transaction")
-	defer func() { _ = holder.Rollback() }()
-	var id int
-	require.NoError(t, holder.QueryRowContext(t.Context(),
-		"SELECT `id` FROM `direct_busy` LIMIT 1 FOR UPDATE").Scan(&id), "acquire the metadata lock")
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+// runDirectReshape drives an apply whose only statement reshapes table's
+// primary key under an enabled direct execution policy with the given lock
+// bound and row limit, and returns the schema change's final state and error message. The
+// apply runs under a bounded context: if it stalls past it, the schema change
+// ends stopped rather than completed or failed, and the caller's assertions
+// on the state diagnose the stall.
+func runDirectReshape(t *testing.T, dsn, tableName string, lockWaitSeconds, maxTableRows int64) (engine.State, string) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	eng := New(Config{Logger: logger})
 
 	host, username, password, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
 
-	ddlStatements := []string{
-		"ALTER TABLE `direct_busy` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
-	}
-
 	eng.mu.Lock()
 	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
-		tables:   []string{"direct_busy"},
+		tables:   []string{tableName},
 		state:    engine.StateRunning,
 		started:  time.Now(),
 	}
 	eng.mu.Unlock()
 
-	// The bounded session lock wait must fail the statement well inside this
-	// deadline; if it expires instead, the schema change ends stopped rather
-	// than failed and the assertions below diagnose the stall.
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	const lockWaitSeconds = 2
-	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false,
-		directPolicy{Enabled: true, MaxTableRows: 100000, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
+	stmt := fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)", sqlescape.EscapeIdentifier(tableName))
+	eng.executeSchemaChange(ctx, host, username, password, database, []string{stmt}, false,
+		directPolicy{Enabled: true, MaxTableRows: maxTableRows, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
 
 	eng.mu.Lock()
-	finalState := eng.runningSchemaChange.state
-	errorMessage := eng.runningSchemaChange.errorMessage
-	eng.mu.Unlock()
+	defer eng.mu.Unlock()
+	return eng.runningSchemaChange.state, eng.runningSchemaChange.errorMessage
+}
 
-	assert.Equal(t, engine.StateFailed, finalState)
-	assert.Contains(t, errorMessage, `Table "direct_busy" is busy`)
-	assert.Contains(t, errorMessage, fmt.Sprintf("could not acquire the metadata lock within %ds", lockWaitSeconds))
-	assert.Contains(t, errorMessage, "Retry when long-running transactions on the table have finished")
+// sessionExists reports whether the MySQL session with the given connection ID
+// is still connected.
+func sessionExists(t *testing.T, db *sql.DB, connectionID int64) bool {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM performance_schema.threads WHERE processlist_id = ?", connectionID).Scan(&n))
+	return n > 0
+}
+
+// A direct statement does not wait out a transaction that blocks it. An
+// application transaction that has read the table holds a shared metadata
+// lock until it ends, and the ALTER's exclusive lock request would otherwise
+// queue behind it, with all new table traffic queueing behind the ALTER, until
+// the bounded wait expires. Instead, most of the way into the wait, the
+// statement kills the blocking session and takes the lock: the apply
+// completes, the reshape lands, and the blocker is gone.
+func TestEngine_ExecuteAlterPhase_KillsMetadataLockBlocker(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	directReshapeTable(t, db, "direct_blocked")
+
+	blockerConn, err := db.Conn(t.Context())
+	require.NoError(t, err, "acquire the blocking session")
+	defer utils.CloseAndLog(blockerConn)
+	blocker, err := blockerConn.BeginTx(t.Context(), nil)
+	require.NoError(t, err, "begin the blocking transaction")
+	// Returning the conn waits for its transaction to end, so the transaction
+	// is ended first, including on an early failure while it still holds the
+	// metadata lock. Once the kill lands the rollback fails on the dead
+	// connection, which is the expected outcome, not a teardown failure.
+	defer func() { _ = blocker.Rollback() }()
+	var blockerID int64
+	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&blockerID))
+	var rows int
+	require.NoError(t, blocker.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM `direct_blocked`").Scan(&rows),
+		"read the table, taking its shared metadata lock until the transaction ends")
+	require.Equal(t, 3, rows)
+
+	const lockWaitSeconds = 2
+	started := time.Now()
+	state, errorMessage := runDirectReshape(t, dsn, "direct_blocked", lockWaitSeconds, 100000)
+	elapsed := time.Since(started)
+
+	require.Equal(t, engine.StateCompleted, state, "the apply completes once the blocker is killed: %s", errorMessage)
+	_, _, _, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+	assert.Equal(t, []string{"id", "tenant_id"}, pkColumns(t, database, "direct_blocked"),
+		"the reshaped primary key landed on the target")
+	assert.GreaterOrEqual(t, elapsed, time.Duration(float64(lockWaitSeconds)*0.9*float64(time.Second)),
+		"the blocker is given most of the bounded wait to finish on its own before it is killed")
+
+	require.Eventually(t, func() bool { return !sessionExists(t, db, blockerID) }, 10*time.Second, 50*time.Millisecond,
+		"the blocking session is killed")
+	assert.Error(t, blocker.QueryRowContext(t.Context(), "SELECT 1").Scan(new(int)),
+		"the blocking transaction's connection is gone")
+}
+
+// A session holding an explicit LOCK TABLES is never killed: it is not a
+// transaction that rolls back, so killing it could interrupt work that
+// depends on the lock being held. The direct statement leaves it alone, each
+// bounded attempt times out, and the apply fails with the operator-actionable
+// busy-table error — naming the kind of blocker it will not kill and asking
+// for a retry — rather than the driver's own words. The lock holder keeps its
+// session and the target is untouched.
+func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	directReshapeTable(t, db, "direct_locked")
+
+	locker, err := db.Conn(t.Context())
+	require.NoError(t, err, "acquire the locking session")
+	defer utils.CloseAndLog(locker)
+	_, err = locker.ExecContext(t.Context(), "LOCK TABLES `direct_locked` READ")
+	require.NoError(t, err, "take an explicit table lock")
+	var lockerID int64
+	require.NoError(t, locker.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&lockerID))
+
+	const lockWaitSeconds = 1
+	state, errorMessage := runDirectReshape(t, dsn, "direct_locked", lockWaitSeconds, 100000)
+
+	assert.Equal(t, engine.StateFailed, state)
+	assert.Contains(t, errorMessage, `Table "direct_locked" is busy`)
+	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts.", lockWaitSeconds, directMaxAttempts))
+	assert.Contains(t, errorMessage, "not a session holding an explicit LOCK TABLES")
+	assert.Contains(t, errorMessage, "unless its database user has PROCESS and CONNECTION_ADMIN",
+		"a kill that fails for lack of privilege lands on this same message, so it names that remedy too")
+	assert.Contains(t, errorMessage, "Retry when those sessions have finished")
 	assert.NotContains(t, errorMessage, "Lock wait timeout exceeded",
 		"the driver's own words are for the server log, not the pull request")
 
-	require.NoError(t, holder.Rollback(), "release the metadata lock")
-	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_busy"), "the target is untouched")
+	assert.True(t, sessionExists(t, db, lockerID), "the explicit lock holder is not killed")
+	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
+	require.NoError(t, err, "release the explicit table lock")
+	_, _, _, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_locked"), "the target is untouched")
+}
+
+// A direct statement finds the sessions blocking it through
+// performance_schema. A target user that cannot read those tables would reach
+// apply time unable to kill anything, and the statement would queue on the
+// lock while table traffic stalls behind it. So the verdict fails closed to
+// blocked instead, and the reason says why without the database's own error
+// text.
+func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	directReshapeTable(t, db, "direct_nokill")
+	host, _, _, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+	// The test context is cancelled before cleanup runs, so each drop gets its
+	// own bounded context that outlives it.
+	cleanupCtx := context.WithoutCancel(t.Context())
+	for _, tc := range []struct {
+		name string
+		// grants are given on top of the user's own database.
+		grants      []string
+		wantMode    string
+		wantOutcome string
+	}{
+		{
+			name:        "no performance_schema access",
+			wantMode:    engine.ExecutionModeBlocked,
+			wantOutcome: "blocked_force_kill_unavailable",
+		},
+		{
+			// MySQL checks PROCESS for innodb_trx only when it fills the
+			// table, so a probe that can return no rows never asks for it.
+			name:        "no PROCESS",
+			grants:      []string{"SELECT ON performance_schema.*"},
+			wantMode:    engine.ExecutionModeBlocked,
+			wantOutcome: "blocked_force_kill_unavailable",
+		},
+		{
+			name:     "both grants",
+			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*"},
+			wantMode: engine.ExecutionModeDirect,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := fmt.Sprintf("direct_nokill_%d", len(tc.grants))
+			const password = "direct_nokill_pw"
+			_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE USER '%s'@'%%' IDENTIFIED BY '%s'", user, password))
+			require.NoError(t, err, "create user %s", user)
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(cleanupCtx, 10*time.Second)
+				defer cancel()
+				_, err := db.ExecContext(ctx, fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", user))
+				assert.NoError(t, err, "drop user %s", user)
+			})
+			_, err = db.ExecContext(t.Context(), fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%%'", sqlescape.EscapeIdentifier(database), user))
+			require.NoError(t, err, "grant the user its database")
+			for _, grant := range tc.grants {
+				_, err = db.ExecContext(t.Context(), fmt.Sprintf("GRANT %s TO '%s'@'%%'", grant, user))
+				require.NoError(t, err, "grant %s", grant)
+			}
+
+			target := &lazyTargetDB{dsn: targetDSN(host, user, password, database)}
+			defer target.close()
+			for name, policy := range map[string]directPolicy{
+				"row bound":  {Enabled: true, MaxTableRows: 100000},
+				"byte bound": {Enabled: true, MaxTableBytes: 100 << 20},
+			} {
+				t.Run(name, func(t *testing.T) {
+					decision := eng.resolveRefusedMode(t.Context(), target, policy,
+						database, "direct_nokill", "dropping primary key is not supported")
+					assert.Equal(t, tc.wantMode, decision.mode)
+					assert.Equal(t, tc.wantOutcome, decision.outcome)
+					if tc.wantOutcome != "" {
+						assert.Equal(t, "dropping primary key is not supported"+blockedForceKillUnavailableReason, decision.modeReason)
+					}
+				})
+			}
+		})
+	}
+}
+
+// A check of the kill's grants that fails without the target denying one, here
+// on a cancelled context, says nothing about the grants. The statement is
+// still blocked, but as unknown, with a reason that asks for a fresh plan
+// rather than a grant the user may already have.
+func TestRequireForceKill_FailedCheckBlocksAsUnknown(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
+	defer target.close()
+	_, err = target.get(t.Context())
+	require.NoError(t, err, "connect to the target as the size gate would")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	decision := eng.requireForceKill(ctx, target, database, "orders", "dropping primary key is not supported",
+		refusedModeDecision{mode: engine.ExecutionModeDirect})
+	assert.Equal(t, engine.ExecutionModeBlocked, decision.mode)
+	assert.Equal(t, "blocked_force_kill_unknown", decision.outcome)
+	assert.Equal(t, "dropping primary key is not supported"+blockedForceKillUnknownReason, decision.modeReason)
 }
 
 // Routing classifies each statement against its table's current definition,
@@ -1049,4 +1235,81 @@ func TestExecutionVerdicts_UnreadableTableFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "read current definition")
 	assert.Empty(t, change.ExecutionMode)
 	assert.Empty(t, change.ModeReason)
+}
+
+// A direct statement only kills sessions while it is waiting for its metadata
+// lock. Once it holds the lock and is rebuilding the table, concurrent
+// application traffic is expected and is not blocking it. A transaction that
+// starts after the rebuild begins, reads the table, and commits before the
+// rebuild ends must survive, even though the rebuild outlasts the kill delay.
+func TestEngine_ExecuteAlterPhase_SparesTrafficDuringRebuild(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	const tableName = "direct_rebuild"
+	dropTablesOnCleanup(t, db, tableName)
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_rebuild (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		pad VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id),
+		KEY pad_idx (pad),
+		KEY tenant_pad_idx (tenant_id, pad)
+	)`)
+	require.NoError(t, err, "create the table")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO direct_rebuild (tenant_id, pad) SELECT 1, REPEAT(MD5(RAND()), 7)")
+	require.NoError(t, err, "seed the first row")
+	for range 19 {
+		_, err = db.ExecContext(t.Context(), "INSERT INTO direct_rebuild (tenant_id, pad) SELECT tenant_id + 1, REPEAT(MD5(RAND()), 7) FROM direct_rebuild")
+		require.NoError(t, err, "double the table")
+	}
+
+	type result struct {
+		state        engine.State
+		errorMessage string
+	}
+	done := make(chan result, 1)
+	started := time.Now()
+	go func() {
+		state, errorMessage := runDirectReshape(t, dsn, tableName, 1, 1<<20)
+		t.Logf("direct apply finished after %s", time.Since(started))
+		done <- result{state, errorMessage}
+	}()
+
+	// alterState reports what the ALTER is doing. "altering table" is the
+	// rebuild itself: the ALTER has taken its lock and not yet asked to
+	// upgrade it, so no session can be blocking it. Earlier states come before
+	// the lock is taken, and the final upgrade waits on every open reader,
+	// the bystander included, which the statement is right to kill.
+	alterState := func() string {
+		var state string
+		err := db.QueryRowContext(t.Context(), `SELECT COALESCE(MAX(state), '') FROM information_schema.processlist
+			WHERE info LIKE 'ALTER TABLE `+"`direct_rebuild`"+`%'`).Scan(&state)
+		require.NoError(t, err, "read the ALTER's state")
+		return state
+	}
+	require.Eventually(t, func() bool { return alterState() == "altering table" },
+		10*time.Second, 10*time.Millisecond, "the ALTER starts rebuilding")
+
+	bystanderConn, err := db.Conn(t.Context())
+	require.NoError(t, err, "acquire the bystander session")
+	defer utils.CloseAndLog(bystanderConn)
+	bystander, err := bystanderConn.BeginTx(t.Context(), nil)
+	require.NoError(t, err, "begin the bystander transaction")
+	defer func() { _ = bystander.Rollback() }()
+	var rows int
+	require.NoError(t, bystander.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM direct_rebuild WHERE id = 1").Scan(&rows))
+	// Hold the transaction across the kill delay, then commit while the
+	// rebuild is still running.
+	time.Sleep(1200 * time.Millisecond)
+	stillRebuilding := alterState() == "altering table"
+	commitErr := bystander.Commit()
+
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(30 * time.Second):
+		require.FailNow(t, "the direct apply did not finish")
+	}
+	require.True(t, stillRebuilding, "the rebuild must outlast the bystander, without waiting on it, for this scenario")
+	require.Equal(t, engine.StateCompleted, r.state, "the apply completes: %s", r.errorMessage)
+	assert.NoError(t, commitErr, "a transaction that never blocked the statement is not killed")
 }
