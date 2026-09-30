@@ -223,7 +223,7 @@ func (h *Handler) retirePlanCommentsForSlot(ctx context.Context, client *ghclien
 // comment no apply ever acted on carries no record worth keeping (its DDL
 // never ran and is reproducible from the head it was rendered at) and is
 // deleted from the timeline; its storage row keeps the identifiers for
-// triage. Under the default minimize-based policy, an apply-owned comment
+// triage. Under the opt-out minimize-based policy, an apply-owned comment
 // stays fully expanded and every other superseded comment is minimized.
 // Every failure leaves the comment as it is and its row unretired, so the
 // next sweep retries it.

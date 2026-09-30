@@ -3640,19 +3640,32 @@ func TestServerConfig_AreChecksEnabled(t *testing.T) {
 }
 
 func TestServerConfig_DeletesUnactionedPlanComments(t *testing.T) {
-	t.Run("nil config defaults to minimize policy", func(t *testing.T) {
+	t.Run("nil config defaults to delete policy", func(t *testing.T) {
 		var cfg *ServerConfig
-		assert.False(t, cfg.DeletesUnactionedPlanComments())
-	})
-
-	t.Run("unset defaults to minimize policy", func(t *testing.T) {
-		cfg := ServerConfig{}
-		assert.False(t, cfg.DeletesUnactionedPlanComments())
-	})
-
-	t.Run("explicit true opts into the delete policy", func(t *testing.T) {
-		cfg := ServerConfig{DeleteUnactionedPlanComments: true}
 		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset defaults to delete policy", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset in YAML defaults to delete policy", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("allowed_environments: [staging]\n"), &cfg))
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit true keeps the delete policy", func(t *testing.T) {
+		deletes := true
+		cfg := ServerConfig{DeleteUnactionedPlanComments: &deletes}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit false opts out to the minimize policy", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("delete_unactioned_plan_comments: false\n"), &cfg))
+		assert.False(t, cfg.DeletesUnactionedPlanComments())
 	})
 }
 
