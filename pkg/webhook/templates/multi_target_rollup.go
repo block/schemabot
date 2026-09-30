@@ -47,13 +47,20 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		if len(work) > 1 {
 			writeGroupHeading(sb, targetNoun, targetNames(data.Model, w.members), len(g.Members))
 		}
-		dialect := dialectForEngine(memberDetail(data.Details, w.members[0]).Engine, data.ApplyID)
+		first := memberDetail(data.Details, w.members[0])
+		dialect := dialectForEngine(first.Engine, data.ApplyID)
+		// The group's DDL is its first target's, so a cut block names that
+		// target's stored plan and says the rest of the group runs the same.
+		restoreGroup := budget.forTargetGroup(targetNames(data.Model, w.members))
+		restorePlan := budget.pointAt(first.storedPlan())
 		for _, t := range w.tables {
 			cells, targets := tableAcrossTargets(data, w.members, t)
 			writeTargetTableLine(sb, t.TableName, cells, targets, lineSilent)
 			writeDDLLine(sb, dialect, t.DDL, budget)
 			sb.WriteString("\n")
 		}
+		restorePlan()
+		restoreGroup()
 	}
 	if len(work) > 0 && silent > 0 {
 		fmt.Fprintf(sb, "_%d of %d targets have not reported progress yet._\n", silent, len(g.Members))

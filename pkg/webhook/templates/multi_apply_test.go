@@ -693,6 +693,35 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 	assert.NotContains(t, out, "testapp-004`**", "a target without detail is not a change of its own")
 }
 
+// Rolled-up targets that run different plans each point their cut DDL at the
+// stored plan of the group's first target, and a group of several says the
+// rest of the group runs the same DDL, the way the plan comment's target
+// groups do.
+func TestRenderMultiDeploymentApplyComment_RolledUpCutDDLNamesEachGroupsStoredPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+		parallelTarget("primary", "testapp-003", so.Running),
+	})
+	longDDL := func(column string) string {
+		return "ALTER TABLE `orders` ADD COLUMN `" + column + "` text" + strings.Repeat(", ADD COLUMN `"+column+"_x` text", 2000)
+	}
+	withPlan := func(detail *ApplyStatusCommentData, planID string) *ApplyStatusCommentData {
+		detail.PlanID, detail.CLIName = planID, "acme schemabot"
+		return detail
+	}
+	out := renderTargets(model,
+		withPlan(targetDetail("testapp_001", state.Task.Running, longDDL("note"), 500), "plan_001"),
+		withPlan(targetDetail("testapp_002", state.Task.Running, longDDL("memo"), 500), "plan_002"),
+		withPlan(targetDetail("testapp_003", state.Task.Running, longDDL("note"), 500), "plan_003"),
+	)
+
+	assert.LessOrEqual(t, len(out), commentBodyLimit-applyCommentAppendReserve)
+	assert.Contains(t, out, "the full plan for `testapp-001` is available from the CLI with `acme schemabot list-plans -e production plan_001` (every target in this group runs the same DDL).")
+	assert.Contains(t, out, "the full plan for this target is available from the CLI with `acme schemabot list-plans -e production plan_002`.")
+	assert.NotContains(t, out, "plan_003", "a group names only its first target's plan")
+}
+
 // A failed target is named with its error in a status table, the way the
 // sharded comment names a failed shard. The table is capped so a deployment
 // whose every target failed still fits in one comment; the <summary> counts

@@ -836,8 +836,9 @@ check `CutoverBlocker` (same file, sharing the automatic cutover claim's
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`), through which every
-projection builds its children, with `completeLandedStopForHeldOpenApply` and `RolloutHeldByResumableChild` keeping a held-open
-rollout's stop resolved and its recovery claim quiet (`pkg/api/operator.go`).
+projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
+`updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
+`completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 

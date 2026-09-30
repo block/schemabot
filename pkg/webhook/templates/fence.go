@@ -30,40 +30,25 @@ const applyCommentAppendReserve = 16384
 // commentFitPasses bounds the render passes a comment may take to fit under
 // its limit. The first pass offers the DDL every byte the limit allows; when
 // the rest of the comment turns out to need some of that room, the second
-// pass cuts the DDL budget by the overshoot, and the marker allowance charged
-// on that pass makes a third one unnecessary unless a comment renders more
-// DDL blocks than it announced.
+// pass cuts the DDL budget by the overshoot and by the marker of every block
+// the first pass left uncut, so the second pass fits and the third is only a
+// bound.
 const commentFitPasses = 3
 
 // ddlTruncatedMarker follows a DDL block that was cut to fit the budget, so an
 // operator knows the statement shown is incomplete and where to look instead.
 // It is the marker for DDL whose stored plan is not known; DDL from a stored
-// plan names the command that prints that plan instead (planPointerMarker).
+// plan names the command that prints that plan instead (planPointer).
 const ddlTruncatedMarker = "_DDL truncated to fit GitHub's comment size limit; the desired schema is in this PR's schema files._\n"
 
-// planPointerMarker follows a DDL block that was cut to fit the budget when the
-// DDL comes from a stored plan. The schema files hold the desired schema, not
-// the statements the plan would run, so a reader who needs the statements the
-// comment could not show is pointed at the stored plan that holds them. The
-// command is labelled as a CLI command because every other schemabot command a
-// plan comment names is a PR-comment command, and this one is not.
-func planPointerMarker(plan storedPlanRef) string {
-	return planPointer("plan", plan, nil)
-}
-
-// sharedPlanPointerMarker is planPointerMarker for a section that renders one
-// environment's plan on behalf of several environments whose plans are the
-// same. Each environment stored its own plan, and the section can name only
-// the first, so the marker says whose plan it names and which environments run
-// the same DDL, rather than handing another environment's operator a plan that
-// reads as their own.
-func sharedPlanPointerMarker(plan storedPlanRef, environments []string) string {
-	return planPointer(flattenIdentifier(environments[0])+" plan", plan, []string{sameEnvironmentDDLNote(environments[1:])})
-}
-
-// planPointer is a pointer marker naming the stored plan ref, described as
-// plan ("plan", "staging plan for this target"), with notes saying who else
-// runs the same DDL.
+// planPointer follows a DDL block that was cut to fit the budget when the DDL
+// comes from a stored plan. The schema files hold the desired schema, not the
+// statements the plan would run, so a reader who needs the statements the
+// comment could not show is pointed at the stored plan ref that holds them,
+// described as plan ("plan", "staging plan for this target"), with notes
+// saying who else runs the same DDL. The command is labelled as a CLI command
+// because every other schemabot command a comment names is a PR-comment
+// command, and this one is not.
 func planPointer(plan string, ref storedPlanRef, notes []string) string {
 	marker := "_DDL truncated to fit GitHub's comment size limit; the full " + plan + " is available from the CLI with " + ref.listCommand()
 	if len(notes) > 0 {
@@ -79,7 +64,15 @@ func sameEnvironmentDDLNote(environments []string) string {
 	for _, env := range environments {
 		matching = append(matching, flattenIdentifier(env))
 	}
-	return strings.Join(matching, " and ") + " " + runVerb(len(matching)) + " the same DDL"
+	return joinWithAnd(matching) + " " + runVerb(len(matching)) + " the same DDL"
+}
+
+// joinWithAnd joins items as prose: "a", "a and b", "a, b and c".
+func joinWithAnd(items []string) string {
+	if len(items) <= 1 {
+		return strings.Join(items, "")
+	}
+	return strings.Join(items[:len(items)-1], ", ") + " and " + items[len(items)-1]
 }
 
 // storedPlanRef names a stored plan the way the CLI reaches it: the tool name
@@ -132,12 +125,11 @@ type ddlBlockBudget struct {
 	// marker is what follows a block cut to fit, set by the section rendering
 	// the DDL through pointAt. Empty means ddlTruncatedMarker.
 	marker string
-	// markers counts the markers the render has written, and longestMarker is
-	// the longest marker any section of the render could write, so a comment
-	// that fits by cutting DDL reserves room for every block's marker however
-	// long its section's marker is.
-	markers       int
-	longestMarker int
+	// uncutMarkerBytes is the length of the marker each block taken so far
+	// would carry, less the markers the render wrote: the room a later pass
+	// must reserve so every block it cuts has room for its own section's
+	// marker, and no more than that.
+	uncutMarkerBytes int
 
 	// sharedBy lists the environments a section rendered once on behalf of
 	// several is shared by, the first being the one whose plan it renders, so
@@ -158,21 +150,20 @@ type ddlBlockBudget struct {
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
 // render the given number of DDL blocks into at most limit bytes of DDL.
 func newDDLBlockBudget(blocks, limit int) *ddlBlockBudget {
-	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks, longestMarker: len(ddlTruncatedMarker)}
+	return &ddlBlockBudget{remaining: limit, blocksLeft: blocks}
 }
 
 // pointAt makes a block cut from here on name the stored plan, until the
 // returned restore runs. A plan with no id means the DDL has no stored plan to
-// point at, and a cut block keeps ddlTruncatedMarker. The marker is built here
-// and its length charged from the same text, so a cli name or environment of
-// any length is reserved exactly.
+// point at, and a cut block keeps ddlTruncatedMarker. The marker is built here,
+// and a block is charged the length of the same text when it is taken, so a
+// cli name or environment of any length is reserved exactly.
 func (b *ddlBlockBudget) pointAt(plan storedPlanRef) (restore func()) {
 	previous := b.marker
 	b.marker = ""
 	if plan.id != "" {
 		b.marker = b.pointerMarker(plan)
 	}
-	b.longestMarker = max(b.longestMarker, len(b.truncationMarker()))
 	return func() { b.marker = previous }
 }
 
@@ -230,10 +221,12 @@ func (b *ddlBlockBudget) truncationMarker() string {
 	return b.marker
 }
 
-// writeTruncationMarker writes the marker for a block cut to fit and counts it.
+// writeTruncationMarker writes the marker for a block cut to fit, releasing the
+// room take reserved for it.
 func (b *ddlBlockBudget) writeTruncationMarker(sb *strings.Builder) {
-	sb.WriteString(b.truncationMarker())
-	b.markers++
+	marker := b.truncationMarker()
+	sb.WriteString(marker)
+	b.uncutMarkerBytes -= len(marker)
 }
 
 // newUnboundedDDLBudget opens a budget no DDL can exhaust, for a render that is
@@ -248,10 +241,11 @@ func newUnboundedDDLBudget(blocks int) *ddlBlockBudget {
 // rest of the comment leaves under GitHub's size cap, less reserve bytes kept
 // for sections the poster appends afterwards. The first pass offers the DDL
 // the whole limit; a comment whose other sections fit alongside is done. When
-// the body overshoots, the DDL budget is cut by the overshoot plus a
-// truncation marker for every block not yet carrying one, so the next pass
-// fits. The render callback must produce the same non-DDL text on every pass:
-// only the budget it is handed changes.
+// the body overshoots, the DDL budget is cut by the overshoot plus, for every
+// block not yet carrying a truncation marker, the marker its own section
+// writes, so the next pass fits. The render callback must produce the same non-DDL text and take the
+// same blocks in the same sections on every pass: only the budget it is
+// handed changes.
 func renderWithinCommentLimit(blocks, reserve int, render func(*ddlBlockBudget) string) string {
 	limit := commentBodyLimit - reserve
 	ddlLimit := limit
@@ -264,15 +258,17 @@ func renderWithinCommentLimit(blocks, reserve int, render func(*ddlBlockBudget) 
 			return body
 		}
 		spent := ddlLimit - budget.remaining
-		unmarked := max(blocks-budget.markers, 0)
-		ddlLimit = max(spent-over-unmarked*budget.longestMarker, 0)
+		ddlLimit = max(spent-over-budget.uncutMarkerBytes, 0)
 	}
 	return body
 }
 
 // take returns the share the next block may render into; the caller reports
-// what the block actually used through spend.
+// what the block actually used through spend. The block's own section's
+// marker is reserved until the block writes it, so a later pass that cuts
+// the block has room for exactly that marker.
 func (b *ddlBlockBudget) take() int {
+	b.uncutMarkerBytes += len(b.truncationMarker())
 	if b.blocksLeft <= 1 {
 		b.blocksLeft = 0
 		return b.remaining
