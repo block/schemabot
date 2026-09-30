@@ -160,6 +160,15 @@ func TestRoundCoversWork(t *testing.T) {
 	assert.False(t, covered)
 	assert.Equal(t, "target eu/payments-002 would run statements the confirmed round did not plan", reason)
 
+	// A target whose statement is unchanged but now runs as direct-execution
+	// DDL would run write-blocking native DDL the confirmed comment disclosed as
+	// running through the schema change engine.
+	nowDirect := members(region)
+	nowDirect["eu/payments-002"].Namespaces["payments"].Tables[0].ExecutionMode = "direct"
+	covered, reason = roundCoversWork(plan(region), plan(region), members(region), nowDirect)
+	assert.False(t, covered, "a target that turned direct since the confirmed round is refused")
+	assert.Equal(t, "target eu/payments-002 would run statements the confirmed round did not plan", reason)
+
 	covered, reason = roundCoversWork(plan(region), plan(region), map[string]*storage.Plan{}, members(region))
 	assert.False(t, covered)
 	assert.Equal(t, "target eu/payments-002 has work the confirmed round did not plan", reason)

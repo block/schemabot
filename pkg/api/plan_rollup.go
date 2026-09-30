@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -386,7 +387,7 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 func countBlockedChanges(cs tern.ChangeSet) int {
 	blocked := 0
 	for _, table := range cs.AuthoritativeTableChanges() {
-		if table.GetExecutionMode() == engine.ExecutionModeBlocked {
+		if strings.EqualFold(table.GetExecutionMode(), engine.ExecutionModeBlocked) {
 			blocked++
 		}
 	}

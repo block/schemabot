@@ -35,15 +35,24 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		assert.NotContains(t, msg, "10.0.0.7")
 		assert.NotContains(t, msg, "plan-7f3a")
 
-		unsafe := &api.MemberPlanRefusedError{
-			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUnsafe, Table: "legacy_orders", Err: cause,
-		}
-		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders`, and this apply was not given `--allow-unsafe`, so nothing was applied. Review that target's plan, then run the command again with `--allow-unsafe` to consent to it.", applyExecutionErrorMessage(unsafe))
+		unsafe := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Table: "legacy_orders", Err: cause,
+		})
+		msg = applyExecutionErrorMessage(unsafe)
+		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders` that the reviewed plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the reviewed plan carries the same change.", msg)
+		assert.NotContains(t, msg, "10.0.0.7")
+		assert.NotContains(t, msg, "plan-7f3a")
 
 		vschema := &api.MemberPlanRefusedError{
-			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUnsafe, Namespace: "ns_0", Err: cause,
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Namespace: "ns_0", Err: cause,
 		}
-		assert.Contains(t, applyExecutionErrorMessage(vschema), "an unsafe change on the VSchema of namespace `ns_0`")
+		assert.Contains(t, applyExecutionErrorMessage(vschema), "an unsafe change on the VSchema of namespace `ns_0` that the reviewed plan does not carry")
+
+		unknown := &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanRefusal(99), Table: "orders", Err: cause,
+		}
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(unknown),
+			"a refusal kind with no line of its own never renders the error text")
 	})
 
 	t.Run("internal error remains sanitized", func(t *testing.T) {

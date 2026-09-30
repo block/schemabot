@@ -161,6 +161,10 @@ func (h *Handler) executeApply(
 		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged)
 	}
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
+	// confirmedMemberWork records that this confirmation was checked against
+	// every other target's work, so apply creation may run the direct changes
+	// the comment disclosed under those targets.
+	confirmedMemberWork := false
 	switch {
 	case runsMemberWork && storedPlan == nil:
 		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment)
@@ -199,6 +203,7 @@ func (h *Handler) executeApply(
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged, memberWorkRefusalMessage(refusal, reviewedTargetConverged))
 			return
 		}
+		confirmedMemberWork = true
 		h.logger.Info("apply-confirm: running the confirmed plans of the other targets that still need the change",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "reviewed_target_converged", reviewedTargetConverged, "pending_targets", rollout.work.names)
@@ -405,6 +410,7 @@ func (h *Handler) executeApply(
 		InstallationID:        installationID,
 		ExpectedLockOwner:     fmt.Sprintf("%s#%d", repo, pr),
 		ExpectedPendingPlanID: expectedPendingPlanID,
+		ConfirmedMemberWork:   confirmedMemberWork,
 	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
@@ -482,7 +488,14 @@ func applyExecutionErrorMessage(err error) string {
 		return featureErr.Error()
 	}
 	if refused, ok := errors.AsType[*api.MemberPlanRefusedError](err); ok {
-		return templates.MemberPlanRefusedDetail(refused.Target, refused.Table, refused.Namespace, refused.Refusal == api.MemberPlanUnsafe)
+		switch refused.Refusal {
+		case api.MemberPlanBlocked:
+			return templates.MemberPlanBlockedDetail(refused.Target, refused.Table)
+		case api.MemberPlanUndisclosedUnsafe:
+			return templates.MemberPlanUndisclosedUnsafeDetail(refused.Target, refused.Table, refused.Namespace)
+		}
+		// A refusal kind with no line of its own takes the generic one below,
+		// never the error text.
 	}
 	return "Failed to execute apply. See SchemaBot server logs for details."
 }
