@@ -70,8 +70,8 @@ func TestPlanUsesTheCallersStatedDirectExecutionPolicy(t *testing.T) {
 }
 
 // A caller's policy replaces the executing server's whole rather than merging
-// into it, so an enabled flag can never pair with a row bound the caller did
-// not send.
+// into it, so an enabled flag can never pair with a size bound the caller
+// did not send.
 func TestPlanReplacesTheExecutingServersPolicyWhole(t *testing.T) {
 	eng := &credentialRecordingEngine{}
 	client := directExecutionTestClient(map[string]string{

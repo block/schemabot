@@ -217,7 +217,7 @@ type ServerConfig struct {
 	// per-database config at all. A database environment's own
 	// direct_execution block replaces this policy whole rather than merging
 	// field by field, so an override can never enable direct execution while
-	// inheriting a row bound stated somewhere else, and an override that
+	// inheriting a size bound stated somewhere else, and an override that
 	// disables it is a complete opt out. Unset (the default) leaves refused
 	// statements blocked everywhere.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`

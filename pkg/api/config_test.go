@@ -1592,7 +1592,7 @@ func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
 }
 
 // A database environment's own block replaces the server-wide policy whole
-// rather than merging into it, so an override can neither inherit a row bound
+// rather than merging into it, so an override can neither inherit a size bound
 // it does not state nor be overruled when it opts out.
 func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *testing.T) {
 	cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}}

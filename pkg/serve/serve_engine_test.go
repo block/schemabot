@@ -167,7 +167,7 @@ func TestServerEngineMetadataAppliesServerDirectExecutionPolicy(t *testing.T) {
 
 // A resolved target that states any part of a direct execution policy states
 // all of it: the server-wide policy is not merged in alongside, so the target
-// can never enable direct execution under a row bound configured elsewhere.
+// can never enable direct execution under a size bound configured elsewhere.
 func TestServerEngineMetadataLeavesATargetsOwnDirectExecutionPolicyWhole(t *testing.T) {
 	for name, serverPolicy := range map[string]*api.DirectExecutionConfig{
 		"row-bound server policy":  {Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},

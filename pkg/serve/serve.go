@@ -1303,7 +1303,7 @@ func serverEngineMetadata(config *api.ServerConfig, resolved map[string]string, 
 	// The direct execution keys are one policy, not independent
 	// defaults: a resolved target that states any of them states the whole
 	// policy, and the server-wide one does not apply. Merging key by key
-	// would let a target enable direct execution while taking its row bound
+	// would let a target enable direct execution while taking its size bound
 	// from somewhere else, which is the pairing the bound exists to prevent.
 	if !hasDirectExecutionPolicy(metadata) {
 		maps.Copy(metadata, directMetadata)

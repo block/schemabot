@@ -75,7 +75,7 @@ func applyRequestWithStatedDirectExecution(req *engine.ApplyRequest) *engine.App
 // its direct execution policy.
 //
 // The replacement is whole rather than key by key. A surface that states a
-// policy states all of it, so an enabled flag can never pair with a row bound
+// policy states all of it, so an enabled flag can never pair with a size bound
 // that came from somewhere else — and the bound is the only thing standing
 // between a refused statement and an unbounded write outage. An empty policy
 // therefore clears the keys rather than leaving the previous ones in place.
