@@ -1183,25 +1183,28 @@ type EnvironmentConfig struct {
 	// alphabetical key order. Only meaningful alongside a Deployments map.
 	DeploymentOrder []string `yaml:"deployment_order,omitempty"`
 
-	// CutoverPolicy controls how a multi-deployment rollout sequences the copy
-	// and cutover phases of its deployments. "rolling" (the default, also used
-	// when unset) keeps today's fully serial behaviour: a later deployment does
-	// not start until every earlier sibling in deployment_order has completed.
-	// "barrier" lets later deployments run their copy phase once earlier
-	// siblings reach the cutover barrier, while cutover itself stays ordered.
-	// Only meaningful alongside a Deployments map.
+	// CutoverPolicy controls how a multi-member rollout sequences the copy and
+	// cutover phases of its members: the deployments of a Deployments map, or
+	// the targets of a Targets list, in resolved order. "rolling" (the default,
+	// also used when unset) keeps the rollout fully serial: a later member does
+	// not start until every earlier member has completed. "barrier" lets later
+	// members run their copy phase once earlier members reach the cutover
+	// barrier, while cutover itself stays ordered. "parallel" starts every
+	// member's copy without waiting on earlier members, up to the server's
+	// max_drivers_per_apply at once, and still cuts over one member at a time in
+	// order. Only meaningful alongside a Deployments map or a Targets list.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
-	// OnFailure controls multi-deployment rollout continuation when a deployment
+	// OnFailure controls multi-member rollout continuation when a member
 	// terminally fails. "halt" (the default, also used when unset) stops the
-	// rollout — later deployments in deployment_order are not started. "continue"
-	// drops a terminal-failed deployment as a blocker so the rollout attempts
-	// every deployment instead of stopping at the first failure. "pause" holds
-	// the rollout after a failure until a human releases it (via the release
-	// control op) so the remaining deployments proceed; to abort instead, use
-	// the separate stop/cancel control op. It governs only rollout continuation;
-	// the apply's pass/fail verdict and the merge gate stay fail-closed on any
-	// failed deployment. Only meaningful alongside a Deployments map.
+	// rollout — later members are not started. "continue" drops a
+	// terminal-failed member as a blocker so the rollout attempts every member
+	// instead of stopping at the first failure. "pause" holds the rollout after
+	// a failure until a human releases it (via the release control op) so the
+	// remaining members proceed; to abort instead, use the separate stop/cancel
+	// control op. It governs only rollout continuation; the apply's pass/fail
+	// verdict and the merge gate stay fail-closed on any failed member. Only
+	// meaningful alongside a Deployments map or a Targets list.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
 	// DirectExecution configures direct execution of ALTER statements that the
@@ -2104,12 +2107,15 @@ func (c *ServerConfig) Validate() error {
 			hasDSN := envConfig.HasLocalDSN()
 			hasScalarRouting := envConfig.Target != "" || envConfig.Targets != nil || envConfig.Deployment != ""
 			hasMapRouting := envConfig.Deployments != nil
+			// A rollout policy sequences an environment's members, so it needs
+			// more than one to sequence: a deployments map or a targets list.
+			hasMemberRouting := hasMapRouting || envConfig.Targets != nil
 			if len(envConfig.DeploymentOrder) > 0 && !hasMapRouting {
 				return fmt.Errorf("database %q environment %q sets deployment_order without a deployments map", name, env)
 			}
 			if envConfig.CutoverPolicy != "" {
-				if !hasMapRouting {
-					return fmt.Errorf("database %q environment %q sets cutover_policy without a deployments map", name, env)
+				if !hasMemberRouting {
+					return fmt.Errorf("database %q environment %q sets cutover_policy without a deployments map or targets list", name, env)
 				}
 				switch envConfig.CutoverPolicy {
 				case storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel:
@@ -2118,8 +2124,8 @@ func (c *ServerConfig) Validate() error {
 				}
 			}
 			if envConfig.OnFailure != "" {
-				if !hasMapRouting {
-					return fmt.Errorf("database %q environment %q sets on_failure without a deployments map", name, env)
+				if !hasMemberRouting {
+					return fmt.Errorf("database %q environment %q sets on_failure without a deployments map or targets list", name, env)
 				}
 				switch envConfig.OnFailure {
 				case storage.OnFailureHalt, storage.OnFailureContinue, storage.OnFailurePause:

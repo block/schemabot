@@ -2947,17 +2947,12 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	}
 
 	childStates := make([]string, len(ops))
-	children := make([]state.RolloutChild, len(ops))
+	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
 		childStates[i] = op.State
-		isContinue := op.OnFailure == storage.OnFailureContinue
-		isPause := op.OnFailure == storage.OnFailurePause
-		children[i] = state.RolloutChild{
-			State:             op.State,
-			ContinueOnFailure: isContinue || (isPause && released),
-			PauseOnFailure:    isPause && !released,
-		}
+		rolloutOps[i] = op.RolloutOperation(released)
 	}
+	children := state.RolloutChildren(rolloutOps)
 	base := state.DeriveApplyState(childStates)
 	derived := state.DeriveRolloutApplyState(children)
 	heldByResumableChild := state.RolloutHeldByResumableChild(derived, children)

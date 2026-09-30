@@ -1396,6 +1396,17 @@ type ApplyOperationStore interface {
 	// changing their state. Other terminal rows
 	// (completed/failed/cancelled/reverted) are never claimed.
 	//
+	// A pending row starts only once its cutover_policy and on_failure admit it
+	// past the earlier rollout members of its apply. A member is a (deployment,
+	// target) pair, so the targets of one deployment are ordered exactly like the
+	// deployments of a map, while the operations of one member (a sharded
+	// target's per-shard work) do not gate each other's start. Under barrier
+	// and parallel they are still ordered at cutover, by
+	// FindNextApplyOperationCutover; under rolling they cut over in their own
+	// drives. A member's finalizer starts only once the work it finalizes has
+	// completed, and it waits on earlier members as rolling does, for them to
+	// complete, under every policy.
+	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
 	// needs work.
@@ -1408,10 +1419,12 @@ type ApplyOperationStore interface {
 	// (claims pending rows → running); this one gates the cutover phase.
 	//
 	// A waiting_for_cutover row is claimed and transitioned to cutting_over only
-	// when every earlier deployment_order sibling has reached completed (the
+	// when every earlier operation of the apply has reached completed (the
 	// cutover gate is completed-only, with the on_failure "continue" exemption
 	// for a terminal-failed earlier sibling) and no pending stop control request
-	// exists for the apply. Separately, a row already in cutting_over or
+	// exists for the apply. The gate covers every earlier operation, whichever
+	// member it belongs to, so one member's shards also cut over one at a time.
+	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
 	// driver died, which carries no ordering gate.

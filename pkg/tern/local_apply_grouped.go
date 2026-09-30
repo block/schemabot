@@ -575,28 +575,25 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		}
 	}
 
-	children := make([]state.RolloutChild, len(ops))
+	rolloutOps := make([]state.RolloutOperation, len(ops))
 	foundCurrent := false
 	for i, op := range ops {
-		isContinue := op.OnFailure == storage.OnFailureContinue
-		isPause := op.OnFailure == storage.OnFailurePause
-		child := state.RolloutChild{
-			State:             op.State,
-			ContinueOnFailure: isContinue || (isPause && released),
-			PauseOnFailure:    isPause && !released,
-		}
+		rolloutOp := op.RolloutOperation(released)
 		if op.ID == operationID {
-			child.State = currentOpState
+			// The current operation is the one this drive is running, so it
+			// has started whatever its stored row says.
+			rolloutOp.State = currentOpState
+			rolloutOp.NeverStarted = false
 			foundCurrent = true
 		}
-		children[i] = child
+		rolloutOps[i] = rolloutOp
 	}
 	if !foundCurrent {
 		logger.Warn("cannot determine aggregate apply state: current operation row missing from sibling set",
 			"apply_operation_id", operationID)
 		return failClosed()
 	}
-	return state.DeriveRolloutApplyState(children), true
+	return state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps)), true
 }
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).

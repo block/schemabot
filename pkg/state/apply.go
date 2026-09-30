@@ -250,6 +250,17 @@ type RolloutChild struct {
 	// PauseOnFailure is true when the operation's on_failure policy is an
 	// unreleased "pause": a terminal failure holds the rollout for a human.
 	PauseOnFailure bool
+	// Orphaned is true for a finalizer that nothing will ever start: it has
+	// not started and work it finalizes has terminally failed. It holds no
+	// target, since no driver will write for it, and the claim gates treat it
+	// like the failure that orphaned it.
+	Orphaned bool
+	// NeverStarted is true for a child no driver has ever claimed: it is
+	// pending, or a stop moved it to stopped before it was claimed. A stopped
+	// child that never started has written nothing, and the claim holds it to
+	// the same start gate as a pending one, so the projection counts it as
+	// pending: it still holds its target, but it is not work already under way.
+	NeverStarted bool
 }
 
 // DeriveRolloutApplyState projects the parent apply's state over all of its
@@ -340,8 +351,10 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		// one awaiting a retry that no driver is working. Hold the apply until
 		// that work settles.
 		// A sibling still pending holds nothing: the same policy is what stops
-		// it from ever starting. A sibling an operator stopped still holds its
-		// target, because it can be started again.
+		// it from ever starting. Neither does one a stop caught before it was
+		// ever claimed, which start resumes only through the same gate. A
+		// sibling an operator stopped after it started still holds its target,
+		// because it can be started again.
 		if hasStartedUnsettledWork(children) {
 			return Apply.RunningDegraded
 		}
@@ -366,7 +379,14 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 // its hold says, that it holds the database until it is started or cancelled.
 // A rollout that reads terminal here would release the reservation on its whole
 // target set (OW-5) over a deployment a stopped sibling still owns.
+//
+// An orphaned child holds nothing either: whatever its state says, no claim
+// will ever start it, so the rollout settles without it rather than waiting
+// on a row that never moves.
 func childHoldsItsTarget(c RolloutChild) bool {
+	if c.Orphaned {
+		return false
+	}
 	return !IsState(c.State, SettledApplyStates...)
 }
 
@@ -376,17 +396,25 @@ func childHoldsItsTarget(c RolloutChild) bool {
 // This is the line a fail-closed rollout turns on, because the two kinds of
 // sibling differ in whether the policy reaches them. A pending sibling is
 // exactly what the ordered-claim gate holds back, so it will not start while
-// the failure stands and it has touched nothing. A sibling already running,
-// draining, parked at a cutover barrier, awaiting a retry, or stopped by an
-// operator was claimed before the failure, and refusing new claims does not
+// the failure stands and it has touched nothing. So is a sibling a stop moved
+// to stopped before any driver claimed it (NeverStarted): start resumes it
+// only through the same gate. A sibling already running, draining, parked at
+// a cutover barrier, awaiting a retry, or stopped by an operator after it
+// started was claimed before the failure, and refusing new claims does not
 // reach back to release it.
 func hasStartedUnsettledWork(children []RolloutChild) bool {
 	for _, c := range children {
-		if childHoldsItsTarget(c) && !IsState(c.State, Apply.Pending) {
+		if childHoldsItsTarget(c) && !childNotYetStarted(c) {
 			return true
 		}
 	}
 	return false
+}
+
+// childNotYetStarted reports whether no driver has begun c's work: it is
+// pending, or it was stopped before it was ever claimed.
+func childNotYetStarted(c RolloutChild) bool {
+	return IsState(c.State, Apply.Pending) || c.NeverStarted
 }
 
 // RolloutHeldByResumableChild reports whether a non-terminal projection is held

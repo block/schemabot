@@ -4,9 +4,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
@@ -314,4 +317,98 @@ func TestWriteProgressKeyedMemberListsTablesUnderAnInheritedTarget(t *testing.T)
 	assertLess(t, output, "shard-2", "orders_2")
 	assert.Equal(t, 1, strings.Count(output, "orders_1"))
 	assert.Equal(t, 1, strings.Count(output, "orders_2"))
+}
+
+// TestProgressOperationsForPresentation_SettlesLikeStoredState verifies that the
+// progress output and watch view read a rollout's state from the same facts the
+// stored derivation does. Under continue, shard -80 of payments-001 fails and
+// payments-002 completes, leaving payments-001's orders finalizer pending with
+// nothing that will start it: the header reads failed, as the stored apply
+// does. Under halt, region-a fails and a stop caught region-b before any driver
+// claimed it: the header reads failed, as it would with region-b still pending.
+// A failed shard of payments-002 orphans only payments-002's finalizer, so the
+// header stays running_degraded while payments-001's finalizer can still start.
+func TestProgressOperationsForPresentation_SettlesLikeStoredState(t *testing.T) {
+	const started = "2026-09-30T12:00:00Z"
+	shard := func(target, shardName, opState string) *apitypes.ProgressOperationResponse {
+		return &apitypes.ProgressOperationResponse{
+			Deployment:    "payments-a",
+			Target:        target,
+			OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shardName, "orders")),
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         opState,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureContinue,
+			StartedAt:     started,
+		}
+	}
+	finalizer := func(target, opState, startedAt string) *apitypes.ProgressOperationResponse {
+		return &apitypes.ProgressOperationResponse{
+			Deployment:    "payments-a",
+			Target:        target,
+			OperationKey:  storage.TargetOperationKey(target, "orders/group_finalizer"),
+			OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			State:         opState,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureContinue,
+			StartedAt:     startedAt,
+		}
+	}
+	region := func(deployment, opState, startedAt string) *apitypes.ProgressOperationResponse {
+		return &apitypes.ProgressOperationResponse{
+			Deployment:    deployment,
+			OperationKey:  "orders",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         opState,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureHalt,
+			StartedAt:     startedAt,
+		}
+	}
+
+	cases := []struct {
+		name string
+		ops  []*apitypes.ProgressOperationResponse
+		want string
+	}{
+		{
+			name: "continue past a finalizer its own failed work orphaned",
+			want: state.Apply.Failed,
+			ops: []*apitypes.ProgressOperationResponse{
+				shard("payments-001", "-80", state.ApplyOperation.Failed),
+				shard("payments-001", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-001", state.ApplyOperation.Pending, ""),
+				shard("payments-002", "-80", state.ApplyOperation.Completed),
+				shard("payments-002", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-002", state.ApplyOperation.Completed, started),
+			},
+		},
+		{
+			name: "continue while another target's finalizer can still start",
+			want: state.Apply.RunningDegraded,
+			ops: []*apitypes.ProgressOperationResponse{
+				shard("payments-001", "-80", state.ApplyOperation.Completed),
+				shard("payments-001", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-001", state.ApplyOperation.Pending, ""),
+				shard("payments-002", "-80", state.ApplyOperation.Failed),
+				shard("payments-002", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-002", state.ApplyOperation.Pending, ""),
+			},
+		},
+		{
+			name: "halt past work stopped before it started",
+			want: state.Apply.Failed,
+			ops: []*apitypes.ProgressOperationResponse{
+				region("region-a", state.ApplyOperation.Failed, started),
+				region("region-b", state.ApplyOperation.Stopped, ""),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := ParseProgressResponse(&apitypes.ProgressResponse{State: state.Apply.Failed, Operations: tc.ops})
+			model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+			assert.Equal(t, tc.want, model.State)
+		})
+	}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // MaxRecoveryAttempts is the operator retry budget for failed_retryable
@@ -42,8 +43,9 @@ const ApplyTargetLockWait = 10 * time.Second
 // a terminal state are left for reconciliation/monitoring to surface.
 const MaxWebhookEventAttempts = 5
 
-// Cutover policies control how a multi-deployment rollout sequences the copy
-// and cutover phases of its deployments. The value is resolved from the
+// Cutover policies control how a multi-member rollout sequences the copy and
+// cutover phases of its members: the deployments of a deployments map, or the
+// targets of a targets list, each ordered the same way. The value is resolved from the
 // environment config at apply-create time and persisted on each apply_operations
 // row so the policy in force when the apply was created travels with it.
 const (
@@ -370,8 +372,10 @@ const (
 
 // OperationKeyDelimiter separates the components of an operation key. A
 // component containing it would make the key ambiguous to split, so producers
-// refuse the delimiter inside a component rather than escaping it.
-const OperationKeyDelimiter = "/"
+// refuse the delimiter inside a component rather than escaping it. It is the
+// rollout projection's delimiter, which reads a finalizer's scope back out of
+// the key (see state.OperationScope).
+const OperationKeyDelimiter = state.OperationKeyDelimiter
 
 // ShardOperationKey builds the operation key for one shard's work on one table
 // ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped

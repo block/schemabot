@@ -763,3 +763,58 @@ func TestSettledApplyStatesExcludeStopped(t *testing.T) {
 		assert.False(t, settled(s), "%s is not settled", s)
 	}
 }
+
+// TestDeriveRolloutApplyState_OrphanedFinalizer verifies that a finalizer
+// orphaned by its own work's failure does not hold the rollout open. Shard
+// -80 of payments-001 failed and payments-002 completed, leaving
+// payments-001's finalizer pending with nothing that will start it. Under
+// continue the rollout settles failed rather than sitting running_degraded,
+// and under an unreleased pause with nothing else left to hold it settles
+// failed rather than paused. A stopped orphan holds nothing either.
+func TestDeriveRolloutApplyState_OrphanedFinalizer(t *testing.T) {
+	orphan := func(childState string, cont, pause bool) RolloutChild {
+		return RolloutChild{State: childState, ContinueOnFailure: cont, PauseOnFailure: pause, Orphaned: true}
+	}
+	cases := []struct {
+		name     string
+		children []RolloutChild
+		want     string
+	}{
+		{
+			name: "continue settles failed past a pending orphan",
+			children: []RolloutChild{
+				rc(Apply.Failed, true), rc(Apply.Completed, true), orphan(Apply.Pending, true, false),
+				rc(Apply.Completed, true), rc(Apply.Completed, true), rc(Apply.Completed, true),
+			},
+			want: Apply.Failed,
+		},
+		{
+			name: "continue still waits for later work that holds its target",
+			children: []RolloutChild{
+				rc(Apply.Failed, true), rc(Apply.Completed, true), orphan(Apply.Pending, true, false),
+				rc(Apply.WaitingForCutover, true),
+			},
+			want: Apply.RunningDegraded,
+		},
+		{
+			name: "unreleased pause with only an orphan after it settles failed",
+			children: []RolloutChild{
+				rcPause(Apply.Failed), rcPause(Apply.Completed),
+				orphan(Apply.Pending, false, true),
+			},
+			want: Apply.Failed,
+		},
+		{
+			name: "halt settles failed past a stopped orphan",
+			children: []RolloutChild{
+				rc(Apply.Failed, false), rc(Apply.Completed, false), orphan(Apply.Stopped, false, false),
+			},
+			want: Apply.Failed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(tc.children))
+		})
+	}
+}

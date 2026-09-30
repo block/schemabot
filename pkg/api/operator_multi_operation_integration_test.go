@@ -237,6 +237,65 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, rec2, rec.resumeOrder(), "parked barrier operations must not be re-leased by the copy claim")
 	})
 
+	// RollingOnFailureGatesLaterTargets drives a rolling rollout over one
+	// deployment's targets list, payments-001..003, whose first target fails.
+	// Each target is a rollout member of its own, so on_failure governs the later
+	// targets exactly as it governs later deployments: halt and pause leave
+	// payments-002 and payments-003 pending and never hand them to a driver, and
+	// continue drives them in list order. Pause is the case only the member gate
+	// can hold: the parent stays paused rather than terminal, so the later
+	// targets remain claimable in every respect but their turn.
+	t.Run("RollingOnFailureGatesLaterTargets", func(t *testing.T) {
+		targets := []string{"payments-001", "payments-002", "payments-003"}
+		for _, tc := range []struct {
+			name        string
+			onFailure   string
+			parentState string
+			driven      []string
+		}{
+			{name: "halt", onFailure: storage.OnFailureHalt, parentState: state.Apply.Failed, driven: targets[:1]},
+			{name: "pause", onFailure: storage.OnFailurePause, parentState: state.Apply.Paused, driven: targets[:1]},
+			{name: "continue", onFailure: storage.OnFailureContinue, parentState: state.Apply.Failed, driven: targets},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resetMatrixTables(t, ctx, db)
+				seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+					applyIdentifier: "matrix-targets-" + tc.name,
+					parentState:     state.Apply.Pending,
+					cutoverPolicy:   storage.CutoverPolicyRolling,
+					onFailure:       tc.onFailure,
+					deployments:     []string{"region-a"},
+					targets:         targets,
+					opState:         state.ApplyOperation.Pending,
+					taskState:       state.Task.Pending,
+				})
+
+				rec := &driveRecorder{}
+				svc := newMatrixService(t, stor, matrixTargetClients(stor, rec, "region-a", map[string]matrixOutcome{
+					"payments-001": {taskState: state.Task.Failed, errMsg: "duplicate key name 'idx_orders_source'"},
+					"payments-002": {taskState: state.Task.Completed},
+					"payments-003": {taskState: state.Task.Completed},
+				}))
+
+				for driver := 1; driver <= len(targets); driver++ {
+					driveNextOperation(t, ctx, svc, driver)
+				}
+
+				assert.Equal(t, tc.driven, rec.resumeTargets(),
+					"on_failure %s decides which targets are driven after payments-001 fails", tc.onFailure)
+				assert.Equal(t, state.ApplyOperation.Failed, opState(t, ctx, stor, seed.opID("payments-001")))
+				for _, target := range targets[1:] {
+					want := state.ApplyOperation.Pending
+					if len(tc.driven) == len(targets) {
+						want = state.ApplyOperation.Completed
+					}
+					assert.Equal(t, want, opState(t, ctx, stor, seed.opID(target)), "operation for %s", target)
+				}
+				assert.Equal(t, tc.parentState, getApply(t, ctx, stor, seed.applyID).State)
+			})
+		}
+	})
+
 	t.Run("PendingStopStopsPendingSiblingsAndCompletesStop", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		// A continue rollout that already failed one deployment and still has a
@@ -438,10 +497,14 @@ type multiOpSeed struct {
 	cutoverPolicy   string
 	onFailure       string
 	deployments     []string
+	// targets, when set, seeds one operation per target of deployments[0], the
+	// shape a deployment's targets list resolves to. Per-member maps and opID
+	// are then keyed by target instead of by deployment.
+	targets []string
 	// opState / taskState set a uniform initial state for every operation/task.
 	opState   string
 	taskState string
-	// perOpState / perTaskState override the uniform state per deployment.
+	// perOpState / perTaskState override the uniform state per member.
 	perOpState   map[string]string
 	perTaskState map[string]string
 }
@@ -452,7 +515,35 @@ type seededMultiOpApply struct {
 	ops         map[string]int64
 }
 
-func (s seededMultiOpApply) opID(deployment string) int64 { return s.ops[deployment] }
+// opID returns the operation seeded for a member: a deployment, or a target
+// when the seed named targets.
+func (s seededMultiOpApply) opID(member string) int64 { return s.ops[member] }
+
+// matrixSeedMember is one operation seedGroupedApply creates: the member name
+// that keys the per-member maps, and the operation's deployment, target and key.
+type matrixSeedMember struct {
+	name, deployment, target, operationKey string
+}
+
+func (spec multiOpSeed) members() []matrixSeedMember {
+	if len(spec.targets) == 0 {
+		members := make([]matrixSeedMember, 0, len(spec.deployments))
+		for _, dep := range spec.deployments {
+			members = append(members, matrixSeedMember{name: dep, deployment: dep, target: "payments-" + dep})
+		}
+		return members
+	}
+	members := make([]matrixSeedMember, 0, len(spec.targets))
+	for _, target := range spec.targets {
+		members = append(members, matrixSeedMember{
+			name:         target,
+			deployment:   spec.deployments[0],
+			target:       target,
+			operationKey: storage.TargetOperationKey(target, ""),
+		})
+	}
+	return members
+}
 
 type seededShardedFinalizerApply struct {
 	applyID     int64
@@ -481,20 +572,22 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 		UpdatedAt:       now,
 	}
 
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(spec.deployments))
-	for _, dep := range spec.deployments {
+	members := spec.members()
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
+	for _, member := range members {
 		opState := spec.opState
-		if s, ok := spec.perOpState[dep]; ok {
+		if s, ok := spec.perOpState[member.name]; ok {
 			opState = s
 		}
 		taskState := spec.taskState
-		if s, ok := spec.perTaskState[dep]; ok {
+		if s, ok := spec.perTaskState[member.name]; ok {
 			taskState = s
 		}
 		groups = append(groups, &storage.ApplyOperationWithTasks{
 			Operation: &storage.ApplyOperation{
-				Deployment:    dep,
-				Target:        "payments-" + dep,
+				Deployment:    member.deployment,
+				OperationKey:  member.operationKey,
+				Target:        member.target,
 				State:         opState,
 				CutoverPolicy: spec.cutoverPolicy,
 				OnFailure:     spec.onFailure,
@@ -502,7 +595,7 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 				UpdatedAt:     now,
 			},
 			Tasks: []*storage.Task{{
-				TaskIdentifier: spec.applyIdentifier + "-" + dep,
+				TaskIdentifier: spec.applyIdentifier + "-" + member.name,
 				Database:       "payments",
 				DatabaseType:   storage.DatabaseTypeMySQL,
 				Engine:         storage.EngineForType(storage.DatabaseTypeMySQL),
@@ -525,8 +618,8 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 	require.NoError(t, err, "seed grouped apply")
 
 	ops := make(map[string]int64, len(groups))
-	for _, group := range groups {
-		ops[group.Operation.Deployment] = group.Operation.ID
+	for i, group := range groups {
+		ops[members[i].name] = group.Operation.ID
 	}
 	return seededMultiOpApply{applyID: applyID, deployments: spec.deployments, ops: ops}
 }
@@ -697,6 +790,21 @@ func matrixClients(stor storage.Storage, rec *driveRecorder, outcomes map[string
 	return clients
 }
 
+// matrixTargetClients builds the one deterministic tern.Client a targets list
+// routes to, since every target shares the deployment, and has it choose each
+// drive's outcome by the operation's target.
+func matrixTargetClients(stor storage.Storage, rec *driveRecorder, deployment string, outcomes map[string]matrixOutcome) map[string]tern.Client {
+	return map[string]tern.Client{
+		deployment + "/staging": &matrixTernClient{
+			mockTernClient: &mockTernClient{},
+			stor:           stor,
+			deployment:     deployment,
+			rec:            rec,
+			targetOutcomes: outcomes,
+		},
+	}
+}
+
 type matrixOutcome struct {
 	taskState        string
 	errMsg           string
@@ -715,6 +823,20 @@ type matrixTernClient struct {
 	deployment string
 	rec        *driveRecorder
 	outcome    matrixOutcome
+	// targetOutcomes, when set, replaces outcome with the entry for the
+	// driven operation's target.
+	targetOutcomes map[string]matrixOutcome
+}
+
+func (m *matrixTernClient) outcomeFor(op *storage.ApplyOperation) (matrixOutcome, error) {
+	if m.targetOutcomes == nil {
+		return m.outcome, nil
+	}
+	outcome, ok := m.targetOutcomes[op.Target]
+	if !ok {
+		return matrixOutcome{}, fmt.Errorf("matrix fake: no outcome for target %q of operation %d", op.Target, op.ID)
+	}
+	return outcome, nil
 }
 
 func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
@@ -726,14 +848,18 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 		return fmt.Errorf("matrix fake: operation %d not found", applyOperationID)
 	}
 	m.rec.recordResume(m.deployment, op)
+	outcome, err := m.outcomeFor(op)
+	if err != nil {
+		return err
+	}
 
 	// The gate proves work drives run concurrently; the group_finalizer drives
 	// only after its work siblings settle, so it never participates in the gate.
-	if m.outcome.gate != nil && op.OperationKind != storage.ApplyOperationKindGroupFinalizer {
-		m.outcome.gate.arriveAndWait()
+	if outcome.gate != nil && op.OperationKind != storage.ApplyOperationKindGroupFinalizer {
+		outcome.gate.arriveAndWait()
 	}
 
-	if m.outcome.probeParentWrite {
+	if outcome.probeParentWrite {
 		// A direct parent write under the operation-only lease must fail closed:
 		// the parent applies row is owned solely by the projection CAS.
 		probe := *apply
@@ -745,10 +871,10 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 	// applies the namespace VSchema and marks the operation row directly. Simulate
 	// that outcome here rather than transitioning task rows it does not have.
 	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
-		if state.IsState(m.outcome.taskState, state.Task.Failed) {
-			return m.stor.ApplyOperations().MarkFailed(ctx, op.ID, m.outcome.errMsg)
+		if state.IsState(outcome.taskState, state.Task.Failed) {
+			return m.stor.ApplyOperations().MarkFailed(ctx, op.ID, outcome.errMsg)
 		}
-		if state.IsState(m.outcome.taskState, state.Task.Completed) {
+		if state.IsState(outcome.taskState, state.Task.Completed) {
 			return m.stor.ApplyOperations().MarkCompleted(ctx, op.ID)
 		}
 		return nil
@@ -759,11 +885,11 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 		return fmt.Errorf("matrix fake: load tasks for operation %d: %w", applyOperationID, err)
 	}
 	for _, task := range tasks {
-		task.State = m.outcome.taskState
-		if state.IsState(m.outcome.taskState, state.Task.Failed) {
-			task.ErrorMessage = m.outcome.errMsg
+		task.State = outcome.taskState
+		if state.IsState(outcome.taskState, state.Task.Failed) {
+			task.ErrorMessage = outcome.errMsg
 		}
-		if state.IsTerminalTaskState(m.outcome.taskState) {
+		if state.IsTerminalTaskState(outcome.taskState) {
 			now := time.Now()
 			task.CompletedAt = &now
 		}
@@ -779,6 +905,7 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 type driveRecorder struct {
 	mu          sync.Mutex
 	order       []string
+	targets     []string
 	opKeys      []string
 	opKinds     []string
 	parentWrite []error
@@ -788,6 +915,7 @@ func (r *driveRecorder) recordResume(deployment string, op *storage.ApplyOperati
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.order = append(r.order, deployment)
+	r.targets = append(r.targets, op.Target)
 	r.opKeys = append(r.opKeys, op.OperationKey)
 	r.opKinds = append(r.opKinds, op.OperationKind)
 }
@@ -802,6 +930,12 @@ func (r *driveRecorder) resumeOrder() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.order...)
+}
+
+func (r *driveRecorder) resumeTargets() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.targets...)
 }
 
 func (r *driveRecorder) resumeCount() int {

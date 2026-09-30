@@ -3165,6 +3165,45 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		assert.Equal(t, state.Apply.RunningDegraded, got, "continue policy must hold the apply degraded until the pending sibling settles")
 	})
 
+	// In a targets-list rollout under continue, this drive's shard -80 of
+	// payments-001 has just failed while its stored row still reads running.
+	// That failure orphans payments-001's pending finalizer, and payments-002
+	// has completed, so the apply settles failed, exactly as the operator's
+	// stored derivation settles it.
+	t.Run("continue settles failed past a finalizer this drive's failure orphans", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		started := time.Now()
+		op := func(id int64, target, key, kind, opState string) *storage.ApplyOperation {
+			return &storage.ApplyOperation{
+				ID: id, Deployment: "payments-a", Target: target,
+				OperationKey: storage.TargetOperationKey(target, key), OperationKind: kind,
+				State: opState, OnFailure: storage.OnFailureContinue, StartedAt: &started,
+			}
+		}
+		pendingFinalizer := op(3, "payments-001", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending)
+		pendingFinalizer.StartedAt = nil
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						op(currentOpID, "payments-001", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Running),
+						op(2, "payments-001", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						pendingFinalizer,
+						op(4, "payments-002", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						op(5, "payments-002", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						op(6, "payments-002", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Completed),
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-orphaned-finalizer"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "current op row present, projection must be determined")
+		assert.Equal(t, state.Apply.Failed, got, "no row left can move, so the continue rollout takes its failed verdict")
+	})
+
 	// Under on_failure "pause" a terminally failed deployment holds the apply
 	// paused for a human while a sibling is still pending. An operator release
 	// latches the rollout open so the same failure projects running_degraded like

@@ -271,7 +271,7 @@ Rules:
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
-- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
 ### Review and the Primary Deployment
 
@@ -327,6 +327,7 @@ Rules:
 - `targets` is mutually exclusive with `target` at the same level, and with a local `dsn` / `dsn_from`.
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
+- `cutover_policy` and `on_failure` order the listed targets the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
