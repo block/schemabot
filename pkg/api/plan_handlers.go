@@ -240,6 +240,11 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if unselectedErr, ok := errors.AsType[*UnselectedPullNamespaceError](err); ok {
+			s.logger.Warn("pull schema rejected for namespaces no targets entry selects", "database", req.Database, "environment", req.Environment, "namespaces", unselectedErr.Namespaces, "selectable_namespaces", unselectedErr.Selectable)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if unsupportedErr, ok := errors.AsType[*unsupportedPullSchemaError](err); ok {
 			s.logger.Warn("pull schema rejected for unsupported database type", "database", req.Database, "environment", req.Environment, "type", unsupportedErr.DatabaseType)
 			s.writeError(w, http.StatusNotImplemented, err.Error())
@@ -313,6 +318,17 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
+		return nil, err
+	}
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve targets")
+		return nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if err := requireSelectablePullNamespaces(req, targets, namespaces); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "unselected namespaces")
 		return nil, err
 	}
 	catalogDetail, err := pullCatalogDetail(req.CatalogDetail)
@@ -776,6 +792,51 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, typeErr
 	}
+	prInt := 0
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
+	}
+	trustedSchemaPath := ""
+	if req.SourceTrusted {
+		trustedSchemaPath = req.SchemaPath
+	}
+	// Source policy checks only apply to SchemaBot-discovered PR sources. Direct
+	// operator/API plans remain available through the existing endpoint access
+	// model until the dedicated auth layer is added. The check runs before
+	// namespace placement, so a plan whose source the policy denies is
+	// reported, counted and logged as a source policy block rather than as
+	// whatever placement defect its files also carry.
+	if !req.SourceTrusted {
+		s.logger.Debug("skipping source policy for direct plan request",
+			"database", req.Database,
+			"environment", req.Environment,
+			"repository", req.Repository,
+			"pull_request", prInt)
+	} else {
+		if err := s.config.AuthorizePlanSource(PlanSourcePolicyRequest{
+			Database:    req.Database,
+			Repository:  req.Repository,
+			PullRequest: prInt,
+			SchemaPath:  trustedSchemaPath,
+		}); err != nil {
+			reason := sourcePolicyReason(err)
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, "source policy")
+			metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
+			s.logger.Warn("plan blocked by source policy",
+				"database", req.Database,
+				"environment", req.Environment,
+				"repository", req.Repository,
+				"pull_request", prInt,
+				"schema_path", req.SchemaPath,
+				"reason", reason,
+				"error", err)
+			return nil, nil, fmt.Errorf("source policy: %w", err)
+		}
+	}
+
 	// Every declared namespace must be held by some rollout member, on every
 	// plan of the environment and not only a pull request review, so a lone
 	// target selecting a subset cannot report a clean plan that leaves the rest
@@ -819,49 +880,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"declared_namespace_count", len(req.SchemaFiles))
 	}
 	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
+	declaredSchemaFiles := req.SchemaFiles
 	req.SchemaFiles = plannedSchemaFiles
-
-	prInt := 0
-	if req.PullRequest != nil {
-		prInt = int(*req.PullRequest)
-	}
-	trustedSchemaPath := ""
-	if req.SourceTrusted {
-		trustedSchemaPath = req.SchemaPath
-	}
-	// Source policy checks only apply to SchemaBot-discovered PR sources. Direct
-	// operator/API plans remain available through the existing endpoint access
-	// model until the dedicated auth layer is added.
-	if !req.SourceTrusted {
-		s.logger.Debug("skipping source policy for direct plan request",
-			"database", req.Database,
-			"environment", req.Environment,
-			"repository", req.Repository,
-			"pull_request", prInt)
-	} else {
-		if err := s.config.AuthorizePlanSource(PlanSourcePolicyRequest{
-			Database:    req.Database,
-			Repository:  req.Repository,
-			PullRequest: prInt,
-			SchemaPath:  trustedSchemaPath,
-		}); err != nil {
-			reason := sourcePolicyReason(err)
-			span.RecordError(err)
-			span.SetStatus(otelcodes.Error, "source policy")
-			metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
-			s.logger.Warn("plan blocked by source policy",
-				"database", req.Database,
-				"environment", req.Environment,
-				"repository", req.Repository,
-				"pull_request", prInt,
-				"schema_path", req.SchemaPath,
-				"reason", reason,
-				"error", err)
-			return nil, nil, fmt.Errorf("source policy: %w", err)
-		}
-	}
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
@@ -991,6 +1011,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
+		return nil, nil, err
+	}
+	if err := s.refuseDropsOfUnselectedTables(req, declaredSchemaFiles, unselected, resolvedTarget, resp.Changes, resp.Shards); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "unselected namespace drops")
 		return nil, nil, err
 	}
 

@@ -397,8 +397,19 @@ but it will not call two different schemas equal.
 
 A target whose entry [selects namespaces](configuration.md#selecting-namespaces-per-target)
 is pulled for exactly those namespaces, by name, and an explicitly requested
-namespace it does not select is left out of its pull. The response shape does
-not change, but the comparison is still keyed by namespace and table: two
+namespace it does not select is left out of its pull. When every entry of the
+environment selects namespaces, a requested namespace none of them selects is
+rejected with `400` naming it and the selectable ones, rather than answered
+with an empty schema:
+
+```json
+{
+  "error": "database \"orders\" environment \"production\" has no targets entry selecting namespaces [shop_l]; the selectable namespaces are [shop_0, shop_1]",
+  "error_code": ""
+}
+```
+
+The response shape does not change, but the comparison is still keyed by namespace and table: two
 targets holding different namespaces report each other's tables as
 `only_on_primary` and `only_on_target`, because neither holds the other's
 namespace.

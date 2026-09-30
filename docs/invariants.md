@@ -662,7 +662,10 @@ refusing member work the apply's operation shape cannot carry, rather than settl
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
 (`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
-the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`).
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an environment whose
+namespace placement refuses its plan stored as a failing check on every plan command
+(`storeNamespacePlacementCheck` in `pkg/webhook/check_records.go`, called by the single- and
+multi-environment plans in `pkg/webhook/plan.go`).
 
 ## Apply state machine (ST)
 
@@ -1590,7 +1593,9 @@ a table declared by two desired schema files fails planning on every engine thro
 `pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
 A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
 refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
-`pkg/tern/local_client.go`).
+`pkg/tern/local_client.go`), and a plan proposing to drop a table that a namespace the target does
+not select declares is refused whatever the data plane build (`refuseDropsOfUnselectedTables` in
+`pkg/api/plan_unselected_drops.go`, for the primary and every member).
 
 ### RV-9: A rollout member runs only a plan made for it
 
