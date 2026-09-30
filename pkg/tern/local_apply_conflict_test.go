@@ -438,6 +438,56 @@ func TestConflictCheckKeepsOrphanWhenCancellationWriteFails(t *testing.T) {
 	assert.Nil(t, orphan.CompletedAt)
 }
 
+// A stale in-flight task only stops blocking once its settlement is durably
+// written, whether the engine's own terminal report settles it or its engine
+// has no active work and it is failed as abandoned. If storage refuses the
+// write, the conflict check must not report the task resolved: the new apply
+// would run alongside work storage still records as in flight. The task keeps
+// blocking and is left exactly as stored, so a later conflict check retries
+// the settlement cleanly.
+func TestConflictCheckKeepsStaleTaskWhenSettlementWriteFails(t *testing.T) {
+	engineReports := map[string]*engine.ProgressResult{
+		"own-process terminal report": {State: engine.StateCompleted, Message: "Complete"},
+		"abandoned in-flight work":    {State: engine.StatePending, Message: "No active schema change"},
+	}
+	writeErrors := map[string]error{
+		"storage unavailable": errors.New("storage down"),
+		"lease lost":          storage.ErrApplyLeaseLost,
+	}
+	for reportName, report := range engineReports {
+		for errName, writeErr := range writeErrors {
+			t.Run(reportName+"/"+errName, func(t *testing.T) {
+				running := &storage.Task{
+					ID: 15, ApplyID: 151, TaskIdentifier: "task-settlement-write-fails", Database: "testdb",
+					DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Running,
+				}
+				client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+				stor := client.storage.(*exactProgressStorage)
+				stor.tasks = &updateFailingTaskStore{
+					exactProgressTaskStore: stor.tasks.(*exactProgressTaskStore),
+					updateErr:              writeErr,
+				}
+				apply := staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")
+				stor.applies = &mockApplyStore{apply: apply}
+				client.spiritEngine = &fakeControlEngine{progressResult: report}
+
+				resolved := client.tryResolveStaleTask(t.Context(), running, apply, "testdb", newConflictScanMemo())
+				assert.False(t, resolved, "a task whose settlement was refused must not be reported resolved")
+				assert.Equal(t, state.Task.Running, running.State, "the task keeps its stored state")
+				assert.Empty(t, running.ErrorMessage)
+				assert.Nil(t, running.CompletedAt)
+
+				plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+				_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+				require.Error(t, err, "the new apply must be refused while the unsettled task holds the database")
+				assert.Contains(t, err.Error(), "schema change already in progress")
+				assert.Equal(t, state.Task.Running, running.State)
+				assert.Nil(t, running.CompletedAt)
+			})
+		}
+	}
+}
+
 // updateFailingTaskStore serves tasks normally but fails every state write,
 // standing in for storage that becomes unavailable mid-conflict-check.
 type updateFailingTaskStore struct {
