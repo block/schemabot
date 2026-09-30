@@ -265,18 +265,20 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 }
 
 // ReleaseByID deletes the lock only while the row the caller read still holds
-// it. The row ID pins everything recorded on that row, the acquirer included,
-// since only the insert that creates a row writes it; a caller that authorized
-// against the row it read therefore cannot delete a lock acquired after that
-// read. When nothing is deleted the lock is re-read, so the caller learns
-// whether it is gone, held by a new row, or held under another owner.
-func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error {
+// it for the pending plan the caller read. The row ID pins everything only the
+// insert writes, the acquirer included; the pending plan pins the one thing a
+// same-owner acquire rewrites in place. A caller that authorized against the
+// row it read therefore cannot delete a lock acquired, or acquired again for a
+// new plan, after that read. When nothing is deleted the lock is re-read, so
+// the caller learns whether it is gone, held by a new row, held under another
+// owner, or held for another plan.
+func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	database = storage.CanonicalKey(database)
 	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
-		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
-	`, id, database, dbType, owner)
+		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND pending_plan_id = ?
+	`, id, database, dbType, owner, pendingPlanID)
 	if err != nil {
 		return fmt.Errorf("release lock row %d for %s/%s owner=%s: %w", id, database, dbType, owner, err)
 	}
@@ -300,7 +302,10 @@ func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType,
 	if current.ID != id {
 		return storage.ErrLockReplaced
 	}
-	return storage.ErrLockNotOwned
+	if current.Owner != owner {
+		return storage.ErrLockNotOwned
+	}
+	return storage.ErrLockIntentChanged
 }
 
 // ReleaseIfPendingPlanID atomically releases only the lock intent the caller

@@ -416,13 +416,13 @@ func TestLocks(t *testing.T, h Harness) {
 		held := CreateLock(t, store, "pinned_db", storage.DatabaseTypeMySQL)
 		other := CreateLock(t, store, "pinned_other_db", storage.DatabaseTypeMySQL)
 
-		err := store.Locks().ReleaseByID(ctx, held.ID, "pinned_db", storage.DatabaseTypeMySQL, "intruder")
+		err := store.Locks().ReleaseByID(ctx, held.ID, "pinned_db", storage.DatabaseTypeMySQL, "intruder", "")
 		require.ErrorIs(t, err, storage.ErrLockNotOwned)
-		err = store.Locks().ReleaseByID(ctx, held.ID, "pinned_db", storage.DatabaseTypeMySQL, "TestUser")
+		err = store.Locks().ReleaseByID(ctx, held.ID, "pinned_db", storage.DatabaseTypeMySQL, "TestUser", "")
 		require.ErrorIs(t, err, storage.ErrLockNotOwned, "the owner compares byte-exact, as in Release")
 
 		// Another row's ID never releases this database's lock.
-		err = store.Locks().ReleaseByID(ctx, other.ID, "pinned_db", storage.DatabaseTypeMySQL, "testuser")
+		err = store.Locks().ReleaseByID(ctx, other.ID, "pinned_db", storage.DatabaseTypeMySQL, "testuser", "")
 		require.ErrorIs(t, err, storage.ErrLockReplaced)
 
 		stored, err := store.Locks().Get(ctx, "pinned_db", storage.DatabaseTypeMySQL)
@@ -433,12 +433,12 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, otherStored, "a pinned release must not touch another database's lock")
 
-		require.NoError(t, store.Locks().ReleaseByID(ctx, held.ID, "PINNED_DB", "MYSQL", "testuser"))
+		require.NoError(t, store.Locks().ReleaseByID(ctx, held.ID, "PINNED_DB", "MYSQL", "testuser", ""))
 		stored, err = store.Locks().Get(ctx, "pinned_db", storage.DatabaseTypeMySQL)
 		require.NoError(t, err)
 		assert.Nil(t, stored)
 
-		err = store.Locks().ReleaseByID(ctx, held.ID, "pinned_db", storage.DatabaseTypeMySQL, "testuser")
+		err = store.Locks().ReleaseByID(ctx, held.ID, "pinned_db", storage.DatabaseTypeMySQL, "testuser", "")
 		require.ErrorIs(t, err, storage.ErrLockNotFound)
 	})
 
@@ -468,7 +468,7 @@ func TestLocks(t *testing.T, h Harness) {
 			Acquirer:     &storage.LockAcquirer{Subject: "erin@example.com", OperatorGroups: []string{"payments-operators"}},
 		}))
 
-		err = store.Locks().ReleaseByID(ctx, checked.ID, "replaced_db", storage.DatabaseTypeMySQL, "cli:shared@host")
+		err = store.Locks().ReleaseByID(ctx, checked.ID, "replaced_db", storage.DatabaseTypeMySQL, "cli:shared@host", "")
 		require.ErrorIs(t, err, storage.ErrLockReplaced)
 
 		current, err := store.Locks().Get(ctx, "replaced_db", storage.DatabaseTypeMySQL)
@@ -477,6 +477,30 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.NotEqual(t, checked.ID, current.ID)
 		assert.Equal(t, &storage.LockAcquirer{Subject: "erin@example.com", OperatorGroups: []string{"payments-operators"}},
 			current.Acquirer)
+	})
+
+	// The owner acquires the lock it already holds again for a new plan after
+	// the caller read it. The row keeps its ID, so the release is also pinned to
+	// the plan it read, and the lock protecting the new plan stays held.
+	t.Run("ReleaseByID_ReacquiredForNewPlanAfterRead", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := &storage.Lock{DatabaseName: "reacquired_db", DatabaseType: storage.DatabaseTypeMySQL, Owner: "org/repo#42", PendingPlanID: "plan-1"}
+		require.NoError(t, store.Locks().Acquire(ctx, lock))
+		checked, err := store.Locks().Get(ctx, "reacquired_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, checked)
+
+		lock.PendingPlanID = "plan-2"
+		require.NoError(t, store.Locks().Acquire(ctx, lock))
+
+		err = store.Locks().ReleaseByID(ctx, checked.ID, "reacquired_db", storage.DatabaseTypeMySQL, "org/repo#42", "plan-1")
+		require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+		current, err := store.Locks().Get(ctx, "reacquired_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, current, "the lock acquired again for a new plan must stay held")
+		assert.Equal(t, checked.ID, current.ID)
+		assert.Equal(t, "plan-2", current.PendingPlanID)
 	})
 
 	t.Run("ReleaseIfPendingPlanID", func(t *testing.T) {
@@ -740,7 +764,7 @@ func TestLocks(t *testing.T, h Harness) {
 
 	t.Run("ReleaseByID_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
-		err := store.Locks().ReleaseByID(t.Context(), 1, "err_db", storage.DatabaseTypeMySQL, "owner-a")
+		err := store.Locks().ReleaseByID(t.Context(), 1, "err_db", storage.DatabaseTypeMySQL, "owner-a", "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "release lock row 1 for err_db/mysql")
 	})

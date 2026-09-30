@@ -344,7 +344,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.False(t, retry, "another PR's lock ownership is a deterministic rejection the same input always reproduces")
-		assert.Zero(t, lockStore.forceReleaseCalls, "another PR's lock must not be force-released")
+		assert.Zero(t, lockStore.releaseCalls, "another PR's lock must not be force-released")
 		body := requireComment(t, comments, "ownership rejection comment")
 		assert.Contains(t, body, "held by octocat/other-repo#7")
 	})
@@ -490,7 +490,6 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a stale command is terminal; the recovery path is a fresh comment")
 		assert.Zero(t, lockStore.releaseCalls, "a stale command must not release any lock")
-		assert.Zero(t, lockStore.forceReleaseCalls, "a stale command must not force-release any lock")
 		body := requireComment(t, comments, "stale-command answer")
 		assert.Contains(t, body, "acquired after the command was received")
 		assert.Contains(t, body, "Comment `schemabot unlock` again")

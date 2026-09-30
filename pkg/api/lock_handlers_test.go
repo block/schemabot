@@ -211,7 +211,7 @@ func (s *memoryLockStore) Release(_ context.Context, database, dbType, owner str
 	return nil
 }
 
-func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner string) error {
+func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	if s.beforeReleaseByID != nil {
 		s.beforeReleaseByID(s)
 	}
@@ -223,6 +223,9 @@ func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbT
 	}
 	if s.lock.Owner != owner {
 		return storage.ErrLockNotOwned
+	}
+	if s.lock.PendingPlanID != pendingPlanID {
+		return storage.ErrLockIntentChanged
 	}
 	s.lock = nil
 	return nil

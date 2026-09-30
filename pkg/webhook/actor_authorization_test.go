@@ -697,8 +697,7 @@ func TestHandleUnlockCommandBlocksUnauthorizedActor(t *testing.T) {
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
 	assert.Contains(t, body, "@mona is not authorized")
 	assert.Contains(t, body, "`schemabot unlock`")
-	assert.Empty(t, locks.forceReleased, "denied unlock must not force-release any lock")
-	assert.Empty(t, locks.released, "denied unlock must not release any lock")
+	assert.Empty(t, locks.releasedByID, "denied unlock must not release any lock")
 }
 
 // TestHandleUnlockCommandAllowsAuthorizedActor verifies that a configured
@@ -725,7 +724,7 @@ func TestHandleUnlockCommandAllowsAuthorizedActor(t *testing.T) {
 	body := requireComment(t, comments, "unlock success comment")
 	assert.Contains(t, body, "Lock Released")
 	assert.Contains(t, body, "@hubot")
-	assert.Equal(t, []string{"orders"}, locks.forceReleased)
+	assert.Equal(t, []string{"orders"}, locks.releasedByID)
 }
 
 // TestHandleUnlockCommandUnconfiguredDatabaseHint exercises the PR force-unlock
@@ -754,8 +753,7 @@ func TestHandleUnlockCommandUnconfiguredDatabaseHint(t *testing.T) {
 	body := requireComment(t, comments, "unconfigured-database unlock comment")
 	assert.Contains(t, body, "database `payments` is not configured on this SchemaBot instance")
 	assert.NotContains(t, body, "is not authorized", "unconfigured database must not render a plain access denial")
-	assert.Empty(t, locks.forceReleased, "unconfigured database unlock must not force-release any lock")
-	assert.Empty(t, locks.released, "unconfigured database unlock must not release any lock")
+	assert.Empty(t, locks.releasedByID, "unconfigured database unlock must not release any lock")
 }
 
 func actorAuthRollbackApply() *storage.Apply {
@@ -878,7 +876,7 @@ func (s *actorAuthTaskStore) GetByDatabase(_ context.Context, database string) (
 // mutation so tests can assert which releases and acquisitions happened.
 // Setting getErr makes every Get call fail with that error, simulating a
 // storage outage during the lock lookup; setting releaseErr does the same for
-// Release, simulating an outage during lock release.
+// every release method, simulating an outage during lock release.
 type actorAuthLockStore struct {
 	storage.LockStore
 	locks             []*storage.Lock
@@ -886,7 +884,7 @@ type actorAuthLockStore struct {
 	acquired          []*storage.Lock
 	released          []string
 	releasedIfPending []string
-	forceReleased     []string
+	releasedByID      []string
 	releaseErr        error
 }
 
@@ -937,8 +935,11 @@ func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, 
 	return true, nil
 }
 
-func (s *actorAuthLockStore) ForceRelease(_ context.Context, database, _ string) error {
-	s.forceReleased = append(s.forceReleased, database)
+func (s *actorAuthLockStore) ReleaseByID(_ context.Context, _ int64, database, _, _, _ string) error {
+	if s.releaseErr != nil {
+		return s.releaseErr
+	}
+	s.releasedByID = append(s.releasedByID, database)
 	return nil
 }
 
