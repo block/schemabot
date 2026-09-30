@@ -18,6 +18,7 @@ package presentation
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/routing"
@@ -232,6 +233,97 @@ type Apply struct {
 	// Deployments are the per-deployment presentations in resolved deployment
 	// order (the order the caller supplies, which mirrors the rollout order).
 	Deployments []Deployment
+}
+
+// Group is one deployment's members of a rollout, so a surface can show a
+// deployment of hundreds of targets as one section.
+type Group struct {
+	Deployment string
+	// Members indexes Apply.Deployments, in resolved order.
+	Members []int
+	// Lead is the member that most needs an operator, so one failed target
+	// heads a group of running ones.
+	Lead Deployment
+	// Counts is the group's per-status histogram, in display order.
+	Counts []StateCount
+	// Open is true when any member is open.
+	Open bool
+}
+
+// Groups partitions the rollout's members by deployment, in the order each
+// deployment first appears in resolved order. A deployment's members form one
+// group only when each is a distinct named target; members that divide one
+// target's work, or carry no target at all, are not targets to count, so each
+// stays a group of its own.
+func (a Apply) Groups() []Group {
+	var order []string
+	byDeployment := make(map[string][]int)
+	for i, d := range a.Deployments {
+		if _, seen := byDeployment[d.Deployment]; !seen {
+			order = append(order, d.Deployment)
+		}
+		byDeployment[d.Deployment] = append(byDeployment[d.Deployment], i)
+	}
+	var groups []Group
+	for _, deployment := range order {
+		members := byDeployment[deployment]
+		if a.membersAreDistinctTargets(members) {
+			groups = append(groups, a.group(deployment, members))
+			continue
+		}
+		for _, i := range members {
+			groups = append(groups, a.group(deployment, []int{i}))
+		}
+	}
+	return groups
+}
+
+// membersAreDistinctTargets reports whether every member names a target of its
+// own, which is what makes the members a deployment's targets.
+func (a Apply) membersAreDistinctTargets(members []int) bool {
+	seen := make(map[string]bool, len(members))
+	for _, i := range members {
+		target := a.Deployments[i].Target
+		if target == "" || seen[target] {
+			return false
+		}
+		seen[target] = true
+	}
+	return true
+}
+
+// group builds deployment's group from members, headed by the member most in
+// need of an operator.
+func (a Apply) group(deployment string, members []int) Group {
+	g := Group{Deployment: deployment, Members: members, Lead: a.Deployments[members[0]]}
+	ds := make([]Deployment, len(members))
+	for j, i := range members {
+		d := a.Deployments[i]
+		ds[j] = d
+		g.Open = g.Open || d.Open
+		if attentionRank(d.Presentation) < attentionRank(g.Lead.Presentation) {
+			g.Lead = d
+		}
+	}
+	g.Counts = summaryCounts(ds)
+	return g
+}
+
+// attentionOrder ranks presentations by how urgently they need an operator,
+// most urgent first and settled members last.
+var attentionOrder = []PresentationState{
+	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
+	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
+	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
+	StateCancelled, StateReverted, StateCompleted,
+}
+
+// attentionRank is ps's position in attentionOrder; unnamed states rank last.
+func attentionRank(ps PresentationState) int {
+	if i := slices.Index(attentionOrder, ps); i >= 0 {
+		return i
+	}
+	return len(attentionOrder)
 }
 
 // MultiDeployment reports whether the apply owns more than one deployment.

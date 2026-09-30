@@ -596,3 +596,60 @@ func TestDerive_KeyedApplyStaysNamedByDeployment(t *testing.T) {
 	assert.Equal(t, "us-east", got.Deployments[0].Name)
 	assert.Equal(t, "us-east", got.Deployments[1].Name)
 }
+
+// A deployment addressing many targets is one group: its members keep their
+// resolved order, the group is headed by the member that most needs attention
+// rather than the first one, it counts its own members only, and it opens when
+// any member would. A single-target deployment is a group of one.
+func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
+	target := func(dep, tgt, st string) Operation {
+		return Operation{Deployment: dep, Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	apply := Derive([]Operation{
+		target("primary", "t_000", so.Completed),
+		target("primary", "t_001", so.Running),
+		target("primary", "t_002", so.Failed),
+		target("eu", "orders_eu", so.Completed),
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 2)
+
+	primary := groups[0]
+	assert.Equal(t, "primary", primary.Deployment)
+	assert.Equal(t, []int{0, 1, 2}, primary.Members)
+	assert.Equal(t, "primary/t_002", primary.Lead.Name, "the failed target heads the group")
+	assert.Equal(t, []StateCount{{"completed", 1}, {"running", 1}, {"failed", 1}}, primary.Counts)
+	assert.True(t, primary.Open)
+
+	eu := groups[1]
+	assert.Equal(t, "eu", eu.Deployment)
+	assert.Equal(t, []int{3}, eu.Members)
+	assert.Equal(t, "eu", eu.Lead.Name)
+	assert.Equal(t, []StateCount{{"completed", 1}}, eu.Counts)
+	assert.False(t, eu.Open)
+}
+
+// Members that are not distinct targets, such as keyed operations with no
+// target or several operations dividing one target's work, are not rolled up:
+// each stays a group of its own, so no surface counts them as targets.
+func TestGroups_OnlyDistinctTargetsRollUp(t *testing.T) {
+	for name, ops := range map[string][]Operation{
+		"no target": {
+			{Deployment: "primary", State: so.Running, Parallel: true},
+			{Deployment: "primary", State: so.Running, Parallel: true},
+		},
+		"one target's work": {
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			groups := Derive(ops).Groups()
+			require.Len(t, groups, 2)
+			assert.Equal(t, []int{0}, groups[0].Members)
+			assert.Equal(t, []int{1}, groups[1].Members)
+			assert.Equal(t, "primary", groups[1].Deployment)
+		})
+	}
+}
