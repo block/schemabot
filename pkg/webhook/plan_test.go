@@ -1276,3 +1276,11 @@ func TestPlanCommentDatabaseFlag(t *testing.T) {
 	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true, 2), "an auto-plan on a PR touching several databases names the one its comment plans")
 	assert.Empty(t, planCommentDatabaseFlag("", "payments", true, 1), "an auto-plan on a PR touching one database has nothing to disambiguate")
 }
+
+// The plan comment carries the stored plan's identifier, so DDL the comment
+// cuts to fit names the command that prints the plan in full.
+func TestBuildPlanCommentData_CarriesPlanID(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "testuser", "")
+	assert.Equal(t, "plan_7c41f9", data.PlanID)
+}

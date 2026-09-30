@@ -126,6 +126,12 @@ type PlanCommentData struct {
 	IsMySQL      bool
 	ApplyID      string
 
+	// PlanID is the identifier of the stored plan this comment renders, so DDL
+	// cut to fit the comment names the command that prints the plan in full.
+	// Empty when the plan was not stored, which leaves a cut block pointing at
+	// the PR's schema files.
+	PlanID string
+
 	// AgentHint is the deployment's configured guidance for AI agents reading
 	// the plan. Empty on deployments that configure none, which render an
 	// unchanged comment.
@@ -274,6 +280,12 @@ type DeploymentPlanGroup struct {
 	// BlockedChanges are the group's changes the engine will refuse at apply,
 	// each naming the targets that refuse it when that is not all of them.
 	BlockedChanges []BlockedChangeData
+	// PlanID is the identifier of the stored plan the group's first member
+	// would run, so DDL cut to fit the comment names the command that prints
+	// the group's plan in full. Unused for the primary's group, which runs the
+	// reviewed plan and points at PlanCommentData.PlanID. Empty when the
+	// member's plan was not stored.
+	PlanID string
 }
 
 // Empty reports that the group's members are already at the desired schema and
@@ -1088,6 +1100,8 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 // writeKeyspaceChanges renders each keyspace's DDL and VSchema changes, with
 // the DDL blocks drawing on the comment's shared budget.
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget) {
+	defer budget.pointAt(data.PlanID)()
+
 	// The DDL blocks below format statements under the plan's own dialect so
 	// they are never reformatted under another family's grammar.
 	dialect := schema.DialectForDatabaseType(data.DatabaseType)
@@ -1587,6 +1601,16 @@ func targetPlanChanges(g DeploymentPlanGroup, data PlanCommentData) []KeyspaceCh
 	return g.Changes
 }
 
+// targetPlanID is the stored plan a target group's DDL comes from, the one a
+// reader who cannot see all of it is pointed at. The primary runs the reviewed
+// plan itself and has no member plan of its own.
+func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
+	if g.Primary {
+		return data.PlanID
+	}
+	return g.PlanID
+}
+
 // writeTargetPlans renders the rollout's plans the way a sharded keyspace
 // renders its shards: one heading per group naming the targets that run it,
 // with the group's DDL under it, and a group already at the desired schema
@@ -1613,6 +1637,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		}
 		group := data
 		group.Changes = targetPlanChanges(g, data)
+		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
 		if collapse && statements+vschema > 1 {
 			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)

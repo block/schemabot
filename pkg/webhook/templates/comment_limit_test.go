@@ -292,3 +292,68 @@ func TestRenderWithinCommentLimitCutsDDLByTheOvershoot(t *testing.T) {
 		assert.Greater(t, len(body), commentBodyLimit-4096-64)
 	})
 }
+
+// DDL cut to fit the comment comes from a stored plan, so the marker under it
+// names the command that prints that plan in full rather than sending the
+// reader to the schema files, which hold the desired schema and not the
+// statements the plan would run.
+func TestPlanCommentCutDDLNamesTheStoredPlan(t *testing.T) {
+	data := greenfieldPlan("production", "events", 200)
+	data.PlanID = "plan_7c41f9"
+	body := RenderPlanComment(data)
+
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Equal(t, 1, strings.Count(body, planPointerMarker("plan_7c41f9")))
+	assert.Contains(t, body, "`schemabot list-plans plan_7c41f9` prints the full plan.")
+	assert.NotContains(t, body, ddlTruncatedMarker)
+}
+
+// A plan whose DDL fits in full is shown in full, so the comment points at no
+// stored plan: there is nothing it could not show.
+func TestPlanCommentUncutDDLNamesNoStoredPlan(t *testing.T) {
+	data := greenfieldPlan("production", "events", 41)
+	data.PlanID = "plan_7c41f9"
+	body := RenderPlanComment(data)
+
+	assert.NotContains(t, body, "list-plans")
+	assert.NotContains(t, body, ddlTruncatedMarker)
+}
+
+// A rollout whose targets run different plans renders each group's plan, and
+// every member's plan is stored as its own row. When the comment cuts the DDL,
+// each group's marker names the plan that group runs: the primary's group the
+// reviewed plan, another group its first member's plan, and a group whose plan
+// was not stored falls back to the schema files.
+func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
+	primary := greenfieldPlan("production", "orders", 150)
+	primary.PlanID = "plan_reviewed"
+	second := greenfieldPlan("production", "orders_eu", 150).Changes
+	third := greenfieldPlan("production", "orders_ap", 150).Changes
+	primary.DeploymentDrift = &DeploymentDriftData{
+		Computed: true, Clean: true, Independent: true,
+		Deployments: []DeploymentDriftEntry{
+			{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+			{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			{Deployment: "primary", Target: "orders_3", Class: "planned"},
+		},
+		Plans: []DeploymentPlanGroup{
+			{Members: []string{"primary/orders_1"}, Primary: true, Changes: primary.Changes},
+			{Members: []string{"primary/orders_2"}, Changes: second, PlanID: "plan_member_2"},
+			{Members: []string{"primary/orders_3"}, Changes: third},
+		},
+	}
+	body := RenderPlanComment(primary)
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+	first, rest, found := strings.Cut(body, "**target `primary/orders_2`**")
+	require.True(t, found, body)
+	middle, last, found := strings.Cut(rest, "**target `primary/orders_3`**")
+	require.True(t, found, body)
+
+	assert.Contains(t, first, planPointerMarker("plan_reviewed"))
+	assert.NotContains(t, first, "plan_member_2")
+	assert.Contains(t, middle, planPointerMarker("plan_member_2"))
+	assert.NotContains(t, middle, "plan_reviewed")
+	assert.Contains(t, last, ddlTruncatedMarker)
+	assert.NotContains(t, last, "list-plans")
+}

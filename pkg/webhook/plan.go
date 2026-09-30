@@ -967,6 +967,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		DatabaseType:      schema.Type,
 		IsMySQL:           schema.Type == "mysql",
 		IgnoredNamespaces: schema.IgnoredNamespaces,
+		PlanID:            planResp.PlanID,
 	}
 	for _, group := range planResp.ExemptTables {
 		if group == nil {

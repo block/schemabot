@@ -161,6 +161,7 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			groups = append(groups, templates.DeploymentPlanGroup{
 				Primary: i == 0,
 				Changes: memberPlanChanges(e.ChangeSet),
+				PlanID:  e.PlanIdentifier,
 			})
 			at = len(groups) - 1
 			byPlan[e.PlanFingerprint] = at
