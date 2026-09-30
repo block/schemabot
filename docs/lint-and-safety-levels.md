@@ -72,6 +72,13 @@ human decision. `--dry-run` previews the fixes without writing anything. Run it
 locally when a plan comes back with lint warnings you agree with — it edits
 your declarative files, so the fixes land in the same PR as the change.
 
+It reads the same layout `plan` does: `.sql` files directly in the schema
+directory, or one level of namespace subdirectories (`<schema-dir>/<namespace>/*.sql`),
+and writes each fix back to the file it came from. Like `plan`, it rejects a
+directory that mixes the two layouts without changing any file. It exits non-zero when
+the directory holds no `.sql` files, since that almost always means a wrong
+path, and when any finding needs a manual fix.
+
 ## Auditing a live schema (`pull --lint`)
 
 `schemabot pull --lint` (the `lint` option on the pull API) runs the linters

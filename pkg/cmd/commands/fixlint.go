@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // FixLintCmd auto-fixes lint issues in schema files.
@@ -19,15 +21,17 @@ type FixLintCmd struct {
 
 // Run executes the fix-lint command.
 func (cmd *FixLintCmd) Run(g *Globals) error {
-	// Read all .sql files from the schema directory
+	// Read the .sql files with the same layout rules plan uses: flat files in
+	// the schema directory, or one level of namespace subdirectories.
 	files, err := readSchemaFiles(cmd.SchemaDir)
 	if err != nil {
 		return fmt.Errorf("read schema files: %w", err)
 	}
 
+	// A schema directory with nothing to fix is almost always a wrong path, so
+	// fail rather than report success on files that were never read.
 	if len(files) == 0 {
-		fmt.Println("No .sql files found in schema directory.")
-		return nil
+		return fmt.Errorf("no .sql files found in %s", cmd.SchemaDir)
 	}
 
 	// Run the fixer
@@ -59,7 +63,7 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 
 				// Write fixed file (unless dry-run)
 				if !cmd.DryRun {
-					filePath := filepath.Join(cmd.SchemaDir, fr.Filename)
+					filePath := filepath.Join(cmd.SchemaDir, filepath.FromSlash(fr.Filename))
 					if err := os.WriteFile(filePath, []byte(fr.FixedSQL), 0644); err != nil {
 						return fmt.Errorf("write %s: %w", fr.Filename, err)
 					}
@@ -96,30 +100,28 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 	return nil
 }
 
-// readSchemaFiles reads all .sql files from a directory.
+// readSchemaFiles reads the .sql files under dir, keyed by their
+// slash-separated path relative to dir ("users.sql" for a flat layout,
+// "orders/users.sql" for a namespaced one). Other schema files such as
+// vschema.json are not SQL and have nothing for the fixer to rewrite. A layout
+// plan rejects, such as flat files beside namespace subdirectories, is
+// rejected here with the same error, so fix-lint never rewrites files plan
+// would refuse to read.
 func readSchemaFiles(dir string) (map[string]string, error) {
-	files := make(map[string]string)
-
-	entries, err := os.ReadDir(dir)
+	all, err := client.ReadSchemaFilesByPath(dir)
 	if err != nil {
 		return nil, err
 	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if !strings.HasSuffix(entry.Name(), ".sql") {
-			continue
-		}
-
-		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", entry.Name(), err)
-		}
-
-		files[entry.Name()] = string(content)
+	if _, _, err := schema.GroupFilesByNamespace(all, filepath.Base(dir), "", nil); err != nil {
+		return nil, err
 	}
 
+	files := make(map[string]string, len(all))
+	for relPath, content := range all {
+		if !strings.HasSuffix(relPath, ".sql") {
+			continue
+		}
+		files[relPath] = content
+	}
 	return files, nil
 }

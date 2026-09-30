@@ -429,55 +429,9 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // excluded from the result. The second return value lists the namespace keys
 // actually removed by ignoreNamespaces, sorted.
 func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) (map[string]*apitypes.SchemaFiles, []string, error) {
-	// Collect all files as relativePath → content
-	rawFiles := make(map[string]string)
-
-	entries, err := os.ReadDir(dir)
+	rawFiles, err := ReadSchemaFilesByPath(dir)
 	if err != nil {
 		return nil, nil, err
-	}
-
-	for _, entry := range entries {
-		// Follow symlinks: DirEntry.IsDir() returns false for symlinks even
-		// if they point to directories. Use os.Stat to resolve.
-		isDir := entry.IsDir()
-		if !isDir {
-			if info, err := os.Stat(filepath.Join(dir, entry.Name())); err == nil {
-				isDir = info.IsDir()
-			}
-		}
-		if isDir {
-			// Read schema files inside the subdirectory
-			subEntries, err := os.ReadDir(filepath.Join(dir, entry.Name()))
-			if err != nil {
-				return nil, nil, fmt.Errorf("read subdirectory %s: %w", entry.Name(), err)
-			}
-			for _, sub := range subEntries {
-				if sub.IsDir() {
-					continue
-				}
-				if !isSchemaFile(sub.Name()) {
-					continue
-				}
-				// Use path.Join (forward slashes) for map keys so
-				// GroupFilesByNamespace can parse them consistently.
-				relPath := path.Join(entry.Name(), sub.Name())
-				content, err := os.ReadFile(filepath.Join(dir, entry.Name(), sub.Name()))
-				if err != nil {
-					return nil, nil, fmt.Errorf("read %s: %w", relPath, err)
-				}
-				rawFiles[relPath] = string(content)
-			}
-			continue
-		}
-		if !isSchemaFile(entry.Name()) {
-			continue
-		}
-		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
-		}
-		rawFiles[entry.Name()] = string(content)
 	}
 
 	// Group by namespace using the shared helper.
@@ -493,6 +447,65 @@ func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) 
 		result[ns] = &apitypes.SchemaFiles{Files: nsFiles.Files}
 	}
 	return result, ignored, nil
+}
+
+// ReadSchemaFilesByPath reads the schema files in dir using the same layout
+// rules as ReadSchemaFiles — flat files in dir, or one level of namespace
+// subdirectories (symlinked directories included) — and returns them keyed by
+// their slash-separated path relative to dir, e.g. "users.sql" or
+// "orders/users.sql". Callers that must write a file back join the key onto dir.
+func ReadSchemaFilesByPath(dir string) (map[string]string, error) {
+	rawFiles := make(map[string]string)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		// Follow symlinks: DirEntry.IsDir() returns false for symlinks even
+		// if they point to directories. Use os.Stat to resolve.
+		isDir := entry.IsDir()
+		if !isDir {
+			if info, err := os.Stat(filepath.Join(dir, entry.Name())); err == nil {
+				isDir = info.IsDir()
+			}
+		}
+		if isDir {
+			// Read schema files inside the subdirectory
+			subEntries, err := os.ReadDir(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, fmt.Errorf("read subdirectory %s: %w", entry.Name(), err)
+			}
+			for _, sub := range subEntries {
+				if sub.IsDir() {
+					continue
+				}
+				if !isSchemaFile(sub.Name()) {
+					continue
+				}
+				// Use path.Join (forward slashes) for map keys so
+				// GroupFilesByNamespace can parse them consistently.
+				relPath := path.Join(entry.Name(), sub.Name())
+				content, err := os.ReadFile(filepath.Join(dir, entry.Name(), sub.Name()))
+				if err != nil {
+					return nil, fmt.Errorf("read %s: %w", relPath, err)
+				}
+				rawFiles[relPath] = string(content)
+			}
+			continue
+		}
+		if !isSchemaFile(entry.Name()) {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", entry.Name(), err)
+		}
+		rawFiles[entry.Name()] = string(content)
+	}
+
+	return rawFiles, nil
 }
 
 func isSchemaFile(name string) bool {
