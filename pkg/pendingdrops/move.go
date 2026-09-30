@@ -78,14 +78,27 @@ func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) err
 // Destinations returns the quarantine destination for each source table,
 // stamped with now. It touches no database, so the same tables and now always
 // produce the same destinations.
+//
+// Every table in one call shares the same timestamp prefix, so two sources
+// with the same table name in different schemas would otherwise be given the
+// same destination and fail the single RENAME. A destination already taken
+// earlier in the call is disambiguated with a hash of its source schema and
+// table name instead. Names are compared case-insensitively because MySQL may
+// store and compare table names that way, depending on lower_case_table_names.
 func Destinations(tables []TableMove, now time.Time) []QuarantinedTable {
 	moved := make([]QuarantinedTable, 0, len(tables))
+	taken := make(map[string]struct{}, len(tables))
 	for _, table := range tables {
+		name := TableName(table.SchemaName, table.TableName, now)
+		if _, ok := taken[strings.ToLower(name)]; ok {
+			name = disambiguatedTableName(timestampPrefix(now), table.SchemaName, table.TableName)
+		}
+		taken[strings.ToLower(name)] = struct{}{}
 		moved = append(moved, QuarantinedTable{
 			SchemaName:       table.SchemaName,
 			TableName:        table.TableName,
 			QuarantineSchema: Database,
-			QuarantineTable:  TableName(table.SchemaName, table.TableName, now),
+			QuarantineTable:  name,
 		})
 	}
 	return moved
