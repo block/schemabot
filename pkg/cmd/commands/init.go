@@ -240,7 +240,12 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		return nil, err
 	}
 	if cmd.ReuseSchema && baseline != nil && len(baseline.Errors) == 0 && hasResultChanges(baseline) {
-		return nil, fmt.Errorf("your existing schema files differ from the live database; your edits were preserved. Review them with %s plan -s %s -e %s --profile %s instead of rerunning setup:\n  %s", cliname.Name(), initShellArg(cmd.SchemaDir), initShellArg(cmd.Environment), initShellArg(profile), strings.Join(describeOnboardPlanChanges(baseline), "\n  "))
+		// The connection is usable even though the desired schema is not a clean baseline.
+		// Preserve the files and save the connection so the suggested plan can run.
+		if _, err := client.RegisterLocalProfile(profile, cmd.Runtime); err != nil {
+			return nil, fmt.Errorf("save connection for reviewing existing schema differences: %w", err)
+		}
+		return nil, &initSchemaDriftError{message: fmt.Sprintf("your existing schema files differ from the live database; your edits were preserved. Review them with %s plan -s %s -e %s --profile %s instead of rerunning setup:\n  %s", cliname.Name(), initShellArg(cmd.SchemaDir), initShellArg(cmd.Environment), initShellArg(profile), strings.Join(describeOnboardPlanChanges(baseline), "\n  "))}
 	}
 	cmd.reportProgress("Saving your schema files and connection...")
 	if err := publishVerifiedInitSchema(stage, root, baseline, cmd.Database, cmd.Environment); err != nil {
@@ -369,7 +374,15 @@ func (cmd *InitCmd) reportProgress(message string) {
 	}
 }
 
+type initSchemaDriftError struct{ message string }
+
+func (err *initSchemaDriftError) Error() string { return err.message }
+
 func retainedInitError(err error) error {
+	var drift *initSchemaDriftError
+	if errors.As(err, &drift) {
+		return err
+	}
 	if errors.Is(err, context.Canceled) {
 		return fmt.Errorf("setup cancelled; runtime registration is retained for retry: %w", err)
 	}
