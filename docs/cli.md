@@ -499,7 +499,9 @@ targets run that plan. When the first target is already at the desired schema,
 for example after an apply narrowed to it, the other targets can still need
 the change, so the plan is not reported as up to date: it fails with an error
 that lists the targets it did not plan. Plan and apply each of them with
-`--target`.
+`--target`. This holds when every target is already converged too, so a
+rollout-wide `apply` re-run with nothing to do exits with that error rather
+than reporting no changes.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and

@@ -398,23 +398,29 @@ type ActiveSchemaChange struct {
 }
 
 func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSchemaChange, error) {
-	return findActiveSchemaChange(endpoint, database, environment, func(*apitypes.ActiveApplyResponse) bool { return true })
+	return findActiveSchemaChange(endpoint, database, environment, "", func(*apitypes.ActiveApplyResponse) bool { return true })
 }
 
 // CheckActiveSchemaChangeOnDeployment is CheckActiveSchemaChange limited to
 // the active schema changes that hold the given deployment, for an apply that
-// reserves only that deployment. An active apply whose deployment is not
-// reported is counted as holding it, since nothing shows it does not.
+// reserves only that deployment. The server is asked for that deployment's
+// applies, since it reports an apply's deployment only when a status request
+// names one. An active apply whose deployment is still not reported is counted
+// as holding it, since nothing shows it does not.
 func CheckActiveSchemaChangeOnDeployment(endpoint, database, environment, deployment string) (*ActiveSchemaChange, error) {
-	return findActiveSchemaChange(endpoint, database, environment, func(apply *apitypes.ActiveApplyResponse) bool {
-		return apply.Deployment == "" || apply.Deployment == deployment
+	deployment = storage.CanonicalKey(deployment)
+	return findActiveSchemaChange(endpoint, database, environment, deployment, func(apply *apitypes.ActiveApplyResponse) bool {
+		return apply.Deployment == "" || storage.CanonicalKey(apply.Deployment) == deployment
 	})
 }
 
-func findActiveSchemaChange(endpoint, database, environment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
+func findActiveSchemaChange(endpoint, database, environment, deployment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
 	var result apitypes.StatusResponse
 	query := url.Values{}
 	query.Set("environment", environment)
+	if deployment != "" {
+		query.Set("deployment", deployment)
+	}
 	query.Set("limit", "1000")
 	// Ask only for applies still holding a target. This runs on every apply and
 	// rollback preflight, and the answer never depends on settled history, so
