@@ -1663,6 +1663,7 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 				seen[ks.Keyspace] = make(map[string]struct{})
 			}
 			combined[i].VSchemaChanged = combined[i].VSchemaChanged || ks.VSchemaChanged
+			combined[i].Finalize = combined[i].Finalize || ks.Finalize
 			for _, stmt := range keyspaceStatements(ks) {
 				if _, dup := seen[ks.Keyspace][stmt]; dup {
 					continue

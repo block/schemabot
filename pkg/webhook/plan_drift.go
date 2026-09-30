@@ -266,7 +266,9 @@ func addBlockedTarget(g *templates.DeploymentPlanGroup, bc templates.BlockedChan
 // the reviewed plan in, so a group's changes can be shown the way a reviewer has
 // already read the primary's. It is a second builder of that shape, not the same
 // one: the reviewed plan is built from the plan response in buildPlanCommentData,
-// and the two have to be kept in step by hand.
+// and the two have to be kept in step by hand. Both record a namespace's
+// VSchema change and finalize through setNamespaceWork, so a member's plan
+// shows them the way the reviewed plan does.
 //
 // A sharded namespace carries its changes twice: once per shard, and once in a
 // collapsed namespace view that dedupes tables across shards. Both are kept, the
@@ -327,10 +329,7 @@ func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
 			}
 			ks.Statements = append(ks.Statements, tc.GetDdl())
 		}
-		if apitypes.HasVSchemaWork(sc.GetMetadata()) {
-			ks.VSchemaChanged = true
-			ks.VSchemaDiff = sc.GetMetadata()[apitypes.VSchemaDiffMetadataKey]
-		}
+		setNamespaceWork(&ks, &apitypes.SchemaChangeResponse{Namespace: sc.GetNamespace(), Metadata: sc.GetMetadata()})
 		changes = append(changes, ks)
 	}
 	for _, ns := range shardedNamespaces {
