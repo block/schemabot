@@ -386,7 +386,7 @@ func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges 
 	}
 
 	if len(parts) > 0 {
-		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
+		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
 		fmt.Println()
 	}
 }

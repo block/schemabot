@@ -167,7 +167,17 @@ func TestWritePlanSummaryWithVSchema_CountsEveryStatement(t *testing.T) {
 			[]VSchemaChange{{Keyspace: "orders"}},
 		)
 	})
-	assert.Equal(t, "📋 **Plan**: 1 index to drop, 1 VSchema change\n\n", out)
+	assert.Equal(t, "📋 Plan: 1 index to drop, 1 VSchema change\n\n", out)
+}
+
+// A terminal does not render markdown, so the VSchema-aware summary writer
+// prints the same plain summary line as WritePlanSummary for the same DDL.
+func TestWritePlanSummaryWithVSchema_MatchesThePlainSummaryLine(t *testing.T) {
+	changes := []DDLChange{{ChangeType: "CREATE", TableName: "orders"}, {ChangeType: "ALTER", TableName: "users"}}
+	plain := captureStdout(t, func() { WritePlanSummary(changes) })
+	withVSchema := captureStdout(t, func() { WritePlanSummaryWithVSchema(changes, nil) })
+	assert.Equal(t, "📋 Plan: 1 table to create, 1 table to alter\n\n", plain)
+	assert.Equal(t, plain, withVSchema)
 }
 
 // Six keyspaces add the same table and the engine finalizes each. The finalize
