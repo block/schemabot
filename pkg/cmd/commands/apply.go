@@ -274,33 +274,45 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	applyID, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
-			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, applyID))
+			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
 		}
 		return err
 	}
 
 	if cmd.Yield && !cmd.NoLock {
-		return yieldLock(ep, cfg.Database, cfg.Type, owner, applyID)
+		return yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID)
 	}
 
 	return nil
 }
 
-// shouldYieldLock reports whether --yield may release the database lock. A
-// failed parent also needs terminal operation rows because its verdict can be
-// recorded while a sibling operation is still writing to the target.
+// shouldYieldLock reports whether --yield may release the database lock. The
+// parent must have settled, and so must every operation and table under it: a
+// settled parent is not proof its work stopped. A rollout projects cancelled as
+// soon as one deployment's operation is cancelled, one failed task fails its
+// operation while a sibling task keeps copying, and a stopped operation can be
+// started again. A failed parent with no operation rows at all offers no proof
+// either way and keeps the lock.
 func shouldYieldLock(progress *apitypes.ProgressResponse) bool {
 	if !state.IsState(progress.State, state.SettledApplyStates...) {
 		return false
 	}
-	if !state.IsState(progress.State, state.Apply.Failed) {
-		return true
-	}
-	if len(progress.Operations) == 0 {
+	if state.IsState(progress.State, state.Apply.Failed) && len(progress.Operations) == 0 {
 		return false
 	}
+	return childWorkSettled(progress)
+}
+
+// childWorkSettled reports whether every operation and table row under the
+// apply has reached a state that no driver will write again.
+func childWorkSettled(progress *apitypes.ProgressResponse) bool {
 	for _, operation := range progress.Operations {
-		if !state.IsTerminalApplyState(operation.State) {
+		if !state.IsState(operation.State, state.SettledApplyStates...) {
+			return false
+		}
+	}
+	for _, table := range progress.Tables {
+		if !state.IsTerminalTaskState(table.Status) {
 			return false
 		}
 	}
@@ -312,7 +324,7 @@ func shouldYieldLock(progress *apitypes.ProgressResponse) bool {
 // command got here: an unwatched apply, a stopped one, and a watch the operator
 // left all return without the apply having finished. Anything that is not a
 // settled state keeps the lock and says how to release it later.
-func yieldLock(ep, database, dbType, owner, applyID string) error {
+func yieldLock(ep, database, dbType, owner, environment, applyID string) error {
 	if applyID == "" {
 		templates.WriteLockKept(database, dbType, "the server returned no apply ID to check")
 		return fmt.Errorf("release lock for %s: the server returned no apply ID", database)
@@ -323,26 +335,38 @@ func yieldLock(ep, database, dbType, owner, applyID string) error {
 		return fmt.Errorf("read apply %s before releasing lock for %s: %w", applyID, database, err)
 	}
 	if !shouldYieldLock(progress) {
-		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, progress.State))
+		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, environment, progress))
 		return nil
 	}
 	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
+		templates.WriteLockKept(database, dbType, fmt.Sprintf("the server did not release it (%v)", err))
 		return fmt.Errorf("release lock for %s: %w", database, err)
 	}
 	templates.WriteLockReleased(database, dbType)
 	return nil
 }
 
-// lockKeptReason says why --yield kept the lock for an apply that has not
-// settled.
-func lockKeptReason(applyID, applyState string) string {
-	if state.IsState(applyState, state.Apply.Stopped) {
+// lockKeptReason says why --yield kept the lock for an apply that
+// shouldYieldLock rejected: the parent has not settled, or it has but a
+// deployment or table under it is still able to write. The settled cases point
+// at the progress command so the operator can see which row is still moving
+// before deciding to unlock.
+func lockKeptReason(applyID, environment string, progress *apitypes.ProgressResponse) string {
+	applyState := state.NormalizeState(progress.State)
+	switch {
+	case state.IsState(applyState, state.Apply.Stopped):
 		return fmt.Sprintf("apply %s is stopped and can still be resumed", applyID)
-	}
-	if state.IsState(applyState, state.NoActiveChange) {
+	case state.IsState(applyState, state.NoActiveChange):
 		return fmt.Sprintf("the server reported no state for apply %s", applyID)
+	case state.IsState(applyState, state.Apply.Failed) && len(progress.Operations) == 0:
+		return fmt.Sprintf("apply %s is failed and the server reported no deployment rows to check (see %s progress -e %s %s)",
+			applyID, cliname.Name(), environment, applyID)
+	case state.IsState(applyState, state.SettledApplyStates...):
+		return fmt.Sprintf("apply %s is %s, but not every deployment and table under it has stopped yet (see %s progress -e %s %s)",
+			applyID, applyState, cliname.Name(), environment, applyID)
+	default:
+		return fmt.Sprintf("apply %s has not finished (state: %s)", applyID, applyState)
 	}
-	return fmt.Sprintf("apply %s has not finished (state: %s)", applyID, state.NormalizeState(applyState))
 }
 
 // OutputFormat specifies how progress output is rendered during apply watch.

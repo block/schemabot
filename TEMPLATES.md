@@ -2599,7 +2599,7 @@ Options:
 ```
 
 🔒 Lock kept for testapp (mysql) despite --yield: apply apply-a1b2c3d4 is stopped and can still be resumed.
-   Release it once the apply has finished: schemabot unlock -d testapp -t mysql
+   Release it once nothing is left to run: schemabot unlock -d testapp -t mysql
 
 ```
 </details>
