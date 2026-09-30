@@ -219,10 +219,10 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 	})
 	primary, rest, found := strings.Cut(body, "**targets `commerce/orders-002`, `commerce/orders-003`**")
 	require.True(t, found, "the second group renders under its own heading")
-	assert.True(t, strings.Contains(primary, "the full plan for this target is available from the CLI with `schemabot list-plans plan_reviewed`."),
+	assert.True(t, strings.Contains(primary, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_reviewed`."),
 		"the primary's cut DDL names the reviewed plan")
 	assert.False(t, strings.Contains(body, "plan_orders_001"), "the primary's own entry identifier is never named")
-	assert.True(t, strings.Contains(rest, "the full plan for `commerce/orders-002` is available from the CLI with `schemabot list-plans plan_orders_002` (every target in this group runs the same DDL)."),
+	assert.True(t, strings.Contains(rest, "the full plan for `commerce/orders-002` is available from the CLI with `schemabot list-plans -e production plan_orders_002` (every target in this group runs the same DDL)."),
 		"the group's cut DDL names its first member's plan and whose it is")
 	assert.False(t, strings.Contains(body, "plan_orders_003"), "a group names only its first member's plan")
 }

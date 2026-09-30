@@ -132,6 +132,10 @@ type PlanCommentData struct {
 	// the PR's schema files.
 	PlanID string
 
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
+
 	// AgentHint is the deployment's configured guidance for AI agents reading
 	// the plan. Empty on deployments that configure none, which render an
 	// unchanged comment.
@@ -1157,7 +1161,7 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 // writeKeyspaceChanges renders each keyspace's DDL and VSchema changes, with
 // the DDL blocks drawing on the comment's shared budget.
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget) {
-	defer budget.pointAt(data.PlanID)()
+	defer budget.pointAt(storedPlanRef{cliName: data.CLIName, environment: data.Environment, id: data.PlanID})()
 
 	// The DDL blocks below format statements under the plan's own dialect so
 	// they are never reformatted under another family's grammar.
@@ -1568,10 +1572,17 @@ func formatTableSize(ts TableSizeData) string {
 // statement that is neither a single statement nor a valid create set is
 // still rendered as written, and the reason is logged for triage.
 func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
+	writeSQLFencedBlocks(sb, formatDDLBlocks(statements, dialect), budget)
+	sb.WriteString("\n")
+}
+
+// formatDDLBlocks formats each statement as the content of its own SQL block,
+// as writePlanDDLBlocks describes.
+func formatDDLBlocks(statements []string, dialect schema.Dialect) []string {
 	blocks := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
-		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
+		slog.Warn("DDL block cannot split create sets; multi-statement DDL will be rendered as written",
 			"dialect", dialect, "error", parserErr)
 	}
 	for _, stmt := range statements {
@@ -1580,7 +1591,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 			if _, _, classifyErr := parser.Classify(stmt); classifyErr != nil {
 				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
 				if createSetErr != nil {
-					slog.Warn("plan DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
+					slog.Warn("DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
 						"dialect", dialect, "classify_error", classifyErr, "create_set_error", createSetErr)
 				} else {
 					statementsToFormat = createSet.Statements
@@ -1593,8 +1604,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 		}
 		blocks = append(blocks, strings.Join(formattedCreateSet, "\n"))
 	}
-	writeSQLFencedBlocks(sb, blocks, budget)
-	sb.WriteString("\n")
+	return blocks
 }
 
 // writeShardedPlanDDL renders a sharded keyspace's DDL grouped by change: shards

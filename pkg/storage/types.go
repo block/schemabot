@@ -374,7 +374,7 @@ const (
 // component containing it would make the key ambiguous to split, so producers
 // refuse the delimiter inside a component rather than escaping it. It is the
 // rollout projection's delimiter, which reads a finalizer's scope back out of
-// the key (see state.OperationScope).
+// the key (see state.FinalizerFinalizesWork).
 const OperationKeyDelimiter = state.OperationKeyDelimiter
 
 // ShardOperationKey builds the operation key for one shard's work on one table
@@ -1482,6 +1482,35 @@ const mirroredControlRequestMetadataKey = "mirrored_remote_rejection"
 // request row created solely to carry another plane's rejection.
 func MirroredControlRequestMetadata() []byte {
 	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
+}
+
+// cutoverRequestOperationMetadataKey binds a cutover request to the one
+// operation that is to take it. A cutover request is apply-level, so under an
+// ordered cutover policy the binding is what keeps one operator command on the
+// member whose turn it was when the command was accepted, rather than letting
+// it pass on to the next member once that one has finished.
+const cutoverRequestOperationMetadataKey = "apply_operation_id"
+
+// CutoverRequestMetadata returns the metadata that binds a cutover request to
+// the operation that is to take it.
+func CutoverRequestMetadata(applyOperationID int64) []byte {
+	return []byte(`{"` + cutoverRequestOperationMetadataKey + `":` + strconv.FormatInt(applyOperationID, 10) + `}`)
+}
+
+// CutoverOperationID returns the operation a cutover request is bound to, or 0
+// when the request names none. Metadata that does not parse is an error rather
+// than an unbound request, so a drive never takes a request it cannot read.
+func (r *ApplyControlRequest) CutoverOperationID() (int64, error) {
+	if r == nil || len(r.Metadata) == 0 {
+		return 0, nil
+	}
+	var payload struct {
+		ApplyOperationID int64 `json:"apply_operation_id"`
+	}
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return 0, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return payload.ApplyOperationID, nil
 }
 
 // ForwardingControlRequestCaller is the requester recorded for a control

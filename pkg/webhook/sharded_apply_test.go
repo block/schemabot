@@ -3,8 +3,14 @@ package webhook
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,11 +29,15 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running,
 		Caller: "github:morgo@block/example#11890",
 	}
-	op := &storage.ApplyOperation{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/-40/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
-	oid := int64(1)
-	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER TABLE `mutes` ADD INDEX a"}}
+	var ops []*storage.ApplyOperation
+	var tasks []*storage.Task
+	for i, shard := range []string{"-80", "80-"} {
+		oid := int64(i + 1)
+		ops = append(ops, &storage.ApplyOperation{ID: oid, ApplyID: 1, Deployment: "cake", OperationKey: "cdb_resolute_sharded/" + shard + "/mutes", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt})
+		tasks = append(tasks, &storage.Task{ID: oid, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: shard, DDL: "ALTER TABLE `mutes` ADD INDEX a"})
+	}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "")
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
 
 	assert.Contains(t, out, "by @morgo at", "attribution shows the clean username")
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
@@ -109,7 +119,7 @@ func TestFormatApplyStatusComment_ShardedFailedSurfacesError(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "40-80"), task(3, 3, "80-c0"), task(4, 4, "c0-")}
 
-	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "")
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
 
 	assert.Contains(t, out, "## Schema Change Status", "uses the stable in-place status headline")
 	assert.Contains(t, out, "**Shards**:", "counts shards, not deployments")
@@ -136,7 +146,7 @@ func TestFormatApplyStatusComment_ShardedFailureFallsBackToTaskError(t *testing.
 	oid := int64(1)
 	tasks := []*storage.Task{{ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40", DDL: "ALTER ...", ErrorMessage: gotZero}}
 
-	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "")
+	out := formatApplyStatusComment(apply, []*storage.ApplyOperation{op}, false, tasks, nil, nil, nil, "", "")
 
 	assert.Contains(t, out, gotZero, "the task error is surfaced when the operation row has none")
 }
@@ -188,8 +198,8 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 
 	require.Len(t, data.Keyspaces, 1)
 	require.Len(t, data.Keyspaces[0].Cells, 1)
-	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Keyspaces[0].Cells[0].DDL,
-		"all non-empty task DDLs are joined in order")
+	assert.Equal(t, []string{"ALTER TABLE `mutes` ADD INDEX a", "ALTER TABLE `mutes` ADD INDEX b"}, data.Keyspaces[0].Cells[0].Statements,
+		"all non-empty task DDLs are kept in order")
 }
 
 // A sharded apply's finalizer operations are its keyspace VSchema changes:
@@ -375,7 +385,7 @@ func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
 	}}
 
 	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveFinalizerPlan(apply, ops), "")
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveFinalizerPlan(apply, ops), "", "")
 
 	assert.Contains(t, body, "### VSchema")
 	assert.Contains(t, body, "```diff\n+ vindex hash\n```",
@@ -470,7 +480,7 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 		mk(5, "contacts_sharded/group_finalizer", state.ApplyOperation.Pending),
 	}
 
-	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "")
+	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "", "")
 
 	assert.NotContains(t, out, "**Deployments**:", "must not fall back to the deployment-unit layout")
 	assert.Contains(t, out, "#### Keyspace `contacts`")
@@ -538,7 +548,7 @@ func TestFormatApplySummaryComment_ShardedRendersVerdict(t *testing.T) {
 	}
 	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "80-")}
 
-	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, nil, "")
+	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, nil, "", "")
 
 	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
 	assert.NotContains(t, out, "Schema Change Status", "the summary is a verdict, not a status snapshot")
@@ -565,7 +575,7 @@ func TestFormatApplySummaryComment_ShardedVSchemaSection(t *testing.T) {
 		mk(3, "cdb_resolute_sharded/group_finalizer"),
 	}
 
-	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "")
+	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "")
 
 	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
 	assert.Contains(t, out, "### VSchema")
@@ -594,7 +604,7 @@ func TestFormatApplySummaryComment_ShardedApplyLevelErrorSurfaced(t *testing.T) 
 	}
 	ops := []*storage.ApplyOperation{op(1, "-40"), op(2, "80-")}
 
-	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "")
+	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "", "")
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
 	assert.Contains(t, out, "> ❌ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded",
@@ -757,6 +767,255 @@ func TestShardedCommentShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 	require.NotNil(t, finalizers)
 	assert.Equal(t, map[string]bool{"ks": true}, finalizers.finalizeOnly)
 
-	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, finalizers, "")
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, finalizers, "", "")
 	assert.NotContains(t, body, "VSchema")
+}
+
+// singleShardStrataApply is a Strata apply of one CREATE TABLE on a keyspace
+// with one shard, which the engine finalizes beside the DDL: one shard work
+// operation and one finalizer operation, as the data plane fans it out.
+func singleShardStrataApply(applyState, workState, finalizerState string) (*storage.Apply, []*storage.ApplyOperation, []*storage.Task) {
+	started := time.Unix(1700000000, 0).UTC()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-s1", Database: "shop", Environment: "staging", Engine: storage.EngineStrata,
+		DatabaseType: storage.DatabaseTypeStrata, State: applyState, Caller: "octocat", StartedAt: &started,
+	}
+	ops := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "shop_001/-/orders", State: workState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{ID: 2, ApplyID: 1, Deployment: "cake", OperationKey: "shop_001/group_finalizer", State: finalizerState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+	}
+	oid := int64(1)
+	taskState := state.Task.Running
+	if state.IsState(workState, state.ApplyOperation.Completed) {
+		taskState = state.Task.Completed
+	}
+	tasks := []*storage.Task{{
+		ID: 1, ApplyID: 1, ApplyOperationID: &oid, Namespace: "shop_001", TableName: "orders", Shard: "-",
+		DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", State: taskState,
+	}}
+	return apply, ops, tasks
+}
+
+// finalizesOnly is the stored plan's verdict that the keyspace's finalize has
+// no VSchema change to show.
+func finalizesOnly(keyspace string) *shardedFinalizerPlan {
+	return &shardedFinalizerPlan{vschemaDiffs: map[string]string{}, finalizeOnly: map[string]bool{keyspace: true}}
+}
+
+// A Strata apply on a keyspace with one shard and no VSchema change to show
+// reads like a MySQL apply: its status comment shows the table's progress and
+// DDL under its keyspace, and its summary lists the applied DDL, with no shard
+// counts and no finalize section.
+func TestFormatApplyComment_SingleShardStrataReadsLikeMySQL(t *testing.T) {
+	apply, ops, tasks := singleShardStrataApply(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
+	status := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "")
+	assert.Contains(t, status, "**Keyspace `shop_001`**")
+	assert.Contains(t, status, "CREATE TABLE `orders`")
+	assert.NotContains(t, status, "**Shards**:")
+	assert.NotContains(t, status, "Finalize")
+
+	apply, ops, tasks = singleShardStrataApply(state.Apply.Completed, state.ApplyOperation.Completed, state.ApplyOperation.Completed)
+	summary := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "")
+	assert.Contains(t, summary, "Apply details (1 table)")
+	assert.Contains(t, summary, "CREATE TABLE `orders`")
+	assert.NotContains(t, summary, "**Shards**:")
+	assert.NotContains(t, summary, "Finalize")
+}
+
+// A finalize is not shown beside the keyspace's DDL, but when it fails it is
+// what failed the apply, so the single-shard comment still names its error.
+func TestFormatApplySummaryComment_SingleShardStrataShowsAFailedFinalize(t *testing.T) {
+	const finalizeErr = "apply VSchema for shop_001: keyspace not found"
+	apply, ops, tasks := singleShardStrataApply(state.Apply.Failed, state.ApplyOperation.Completed, state.ApplyOperation.Failed)
+	ops[1].ErrorMessage = finalizeErr
+
+	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, finalizesOnly("shop_001"), "", "")
+
+	assert.Contains(t, out, finalizeErr)
+	assert.Contains(t, out, "CREATE TABLE `orders`")
+	assert.NotContains(t, out, "**Shards**:")
+}
+
+// Only an apply whose every keyspace runs on one shard, with each finalize
+// sitting beside that keyspace's DDL and no VSchema change to show, renders
+// like a MySQL apply. Anything the single-deployment layout cannot render
+// keeps the shard layout.
+func TestRendersAsSingleShard(t *testing.T) {
+	work := func(key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{Deployment: "cake", OperationKey: key}
+	}
+	cases := []struct {
+		name       string
+		ops        []*storage.ApplyOperation
+		finalizers *shardedFinalizerPlan
+		want       bool
+	}{
+		{"one shard beside its finalize", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, finalizesOnly("ks"), true},
+		{"one shard, several tables", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/-/users")}, nil, true},
+		{"one shard in each of two keyspaces", []*storage.ApplyOperation{work("ks1/-/orders"), work("ks2/-/users")}, nil, true},
+		{"a keyspace across two shards", []*storage.ApplyOperation{work("ks/-80/orders"), work("ks/80-/orders")}, nil, false},
+		{"one changing shard of several", []*storage.ApplyOperation{work("ks/80-/orders")}, nil, false},
+		{"a VSchema change to show", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, &shardedFinalizerPlan{}, false},
+		{"an unreadable stored plan", []*storage.ApplyOperation{work("ks/-/orders"), work("ks/group_finalizer")}, nil, false},
+		{"a keyspace whose only work is its finalize", []*storage.ApplyOperation{work("ks1/-/orders"), work("ks2/group_finalizer")}, finalizesOnly("ks2"), false},
+		{"no shard work", nil, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, rendersAsSingleShard(nil, tc.ops, tc.finalizers))
+		})
+	}
+
+	// An apply whose operations are still attaching is judged by every
+	// operation it declared, so its layout does not change as siblings attach.
+	attaching := &storage.Apply{ExpectedOperationKeys: []string{"ks/-/orders", "ks/group_finalizer"}}
+	onlyWork := []*storage.ApplyOperation{work("ks/-/orders")}
+	assert.False(t, rendersAsSingleShard(attaching, onlyWork, &shardedFinalizerPlan{}),
+		"a declared finalizer with a VSchema change keeps the shard layout before it attaches")
+	assert.True(t, rendersAsSingleShard(attaching, onlyWork, finalizesOnly("ks")),
+		"a declared finalize-only finalizer takes the single-deployment layout before it attaches")
+	widening := &storage.Apply{ExpectedOperationKeys: []string{"ks/-80/orders", "ks/80-/orders"}}
+	assert.False(t, rendersAsSingleShard(widening, []*storage.ApplyOperation{work("ks/-80/orders")}, nil),
+		"a declared sibling shard keeps the shard layout before it attaches")
+}
+
+// A finalizer the apply declared but has not attached yet still needs the
+// stored plan, so the first comment already knows whether it carries a VSchema
+// change.
+func TestResolveShardedFinalizerPlanReadsTheDeclaredFinalizer(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: 7, ExpectedOperationKeys: []string{"ks/-/orders", "ks/group_finalizer"}}
+	ops := []*storage.ApplyOperation{{OperationKey: "ks/-/orders"}}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"ks": {Finalize: true}}}
+
+	finalizers := resolveShardedFinalizerPlan(t.Context(), &stubPlanStorage{plan: plan}, apply, ops)
+	require.NotNil(t, finalizers, "the declared finalizer reads the stored plan")
+	assert.True(t, finalizers.finalizesOnly("ks"))
+}
+
+// Every comment render of an apply shares its handler's finalizer plan cache.
+// The aggregate terminal observer is built fresh when the apply settles, so
+// when its own plan read fails it still takes the layout the progress comments
+// used rather than switching the final edit and summary to the shard rollup.
+func TestFinalizerPlanCacheIsSharedAcrossObservers(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", PlanID: 7}
+	ops := []*storage.ApplyOperation{
+		{OperationKey: "shop_001/-/orders"},
+		{OperationKey: "shop_001/group_finalizer"},
+	}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {Finalize: true}}}
+	failing := &stubPlanStorage{err: errors.New("storage down")}
+	cache := newFinalizerPlanCache()
+
+	progress := NewCommentObserver(CommentObserverConfig{Storage: failing, finalizerPlans: cache})
+	assert.Nil(t, progress.resolveFinalizerPlan(apply, ops), "a failed read has no plan to show")
+
+	progress.stor = &stubPlanStorage{plan: plan}
+	first := progress.resolveFinalizerPlan(apply, ops)
+	require.NotNil(t, first, "a read after a failed one tries storage again")
+	assert.True(t, first.finalizesOnly("shop_001"))
+
+	progress.stor = failing
+	assert.Same(t, first, progress.resolveFinalizerPlan(apply, ops), "a failed read after a successful one keeps the plan already read")
+
+	terminal := NewAggregateTerminalCommentObserver(CommentObserverConfig{Storage: failing, finalizerPlans: cache})
+	assert.Same(t, first, terminal.resolveFinalizerPlan(apply, ops), "a new observer sharing the cache keeps the plan another observer read")
+	assert.True(t, rendersAsSingleShard(apply, ops, terminal.resolveFinalizerPlan(apply, ops)))
+
+	other := &storage.Apply{ApplyIdentifier: "apply-y", PlanID: 8}
+	assert.Nil(t, terminal.resolveFinalizerPlan(other, ops), "the cache answers only for the plan it read")
+
+	separate := NewCommentObserver(CommentObserverConfig{Storage: failing})
+	assert.Nil(t, separate.resolveFinalizerPlan(apply, ops), "an observer given no cache starts with its own")
+}
+
+// A full finalizer plan cache evicts the plan rendered longest ago, so an apply
+// still in flight keeps its plan while a newer apply's plan is added.
+func TestFinalizerPlanCacheEvictsThePlanRenderedLongestAgo(t *testing.T) {
+	cache := newFinalizerPlanCache()
+	ops := []*storage.ApplyOperation{{OperationKey: "shop_001/-/orders"}, {OperationKey: "shop_001/group_finalizer"}}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {Finalize: true}}}
+	readable := &stubPlanStorage{plan: plan}
+	failing := &stubPlanStorage{err: errors.New("storage down")}
+	applyFor := func(planID int64) *storage.Apply {
+		return &storage.Apply{ApplyIdentifier: fmt.Sprintf("apply-%d", planID), PlanID: planID}
+	}
+
+	for id := int64(1); id <= finalizerPlanCacheLimit; id++ {
+		require.NotNil(t, cache.resolve(t.Context(), readable, applyFor(id), ops))
+	}
+	inFlight := cache.resolve(t.Context(), failing, applyFor(1), ops)
+	require.NotNil(t, inFlight, "the first plan is still cached")
+
+	require.NotNil(t, cache.resolve(t.Context(), readable, applyFor(finalizerPlanCacheLimit+1), ops))
+	assert.Equal(t, finalizerPlanCacheLimit, cache.recent.Len())
+	assert.Len(t, cache.byPlan, finalizerPlanCacheLimit)
+	assert.Same(t, inFlight, cache.resolve(t.Context(), failing, applyFor(1), ops), "a plan rendered recently stays cached")
+	assert.Nil(t, cache.resolve(t.Context(), failing, applyFor(2), ops), "the plan rendered longest ago is evicted")
+	assert.NotNil(t, cache.resolve(t.Context(), failing, applyFor(finalizerPlanCacheLimit+1), ops), "the newest plan is cached")
+}
+
+// Every comment observer the package builds shares its handler's finalizer
+// plan cache, and only the cache reads the stored plan for a comment. An
+// observer config that omits the cache gets a private one, so its renders
+// would forget the plan the others read and could switch an apply's comments
+// between layouts; a direct plan read would bypass the cache the same way.
+//
+// The observer configs and plan reads are found by parsing the package rather
+// than listed here, so one added later is held to the same rule.
+func TestCommentRendersShareTheFinalizerPlanCache(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+
+	fset := token.NewFileSet()
+	configs, reads := 0, 0
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fset, path, nil, 0)
+		require.NoError(t, parseErr, path)
+
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			inCache := isFinalizerPlanCacheMethod(fn)
+			ast.Inspect(fn, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.CompositeLit:
+					if ident, ok := n.Type.(*ast.Ident); ok && ident.Name == "CommentObserverConfig" {
+						configs++
+						assert.True(t, litSetsField(n, "finalizerPlans"),
+							"%s builds a CommentObserverConfig without finalizerPlans; its observer would not share the handler's finalizer plan cache",
+							fset.Position(n.Pos()))
+					}
+				case *ast.CallExpr:
+					if ident, ok := n.Fun.(*ast.Ident); ok && ident.Name == "resolveShardedFinalizerPlan" {
+						reads++
+						assert.True(t, inCache,
+							"%s reads the stored finalizer plan directly; read it through finalizerPlanCache.resolve so every render shares the result",
+							fset.Position(n.Pos()))
+					}
+				}
+				return true
+			})
+		}
+	}
+	require.NotZero(t, configs, "found no CommentObserverConfig literals to check")
+	require.NotZero(t, reads, "found no finalizer plan reads to check")
+}
+
+// isFinalizerPlanCacheMethod reports whether fn is a method on
+// *finalizerPlanCache.
+func isFinalizerPlanCacheMethod(fn *ast.FuncDecl) bool {
+	if fn.Recv == nil || len(fn.Recv.List) != 1 {
+		return false
+	}
+	star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := star.X.(*ast.Ident)
+	return ok && ident.Name == "finalizerPlanCache"
 }

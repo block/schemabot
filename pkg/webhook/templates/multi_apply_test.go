@@ -54,11 +54,11 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.Contains(t, out, "**Deployments**: 1 ready for cutover, 1 running, 2 waiting")
 
 	// Single next-action points at the cutover-ready deployment, even though the
-	// aggregate is still running. The command is the executable apply-ID form the
-	// CLI accepts today (no --deployment flag yet).
-	assert.Contains(t, out, "To cut over `eu`:")
-	assert.Contains(t, out, "schemabot cutover apply-123 -e production")
-	assert.NotContains(t, out, "--deployment")
+	// aggregate is still running. The apply was not deferred, so SchemaBot cuts
+	// eu over itself and the comment offers no command to run.
+	assert.Contains(t, out, "SchemaBot will cut over `eu` next — no action needed.")
+	assert.NotContains(t, out, "To cut over")
+	assert.NotContains(t, out, "schemabot cutover")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
 	assert.Contains(t, out, "- 🟢 `eu` — ready for cutover — next in order")
@@ -693,6 +693,82 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 	assert.NotContains(t, out, "testapp-004`**", "a target without detail is not a change of its own")
 }
 
+// Rolled-up targets that run different plans each point their cut DDL at the
+// stored plan of the group's first target, and a group of several says the
+// rest of the group runs the same DDL, the way the plan comment's target
+// groups do.
+func TestRenderMultiDeploymentApplyComment_RolledUpCutDDLNamesEachGroupsStoredPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+		parallelTarget("primary", "testapp-003", so.Running),
+	})
+	longDDL := func(column string) string {
+		return "ALTER TABLE `orders` ADD COLUMN `" + column + "` text" + strings.Repeat(", ADD COLUMN `"+column+"_x` text", 2000)
+	}
+	withPlan := func(detail *ApplyStatusCommentData, planID string) *ApplyStatusCommentData {
+		detail.PlanID, detail.CLIName = planID, "acme schemabot"
+		return detail
+	}
+	out := renderTargets(model,
+		withPlan(targetDetail("testapp_001", state.Task.Running, longDDL("note"), 500), "plan_001"),
+		withPlan(targetDetail("testapp_002", state.Task.Running, longDDL("memo"), 500), "plan_002"),
+		withPlan(targetDetail("testapp_003", state.Task.Running, longDDL("note"), 500), "plan_003"),
+	)
+
+	assert.LessOrEqual(t, len(out), commentBodyLimit-applyCommentAppendReserve)
+	assert.Contains(t, out, "the full plan for `testapp-001` is available from the CLI with `acme schemabot list-plans -e production plan_001` (every target in this group runs the same DDL).")
+	assert.Contains(t, out, "the full plan for this target is available from the CLI with `acme schemabot list-plans -e production plan_002`.")
+	assert.NotContains(t, out, "plan_003", "a group names only its first target's plan")
+}
+
+// Rolled-up targets that all report one change render with no group heading,
+// so a cut block's pointer names the target whose stored plan it is and says
+// the other targets run the same DDL only of the targets that have reported:
+// a target that has not reported is not known to run it.
+func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReportingTargets(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+		parallelTarget("primary", "testapp-003", so.Running),
+	})
+	longDDL := "ALTER TABLE `orders` ADD COLUMN `note` text" + strings.Repeat(", ADD COLUMN `note_x` text", 2000)
+	reporting := func(database, planID string) *ApplyStatusCommentData {
+		detail := targetDetail(database, state.Task.Running, longDDL, 500)
+		detail.PlanID, detail.CLIName = planID, "acme schemabot"
+		return detail
+	}
+	silent := func(database string) *ApplyStatusCommentData {
+		return &ApplyStatusCommentData{Database: database, State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit}
+	}
+	const pointer = "_DDL truncated to fit GitHub's comment size limit; the full plan for `testapp-001` is available from the CLI with `acme schemabot list-plans -e production plan_001`"
+
+	t.Run("every target reports", func(t *testing.T) {
+		out := renderTargets(model, reporting("testapp_001", "plan_001"), reporting("testapp_002", "plan_002"), reporting("testapp_003", "plan_003"))
+
+		assert.Contains(t, out, pointer+" (every target runs the same DDL)._\n")
+		assert.NotContains(t, out, "have not reported progress yet")
+	})
+
+	t.Run("a silent target is not claimed", func(t *testing.T) {
+		out := renderTargets(model, reporting("testapp_001", "plan_001"), reporting("testapp_002", "plan_002"), silent("testapp_003"))
+
+		assert.Contains(t, out, pointer+" (every target that has reported runs the same DDL)._\n")
+		assert.NotContains(t, out, "every target runs the same DDL")
+		assert.NotContains(t, out, "every target in this group")
+		assert.Contains(t, out, "\n_1 of 3 targets have not reported progress yet._\n")
+	})
+
+	t.Run("one reporting target is named and speaks for no other", func(t *testing.T) {
+		out := renderTargets(model, reporting("testapp_001", "plan_001"), silent("testapp_002"), silent("testapp_003"))
+
+		assert.Contains(t, out, pointer+"._\n")
+		assert.NotContains(t, out, "for this target", "no heading names the target, so the pointer does")
+		assert.NotContains(t, out, "runs the same DDL")
+		assert.Contains(t, out, "\n_2 of 3 targets have not reported progress yet._\n")
+	})
+}
+
 // A failed target is named with its error in a status table, the way the
 // sharded comment names a failed shard. The table is capped so a deployment
 // whose every target failed still fits in one comment; the <summary> counts
@@ -858,6 +934,33 @@ func TestRenderMultiDeploymentApplyComment_ManyTargetsFitOneComment(t *testing.T
 	assert.NotContains(t, out, "- Running:", "with every target running, the count already says which")
 }
 
+// deferredCutoverDetails is the member detail of an apply started with
+// --defer-cutover. The first member with detail speaks for the whole apply.
+func deferredCutoverDetails() []*ApplyStatusCommentData {
+	return []*ApplyStatusCommentData{{ApplyID: "apply-123", Environment: "production", State: state.Apply.WaitingForCutover, DeferCutover: true}}
+}
+
+// An apply started with --defer-cutover waits for an operator at each cutover,
+// so the next action offers the command for the member whose turn it is. The
+// command is the executable apply-ID form the CLI accepts today (no --deployment
+// flag yet).
+func TestRenderMultiDeploymentApplyComment_DeferredCutoverOffersCommand(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		barrierOp("eu", so.WaitingForCutover),
+		barrierOp("us", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details:     deferredCutoverDetails(),
+	})
+
+	assert.Contains(t, out, "To cut over `eu`:\n```\nschemabot cutover apply-123 -e production\n```")
+	assert.NotContains(t, out, "--deployment")
+	assert.NotContains(t, out, "no action needed")
+}
+
 // A cutover suggestion names the member it applies to, so an operator reading it
 // on a deployment with several targets knows which one is parked at the barrier.
 func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *testing.T) {
@@ -869,6 +972,7 @@ func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *t
 		Model:       model,
 		ApplyID:     "apply-123",
 		Environment: "production",
+		Details:     deferredCutoverDetails(),
 	})
 
 	assert.Contains(t, out, "To cut over `primary/testapp-002`:")
@@ -913,9 +1017,21 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 		}),
 		ApplyID:     "apply-123",
 		Environment: "production",
+		Details:     deferredCutoverDetails(),
 	})
 	assert.NotContains(t, cutover, "\n## Injected")
 	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
+
+	// The automatic form names the member in the same prose position.
+	automatic := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			{Deployment: hostile, State: so.WaitingForCutover, Barrier: true},
+		}),
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+	assert.NotContains(t, automatic, "\n## Injected")
+	assert.Contains(t, automatic, "SchemaBot will cut over `` us` ## Injected [click](https://example.invalid) `` next — no action needed.")
 }
 
 // Every control command addresses the whole apply, so a rollout writes its
@@ -980,17 +1096,24 @@ func TestRenderMultiDeploymentApplyComment_RunningRolloutFooterStopsIt(t *testin
 // A pending rollup action does not take stop away from a member that is still
 // writing to its target: a cutover ready beside a sibling still copying, a
 // halted rollout whose started sibling keeps copying, and a revert window
-// beside a running sibling each lead with their own command and then offer
-// stop, in the same footer.
+// beside a running sibling each lead with their own line and then offer stop,
+// in the same footer. A deferred cutover leads with its command; an automatic
+// one says SchemaBot will run it.
 func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAction(t *testing.T) {
 	const stop = "To stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n"
 	for name, tc := range map[string]struct {
-		ops  []presentation.Operation
-		lead string
+		ops          []presentation.Operation
+		deferCutover bool
+		lead         string
 	}{
-		"cutover ready beside a copying sibling": {
+		"deferred cutover ready beside a copying sibling": {
+			ops:          []presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)},
+			deferCutover: true,
+			lead:         "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n",
+		},
+		"automatic cutover ready beside a copying sibling": {
 			ops:  []presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)},
-			lead: "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n",
+			lead: "SchemaBot will cut over `us` next — no action needed.\n",
 		},
 		"halted rollout with a copying sibling": {
 			ops:  []presentation.Operation{{Deployment: "us", State: so.Failed, Parallel: true}, {Deployment: "eu", State: so.Running, Parallel: true}},
@@ -1007,8 +1130,8 @@ func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAc
 				ApplyID:     "apply-123",
 				Environment: "production",
 				Details: []*ApplyStatusCommentData{
-					{Database: "orders_us", State: tc.ops[0].State, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
-					{Database: "orders_eu", State: tc.ops[1].State, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
+					{Database: "orders_us", State: tc.ops[0].State, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
+					{Database: "orders_eu", State: tc.ops[1].State, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
 				},
 			})
 
@@ -1071,22 +1194,33 @@ func TestRenderMultiDeploymentApplyComment_PausedRolloutWithPendingCutoverShares
 	require.Equal(t, state.Apply.Paused, model.State)
 	require.Equal(t, presentation.NextActionCutover, model.NextAction.Kind)
 
-	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
-		Model:       model,
-		ApplyID:     "apply-123",
-		Environment: "production",
-		Details: []*ApplyStatusCommentData{
-			{Database: "orders_us", State: state.Apply.WaitingForCutover, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
-			{Database: "orders_eu", State: state.Apply.Failed, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
-			{Database: "orders_ap", State: state.Apply.Pending, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
-		},
-	})
+	for _, tc := range []struct {
+		name         string
+		deferCutover bool
+		cutoverLine  string
+	}{
+		{name: "deferred", deferCutover: true, cutoverLine: "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"},
+		{name: "automatic", cutoverLine: "SchemaBot will cut over `us` next — no action needed.\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+				Model:       model,
+				ApplyID:     "apply-123",
+				Environment: "production",
+				Details: []*ApplyStatusCommentData{
+					{Database: "orders_us", State: state.Apply.WaitingForCutover, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
+					{Database: "orders_eu", State: state.Apply.Failed, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
+					{Database: "orders_ap", State: state.Apply.Pending, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit, DeferCutover: tc.deferCutover},
+				},
+			})
 
-	footer := out[strings.LastIndex(out, "</details>"):]
-	assert.Contains(t, footer, "\n---\n\nTo cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"+
-		"\nPaused after a failure — to let the held deployments proceed:\n```\nschemabot release apply-123 -e production\n```\n"+
-		"\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n", out)
-	assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
+			footer := out[strings.LastIndex(out, "</details>"):]
+			assert.Contains(t, footer, "\n---\n\n"+tc.cutoverLine+
+				"\nPaused after a failure — to let the held deployments proceed:\n```\nschemabot release apply-123 -e production\n```\n"+
+				"\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n", out)
+			assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
+		})
+	}
 }
 
 // A terminal apply refuses stop, and refuses cancel in every terminal state

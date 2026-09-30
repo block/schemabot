@@ -1,10 +1,12 @@
 package webhook
 
 import (
+	"container/list"
 	"context"
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -135,7 +137,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 					Diff:      finalizers.vschemaDiff(finalizerNS),
 				})
 			}
-			if finalizerError == "" && isFinalizerFailureState(op.State) && op.ErrorMessage != "" {
+			if finalizerError == "" && isOperationFailureState(op.State) && op.ErrorMessage != "" {
 				finalizerError = op.ErrorMessage
 			}
 			continue
@@ -154,7 +156,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 				ddls = append(ddls, t.DDL)
 			}
 		}
-		cellsByKeyspace[ns] = append(cellsByKeyspace[ns], templates.ShardCell{Shard: shard, Table: table, DDL: strings.Join(ddls, "\n")})
+		cellsByKeyspace[ns] = append(cellsByKeyspace[ns], templates.ShardCell{Shard: shard, Table: table, Statements: ddls})
 		groupKey := keyspaceShard{namespace: ns, shard: shard}
 		i, seen := groupIndex[groupKey]
 		if !seen {
@@ -246,17 +248,7 @@ func (p *shardedFinalizerPlan) finalizesOnly(namespace string) bool {
 // nothing rather than blocking the comment, and a stored plan without diffs
 // (recorded before diffs were persisted) contributes no diffs.
 func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
-	if !isShardedApply(ops) {
-		return nil
-	}
-	hasFinalizer := false
-	for _, op := range ops {
-		if _, ok := parseFinalizerOperationKey(op.OperationKey); ok {
-			hasFinalizer = true
-			break
-		}
-	}
-	if !hasFinalizer {
+	if !needsShardedFinalizerPlan(apply, ops) {
 		return nil
 	}
 
@@ -287,6 +279,106 @@ func resolveShardedFinalizerPlan(ctx context.Context, stor storage.Storage, appl
 	return finalizers
 }
 
+// needsShardedFinalizerPlan reports whether the apply's comment consumes the
+// stored plan's finalizer view: only a sharded apply that declares a finalizer
+// operation does.
+func needsShardedFinalizerPlan(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	if !isShardedApply(ops) {
+		return false
+	}
+	for _, key := range applyOperationKeys(apply, ops) {
+		if _, ok := parseFinalizerOperationKey(key); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// finalizerPlanCacheLimit bounds how many plans a finalizerPlanCache holds, so
+// a long-lived process does not keep every plan it has ever rendered.
+const finalizerPlanCacheLimit = 1024
+
+// finalizerPlanCache remembers what each stored plan says about its apply's
+// finalizers once a read of it has succeeded. A stored plan never changes, so
+// the first successful read stays true for every later render. The plan
+// decides whether a Strata apply's comments take the single-deployment layout,
+// and one cache is shared by every comment render in the process (each
+// driver's observer, the aggregate terminal observer, and the summary repair),
+// so within a process a failed read in a later render cannot switch the
+// comments back to the shard layout that earlier renders did not use. A full
+// cache evicts the plan rendered longest ago, so an apply still in flight,
+// which renders on every progress tick, keeps its entry. A nil cache reads
+// storage on every call.
+type finalizerPlanCache struct {
+	mu sync.Mutex
+	// recent orders the cached plans from most to least recently rendered.
+	recent *list.List
+	byPlan map[int64]*list.Element
+}
+
+// finalizerPlanCacheEntry is one cached plan in finalizerPlanCache.recent.
+type finalizerPlanCacheEntry struct {
+	planID int64
+	plan   *shardedFinalizerPlan
+}
+
+func newFinalizerPlanCache() *finalizerPlanCache {
+	return &finalizerPlanCache{recent: list.New(), byPlan: make(map[int64]*list.Element)}
+}
+
+// resolve returns the cached finalizer view of the apply's stored plan, or
+// reads it with resolveShardedFinalizerPlan and caches a successful read. The
+// read runs outside the lock, so a slow read for one apply does not hold up
+// another's comment.
+func (c *finalizerPlanCache) resolve(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
+	if c == nil || !needsShardedFinalizerPlan(apply, ops) {
+		return resolveShardedFinalizerPlan(ctx, stor, apply, ops)
+	}
+	if cached := c.lookup(apply.PlanID); cached != nil {
+		return cached
+	}
+	plan := resolveShardedFinalizerPlan(ctx, stor, apply, ops)
+	if plan == nil {
+		return nil
+	}
+	return c.store(apply, plan)
+}
+
+// lookup returns the cached plan for planID, marking it the most recently
+// rendered, or nil when it is not cached.
+func (c *finalizerPlanCache) lookup(planID int64) *shardedFinalizerPlan {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.byPlan[planID]
+	if !ok {
+		return nil
+	}
+	c.recent.MoveToFront(el)
+	return el.Value.(*finalizerPlanCacheEntry).plan
+}
+
+// store caches a plan read for the apply and returns the cached plan: the one
+// passed in, or the one a concurrent render stored first. When the cache is
+// over its limit it evicts the plan rendered longest ago.
+func (c *finalizerPlanCache) store(apply *storage.Apply, plan *shardedFinalizerPlan) *shardedFinalizerPlan {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.byPlan[apply.PlanID]; ok {
+		c.recent.MoveToFront(el)
+		return el.Value.(*finalizerPlanCacheEntry).plan
+	}
+	c.byPlan[apply.PlanID] = c.recent.PushFront(&finalizerPlanCacheEntry{planID: apply.PlanID, plan: plan})
+	if c.recent.Len() > finalizerPlanCacheLimit {
+		oldest := c.recent.Back()
+		evicted := oldest.Value.(*finalizerPlanCacheEntry).planID
+		c.recent.Remove(oldest)
+		delete(c.byPlan, evicted)
+		slog.Debug("finalizer plan cache is full; evicted the plan rendered longest ago",
+			append(apply.LogAttrs(), "evicted_plan_id", evicted)...)
+	}
+	return plan
+}
+
 // vschemaStatusForOperationState projects a finalizer operation's state onto
 // the VSchema display status vocabulary the single-deployment comment uses, so
 // both comment shapes describe VSchema application identically: applied when
@@ -308,7 +400,7 @@ func vschemaStatusForOperationState(applyState, opState string) string {
 		return "applied"
 	case state.IsState(opState, state.ApplyOperation.Running):
 		return "applying"
-	case isFinalizerFailureState(opState):
+	case isOperationFailureState(opState):
 		return "failed"
 	case state.IsState(opState, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted):
 		return "cancelled"
@@ -321,10 +413,10 @@ func vschemaStatusForOperationState(applyState, opState string) string {
 	}
 }
 
-// isFinalizerFailureState reports whether a finalizer operation's state carries
+// isOperationFailureState reports whether an operation's state carries
 // an operator-facing error — a terminal failure or an automatic retry after
 // one, mirroring the shard-failure vocabulary.
-func isFinalizerFailureState(opState string) bool {
+func isOperationFailureState(opState string) bool {
 	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
@@ -628,4 +720,89 @@ func shardStateRank(s string) int {
 	default:
 		return 3
 	}
+}
+
+// fullKeyRangeShard is the name of the shard that covers a keyspace's whole
+// keyrange, which makes it the keyspace's only shard.
+const fullKeyRangeShard = "-"
+
+// rendersAsSingleShard reports whether a sharded apply reads as one change on
+// one database, so its comments take the single-deployment layout, with its
+// progress bars and DDL, instead of the shard rollup. That holds when every
+// keyspace with shard work runs on the shard covering its whole keyrange and
+// every finalizer only finalizes a keyspace beside its DDL, with no VSchema
+// change to show. The shard is judged by its keyrange, not by how many shards
+// the apply touches: operations exist only for the shards that change, so one
+// changing shard of a keyspace with several is still a sharded change and
+// keeps the shard layout, which names it. So do a VSchema change, a keyspace
+// whose only work is its finalize, and a stored plan that could not be read
+// (nil finalizers). The decision reads every operation the apply declared, not
+// only those attached so far, so an apply whose operations attach over time
+// takes one layout from its first comment rather than switching as its
+// siblings appear.
+func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, finalizers *shardedFinalizerPlan) bool {
+	keyspacesWithWork := make(map[string]bool)
+	var finalizerKeyspaces []string
+	for _, key := range applyOperationKeys(apply, ops) {
+		if ns, shard, _, ok := parseShardOperationKey(key); ok {
+			if shard != fullKeyRangeShard {
+				return false
+			}
+			keyspacesWithWork[ns] = true
+			continue
+		}
+		if ns, ok := parseFinalizerOperationKey(key); ok {
+			finalizerKeyspaces = append(finalizerKeyspaces, ns)
+		}
+	}
+	for _, ns := range finalizerKeyspaces {
+		if !keyspacesWithWork[ns] || !finalizers.finalizesOnly(ns) {
+			return false
+		}
+	}
+	return len(keyspacesWithWork) > 0
+}
+
+// buildSingleShardApplyCommentData maps a sharded apply that rendersAsSingleShard
+// onto the single-deployment comment data: the shard operations' tables and the
+// lone shard operation's display projection when there is one. A finalize
+// beside a keyspace's DDL is not shown, the same as in the plan. When the apply
+// row carries no failure cause, the most significant operation's error stands
+// in for it, falling back to that operation's task error as the shard layout
+// does, so a failed shard or finalizer still says why. The per-shard summary is
+// left out, since each keyspace has only one shard.
+func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, displayByOp map[int64]operationDisplay, tenant string) templates.ApplyStatusCommentData {
+	tasksByOp := groupTasksByOperation(tasks)
+	var workTasks []*storage.Task
+	var workOps []*storage.ApplyOperation
+	for _, op := range ops {
+		if _, _, _, ok := parseShardOperationKey(op.OperationKey); ok {
+			workOps = append(workOps, op)
+			workTasks = append(workTasks, tasksByOp[op.ID]...)
+		}
+	}
+	sort.Slice(workTasks, func(i, j int) bool { return workTasks[i].ID < workTasks[j].ID })
+
+	data := buildApplyCommentData(apply, workTasks, singleOpDisplay(workOps, displayByOp), nil, tenant)
+	if data.ErrorMessage == "" {
+		if opState, errMsg := aggregateShardState(ops, tasksByOp); isOperationFailureState(opState) {
+			data.ErrorMessage = errMsg
+		}
+	}
+	return data
+}
+
+// applyOperationKeys returns the keys of every operation the apply is made of:
+// the manifest the dispatcher declared when the apply carries one, since its
+// operations may still be attaching, and the attached operations' keys
+// otherwise.
+func applyOperationKeys(apply *storage.Apply, ops []*storage.ApplyOperation) []string {
+	if apply != nil && len(apply.ExpectedOperationKeys) > 0 {
+		return apply.ExpectedOperationKeys
+	}
+	keys := make([]string, 0, len(ops))
+	for _, op := range ops {
+		keys = append(keys, op.OperationKey)
+	}
+	return keys
 }

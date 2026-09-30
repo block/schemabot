@@ -36,7 +36,7 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "per-shard changes are threaded into the keyspace")
@@ -123,7 +123,7 @@ func TestPlanSummarySelectionsAgreeForDivergentShards(t *testing.T) {
 	require.Equal(t, []string{"1 table to create", "1 table to alter"}, cliParts)
 
 	schema := &ghclient.SchemaRequestResult{Database: "commerce", Type: "mysql"}
-	commentData := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	commentData := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 	comment := templates.RenderPlanComment(commentData)
 	commentSummary := "📋 **Plan**: " + strings.ReplaceAll(strings.Join(cliParts, ", "), "1 table", "**1** table")
 	assert.Contains(t, comment, commentSummary)
@@ -143,7 +143,7 @@ func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.Equal(t, []templates.ExemptTablesData{
 		{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
@@ -170,7 +170,7 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -203,7 +203,7 @@ func TestBuildPlanCommentData_PerShardUnsafeDriftGroupsOneDrop(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.UnsafeChanges, 1, "same table and reason across shards is one unsafe change")
 	assert.Equal(t, []string{"-40", "40-80"}, data.UnsafeChanges[0].Shards)
@@ -237,7 +237,7 @@ func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.Equal(t, "postgres", data.DatabaseType)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -300,7 +300,7 @@ func TestBuildPlanCommentData_CarriesSatisfiedShard(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "the satisfied shard is carried, not dropped")
@@ -329,7 +329,7 @@ func TestBuildPlanCommentData_MalformedShardSurfacesError(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 1, "the malformed shard is not carried into the rendered shards")
@@ -365,7 +365,7 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan contains unsafe table changes")
 	require.Len(t, data.UnsafeChanges, 1)
@@ -390,7 +390,7 @@ func TestBuildPlanCommentData_TableDropIsUnsafeWithoutEngineFlag(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -433,7 +433,7 @@ func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan records VSchema deletions and mutations")
 	require.Len(t, data.UnsafeChanges, 2)
@@ -465,7 +465,7 @@ func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.False(t, data.HasUnsafeChanges)
 	assert.Empty(t, data.UnsafeChanges)
@@ -501,7 +501,7 @@ func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -1281,7 +1281,7 @@ func TestPlanCommentDatabaseFlag(t *testing.T) {
 // cuts to fit names the command that prints the plan in full.
 func TestBuildPlanCommentData_CarriesPlanID(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
-	data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "testuser", "", "")
 	assert.Equal(t, "plan_7c41f9", data.PlanID)
 }
 

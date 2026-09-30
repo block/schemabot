@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -738,15 +739,36 @@ func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operatio
 	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
-// finalizerScopeSQL renders the scope a group_finalizer shares with the work
-// it finalizes: the leading segment of the operation key, or the whole key
-// when it has no delimiter. A finalizer and its work also share a deployment,
-// which callers match separately.
-func finalizerScopeSQL(alias string) string {
-	return `CASE
-		WHEN POSITION('/' IN ` + alias + `.operation_key) = 0 THEN ` + alias + `.operation_key
-		ELSE SUBSTRING(` + alias + `.operation_key FROM 1 FOR POSITION('/' IN ` + alias + `.operation_key) - 1)
-	END`
+// finalizerFinalizesWorkSQL matches when the group_finalizer at finalizerAlias
+// finalizes the work at workAlias: the finalizer's key ends in the
+// group_finalizer segment after a non-empty scope, and the work's key is that
+// scope or begins with it and the delimiter. It is state.FinalizerFinalizesWork
+// in SQL, so the claim query and every rollout projection agree on which work
+// a finalizer waits for and is orphaned by: one namespace of one target, in
+// both the single-target and the targets-list key shape. A finalizer and its
+// work also share a deployment, which callers match separately. Every
+// comparison is byte-exact through the dialect's binary collation, as the Go
+// rule's string comparisons are: namespaces and tables are case-significant,
+// so "orders/group_finalizer" never finalizes "Orders/-80/orders" work. The
+// fragment takes no placeholders.
+func finalizerFinalizesWorkSQL(d Dialect, finalizerAlias, workAlias string) string {
+	suffix := state.OperationKeyDelimiter + state.GroupFinalizerKeySegment
+	suffixLen := strconv.Itoa(len(suffix))
+	finalizerKey := finalizerAlias + `.operation_key`
+	workKey := workAlias + `.operation_key`
+	scopeLen := `CHAR_LENGTH(` + finalizerKey + `) - ` + suffixLen
+	// The scope with the delimiter that closes it, so ns_0 never claims
+	// ns_01's work.
+	scopeWithDelimiterLen := scopeLen + ` + ` + strconv.Itoa(len(state.OperationKeyDelimiter))
+	bin := d.BinaryCollation
+	return `(
+		CHAR_LENGTH(` + finalizerKey + `) > ` + suffixLen + `
+		AND ` + bin(`RIGHT(`+finalizerKey+`, `+suffixLen+`)`) + ` = '` + suffix + `'
+		AND (
+			` + bin(workKey) + ` = ` + bin(`LEFT(`+finalizerKey+`, `+scopeLen+`)`) + `
+			OR ` + bin(`LEFT(`+workKey+`, `+scopeWithDelimiterLen+`)`) + ` = ` + bin(`LEFT(`+finalizerKey+`, `+scopeWithDelimiterLen+`)`) + `
+		)
+	)`
 }
 
 // orphanedFinalizerSQL matches an earlier group_finalizer that nothing will
@@ -758,7 +780,8 @@ func finalizerScopeSQL(alias string) string {
 // loaded rows for every rollout state derivation. The fragment references the
 // earlier alias; its placeholders, in order, are the finalizer kind, pending, stopped,
 // the work kind and failed.
-var orphanedFinalizerSQL = `(
+func orphanedFinalizerSQL(d Dialect) string {
+	return `(
 	earlier.operation_kind = ?
 	AND earlier.state IN (?, ?)
 	AND EXISTS (
@@ -767,10 +790,11 @@ var orphanedFinalizerSQL = `(
 		WHERE orphaning.apply_id = earlier.apply_id
 			AND orphaning.deployment = earlier.deployment
 			AND orphaning.operation_kind = ?
-			AND ` + finalizerScopeSQL("orphaning") + ` = ` + finalizerScopeSQL("earlier") + `
+			AND ` + finalizerFinalizesWorkSQL(d, "earlier", "orphaning") + `
 			AND orphaning.state = ?
 	)
 )`
+}
 
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
 // blocking a later deployment's claim once the rollout policy says to keep
@@ -789,10 +813,11 @@ var orphanedFinalizerSQL = `(
 // Placeholders, in order: earlier-failed state, the orphanedFinalizerSQL
 // placeholders, continue, pause, release operation, pending, completed (see
 // releasedFailureExemptionArgs).
-var releasedFailureExemptionSQL = `NOT (
+func releasedFailureExemptionSQL(d Dialect) string {
+	return `NOT (
 	(
 		earlier.state = ?
-		OR ` + orphanedFinalizerSQL + `
+		OR ` + orphanedFinalizerSQL(d) + `
 	)
 	AND (
 		apply_operations.on_failure = ?
@@ -808,6 +833,7 @@ var releasedFailureExemptionSQL = `NOT (
 		)
 	)
 )`
+}
 
 // earlierRolloutMemberSQL matches an earlier sibling that belongs to a
 // different rollout member than the candidate row. A rollout member is a
@@ -827,6 +853,29 @@ const earlierRolloutMemberSQL = `(
 	earlier.deployment <> apply_operations.deployment
 	OR earlier.target <> apply_operations.target
 )`
+
+// earlierSiblingHoldsCutoverSQL is the cutover-order rule: an earlier sibling
+// (lower created_at, id — deployment_order as materialized at apply-create)
+// holds a later operation's cutover until it has completed, unless
+// releasedFailureExemptionSQL lets a terminal-failed one stop blocking. The
+// swaps are strictly ordered, so a sibling parked at the barrier still holds.
+// It references the apply_operations (the operation whose turn is asked about)
+// and earlier aliases, so the automatic cutover claim
+// (FindNextApplyOperationCutover) and the manual-request turn check
+// (CutoverBlocker) evaluate the same rule. pkg/presentation blocksCutover is
+// the render-side mirror. Placeholders: see earlierSiblingHoldsCutoverArgs.
+func earlierSiblingHoldsCutoverSQL(d Dialect) string {
+	return `earlier.apply_id = apply_operations.apply_id
+	AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+	AND earlier.state <> ?
+	AND ` + releasedFailureExemptionSQL(d)
+}
+
+// earlierSiblingHoldsCutoverArgs returns the positional arguments for
+// earlierSiblingHoldsCutoverSQL, in placeholder order.
+func earlierSiblingHoldsCutoverArgs() []any {
+	return append([]any{state.ApplyOperation.Completed}, releasedFailureExemptionArgs()...)
+}
 
 // earlierFinalizerAtBarrierSQL matches an earlier group_finalizer that the
 // barrier copy gate treats as having reached the barrier. A finalizer never
@@ -867,14 +916,15 @@ func earlierFinalizerAtBarrierArgs() []any {
 // apply_operations alias; its placeholders, in order, are the work kind,
 // completed, completed, and releasedFailureExemptionArgs (see
 // finalizerStartGateArgs).
-var finalizerStartGateSQL = `(
+func finalizerStartGateSQL(d Dialect) string {
+	return `(
 	NOT EXISTS (
 		SELECT 1
 		FROM apply_operations AS sibling
 		WHERE sibling.apply_id = apply_operations.apply_id
 			AND sibling.deployment = apply_operations.deployment
 			AND sibling.operation_kind = ?
-			AND ` + finalizerScopeSQL("sibling") + ` = ` + finalizerScopeSQL("apply_operations") + `
+			AND ` + finalizerFinalizesWorkSQL(d, "apply_operations", "sibling") + `
 			AND sibling.state <> ?
 	)
 	AND NOT EXISTS (
@@ -884,9 +934,10 @@ var finalizerStartGateSQL = `(
 			AND ` + earlierRolloutMemberSQL + `
 			AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 			AND earlier.state <> ?
-			AND ` + releasedFailureExemptionSQL + `
+			AND ` + releasedFailureExemptionSQL(d) + `
 	)
 )`
+}
 
 // finalizerStartGateArgs returns the positional arguments for
 // finalizerStartGateSQL, in placeholder order.
@@ -911,7 +962,8 @@ func finalizerStartGateArgs() []any {
 // earlier sibling stops blocking. The on_failure exemption applies to every
 // policy. The fragment references the apply_operations alias; see
 // workStartGateArgs for its placeholders.
-var workStartGateSQL = `NOT EXISTS (
+func workStartGateSQL(d Dialect) string {
+	return `NOT EXISTS (
 	SELECT 1
 	FROM apply_operations AS earlier
 	WHERE earlier.apply_id = apply_operations.apply_id
@@ -928,8 +980,9 @@ var workStartGateSQL = `NOT EXISTS (
 				AND earlier.state <> ?
 			)
 		)
-		AND ` + releasedFailureExemptionSQL + `
+		AND ` + releasedFailureExemptionSQL(d) + `
 )`
+}
 
 // workStartGateArgs returns the positional arguments for workStartGateSQL,
 // in placeholder order.
@@ -957,16 +1010,18 @@ func workStartGateArgs() []any {
 // caught before they ever started, so a stop and start cannot reorder the
 // rollout. The fragment references the apply_operations alias; see
 // operationStartGateArgs for its placeholders.
-var operationStartGateSQL = `(
+func operationStartGateSQL(d Dialect) string {
+	return `(
 	(
 		apply_operations.operation_kind <> ?
-		AND ` + workStartGateSQL + `
+		AND ` + workStartGateSQL(d) + `
 	)
 	OR (
 		apply_operations.operation_kind = ?
-		AND ` + finalizerStartGateSQL + `
+		AND ` + finalizerStartGateSQL(d) + `
 	)
 )`
+}
 
 // operationStartGateArgs returns the positional arguments for
 // operationStartGateSQL, in placeholder order.
@@ -1436,7 +1491,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		WHERE (
 			(
 				state = ?
-				AND `+operationStartGateSQL+`
+				AND `+operationStartGateSQL(s.dialect)+`
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
@@ -1476,7 +1531,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND apply_operations.started_at IS NOT NULL
 					)
 					OR (
-						`+operationStartGateSQL+`
+						`+operationStartGateSQL(s.dialect)+`
 						AND `+parentClaimable+`
 					)
 				)
@@ -1800,11 +1855,8 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// cutovers under "continue", or under "pause" once a release latches the
 	// rollout open; and the pending-stop NOT EXISTS makes `stop` halt remaining
 	// cutovers even under those exemptions.
-	queryArgs = append(queryArgs,
-		state.ApplyOperation.WaitingForCutover,
-		state.ApplyOperation.Completed,
-	)
-	queryArgs = append(queryArgs, releasedFailureExemptionArgs()...)
+	queryArgs = append(queryArgs, state.ApplyOperation.WaitingForCutover)
+	queryArgs = append(queryArgs, earlierSiblingHoldsCutoverArgs()...)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending,
 	)
@@ -1840,10 +1892,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_operations AS earlier
-					WHERE earlier.apply_id = apply_operations.apply_id
-						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-						AND earlier.state <> ?
-						AND `+releasedFailureExemptionSQL+`
+					WHERE `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
 				)
 				AND NOT EXISTS (
 					SELECT 1
@@ -1926,6 +1975,39 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
+}
+
+// CutoverBlocker returns the earliest earlier sibling that holds the given
+// operation's cutover, or nil when it is that operation's turn. It evaluates
+// earlierSiblingHoldsCutoverSQL, the rule the automatic cutover claim gates on,
+// so a manually requested cutover and the automatic one agree on whose turn it
+// is between members. Only operations of another rollout member
+// (earlierRolloutMemberSQL) are considered: under a requested cutover a
+// member's own operations, its shards and tables, cut over together, since the
+// cutover a request sends addresses the member's remote apply and takes
+// whichever of them are parked. The automatic claim has no member filter and
+// still cuts them over one at a time. It reads the order and does not claim
+// anything.
+func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID int64) (*storage.ApplyOperation, error) {
+	args := append([]any{operationID}, earlierSiblingHoldsCutoverArgs()...)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations AS earlier
+		WHERE EXISTS (
+			SELECT 1
+			FROM apply_operations
+			WHERE apply_operations.id = ?
+				AND `+earlierRolloutMemberSQL+`
+				AND `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
+		)
+		ORDER BY created_at, id
+		LIMIT 1
+	`, args...)
+	blocker, err := scanApplyOperation(row)
+	if err != nil {
+		return nil, fmt.Errorf("find sibling holding the cutover of apply_operation %d: %w", operationID, err)
+	}
+	return blocker, nil
 }
 
 // ReleaseClaim clears the lease fields and backdates the heartbeat past the

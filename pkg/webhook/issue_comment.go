@@ -374,7 +374,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}
@@ -622,7 +622,7 @@ func (h *Handler) postCommentReportingError(repo string, pr int, installationID 
 		return fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
 	}
 
-	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, body)); err != nil {
+	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body)); err != nil {
 		return fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
 	}
 	return nil
@@ -651,7 +651,7 @@ func (h *Handler) postAndTrackComment(
 		return
 	}
 
-	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, body))
+	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, apply.Environment, body))
 	if err != nil {
 		h.logger.Error("failed to post tracked comment",
 			"repo", repo, "pr", pr, "commentState", commentState, "error", err)
@@ -739,7 +739,7 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 		return
 	}
 	finalBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
-	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(repo, pr, finalBody)); err != nil {
+	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(repo, pr, apply.Environment, finalBody)); err != nil {
 		h.logger.Error("failed to finalize progress comment for already-terminal apply",
 			append(apply.LogAttrs(), "github_comment_id", comment.GitHubCommentID, "error", err)...)
 		return
@@ -846,19 +846,21 @@ func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, 
 
 // renderPRComment finishes a comment body for posting on repo's PR: an
 // oversized body is replaced with the notice that fits, then the support
-// footer is appended.
-func (h *Handler) renderPRComment(repo string, pr int, body string) string {
-	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, body), h.supportChannel())
+// footer is appended. environment is the one environment the comment is about,
+// which scopes the notice's CLI hint; empty when it names none or several.
+func (h *Handler) renderPRComment(repo string, pr int, environment, body string) string {
+	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, environment, body, h.cliName()), h.supportChannel())
 }
 
 // fitPRComment returns body when GitHub will accept it and otherwise the
 // oversized-comment notice, logging the rendered size with the identifiers an
-// operator needs to find the comment that was replaced.
-func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, body string) string {
-	fitted, replaced := templates.FitGitHubComment(body)
+// operator needs to find the comment that was replaced. cliName starts the
+// notice's CLI command hint and environment scopes it.
+func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, environment, body, cliName string) string {
+	fitted, replaced := templates.FitGitHubComment(body, cliName, environment)
 	if replaced {
 		logger.Error("comment exceeds GitHub's size cap; posting the oversized-comment notice in its place",
-			"repo", repo, "pr", pr, "rendered_bytes", len(body), "limit_bytes", templates.GitHubIssueCommentMaxChars)
+			"repo", repo, "pr", pr, "environment", environment, "rendered_bytes", len(body), "limit_bytes", templates.GitHubIssueCommentMaxChars)
 	}
 	return fitted
 }
@@ -869,6 +871,12 @@ func (h *Handler) supportChannel() api.SupportChannelConfig {
 		return api.SupportChannelConfig{}
 	}
 	return cfg.SupportChannel
+}
+
+// cliName is the tool name the CLI command hints in this server's PR comments
+// start with: the configured cli_name, or the CLI's own default.
+func (h *Handler) cliName() string {
+	return h.config().HintCLIName()
 }
 
 func (h *Handler) agentHint() string {

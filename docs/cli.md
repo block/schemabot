@@ -940,7 +940,9 @@ launching SchemaBot. Keep those organization-specific steps in the wrapper;
 use the upstream CLI for plans and operations.
 
 An exec-style wrapper passes `--cli-name "acme schemabot"` so generated hints
-lead back through the wrapper. It can supply the endpoint with `--endpoint`
+lead back through the wrapper. Set the server's
+[`cli_name`](configuration.md#cli-name) to the same value so the CLI hints in
+PR comments lead back through it too. It can supply the endpoint with `--endpoint`
 and a bearer token through `SCHEMABOT_TOKEN`. Avoid placing credentials in
 shell history or printing them in diagnostics.
 

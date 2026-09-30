@@ -34,7 +34,7 @@ const (
 )
 
 func previewMutesCell(shard string) ShardCell {
-	return ShardCell{Shard: shard, Table: "mutes", DDL: previewMutesIndex}
+	return ShardCell{Shard: shard, Table: "mutes", Statements: []string{previewMutesIndex}}
 }
 
 // PreviewCommentShardedApplyInProgress renders a sharded apply mid-rollout: the
@@ -265,7 +265,7 @@ func PreviewCommentShardedApplyDivergent() string {
 			}),
 			Cells: []ShardCell{
 				previewMutesCell("-40"),
-				{Shard: "40-80", Table: "mutes", DDL: previewMutesIndexDrift},
+				{Shard: "40-80", Table: "mutes", Statements: []string{previewMutesIndexDrift}},
 				previewMutesCell("80-c0"),
 			},
 		}},
@@ -302,7 +302,7 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Completed}},
 				}},
 				Shards: []ShardStatus{unshard(shards[0], "-")},
-				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", Statements: []string{"ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_lookup",
@@ -313,7 +313,7 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 					Shards:          []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
 				}},
 				Shards: []ShardStatus{unshard(shards[1], "-")},
-				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", DDL: "ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", Statements: []string{"ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_sharded",

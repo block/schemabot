@@ -991,6 +991,7 @@ func PreviewCommentOversized() string {
 	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
 		Title:         "## Schema Change Apply — Staging",
 		RenderedBytes: 84801,
+		Environment:   "staging",
 	}), previewSupportChannel())
 }
 
@@ -2509,7 +2510,19 @@ func sampleDeploymentDetail(database, applyState string, tables []TableProgressD
 
 // PreviewCommentMultiDeploymentApplyInProgress renders a barrier rollout
 // mid-flight: one deployment parked ready for cutover, one copying, two queued.
+// SchemaBot cuts the parked deployment over itself, so no command is offered.
 func PreviewCommentMultiDeploymentApplyInProgress() string {
+	return previewBarrierRolloutInProgress(false)
+}
+
+// PreviewCommentMultiDeploymentApplyDeferredCutover renders the same barrier
+// rollout started with --defer-cutover: the parked deployment waits for an
+// operator, so the comment offers the cutover command.
+func PreviewCommentMultiDeploymentApplyDeferredCutover() string {
+	return previewBarrierRolloutInProgress(true)
+}
+
+func previewBarrierRolloutInProgress(deferCutover bool) string {
 	model := presentation.Derive([]presentation.Operation{
 		{Deployment: "eu", State: state.ApplyOperation.WaitingForCutover, Barrier: true},
 		{Deployment: "us", State: state.ApplyOperation.Running, Barrier: true},
@@ -2531,16 +2544,21 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	usTables[1].ETASeconds = 195
 	usTables[2].Status = state.Task.Pending
 
+	details := []*ApplyStatusCommentData{
+		sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
+		sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
+	}
+	for _, detail := range details {
+		detail.DeferCutover = deferCutover
+	}
+
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
 		ApplyID:     "apply-a1b2c3d4e5f6",
 		Environment: "production",
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-12 * time.Minute).UTC().Format(time.RFC3339),
-		Details: []*ApplyStatusCommentData{
-			sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
-			sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
-		},
+		Details:     details,
 	})
 }
 
