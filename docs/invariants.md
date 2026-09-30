@@ -793,14 +793,15 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 Multi-member rollouts claim operations in member order, where a member is a (deployment, target)
 pair taken in `deployment_order` and then in each deployment's `targets` order, and a failed
 earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
-member, not per operation: one member's operations never wait on each other to start, and a later
-member's operations wait on every earlier member's, until those complete under `rolling` or reach
+member, not per operation: one member's work never waits on its own member's work to start, and a
+later member's work waits on every earlier member's, until it completes under `rolling` or reaches
 the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Cutover
 under `barrier` and `parallel` is ordered across every operation, not per member: operations cut
 over strictly one at a time in the order the rollout created them, so two shards of one member cut
-over one after the other. A member's finalizer runs only once all of the work it finalizes has
-completed. Once an operator releases a paused rollout it stays released, with no path back to
-paused. An *unrecognized* `on_failure` value behaves like `halt`, never like `continue`.
+over one after the other. A member's finalizer publishes its change without parking at the
+barrier, so it is ordered like a cutover under every policy: it starts only once all of the work it
+finalizes and every earlier member have completed. Once an operator releases a paused rollout it
+stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like `halt`, never like `continue`.
 
 Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
 claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
@@ -818,8 +819,10 @@ or `paused` where a pause is holding it — until that sibling is started and fi
 cancelled. A rollout held open this way still resolves the stop that produced it, once that stop
 has reached every operation: the pending request is what `start` consults, so holding it open
 without completing the request would refuse the start the hold exists to preserve (CO-2).
-*Enforced:* the ordered-claim gates in `FindNextApplyOperation` and
-`FindNextApplyOperationCutover` (`pkg/storage/internal/sqlstore/apply_operations.go`) and the rollout state derivation
+*Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
+each gate on earlier members, and `FindNextApplyOperationCutover`
+(`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
+storage parity suite (`pkg/storage/storagetest/apply_operations.go`), and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), with `completeLandedStopForHeldOpenApply` and
 `RolloutHeldByResumableChild` keeping a held-open rollout's stop resolved and its recovery claim
