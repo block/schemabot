@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,10 +14,46 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
+
+// The rollback comment has no unsafe section, so it shows warning-severity
+// findings and withholds error-severity ones. It links a guide only for what it
+// shows: an operator reading "Related guidance" with nothing above it naming
+// the rule has no way to tell what the link is about.
+func TestRollbackPlanCommentRelatedGuidance(t *testing.T) {
+	for _, severity := range []string{"warning", "error"} {
+		t.Run(severity, func(t *testing.T) {
+			resp := &apitypes.PlanResponse{
+				Changes: []*apitypes.SchemaChangeResponse{{Namespace: "app", TableChanges: []*apitypes.TableChangeResponse{{TableName: "customers", DDL: "ALTER TABLE `customers` DROP INDEX `idx_created_at`;"}}}},
+				LintResults: []*apitypes.LintViolationResponse{
+					{Table: "customers", Linter: "primary_key", Severity: severity, Message: `Primary key column "id" has type "varchar"`},
+					{Table: "orders", Linter: "primary_key", Severity: severity, Message: `Primary key column "id" has type "varchar"`},
+				},
+			}
+			data := buildRollbackPlanCommentData(templates.PlanCommentData{Database: "app", IsMySQL: true, DatabaseType: "mysql", Environment: "staging"}, resp)
+			if severity == "warning" {
+				require.Len(t, data.LintViolations, 2)
+				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
+			} else {
+				assert.Empty(t, data.LintViolations)
+			}
+			out := templates.RenderRollbackPlanComment(data)
+			if severity == "warning" {
+				assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"),
+					"two findings on one rule link the guide once")
+				assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]")
+			} else {
+				assert.NotContains(t, out, "docs/mysql.md#choosing-a-primary-key")
+				assert.NotContains(t, out, "📖 **Related guidance:**")
+			}
+		})
+	}
+}
 
 func TestWebhookRollbackDispatch(t *testing.T) {
 	h, _, _ := newTestHandler(t)
