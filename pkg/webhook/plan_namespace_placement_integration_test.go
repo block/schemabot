@@ -4,6 +4,7 @@ package webhook
 
 import (
 	"database/sql"
+	"html"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -98,7 +99,8 @@ func runNamespacePlacementPlan(t *testing.T, productionTargets []api.TargetEntry
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, wantRefusal)
+		// The comment renders the refusal HTML-escaped.
+		assert.Contains(t, html.UnescapeString(body), wantRefusal)
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for multi-env plan comment")
 	}
