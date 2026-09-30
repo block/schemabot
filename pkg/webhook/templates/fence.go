@@ -166,18 +166,23 @@ func (b *ddlBlockBudget) pointerMarker(planID string) string {
 	return scopedPlanPointerMarker(planID, b.scope)
 }
 
-// forTargetGroups marks the DDL rendered from here on as target groups'
-// plans, each naming a stored plan that covers only its group's targets,
-// until the returned restore runs.
-func (b *ddlBlockBudget) forTargetGroups() (restore func()) {
+// forTargetGroup marks the DDL rendered from here on as the plan of a target
+// group of the given size, naming a stored plan that covers only the group's
+// targets, until the returned restore runs.
+func (b *ddlBlockBudget) forTargetGroup(members int) (restore func()) {
 	previous := b.scope
-	b.scope = targetGroupPlanScope
+	b.scope = targetGroupPlanScope(members)
 	return func() { b.scope = previous }
 }
 
 // targetGroupPlanScope is how a pointer marker under a target group's DDL
-// qualifies the plan it names.
-const targetGroupPlanScope = " for these targets"
+// qualifies the plan it names, agreeing in number with the group's heading.
+func targetGroupPlanScope(members int) string {
+	if members == 1 {
+		return " for this target"
+	}
+	return " for these targets"
+}
 
 // shareAcross marks the DDL rendered from here on as one section shared by
 // environments, rendered from the first one's plan, until the returned restore

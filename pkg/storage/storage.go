@@ -1400,9 +1400,12 @@ type ApplyOperationStore interface {
 	// past the earlier rollout members of its apply. A member is a (deployment,
 	// target) pair, so the targets of one deployment are ordered exactly like the
 	// deployments of a map, while the operations of one member (a sharded
-	// target's per-shard work) do not gate each other's start. They are still
-	// ordered at cutover, by FindNextApplyOperationCutover, and a member's
-	// finalizer still waits for the work it finalizes.
+	// target's per-shard work) do not gate each other's start. Under barrier
+	// and parallel they are still ordered at cutover, by
+	// FindNextApplyOperationCutover; under rolling they cut over in their own
+	// drives. A member's finalizer starts only once the work it finalizes has
+	// completed, and it waits on earlier members as rolling does, for them to
+	// complete, under every policy.
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing

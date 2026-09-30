@@ -1629,7 +1629,6 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 	slices.SortStableFunc(plans, func(a, b DeploymentPlanGroup) int {
 		return compareWorkFirst(a.Empty(), b.Empty())
 	})
-	defer budget.forTargetGroups()()
 	for _, g := range plans {
 		writeGroupHeading(sb, targetNoun, g.Members, len(drift.Deployments))
 		if g.Empty() {
@@ -1640,11 +1639,13 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
+		restore := budget.forTargetGroup(len(g.Members))
 		if collapse && statements+vschema > 1 {
 			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)
 		} else {
 			writeKeyspaceChanges(sb, group, budget)
 		}
+		restore()
 		// A refused change is disclosed under the DDL it refuses, naming the
 		// targets that refuse it, so the reader sees what fails and where.
 		if len(g.BlockedChanges) > 0 {
