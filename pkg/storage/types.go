@@ -505,6 +505,12 @@ func (tc TableChange) EngineBlocked() bool {
 	return strings.EqualFold(tc.ExecutionMode, "blocked")
 }
 
+// DirectExecution reports whether the planner routed this change to direct
+// execution: native DDL on the target instead of the schema change engine.
+func (tc TableChange) DirectExecution() bool {
+	return strings.EqualFold(tc.ExecutionMode, "direct")
+}
+
 // UnsafeOptInReason returns the planner-provided unsafe reason, or a generic
 // table-drop reason for older/malformed plans that only persisted the operation.
 func (tc TableChange) UnsafeOptInReason() string {

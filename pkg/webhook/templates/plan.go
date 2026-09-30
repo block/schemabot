@@ -1739,7 +1739,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
-// directConsentCopy returns the header noun and the consequence sentence for
+// directDisclosureCopy returns the header noun and the consequence sentence for
 // the direct-execution disclosure, keyed by database type. What a
 // direct statement does to the table while it runs is engine-specific — an
 // engine that adopts direct execution adds its own copy here rather than
@@ -1749,7 +1749,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 // rest of the plan. Undoing one is the same inverse schema change as for any other
 // MySQL change, none of which has a revert window, so the MySQL copy does not
 // warn about reverting.
-func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, consequence string) {
+func directDisclosureCopy(databaseType string, isMySQL bool) (headerNoun, consequence string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
 	databaseType = strings.TrimSpace(databaseType)
@@ -1786,7 +1786,7 @@ func writePausedApplyCause(sb *strings.Builder, cause *PausedApplyCauseData) {
 // flag leaves these statements alone even though it defers the rest of the
 // plan's.
 func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL, deferCutover bool) {
-	headerNoun, consequence := directConsentCopy(databaseType, isMySQL)
+	headerNoun, consequence := directDisclosureCopy(databaseType, isMySQL)
 	footer := consequence
 	if deferCutover {
 		footer += " `--defer-cutover` does not apply to these direct statements: they have no cutover to defer."

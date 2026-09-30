@@ -554,14 +554,27 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	// Store the check record before anything runs: the merge gate must block on
+	// the pending changes before the target starts changing. A storage failure
+	// releases the lock (keyed on this plan's intent) and stays retryable — the
+	// re-drive re-plans from the top, reacquires the lock, and stores again —
+	// so the apply never dispatches over unknown check state.
 	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
-		h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
+		h.logger.Error("failed to store check state for automatic apply; the merge gate does not reflect the pending changes, so nothing was dispatched and the command stays retryable",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_id", planResp.PlanID, "error", checkErr)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply check state store failure")
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				"SchemaBot could not record the check state for this apply. Nothing was applied. Retry the command, and see server logs if it persists.")
+		}
+		return true, fmt.Errorf("apply command check record %s#%d: %w", repo, pr, checkErr)
 	}
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)

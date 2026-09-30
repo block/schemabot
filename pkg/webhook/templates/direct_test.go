@@ -108,20 +108,20 @@ func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
 	assert.Contains(t, out, "`users` (shards `-40`, `40-80`): the table has ~40 rows")
 }
 
-// The direct-execution consent copy is keyed by database type: MySQL-family
+// The direct-execution disclosure copy is keyed by database type: MySQL-family
 // databases (including Strata, whose shards are MySQL) disclose MySQL
 // semantics, and a database type without registered copy gets the
 // conservative engine-neutral disclosure rather than inheriting MySQL's.
-func TestDirectConsentCopy_KeyedByDatabaseType(t *testing.T) {
-	mysqlHeader, mysqlConsequence := directConsentCopy("mysql", true)
+func TestDirectDisclosureCopy_KeyedByDatabaseType(t *testing.T) {
+	mysqlHeader, mysqlConsequence := directDisclosureCopy("mysql", true)
 	assert.Equal(t, "native MySQL DDL, not through Spirit", mysqlHeader)
 	assert.Equal(t, "Writes to each table are blocked until its statement finishes.", mysqlConsequence)
 
-	strataHeader, strataConsequence := directConsentCopy("strata", false)
+	strataHeader, strataConsequence := directDisclosureCopy("strata", false)
 	assert.Equal(t, mysqlHeader, strataHeader, "Strata shards run the same native MySQL DDL")
 	assert.Equal(t, mysqlConsequence, strataConsequence)
 
-	otherHeader, otherConsequence := directConsentCopy("postgres", false)
+	otherHeader, otherConsequence := directDisclosureCopy("postgres", false)
 	assert.Equal(t, "native DDL", otherHeader)
 	assert.Contains(t, otherConsequence, "Each table is unavailable until its statement finishes")
 	assert.Contains(t, otherConsequence, "**not revertible**")

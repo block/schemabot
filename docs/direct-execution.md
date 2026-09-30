@@ -268,8 +268,10 @@ confirmation step:
   its measured size, above the statement in the plan.
 - `schemabot apply` re-plans against the live target before executing, as
   every apply does, and runs the direct statements alongside the rest of the
-  plan. A re-plan that resolves to blocked is rejected. The automatic apply
-  path runs direct changes the same way.
+  plan. A re-plan that resolves to blocked is rejected. A re-plan that routes
+  a statement to direct execution that the posted plan ran through Spirit
+  pauses for `apply-confirm` against a comment that discloses it, the same
+  way a re-plan whose DDL changed does.
 - Other gates still apply: a direct statement that is also an unsafe change,
   such as dropping a primary key, still needs `--allow-unsafe`.
 - `--defer-cutover` is rejected on an all-direct plan — a direct statement has

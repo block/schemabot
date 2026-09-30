@@ -413,3 +413,70 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 		"`orders` (create) is in this plan but not in the one this apply was started from",
 	}, oneKeyspace.Entries)
 }
+
+// A re-plan can route a statement to direct execution that the plan behind the
+// apply's comment ran through the engine, with the same DDL. Only those
+// statements are newly direct: one already disclosed as direct, or one that
+// now runs through the engine instead, was not hidden from the operator.
+func TestNewlyDirectChanges(t *testing.T) {
+	const swap = "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"
+	const addColumn = "ALTER TABLE `orders` ADD COLUMN `notes` text"
+	replan := func(usersMode, ordersMode string) *apitypes.PlanResponse {
+		return &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", ChangeType: "alter", DDL: swap, ExecutionMode: usersMode},
+				{TableName: "orders", ChangeType: "alter", DDL: addColumn, ExecutionMode: ordersMode},
+			}},
+		}}
+	}
+	stored := func(usersMode string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", Operation: "alter", DDL: swap, ExecutionMode: usersMode},
+				{Table: "orders", Operation: "alter", DDL: addColumn},
+			}},
+		}}
+	}
+
+	t.Run("statement the plan ran through the engine is newly direct", func(t *testing.T) {
+		assert.Equal(t, []directChangeIdentity{{namespace: "mydb", table: "users", ddl: swap}},
+			newlyDirectChanges(replan("direct", ""), stored("")))
+	})
+	t.Run("statement the plan already disclosed as direct is not", func(t *testing.T) {
+		assert.Empty(t, newlyDirectChanges(replan("direct", ""), stored("direct")))
+	})
+	t.Run("statement that stops being direct is not", func(t *testing.T) {
+		assert.Empty(t, newlyDirectChanges(replan("", ""), stored("direct")))
+	})
+	t.Run("every newly direct statement is returned in table order", func(t *testing.T) {
+		assert.Equal(t, []directChangeIdentity{
+			{namespace: "mydb", table: "orders", ddl: addColumn},
+			{namespace: "mydb", table: "users", ddl: swap},
+		}, newlyDirectChanges(replan("direct", "direct"), stored("")))
+	})
+	t.Run("a shard newly direct is newly direct even when another shard was disclosed", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "ks", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			{Namespace: "ks", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+		}}
+		storedPlan := &storage.Plan{Shards: []storage.ShardPlan{
+			{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			{Namespace: "ks", Shard: "80-", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+		}}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", shard: "80-", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan))
+	})
+}
+
+func TestNewlyDirectCauseNamesEachTable(t *testing.T) {
+	cause := newlyDirectCause([]directChangeIdentity{
+		{namespace: "mydb", table: "users", ddl: "ALTER TABLE `users` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "80-", table: "events", ddl: "ALTER TABLE `events` DROP PRIMARY KEY"},
+	})
+	assert.Equal(t, "Changes run differently from the plan this apply was started from", cause.Heading)
+	assert.Equal(t, []string{
+		"`users` now runs as direct execution",
+		"`events` (shard `80-`) now runs as direct execution",
+	}, cause.Entries)
+	assert.Equal(t, "The direct execution section above shows how they will run. Review it, then confirm to apply.", cause.Remedy)
+}

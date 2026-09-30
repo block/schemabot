@@ -165,6 +165,26 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// Engine refusals are judged against the live table, so the re-plan can
+	// route a statement to direct execution that the plan behind this apply's
+	// comment ran through the engine, without its DDL changing. That comment
+	// never disclosed the native DDL, so downgrade to manual confirmation
+	// against one that does, the same as DDL drift.
+	if storedPlan != nil {
+		if newlyDirect := newlyDirectChanges(planResp, storedPlan); len(newlyDirect) > 0 {
+			h.logger.Info("automatic apply downgraded: re-plan routes changes to direct execution that the plan did not",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", planResp.PlanID, "newly_direct", len(newlyDirect))
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				newlyDirectCause(newlyDirect)); err != nil {
+				h.logger.Error("failed to post the newly-direct downgrade comment",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "error", err)
+			}
+			return
+		}
+	}
+
 	// The copy on the target is read fresh on every plan, so this re-plan can
 	// discover a discard the comment behind this apply never showed: another
 	// apply can start a copy, or an adopted copy's checkpoint can age out,
@@ -207,8 +227,9 @@ func (h *Handler) executeApply(
 	// --defer-cutover only affects engine-driven statements; an all-direct
 	// plan has no cutover to defer, so reject the flag instead of silently
 	// ignoring it. Only apply-confirm reaches this gate (the apply command
-	// rejects the flag before locking, and an automatic apply whose re-plan
-	// carries direct changes downgrades above), so keep the lock: it still
+	// rejects the flag before locking on an all-direct plan, and an automatic
+	// apply whose re-plan routes changes to direct execution that the plan did
+	// not downgrades above), so keep the lock: it still
 	// pins the plan the operator confirmed against, and re-running
 	// apply-confirm without the flag executes it.
 	if result.DeferCutover && planResp.AllChangesDirect() {
@@ -561,6 +582,92 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 		Heading: "Schema changes differ from the plan this apply was started from",
 		Entries: entries,
 		Remedy:  "The statements above are what will run. Review them, then confirm to apply them.",
+	}
+}
+
+// directChangeIdentity is one statement routed to direct execution, keyed by
+// where it runs: a sharded plan routes each shard's statement on its own.
+type directChangeIdentity struct {
+	namespace string
+	shard     string
+	table     string
+	ddl       string
+}
+
+// newlyDirectChanges returns the statements the re-plan routes to direct
+// execution that storedPlan did not, sorted for a stable disclosure. A
+// statement that stops being direct is not returned: it now runs through the
+// engine, which the comment already overstated rather than hid.
+func newlyDirectChanges(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) []directChangeIdentity {
+	stored := make(map[directChangeIdentity]struct{})
+	for _, tc := range storedPlan.FlatDDLChanges() {
+		if tc.DirectExecution() {
+			stored[directChangeIdentity{namespace: normalizePlanNamespace(tc.Namespace), table: tc.Table, ddl: tc.DDL}] = struct{}{}
+		}
+	}
+	for _, sp := range storedPlan.Shards {
+		for _, tc := range sp.Changes {
+			if tc.DirectExecution() {
+				stored[directChangeIdentity{namespace: normalizePlanNamespace(sp.Namespace), shard: sp.Shard, table: tc.Table, ddl: tc.DDL}] = struct{}{}
+			}
+		}
+	}
+
+	var newly []directChangeIdentity
+	addIfNew := func(id directChangeIdentity) {
+		if _, ok := stored[id]; !ok {
+			newly = append(newly, id)
+		}
+	}
+	for _, sc := range planResp.Changes {
+		for _, tc := range sc.TableChanges {
+			if tc.DirectExecution() {
+				addIfNew(directChangeIdentity{namespace: normalizePlanNamespace(sc.Namespace), table: tc.TableName, ddl: tc.DDL})
+			}
+		}
+	}
+	for _, sp := range planResp.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.DirectExecution() {
+				addIfNew(directChangeIdentity{namespace: normalizePlanNamespace(sp.Namespace), shard: sp.Shard, table: tc.TableName, ddl: tc.DDL})
+			}
+		}
+	}
+	slices.SortFunc(newly, func(a, b directChangeIdentity) int {
+		return cmp.Or(
+			cmp.Compare(a.namespace, b.namespace),
+			cmp.Compare(a.table, b.table),
+			cmp.Compare(a.shard, b.shard),
+			cmp.Compare(a.ddl, b.ddl),
+		)
+	})
+	return newly
+}
+
+// newlyDirectCause names each table the re-plan newly routes to direct
+// execution. How they run is disclosed in the direct execution section above
+// this cause, so the entries only say which tables moved.
+func newlyDirectCause(newly []directChangeIdentity) *templates.PausedApplyCauseData {
+	var entries []string
+	for _, id := range newly {
+		subject := fmt.Sprintf("`%s`", id.table)
+		if id.shard != "" {
+			subject = fmt.Sprintf("`%s` (shard `%s`)", id.table, id.shard)
+		}
+		entries = append(entries, subject+" now runs as direct execution")
+	}
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("change", "changes", remaining)))
+	}
+	return &templates.PausedApplyCauseData{
+		Heading: "Changes run differently from the plan this apply was started from",
+		Entries: entries,
+		Remedy:  "The direct execution section above shows how they will run. Review it, then confirm to apply.",
 	}
 }
 
