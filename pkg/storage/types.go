@@ -582,18 +582,19 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 // namespace's VSchema change as one. It is the stored-plan counterpart of
 // apitypes.SchemaChangeResponse.ShowsVSchemaChange: a change the engine
 // generated entirely from the plan's DDL, with no diff to review, no recorded
-// deletion or mutation, and a finalize to show, is shown as that finalize.
+// deletion or mutation, and a finalize to write it, is left to the DDL and
+// that finalize.
 func (n *NamespacePlanData) ShowsVSchemaChange() bool {
 	if !n.ChangesVSchema() {
 		return false
 	}
-	return !n.vschemaChangeShownAsFinalize()
+	return !n.vschemaChangeGeneratedFromDDL()
 }
 
-// vschemaChangeShownAsFinalize reports whether the stored plan marks this
+// vschemaChangeGeneratedFromDDL reports whether the stored plan marks this
 // namespace's VSchema change generated from the DDL, with no diff and no
 // deletion or mutation record, and finalizes the namespace.
-func (n *NamespacePlanData) vschemaChangeShownAsFinalize() bool {
+func (n *NamespacePlanData) vschemaChangeGeneratedFromDDL() bool {
 	meta := n.Metadata
 	generatedOnly := meta[PlanMetadataVSchemaGeneratedOnly] == "true"
 	noDiff := meta[PlanMetadataVSchemaDiff] == ""

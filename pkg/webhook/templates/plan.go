@@ -347,8 +347,10 @@ type KeyspaceChangeData struct {
 	VSchemaDiff    string
 
 	// Finalize marks a keyspace the engine asked to finalize after its DDL.
-	// Without a VSchema change to show, the finalize is the keyspace's own
-	// line and count, since it is work the apply runs.
+	// A keyspace with DDL or a VSchema change to show finalizes as part of that
+	// work, so the finalize gets its own line and count only when it is the
+	// keyspace's only work, which keeps such a plan from reading as having no
+	// changes.
 	Finalize bool
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
@@ -678,18 +680,24 @@ func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspaceUpdate
 	return
 }
 
-// countKeyspaceUpdates splits countChanges' keyspace-level updates into the
-// VSchema updates and the finalize-only keyspaces, for the summary labels.
+// countKeyspaceUpdates counts the summary's keyspace-level labels: the VSchema
+// updates, and the keyspaces whose only work is a finalize.
 func countKeyspaceUpdates(changes []KeyspaceChangeData) (vschemaUpdates, finalizes int) {
 	for _, ks := range changes {
 		switch {
 		case ks.VSchemaChanged:
 			vschemaUpdates++
-		case ks.Finalize:
+		case finalizeIsOnlyWork(ks):
 			finalizes++
 		}
 	}
 	return
+}
+
+// finalizeIsOnlyWork reports whether a keyspace's only work is the finalize
+// the engine asked for: no DDL and no VSchema change to show beside it.
+func finalizeIsOnlyWork(ks KeyspaceChangeData) bool {
+	return ks.Finalize && !ks.VSchemaChanged && keyspaceStatementCount(ks) == 0
 }
 
 // keyspaceStatementCount counts a keyspace's DDL statements for the summary and
@@ -1127,7 +1135,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			}
 		}
 
-		if ks.Finalize && !hasVSchemaChanges {
+		if ks.Finalize && !hasVSchemaChanges && keyspaceStatementCount(ks) == 0 {
 			sb.WriteString(keyspaceFinalizeNote)
 		}
 
@@ -1141,8 +1149,8 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 	}
 }
 
-// keyspaceFinalizeNote is the plan comment's line for a keyspace the engine
-// asked to finalize without a VSchema change to show. What finalizing does
+// keyspaceFinalizeNote is the plan comment's line for a keyspace whose only
+// work is the finalize the engine asked for. What finalizing does
 // is the engine's; the comment only says that it runs and when.
 const keyspaceFinalizeNote = "_Finalized by the engine once every shard's DDL has landed._\n\n"
 

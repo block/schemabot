@@ -26,9 +26,10 @@ func TestRenderPlanComment_FinalizeOnlyKeyspaceIsAChange(t *testing.T) {
 	assert.NotContains(t, out, "`ledger`", "a keyspace with nothing to do is not listed")
 }
 
-// A keyspace that adds a table and is finalized afterward shows its DDL and the
-// finalize line, and the summary counts both.
-func TestRenderPlanComment_FinalizeAlongsideDDL(t *testing.T) {
+// A keyspace that adds a table and is finalized afterward shows only its DDL:
+// the finalize is part of that work, so it gets no line or count of its own.
+// A keyspace whose only work is a finalize still gets both.
+func TestRenderPlanComment_FinalizeBesideDDLShowsOnlyTheDDL(t *testing.T) {
 	stmt := "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
 	out := RenderPlanComment(PlanCommentData{
 		Database: "payments", Environment: "staging", DatabaseType: "strata",
@@ -38,10 +39,20 @@ func TestRenderPlanComment_FinalizeAlongsideDDL(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "📋 **Plan**: **2** tables to create, **1** keyspace to finalize")
-	assert.Equal(t, 1, strings.Count(out, keyspaceFinalizeNote), "only the finalized keyspace carries the line")
-	assert.Less(t, strings.Index(out, "`payments`"), strings.Index(out, keyspaceFinalizeNote))
-	assert.Less(t, strings.Index(out, keyspaceFinalizeNote), strings.Index(out, "`ledger`"))
+	assert.Contains(t, out, "📋 **Plan**: **2** tables to create\n")
+	assert.NotContains(t, out, keyspaceFinalizeNote)
+
+	mixed := RenderPlanComment(PlanCommentData{
+		Database: "payments", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{
+			{Keyspace: "payments", Statements: []string{stmt}, Finalize: true},
+			{Keyspace: "ledger", Finalize: true},
+		},
+	})
+
+	assert.Contains(t, mixed, "📋 **Plan**: **1** table to create, **1** keyspace to finalize\n")
+	assert.Equal(t, 1, strings.Count(mixed, keyspaceFinalizeNote), "only the keyspace whose only work is a finalize carries the line")
+	assert.Less(t, strings.Index(mixed, "`ledger`"), strings.Index(mixed, keyspaceFinalizeNote))
 }
 
 // A keyspace whose VSchema changes is shown as a VSchema update even when its
@@ -66,11 +77,40 @@ func TestSummarizeChanges_CountsFinalizes(t *testing.T) {
 		DatabaseType: "strata",
 		Changes:      []KeyspaceChangeData{{Keyspace: "payments", Finalize: true}},
 	}))
-	assert.Equal(t, "1 create · 2 keyspaces to finalize", SummarizeChanges(PlanCommentData{
+	assert.Equal(t, "1 create · 1 keyspace to finalize", SummarizeChanges(PlanCommentData{
 		DatabaseType: "strata",
 		Changes: []KeyspaceChangeData{
 			{Keyspace: "payments", Statements: []string{stmt}, Finalize: true},
 			{Keyspace: "ledger", Finalize: true},
 		},
 	}))
+}
+
+// A sharded keyspace carries its DDL per shard, so a finalize beside that DDL
+// gets no line of its own. A sharded keyspace whose every shard already
+// matches has no DDL to show, so its finalize keeps its line and count and the
+// keyspace is never an empty header.
+func TestRenderPlanComment_ShardedKeyspaceFinalize(t *testing.T) {
+	stmt := "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	ledger := KeyspaceChangeData{Keyspace: "ledger", Statements: []string{stmt}}
+
+	withDDL := RenderPlanComment(PlanCommentData{
+		Database: "payments", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{Keyspace: "payments", Finalize: true, Shards: []KeyspaceShardChange{
+			{Shard: "-80", Statements: []string{stmt}},
+			{Shard: "80-", Statements: []string{stmt}},
+		}}, ledger},
+	})
+	assert.NotContains(t, withDDL, keyspaceFinalizeNote)
+	assert.Contains(t, withDDL, "📋 **Plan**: **2** tables to create\n")
+
+	satisfied := RenderPlanComment(PlanCommentData{
+		Database: "payments", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{Keyspace: "payments", Finalize: true, Shards: []KeyspaceShardChange{
+			{Shard: "-80", Satisfied: true},
+			{Shard: "80-", Satisfied: true},
+		}}, ledger},
+	})
+	assert.Contains(t, satisfied, "#### Keyspace: `payments`\n"+keyspaceFinalizeNote)
+	assert.Contains(t, satisfied, "📋 **Plan**: **1** table to create, **1** keyspace to finalize\n")
 }

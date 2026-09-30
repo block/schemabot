@@ -611,19 +611,38 @@ func TestDescribeOnboardPlanChangesNamesFinalizeOnlyKeyspace(t *testing.T) {
 	assert.Equal(t, []string{"payments: engine finalize requested"}, lines)
 }
 
-// A keyspace whose only VSchema work is generated from its DDL is named by the
-// finalize that writes it, the same way the plan shows it.
-func TestDescribeOnboardPlanChangesNamesGeneratedVSchemaChangeAsAFinalize(t *testing.T) {
+// A keyspace whose only VSchema work is generated from its DDL is named by
+// that DDL alone, the same way the plan shows it.
+func TestDescribeOnboardPlanChangesNamesGeneratedVSchemaChangeByItsDDL(t *testing.T) {
 	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{
 		Changes: []*apitypes.SchemaChangeResponse{
-			{Namespace: "payments", Metadata: map[string]string{
-				apitypes.VSchemaChangedMetadataKey:       "true",
-				apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
-				apitypes.NeedsFinalizerMetadataKey:       "true",
-			}},
+			{
+				Namespace:    "payments",
+				TableChanges: []*apitypes.TableChangeResponse{{TableName: "refund_notes", ChangeType: "create", DDL: "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+				Metadata: map[string]string{
+					apitypes.VSchemaChangedMetadataKey:       "true",
+					apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+					apitypes.NeedsFinalizerMetadataKey:       "true",
+				},
+			},
 		},
 	})
-	assert.Equal(t, []string{"payments: engine finalize requested"}, lines)
+	assert.Equal(t, []string{"payments/refund_notes (create): CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}, lines)
+}
+
+// A keyspace that still plans a table and is finalized afterward is named by
+// its table alone: the finalize is part of that work.
+func TestDescribeOnboardPlanChangesNamesOnlyTheTableOfAFinalizedKeyspace(t *testing.T) {
+	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{
+				Namespace:    "payments",
+				TableChanges: []*apitypes.TableChangeResponse{{TableName: "refund_notes", ChangeType: "create", DDL: "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+				Metadata:     map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"},
+			},
+		},
+	})
+	assert.Equal(t, []string{"payments/refund_notes (create): CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}, lines)
 }
 
 // A leftover schema file for a table that no longer exists in the target is

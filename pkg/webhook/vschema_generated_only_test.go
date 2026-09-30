@@ -23,9 +23,9 @@ func renderStrataPlan(t *testing.T, metadata map[string]string) string {
 
 // A Strata keyspace gains a table without a hand-written VSchema change: the
 // engine generates the table's VSchema entry from its DDL and finalizes the
-// keyspace. The plan comment shows no VSchema section at all, only the DDL and
-// the finalize line, and counts the keyspace as a finalize.
-func TestPlanComment_GeneratedVSchemaChangeShowsOnlyTheFinalize(t *testing.T) {
+// keyspace. The plan comment shows only the DDL: no VSchema section, and no
+// finalize line or count, since the finalize is part of the DDL's work.
+func TestPlanComment_GeneratedVSchemaChangeShowsOnlyTheDDL(t *testing.T) {
 	out := renderStrataPlan(t, map[string]string{
 		apitypes.VSchemaChangedMetadataKey:       "true",
 		apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
@@ -34,8 +34,9 @@ func TestPlanComment_GeneratedVSchemaChangeShowsOnlyTheFinalize(t *testing.T) {
 
 	assert.NotContains(t, out, "VSchema")
 	assert.NotContains(t, out, "diff not available")
-	assert.Contains(t, out, "_Finalized by the engine once every shard's DDL has landed._")
-	assert.Contains(t, out, "📋 **Plan**: **1** table to create, **1** keyspace to finalize\n")
+	assert.NotContains(t, out, "Finalized by the engine")
+	assert.Contains(t, out, "`refund_notes`")
+	assert.Contains(t, out, "📋 **Plan**: **1** table to create\n")
 }
 
 // A VSchema change the engine sent no diff for, and did not mark generated

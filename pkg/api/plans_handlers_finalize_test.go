@@ -48,7 +48,8 @@ func TestPlanSummaryFromStorageCountsFinalizeRequests(t *testing.T) {
 }
 
 // A stored plan whose VSchema change the engine generated entirely from the
-// plan's DDL lists and reads back as a finalize, the way the live plan showed
+// plan's DDL counts under finalize_count rather than as a VSchema change, and
+// reads back without a VSchema change to show, the way the live plan showed
 // it, while still reporting the VSchema change to anything that acts on it.
 func TestStoredPlanShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 	plan := &storage.Plan{
@@ -57,6 +58,7 @@ func TestStoredPlanShowsGeneratedVSchemaChangeAsFinalize(t *testing.T) {
 		DatabaseType:   storage.DatabaseTypeStrata,
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"payments": {
+				Tables:    []storage.TableChange{{Table: "refund_notes", DDL: "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", Operation: "create"}},
 				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaGeneratedOnly: "true"},
 				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {"refund_notes": {}}}`},
 				Finalize:  true,

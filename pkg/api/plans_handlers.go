@@ -245,7 +245,8 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
 			if !nsData.ShowsVSchemaChange() {
 				// Carried so the stored plan renders the namespace the way
-				// the live plan did: as its finalize alone.
+				// the live plan did: by its DDL and finalize, with no VSchema
+				// change of its own.
 				change.Metadata[apitypes.VSchemaGeneratedOnlyMetadataKey] = "true"
 			}
 		}

@@ -187,23 +187,24 @@ const VSchemaGeneratedOnlyMetadataKey = "vschema_generated_only"
 
 // ShowsVSchemaChange reports whether plan surfaces show this namespace's
 // VSchema work as a VSchema change. A change the engine generates entirely
-// from the plan's DDL, with no diff to review, is shown as the finalize that
-// writes it, the same as any other keyspace the engine finalizes after its
-// DDL. It is shown as a VSchema change whenever it records a deletion or
-// mutation, so an unsafe VSchema change is never hidden, and when there is no
-// finalize to show, so the namespace's work never drops out of the plan.
+// from the plan's DDL, with no diff to review, is left to the DDL and the
+// finalize that writes it, the same as any other keyspace the engine
+// finalizes after its DDL. It is shown as a VSchema change whenever it
+// records a deletion or mutation, so an unsafe VSchema change is never
+// hidden, and when there is no finalize to write it, so the namespace's work
+// never drops out of the plan.
 func (sc *SchemaChangeResponse) ShowsVSchemaChange() bool {
 	if !sc.HasVSchemaChange() {
 		return false
 	}
-	return !sc.vschemaChangeShownAsFinalize()
+	return !sc.vschemaChangeGeneratedFromDDL()
 }
 
-// vschemaChangeShownAsFinalize reports whether the engine marked this
+// vschemaChangeGeneratedFromDDL reports whether the engine marked this
 // namespace's VSchema change generated from the DDL, sent no diff and no
 // deletion or mutation record for it, and scheduled the finalize that writes
 // it.
-func (sc *SchemaChangeResponse) vschemaChangeShownAsFinalize() bool {
+func (sc *SchemaChangeResponse) vschemaChangeGeneratedFromDDL() bool {
 	generatedOnly := sc.Metadata[VSchemaGeneratedOnlyMetadataKey] == "true"
 	noDiff := sc.Metadata[VSchemaDiffMetadataKey] == ""
 	noUnsafeRecord := sc.Metadata[VSchemaDeletionsMetadataKey] == "" && sc.Metadata[VSchemaMutationsMetadataKey] == ""

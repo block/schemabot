@@ -76,39 +76,61 @@ func TestWritePlanBody_FinalizeOnlyPlanIsNotClean(t *testing.T) {
 }
 
 // A Strata keyspace changes its VSchema and adds a table, and its engine also
-// asks to finalize it. The CLI hides the VSchema section for this engine, so it
-// shows the finalize line instead, and the keyspace is not rendered as its
-// header and DDL alone. It is counted once, as a VSchema change.
-func TestWritePlanBody_FinalizeLineShowsForAVSchemaChangingKeyspace(t *testing.T) {
+// asks to finalize it. The CLI shows the VSchema change and the DDL, as the PR
+// plan comment does, with no finalize line: the finalize is part of that work.
+func TestWritePlanBody_VSchemaChangingKeyspaceWithDDLShowsTheVSchemaChange(t *testing.T) {
 	plan := &apitypes.PlanResponse{
 		Database: "commerce",
 		Engine:   "strata",
 		Changes: []*apitypes.SchemaChangeResponse{{
 			Namespace:    "payments",
-			TableChanges: []*apitypes.TableChangeResponse{{TableName: "refunds", ChangeType: "create", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "refunds", Namespace: "payments", ChangeType: "create", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
 			Metadata: map[string]string{
 				apitypes.VSchemaChangedMetadataKey: "true",
+				apitypes.VSchemaDiffMetadataKey:    "+  \"refunds\": {\"column_vindexes\": [{\"column\": \"id\", \"name\": \"hash\"}]}",
 				apitypes.NeedsFinalizerMetadataKey: "true",
 			},
 		}},
 	}
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
-	assert.Contains(t, out, "~ Finalized by the engine once every shard's DDL has landed", "%s", out)
+	assert.Contains(t, out, "── payments ──\n\n     ~ VSchema:", "%s", out)
+	assert.Contains(t, out, `"refunds": {"column_vindexes"`, "%s", out)
+	assert.Contains(t, out, "     + refunds", "%s", out)
+	assert.NotContains(t, out, "Finalized by the engine", "%s", out)
 	assert.Contains(t, out, "1 VSchema change", "%s", out)
 	assert.NotContains(t, out, "to finalize", "%s", out)
 }
 
+// A change that names no namespace belongs to the database itself, so a
+// finalize the engine asks for beside that database's DDL is part of the DDL's
+// work: the CLI shows the DDL under the database alone, with no finalize line.
+func TestWritePlanBody_DatabaseLevelFinalizeBesideDDLShowsOnlyTheDDL(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Database: "commerce",
+		Engine:   "strata",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "refunds", ChangeType: "create", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+			Metadata:     map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"},
+		}},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Contains(t, out, "+ refunds", "%s", out)
+	assert.NotContains(t, out, "Finalized by the engine", "%s", out)
+	assert.Contains(t, out, "📋 Plan: 1 table to create\n", "%s", out)
+}
+
 // A Strata keyspace adds a table, and its engine generates the table's VSchema
 // entry from the DDL, so there is no VSchema diff to review. The CLI shows and
-// counts the keyspace as a finalize, as the PR plan comment does (UX-6).
-func TestWritePlanBody_GeneratedVSchemaChangeCountsAsAFinalize(t *testing.T) {
+// counts only the keyspace's DDL, as the PR plan comment does (UX-6).
+func TestWritePlanBody_GeneratedVSchemaChangeShowsOnlyTheDDL(t *testing.T) {
 	plan := &apitypes.PlanResponse{
 		Database: "commerce",
 		Engine:   "strata",
 		Changes: []*apitypes.SchemaChangeResponse{{
 			Namespace:    "payments",
-			TableChanges: []*apitypes.TableChangeResponse{{TableName: "refunds", ChangeType: "create", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "refunds", Namespace: "payments", ChangeType: "create", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}},
 			Metadata: map[string]string{
 				apitypes.VSchemaChangedMetadataKey:       "true",
 				apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
@@ -118,7 +140,8 @@ func TestWritePlanBody_GeneratedVSchemaChangeCountsAsAFinalize(t *testing.T) {
 	}
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
-	assert.Contains(t, out, "~ Finalized by the engine once every shard's DDL has landed", "%s", out)
-	assert.Contains(t, out, "1 table to create, 1 keyspace to finalize", "%s", out)
+	assert.Contains(t, out, "── payments ──\n\n     + refunds", "%s", out)
+	assert.NotContains(t, out, "Finalized by the engine", "%s", out)
+	assert.Contains(t, out, "📋 Plan: 1 table to create\n", "%s", out)
 	assert.NotContains(t, out, "VSchema", "%s", out)
 }

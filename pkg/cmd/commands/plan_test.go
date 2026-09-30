@@ -801,8 +801,8 @@ func TestWritePlanHeaderPostgres(t *testing.T) {
 
 // Two environments plan the same table create in keyspace payments. In one the
 // engine generated the VSchema change from the DDL, and the plan shows only the
-// finalize; in the other the VSchema change has no diff and no marker, and the
-// plan shows a VSchema change. They render differently, so they are not
+// DDL; in the other the VSchema change has no diff and no marker, and the plan
+// shows a VSchema change beside the DDL. They render differently, so they are not
 // deduplicated into one section.
 func TestPlanFingerprint_GeneratedVSchemaChangeDiffersFromAVSchemaChange(t *testing.T) {
 	mk := func(metadata map[string]string) *apitypes.PlanResponse {
@@ -815,4 +815,34 @@ func TestPlanFingerprint_GeneratedVSchemaChangeDiffersFromAVSchemaChange(t *test
 	unmarked := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.NeedsFinalizerMetadataKey: "true"})
 
 	assert.NotEqual(t, planFingerprint(generated), planFingerprint(unmarked))
+}
+
+// Two environments plan the same table create in keyspace payments, and only
+// one engine asks to finalize the keyspace. The finalize is part of the DDL's
+// work, so both render the same and are deduplicated into one section.
+func TestPlanFingerprint_FinalizeBesideDDLRendersTheSame(t *testing.T) {
+	cases := []struct {
+		name            string
+		tableNamespace  string
+		changeNamespace string
+	}{
+		{name: "keyspace", tableNamespace: "payments", changeNamespace: "payments"},
+		// A table with no namespace is listed under the database itself.
+		{name: "database", tableNamespace: "", changeNamespace: "payments"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mk := func(metadata map[string]string) *apitypes.PlanResponse {
+				plan := planWithTables(&apitypes.TableChangeResponse{DDL: "CREATE TABLE refunds (id BIGINT PRIMARY KEY)", ChangeType: "CREATE", TableName: "refunds", Namespace: tc.tableNamespace})
+				plan.Database = "payments"
+				plan.Changes[0].Namespace = tc.changeNamespace
+				plan.Changes[0].Metadata = metadata
+				return plan
+			}
+			finalized := mk(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"})
+			plain := mk(nil)
+
+			assert.Equal(t, planFingerprint(plain), planFingerprint(finalized))
+		})
+	}
 }

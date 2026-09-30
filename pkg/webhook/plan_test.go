@@ -46,7 +46,7 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 
 // An engine's namespace-level metadata reaches the plan comment's keyspace
 // data: the VSchema change and its diff, and the finalize. A VSchema change the
-// engine generates from the DDL and finalizes reads as the finalize alone, and
+// engine generates from the DDL and finalizes carries only the finalize, and
 // a namespace that carries only DDL gets neither.
 func TestSetNamespaceWork_CarriesVSchemaAndFinalizeMetadata(t *testing.T) {
 	var generated templates.KeyspaceChangeData
@@ -75,13 +75,14 @@ func TestSetNamespaceWork_CarriesVSchemaAndFinalizeMetadata(t *testing.T) {
 	assert.Equal(t, templates.KeyspaceChangeData{}, ddlOnly)
 }
 
-// A rollback that drops a table the forward apply created also updates the
-// keyspace's VSchema entries from DDL alone, so the rollback comment shows the
-// keyspace as finalized after its DDL, as the plan comment would.
+// A rollback that recreates a table the forward apply dropped also updates the
+// keyspace's VSchema entries from the DDL alone, so the rollback comment
+// carries the keyspace's DDL and finalize with no VSchema change, as the plan
+// comment would.
 func TestRollbackKeyspaceChanges_CarriesNamespaceWork(t *testing.T) {
 	got := rollbackKeyspaceChanges([]*apitypes.SchemaChangeResponse{{
 		Namespace:    "payments_001",
-		TableChanges: []*apitypes.TableChangeResponse{{TableName: "refund_notes", DDL: "DROP TABLE `refund_notes`", ChangeType: "DROP"}},
+		TableChanges: []*apitypes.TableChangeResponse{{TableName: "refund_notes", DDL: refundNotesDDL, ChangeType: "CREATE"}},
 		Metadata: map[string]string{
 			apitypes.VSchemaChangedMetadataKey:       "true",
 			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
@@ -90,7 +91,7 @@ func TestRollbackKeyspaceChanges_CarriesNamespaceWork(t *testing.T) {
 	}})
 	assert.Equal(t, []templates.KeyspaceChangeData{{
 		Keyspace:   "payments_001",
-		Statements: []string{"DROP TABLE `refund_notes`"},
+		Statements: []string{refundNotesDDL},
 		Finalize:   true,
 	}}, got)
 }

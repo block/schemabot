@@ -942,9 +942,11 @@ or blocked. Namespace-level work is counted separately:
 `finalize_count` is how many namespaces the engine asked to finalize once
 their DDL lands. A namespace whose VSchema change the engine generates
 entirely from the plan's DDL has nothing to review, so it counts under
-`finalize_count` alone. A plan with no changes omits every count; a plan whose only
-work is a finalize carries `finalize_count` alone, and `list-plans` renders
-it as `1 finalize` rather than `no changes`. The repository, PR, and
+`finalize_count` alone. A plan with no changes omits every count; a plan
+whose only work is a finalize carries `finalize_count` alone, and
+`list-plans` renders it as `1 finalize` rather than `no changes`. A finalize
+is implied by the table and VSchema changes beside it, so `list-plans` lists
+finalizes only for a plan that has neither. The repository, PR, and
 head SHA it was planned from appear when the plan came from a PR (an ad-hoc
 CLI plan has none, and older plans may lack the SHA); `deployment` names the
 primary deployment the plan was computed against, when one was recorded.
@@ -981,8 +983,8 @@ as its own `group_finalizer` operation of the apply, so a namespace can carry
 the marker with no table changes at all, and such a plan still has work to
 apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
 engine generates the namespace's whole VSchema change from the plan's DDL, so
-there is no VSchema diff to review; plans show such a namespace as its
-finalize.
+there is no VSchema diff to review; plans show such a namespace by its DDL
+alone.
 
 <details>
 <summary>Stored plan whose only work is a finalize</summary>
