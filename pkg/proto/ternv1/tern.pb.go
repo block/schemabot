@@ -1280,22 +1280,29 @@ func (x *PlanRequest) GetDirectExecution() *DirectExecutionPolicy {
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
-// to run verbatim as native DDL, bounded by the target table's size. Engines
-// that do not implement direct execution ignore it.
+// to run verbatim as native DDL, bounded by the target table's size in rows
+// or in bytes. Engines that do not implement direct execution
+// ignore it.
 type DirectExecutionPolicy struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Whether refused statements may run directly at all.
 	Enabled bool `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
-	// The fail-closed size bound: a refused statement runs directly only when
-	// the target table is at or below this row count. Required (positive) when
-	// enabled — a grant carrying no bound is refused, never treated as
-	// unbounded — and a table whose size cannot be measured is blocked.
+	// A size bound on the target table's row count; zero states no row bound.
+	// An enabled policy carries exactly one of this bound and max_table_bytes —
+	// a grant carrying no bound is refused, never treated as unbounded — and a
+	// table whose size cannot be measured is blocked. A negative value is an
+	// unusable bound, which the engine refuses.
 	MaxTableRows int64 `protobuf:"varint,2,opt,name=max_table_rows,json=maxTableRows,proto3" json:"max_table_rows,omitempty"`
 	// How long each direct statement waits to acquire its locks before failing
 	// with a retryable busy-table error. Zero leaves the engine's own default.
 	LockAcquisitionTimeoutSeconds int64 `protobuf:"varint,3,opt,name=lock_acquisition_timeout_seconds,json=lockAcquisitionTimeoutSeconds,proto3" json:"lock_acquisition_timeout_seconds,omitempty"`
-	unknownFields                 protoimpl.UnknownFields
-	sizeCache                     protoimpl.SizeCache
+	// A size bound on the target table's data plus index footprint, in bytes;
+	// zero states no byte bound. A refused statement runs directly when the
+	// table is within the policy's bound. A negative value is an unusable
+	// bound, which the engine refuses.
+	MaxTableBytes int64 `protobuf:"varint,4,opt,name=max_table_bytes,json=maxTableBytes,proto3" json:"max_table_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DirectExecutionPolicy) Reset() {
@@ -1349,6 +1356,13 @@ func (x *DirectExecutionPolicy) GetLockAcquisitionTimeoutSeconds() int64 {
 	return 0
 }
 
+func (x *DirectExecutionPolicy) GetMaxTableBytes() int64 {
+	if x != nil {
+		return x.MaxTableBytes
+	}
+	return 0
+}
+
 // TableChange represents a DDL change to a table.
 type TableChange struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
@@ -1368,9 +1382,27 @@ type TableChange struct {
 	// the namespace's persisted VSchema change-metadata here so a deployment
 	// that materializes the plan from a dispatch request runs the same
 	// apply-time safety gates as one reading its own stored plan.
-	Metadata      map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Metadata map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Approximate number of rows in the table at plan time, for display only.
+	// Sourced from engine statistics (e.g. information_schema TABLE_ROWS), which
+	// may be stale — never treat it as an exact count or use it as a gate input.
+	// For sharded targets this is the sum across shards. Unset when no estimate
+	// is available (e.g. the table is being created, or statistics could not be
+	// read).
+	EstimatedRows *int64 `protobuf:"varint,10,opt,name=estimated_rows,json=estimatedRows,proto3,oneof" json:"estimated_rows,omitempty"`
+	// Number of shards this table change spans. Zero when the target is not
+	// sharded or the shard topology is unknown.
+	ShardCount int32 `protobuf:"varint,11,opt,name=shard_count,json=shardCount,proto3" json:"shard_count,omitempty"`
+	// Approximate row count of the largest single shard — the biggest chunk a
+	// shard-at-a-time apply works through at once. Unset when the target is not
+	// sharded or no estimate is available. Approximate like estimated_rows.
+	LargestShardRows *int64 `protobuf:"varint,12,opt,name=largest_shard_rows,json=largestShardRows,proto3,oneof" json:"largest_shard_rows,omitempty"`
+	// Approximate on-disk footprint of the table (data plus indexes), summed
+	// across shards for sharded targets. Unset when no estimate was available.
+	// Approximate like estimated_rows.
+	EstimatedBytes *int64 `protobuf:"varint,13,opt,name=estimated_bytes,json=estimatedBytes,proto3,oneof" json:"estimated_bytes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TableChange) Reset() {
@@ -1464,6 +1496,34 @@ func (x *TableChange) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *TableChange) GetEstimatedRows() int64 {
+	if x != nil && x.EstimatedRows != nil {
+		return *x.EstimatedRows
+	}
+	return 0
+}
+
+func (x *TableChange) GetShardCount() int32 {
+	if x != nil {
+		return x.ShardCount
+	}
+	return 0
+}
+
+func (x *TableChange) GetLargestShardRows() int64 {
+	if x != nil && x.LargestShardRows != nil {
+		return *x.LargestShardRows
+	}
+	return 0
+}
+
+func (x *TableChange) GetEstimatedBytes() int64 {
+	if x != nil && x.EstimatedBytes != nil {
+		return *x.EstimatedBytes
+	}
+	return 0
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -4761,11 +4821,12 @@ const file_tern_proto_rawDesc = "" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
-	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xa0\x01\n" +
+	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xc8\x01\n" +
 	"\x15DirectExecutionPolicy\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12$\n" +
 	"\x0emax_table_rows\x18\x02 \x01(\x03R\fmaxTableRows\x12G\n" +
-	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\"\x99\x03\n" +
+	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\x12&\n" +
+	"\x0fmax_table_bytes\x18\x04 \x01(\x03R\rmaxTableBytes\"\x85\x05\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -4778,10 +4839,19 @@ const file_tern_proto_rawDesc = "" +
 	"\x0eexecution_mode\x18\a \x01(\tR\rexecutionMode\x12\x1f\n" +
 	"\vmode_reason\x18\b \x01(\tR\n" +
 	"modeReason\x12>\n" +
-	"\bmetadata\x18\t \x03(\v2\".tern.v1.TableChange.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\t \x03(\v2\".tern.v1.TableChange.MetadataEntryR\bmetadata\x12*\n" +
+	"\x0eestimated_rows\x18\n" +
+	" \x01(\x03H\x00R\restimatedRows\x88\x01\x01\x12\x1f\n" +
+	"\vshard_count\x18\v \x01(\x05R\n" +
+	"shardCount\x121\n" +
+	"\x12largest_shard_rows\x18\f \x01(\x03H\x01R\x10largestShardRows\x88\x01\x01\x12,\n" +
+	"\x0festimated_bytes\x18\r \x01(\x03H\x02R\x0eestimatedBytes\x88\x01\x01\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb0\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x11\n" +
+	"\x0f_estimated_rowsB\x15\n" +
+	"\x13_largest_shard_rowsB\x12\n" +
+	"\x10_estimated_bytes\"\xb0\x03\n" +
 	"\fSchemaChange\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x129\n" +
 	"\rtable_changes\x18\x02 \x03(\v2\x14.tern.v1.TableChangeR\ftableChanges\x12?\n" +
@@ -5307,6 +5377,7 @@ func file_tern_proto_init() {
 		return
 	}
 	file_tern_proto_msgTypes[9].OneofWrappers = []any{}
+	file_tern_proto_msgTypes[11].OneofWrappers = []any{}
 	file_tern_proto_msgTypes[24].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

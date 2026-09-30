@@ -26,12 +26,16 @@ import (
 // write-thread autoscaler grow above its starting value.
 const maxCommitLatency = 100 * time.Millisecond
 
-// classifyRunnerError marks runner failures that reproduce after every
-// completed checksum attempt as permanent so operator retries are not spent
-// repeating a lossy schema change. Attempts that errored before establishing
-// row differences remain retryable.
+// classifyRunnerError marks runner failures that are verdicts about the data
+// as permanent, so operator retries are not spent repeating a lossy schema
+// change: the snapshot checksum found row differences on every completed
+// attempt, or the lockless checksum proved a divergence the copy cannot heal.
+// Attempts that errored before establishing row differences remain retryable,
+// and so does the lockless checksum's pass budget running out: that verdict
+// proves no divergence, only that ranges were still changing too fast to
+// verify, which a later attempt against a quieter table can resolve.
 func classifyRunnerError(err error) error {
-	if errors.Is(err, checksum.ErrDifferencesExhausted) {
+	if errors.Is(err, checksum.ErrDifferencesExhausted) || errors.Is(err, checksum.ErrPermanentDivergence) {
 		return &engine.PermanentError{Err: err}
 	}
 	return err
@@ -463,7 +467,9 @@ func (e *Engine) setSchemaChangeCompleted() {
 
 // setSchemaChangeFailed sets the state to failed with a reason an operator can
 // read. Every caller has already logged err with the target identifiers, so the
-// detail this drops is still available where it is safe to keep it.
+// detail this drops is still available where it is safe to keep it. An err
+// classified permanent (see classifyRunnerError) is recorded as such, so
+// progress tells the drive a retry would only repeat the same failure.
 func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -471,6 +477,7 @@ func (e *Engine) setSchemaChangeFailed(err error) {
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
 			e.runningSchemaChange.errorMessage = failureReason(err)
+			e.runningSchemaChange.permanentFailure = !engine.IsRetryable(err)
 		}
 	}
 }

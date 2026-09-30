@@ -23,7 +23,7 @@ func TestFormatApplyStatusComment_RendersStoredStatementPosition(t *testing.T) {
 		ProgressMetadata: `{"step":"2","steps_total":"3","statement":"CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)"}`,
 	}}
 
-	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 1)
 	assert.Equal(t, apitypes.ProgressStep{Step: 2, StepsTotal: 3, Statement: "CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)"}, displayByOp[1].Step)
 
@@ -41,7 +41,7 @@ func TestFormatApplyStatusComment_RendersStatementPositionPerDeployment(t *testi
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
 
-	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 1)
 	assert.NotContains(t, displayByOp, int64(2))
 
@@ -65,7 +65,7 @@ func TestFormatApplyStatusComment_RendersStoredBuildWork(t *testing.T) {
 			`"blocks_done":"10000","blocks_total":"10000","tuples_done":"12000","tuples_total":"50000","lockers_done":"0","lockers_total":"0"}`,
 	}}
 
-	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 1)
 	assert.Equal(t, apitypes.BuildWork{
 		Operation: "concurrent-index-build", ServerPhase: "building index: loading tuples in tree",
@@ -90,7 +90,7 @@ func TestFormatApplyStatusComment_RendersBuildWorkPerDeployment(t *testing.T) {
 				`"executor_operation":"concurrent-index-build","server_phase":"building index: scanning table","blocks_done":"1","blocks_total":"4"}`},
 	}
 
-	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 2)
 
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
@@ -105,7 +105,7 @@ func TestFormatApplyStatusComment_KeepsPositionWhenBuildWorkIsMalformed(t *testi
 	ops := []*storage.ApplyOperation{{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running,
 		ProgressMetadata: `{"step":"2","steps_total":"3","statement":"CREATE INDEX CONCURRENTLY idx ON t (c)","executor_operation":"concurrent-index-build","blocks_done":"many"}`}}
 
-	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 1)
 	assert.Equal(t, apitypes.BuildWork{}, displayByOp[1].BuildWork)
 
@@ -127,7 +127,7 @@ func TestFormatApplyStatusComment_OmitsUnreadableStatementPosition(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			ops := []*storage.ApplyOperation{{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running, ProgressMetadata: metadata}}
 
-			displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+			displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 			assert.Empty(t, displayByOp)
 
 			out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")

@@ -1,11 +1,13 @@
 package templates
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -716,4 +718,281 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 	})
 	assert.NotContains(t, cutover, "\n## Injected")
 	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
+
+	// The stop footer names the member whose section it closes, in prose ahead
+	// of the command an operator is about to paste.
+	footer := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders_eu", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+			{Database: "orders_us", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+	assert.NotContains(t, footer, "\n## Injected")
+	assert.Contains(t, footer, rolloutScopeLine+", not just `` us` ## Injected [click](https://example.invalid) ``.")
+}
+
+// rolloutScopeLine opens the sentence a member's footer carries when the
+// apply fans out across several members.
+const rolloutScopeLine = "This command addresses the whole rollout"
+
+// Control commands address the apply, not one member of it, and the CLI offers
+// no way to narrow them. A member's section therefore says how far its stop
+// command reaches, ahead of the command rather than after it, so an operator
+// who copies the command from one target's section has already read that it
+// stops every target.
+func TestRenderMultiDeploymentApplyComment_StopFooterNamesTheWholeRollout(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		memberOp("primary", "testapp-001", so.Running),
+		memberOp("primary", "testapp-002", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "testapp_001", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+			{Database: "testapp_002", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+
+	assert.Contains(t, out, "---\n\n"+rolloutScopeLine+", not just `primary/testapp-001`.\n\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```")
+	assert.Contains(t, out, "---\n\n"+rolloutScopeLine+", not just `primary/testapp-002`.\n\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```")
+}
+
+// On an engine whose control command is cancel, the sentence qualifies the
+// cancel command the same way.
+func TestRenderMultiDeploymentApplyComment_CancelFooterNamesTheWholeRollout(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EnginePlanetScale},
+			{Database: "orders_eu", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EnginePlanetScale},
+		},
+	})
+
+	assert.Contains(t, out, rolloutScopeLine+", not just `primary`.\n\nTo cancel this schema change:\n```\nschemabot cancel apply-123 -e production\n```")
+}
+
+// A stopped rollout's terminal summary renders each member's section through
+// the summary renderer, and its resume command is apply-wide too.
+func TestRenderMultiDeploymentApplySummaryComment_ResumeFooterNamesTheWholeRollout(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("us", so.Stopped),
+		rollingOp("eu", so.Stopped),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders_us", State: state.Apply.Stopped, ApplyID: "apply-123", Environment: "production"},
+			{Database: "orders_eu", State: state.Apply.Stopped, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+
+	assert.Contains(t, out, rolloutScopeLine+", not just `us`.\n\nPaused — to resume from where it stopped:\n```\nschemabot start apply-123 -e production\n```")
+	assert.Contains(t, out, rolloutScopeLine+", not just `eu`.\n\nPaused — to resume from where it stopped:")
+}
+
+// Every command a member's footer offers addresses the whole apply, in every
+// state and on every engine, including states added after this test: none takes
+// a member selector. So wherever a member's section prints a command, the scope
+// sentence is in the same footer ahead of it, worded for how many commands the
+// footer offers. Cutover is the exception: one cutover lands on one member, so
+// its footer must not claim the whole rollout.
+func TestMemberFooterCommandsStateRolloutScope(t *testing.T) {
+	for _, field := range reflect.ValueOf(state.Apply).Fields() {
+		applyState := field.String()
+		for _, engine := range []string{storage.EngineSpirit, storage.EnginePlanetScale} {
+			data := ApplyStatusCommentData{
+				Database:      "orders_us",
+				State:         applyState,
+				ApplyID:       "apply-123",
+				Environment:   "production",
+				Engine:        engine,
+				DeferCutover:  true,
+				RolloutWide:   true,
+				RolloutMember: "us",
+			}
+			// The retrying-table variant of an active state has its own
+			// footer label.
+			retrying := data
+			retrying.Tables = []TableProgressData{{TableName: "users", Status: state.Apply.FailedRetryable}}
+			renders := map[string]string{
+				"status":          RenderApplyStatusComment(data),
+				"status/retrying": RenderApplyStatusComment(retrying),
+				"summary":         RenderApplySummaryComment(data),
+			}
+			for surface, out := range renders {
+				t.Run(applyState+"/"+engine+"/"+surface, func(t *testing.T) {
+					assertEveryCommandCarriesScope(t, out, "us")
+				})
+			}
+		}
+	}
+}
+
+// assertEveryCommandCarriesScope checks that each schemabot command block in
+// out sits in a footer whose scope sentence names member and is worded for the
+// footer's number of commands, and that each cutover command sits in a footer
+// without one.
+func assertEveryCommandCarriesScope(t *testing.T, out, member string) {
+	t.Helper()
+	const command = "```\nschemabot "
+	for at := 0; ; {
+		i := strings.Index(out[at:], command)
+		if i < 0 {
+			return
+		}
+		i += at
+		footerStart := strings.LastIndex(out[:i], "\n---\n")
+		require.GreaterOrEqual(t, footerStart, 0, "a command renders outside any footer:\n%s", out)
+		footer := out[footerStart+len("\n---\n"):]
+		if next := strings.Index(footer, "\n---\n"); next >= 0 {
+			footer = footer[:next]
+		}
+		if strings.HasPrefix(out[i+len(command):], "cutover ") {
+			assert.NotContains(t, out[footerStart:i], "addresses the whole rollout", "a cutover command claims the whole rollout:\n%s", out)
+		} else {
+			subject := "This command"
+			if strings.Count(footer, command) > 1 {
+				subject = "Each command below"
+			}
+			scope := subject + " addresses the whole rollout, not just " + inlineCode(member) + ".\n\n"
+			assert.Contains(t, out[footerStart:i], scope, "a command renders without a scope sentence matching its footer:\n%s", out)
+		}
+		at = i + len(command)
+	}
+}
+
+// A single-deployment apply has nothing for the command to reach past, so the
+// scope sentence would only add words to the one section that exists.
+func TestRenderMultiDeploymentApplyComment_SoleMemberHasNoRolloutScopeLine(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{rollingOp("primary", so.Running)})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production"},
+		},
+	})
+
+	assert.Contains(t, out, "To stop this schema change:")
+	assert.NotContains(t, out, rolloutScopeLine)
+}
+
+// A member that reaches the renderer without a name still gets the sentence:
+// whether it renders depends on the rollout having several members, not on
+// the name that qualifies it.
+func TestRenderApplyStatusComment_UnnamedRolloutMemberKeepsScopeLine(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "orders",
+		State:       state.Apply.Running,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		RolloutWide: true,
+	})
+
+	assert.Contains(t, out, rolloutScopeLine+".\n\nTo stop this schema change:")
+}
+
+// The single-deployment comment is rendered by the same footer code and is not
+// part of a rollout, so it keeps the unqualified command it has always shown.
+func TestRenderApplyStatusComment_NoRolloutScopeLine(t *testing.T) {
+	out := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "orders",
+		State:       state.Apply.Running,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.Contains(t, out, "To stop this schema change:")
+	assert.NotContains(t, out, rolloutScopeLine)
+}
+
+// When the round produced more than one plan, each member's section names the
+// one it runs, beside the database and apply identifiers it already carries, so
+// a running member can be tied back to the block that was reviewed.
+func TestRenderMultiDeploymentApplyComment_MemberSectionNamesItsPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Running, PlanID: "plan_reviewed"},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Pending, PlanID: "plan_3344"},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Plan**: `plan_3344`\n")
+	assertRolloutHeaderNotRepeated(t, out)
+}
+
+// assertRolloutHeaderNotRepeated checks that the apply ID and who applied it
+// appear once, in the rollout header, and not again in each member's section.
+func assertRolloutHeaderNotRepeated(t *testing.T, out string) {
+	t.Helper()
+	assert.Equal(t, 1, strings.Count(out, "**Apply ID**"), "only the rollout header names the apply")
+	assert.NotContains(t, out, "_Apply ID:", "no member section names the apply again")
+	assert.Equal(t, 1, strings.Count(out, "*Started at")+strings.Count(out, "*Applied by"), "only the rollout header says who applied it")
+}
+
+// A rollout whose members all run the same plan names none of them: the
+// identifier would be identical under every member and name nothing.
+func TestRenderMultiDeploymentApplyComment_ConvergedRolloutNamesNoPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Running),
+		rollingOp("eu-west", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Running},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders`\n")
+	assert.NotContains(t, out, "**Plan**:")
+	assertRolloutHeaderNotRepeated(t, out)
+}
+
+// The terminal summary names it too, on every member: which plan a failed member
+// ran is the first thing triage needs, and for every member it is the record
+// that ties the outcome back to a reviewed block.
+func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("primary", so.Completed),
+		rollingOp("eu-west", so.Failed),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-7f3a",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders", ApplyID: "apply-7f3a", State: state.Apply.Completed, PlanID: "plan_reviewed"},
+			{Database: "orders_eu", ApplyID: "apply-7f3a", State: state.Apply.Failed, PlanID: "plan_3344"},
+		},
+	})
+
+	assert.Contains(t, out, "**Database**: `orders_eu` | **Plan**: `plan_3344`\n")
+	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
+	assertRolloutHeaderNotRepeated(t, out)
 }

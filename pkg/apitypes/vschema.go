@@ -154,9 +154,75 @@ func (sc *SchemaChangeResponse) VSchemaUnsafeChanges() []UnsafeChange {
 	return result
 }
 
+// HasVSchemaWork reports whether a plan change's metadata records VSchema work.
+//
+// Either key alone means work, because they are two annotations of the same
+// thing: an engine records a rendered diff when it has one and the flag when the
+// work is known without one.
+//
+// Review reads the annotations here: the surface that renders a namespace's
+// work, the comparison that judges it, the grouping key derived from that
+// comparison, and the count of members with work that the check reads cannot
+// come to different answers about the same change. Storage and
+// apply still test the flag directly, which agrees with this for every plan an
+// engine produces today, since an engine that records a diff records the flag
+// with it. An engine that recorded only the diff would be described as changing
+// its VSchema and persisted as not changing it, so widening those callers is
+// what keeps the two halves from splitting.
+func HasVSchemaWork(metadata map[string]string) bool {
+	return metadata[VSchemaDiffMetadataKey] != "" || metadata[VSchemaChangedMetadataKey] == "true"
+}
+
 // HasVSchemaChange reports whether this namespace's change carries VSchema work.
 func (sc *SchemaChangeResponse) HasVSchemaChange() bool {
-	return sc.Metadata[VSchemaDiffMetadataKey] != "" || sc.Metadata[VSchemaChangedMetadataKey] == "true"
+	return HasVSchemaWork(sc.Metadata)
+}
+
+// VSchemaGeneratedOnlyMetadataKey is the plan change-metadata key ("true")
+// under which an engine says a namespace's VSchema change is made up entirely
+// of what the engine generates from the plan's DDL, so it has no hand-written
+// diff to show. It mirrors engine.MetadataVSchemaGeneratedOnly; apitypes keeps
+// its own copy so this package stays dependency-free.
+const VSchemaGeneratedOnlyMetadataKey = "vschema_generated_only"
+
+// ShowsVSchemaChange reports whether plan surfaces show this namespace's
+// VSchema work as a VSchema change. A change the engine generates entirely
+// from the plan's DDL, with no diff to review, is left to the DDL and the
+// finalize that writes it, the same as any other keyspace the engine
+// finalizes after its DDL. It is shown as a VSchema change whenever it
+// records a deletion or mutation, so an unsafe VSchema change is never
+// hidden, and when there is no finalize to write it, so the namespace's work
+// never drops out of the plan.
+func (sc *SchemaChangeResponse) ShowsVSchemaChange() bool {
+	if !sc.HasVSchemaChange() {
+		return false
+	}
+	return !sc.vschemaChangeGeneratedFromDDL()
+}
+
+// vschemaChangeGeneratedFromDDL reports whether the engine marked this
+// namespace's VSchema change generated from the DDL, sent no diff and no
+// deletion or mutation record for it, and scheduled the finalize that writes
+// it.
+func (sc *SchemaChangeResponse) vschemaChangeGeneratedFromDDL() bool {
+	generatedOnly := sc.Metadata[VSchemaGeneratedOnlyMetadataKey] == "true"
+	noDiff := sc.Metadata[VSchemaDiffMetadataKey] == ""
+	noUnsafeRecord := sc.Metadata[VSchemaDeletionsMetadataKey] == "" && sc.Metadata[VSchemaMutationsMetadataKey] == ""
+	return generatedOnly && noDiff && noUnsafeRecord && sc.NeedsFinalizer()
+}
+
+// NeedsFinalizerMetadataKey is the plan change-metadata key ("true") under
+// which an engine asks for a namespace's group finalizer to run once its DDL
+// lands, independent of a VSchema change. It mirrors
+// engine.MetadataNeedsFinalizer; apitypes keeps its own copy so this package
+// stays dependency-free.
+const NeedsFinalizerMetadataKey = "needs_finalizer"
+
+// NeedsFinalizer reports whether the engine asked for this namespace to be
+// finalized after its DDL. The finalizer is work an apply runs, so a plan whose
+// only work is a finalizer still has changes.
+func (sc *SchemaChangeResponse) NeedsFinalizer() bool {
+	return sc.Metadata[NeedsFinalizerMetadataKey] == "true"
 }
 
 // VSchemaChange is one keyspace's VSchema application state for display. Each

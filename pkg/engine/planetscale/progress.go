@@ -632,7 +632,7 @@ func failedShard(rows []vitessMigrationRow) (vitessMigrationRow, bool) {
 }
 
 // showVitessMigrationsForKeyspace connects to vtgate and runs
-// SHOW VITESS_MIGRATIONS LIKE '<context>' for a single keyspace.
+// SHOW VITESS_MIGRATIONS FROM `<keyspace>` LIKE '<context>' for a single keyspace.
 // If migrationContext is empty, returns all migrations.
 func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keyspace, migrationContext string) ([]vitessMigrationRow, error) {
 	if migrationContext != "" {
@@ -646,23 +646,10 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		return nil, fmt.Errorf("get vtgate connection for keyspace %s: %w", keyspace, err)
 	}
 
-	conn, err := db.Conn(ctx)
+	query := showVitessMigrationsQuery(keyspace, migrationContext)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("get connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	if _, err := conn.ExecContext(ctx, "USE `"+keyspace+"`"); err != nil {
-		return nil, fmt.Errorf("use keyspace %s: %w", keyspace, err)
-	}
-
-	query := "SHOW VITESS_MIGRATIONS"
-	if migrationContext != "" {
-		query += " LIKE '" + migrationContext + "'"
-	}
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("show vitess_migrations: %w", err)
+		return nil, fmt.Errorf("show vitess_migrations for keyspace %s: %w", keyspace, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -738,6 +725,20 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+// showVitessMigrationsQuery builds the SHOW VITESS_MIGRATIONS statement for one
+// keyspace. The keyspace is named in the statement rather than selected with
+// USE, so the query leaves no session state on the pooled vtgate connection:
+// the pool is shared with other readers, and a connection handed back still
+// switched to this keyspace would silently point the next reader at the wrong
+// keyspace. migrationContext must already have passed validateMigrationContext.
+func showVitessMigrationsQuery(keyspace, migrationContext string) string {
+	query := "SHOW VITESS_MIGRATIONS FROM `" + strings.ReplaceAll(keyspace, "`", "``") + "`"
+	if migrationContext != "" {
+		query += " LIKE '" + migrationContext + "'"
+	}
+	return query
 }
 
 // validateMigrationContext rejects migration context strings containing unsafe characters.

@@ -362,7 +362,9 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 	}
-	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier)
+	if err := c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier); err != nil {
+		return true, err
+	}
 	return true, ctx.Err()
 }
 
@@ -414,6 +416,10 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		}
 		if action == taskStopped {
 			stoppedByUser = true
+			break
+		}
+		if action == taskAlreadyFailed {
+			failedTask = task
 			break
 		}
 		if action == taskSkip {
@@ -509,7 +515,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	}
 
 	// Update apply state based on task outcomes
-	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
+	if err := c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser); err != nil {
+		return fmt.Errorf("finalize sequential resume: %w", err)
+	}
 	logger.Info("sequential resume finished", "state", apply.State)
 	return nil
 }
@@ -1049,40 +1057,53 @@ func sameApplyOperation(a, b *int64) bool {
 
 // prepareRetryableTasksForResume queues only the task work that previously
 // stopped on a retryable engine failure. Completed tasks remain completed, and
-// pending tasks remain queued behind the retried work.
-func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+// pending tasks remain queued behind the retried work. A requeue write that
+// does not land is returned: the task row is still failed_retryable, so driving
+// on would run its DDL while storage records it at rest. The caller exits the
+// drive with the apply still retryable, and the next claim retries the requeue.
+func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		return
+		return nil
 	}
 	apply.ErrorMessage = ""
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue
 		}
+		previous := *task
 		task.Attempt++
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
+			*task = previous
+			return fmt.Errorf("requeue retryable task %s for retry of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 // prepareStoppedTasksForResume turns an operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a driver crash can still be
 // recovered by another operator driver.
-func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) error {
 	if !startRequested {
-		return
+		return nil
 	}
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
+		previous := *task
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
+			*task = previous
+			return fmt.Errorf("requeue stopped task %s for start of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
@@ -1236,6 +1257,10 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already terminal on resume (final schema check shows no remaining changes)", oldApplyState, terminalState)
+		// A previous drive can have settled every task and exited before it
+		// recorded the apply's outcome, leaving requests the outcome moots
+		// pending. Settle them before the summary posts.
+		c.settleRequestsForStoredOutcome(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply)
 		c.notifyTerminalObserver(apply, allTasks)
 		return nil
 	}
@@ -1326,8 +1351,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		// heartbeats the operation row instead.
 		stopHeartbeat := c.startParentApplyHeartbeat(pollCtx, apply, suppressParent, cancelPoll)
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
-		return nil
+		return c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 	}
 
 	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
@@ -1342,7 +1366,9 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		defer cancelResume()
 		defer stopHeartbeat()
 		defer stopEngineLogging()
-		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+		if err := c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier); err != nil {
+			c.logger.Warn("detached grouped drive exited with an error", append(apply.MutableLogAttrs(), "error", err)...)
+		}
 	}()
 	return nil
 }
@@ -1782,7 +1808,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("resolve credentials for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 
-	c.logger.Info("driving group_finalizer VSchema apply",
+	work := finalizerWork(changes)
+	c.logger.Info("driving group_finalizer",
+		"work", work,
 		"apply_id", apply.ApplyIdentifier,
 		"apply_operation_id", op.ID,
 		"deployment", op.Deployment,
@@ -1842,10 +1870,10 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		OnStateChange: persistResume,
 	})
 	if err != nil {
-		return failClosed(fmt.Errorf("apply VSchema for group_finalizer (apply %s): %w", apply.ApplyIdentifier, err))
+		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 	}
 	if result == nil || !result.Accepted {
-		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s was not accepted", apply.ApplyIdentifier))
+		return failClosed(fmt.Errorf("group_finalizer %s for apply %s was not accepted", work, apply.ApplyIdentifier))
 	}
 
 	// A nil resume state means the engine has no in-flight work to track: the
@@ -1857,46 +1885,82 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		persistResume(result.ResumeState)
 		finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, result.ResumeState, persistResume)
 		if err != nil {
-			return failClosed(fmt.Errorf("await group_finalizer VSchema apply (apply %s): %w", apply.ApplyIdentifier, err))
+			return failClosed(fmt.Errorf("await group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 		}
 		if !finalizerVSchemaApplied(finalState) {
-			return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s ended in non-success state %q", apply.ApplyIdentifier, finalState))
+			return failClosed(fmt.Errorf("group_finalizer %s for apply %s ended in non-success state %q", work, apply.ApplyIdentifier, finalState))
 		}
 	}
 	if err := c.storage.ApplyOperations().MarkCompleted(ctx, op.ID); err != nil {
 		return fmt.Errorf("mark group_finalizer apply_operation %d completed (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
-	c.logger.Info("group_finalizer VSchema apply completed",
-		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
+	c.logger.Info("group_finalizer completed",
+		"work", work, "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
 	return nil
 }
 
-// finalizerVSchemaChanges reconstructs the VSchema change(s) a group_finalizer
-// applies, from the plan. A namespace-scoped finalizer (operation key
-// "<ns>/group_finalizer", from a sharded fan-out) applies that one namespace's
-// VSchema. A finalizer with no namespace in its key (a non-sharded VSchema-only
-// apply on an externally-authoritative engine) applies every VSchema-changed
-// namespace in the plan, because that engine deploys the whole branch in one
-// operation.
+// finalizerVSchemaChanges reconstructs the change(s) a group_finalizer applies,
+// from the plan. A namespace-scoped finalizer (operation key
+// "<ns>/group_finalizer", from a sharded fan-out) finalizes that one namespace.
+// A finalizer with no namespace in its key (a finalizer-only apply) finalizes
+// every namespace in the plan that needs it, because an externally-authoritative
+// engine deploys the whole branch in one operation.
+//
+// Each change says what the finalizer is for: vschema_changed when the
+// namespace's VSchema document changes, and needs_finalizer when the engine
+// asked to finalize the namespace. A namespace the engine asked to finalize
+// whose VSchema is unchanged carries only needs_finalizer, so the engine
+// finalizes it without being told to apply a VSchema it does not have.
 func finalizerVSchemaChanges(plan *storage.Plan, namespace string) ([]engine.SchemaChange, error) {
-	vschemaChange := func(ns string) engine.SchemaChange {
-		return engine.SchemaChange{Namespace: ns, Metadata: map[string]string{"vschema_changed": "true"}}
+	finalizerChange := func(ns string) engine.SchemaChange {
+		nsData := plan.Namespaces[ns]
+		metadata := map[string]string{}
+		if nsData.ChangesVSchema() {
+			metadata[storage.PlanMetadataVSchemaChanged] = "true"
+		}
+		if nsData.Finalize {
+			metadata[engine.MetadataNeedsFinalizer] = "true"
+		}
+		return engine.SchemaChange{Namespace: ns, Metadata: metadata}
 	}
 	if namespace != "" {
-		if !plan.Namespaces[namespace].ChangesVSchema() {
-			return nil, fmt.Errorf("plan %d has no VSchema artifact for namespace %q", plan.ID, namespace)
+		if !plan.Namespaces[namespace].NeedsFinalizer() {
+			return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for namespace %q", plan.ID, namespace)
 		}
-		return []engine.SchemaChange{vschemaChange(namespace)}, nil
+		return []engine.SchemaChange{finalizerChange(namespace)}, nil
 	}
-	namespaces := plan.VSchemaNamespaces()
+	namespaces := plan.FinalizerNamespaces()
 	if len(namespaces) == 0 {
-		return nil, fmt.Errorf("plan %d has no VSchema artifact for a deployment-scoped finalizer", plan.ID)
+		return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for a deployment-scoped finalizer", plan.ID)
 	}
 	changes := make([]engine.SchemaChange, 0, len(namespaces))
 	for _, ns := range namespaces {
-		changes = append(changes, vschemaChange(ns))
+		changes = append(changes, finalizerChange(ns))
 	}
 	return changes, nil
+}
+
+// finalizerWork names what a group_finalizer's changes ask the engine to do,
+// for its logs and errors: apply a changed VSchema, finalize a namespace whose
+// VSchema is unchanged, or both across namespaces. Triage then looks for a
+// VSchema document only when there is one.
+func finalizerWork(changes []engine.SchemaChange) string {
+	var vschema, finalizeOnly bool
+	for _, change := range changes {
+		if change.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+			vschema = true
+		} else {
+			finalizeOnly = true
+		}
+	}
+	switch {
+	case vschema && finalizeOnly:
+		return "VSchema apply and finalize"
+	case vschema:
+		return "VSchema apply"
+	default:
+		return "finalize"
+	}
 }
 
 // finalizerVSchemaApplied reports whether an engine progress state means the
@@ -2088,7 +2152,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if state.IsState(apply.State, state.Apply.Pending) && apply.StartedAt == nil {
-		c.dispatchQueuedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+		if err := c.dispatchQueuedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier); err != nil {
+			return err
+		}
 		return ctx.Err()
 	}
 
@@ -2191,6 +2257,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				return err
 			}
 		}
+		// A previous drive can have settled every task and exited before it
+		// recorded the apply's outcome, leaving requests the outcome moots
+		// pending. Settle them before the summary posts, since nothing later
+		// re-claims a completed apply to do it.
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
@@ -2244,8 +2315,21 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		}
 	}
 
-	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
-	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
+	retryableApplyError := apply.ErrorMessage
+	if err := c.prepareRetryableTasksForResume(ctx, apply, activeTasks); err != nil {
+		// Nothing has written the apply row yet, so it still records the
+		// retryable pause it was claimed in; only the in-memory error message
+		// was cleared for the retry, and it is put back to match the row.
+		apply.ErrorMessage = retryableApplyError
+		logger.Warn("could not requeue retryable tasks for the retry; the apply stays retryable for the next claim",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
+	if err := c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested); err != nil {
+		logger.Warn("could not requeue stopped tasks for start; the request remains pending for the next claim",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 
 	if grouped {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
@@ -2334,7 +2418,7 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	return err
 }
 
-func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
 	applyCtx, cancelApply := context.WithCancel(ctx)
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	defer c.clearApplyCancel(cancelGeneration)
@@ -2347,5 +2431,5 @@ func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Ap
 		"task_count", len(tasks),
 	)
 
-	c.runApplyExecution(applyCtx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+	return c.runApplyExecution(applyCtx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 }

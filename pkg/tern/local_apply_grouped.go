@@ -18,7 +18,7 @@ import (
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
 // defer_cutover, this is atomic cutover; for Vitess, this is one deploy request.
-func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
 	// Bind stable apply identity for every grouped-drive emission; mutable attrs remain per-call snapshots.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	ctx, cancelApply := context.WithCancel(ctx)
@@ -50,7 +50,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	logger.Info("building changes from scoped tasks", "task_count", len(tasks), "plan_id", plan.PlanIdentifier)
 	if len(plan.Namespaces) == 0 {
 		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
-		return
+		return nil
 	}
 	if c.config.Type == storage.DatabaseTypeMySQL && len(plan.Namespaces) > 1 {
 		var names []string
@@ -59,12 +59,12 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		}
 		c.failApplyWithTasks(ctx, apply, tasks,
 			fmt.Sprintf("MySQL applies support one namespace per apply, but plan has %d: %v", len(plan.Namespaces), names))
-		return
+		return nil
 	}
 	creds, err := c.credentialsForGroupedApply(plan)
 	if err != nil {
 		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		return
+		return nil
 	}
 	changes := groupedResumeChanges(tasks, plan)
 
@@ -72,14 +72,14 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// for a long time (branch creation, DDL application, deploy request) and
 	// started_at should reflect when work actually began, not when it finished.
 	if !c.recordDriveStarted(ctx, apply, logger) {
-		return
+		return nil
 	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",
 			append(apply.MutableLogAttrs(), "error", err)...)
-		return
+		return nil
 	} else if standDown {
-		return
+		return nil
 	}
 
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
@@ -118,7 +118,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		// A cancelled drive is why the engine call returned, so the error
 		// describes the driver and not the change the engine already accepted.
 		if c.driveCancelled(ctx, apply, "while the engine was applying") {
-			return
+			return nil
 		}
 		newState := state.Apply.Failed
 		if c.shouldRetryEngineError(err) {
@@ -132,19 +132,19 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		} else {
 			logger.Error("apply failed", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
 		}
-		return
+		return nil
 	}
 
 	if !result.Accepted {
 		c.failApplyWithTasks(ctx, apply, tasks, result.Message)
-		return
+		return nil
 	}
 
 	if isTasklessVSchemaOnlyPlan(tasks, plan) {
 		if completeErr := c.completeTasklessGroupedApply(ctx, apply, result.Message); completeErr != nil {
 			logger.Error("failed to complete task-less grouped apply", append(apply.MutableLogAttrs(), "error", completeErr)...)
 		}
-		return
+		return nil
 	}
 
 	// Persist the engine resume state and set IsInstant on tasks before marking
@@ -162,18 +162,18 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			// of abandoning it as terminal.
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				if c.driveCancelled(ctx, apply, "while saving the engine resume state") {
-					return
+					return nil
 				}
 				logger.Warn("failed to save engine resume state after accepted apply; pausing apply for operator retry",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
-				return
+				return nil
 			}
 		}
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && resumeState == nil {
 		c.failApplyWithTasks(ctx, apply, tasks, "engine accepted Vitess apply without resume state")
-		return
+		return nil
 	}
 
 	if result.ResumeState != nil {
@@ -198,7 +198,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
 	// Poll for completion - all tasks share the same state
-	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+	return c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 }
 
 func (c *LocalClient) saveEngineResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, resumeState *engine.ResumeState) error {
@@ -603,7 +603,17 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // Each table copies and cuts over independently.
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
-func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) {
+//
+// It returns an error only when the drive settled the apply's outcome but could
+// not record it, so the caller knows the stored apply is still active and no
+// side effect of the outcome has run. Once the outcome is stored the poll
+// returns nil whatever happens to the side effects: a failed request
+// settlement is logged and left for the operator's post-drive settlement, and
+// the summary still posts. A drive context that ends — an operator's
+// stop cancelling the drive, a lost lease, the operator shutting down — is a
+// hand-back rather than a failure: the poll returns nil and the caller reads
+// its own context to learn why it stopped.
+func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) error {
 	eng := c.getEngine()
 	ticker := time.NewTicker(c.taskPollInterval())
 	defer ticker.Stop()
@@ -623,10 +633,10 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		case <-ctx.Done():
 			c.logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				apply.IdentityLogAttrs()...)
-			return
+			return nil
 		case <-ticker.C:
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
-				return
+				return ps.terminalErr
 			}
 		}
 	}
@@ -732,6 +742,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if exhausted {
 			var settleErr error
 			if settled, settleErr = c.settleLostEngineWorkForTasks(ctx, apply, tasks, result.State); settleErr != nil {
+				if errors.Is(settleErr, storage.ErrApplyLeaseLost) {
+					// The target answered; only a settlement write was refused,
+					// because a peer now holds the lease. That peer settles the
+					// tasks, so this driver exits rather than counting the
+					// refusal as a failed verification and going on to pause an
+					// apply it no longer owns.
+					logger.Warn("settling lost engine work was refused because the drive's lease was lost; this driver exits",
+						append(apply.MutableLogAttrs(), "engine_state", result.State, "error", settleErr)...)
+					return true
+				}
 				// Neither the engine nor the target has answered what happened
 				// to the work, so count the failed verification against the
 				// same bounded error budget as a failed poll — this must never
@@ -891,35 +911,35 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
-	// If --skip-revert was set, auto-skip the revert window immediately.
-	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped {
-		logger.Info("auto-skipping revert window (--skip-revert)")
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			"Auto-skipping revert window (--skip-revert)", "", "")
-		_, err := eng.SkipRevert(ctx, controlReq)
-		if err != nil {
-			logger.Error("auto-skip revert failed", append(apply.MutableLogAttrs(), "error", err)...)
-		} else {
-			logger.Info("skip-revert triggered", "reason", "--skip-revert")
-			c.markRevertSkipped(ctx, apply)
-		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, state.Apply.SkippingRevert)
-		ps.revertSkipped = true
+	// If --skip-revert was set, auto-skip the revert window immediately. Only an
+	// accepted skip marks the window skipped: a failed attempt is retried on the
+	// next progress tick, and until then the window stays open to the queued
+	// revert and skip-revert requests below.
+	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped && !ps.revertTriggered {
+		c.autoSkipRevert(ctx, logger, eng, apply, controlReq, ps, now, autoSkipRevertTrigger{
+			reason:       "--skip-revert",
+			triggerEvent: "Auto-skipping revert window (--skip-revert)",
+			skippedEvent: "Skip-revert triggered (--skip-revert)",
+		})
 	}
 
 	// A durable skip-revert control request (the interactive "skip now" command,
 	// vs the upfront --skip-revert flag above) was queued; honor it. This is the
 	// apply owner's retry path: the API's immediate skip attempt may have failed
 	// or its process may have died, leaving the request pending for the drive.
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
 			logger.Warn("could not load pending skip-revert control request", "error", err)
-		} else if pending != nil {
+		} else if pending != nil && c.skipRevertAllowed(ctx, logger, apply, ps) {
 			logger.Info("skip-revert requested by user; closing revert window", "requested_by", controlRequestCaller(pending))
-			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
+			skipResult, err := eng.SkipRevert(ctx, controlReq)
+			switch {
+			case err != nil:
 				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationSkipRevert, storage.LogEventSkipRevertTriggered, pending, err)
-			} else {
+			case skipResult == nil || !skipResult.Accepted:
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationSkipRevert,
+					storage.LogEventSkipRevertTriggered, pending, errors.New("engine rejected skip-revert request"))
+			default:
 				c.markRevertSkipped(ctx, apply)
 				ps.revertSkipped = true
 				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
@@ -936,15 +956,21 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// revert attempt may have failed or its process may have died, leaving the
 	// request pending for the drive.
 	revertedByControlRequest := false
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
 			logger.Warn("could not load pending revert control request", "error", err)
 		} else if pending != nil {
 			logger.Info("revert requested by user; reverting schema change", "requested_by", controlRequestCaller(pending))
-			if _, err := eng.Revert(ctx, controlReq); err != nil {
+			revertResult, err := eng.Revert(ctx, controlReq)
+			switch {
+			case err != nil:
 				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending, err)
-			} else {
+			case revertResult == nil || !revertResult.Accepted:
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert,
+					storage.LogEventRevertTriggered, pending, errors.New("engine rejected revert request"))
+			default:
 				revertedByControlRequest = true
+				ps.revertTriggered = true
 				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
 					logger.Warn("failed to complete revert control request", "error", err)
 				}
@@ -956,21 +982,17 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
 	// Falls back to stateEnteredAt if deployed_at is unavailable. A user revert
-	// this tick takes precedence — do not also auto-skip the window shut.
-	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !revertedByControlRequest {
+	// this tick takes precedence — do not also auto-skip the window shut. As with
+	// --skip-revert, only an accepted skip marks the window skipped; a failed one
+	// is retried on the next progress tick.
+	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !ps.revertTriggered && !revertedByControlRequest {
 		revertDeadline := c.revertWindowDeadline(logger, result.ResumeState, ps.stateEnteredAt)
 		if !revertDeadline.IsZero() && now.After(revertDeadline) {
-			logger.Info("revert window expired, skipping", "deadline", revertDeadline)
-			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-				"Revert window expired, finalizing", "", "")
-			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
-				logger.Error("revert window timeout skip failed", append(apply.MutableLogAttrs(), "error", err)...)
-			} else {
-				c.markRevertSkipped(ctx, apply)
-				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, state.Apply.SkippingRevert)
-			}
-			ps.revertSkipped = true
+			c.autoSkipRevert(ctx, logger.With("deadline", revertDeadline), eng, apply, controlReq, ps, now, autoSkipRevertTrigger{
+				reason:       "revert window expired",
+				triggerEvent: "Revert window expired, skipping revert",
+				skippedEvent: "Revert window expired, skip-revert triggered",
+			})
 		}
 	}
 
@@ -1078,19 +1100,29 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ensureApplyFailureMessage(apply, tasks)
 		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 		if err != nil {
-			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-		} else if !swapped {
+			// A cancelled drive is why the write failed, so the error describes
+			// the driver and not the outcome; the drive hands the apply back.
+			if c.driveCancelled(ctx, apply, "while persisting the apply's settled state") {
+				return true
+			}
+			// The stored apply is still active, so nothing that answers for its
+			// outcome may run: completing a pending control request here would
+			// resolve an operator's command against an apply storage still
+			// reports active, and the observer would post a terminal summary for
+			// it. The drive exits and a later claim finalizes the apply.
+			logger.Error("failed to persist the apply's settled state; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
+				"deployment", apply.Deployment, "stored_state", expectedState, "settled_state", apply.State, "error", err)
+			ps.terminalErr = fmt.Errorf("persist grouped outcome for apply %s: %w", apply.ApplyIdentifier, err)
+			return true
+		}
+		if !swapped {
 			// Another drive advanced the apply between our reload and write; it
 			// owns the terminal transition and its side-effects. Skip ours.
 			logger.Info("apply terminal-state write lost a race; yielding to the owning drive",
 				"expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-			logger.Warn("failed to settle pending control requests after terminal progress reconciliation; current apply owner will exit for operator retry",
-				"error", err)
-			return true
-		}
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		switch {
 		case retryableFailure:
@@ -1221,7 +1253,9 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 			continue
 		}
 		if taskInRevertPhase(task) {
-			c.settleLostRevertPhaseTask(ctx, apply, task, engineState)
+			if err := c.settleLostRevertPhaseTask(ctx, apply, task, engineState); err != nil {
+				return settled, err
+			}
 			settled.add(task)
 			continue
 		}
@@ -1242,7 +1276,9 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	for _, task := range unverified {
-		c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState)
+		if err := c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState); err != nil {
+			return settled, err
+		}
 		settled.add(task)
 	}
 	return settled, nil
@@ -1358,6 +1394,109 @@ func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Appl
 	if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
 		logger.Warn("failed to record skip-revert on apply", append(apply.MutableLogAttrs(), "error", err)...)
 	}
+}
+
+// revertAccepted reports whether the engine has accepted an operator revert for
+// this apply. The durable completed revert request is the source of truth: the
+// API carries most reverts out itself and completes the request without the
+// drive seeing the acceptance, and a drive that claims the apply after a lease
+// handover starts with no in-memory state at all. Progress keeps reporting the
+// revert window for a while after an accepted revert, so a skip sent on the
+// strength of that lagging state would race the revert. The in-memory flag is
+// a shortcut that saves the read once either path has seen the acceptance.
+func (c *LocalClient) revertAccepted(ctx context.Context, apply *storage.Apply, ps *atomicPollState) (bool, error) {
+	if ps.revertTriggered {
+		return true, nil
+	}
+	accepted, err := controlRequestAccepted(ctx, c.storage, apply, storage.ControlOperationRevert)
+	if err != nil {
+		return false, err
+	}
+	if accepted {
+		ps.revertTriggered = true
+	}
+	return accepted, nil
+}
+
+// skipRevertAllowed reports whether the drive may send a skip-revert to the
+// engine this tick: no revert has been accepted for the apply. It fails
+// closed: when storage cannot say whether a revert was accepted, no skip is
+// sent this tick and the next progress tick asks again.
+func (c *LocalClient) skipRevertAllowed(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState) bool {
+	accepted, err := c.revertAccepted(ctx, apply, ps)
+	if err != nil {
+		logger.Warn("could not determine whether a revert was accepted; no skip-revert is sent this tick and the next progress tick asks again",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return false
+	}
+	if accepted {
+		logger.Info("revert already accepted; the revert window is not skipped", apply.MutableLogAttrs()...)
+		return false
+	}
+	return true
+}
+
+// autoSkipRevertTrigger names why the drive is closing a revert window on its
+// own, for the logs and the apply timeline.
+type autoSkipRevertTrigger struct {
+	reason       string
+	triggerEvent string
+	skippedEvent string
+}
+
+// autoSkipRevert closes the revert window without an operator command, either
+// because the apply was started with --skip-revert or because the window
+// expired. The trigger lands on the timeline once, however many ticks the skip
+// takes. Only an accepted skip marks the window skipped; a failed or rejected
+// one is retried on the next progress tick, at Warn while the failure is
+// recent and escalating to Error logging plus a one-time timeline event once
+// it has outlived autoSkipRevertEscalationAfter, so a window the engine will
+// not close pages instead of filling the logs at every tick.
+func (c *LocalClient) autoSkipRevert(ctx context.Context, logger *slog.Logger, eng engine.Engine, apply *storage.Apply, controlReq *engine.ControlRequest, ps *atomicPollState, now time.Time, trigger autoSkipRevertTrigger) {
+	if !c.skipRevertAllowed(ctx, logger, apply, ps) {
+		return
+	}
+	if !ps.autoSkipRevertLogged {
+		logger.Info("auto-skipping revert window", "reason", trigger.reason)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			trigger.triggerEvent, "", "")
+		ps.autoSkipRevertLogged = true
+	}
+	skipResult, err := eng.SkipRevert(ctx, controlReq)
+	switch {
+	case err != nil:
+		c.reportAutoSkipRevertFailure(ctx, logger, apply, ps, now, err)
+	case skipResult == nil || !skipResult.Accepted:
+		c.reportAutoSkipRevertFailure(ctx, logger, apply, ps, now, errors.New("engine rejected skip-revert request"))
+	default:
+		logger.Info("skip-revert triggered", "reason", trigger.reason)
+		c.markRevertSkipped(ctx, apply)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
+			trigger.skippedEvent, state.Apply.RevertWindow, state.Apply.SkippingRevert)
+		ps.revertSkipped = true
+	}
+}
+
+// reportAutoSkipRevertFailure logs a failed automatic skip-revert that the
+// drive retries at the next progress tick, escalating once the failure has
+// persisted past autoSkipRevertEscalationAfter.
+func (c *LocalClient) reportAutoSkipRevertFailure(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState, now time.Time, skipErr error) {
+	if ps.autoSkipRevertFailingSince.IsZero() {
+		ps.autoSkipRevertFailingSince = now
+	}
+	failingFor := now.Sub(ps.autoSkipRevertFailingSince)
+	if failingFor < autoSkipRevertEscalationAfter {
+		logger.Warn("auto-skip revert failed; the drive retries it at the next progress tick",
+			append(apply.MutableLogAttrs(), "failing_for", failingFor, "error", skipErr)...)
+		return
+	}
+	if !ps.autoSkipRevertEscalated {
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("The engine has not accepted the skip-revert for %s; the revert window stays open and SchemaBot keeps retrying every progress tick", failingFor.Round(time.Second)), "", "")
+		ps.autoSkipRevertEscalated = true
+	}
+	logger.Error("auto-skip revert has been failing beyond the escalation window; the revert window stays open and the drive keeps retrying",
+		append(apply.MutableLogAttrs(), "failing_for", failingFor, "error", skipErr)...)
 }
 
 // resolveOrRetryRevertPhaseRequest disposes of a revert-phase control operation

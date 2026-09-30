@@ -6,7 +6,7 @@
 
 - [Schema Directory Structure](#schema-directory-structure)
 - [Where to Put the Schema Directory](#where-to-put-the-schema-directory)
-- [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
+- [Environment Substitution in Namespace Names](#environment-substitution-in-namespace-names)
 - [Ignoring Namespaces](#ignoring-namespaces)
 - [Ignoring Tables](#ignoring-tables)
 - [Per-Target Schema Overrides](#per-target-schema-overrides)
@@ -224,9 +224,9 @@ an established home. Relocating is worth it only if the points above start to
 bite — packaging dead weight, confusion next to imperative change scripts, or
 allowlist/CODEOWNERS churn — and can be done later as a follow-up.
 
-## `$ENV` Substitution in Namespace Names
+## Environment Substitution in Namespace Names
 
-Some infrastructure names schemas with an environment suffix: `bikeshare_staging` in staging, `bikeshare_production` in production. Rather than maintaining separate directories for each environment, you can use `$ENV` in the directory name. When an environment is specified (via `-e`), `$ENV` is replaced with the environment value.
+Some infrastructure names schemas with an environment suffix: `bikeshare_staging` in staging, `bikeshare_production` in production. Rather than maintaining separate directories for each environment, use `{env}` in the directory name. When an environment is specified (via `-e`), `{env}` is replaced with the environment value. Existing `$ENV` directories remain supported.
 
 ### Example
 
@@ -235,7 +235,7 @@ Directory structure:
 ```
 myapp/schema/
 ├── schemabot.yaml
-└── bikeshare_$ENV/
+└── bikeshare_{env}/
     ├── bikes.sql
     └── stations.sql
 ```
@@ -252,11 +252,12 @@ schemabot plan -s myapp/schema -e production
 
 ### Rules
 
-- `$ENV` is replaced with the environment value from `-e` (e.g., `staging`, `production`).
-- If no environment is specified, `$ENV` is left as-is (no substitution).
+- `{env}` and legacy `$ENV` are replaced with the environment value from `-e` (e.g., `staging`, `production`). New `schemabot onboard --template-env-suffix` output uses `{env}`.
+- If no environment is specified, the tokens are left as-is (no substitution).
 - Works in both flat layout (directory name = namespace) and subdirectory layout (subdirectory names = namespaces).
-- You can mix `$ENV` directories with regular directories in the subdirectory layout.
-- When creating the directory from a shell, quote the name to prevent shell expansion: `mkdir 'bikeshare_$ENV'`
+- You can mix templated directories with regular directories in the subdirectory layout. Do not include both `bikeshare_{env}/` and `bikeshare_$ENV/` in one schema root: they resolve to the same namespace and are rejected.
+- Quote literal paths in shell commands, especially legacy `$ENV` names, to prevent shell variable expansion.
+- Pass concrete schema names to `pull --namespace` and `onboard --namespace`, such as `bikeshare_production`; placeholders are for repository directories and `ignore_namespaces` entries.
 
 ## Ignoring Namespaces
 
@@ -287,7 +288,7 @@ ignore_namespaces:
 
 - Entries are bare namespace names, not paths. An entry containing `/` or `\` (e.g., `schema/commerce_test`) is rejected when the config is loaded.
 - Ignored namespaces are excluded from plans, applies, and merge-gate checks. This applies to both the GitHub PR flow and the CLI (`schemabot plan` / `schemabot apply` read the same `schemabot.yaml`).
-- `$ENV` substitution applies to entries the same way it applies to directory names: `fixtures_$ENV` ignores the `fixtures_staging` namespace when planning for staging.
+- `{env}` and legacy `$ENV` substitution apply to entries the same way they apply to directory names: `fixtures_{env}` ignores the `fixtures_staging` namespace when planning for staging.
 - Matching is exact and case-sensitive. An entry that matches no namespace directory excludes nothing; the plan proceeds and the unmatched entry is reported (a CLI warning, a server-side log) so a typo or stale entry is visible.
 - Ignoring every namespace in the schema root is an error: the plan fails rather than reconciling an empty desired state.
 - Ignoring a namespace does not exempt the directory from layout validation; a schema root mixing flat files and subdirectories is still rejected.
@@ -336,7 +337,7 @@ An ignored table is withheld from the planner's view of the live schema. The pla
 
 - Entries are bare table names. Patterns are not supported, so a set of time-partitioned tables needs one entry per table.
 - Entries are not namespace-qualified, so an entry applies to every namespace the plan covers. A name that occurs in two namespaces is withheld in both.
-- `$ENV` substitution does **not** apply. Namespace entries substitute `$ENV` because namespace *directories* are environment-suffixed; table names are not.
+- Environment substitution does **not** apply. Namespace entries substitute `{env}` or `$ENV` because namespace *directories* are environment-suffixed; table names are not.
 - Matching is exact and case-sensitive. An entry that matches no live table withholds nothing and the plan proceeds, without comment: a table that is not always on the target is the ordinary case, not a mistake. The server logs unmatched entries.
 - On the MySQL-family engines, naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial. Prefer naming the table you mean.
 
@@ -359,7 +360,7 @@ from this PR onward.
 
 ## Per-Target Schema Overrides
 
-`$ENV` substitution handles physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
+`{env}` and `$ENV` substitution handle physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
 
 Instead, keep one canonical directory (`bikeshare/`) and map the canonical namespace to each deployment's physical schema on the data-plane target. (`target_resolver` is the gRPC data plane's target-to-connection inventory — see [Configuration](configuration.md) for how targets are defined.)
 
@@ -393,7 +394,7 @@ The canonical namespace stays the name everywhere SchemaBot labels a namespace �
 | MySQL, multiple schema names | 1 | many | `app_primary/`, `app_analytics/` |
 | MySQL, different databases | 1 per database | 1 each | separate directories |
 | Vitess, multiple keyspaces | 1 | many | `commerce/`, `commerce_sharded/` |
-| Environment-specific namespace | 1 | 1 per env | `bikeshare_$ENV/` |
+| Environment-specific namespace | 1 | 1 per env | `bikeshare_{env}/` (legacy `bikeshare_$ENV/`) |
 | Repo-only namespace (never deployed) | 1 | all except ignored | `ignore_namespaces: [commerce_test]` |
 | Deployment-specific physical schema | 1 | 1 canonical | `bikeshare/` + per-target `schema_overrides` |
 
