@@ -424,6 +424,9 @@ func applyExecutionErrorMessage(err error) string {
 	if errors.As(err, &featureErr) {
 		return featureErr.Error()
 	}
+	if refused, ok := errors.AsType[*api.MemberPlanRefusedError](err); ok {
+		return templates.MemberPlanRefusedDetail(refused.Target, refused.Table, refused.Namespace, refused.Refusal == api.MemberPlanUnsafe)
+	}
 	return "Failed to execute apply. See SchemaBot server logs for details."
 }
 

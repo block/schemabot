@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -229,4 +230,42 @@ func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
 	assert.Contains(t, out, "`users`: refused by \\[endpoint redacted\\] \\*event\\_id\\* \\| \\<details>\n",
 		"the reason stays on one line with Markdown escaped")
+}
+
+// When every target's own plan renders, a direct change is disclosed under the
+// targets that run it, naming them when only some of the group does. The
+// reviewed plan's own direct changes move under its group rather than repeat
+// plan-wide, and stay plan-wide when its group carries none, so consent is
+// never asked for a direct statement the comment does not disclose.
+func TestRenderPlanComment_DirectDisclosedPerTargetGroup(t *testing.T) {
+	const alter = "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)"
+	direct := DirectChangeData{Table: "users", Reason: "the table has ~1,240 rows"}
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes:       []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{alter}}},
+		DirectChanges: []DirectChangeData{direct},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{{Deployment: "payments-001"}, {Deployment: "payments-002"}, {Deployment: "payments-003"}},
+			Plans: []DeploymentPlanGroup{{
+				Members: []string{"payments-001", "payments-002", "payments-003"},
+				Primary: true,
+				Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{alter}}},
+				DirectChanges: []DirectChangeData{{
+					Table: "users", Reason: "the table has ~1,240 rows",
+					Targets: []string{"payments-001", "payments-003"}, TotalTargets: 3,
+				}},
+			}},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the reviewed plan's direct change is disclosed once, under its group")
+	assert.Contains(t, out, "- `users` on targets `payments-001`, `payments-003`: the table has ~1,240 rows\n",
+		"only the targets that run it directly are named")
+
+	data.DeploymentDrift.Plans[0].DirectChanges = nil
+	fallback := RenderPlanComment(data)
+	assert.Equal(t, 1, strings.Count(fallback, "**Direct execution**"), "a group that carries none leaves the plan-wide disclosure in place")
+	assert.Contains(t, fallback, "- `users`: the table has ~1,240 rows\n")
 }

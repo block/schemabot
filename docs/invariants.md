@@ -1486,7 +1486,8 @@ verdict, so a plan that changed after the confirmation stops rather than running
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), including the re-check that other rollout members' work is what the
 confirmation was given against (`confirmationCoversMemberWork` in
-`pkg/webhook/apply_member_work.go`), plus rollback confirmation's transactional lock-intent check
+`pkg/webhook/apply_member_work.go`) and each member's own direct changes disclosed under that
+member's plan (`deploymentPlanGroups` in `pkg/webhook/plan_drift.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 

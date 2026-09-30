@@ -517,3 +517,21 @@ func FormatAvailableDatabases(errMsg string) string {
 	}
 	return result.String()
 }
+
+// MemberPlanRefusedDetail is the error line for an apply whose creation refused
+// one rollout target's own plan. It is built from the target's name and the
+// refused change's table or namespace rather than from the refusal's error
+// text, and it names the target so the operator looks for the change under
+// that target's plan instead of in the reviewed one.
+func MemberPlanRefusedDetail(target, table, namespace string, unsafe bool) string {
+	subject := "table " + inlineCode(table)
+	if table == "" {
+		subject = "the VSchema of namespace " + inlineCode(namespace)
+	}
+	if unsafe {
+		return fmt.Sprintf("Target %s has an unsafe change on %s, and this apply was not given `--allow-unsafe`, so nothing was applied. Review that target's plan, then run the command again with `--allow-unsafe` to consent to it.",
+			inlineCode(target), subject)
+	}
+	return fmt.Sprintf("Target %s has a change on %s that its engine refuses to execute, so nothing was applied. Fix what that target's plan names as the reason, then run the command again.",
+		inlineCode(target), subject)
+}
