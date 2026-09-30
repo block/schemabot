@@ -2,9 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -965,6 +969,84 @@ func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) 
 			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
 			assert.Contains(t, err.Error(), "runs table \"orders\" as direct-execution DDL")
 			assert.Contains(t, err.Error(), "shown only the reviewed plan plan-primary")
+			applies, ok := svc.storage.Applies().(*capturingApplyStore)
+			require.True(t, ok)
+			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
+		})
+	}
+}
+
+// Every entry point that creates an apply without a pull request apply-confirm
+// refuses another target's direct-execution change: the HTTP API that the CLI
+// and direct callers post to, ExecuteApply, which a rollback-confirm also calls
+// without the flag, and the trusted EnqueueAuthorizedApply. Each was shown the
+// reviewed plan alone, and none can assert the confirmation, including through
+// the JSON body of POST /api/apply, which rejects the field as unknown.
+func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
+	direct := storage.TableChange{
+		Namespace:     "testapp",
+		Table:         "orders",
+		Operation:     "alter",
+		DDL:           "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)",
+		ExecutionMode: "direct",
+		ModeReason:    "table is 12 MiB, within the direct execution bound",
+	}
+	newService := func(t *testing.T) *Service {
+		t.Helper()
+		reviewed := primaryPlanRow("testapp-001")
+		reviewed.Environment = "production"
+		svc := multiTargetApplyService(t, &listingPlanStore{
+			mockPlanLookupStore: mockPlanLookupStore{plan: reviewed},
+			plans:               []*storage.Plan{memberPlanWithChange(direct)},
+		})
+		svc.ternClients["eu/production"] = &mockTernClient{isRemote: true}
+		return svc
+	}
+	// postApply posts the body to the apply endpoint and returns the status and
+	// the error message it answered with.
+	postApply := func(t *testing.T, svc *Service, body string) (int, string) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		svc.handleApply(rec, req)
+		var resp struct {
+			Error string `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		return rec.Code, resp.Error
+	}
+	request := ApplyRequest{PlanID: "plan-primary", Environment: "production"}
+	const refused = "runs table \"orders\" as direct-execution DDL"
+
+	for _, tc := range []struct {
+		name  string
+		apply func(t *testing.T, svc *Service) string
+		want  string
+	}{
+		{"POST /api/apply", func(t *testing.T, svc *Service) string {
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production"}`)
+			assert.Equal(t, http.StatusInternalServerError, code)
+			return msg
+		}, refused},
+		{"POST /api/apply asserting the confirmation", func(t *testing.T, svc *Service) string {
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","ConfirmedMemberWork":true}`)
+			assert.Equal(t, http.StatusBadRequest, code)
+			return msg
+		}, `unknown field "ConfirmedMemberWork"`},
+		{"ExecuteApply", func(t *testing.T, svc *Service) string {
+			_, _, err := svc.ExecuteApply(t.Context(), request)
+			require.Error(t, err)
+			return err.Error()
+		}, refused},
+		{"EnqueueAuthorizedApply", func(t *testing.T, svc *Service) string {
+			_, _, err := svc.EnqueueAuthorizedApply(t.Context(), request)
+			require.Error(t, err)
+			return err.Error()
+		}, refused},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newService(t)
+			assert.Contains(t, tc.apply(t, svc), tc.want)
 			applies, ok := svc.storage.Applies().(*capturingApplyStore)
 			require.True(t, ok)
 			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
