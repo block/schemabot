@@ -1183,7 +1183,7 @@ func (e *UnsupportedFeatureError) Error() string {
 // errPlanLookupFailed marks an apply that could not read its stored plan. The
 // storage read failed, so the request is neither accepted nor known to be
 // wrong: it is a server failure, kept apart from a plan that does not exist.
-var errPlanLookupFailed = errors.New("get plan")
+var errPlanLookupFailed = errors.New("plan lookup failed")
 
 // storedPlanLookupFailedMessage is the response for an operation whose stored
 // plan could not be read. The storage error stays in the server log; the
@@ -1208,6 +1208,15 @@ type planEnvironmentMismatchError struct {
 	RequestedEnvironment string
 }
 
+func (e *planEnvironmentMismatchError) Error() string {
+	return fmt.Sprintf("plan %s was created for environment %q, not %q; apply it to %q or create a plan for %q",
+		e.PlanID, e.PlanEnvironment, e.RequestedEnvironment, e.PlanEnvironment, e.RequestedEnvironment)
+}
+
+// planRoutingMetadataError identifies a stored plan that lacks one of the
+// server-side routing fields (deployment, target) the operator needs to
+// dispatch it. The plan cannot be repaired from the apply request, so the
+// caller is told to create a new plan rather than retry this one.
 type planRoutingMetadataError struct {
 	PlanID string
 	Field  string
@@ -1216,11 +1225,6 @@ type planRoutingMetadataError struct {
 func (e *planRoutingMetadataError) Error() string {
 	return fmt.Sprintf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply",
 		e.PlanID, e.Field)
-}
-
-func (e *planEnvironmentMismatchError) Error() string {
-	return fmt.Sprintf("plan %s was created for environment %q, not %q; apply it to %q or create a plan for %q",
-		e.PlanID, e.PlanEnvironment, e.RequestedEnvironment, e.PlanEnvironment, e.RequestedEnvironment)
 }
 
 // ExecuteApply queues an apply request in storage and returns once the work is
@@ -1299,13 +1303,26 @@ func (s *Service) EnqueueAuthorizedApply(ctx context.Context, req ApplyRequest) 
 // execution invariants every queue path requires: the plan exists, was created
 // for the requested environment, and carries the server-side routing metadata
 // (deployment, target) the operator needs to dispatch it.
+//
+// The apply counter is keyed by the plan's repository, database, and
+// deployment, so a failed or empty lookup deliberately records nothing: there
+// is no plan to attribute the failure to, and a sentinel-labelled point would
+// only dilute the per-database series. Those failures stay on the span and in
+// the handler's log line. Every invariant checked after the plan loads records
+// an error against the plan's own labels.
 func (s *Service) loadPlanForApply(ctx context.Context, span trace.Span, req ApplyRequest) (*storage.Plan, error) {
 	// Load plan first; it is the source of truth for database, type, and routing.
 	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "get plan")
-		return nil, fmt.Errorf("%w %s: %w", errPlanLookupFailed, req.PlanID, err)
+		if errors.Is(err, storage.ErrPlanNotFound) {
+			// A store that reports a missing plan as the sentinel rather than
+			// a nil plan is still a caller error, not a storage failure.
+			span.SetStatus(otelcodes.Error, "plan not found")
+			return nil, fmt.Errorf("%w: %s", err, req.PlanID)
+		}
+		span.SetStatus(otelcodes.Error, "plan lookup failed")
+		return nil, fmt.Errorf("%w for %s: %w", errPlanLookupFailed, req.PlanID, err)
 	}
 	if plan == nil {
 		planErr := fmt.Errorf("%w: %s", storage.ErrPlanNotFound, req.PlanID)
