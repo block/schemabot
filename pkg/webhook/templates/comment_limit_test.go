@@ -358,6 +358,38 @@ func TestRenderWithinCommentLimitChargesEachCutBlockOneMarker(t *testing.T) {
 	})
 }
 
+// Environments whose plans are the same render as one section drawn from the
+// first environment's plan, while each environment stored a plan of its own.
+// A block the section cuts names the first environment's stored plan and says
+// so, so another environment's operator knows the plan it names is not theirs
+// and that theirs runs the same DDL.
+func TestMultiEnvPlanCommentSharedSectionSaysWhosePlanItNames(t *testing.T) {
+	staging := greenfieldPlan("staging", "events", 200)
+	production := greenfieldPlan("production", "events", 200)
+	staging.Changes[0].Keyspace, production.Changes[0].Keyspace = "ledger", "ledger"
+	staging.PlanID, production.PlanID = "plan_staging1", "plan_production1"
+	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "ledger",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	require.Contains(t, body, "### Staging & Production")
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Contains(t, body, "the full staging plan is available from the CLI with `schemabot list-plans plan_staging1` (production runs the same DDL).")
+	assert.Equal(t, 1, strings.Count(body, sharedPlanPointerMarker("plan_staging1", []string{"staging", "production"})))
+	assert.NotContains(t, body, planPointerMarker("plan_staging1"))
+	assert.NotContains(t, body, ddlTruncatedMarker)
+
+	t.Run("more than one matching environment", func(t *testing.T) {
+		assert.Equal(t,
+			"_DDL truncated to fit GitHub's comment size limit; the full staging plan is available from the CLI with `schemabot list-plans plan_staging1` (production and sandbox run the same DDL)._\n",
+			sharedPlanPointerMarker("plan_staging1", []string{"staging", "production", "sandbox"}))
+	})
+}
+
 // DDL cut to fit the comment comes from a stored plan, so the marker under it
 // names the command that prints that plan in full rather than sending the
 // reader to the schema files, which hold the desired schema and not the

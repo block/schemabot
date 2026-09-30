@@ -2244,7 +2244,9 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 	if multiEnvPlansRenderOnce(data) {
 		// Identical plans: render once with combined header
 		fmt.Fprintf(&sb, "### %s\n\n", capitalizeEnvNames(data.Environments))
+		restore := budget.shareAcross(data.Environments)
 		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]], budget)
+		restore()
 	} else {
 		// Separate sections per environment
 		for _, env := range data.Environments {
