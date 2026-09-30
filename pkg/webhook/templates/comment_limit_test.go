@@ -392,9 +392,10 @@ func TestMultiEnvPlanCommentSharedSectionSaysWhosePlanItNames(t *testing.T) {
 
 // A shared section that renders target groups cuts each group's DDL under a
 // marker naming that group's stored plan, which holds only the group's
-// targets, so the marker says the plan is for these targets rather than
-// calling it the environment's full plan, agreeing in number with the group
-// heading above it.
+// targets, so the marker scopes the plan to the group rather than calling it
+// the environment's full plan. A group of several stored its first member's
+// plan, so the marker names that member and says the rest of the group runs
+// the same DDL.
 func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
 	withTargets := func(env, planID, memberPlanID string) PlanCommentData {
 		plan := greenfieldPlan(env, "orders", 150)
@@ -430,7 +431,7 @@ func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
 	first, rest, found := strings.Cut(body, "**targets `primary/orders_2`, `primary/orders_3`**")
 	require.True(t, found, body)
 	assert.Contains(t, first, "the full staging plan for this target is available from the CLI with `schemabot list-plans plan_staging1` (production runs the same DDL).")
-	assert.Contains(t, rest, "the full staging plan for these targets is available from the CLI with `schemabot list-plans plan_staging_member_2` (production runs the same DDL).")
+	assert.Contains(t, rest, "the full staging plan for `primary/orders_2` is available from the CLI with `schemabot list-plans plan_staging_member_2` (every target in this group runs the same DDL; production runs the same DDL).")
 	assert.NotContains(t, body, "the full staging plan is available")
 }
 
@@ -491,10 +492,42 @@ func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
 	middle, last, found := strings.Cut(rest, "**target `primary/orders_3`**")
 	require.True(t, found, body)
 
-	assert.Contains(t, first, scopedPlanPointerMarker("plan_reviewed", targetGroupPlanScope(1)))
+	assert.Contains(t, first, "the full plan for this target is available from the CLI with `schemabot list-plans plan_reviewed`.")
 	assert.NotContains(t, first, "plan_member_2")
 	assert.Contains(t, middle, "the full plan for this target is available from the CLI with `schemabot list-plans plan_member_2`.")
 	assert.NotContains(t, middle, "plan_reviewed")
 	assert.Contains(t, last, ddlTruncatedMarker)
 	assert.NotContains(t, last, "list-plans")
+}
+
+// A group of several targets stored one plan per member and renders its first
+// member's, so a cut block's marker names that member as the owner of the plan
+// it points at and says the rest of the group runs the same DDL. The primary's
+// group names the reviewed plan, which is the primary member's own.
+func TestPlanCommentCutTargetGroupNamesWhosePlanItPointsAt(t *testing.T) {
+	primary := greenfieldPlan("production", "orders", 150)
+	primary.PlanID = "plan_reviewed"
+	second := greenfieldPlan("production", "orders_eu", 150).Changes
+	primary.DeploymentDrift = &DeploymentDriftData{
+		Computed: true, Clean: true, Independent: true,
+		Deployments: []DeploymentDriftEntry{
+			{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+			{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			{Deployment: "primary", Target: "orders_3", Class: "planned"},
+			{Deployment: "primary", Target: "orders_4", Class: "planned"},
+		},
+		Plans: []DeploymentPlanGroup{
+			{Members: []string{"primary/orders_1", "primary/orders_2"}, Primary: true, Changes: primary.Changes},
+			{Members: []string{"primary/orders_3", "primary/orders_4"}, Changes: second, PlanID: "plan_member_3"},
+		},
+	}
+	body := RenderPlanComment(primary)
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+	first, rest, found := strings.Cut(body, "**targets `primary/orders_3`, `primary/orders_4`**")
+	require.True(t, found, body)
+	assert.Contains(t, first, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_1` is available from the CLI with `schemabot list-plans plan_reviewed` (every target in this group runs the same DDL)._\n")
+	assert.Contains(t, rest, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_3` is available from the CLI with `schemabot list-plans plan_member_3` (every target in this group runs the same DDL)._\n")
+	assert.NotContains(t, body, "for these targets")
+	assert.NotContains(t, body, ddlTruncatedMarker)
 }

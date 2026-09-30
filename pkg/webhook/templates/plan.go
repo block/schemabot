@@ -1651,7 +1651,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
-		restore := budget.forTargetGroup(len(g.Members))
+		restore := budget.forTargetGroup(g.Members)
 		if collapse && statements+vschema > 1 {
 			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)
 		} else {
