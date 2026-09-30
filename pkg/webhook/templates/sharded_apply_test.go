@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
@@ -1037,4 +1038,37 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	assert.NotContains(t, inFlight, "applied on",
 		"an in-flight aggregate's shard summary already carries the breakdown")
 	assert.Contains(t, inFlight, "└ shards:")
+}
+
+// A table copying across shards reads like a Vitess apply: the progress bar
+// aggregated across the shards, the DDL right under it, then the summed rows
+// and the per-shard breakdown.
+func TestRenderShardedApplyComment_CopyingTableReadsLikeVitess(t *testing.T) {
+	keyspaces := oneKeyspace([]ShardStatus{
+		{Shard: "-80", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+		{Shard: "80-", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+	}, []ShardCell{mutesCell("-80"), mutesCell("80-")})
+	keyspaces[0].Tables = []ShardedTableStatus{{
+		Table: "mutes", Status: state.Task.Running,
+		RowsCopied: 500, RowsTotal: 1000, ETASeconds: 60, ShardsReporting: 2,
+		Shards: []ShardProgressData{
+			{Shard: "-80", Status: state.Task.Running, PercentComplete: 40},
+			{Shard: "80-", Status: state.Task.Running, PercentComplete: 60},
+		},
+	}}
+
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x", Keyspaces: keyspaces,
+	})
+
+	bar := strings.Index(out, "**`mutes`**: 🟦")
+	ddl := strings.Index(out, "```sql\nALTER TABLE `mutes` ADD INDEX")
+	rows := strings.Index(out, "- Rows: 500 / 1,000")
+	shards := strings.Index(out, "└ shards:")
+	require.NotEqual(t, -1, bar, "the aggregated progress bar renders:\n%s", out)
+	assert.Contains(t, out, "50%", "the bar aggregates both shards' rows")
+	assert.Less(t, bar, ddl, "the DDL follows the progress bar")
+	assert.Less(t, ddl, rows, "the rows line follows the DDL")
+	assert.Less(t, rows, shards, "the per-shard breakdown comes last")
 }

@@ -413,8 +413,9 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, budg
 	for _, ks := range keyspaces {
 		fmt.Fprintf(sb, "\n#### Keyspace %s\n\n", inlineCode(ks.Keyspace))
 		for _, t := range ks.Tables {
-			writeShardedTableLine(sb, t)
-			writeShardedTableDDL(sb, shardedTableDDLGroups(ks, t.Table), len(ks.Shards), dialect, budget)
+			writeShardedTableLine(sb, t, func() {
+				writeShardedTableDDL(sb, shardedTableDDLGroups(ks, t.Table), len(ks.Shards), dialect, budget)
+			})
 		}
 		needsShardDetail := applyHasShardFailure || keyspaceHasDivergentOutcome(ks.Shards)
 		groups := groupShardsBySignature(ks.Shards, ks.Cells)
@@ -535,10 +536,12 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 // shards — a partially-landed table between dispatch waves, or one cancelled
 // after part of the fleet applied — the line states the landed coverage so the
 // aggregate phrase alone never hides or contradicts work that happened.
-func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
+// writeDDL writes the table's DDL directly under the headline, before the rows
+// and shard lines, where the single-deployment comment puts it.
+func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
 	status := state.NormalizeTaskStatus(t.Status)
 	if status == state.Task.Running && t.RowsTotal > 0 {
-		writeShardedTableCopyProgress(sb, t)
+		writeShardedTableCopyProgress(sb, t, writeDDL)
 	} else {
 		phrase := shardedTableStatusPhrase(status)
 		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !shardSummaryBreakdownState(status) {
@@ -554,6 +557,7 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 			line += fmt.Sprintf(" (%d shards)", len(t.Shards))
 		}
 		sb.WriteString(line + "\n")
+		writeDDL()
 	}
 	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards})
 }
@@ -567,9 +571,10 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 // dispatch waves), the figures describe only the reporting shards, so both the
 // headline and the rows line name the coverage and the ETA renders as a floor —
 // nothing claims to describe shards that have not started.
-func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
+func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
 	if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 		fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(t.Table), ui.ProgressBarActivity(), shardedCopyCoverageSuffix(t))
+		writeDDL()
 		fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
 		fmt.Fprintf(sb, "- %s _%s_\n", glyph.Info, ui.EstimateExceededTooltip)
 		return
@@ -577,10 +582,12 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
 	pct := ui.RowCopyDisplayPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal)*100/t.RowsTotal), t.RowsCopied)
 	if pct == 0 {
 		fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...\n", inlineCode(t.Table))
+		writeDDL()
 		writeShardedRowsAndETA(sb, t)
 		return
 	}
 	fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct, shardedCopyCoverageSuffix(t))
+	writeDDL()
 	writeShardedRowsAndETA(sb, t)
 }
 
