@@ -693,6 +693,82 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 	assert.NotContains(t, out, "testapp-004`**", "a target without detail is not a change of its own")
 }
 
+// Rolled-up targets that run different plans each point their cut DDL at the
+// stored plan of the group's first target, and a group of several says the
+// rest of the group runs the same DDL, the way the plan comment's target
+// groups do.
+func TestRenderMultiDeploymentApplyComment_RolledUpCutDDLNamesEachGroupsStoredPlan(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+		parallelTarget("primary", "testapp-003", so.Running),
+	})
+	longDDL := func(column string) string {
+		return "ALTER TABLE `orders` ADD COLUMN `" + column + "` text" + strings.Repeat(", ADD COLUMN `"+column+"_x` text", 2000)
+	}
+	withPlan := func(detail *ApplyStatusCommentData, planID string) *ApplyStatusCommentData {
+		detail.PlanID, detail.CLIName = planID, "acme schemabot"
+		return detail
+	}
+	out := renderTargets(model,
+		withPlan(targetDetail("testapp_001", state.Task.Running, longDDL("note"), 500), "plan_001"),
+		withPlan(targetDetail("testapp_002", state.Task.Running, longDDL("memo"), 500), "plan_002"),
+		withPlan(targetDetail("testapp_003", state.Task.Running, longDDL("note"), 500), "plan_003"),
+	)
+
+	assert.LessOrEqual(t, len(out), commentBodyLimit-applyCommentAppendReserve)
+	assert.Contains(t, out, "the full plan for `testapp-001` is available from the CLI with `acme schemabot list-plans -e production plan_001` (every target in this group runs the same DDL).")
+	assert.Contains(t, out, "the full plan for this target is available from the CLI with `acme schemabot list-plans -e production plan_002`.")
+	assert.NotContains(t, out, "plan_003", "a group names only its first target's plan")
+}
+
+// Rolled-up targets that all report one change render with no group heading,
+// so a cut block's pointer names the target whose stored plan it is and says
+// the other targets run the same DDL only of the targets that have reported:
+// a target that has not reported is not known to run it.
+func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReportingTargets(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+		parallelTarget("primary", "testapp-003", so.Running),
+	})
+	longDDL := "ALTER TABLE `orders` ADD COLUMN `note` text" + strings.Repeat(", ADD COLUMN `note_x` text", 2000)
+	reporting := func(database, planID string) *ApplyStatusCommentData {
+		detail := targetDetail(database, state.Task.Running, longDDL, 500)
+		detail.PlanID, detail.CLIName = planID, "acme schemabot"
+		return detail
+	}
+	silent := func(database string) *ApplyStatusCommentData {
+		return &ApplyStatusCommentData{Database: database, State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit}
+	}
+	const pointer = "_DDL truncated to fit GitHub's comment size limit; the full plan for `testapp-001` is available from the CLI with `acme schemabot list-plans -e production plan_001`"
+
+	t.Run("every target reports", func(t *testing.T) {
+		out := renderTargets(model, reporting("testapp_001", "plan_001"), reporting("testapp_002", "plan_002"), reporting("testapp_003", "plan_003"))
+
+		assert.Contains(t, out, pointer+" (every target runs the same DDL)._\n")
+		assert.NotContains(t, out, "have not reported progress yet")
+	})
+
+	t.Run("a silent target is not claimed", func(t *testing.T) {
+		out := renderTargets(model, reporting("testapp_001", "plan_001"), reporting("testapp_002", "plan_002"), silent("testapp_003"))
+
+		assert.Contains(t, out, pointer+" (every target that has reported runs the same DDL)._\n")
+		assert.NotContains(t, out, "every target runs the same DDL")
+		assert.NotContains(t, out, "every target in this group")
+		assert.Contains(t, out, "\n_1 of 3 targets have not reported progress yet._\n")
+	})
+
+	t.Run("one reporting target is named and speaks for no other", func(t *testing.T) {
+		out := renderTargets(model, reporting("testapp_001", "plan_001"), silent("testapp_002"), silent("testapp_003"))
+
+		assert.Contains(t, out, pointer+"._\n")
+		assert.NotContains(t, out, "for this target", "no heading names the target, so the pointer does")
+		assert.NotContains(t, out, "runs the same DDL")
+		assert.Contains(t, out, "\n_2 of 3 targets have not reported progress yet._\n")
+	})
+}
+
 // A failed target is named with its error in a status table, the way the
 // sharded comment names a failed shard. The table is capped so a deployment
 // whose every target failed still fits in one comment; the <summary> counts
