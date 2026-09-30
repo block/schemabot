@@ -297,6 +297,40 @@ func TestE2EApplyConfirmOnConvergedPrimaryWithPendingTargetRefuses(t *testing.T)
 	assert.True(t, check.HasChanges)
 }
 
+// The reviewed primary (eu) already has the column and us does not, so the
+// apply pauses on a comment that shows us's plan alone. Before the operator
+// confirms, eu loses the column and needs the change again. The confirmed
+// comment never showed eu's plan, so apply-confirm refuses, runs nothing on
+// either target, and releases the pending confirmation.
+func TestE2EApplyConfirmRefusesWhenConvergedPrimaryGainsChanges(t *testing.T) {
+	dbName := "webhook_rollout_primary_regained"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Confirmation required")
+	assert.Contains(t, body, "The reviewed target already has this schema")
+
+	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
+	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` DROP COLUMN `email`")
+	require.NoError(t, err)
+
+	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+	body = awaitCommentContaining(t, confirm, "now has changes of its own")
+	assert.Contains(t, body, "showed the reviewed target already at the desired schema")
+	assert.Contains(t, body, "nothing was applied")
+
+	requireNoApplies(t, svc, dbName)
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "the refused confirmation releases the pending lock")
+}
+
 // planResultFailingStorage fails every plan-result write to stored check
 // state, so a test can observe what the PR's check shows when the write that
 // records a pending rollout never lands.

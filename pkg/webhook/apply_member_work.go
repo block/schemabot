@@ -196,9 +196,9 @@ func pendingRolloutMessage(outcome reviewDriftOutcome) string {
 // apply-confirm acts on was given against the member work it is about to run,
 // with a reason for the log when it was not.
 //
-// Only one comment pins an empty reviewed plan: the one the apply command posts
-// when the reviewed target is already at the desired schema and other targets
-// still have work, and that comment renders every target's plan. A pinned plan
+// Only the comment the apply command posts when the reviewed target is already
+// at the desired schema and other targets still have work renders the other
+// targets' plans, and it pins the reviewed target's empty plan. A pinned plan
 // with work of its own was confirmed against a comment that showed the reviewed
 // target's plan alone, so no other target's work was on it.
 //
@@ -249,12 +249,15 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	return true, "", nil
 }
 
-// confirmedPlanHasNoWork reports whether the plan a pending confirmation is
-// pinned to has no work of its own, which only the confirmation of an apply
-// whose reviewed target was already at the desired schema is. A pinned plan
-// that no longer loads is an error: whether its comment showed the reviewed
-// target's changes cannot be told.
-func (h *Handler) confirmedPlanHasNoWork(ctx context.Context, pinnedPlanID string) (bool, error) {
+// confirmedConvergedTargetRound reports whether the pending confirmation an
+// apply-confirm acts on was given against the comment an apply posts when the
+// reviewed target is already at the desired schema and other targets still have
+// work. That comment pins the reviewed target's empty plan and renders the plans
+// the review round stored for the other targets, so both are read from storage:
+// an empty pinned plan alone is not that comment, since a database with one
+// target has no round of other targets' plans for it to have shown. A pinned
+// plan that no longer loads is an error: what its comment showed cannot be told.
+func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanID, environment string) (bool, error) {
 	pinned, err := h.service.Storage().Plans().Get(ctx, pinnedPlanID)
 	if err != nil {
 		return false, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
@@ -262,7 +265,23 @@ func (h *Handler) confirmedPlanHasNoWork(ctx context.Context, pinnedPlanID strin
 	if pinned == nil {
 		return false, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
 	}
-	return !pinned.HasWork(), nil
+	if pinned.HasWork() {
+		h.logger.Debug("apply-confirm: the confirmed plan has work on the reviewed target, so its comment was not a converged-target confirmation",
+			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID)
+		return false, nil
+	}
+	members, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
+	if err != nil {
+		return false, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
+	}
+	for _, member := range members {
+		if member.HasWork() {
+			return true, nil
+		}
+	}
+	h.logger.Debug("apply-confirm: the confirmed round planned no other target with work, so its comment was not a converged-target confirmation",
+		"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "member_plans", len(members))
+	return false, nil
 }
 
 // sameMemberWork reports whether two plans for one member run the same

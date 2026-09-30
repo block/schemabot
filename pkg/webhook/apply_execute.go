@@ -113,21 +113,23 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// A confirmation pinned to an empty reviewed plan was given against a
-	// comment saying the reviewed target already had this schema. If the
-	// reviewed target has changes of its own now, none of them were on that
-	// comment, so they never run on the strength of it.
+	// A confirmation given against the comment saying the reviewed target
+	// already had this schema, which showed only the other targets' plans, does
+	// not cover changes the reviewed target has gained since: none of them were
+	// on that comment, so they never run on the strength of it. Any other
+	// confirmation was given against the reviewed target's own plan, and the
+	// gates below re-check that.
 	if storedPlan == nil && planResp.HasChanges() {
-		confirmedEmpty, emptyErr := h.confirmedPlanHasNoWork(ctx, expectedPendingPlanID)
-		if emptyErr != nil {
-			h.logger.Error("apply-confirm rejected: could not load the confirmed plan to compare with the reviewed target's changes; the pending confirmation is preserved",
+		confirmedConverged, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, environment)
+		if roundErr != nil {
+			h.logger.Error("apply-confirm rejected: could not load the confirmed plan and its review round to compare with the reviewed target's changes; the pending confirmation is preserved",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", emptyErr)
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", roundErr)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
 				"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
 			return
 		}
-		if confirmedEmpty {
+		if confirmedConverged {
 			h.logger.Info("apply-confirm refused: the reviewed target has changes the confirmed comment did not show",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)

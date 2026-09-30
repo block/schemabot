@@ -1496,8 +1496,8 @@ unfinished row copy, require the operator to confirm the specific consequences d
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), including the re-check that other rollout members' work is what the
-confirmation was given against and carries no consequence it did not disclose
-(`confirmationCoversMemberWork` and `memberWorkRefusal` in `pkg/webhook/apply_member_work.go`), plus rollback confirmation's transactional lock-intent check
+confirmation was given against, that the reviewed target has gained no changes of its own since, and that the work carries no consequence it did not disclose
+(`confirmedConvergedTargetRound`, `confirmationCoversMemberWork` and `memberWorkRefusal` in `pkg/webhook/apply_member_work.go`), plus rollback confirmation's transactional lock-intent check
 (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
 `verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
 
