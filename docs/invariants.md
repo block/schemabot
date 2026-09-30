@@ -1530,9 +1530,8 @@ direct-execution size bound ([direct-execution.md](direct-execution.md)); the po
 verdicts were judged under recorded on the plan row and read at admission in place of a second
 resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`); in a rollout, each
 member's own direct changes disclosed under that member's plan (`deploymentPlanGroups` in
-`pkg/webhook/plan_drift.go`), and apply creation refusing a member's own direct-execution DDL where
-the reviewed plan has work of its own and so discloses no other target's statements
-(`rejectMemberDirectExecution` in `pkg/api/plan_handlers.go`).
+`pkg/webhook/plan_drift.go`), with apply-confirm refusing a member whose execution modes differ
+from the confirmed round's (`roundCoversWork` in `pkg/webhook/apply_member_work.go`).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 

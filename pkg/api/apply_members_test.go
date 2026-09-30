@@ -544,8 +544,8 @@ func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
 		{name: "same work", reviewed: planWith(alter), member: planWith(alter), want: ""},
 		{name: "disclosed unsafe change", reviewed: planWith(alter, drop), member: planWith(alter, drop), want: ""},
 		{name: "undisclosed unsafe change", reviewed: planWith(alter), member: planWith(alter, drop), want: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`},
-		{name: "direct execution", reviewed: planWith(alter), member: planWith(direct), want: `runs table "users" as direct-execution DDL`},
-		{name: "direct execution the reviewed plan runs too", reviewed: planWith(direct), member: planWith(direct), want: `runs table "users" as direct-execution DDL`},
+		{name: "disclosed direct execution", reviewed: planWith(alter), member: planWith(direct), want: ""},
+		{name: "disclosed direct execution the reviewed plan runs too", reviewed: planWith(direct), member: planWith(direct), want: ""},
 		{name: "blocked change", reviewed: planWith(alter), member: planWith(blocked), want: "carries changes its target's engine refuses"},
 		{name: "work outside the shape", reviewed: planWith(alter), member: shardOnly, want: "has per-shard changes in namespaces [testapp]"},
 	} {
@@ -882,12 +882,13 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 	assert.Nil(t, byTarget["testapp-002"].StartedAt, "nothing ran on the converged member")
 }
 
-// Where the reviewed target has work of its own, the locked comment discloses
-// how the reviewed plan's statements run and names no other target's direct
-// changes. A member planned on its own that runs direct-execution DDL is refused
-// there, including the same statement the reviewed plan runs directly, so no
-// direct statement runs without a comment disclosing it.
-func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasWork(t *testing.T) {
+// The reviewed target and another target both add a column, and the other
+// target's own plan runs it as direct-execution DDL because its table is within
+// the direct execution bound. The verdict belongs to the target that runs the
+// statement, and the comment the operator confirms discloses it under that
+// target, so apply creation builds each target's task with its own verdict: the
+// reviewed target's through Spirit, the other target's direct.
+func TestCreateStoredApply_ReviewedPlanWithWorkRunsAMembersDirectChange(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
 		Table:     "users",
@@ -896,27 +897,32 @@ func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasW
 	}
 	direct := alter
 	direct.ExecutionMode = "direct"
-	// The disclosure names the reviewed target's table at the size measured
-	// there, so the reviewed plan running the identical statement directly
-	// consents to nothing on the other target's copy of the table.
-	for name, reviewedChange := range map[string]storage.TableChange{
-		"reviewed plan runs it online":   alter,
-		"reviewed plan runs it directly": direct,
-	} {
-		t.Run(name, func(t *testing.T) {
-			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
-			reviewed := primaryPlanRow("testapp-001")
-			reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{reviewedChange}}}
+	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
+	reviewed := primaryPlanRow("testapp-001")
+	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
 
-			_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-member-direct")
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
-			assert.Contains(t, err.Error(), "runs table \"users\" as direct-execution DDL")
-			applies, ok := svc.storage.Applies().(*capturingApplyStore)
-			require.True(t, ok)
-			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
-		})
+	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-member-direct")
+	require.NoError(t, err)
+
+	applies, ok := svc.storage.Applies().(*capturingApplyStore)
+	require.True(t, ok)
+	require.NotNil(t, applies.apply, "the apply is stored")
+	tasks := applies.taskStore.tasks
+	require.Len(t, tasks, 2, "each target runs its own ALTER")
+	targetOf := map[int64]string{}
+	for _, operation := range applies.operations {
+		targetOf[operation.ID] = operation.Target
 	}
+	modes := map[string]string{}
+	for _, task := range tasks {
+		assert.Equal(t, "users", task.TableName)
+		assert.Contains(t, task.DDL, "ADD COLUMN `email`")
+		require.NotNil(t, task.ApplyOperationID)
+		modes[targetOf[*task.ApplyOperationID]] = task.ExecutionMode
+	}
+	assert.Equal(t, map[string]string{"testapp-001": "", "testapp-002": "direct"}, modes,
+		"each target's task carries its own plan's verdict")
 }
 
 // Two PostgreSQL targets map the namespace to differently named physical

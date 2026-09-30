@@ -111,6 +111,7 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 // an empty one can carry only per-member table work and discloses nothing
 // (api.MemberWorkAConvergedReviewedPlanCannotRun), and one with work holds each
 // member to its shape and to its disclosure (api.MemberWorkTheReviewedPlanCannotRun).
+// A member's direct change runs under either, as the comment disclosed it.
 func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment string, rollout reviewDriftOutcome, reviewedTargetConverged bool) (string, error) {
 	if rollout.work.copyAtStake != "" {
 		return rollout.work.copyAtStake, nil
