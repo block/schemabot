@@ -1719,7 +1719,7 @@ func (s *Service) createStoredApply(
 	// member's. Members that run the apply's plan re-clear the same checks here,
 	// which is a no-op rather than a second verdict.
 	for _, member := range members {
-		if err := rejectUnapplyableMemberPlan(member, applyOpts); err != nil {
+		if err := rejectUnapplyableMemberPlan(member, plan, applyOpts); err != nil {
 			return nil, 0, err
 		}
 		if err := rejectMemberDirectExecution(member, plan); err != nil {
@@ -1778,10 +1778,15 @@ func (s *Service) createStoredApply(
 // looking for it in the plan they reviewed.
 //
 // Blocked changes reject before unsafe ones for the same reason they do there:
-// no opt-in can make a statement the engine refuses executable.
-func rejectUnapplyableMemberPlan(member applyMember, applyOpts storage.ApplyOptions) error {
+// no opt-in can make a statement the engine refuses executable. An unsafe change
+// the reviewed plan's disclosure never named rejects before the opt-in is
+// consulted, since no opt-in covers it.
+func rejectUnapplyableMemberPlan(member applyMember, applyPlan *storage.Plan, applyOpts storage.ApplyOptions) error {
 	if err := member.Plan.BlockedApplyError(); err != nil {
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
+	}
+	if err := rejectMemberUndisclosedUnsafe(member, applyPlan); err != nil {
+		return err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
 		return fmt.Errorf("rollout member %s: %w", member.MemberID(), err)
@@ -1815,8 +1820,9 @@ func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 // refused whatever the command's flags: the operator consents to them against
 // the disclosure the reviewed plan's comment carries, and the member plans that
 // comment renders carry none. Apply creation refuses a member's own
-// direct-execution statement whether or not the reviewed plan is empty
-// (rejectMemberDirectExecution).
+// direct-execution statement, and an unsafe change the reviewed plan does not
+// carry, whether or not the reviewed plan is empty (rejectMemberDirectExecution,
+// rejectMemberUndisclosedUnsafe).
 func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 	if plan.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
@@ -1858,6 +1864,52 @@ func rejectMemberDirectExecution(member applyMember, applyPlan *storage.Plan) er
 		}
 	}
 	return nil
+}
+
+// rejectMemberUndisclosedUnsafe refuses a member planned on its own whose plan
+// carries an unsafe change the reviewed plan does not, whatever the command's
+// flags. The operator's unsafe opt-in is given against the disclosure on the
+// comment it confirms, which lists the reviewed plan's unsafe changes and no
+// other target's: the other targets' plans render as statements alone. So a
+// member's unsafe change runs under the opt-in only when the reviewed plan
+// carries the same change, which the disclosure named (RV-3). A member running
+// the apply's plan runs exactly the changes that disclosure names.
+func rejectMemberUndisclosedUnsafe(member applyMember, applyPlan *storage.Plan) error {
+	if member.Plan == applyPlan {
+		return nil
+	}
+	if reason := UndisclosedMemberUnsafeChange(applyPlan, member.Plan); reason != "" {
+		return fmt.Errorf("rollout member %s: plan %s %s that the reviewed plan %s does not carry, so the disclosure the operator confirmed never named it and no opt-in covers it",
+			member.MemberID(), member.Plan.PlanIdentifier, reason, applyPlan.PlanIdentifier)
+	}
+	return nil
+}
+
+// UndisclosedMemberUnsafeChange describes the first unsafe change in a member's
+// own plan that the reviewed plan does not carry, or returns "" when every
+// unsafe change the member carries is one the reviewed plan's disclosure names.
+// A change is the same when it touches the same table with the same statement,
+// or the same namespace's VSchema for the same reason. An empty reviewed plan
+// discloses nothing, so every unsafe member change is undisclosed. The
+// description names only tables and namespaces, so it is fit for a PR comment.
+func UndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) string {
+	disclosed := reviewed.UnsafeDDLChanges()
+	for _, change := range member.UnsafeDDLChanges() {
+		if !slices.ContainsFunc(disclosed, func(named storage.TableChange) bool { return sameUnsafeTableChange(named, change) }) {
+			return fmt.Sprintf("carries an unsafe change for table %q", change.Table)
+		}
+	}
+	disclosedVSchema := reviewed.UnsafeVSchemaChanges()
+	for _, change := range member.UnsafeVSchemaChanges() {
+		if !slices.Contains(disclosedVSchema, change) {
+			return fmt.Sprintf("carries an unsafe VSchema change in namespace %q", change.Namespace)
+		}
+	}
+	return ""
+}
+
+func sameUnsafeTableChange(a, b storage.TableChange) bool {
+	return a.Namespace == b.Namespace && a.Table == b.Table && a.Operation == b.Operation && a.DDL == b.DDL
 }
 
 func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
@@ -2075,24 +2127,55 @@ func operationShapeOf(plan *storage.Plan, taskChanges []storage.TableChange) ope
 // plan is held to the second rule as well, since it chose the shape without
 // being checked against it. A member with no work fits every shape.
 func rejectMemberWorkOutsideShape(member applyMember, applyPlan *storage.Plan, shape operationShape) error {
-	if !member.Plan.HasWork() {
-		return nil
+	if reason := memberWorkOutsideShape(member.Plan, applyPlan, shape); reason != "" {
+		return fmt.Errorf("rollout member %s: plan %s %s, so the apply was not created rather than mark the target done without its change",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)
 	}
-	memberChanges := applyTaskChanges(member.Plan)
-	if member.Plan != applyPlan {
-		if needs := operationShapeOf(member.Plan, memberChanges); needs != shape {
-			return fmt.Errorf("rollout member %s: plan %s needs %s, but this apply runs %s, chosen from the reviewed plan %s, so the apply was not created rather than mark the target done without its change",
-				member.MemberID(), member.Plan.PlanIdentifier, needs, shape, applyPlan.PlanIdentifier)
+	return nil
+}
+
+// memberWorkOutsideShape describes the work in memberPlan that an apply of
+// shape, chosen from applyPlan, has no place for, or returns "" when it fits.
+func memberWorkOutsideShape(memberPlan, applyPlan *storage.Plan, shape operationShape) string {
+	if !memberPlan.HasWork() {
+		return ""
+	}
+	memberChanges := applyTaskChanges(memberPlan)
+	if memberPlan != applyPlan {
+		if needs := operationShapeOf(memberPlan, memberChanges); needs != shape {
+			return fmt.Sprintf("needs %s, but this apply runs %s, chosen from the reviewed plan", needs, shape)
 		}
 	}
 	if shape == operationShapeSharded {
-		return nil
+		return ""
 	}
-	if namespaces := shardWorkWithoutTableChanges(member.Plan, memberChanges); len(namespaces) > 0 {
-		return fmt.Errorf("rollout member %s: plan %s has per-shard changes in namespaces %v with no table statements to run them from, and this apply runs %s, so the apply was not created rather than mark the target done without its change",
-			member.MemberID(), member.Plan.PlanIdentifier, namespaces, shape)
+	if namespaces := shardWorkWithoutTableChanges(memberPlan, memberChanges); len(namespaces) > 0 {
+		return fmt.Sprintf("has per-shard changes in namespaces %v with no table statements to run them from, and this apply runs %s", namespaces, shape)
 	}
-	return nil
+	return ""
+}
+
+// MemberWorkTheReviewedPlanCannotRun describes the first thing in a member's
+// own plan that apply creation refuses when the apply is created from reviewed,
+// or returns "" when there is none: a blocked change, direct-execution DDL, an
+// unsafe change the reviewed plan's disclosure does not name, or work the
+// apply's shape has no place for. It asks what createStoredApply asks of each
+// member, so a caller can refuse before it pins a confirmation that apply
+// creation would refuse. The description names only tables, namespaces, and
+// the apply's shape, so it is fit for a PR comment.
+func MemberWorkTheReviewedPlanCannotRun(reviewed, member *storage.Plan) string {
+	if member.BlockedApplyError() != nil {
+		return "carries changes its target's engine refuses"
+	}
+	for _, change := range member.FlatDDLChanges() {
+		if strings.EqualFold(change.ExecutionMode, engine.ExecutionModeDirect) {
+			return fmt.Sprintf("runs table %q as direct-execution DDL", change.Table)
+		}
+	}
+	if reason := UndisclosedMemberUnsafeChange(reviewed, member); reason != "" {
+		return reason
+	}
+	return memberWorkOutsideShape(member, reviewed, operationShapeOf(reviewed, applyTaskChanges(reviewed)))
 }
 
 // shardWorkWithoutTableChanges returns, in sorted order, the namespaces whose

@@ -257,6 +257,40 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 	assert.Contains(t, byOperation, byDeployment["us"].ID)
 }
 
+// Two targets planned against schemas of their own, both needing the column.
+// eu also drops nickname, which the comment discloses as unsafe. us has drifted
+// and drops legacy_id besides, a change the reviewed plan does not carry, so the
+// comment's unsafe disclosure never names it. The operator's --allow-unsafe
+// covers only what was disclosed, so the apply refuses before it pauses for a
+// confirmation, runs nothing, and leaves the check pending.
+func TestE2EIndependentRolloutRefusesAnUnsafeTargetChangeTheCommentDidNotDisclose(t *testing.T) {
+	dbName := "webhook_rollout_unsafe"
+	withNickname := strings.Replace(usersBaseSchema, "  PRIMARY KEY", "  `nickname` varchar(64) DEFAULT NULL,\n  PRIMARY KEY", 1)
+	withLegacyID := strings.Replace(withNickname, "  PRIMARY KEY", "  `legacy_id` bigint DEFAULT NULL,\n  PRIMARY KEY", 1)
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: withNickname},
+		{name: "us", liveSchema: withLegacyID},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	runRolloutCommand(t, svc, dbName, "schemabot plan -e "+driftEnv)
+	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe")
+	body := awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
+		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied")
+	})
+	require.NotContains(t, body, "Confirmation required", "no confirmation is pinned for work apply creation refuses")
+	assert.Contains(t, body, "target us/"+dbName+"-us-target: its plan carries an unsafe change for table &#34;users&#34;")
+	requireNoApplies(t, svc, dbName)
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "a refusal before the pause holds no lock")
+	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
+}
+
 // The same rollout, planned automatically when the PR opens. The primary's own
 // plan is empty, but the check is pending on us, so auto-plan must post its
 // comment rather than skip it as a no-op: a check that is not passing always

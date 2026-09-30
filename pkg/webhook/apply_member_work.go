@@ -98,26 +98,21 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 // The apply runs each member's stored plan, and the comment the operator
 // confirms renders those plans' statements and nothing else. So work the apply
 // cannot run as planned, and anything whose consent rests on a disclosure that
-// comment does not carry, refuses here: an unsafe or direct-execution change, or
-// an unfinished copy the apply would discard. It is asked before the apply
-// pauses, so a refusal never pins a confirmation that could not succeed, and
-// again at confirm against the rollout as it is then.
+// comment does not carry, refuses here: an unsafe change the reviewed plan's
+// disclosure does not name, a direct-execution change, or an unfinished copy
+// the apply would discard. It is asked before the apply pauses, so a refusal
+// never pins a confirmation that could not succeed, and again at confirm against
+// the rollout as it is then.
 //
 // A copy at stake refuses whether or not the reviewed target has work, since
-// the comment discloses only the reviewed plan's discarded copies. The rest
-// is asked here only of an empty reviewed plan: when the reviewed target has
-// work, apply creation holds each member to the reviewed plan's shape
-// (rejectMemberWorkOutsideShape) and refuses its own direct-execution,
-// blocked, and unsafe changes (rejectMemberDirectExecution,
-// rejectUnapplyableMemberPlan).
+// the comment discloses only the reviewed plan's discarded copies. The rest is
+// what apply creation asks of each member, which depends on the reviewed plan:
+// an empty one can carry only per-member table work and discloses nothing
+// (api.MemberWorkAConvergedReviewedPlanCannotRun), and one with work holds each
+// member to its shape and to its disclosure (api.MemberWorkTheReviewedPlanCannotRun).
 func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment string, rollout reviewDriftOutcome, reviewedTargetConverged bool) (string, error) {
 	if rollout.work.copyAtStake != "" {
 		return rollout.work.copyAtStake, nil
-	}
-	if !reviewedTargetConverged {
-		h.logger.Debug("member-work preflight: the reviewed target has work, so apply creation checks the other targets' plans",
-			"environment", environment, "plan_id", planID)
-		return "", nil
 	}
 	plan, err := h.service.Storage().Plans().Get(ctx, planID)
 	if err != nil {
@@ -135,11 +130,20 @@ func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment str
 		if !memberPlan.HasWork() {
 			continue
 		}
-		if reason := api.MemberWorkAConvergedReviewedPlanCannotRun(memberPlan); reason != "" {
+		if reason := memberWorkReviewedPlanCannotRun(plan, memberPlan, reviewedTargetConverged); reason != "" {
 			return fmt.Sprintf("target %s: its plan %s", member, reason), nil
 		}
 	}
 	return "", nil
+}
+
+// memberWorkReviewedPlanCannotRun asks of one member's plan what apply creation
+// asks of it under the reviewed plan the apply is created from.
+func memberWorkReviewedPlanCannotRun(reviewed, member *storage.Plan, reviewedTargetConverged bool) string {
+	if reviewedTargetConverged {
+		return api.MemberWorkAConvergedReviewedPlanCannotRun(member)
+	}
+	return api.MemberWorkTheReviewedPlanCannotRun(reviewed, member)
 }
 
 // annotateMemberApplyRefusal records on a plan comment why a PR apply cannot
