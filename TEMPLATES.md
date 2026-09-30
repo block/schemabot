@@ -309,9 +309,9 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL
-- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+- `users`: dropping primary key is not supported; the table has ~1,240 rows
 
-These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+Writes to each table are blocked until its statement finishes, and `--defer-cutover` does not apply to them. Confirming the apply consents to this.
 
 📋 **Plan**: **2** tables to alter
 

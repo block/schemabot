@@ -570,8 +570,8 @@ const (
 
 	// ExecutionModeDirect marks a statement the engine refuses but that the
 	// database's direct execution policy routes to native DDL on the target
-	// instead: it runs synchronously, it blocks writes to the table while it
-	// runs, and it is not revertible.
+	// instead: it runs synchronously and blocks writes to the table while it
+	// runs.
 	ExecutionModeDirect = "direct"
 )
 

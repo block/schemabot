@@ -235,7 +235,7 @@ func PreviewCommentPlanDirect() string {
 			},
 		},
 		DirectChanges: []DirectChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+			{Table: "users", Reason: "dropping primary key is not supported; the table has ~1,240 rows"},
 		},
 		PendingManualConfirmation: true,
 	})

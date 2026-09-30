@@ -295,7 +295,7 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 	}
 	return refusedModeDecision{
 		mode:       engine.ExecutionModeDirect,
-		modeReason: fmt.Sprintf("%s; runs as native MySQL DDL on a table with ~%s rows", refusalReason, ui.FormatNumber(count)),
+		modeReason: fmt.Sprintf("%s; the table has ~%s rows", refusalReason, ui.FormatNumber(count)),
 		rows:       count,
 	}
 }
@@ -316,7 +316,7 @@ func (e *Engine) resolveByteBound(policy directPolicy, database, tableName, refu
 	}
 	return refusedModeDecision{
 		mode: engine.ExecutionModeDirect,
-		modeReason: fmt.Sprintf("%s; runs as native MySQL DDL on a table with %s of data and indexes",
+		modeReason: fmt.Sprintf("%s; the table has %s of data and indexes",
 			refusalReason, ui.FormatApproxBytes(size.bytes)),
 		bytes: size.bytes,
 	}
@@ -626,7 +626,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		progress := e.trackDirectStatement(ds.table, ds.stmt)
 		logger.Info("executing statement directly as native MySQL DDL",
 			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows, "estimated_bytes", ds.bytes)
-		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: writes to the table block while it runs; not revertible")
+		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: writes to the table block while it runs")
 		if _, err := conn.ExecContext(ctx, ds.stmt); err != nil {
 			if ctx.Err() != nil {
 				// A cancelled context closes the connection, but MySQL may

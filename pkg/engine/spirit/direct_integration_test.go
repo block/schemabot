@@ -155,7 +155,7 @@ func TestEngine_Plan_DirectVerdictWithinBound(t *testing.T) {
 	assert.Contains(t, changes[0].DDL, "DROP PRIMARY KEY")
 	assert.Equal(t, "direct", changes[0].ExecutionMode, "the refused statement resolves to the direct verdict")
 	assert.Contains(t, changes[0].ModeReason, "dropping primary key is not supported")
-	assert.Contains(t, changes[0].ModeReason, "runs as native MySQL DDL on a table with ~")
+	assert.Contains(t, changes[0].ModeReason, "; the table has ~")
 }
 
 // A table whose row count exceeds max_table_rows keeps the blocked verdict
@@ -382,7 +382,7 @@ func TestEngine_Plan_DirectVerdictWithinByteBound(t *testing.T) {
 
 	assert.Equal(t, engine.ExecutionModeDirect, change.ExecutionMode)
 	assert.Contains(t, change.ModeReason, "dropping primary key is not supported")
-	assert.True(t, strings.HasSuffix(change.ModeReason, "; runs as native MySQL DDL on a table with "+
+	assert.True(t, strings.HasSuffix(change.ModeReason, "; the table has "+
 		ui.FormatApproxBytes(measured)+" of data and indexes"), "reason %q", change.ModeReason)
 }
 
