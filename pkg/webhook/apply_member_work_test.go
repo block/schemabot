@@ -15,12 +15,12 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// A PR apply whose reviewed target is already converged runs the other targets'
-// plans only when the rollout passed its contract, some target has work, and
-// the comment renders every target's plan. Anything else refuses, since the
-// apply would otherwise run statements its comment never showed.
+// A PR apply runs the other targets' plans only when the rollout passed its
+// contract, a target other than the reviewed one has work, and the comment
+// renders every target's plan. Anything else refuses, since the apply would
+// otherwise run statements its comment never showed.
 func TestRolloutRunsMemberWork(t *testing.T) {
-	pending := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 3, names: []string{"payments-002", "payments-003"}}}
+	pending := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 3, others: 2, names: []string{"payments-002", "payments-003"}}}
 	targetPlans := func() *templates.DeploymentDriftData {
 		return &templates.DeploymentDriftData{
 			Computed: true, Clean: true, Independent: true,
@@ -42,6 +42,9 @@ func TestRolloutRunsMemberWork(t *testing.T) {
 
 	converged := reviewDriftOutcome{state: driftClean, work: memberWork{members: 3}}
 	assert.False(t, rolloutRunsMemberWork(converged, targetPlans()), "a rollout with no work left has nothing to run")
+
+	reviewedOnly := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 1, members: 3, names: []string{"payments-001"}}}
+	assert.False(t, rolloutRunsMemberWork(reviewedOnly, targetPlans()), "work on the reviewed target alone runs the reviewed plan")
 
 	assert.False(t, rolloutRunsMemberWork(pending, nil), "no preview means the comment showed no target's plan")
 

@@ -644,3 +644,63 @@ func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *te
 		})
 	}
 }
+
+// The apply's shape, per-shard fan-out, finalizer, or one work operation per
+// member, is chosen from the apply's own plan, and every member is built into
+// that shape. A member planned on its own can carry work that shape has no place
+// for, and building it anyway would leave the member with no operation for that
+// work: settled as done, or never created, while its target never got the
+// change. Apply creation refuses instead, naming the member.
+func TestBuildApplyOperationGroups_MemberWorkTheApplyShapeCannotCarryIsRefused(t *testing.T) {
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+	flatPlan := func(p *storage.Plan) *storage.Plan {
+		p.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+		return p
+	}
+	shardedPlan := func(p *storage.Plan) *storage.Plan {
+		p = flatPlan(p)
+		p.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "testapp", Changes: []storage.TableChange{alter}}}
+		return p
+	}
+	vschemaOnlyPlan := func(p *storage.Plan) *storage.Plan {
+		p.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {
+			Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{"users":{}}}`},
+		}}
+		return p
+	}
+	shardChangesOnlyPlan := func(p *storage.Plan) *storage.Plan {
+		p.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "testapp", Changes: []storage.TableChange{alter}}}
+		return p
+	}
+	for _, tc := range []struct {
+		name     string
+		reviewed func(*storage.Plan) *storage.Plan
+		member   func(*storage.Plan) *storage.Plan
+	}{
+		{name: "table changes reviewed, member changes only its VSchema", reviewed: flatPlan, member: vschemaOnlyPlan},
+		{name: "table changes reviewed, member changes only shards", reviewed: flatPlan, member: shardChangesOnlyPlan},
+		{name: "per-shard changes reviewed, member changes only tables", reviewed: shardedPlan, member: flatPlan},
+		{name: "VSchema change reviewed, member changes tables", reviewed: vschemaOnlyPlan, member: flatPlan},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			applyPlan := tc.reviewed(primaryPlanRow("testapp-001"))
+			memberPlan := tc.member(memberPlanRow("plan-second", "testapp-002", "plan-primary"))
+			members := []applyMember{
+				{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-001"}, Plan: applyPlan},
+				{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}, Plan: memberPlan},
+			}
+
+			groups, _, err := buildApplyOperationGroups(applyPlan, applyTaskChanges(applyPlan), members,
+				"production", storage.ApplyOptions{}, "", "", pershardTestTime())
+			require.Error(t, err, "built %d groups", len(groups))
+			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
+			assert.Contains(t, err.Error(), "plan-second")
+			assert.Nil(t, groups)
+		})
+	}
+}
