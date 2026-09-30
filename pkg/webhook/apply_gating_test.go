@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestFilterNonPassingNonSchemaBotChecks(t *testing.T) {
@@ -349,6 +350,29 @@ func TestFilterInProgressNonSchemaBotChecks(t *testing.T) {
 	assert.Equal(t, "queued", inProgress[1].State)
 	assert.Equal(t, "Deploy preview", inProgress[2].Name)
 	assert.Equal(t, "pending", inProgress[2].State)
+}
+
+// Any status other than "completed" means the check has not concluded, so the
+// gate treats it as unfinished: "waiting" (an Actions job paused on an
+// environment protection rule), "requested", and statuses GitHub has not
+// defined yet all block apply as in progress, and none of them is evaluated
+// as a non-passing completed check.
+func TestFilterInProgressNonSchemaBotChecks_UnfinishedStatusesFailClosed(t *testing.T) {
+	statuses := []ghclient.PRCheckStatus{
+		{Name: "Deploy / production-approval", Status: "waiting", Conclusion: ""},
+		{Name: "CI / integration", Status: "requested", Conclusion: ""},
+		{Name: "Security scan", Status: "some_future_status", Conclusion: ""},
+		{Name: "CI / lint", Status: "completed", Conclusion: "success"},
+	}
+
+	inProgress := filterInProgressNonSchemaBotChecks(statuses, nil)
+	require.Len(t, inProgress, 3)
+	assert.Equal(t, templates.BlockingCheck{Name: "Deploy / production-approval", State: "waiting"}, inProgress[0])
+	assert.Equal(t, templates.BlockingCheck{Name: "CI / integration", State: "requested"}, inProgress[1])
+	assert.Equal(t, templates.BlockingCheck{Name: "Security scan", State: "some_future_status"}, inProgress[2])
+
+	assert.Empty(t, filterNonPassingNonSchemaBotChecks(statuses, nil),
+		"unfinished checks block as in progress, not as completed checks with a failing conclusion")
 }
 
 func TestFilterInProgressNonSchemaBotChecks_RequiredChecks(t *testing.T) {
@@ -1120,6 +1144,54 @@ func TestEnforcePassingChecks(t *testing.T) {
 			t.Fatal("timed out waiting for in-progress-checks comment")
 		}
 	})
+
+	// A check run that is waiting on an environment approval, requested but
+	// not yet queued, or in a status GitHub adds later has not concluded, so
+	// apply must block and name the check with its status rather than proceed.
+	for _, status := range []string{"waiting", "requested", "some_future_status"} {
+		t.Run("unfinished status "+status+" blocks apply", func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 10)
+
+			registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+				{Typename: "CheckRun", Name: "Deploy / production-approval", Status: status, Conclusion: "", AppSlug: "github-actions"},
+				{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "success", AppSlug: "github-actions"},
+			})
+
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Body string `json:"body"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				comments <- body.Body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+			})
+
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			factory := &fakeClientFactory{client: installClient}
+
+			service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
+			h := &Handler{
+				service:   service,
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+				logger:    testLogger(),
+			}
+
+			blocked, err := h.enforcePassingChecks(t.Context(), installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+			require.NoError(t, err)
+			assert.True(t, blocked, "a check in status %q has not concluded and must block apply", status)
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "Cannot apply while PR checks are still running:")
+				assert.Contains(t, body, "| `Deploy / production-approval` | "+status+" |")
+				assert.NotContains(t, body, "CI / tests")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for in-progress-checks comment")
+			}
+		})
+	}
 
 	t.Run("variant app slug excluded from gate", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)

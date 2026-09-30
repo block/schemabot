@@ -1364,7 +1364,7 @@ By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR c
 require_passing_checks: true
 ```
 
-Apply is blocked in two cases: completed checks that did not **pass** and checks that are **still running** (`in_progress`, `queued`, `pending`). A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
+Apply is blocked in two cases: completed checks that did not **pass** and checks that have **not finished**. Any status other than `completed` (such as `in_progress`, `queued`, `pending`, `waiting`, or `requested`) counts as not finished, so unrecognized statuses fail closed. A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
 
 For repositories with many optional checks, `required_checks` can narrow the gate to specific check names:
 
