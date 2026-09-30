@@ -43,19 +43,38 @@ func TestPlanCmd_TargetRequiresEnvironment(t *testing.T) {
 
 // narrowedPlanServer serves plan from /api/plan, the given active applies from
 // /api/status, and accepts every apply, and records the requests the CLI sent
-// and the paths it called.
+// and the paths it called. Its status answer follows the server's: an apply's
+// deployment is reported only when the request names one, and then only that
+// deployment's applies are listed.
 type narrowedPlanServer struct {
 	mu       sync.Mutex
 	planReq  apitypes.PlanRequest
 	applyReq apitypes.ApplyRequest
 	paths    []string
+	// statusDeployments records the deployment filter of each status request.
+	statusDeployments []string
+}
+
+// statusAppliesFor lists active applies the way /api/status does: filtered by
+// deployment and reporting it when the request names one, and with no
+// deployment reported otherwise.
+func statusAppliesFor(deployment string, active []*apitypes.ActiveApplyResponse) []*apitypes.ActiveApplyResponse {
+	listed := make([]*apitypes.ActiveApplyResponse, 0, len(active))
+	for _, apply := range active {
+		reported := *apply
+		if deployment == "" {
+			reported.Deployment = ""
+		} else if apply.Deployment != deployment {
+			continue
+		}
+		listed = append(listed, &reported)
+	}
+	return listed
 }
 
 func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse, active ...*apitypes.ActiveApplyResponse) (*narrowedPlanServer, string) {
 	t.Helper()
 	planBody, err := json.Marshal(plan)
-	require.NoError(t, err)
-	statusBody, err := json.Marshal(apitypes.StatusResponse{Applies: active})
 	require.NoError(t, err)
 	recorded := &narrowedPlanServer{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -69,8 +88,8 @@ func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse, active ...
 			_, writeErr := w.Write(planBody)
 			assert.NoError(t, writeErr)
 		case "/api/status":
-			_, writeErr := w.Write(statusBody)
-			assert.NoError(t, writeErr)
+			recorded.statusDeployments = append(recorded.statusDeployments, r.URL.Query().Get("deployment"))
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StatusResponse{Applies: statusAppliesFor(r.URL.Query().Get("deployment"), active)}))
 		case "/api/apply":
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&recorded.applyReq))
 			_, writeErr := w.Write([]byte(`{"accepted":true,"apply_id":"apply-narrowed"}`))
@@ -123,6 +142,7 @@ func TestApplyCmd_TargetNarrowsPlanAndApply(t *testing.T) {
 	assert.Equal(t, "plan-narrowed", recorded.applyReq.PlanID)
 	assert.Equal(t, "prod/payments-002", recorded.applyReq.Target)
 	assert.Equal(t, []string{"/api/plan", "/api/status", "/api/apply"}, recorded.paths, "a targeted apply checks for active schema changes after planning resolves its member")
+	assert.Equal(t, []string{"prod"}, recorded.statusDeployments, "the preflight asks for the member's deployment")
 	assert.Equal(t, 1, strings.Count(out, "Target: prod/payments-002 (this plan covers only this rollout member)"), "the narrowing is disclosed once:\n%s", out)
 }
 
