@@ -331,7 +331,7 @@ func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChange
 			}
 			total++
 			for _, tc := range sp.GetChanges() {
-				if tc.GetExecutionMode() != mode {
+				if !strings.EqualFold(tc.GetExecutionMode(), mode) {
 					continue
 				}
 				out = mergeModeShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
@@ -345,7 +345,7 @@ func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChange
 	var out []templates.BlockedChangeData
 	for _, sc := range cs.Changes {
 		for _, tc := range sc.GetTableChanges() {
-			if tc.GetExecutionMode() == mode {
+			if strings.EqualFold(tc.GetExecutionMode(), mode) {
 				out = append(out, templates.BlockedChangeData{Table: tc.GetTableName(), Reason: tc.GetModeReason()})
 			}
 		}
