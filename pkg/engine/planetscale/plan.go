@@ -41,12 +41,14 @@ func vschemaDeletionsMetadata(currentRaw, desired string) (string, error) {
 	return apitypes.EncodeVSchemaDeletions(converted)
 }
 
-// vschemaMutationsMetadata detects in-place vindex definition changes between
-// the current and desired VSchema and encodes them for plan change metadata.
+// vschemaMutationsMetadata detects in-place routing changes between the
+// current and desired VSchema and encodes them for plan change metadata.
 // Mutations gate the apply behind the unsafe opt-in just like removals: a
-// same-name vindex whose type, params, or owner changes alters Vitess query
-// routing and lookup maintenance the moment the VSchema lands. Returns ""
-// when no vindex definition changes.
+// same-name vindex whose type, params, or owner changes, a keyspace whose
+// sharded flag flips, or a table whose type, primary vindex, or
+// auto-increment changes alters Vitess query routing, lookup maintenance, or
+// id generation the moment the VSchema lands. Returns "" when nothing
+// changes in place.
 func vschemaMutationsMetadata(currentRaw, desired string) (string, error) {
 	mutations, err := vschema.Mutations(currentRaw, desired)
 	if err != nil {

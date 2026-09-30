@@ -8,32 +8,47 @@ import (
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
-// Mutation kinds, in the order they are reported per vindex.
+// Mutation kinds. Vindex kinds are reported per vindex in the order listed,
+// then the keyspace's sharded flag, then table kinds per table in the order
+// listed.
 const (
 	MutationKindVindexType   = "vindex_type"
 	MutationKindVindexParams = "vindex_params"
 	MutationKindVindexOwner  = "vindex_owner"
+
+	MutationKindKeyspaceSharded = "keyspace_sharded"
+
+	MutationKindTableType          = "table_type"
+	MutationKindTablePrimaryVindex = "table_primary_vindex"
+	MutationKindTableAutoIncrement = "table_auto_increment"
 )
 
-// Mutation describes an in-place change to a vindex definition between a
-// current and desired VSchema: its type, one of its params, or its owner. The
-// vindex keeps its name, so nothing is structurally removed, but Vitess
-// starts routing queries and maintaining lookups differently the moment the
-// VSchema is applied — the blast radius matches removing the vindex outright
-// — so callers treat mutations as unsafe changes requiring the same explicit
-// operator opt-in as removals.
+// Mutation describes an in-place change between a current and desired
+// VSchema that alters how Vitess routes rows or generates ids without
+// structurally removing anything: a vindex definition's type, one of its
+// params, or its owner; the keyspace's sharded flag; or a table's type,
+// primary vindex, or auto-increment sequence. Vitess starts routing queries,
+// maintaining lookups, or issuing ids differently the moment the VSchema is
+// applied — the blast radius matches removing the entry outright — so callers
+// treat mutations as unsafe changes requiring the same explicit operator
+// opt-in as removals.
+//
+// Name is the vindex name for vindex kinds, the table name for table kinds,
+// and empty for the keyspace kind.
 type Mutation struct {
 	Kind   string `json:"kind"`
 	Name   string `json:"name"`
 	Reason string `json:"reason"`
 }
 
-// Mutations returns the in-place vindex definition changes between the
-// current and desired VSchema. A vindex that disappears entirely is a
-// removal, reported by Deletions and never duplicated here. An empty or blank
-// current VSchema (a new keyspace) has nothing to mutate. Both documents must
-// parse as VSchema keyspace JSON; a document that cannot be parsed returns an
-// error so callers can fail closed rather than miss a mutation.
+// Mutations returns the in-place changes between the current and desired
+// VSchema. A vindex, table, or column-vindex association that disappears
+// entirely is a removal, reported by Deletions and never duplicated here;
+// additions (a new vindex, table, secondary vindex, or an auto-increment on a
+// table that had none) are not mutations. An empty or blank current VSchema
+// (a new keyspace) has nothing to mutate. Both documents must parse as
+// VSchema keyspace JSON; a document that cannot be parsed returns an error so
+// callers can fail closed rather than miss a mutation.
 func Mutations(current, desired string) ([]Mutation, error) {
 	if strings.TrimSpace(current) == "" || strings.TrimSpace(current) == "{}" {
 		return nil, nil
@@ -77,7 +92,115 @@ func Mutations(current, desired string) ([]Mutation, error) {
 		}
 	}
 
+	if currentKs.GetSharded() != desiredKs.GetSharded() {
+		mutations = append(mutations, Mutation{
+			Kind: MutationKindKeyspaceSharded,
+			Reason: fmt.Sprintf("keyspace changes from %s to %s: Vitess routes every table in it differently the moment the VSchema is applied, while the rows stay where they are, so queries can miss rows or fail",
+				shardedLabel(currentKs.GetSharded()), shardedLabel(desiredKs.GetSharded())),
+		})
+	}
+
+	sharded := currentKs.GetSharded() || desiredKs.GetSharded()
+	for _, table := range sortedKeys(currentKs.Tables) {
+		desiredTable, ok := desiredKs.Tables[table]
+		if !ok {
+			continue
+		}
+		mutations = append(mutations, tableMutations(table, currentKs.Tables[table], desiredTable, sharded)...)
+	}
+
 	return mutations, nil
+}
+
+// tableMutations reports in-place changes to a table present in both the
+// current and desired VSchema.
+//
+// The primary vindex is the table's first column vindex: Vitess computes
+// every row's keyspace id from it, so replacing or reordering it re-keys the
+// whole table even when every association is still present. It is reported
+// whenever both sides have one and they differ, including when the old
+// primary's association is also removed — Deletions discloses the lost
+// association, this discloses that every row now routes by a different
+// vindex. A table that had no column vindexes gaining one is an addition.
+//
+// An auto-increment that is removed or re-pointed to a different column or
+// sequence changes where new ids come from. Without the sequence each shard
+// generates ids on its own and they collide across shards, so a removal is
+// reported when the keyspace is sharded on either side of the change; in a
+// keyspace that stays unsharded the single database's own auto-increment
+// column keeps issuing unique ids. A different sequence can hand out ids
+// already in use whatever the sharding, so a re-point is always reported.
+// Adding an auto-increment to a table that had none is an addition.
+func tableMutations(table string, current, desired *vschemapb.Table, sharded bool) []Mutation {
+	var mutations []Mutation
+
+	if current.GetType() != desired.GetType() {
+		mutations = append(mutations, Mutation{
+			Kind: MutationKindTableType,
+			Name: table,
+			Reason: fmt.Sprintf("table %q changes type from %s to %s: Vitess routes its queries differently the moment the VSchema is applied, so queries can miss rows or fail",
+				table, tableTypeLabel(current.GetType()), tableTypeLabel(desired.GetType())),
+		})
+	}
+
+	currentPrimary, desiredPrimary := primaryColumnVindex(current), primaryColumnVindex(desired)
+	if currentPrimary != nil && desiredPrimary != nil && columnVindexKey(currentPrimary) != columnVindexKey(desiredPrimary) {
+		mutations = append(mutations, Mutation{
+			Kind: MutationKindTablePrimaryVindex,
+			Name: table,
+			Reason: fmt.Sprintf("table %q changes its primary vindex from %q on (%s) to %q on (%s): every row's keyspace id is computed differently the moment the VSchema is applied, while the rows stay on their current shards, so queries can miss rows and new rows land on different shards",
+				table, currentPrimary.GetName(), strings.Join(columnVindexColumns(currentPrimary), ", "),
+				desiredPrimary.GetName(), strings.Join(columnVindexColumns(desiredPrimary), ", ")),
+		})
+	}
+
+	if currentAuto := current.GetAutoIncrement(); currentAuto != nil {
+		desiredAuto := desired.GetAutoIncrement()
+		switch {
+		case desiredAuto == nil && !sharded:
+			// A keyspace that stays unsharded falls back to its database's own
+			// auto-increment column, which still issues unique ids.
+		case desiredAuto == nil:
+			mutations = append(mutations, Mutation{
+				Kind: MutationKindTableAutoIncrement,
+				Name: table,
+				Reason: fmt.Sprintf("table %q stops using sequence %q for column %q: new ids are generated by each shard independently the moment the VSchema is applied, so they can collide across shards",
+					table, currentAuto.GetSequence(), currentAuto.GetColumn()),
+			})
+		case currentAuto.GetColumn() != desiredAuto.GetColumn() || currentAuto.GetSequence() != desiredAuto.GetSequence():
+			mutations = append(mutations, Mutation{
+				Kind: MutationKindTableAutoIncrement,
+				Name: table,
+				Reason: fmt.Sprintf("table %q changes its auto-increment from sequence %q on column %q to sequence %q on column %q: new ids come from a different source the moment the VSchema is applied, so they can collide with ids already in use",
+					table, currentAuto.GetSequence(), currentAuto.GetColumn(), desiredAuto.GetSequence(), desiredAuto.GetColumn()),
+			})
+		}
+	}
+
+	return mutations
+}
+
+// primaryColumnVindex returns a table's primary vindex association — its
+// first column vindex — or nil when the table has none.
+func primaryColumnVindex(t *vschemapb.Table) *vschemapb.ColumnVindex {
+	if cvs := t.GetColumnVindexes(); len(cvs) > 0 {
+		return cvs[0]
+	}
+	return nil
+}
+
+func shardedLabel(sharded bool) string {
+	if sharded {
+		return "sharded"
+	}
+	return "unsharded"
+}
+
+func tableTypeLabel(t string) string {
+	if t == "" {
+		return "the default table type"
+	}
+	return fmt.Sprintf("%q", t)
 }
 
 // paramMutations reports each changed, added, or removed param on a same-name

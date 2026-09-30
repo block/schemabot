@@ -159,6 +159,190 @@ func TestMutations_CombinedTypeParamsOwner(t *testing.T) {
 	assert.Equal(t, MutationKindVindexOwner, mutations[2].Kind)
 }
 
+func TestMutations_KeyspaceAndTableRouting(t *testing.T) {
+	// Changes to the keyspace's sharded flag or to a table's type, primary
+	// vindex, or auto-increment re-route rows or change where ids come from
+	// the moment the VSchema lands, so each is disclosed. Additions — a new
+	// secondary vindex, an auto-increment on a table that had none — are not.
+	const vindexes = `"vindexes": {"hash": {"type": "hash"}, "xxhash": {"type": "xxhash"}}`
+	usersTable := func(body string) string {
+		return `{"sharded": true, ` + vindexes + `, "tables": {"users": {` + body + `}}}`
+	}
+	const hashID = `"column_vindexes": [{"column": "id", "name": "hash"}]`
+	const hashIDThenXXHashEmail = `"column_vindexes": [{"column": "id", "name": "hash"}, {"column": "email", "name": "xxhash"}]`
+	const xxhashEmailThenHashID = `"column_vindexes": [{"column": "email", "name": "xxhash"}, {"column": "id", "name": "hash"}]`
+	const usersSeq = `"auto_increment": {"column": "id", "sequence": "users_seq"}`
+
+	tests := []struct {
+		name           string
+		current        string
+		desired        string
+		wantKind       string
+		wantName       string
+		reasonContains []string
+	}{
+		{
+			name:           "reordering column vindexes changes the primary vindex",
+			current:        usersTable(hashIDThenXXHashEmail),
+			desired:        usersTable(xxhashEmailThenHashID),
+			wantKind:       MutationKindTablePrimaryVindex,
+			wantName:       "users",
+			reasonContains: []string{`primary vindex from "hash" on (id) to "xxhash" on (email)`, "keyspace id"},
+		},
+		{
+			name:           "replacing the primary vindex on the same column",
+			current:        usersTable(hashID),
+			desired:        usersTable(`"column_vindexes": [{"column": "id", "name": "xxhash"}]`),
+			wantKind:       MutationKindTablePrimaryVindex,
+			wantName:       "users",
+			reasonContains: []string{`from "hash" on (id) to "xxhash" on (id)`},
+		},
+		{
+			name:           "removing the auto-increment",
+			current:        usersTable(hashID + `, ` + usersSeq),
+			desired:        usersTable(hashID),
+			wantKind:       MutationKindTableAutoIncrement,
+			wantName:       "users",
+			reasonContains: []string{`stops using sequence "users_seq" for column "id"`, "collide across shards"},
+		},
+		{
+			name:           "re-pointing the auto-increment sequence",
+			current:        usersTable(hashID + `, ` + usersSeq),
+			desired:        usersTable(hashID + `, "auto_increment": {"column": "id", "sequence": "users_seq_v2"}`),
+			wantKind:       MutationKindTableAutoIncrement,
+			wantName:       "users",
+			reasonContains: []string{`from sequence "users_seq" on column "id" to sequence "users_seq_v2" on column "id"`},
+		},
+		{
+			name:           "re-pointing the auto-increment column",
+			current:        usersTable(hashID + `, ` + usersSeq),
+			desired:        usersTable(hashID + `, "auto_increment": {"column": "user_id", "sequence": "users_seq"}`),
+			wantKind:       MutationKindTableAutoIncrement,
+			wantName:       "users",
+			reasonContains: []string{`on column "id" to sequence "users_seq" on column "user_id"`},
+		},
+		{
+			name:           "changing the table type",
+			current:        `{"tables": {"countries": {}}}`,
+			desired:        `{"tables": {"countries": {"type": "reference"}}}`,
+			wantKind:       MutationKindTableType,
+			wantName:       "countries",
+			reasonContains: []string{`table "countries" changes type from the default table type to "reference"`},
+		},
+		{
+			name:           "sharding an unsharded keyspace",
+			current:        `{"tables": {"users": {}}}`,
+			desired:        `{"sharded": true, ` + vindexes + `, "tables": {"users": {` + hashID + `}}}`,
+			wantKind:       MutationKindKeyspaceSharded,
+			wantName:       "",
+			reasonContains: []string{"from unsharded to sharded"},
+		},
+		{
+			name:           "unsharding a sharded keyspace",
+			current:        usersTable(hashID),
+			desired:        `{` + vindexes + `, "tables": {"users": {` + hashID + `}}}`,
+			wantKind:       MutationKindKeyspaceSharded,
+			wantName:       "",
+			reasonContains: []string{"from sharded to unsharded"},
+		},
+		{
+			name:    "adding a secondary vindex is not a mutation",
+			current: usersTable(hashID),
+			desired: usersTable(hashIDThenXXHashEmail),
+		},
+		{
+			name:    "adding an auto-increment to a table without one is not a mutation",
+			current: usersTable(hashID),
+			desired: usersTable(hashID + `, ` + usersSeq),
+		},
+		{
+			name:    "giving a table its first column vindex is not a mutation",
+			current: usersTable(``),
+			desired: usersTable(hashID),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mutations, err := Mutations(tt.current, tt.desired)
+			require.NoError(t, err)
+			if tt.wantKind == "" {
+				assert.Empty(t, mutations)
+				return
+			}
+			require.Len(t, mutations, 1)
+			assert.Equal(t, tt.wantKind, mutations[0].Kind)
+			assert.Equal(t, tt.wantName, mutations[0].Name)
+			for _, want := range tt.reasonContains {
+				assert.Contains(t, mutations[0].Reason, want)
+			}
+		})
+	}
+}
+
+func TestMutations_AutoIncrementRemovalFollowsSharding(t *testing.T) {
+	// Without its sequence each shard issues ids on its own, so dropping an
+	// auto-increment is disclosed whenever the keyspace is sharded before or
+	// after the change. A keyspace that stays unsharded keeps its database's
+	// own auto-increment column issuing unique ids, so the removal is not.
+	const seq = `, "auto_increment": {"column": "id", "sequence": "users_seq"}`
+	unsharded := func(extra string) string { return `{"tables": {"users": {"column_vindexes": []` + extra + `}}}` }
+	sharded := func(extra string) string {
+		return `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]` + extra + `}}}`
+	}
+
+	tests := []struct {
+		name      string
+		current   string
+		desired   string
+		wantKinds []string
+	}{
+		{name: "stays unsharded", current: unsharded(seq), desired: unsharded("")},
+		{name: "stays sharded", current: sharded(seq), desired: sharded(""), wantKinds: []string{MutationKindTableAutoIncrement}},
+		{name: "unsharded to sharded", current: unsharded(seq), desired: sharded(""), wantKinds: []string{MutationKindKeyspaceSharded, MutationKindTableAutoIncrement}},
+		{name: "sharded to unsharded", current: sharded(seq), desired: unsharded(""), wantKinds: []string{MutationKindKeyspaceSharded, MutationKindTableAutoIncrement}},
+		{
+			name:      "re-pointing the sequence in an unsharded keyspace",
+			current:   unsharded(seq),
+			desired:   unsharded(`, "auto_increment": {"column": "id", "sequence": "users_seq_v2"}`),
+			wantKinds: []string{MutationKindTableAutoIncrement},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mutations, err := Mutations(tt.current, tt.desired)
+			require.NoError(t, err)
+			var kinds []string
+			for _, m := range mutations {
+				kinds = append(kinds, m.Kind)
+			}
+			assert.Equal(t, tt.wantKinds, kinds)
+		})
+	}
+}
+
+func TestMutations_PrimaryVindexRemovedAlsoReportsNewPrimary(t *testing.T) {
+	// Dropping the primary vindex's association promotes the next one to
+	// primary. Deletions discloses the lost association; Mutations discloses
+	// that every row is now keyed by a different vindex.
+	current := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}, "xxhash": {"type": "xxhash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}, {"column": "email", "name": "xxhash"}]}}}`
+	desired := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}, "xxhash": {"type": "xxhash"}}, "tables": {"users": {"column_vindexes": [{"column": "email", "name": "xxhash"}]}}}`
+	mutations, err := Mutations(current, desired)
+	require.NoError(t, err)
+	require.Len(t, mutations, 1)
+	assert.Equal(t, MutationKindTablePrimaryVindex, mutations[0].Kind)
+	assert.Contains(t, mutations[0].Reason, `from "hash" on (id) to "xxhash" on (email)`)
+}
+
+func TestMutations_RemovedTableNotDuplicated(t *testing.T) {
+	// A table that leaves the VSchema is a removal reported by Deletions; its
+	// primary vindex and auto-increment are not also reported as mutations.
+	current := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}], "auto_increment": {"column": "id", "sequence": "users_seq"}}}}`
+	desired := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {}}`
+	mutations, err := Mutations(current, desired)
+	require.NoError(t, err)
+	assert.Empty(t, mutations)
+}
+
 func TestMutations_UnparseableCurrentFailsClosed(t *testing.T) {
 	_, err := Mutations("{not json", shardedVSchema)
 	require.Error(t, err)

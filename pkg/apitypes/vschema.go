@@ -69,20 +69,21 @@ func ParseVSchemaDeletions(metadata map[string]string) ([]VSchemaDeletion, error
 }
 
 // VSchemaMutationsMetadataKey is the plan change-metadata key under which
-// engines record in-place vindex definition changes in a namespace's VSchema
-// change as a JSON-encoded []VSchemaMutation. A mutation keeps the vindex's
-// name but changes how Vitess routes through it — a type change re-computes
-// every row's keyspace id, a repointed lookup backing table moves lookup rows
-// — so any recorded mutation makes the plan's VSchema change an unsafe change
-// requiring the same operator opt-in as a removal.
+// engines record in-place routing changes in a namespace's VSchema change as a
+// JSON-encoded []VSchemaMutation. A mutation removes nothing but changes how
+// Vitess routes rows or issues ids — a vindex type change or a new primary
+// vindex re-computes every row's keyspace id, a repointed lookup backing
+// table moves lookup rows, a dropped auto-increment sequence lets shards
+// issue colliding ids — so any recorded mutation makes the plan's VSchema
+// change an unsafe change requiring the same operator opt-in as a removal.
 const VSchemaMutationsMetadataKey = "vschema_mutations"
 
-// VSchemaMutation is one in-place vindex definition change in a namespace's
-// VSchema change. It mirrors the engine-side mutation type (pkg/vschema);
-// apitypes keeps its own copy so this package stays dependency-free.
+// VSchemaMutation is one in-place routing change in a namespace's VSchema
+// change. It mirrors the engine-side mutation type (pkg/vschema); apitypes
+// keeps its own copy so this package stays dependency-free.
 type VSchemaMutation struct {
-	Kind   string `json:"kind"`   // "vindex_type", "vindex_params", or "vindex_owner"
-	Name   string `json:"name"`   // vindex name
+	Kind   string `json:"kind"`   // "vindex_type", "vindex_params", "vindex_owner", "keyspace_sharded", "table_type", "table_primary_vindex", or "table_auto_increment"
+	Name   string `json:"name"`   // vindex name, table name, or empty for the keyspace
 	Reason string `json:"reason"` // operator-facing explanation of the risk
 }
 

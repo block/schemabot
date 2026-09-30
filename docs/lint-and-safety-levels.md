@@ -142,8 +142,21 @@ in a different table immediately, leaving the old table stale. The blast
 radius matches removing the vindex outright, so mutations take the same
 `--allow-unsafe` acknowledgment.
 
-Additions-only VSchema changes (new vindexes, new tables, new column-vindex
-associations) are not unsafe. Removals and mutations are detected structurally
+The same holds for in-place changes to the keyspace or a table's routing:
+flipping the keyspace's `sharded` flag, changing a table's `type`, changing a
+table's primary vindex (its first `column_vindexes` entry — including by
+reordering the entries), re-pointing a table's `auto_increment` to another
+column or sequence, and removing it from a keyspace that is sharded before or
+after the change. A new primary vindex computes every row's keyspace id
+differently while the rows stay on their current shards; without its
+sequence, each shard generates ids independently and they collide across
+shards. Removing an `auto_increment` from a keyspace that stays unsharded is
+not unsafe: its single database's own auto-increment column keeps issuing
+unique ids.
+
+Additions-only VSchema changes (new vindexes, new tables, new secondary
+column-vindex associations, an `auto_increment` on a table that had none) are
+not unsafe. Removals and mutations are detected structurally
 by comparing the current and desired VSchema documents; a VSchema that cannot
 be parsed fails the plan rather than skipping detection.
 
