@@ -1736,11 +1736,13 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 // operation's cutover, or nil when it is that operation's turn. It evaluates
 // earlierSiblingHoldsCutoverSQL, the rule the automatic cutover claim gates on,
 // so a manually requested cutover and the automatic one agree on whose turn it
-// is. Only operations of another rollout member (earlierRolloutMemberSQL) are
-// considered: a member's own operations, its shards and tables, cut over
-// together, since the cutover a request sends addresses the member's remote
-// apply and takes whichever of them are parked. It reads the order and does
-// not claim anything.
+// is between members. Only operations of another rollout member
+// (earlierRolloutMemberSQL) are considered: under a requested cutover a
+// member's own operations, its shards and tables, cut over together, since the
+// cutover a request sends addresses the member's remote apply and takes
+// whichever of them are parked. The automatic claim has no member filter and
+// still cuts them over one at a time. It reads the order and does not claim
+// anything.
 func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID int64) (*storage.ApplyOperation, error) {
 	args := append([]any{operationID}, earlierSiblingHoldsCutoverArgs()...)
 	row := s.db.QueryRowContext(ctx, `

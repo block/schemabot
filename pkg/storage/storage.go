@@ -1437,9 +1437,11 @@ type ApplyOperationStore interface {
 	// completed, unless the rollout's on_failure policy continues past its
 	// terminal failure. A manually requested cutover uses it so that it lands
 	// on the member whose turn it is, in the order the automatic cutover claim
-	// would follow. Operations of the same member, its shards and tables, never
-	// hold each other: a cutover addresses the member's remote apply, which
-	// takes whichever of them are parked. It claims nothing.
+	// would follow between members. Operations of the same member, its shards
+	// and tables, never hold each other's requested cutover: the request
+	// addresses the member's remote apply, which takes whichever of them are
+	// parked. The automatic claim still cuts them over one at a time. It claims
+	// nothing.
 	CutoverBlocker(ctx context.Context, operationID int64) (*ApplyOperation, error)
 
 	// ReleaseClaim releases an operation lease the calling driver holds but

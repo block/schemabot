@@ -412,7 +412,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// of one deployment are separate members. Each target is its own database
 	// with its own cutover, so an earlier target holds a later target's turn
 	// exactly as an earlier deployment would, while the shards of one target
-	// are not ordered among themselves.
+	// never hold each other's requested cutover.
 	t.Run("CutoverBlocker_TargetsOfOneDeploymentTakeTurns", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
