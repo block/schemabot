@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -64,15 +66,39 @@ func SetAuthToken(token string) {
 
 // bearerTransport sets "Authorization: Bearer <token>" on each request when a
 // token is configured and the header is not already set.
+//
+// The token belongs to the server the command addressed, so across a redirect
+// it travels only while every hop stays on the origin (scheme, host, and port)
+// of the request the command sent. That is stricter than net/http, which keeps
+// sensitive headers across a redirect to a subdomain, another port, or another
+// scheme of the same host. A redirect to another origin is still followed, as
+// net/http follows it, but without the token; once a chain has left the origin
+// it stays unauthenticated, as net/http's own stripping of sensitive headers
+// does. A redirect whose chain the base transport did not record in full is
+// treated as having left the origin, since the token's origin cannot be
+// established from what remains.
 type bearerTransport struct {
-	base   http.RoundTripper
-	token  string
+	base  http.RoundTripper
+	token string
+	// origin, when set, is the one origin (as requestOrigin renders it) the
+	// private local-runtime credential may be sent to; every other request
+	// is refused outright.
 	origin string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.origin != "" && req.URL.Scheme+"://"+req.URL.Host != t.origin {
+	if t.origin != "" && requestOrigin(req.URL) != t.origin {
 		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
+	}
+	chain, complete := redirectChain(req)
+	if !complete {
+		warnUnauthenticatedRedirect("its origin cannot be established", "", requestOrigin(req.URL))
+		return t.base.RoundTrip(withoutAuthorization(req))
+	}
+	first := chain[0]
+	if !stayedOnFirstOrigin(chain) {
+		warnUnauthenticatedRedirect("it is on another origin", requestOrigin(first.URL), requestOrigin(req.URL))
+		return t.base.RoundTrip(withoutAuthorization(req))
 	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
 		if err := GuardInsecureToken(req.URL); err != nil {
@@ -83,6 +109,87 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set("Authorization", "Bearer "+t.token)
 	}
 	return t.base.RoundTrip(req)
+}
+
+// warnWriter receives the CLI's warning lines. It is the process's stderr, the
+// same stream the commands use for their own warnings, so an operator sees why
+// a later 401 happened next to the command output rather than in a log format
+// they filter out.
+var warnWriter io.Writer = os.Stderr
+
+// warnUnauthenticatedRedirect tells the operator that a redirect is being
+// followed without the token and why, naming the origin the token belongs to
+// (when known) and the origin the redirect points at.
+func warnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
+	subject := "the auth token"
+	if tokenOrigin != "" {
+		subject += " for " + tokenOrigin
+	}
+	// The warning is advisory. A stderr that refuses writes leaves nowhere to
+	// report that, and the request itself is unaffected.
+	_, _ = fmt.Fprintf(warnWriter, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
+		subject, redirectOrigin, reason)
+}
+
+// withoutAuthorization returns a copy of req with no Authorization header.
+// RoundTrip must not mutate the caller's request, so the header is removed
+// from a clone. The clone is the contract, not a sign the header is expected:
+// by the time a cross-host redirect reaches this transport net/http has usually
+// stripped it already, and the copy is then of a request with nothing to remove.
+func withoutAuthorization(req *http.Request) *http.Request {
+	stripped := req.Clone(req.Context())
+	stripped.Header.Del("Authorization")
+	return stripped
+}
+
+// redirectChain returns the requests net/http sent to arrive at req, oldest
+// first and ending with req itself, and whether that chain is complete. A
+// request that is not a redirect is a complete chain of one.
+//
+// net/http links each redirected request to the response that caused it, and
+// the response to the request that produced it. A base RoundTripper that omits
+// that second link leaves the earlier hops unknowable, so the chain is reported
+// incomplete rather than presenting the hop it stopped at as the first request.
+func redirectChain(req *http.Request) (chain []*http.Request, complete bool) {
+	chain = []*http.Request{req}
+	for hop := req; hop.Response != nil; hop = hop.Response.Request {
+		if hop.Response.Request == nil {
+			slices.Reverse(chain)
+			return chain, false
+		}
+		chain = append(chain, hop.Response.Request)
+	}
+	slices.Reverse(chain)
+	return chain, true
+}
+
+// stayedOnFirstOrigin reports whether every hop in a redirect chain targets the
+// origin of the request the command sent.
+func stayedOnFirstOrigin(chain []*http.Request) bool {
+	origin := requestOrigin(chain[0].URL)
+	for _, hop := range chain[1:] {
+		if requestOrigin(hop.URL) != origin {
+			return false
+		}
+	}
+	return true
+}
+
+// requestOrigin renders a URL's origin as scheme://host:port, with the scheme
+// and host lowercased and the scheme's default port made explicit, so the same
+// server compares equal however a redirect spells it.
+func requestOrigin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
 // ErrInsecureTokenTransport is returned when a Bearer token would be sent over
@@ -408,4 +515,14 @@ func FormatAPIError(statusCode int, body []byte) string {
 }
 
 // SetLocalAuth binds the private runtime credential to its verified endpoint.
-func SetLocalAuth(token, endpoint string) { SetAuthToken(token); authTransport.origin = endpoint }
+// The endpoint is stored as the origin RoundTrip compares requests against, so
+// the credential goes to the same server however a request spells it. An
+// endpoint that does not parse as a URL is kept as given; nothing renders to
+// it, so every request is refused rather than one slipping through.
+func SetLocalAuth(token, endpoint string) {
+	SetAuthToken(token)
+	authTransport.origin = endpoint
+	if u, err := url.Parse(endpoint); err == nil {
+		authTransport.origin = requestOrigin(u)
+	}
+}

@@ -152,11 +152,9 @@ func (s CreateSet) StatementType(i int) StatementType {
 // CREATE INDEX statements on that same table.
 //
 // Multi-statement create sets are currently a PostgreSQL-parser capability.
-// The MySQL parser's Split reports one entry per statement, but each entry
-// that Spirit does not rewrite carries the whole script's text rather than
-// that statement alone, so the entries cannot be classified one at a time;
-// Classify rejects the first entry as multi-statement input and the script is
-// refused with that cause.
+// The MySQL parser classifies CREATE INDEX as ALTER TABLE, so a MySQL script
+// of a CREATE TABLE followed by CREATE INDEX statements is refused at its
+// second statement with that cause.
 func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
 	statements, err := p.Split(script)
 	if err != nil {
@@ -302,12 +300,16 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", statementPreview(content), err)
 	}
-	var stmts []string
-	for _, s := range parsed {
-		stmt := strings.TrimSpace(s.Statement)
-		if stmt != "" {
-			stmts = append(stmts, stmt)
+	stmts := make([]string, 0, len(parsed))
+	for i, s := range parsed {
+		// Each parsed entry is its own statement, so a node with no text
+		// would be a statement silently missing from the output. Callers plan
+		// and lint from this list, so that is an error rather than a skip.
+		stmt := strings.TrimSpace((*s.StmtNode).Text())
+		if stmt == "" {
+			return nil, fmt.Errorf("statement %d of %q parsed with no text", i+1, statementPreview(content))
 		}
+		stmts = append(stmts, stmt)
 	}
 	return stmts, nil
 }

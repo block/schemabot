@@ -88,6 +88,9 @@ func previewCommentAllOutput() {
 		{"DEPLOYMENT DRIFT (CLEAN, BLOCKED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftCleanBlocked()) }},
 		{"DEPLOYMENT DRIFT (DETECTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftDetected()) }},
 		{"DEPLOYMENT DRIFT (COULD NOT VERIFY)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftUnverified()) }},
+		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
+		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
+		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
 		{"HELP COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentHelp()) }},
 		{"SUPPORT CHANNEL FOOTER", func() { fmt.Print(webhooktemplates.PreviewCommentSupportChannel()) }},
 		{"OVERSIZED COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentOversized()) }},
@@ -201,6 +204,9 @@ func previewCommentPlanAllOutput() {
 		{"DEPLOYMENT DRIFT (CLEAN, BLOCKED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftCleanBlocked()) }},
 		{"DEPLOYMENT DRIFT (DETECTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftDetected()) }},
 		{"DEPLOYMENT DRIFT (COULD NOT VERIFY)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftUnverified()) }},
+		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
+		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
+		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
 		{"DROP INDEX BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked()) }},
 		{"SCHEMA LINT ERRORS BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentLintErrorsBlocked()) }},
@@ -255,6 +261,12 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
 		{"APPLY BLOCKED: SCHEMA STALE (NEW COMMITS)", func() { fmt.Print(webhooktemplates.PreviewCommentStaleSchemaRejected()) }},
 		{"APPLY BLOCKED: CONFIRMED PLAN STALE", func() { fmt.Print(webhooktemplates.PreviewCommentStalePlanRejected()) }},
+		{"APPLY-CONFIRM REFUSED: PLAN IS FOR ANOTHER ENVIRONMENT", func() {
+			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanForOtherEnvironment())
+		}},
+		{"APPLY-CONFIRM REFUSED: PLAN CANNOT BE LOADED", func() {
+			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanUnavailable())
+		}},
 		{"APPLY BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
@@ -356,6 +368,7 @@ func previewCommentMultiDeployAllOutput() {
 		fn   func()
 	}{
 		{"BARRIER ROLLOUT IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyInProgress()) }},
+		{"ROLLOUT WHERE PLANS DIFFER", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyDivergentPlans()) }},
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyFailed()) }},
 		{"ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyCompleted()) }},
 		{"SUMMARY: ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryCompleted()) }},
@@ -379,6 +392,7 @@ func previewCommentShardedAllOutput() {
 		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
 		{"APPLY ACROSS MULTIPLE KEYSPACES", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyMultiKeyspace()) }},
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
+		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
 		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}

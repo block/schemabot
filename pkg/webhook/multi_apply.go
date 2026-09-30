@@ -37,14 +37,14 @@ func releasedForApply(ctx context.Context, stor storage.Storage, apply *storage.
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-// vschemaDiffs is the stored plan's per-namespace VSchema diffs (see
-// resolveShardedVSchemaDiffs), consumed only by the sharded layout.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, vschemaDiffs map[string]string, tenant string) string {
+// finalizers is what the stored plan says about the apply's finalizers (see
+// resolveShardedFinalizerPlan), consumed only by the sharded layout.
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, finalizers *shardedFinalizerPlan, tenant string) string {
 	// A sharded apply fans out across the shards of one or more keyspaces within
 	// a single deployment, so it gets the shard-unit layout rather than the
 	// deployment-unit one — its operations differ by shard, not deployment.
 	if isShardedApply(ops) {
-		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, vschemaDiffs, tenant))
+		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, finalizers, tenant))
 	}
 	if len(ops) <= 1 {
 		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant))
@@ -62,14 +62,14 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-// vschemaDiffs is the stored plan's per-namespace VSchema diffs (see
-// resolveShardedVSchemaDiffs), consumed only by the sharded layout.
-func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, vschemaDiffs map[string]string, tenant string) string {
+// finalizers is what the stored plan says about the apply's finalizers (see
+// resolveShardedFinalizerPlan), consumed only by the sharded layout.
+func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, finalizers *shardedFinalizerPlan, tenant string) string {
 	// A sharded apply renders the shard-unit terminal summary: the same shard
 	// rollup as its status comment, under the state-specific verdict header the
 	// other apply shapes' summaries lead with.
 	if isShardedApply(ops) {
-		return templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, released, tasks, vschemaDiffs, tenant))
+		return templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, released, tasks, finalizers, tenant))
 	}
 	if len(ops) <= 1 {
 		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant))
@@ -181,6 +181,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
+		PlanID:           display.PlanIdentifier,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

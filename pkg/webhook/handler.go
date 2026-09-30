@@ -732,11 +732,11 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		// best-effort read that failed on the second pass would silently drop
 		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops)
-		vschemaDiffs := resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops)
+		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
+		finalizers := resolveShardedFinalizerPlan(ctx, h.service.Storage(), apply, ops)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, vschemaDiffs, h.deploymentTenant())
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, finalizers, h.deploymentTenant())
 			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)

@@ -36,9 +36,13 @@ type CommentObserver struct {
 	// ran an apply, for the engine-logs fold on a failed apply's summary.
 	// Nil where no reader was wired; see EngineLogReader.
 	engineLogs EngineLogReader
-	logger     interface {
+	// plans remembers the plan rows this apply's members run, so the progress
+	// comment reads each once for the observer's life, not once per render.
+	plans  planIdentities
+	logger interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
+		Warn(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
 
@@ -167,6 +171,7 @@ type CommentObserverConfig struct {
 	Logger interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
+		Warn(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
 
@@ -682,7 +687,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveFinalizerPlan(apply, ops), o.tenant)
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
@@ -694,7 +699,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 func (o *CommentObserver) resolveDisplay(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]operationDisplay {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveDisplayByOperation(ctx, o.stor, apply, ops)
+	return resolveDisplayByOperation(ctx, o.stor, apply, ops, &o.plans)
 }
 
 // resolveReleased reports whether the apply's paused rollout has been released
@@ -707,14 +712,14 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 	return releasedForApply(ctx, o.stor, apply, ops, o.logger)
 }
 
-// resolveVSchemaDiffs loads the stored plan's per-namespace VSchema diffs for
-// a sharded apply's comment rendering. It uses a short, independent deadline
+// resolveFinalizerPlan loads what the stored plan says about a sharded apply's
+// finalizers for its comment rendering. It uses a short, independent deadline
 // so a slow storage read degrades to a comment without diffs rather than
 // blocking the update.
-func (o *CommentObserver) resolveVSchemaDiffs(apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+func (o *CommentObserver) resolveFinalizerPlan(apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveShardedVSchemaDiffs(ctx, o.stor, apply, ops)
+	return resolveShardedFinalizerPlan(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -750,11 +755,11 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 	// the body actually posted.
 	var released bool
 	var display map[int64]operationDisplay
-	var vschemaDiffs map[string]string
+	var finalizers *shardedFinalizerPlan
 	if opsErr == nil {
 		released = o.resolveReleased(apply, ops)
 		display = o.resolveDisplay(apply, ops)
-		vschemaDiffs = o.resolveVSchemaDiffs(apply, ops)
+		finalizers = o.resolveFinalizerPlan(apply, ops)
 	}
 	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
 	renderBody := func(apply *storage.Apply) string {
@@ -762,7 +767,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 		if opsErr != nil {
 			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 		} else {
-			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, vschemaDiffs, o.tenant)
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, finalizers, o.tenant)
 		}
 		return body + renderControlRejections(rejections, o.logger, apply, body)
 	}

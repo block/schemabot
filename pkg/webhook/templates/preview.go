@@ -208,10 +208,10 @@ func PreviewCommentPlanAttributedChange() string {
 	})
 }
 
-// PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
-// for a plan whose refused statement the direct execution policy routes to
-// native MySQL DDL (execution-mode verdict "direct"), showing the disclosure
-// the operator consents to by confirming.
+// PreviewCommentPlanDirect renders a sample locked apply comment for a plan
+// whose refused statement the direct execution policy routes to native MySQL
+// DDL (execution-mode verdict "direct"), showing the disclosure of how it runs.
+// The policy approves the change, so the apply runs without a confirmation.
 func PreviewCommentPlanDirect() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -235,9 +235,8 @@ func PreviewCommentPlanDirect() string {
 			},
 		},
 		DirectChanges: []DirectChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+			{Table: "users", Reason: "the table has ~1,240 rows"},
 		},
-		PendingManualConfirmation: true,
 	})
 }
 
@@ -602,6 +601,100 @@ func PreviewCommentPlanDriftDetected() string {
 	})
 }
 
+// previewRolloutMembers is the three independent targets the rollout previews
+// below are rendered for, in rollout order with the reviewed primary first.
+func previewRolloutMembers() []DeploymentDriftEntry {
+	return []DeploymentDriftEntry{
+		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
+		{Deployment: "primary", Target: "testapp_2", Class: "planned"},
+		{Deployment: "primary", Target: "testapp_3", Class: "planned"},
+	}
+}
+
+// PreviewCommentPlanRolloutConverging renders a plan comment for a rollout of
+// independent targets partway through converging: the reviewed target and one
+// other still need the change, and the third already holds it. The plan renders
+// under the two targets that run it, and the third is named as already there.
+func PreviewCommentPlanRolloutConverging() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: samplePlanChanges()},
+				{Members: []string{"primary/testapp_3"}},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
+// whose reviewed target already holds the desired schema while other targets do
+// not. The reviewed target has no plan to show, so the comment renders the plan
+// of the targets still missing the change and names the reviewed target as
+// already there.
+func PreviewCommentPlanRolloutConvergedPrimary() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1"}, Primary: true},
+				{Members: []string{"primary/testapp_2", "primary/testapp_3"}, Changes: samplePlanChanges()},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
+// independent targets that need different work: the reviewed target and one
+// other need the email column, and the third needs it with an index as well.
+// Each target applies its own plan, so each plan renders under its targets.
+func PreviewCommentPlanRolloutDistinctPlans() string {
+	email := "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;"
+	reviewed := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{email}}}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: reviewed},
+				{Members: []string{"primary/testapp_3"}, Changes: []KeyspaceChangeData{{
+					Keyspace:   "testapp",
+					Statements: []string{email, "ALTER TABLE `users` ADD INDEX `idx_email` (`email`);"},
+				}}},
+			},
+		},
+	})
+}
+
 // PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
 // drift rollup could not be computed, so the plan check fails closed.
 func PreviewCommentPlanDriftUnverified() string {
@@ -920,6 +1013,30 @@ func PreviewCommentApplyBlockedMergedPR() string {
 // PreviewCommentApplyConfirmNoLock renders a sample "no lock found" comment.
 func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
+}
+
+// PreviewCommentConfirmationPlanForOtherEnvironment renders a sample refusal
+// of an apply-confirm that named a different environment than the pending
+// confirmation was planned for.
+func PreviewCommentConfirmationPlanForOtherEnvironment() string {
+	return RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		PlanEnvironment:      "staging",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
+}
+
+// PreviewCommentConfirmationPlanUnavailable renders a sample refusal of an
+// apply-confirm whose pending confirmation pins no plan that can be loaded.
+func PreviewCommentConfirmationPlanUnavailable() string {
+	return RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
 }
 
 // PreviewCommentBaseSchemaFreshnessRejected renders a sample path-scoped base
@@ -2242,6 +2359,44 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
+// members were planned independently and so run different plans: `eu` is
+// already at the desired schema bar one index, while `us` still needs all
+// three. Each member's section names the plan it runs, so a reader can tie it
+// back to the block they reviewed. The converged rollouts above name none.
+func PreviewCommentMultiDeploymentApplyDivergentPlans() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "us", State: state.ApplyOperation.Running},
+		{Deployment: "eu", State: state.ApplyOperation.Pending},
+	})
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Running
+	usTables[0].RowsCopied = 914707
+	usTables[0].RowsTotal = 1466232
+	usTables[0].PercentComplete = 62
+	usTables[0].ETASeconds = 195
+	usTables[1].Status = state.Task.Pending
+	usTables[2].Status = state.Task.Pending
+
+	euTables := sampleApplyTables()[:1]
+	euTables[0].Status = state.Task.Pending
+
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Running, usTables)
+	usDetail.PlanID = "plan_7c41f9"
+	euDetail := sampleDeploymentDetail("payments_eu", state.Apply.Pending, euTables)
+	euDetail.PlanID = "plan_3344ab"
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-6 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     []*ApplyStatusCommentData{usDetail, euDetail},
+	})
+}
+
 // PreviewCommentMultiDeploymentApplyFailed renders a halt-on-failure rollout
 // where one deployment failed: completed deployments stay completed, later
 // deployments are halted, and the aggregate is failed with retry as next action.
@@ -2691,8 +2846,8 @@ func PreviewCommentSummaryFailedEngineLogsMultiDeployment() string {
 	}
 	return RenderFailureLogs([]LogGroupData{
 		{Label: "apply logs", Entries: sampleRemoteFailureLogEntries("users", mysqlerr.ReasonFromText("(errno 1265)"))},
-		{Label: "engine logs: shard-a, target: cluster-a", Entries: shardA},
-		{Label: "engine logs: shard-b, target: cluster-b", Entries: shardB},
+		{Label: "engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001", Entries: shardA},
+		{Label: "engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002", Entries: shardB},
 	}, GitHubIssueCommentMaxChars)
 }
 

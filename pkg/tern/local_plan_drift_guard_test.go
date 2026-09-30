@@ -385,12 +385,22 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 	})
 
 	t.Run("multi-statement DDL is rejected", func(t *testing.T) {
-		// The parser rejects multi-statement input, so a destructive trailing
-		// statement cannot hide behind the classification of the first one and
-		// mask drift. It must fail closed instead.
+		// The only multi-statement shape drift admits is a greenfield create
+		// set, so a script of two ALTERs is refused at its first statement: a
+		// destructive trailing statement cannot hide behind the classification
+		// of the first one and mask drift. It must fail closed instead.
 		_, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255); ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "parsed as 2 statements")
+		assert.Contains(t, err.Error(), "statement 1 is ALTER TABLE; a multi-statement DDL script must start with CREATE TABLE")
+	})
+
+	t.Run("destructive statement after CREATE TABLE is rejected", func(t *testing.T) {
+		// The first statement is a CREATE TABLE that would classify on its own,
+		// so the refusal has to come from the create set's shape rule: the
+		// trailing DROP TABLE is named as the statement that breaks it.
+		_, err := canonicalDDLForDrift(parser, "CREATE TABLE `users` (`id` bigint NOT NULL, PRIMARY KEY (`id`)); DROP TABLE `orders`")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "statement 2 is DROP TABLE; a multi-statement DDL script must be a CREATE TABLE followed only by CREATE INDEX statements on that table")
 	})
 
 	t.Run("DML is rejected", func(t *testing.T) {
@@ -548,4 +558,62 @@ func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
 	_, _, err = my.driftMultisetFromPlanResult(planResult(), false, "")
 	require.Error(t, err, "PostgreSQL-only DDL must not parse under a MySQL-typed client")
 	assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
+}
+
+func TestCanonicalDDLForDrift_RowSecurity(t *testing.T) {
+	parser := driftParserForDialect(t, schema.DialectPostgres)
+	reviewed := `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `
+	canonical, err := canonicalDDLForDrift(parser, reviewed)
+	require.NoError(t, err)
+	same, err := canonicalDDLForDrift(parser, `
+ drop policy "readers" on "staging"."documents";
+ create policy "readers" on "staging"."documents" for select to public using (owner_id=auth.uid());
+ `)
+	require.NoError(t, err)
+	assert.Equal(t, canonical, same)
+	mapped, err := canonicalDDLForDrift(parser, `
+ DROP POLICY readers ON production.documents;
+ CREATE POLICY readers ON production.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `)
+	require.NoError(t, err)
+	assert.NotEqual(t, canonical, mapped, "RLS review retains its physical target; a different schema needs a fresh review")
+	for _, tt := range []struct{ name, sql string }{
+		{"order", `
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ DROP POLICY readers ON staging.documents;
+ `},
+		{"predicate", `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (true);
+ `},
+		{"helper schema", `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = other_auth.uid());
+ `},
+		{"duplicate", `
+ DROP POLICY readers ON staging.documents;
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			changed, err := canonicalDDLForDrift(parser, tt.sql)
+			require.NoError(t, err)
+			assert.NotEqual(t, canonical, changed)
+		})
+	}
+	t.Run("mixed structural operation refuses", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, `
+ DROP POLICY readers ON staging.documents;
+ ALTER TABLE staging.documents ADD COLUMN title text;
+ `)
+		require.Error(t, err)
+	})
+	t.Run("MySQL does not admit PostgreSQL policies", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(driftParserForDialect(t, schema.DialectMySQL), reviewed)
+		require.Error(t, err)
+	})
 }

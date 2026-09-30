@@ -138,6 +138,14 @@ type LockStore interface {
 	// If the same owner already holds the lock, this is a no-op (idempotent).
 	Acquire(ctx context.Context, lock *Lock) error
 
+	// AcquireIfPendingPlanID acquires like Acquire, but only while the lock is
+	// in the state the caller observed: free when observedPendingPlanID is
+	// empty, or held by the same owner with observedPendingPlanID as its
+	// pending plan. Any other same-owner state returns ErrLockIntentChanged and
+	// leaves the stored pending plan alone, so a command that planned against
+	// one intent can never overwrite an intent another command pinned since.
+	AcquireIfPendingPlanID(ctx context.Context, lock *Lock, observedPendingPlanID string) error
+
 	// Release releases a lock. Only succeeds if caller is the owner.
 	// Returns ErrLockNotOwned if the lock is not owned by the caller.
 	Release(ctx context.Context, database, dbType, owner string) error

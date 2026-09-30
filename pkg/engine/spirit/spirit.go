@@ -14,6 +14,7 @@ package spirit
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -23,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	spiritlint "github.com/block/spirit/pkg/lint"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
@@ -89,6 +91,16 @@ type Engine struct {
 	// exit and Drain's release of the tracked state, so tests can interleave
 	// engine activity into that window deterministically.
 	drainRaceWindow func()
+
+	// sizeProbeFault is a test seam invoked with the plan-time size probe's
+	// context when the probe starts. A non-nil error fails the probe, so tests
+	// can prove a failed or slow probe never fails or stalls a plan.
+	sizeProbeFault func(ctx context.Context) error
+
+	// sizeProbeSQL is a test seam that rewrites each statement the size probe
+	// sends, given the probe's context, so tests can make the server slow to
+	// answer and prove every statement runs under the probe's budget.
+	sizeProbeSQL func(ctx context.Context, stmt string) string
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -575,9 +587,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, err
 	}
-	// Row estimates for the policy bound connect lazily so plans without
-	// refused statements never open the extra connection. The existing-copy
-	// disclosure below reads the target through the same connection.
+	// The target connection opens lazily, so a plan with no changes never
+	// opens it. The size probe, the policy bound's row estimates, and the
+	// existing-copy disclosure below all read the target through it.
 	defer verdicts.Close()
 	target := verdicts.target
 
@@ -600,6 +612,30 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		currentByTable[ts.Name] = ts.Schema
 	}
 
+	// Best-effort per-table size estimates for plan display, read only for the
+	// tables this plan touches so a database with many unrelated tables does
+	// not pay for them. Sizes are informational — a failed or slow read must
+	// not fail or stall the plan, so the probe runs under its own budget, and
+	// a miss logs and renders the plan without sizes.
+	// A table the plan creates has no size to read yet, so only existing
+	// tables are probed: a plan that only creates tables never connects to
+	// the target for sizes.
+	sizedTables, createdTables := partitionByExistence(e.plannedTableNames(database, plan.Changes), currentByTable)
+	if len(createdTables) > 0 {
+		e.logger.Debug("tables the plan creates have no size estimate yet",
+			"database", database, "tables", createdTables)
+	}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
+	sizeEstimates, err := e.fetchTableSizeEstimates(probeCtx, target, database, sizedTables)
+	cancelProbe()
+	if err != nil {
+		e.logger.Warn("table size estimates unavailable; the plan will omit table sizes",
+			"database", database, "tables", sizedTables, "error", err)
+		sizeEstimates = nil
+	} else {
+		e.logMissingSizeEstimates(database, sizedTables, sizeEstimates)
+	}
+
 	// Convert PlannedChanges to engine types
 	var lintViolations []engine.LintViolation
 	changes := make([]engine.TableChange, 0, len(plan.Changes))
@@ -612,6 +648,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			Table:     pc.TableName,
 			Operation: stmtType,
 			DDL:       pc.Statement,
+		}
+
+		// Attach the plan-time size estimates statistics reported. A table
+		// being created does not exist yet and gets none.
+		if est, ok := sizeEstimates[pc.TableName]; ok {
+			change.EstimatedRows = copyInt64(est.rows)
+			change.EstimatedBytes = copyInt64(est.bytes)
 		}
 
 		// Error-severity violations mark the change as unsafe
@@ -1155,4 +1198,201 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			"database", database, "tables", withheld)
 	}
 	return kept, withheld, nil
+}
+
+// tableSizeEstimate is one table's approximate plan-time size read from
+// information_schema statistics: row count and on-disk footprint (data plus
+// indexes). Either is nil when statistics did not report it, and the other is
+// still kept. Display only; statistics are estimates.
+type tableSizeEstimate struct {
+	rows  *int64
+	bytes *int64
+}
+
+// copyInt64 returns a pointer to a copy of *v, or nil for nil, so plan changes
+// for the same table never share one estimate.
+func copyInt64(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	return &c
+}
+
+// plannedTableNames returns the distinct tables a plan touches, in first-seen
+// order, as parameters for the size probe.
+func (e *Engine) plannedTableNames(database string, changes []spiritlint.PlannedChange) []string {
+	seen := make(map[string]bool, len(changes))
+	names := make([]string, 0, len(changes))
+	for _, pc := range changes {
+		if pc.TableName == "" {
+			e.logger.Warn("planned statement names no table; the plan will omit its size estimate",
+				"database", database, "statement", pc.Statement)
+			continue
+		}
+		if seen[pc.TableName] {
+			// A plan can carry several statements for one table (a
+			// partition-type change needs its own REMOVE PARTITIONING
+			// statement); the table is probed once.
+			continue
+		}
+		seen[pc.TableName] = true
+		names = append(names, pc.TableName)
+	}
+	return names
+}
+
+// sizeProbeStatement returns stmt as the size probe sends it: unchanged
+// outside tests, rewritten by the sizeProbeSQL seam inside them.
+func (e *Engine) sizeProbeStatement(ctx context.Context, stmt string) string {
+	if e.sizeProbeSQL == nil {
+		return stmt
+	}
+	return e.sizeProbeSQL(ctx, stmt)
+}
+
+// fetchTableSizeEstimates reads the approximate row count and on-disk
+// footprint of the named base tables from information_schema, through the
+// plan's own lazily opened connection to the target. The read is scoped to the
+// planned tables so the cost does not scale with the size of the schema, and
+// it disables statistics caching as the direct execution size gate does, so a
+// plan never displays a size older than the one its own gate reads. Estimates
+// are display-only plan context: the caller treats a failure as "no sizes"
+// rather than failing the plan.
+func (e *Engine) fetchTableSizeEstimates(ctx context.Context, target *lazyTargetDB, database string, tables []string) (map[string]tableSizeEstimate, error) {
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	if e.sizeProbeFault != nil {
+		if err := e.sizeProbeFault(ctx); err != nil {
+			return nil, fmt.Errorf("size probe fault: %w", err)
+		}
+	}
+
+	db, err := target.get(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("connect for size estimates: %w", err)
+	}
+	// A dedicated connection, so the session setting below applies to the
+	// query that follows it. The setting outlives this function on the pooled
+	// connection, which is safe because the pool is the plan's own: it is
+	// closed with the plan, and its other readers also want fresh statistics.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire connection for size estimates: %w", err)
+	}
+	defer utils.CloseAndLog(conn)
+	if _, err := conn.ExecContext(ctx, e.sizeProbeStatement(ctx, "SET SESSION information_schema_stats_expiry = 0")); err != nil {
+		return nil, fmt.Errorf("disable cached statistics for size estimates: %w", err)
+	}
+
+	args := make([]any, 0, len(tables)+1)
+	args = append(args, database)
+	for _, name := range tables {
+		args = append(args, name)
+	}
+	query := `
+		SELECT table_name, table_rows, data_length + index_length
+		FROM information_schema.tables
+		WHERE table_schema = ? AND table_type = 'BASE TABLE'
+		  AND table_name IN (?` + strings.Repeat(", ?", len(tables)-1) + `)`
+	requested := requestedTableNames(tables)
+
+	rows, err := conn.QueryContext(ctx, e.sizeProbeStatement(ctx, query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query size estimates for tables %v: %w", tables, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	estimates := make(map[string]tableSizeEstimate)
+	for rows.Next() {
+		var name string
+		var tableRows, tableBytes sql.NullInt64
+		if err := rows.Scan(&name, &tableRows, &tableBytes); err != nil {
+			return nil, fmt.Errorf("scan table size estimate: %w", err)
+		}
+		// information_schema can match a name case-insensitively and return it
+		// in the server's case; the estimate is keyed by the name the plan
+		// asked for, which is the name its changes carry.
+		asked, ok := requested[strings.ToLower(name)]
+		if !ok {
+			e.logger.Warn("size probe returned a table the plan did not ask for; ignoring it",
+				"database", database, "table", name)
+			continue
+		}
+		name = asked
+		est := tableSizeEstimate{
+			rows:  e.validSizeStatistic(database, name, "table_rows", tableRows),
+			bytes: e.validSizeStatistic(database, name, "data_length + index_length", tableBytes),
+		}
+		if est.rows == nil && est.bytes == nil {
+			// validSizeStatistic logged why each one is missing.
+			continue
+		}
+		estimates[name] = est
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate table size estimates: %w", err)
+	}
+	return estimates, nil
+}
+
+// validSizeStatistic returns a base table's statistic as a display estimate,
+// or nil with a warning when statistics could not report it. A NULL value is a
+// base table whose statistics are unreadable (for example a discarded
+// tablespace), and a negative one is a sentinel for "no real estimate", not a
+// count, as it is for the direct execution size gate.
+func (e *Engine) validSizeStatistic(database, table, statistic string, v sql.NullInt64) *int64 {
+	if !v.Valid {
+		e.logger.Warn("table statistics report no value; the plan will omit it from the table's size",
+			"database", database, "table", table, "statistic", statistic)
+		return nil
+	}
+	if v.Int64 < 0 {
+		e.logger.Warn("table statistics report a negative value; the plan will omit it from the table's size",
+			"database", database, "table", table, "statistic", statistic, "value", v.Int64)
+		return nil
+	}
+	n := v.Int64
+	return &n
+}
+
+// logMissingSizeEstimates reports the existing tables a successful probe
+// returned no estimate for: their statistics were unreadable, which the plan
+// renders as an unavailable size.
+func (e *Engine) logMissingSizeEstimates(database string, tables []string, estimates map[string]tableSizeEstimate) {
+	var missing []string
+	for _, name := range tables {
+		if _, ok := estimates[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		e.logger.Warn("existing tables have no size estimate; the plan will omit their sizes",
+			"database", database, "tables", missing)
+	}
+}
+
+// partitionByExistence splits the planned tables into those present in the
+// current schema, whose sizes can be read, and those the plan creates.
+func partitionByExistence(tables []string, currentByTable map[string]string) (existing, created []string) {
+	for _, name := range tables {
+		if _, ok := currentByTable[name]; ok {
+			existing = append(existing, name)
+		} else {
+			created = append(created, name)
+		}
+	}
+	return existing, created
+}
+
+// requestedTableNames indexes the probed table names by their lower-cased
+// form, so a row information_schema returns in a different case maps back to
+// the name the plan asked for.
+func requestedTableNames(tables []string) map[string]string {
+	requested := make(map[string]string, len(tables))
+	for _, name := range tables {
+		requested[strings.ToLower(name)] = name
+	}
+	return requested
 }
