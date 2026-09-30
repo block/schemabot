@@ -1089,9 +1089,12 @@ func TestRenderMultiDeploymentApplyComment_PausedRolloutWithPendingCutoverShares
 	assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
 }
 
-// A terminal apply refuses stop and cancel, so no terminal aggregate state
-// offers either one, even while a member is still writing to its target: a
-// cancelled sibling ranks the aggregate cancelled over a sibling still copying.
+// A terminal apply refuses stop, and refuses cancel in every terminal state
+// but stopped, so the rollout footer offers neither once the aggregate is
+// terminal, even while a member is still writing to its target: a cancelled
+// sibling ranks the aggregate cancelled over a sibling still copying. A stopped
+// PlanetScale aggregate offers no cancel either, since PlanetScale refuses stop
+// and so never reaches that state.
 func TestRenderMultiDeploymentApplyComment_TerminalAggregateNeverOffersStop(t *testing.T) {
 	ops := []presentation.Operation{rollingOp("us", so.Cancelled), rollingOp("eu", so.Running)}
 	require.Equal(t, state.Apply.Cancelled, presentation.Derive(ops).State)
