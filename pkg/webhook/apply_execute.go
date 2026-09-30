@@ -12,7 +12,6 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -120,7 +119,7 @@ func (h *Handler) executeApply(
 	// for the primary where members hold schemas of their own, so the other
 	// members are planned first and their work, if any, answers.
 	if !planResp.HasChanges() {
-		rollout, _ := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+		rollout, _ := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 		if rolloutStillPending(rollout) {
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rest of the rollout is not at the desired schema")
 			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout)

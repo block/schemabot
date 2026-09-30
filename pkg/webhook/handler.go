@@ -746,7 +746,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		view := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant())
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName())
 			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)

@@ -52,7 +52,236 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-columnonly-alter-no-table-sizes"></a><strong>MySQL Plan (Column-only Alter, No Table Sizes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;
+```
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-many-tables-folded-table-sizes"></a><strong>MySQL Plan (Many Tables, Folded Table Sizes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `accounts` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `addresses` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `api_keys` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `audit_events` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `carts` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `categories` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `coupons` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `disputes` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `feature_flags` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `fulfillments` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `inventory` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `invoices` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `ledger_entries` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `line_items` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `locations` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `notifications` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `order_events` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `payment_methods` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `payments` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `payouts` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `prices` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `refunds` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `reviews` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `sessions` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `settlements` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `shipments` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `subscriptions` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `tax_rates` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `transfers` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+📊 **Table sizes** (34 tables, largest first; 2 without a size estimate):
+- `audit_events`: ~186 GB
+- `ledger_entries`: ~121 GB
+- `line_items`: ~58 GB
+- `notifications`: ~44 GB
+- `orders`: ~26.5 GB
+
+<details>
+<summary>29 more tables</summary>
+
+- `payments`: ~23.1 GB
+- `invoices`: ~17.4 GB
+- `fulfillments`: ~11.8 GB
+- `shipments`: ~10.9 GB
+- `transfers`: ~7.7 GB
+- `reviews`: ~6.9 GB
+- `inventory`: ~5.3 GB
+- `users`: ~3.6 GB
+- `carts`: ~3.2 GB
+- `customers`: ~2.9 GB
+- `payment_methods`: ~2.6 GB
+- `settlements`: ~2.1 GB
+- `addresses`: ~1.4 GB
+- `refunds`: ~1.3 GB
+- `products`: ~1.1 GB
+- `payouts`: ~820 MB
+- `accounts`: ~610 MB
+- `webhooks`: ~540 MB
+- `subscriptions`: ~470 MB
+- `prices`: ~210 MB
+- `disputes`: ~150 MB
+- `coupons`: ~41 MB
+- `api_keys`: ~6.1 MB
+- `locations`: ~4.2 MB
+- `tax_rates`: ~2.3 MB
+- `categories`: ~1.6 MB
+- `feature_flags`: ~180 KB
+- `order_events`: size estimate unavailable
+- `sessions`: size estimate unavailable
+
+</details>
+
+📋 **Plan**: **34** tables to alter
 
 
 ---
@@ -102,6 +331,9 @@ CREATE TABLE `orders` (
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -640,6 +872,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -868,7 +1103,11 @@ CREATE TABLE `addresses` (
   COLLATE utf8mb4_0900_ai_ci;
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 ---
@@ -1057,7 +1296,11 @@ CREATE TABLE `addresses` (
   COLLATE utf8mb4_0900_ai_ci;
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 **Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
@@ -1159,6 +1402,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ---
@@ -1225,6 +1471,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ---
@@ -1281,6 +1530,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 </details>
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1353,6 +1605,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ---
@@ -1409,6 +1664,9 @@ CREATE TABLE `orders` (
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1467,6 +1725,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -1524,6 +1785,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -1576,6 +1840,9 @@ CREATE TABLE `orders` (
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1729,6 +1996,78 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-table-sizes-two-targets"></a><strong>Rollout Plans (Table Sizes, Two Targets)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+**targets `primary/testapp_1`, `primary/testapp_2`**
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📊 **Table sizes**:
+- `orders`: ~24 GB across 2 targets (~610 MB on `primary/testapp_1`, ~23.4 GB on `primary/testapp_2`)
+- `users`: ~193 MB across 2 targets (~95 MB on `primary/testapp_1`, ~98 MB on `primary/testapp_2`)
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-table-sizes-three-targets"></a><strong>Rollout Plans (Table Sizes, Three Targets)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+**targets `primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`**
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📊 **Table sizes**:
+- `orders`: ~24 GB across 2 of 3 targets; 1 has no estimate
+- `users`: ~297 MB across 3 targets
+
+📋 **Plan**: **2** tables to alter
 
 
 ---
@@ -2001,6 +2340,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2852,6 +3194,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -2901,6 +3246,9 @@ CREATE TABLE `orders` (
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2960,6 +3308,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `shipments` (create) was in the plan this apply was started from but is not in this one
 
 The statements above are what will run. Review them, then confirm to apply them.
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3056,7 +3407,11 @@ CREATE TABLE `addresses` (
   COLLATE utf8mb4_0900_ai_ci;
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 **Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
@@ -8426,6 +8781,9 @@ ALTER TABLE `mutes`
     ADD COLUMN `reason` varchar(255);
 ```
 
+📊 **Table sizes**:
+- `mutes`: ~22.8 GB across 4 shards
+
 📋 **Plan**: **1** table to alter
 
 
@@ -8491,11 +8849,19 @@ Shards diverge — what applies where:
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
+```sql
+ALTER TABLE `outcomes` ADD INDEX `status`(`status`);
+```
+
 **shard `-40`**
 
 No schema changes detected
 
-📋 **Plan**: **1** table to alter
+📊 **Table sizes**:
+- `mutes`: size estimate unavailable · 3 shards
+- `outcomes`: ~4.2 GB across 3 shards
+
+📋 **Plan**: **2** tables to alter
 
 
 ---

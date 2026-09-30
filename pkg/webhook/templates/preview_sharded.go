@@ -354,6 +354,9 @@ func PreviewCommentShardedPlanDivergent() string {
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "cdb_resolute_sharded",
 			Statements: []string{idx},
+			TableSizes: []TableSizeData{
+				{Table: "mutes", EstimatedBytes: previewBytes(22_800_000_000), ShardCount: 4},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Statements: []string{idx}},
 				{Shard: "80-c0", Statements: []string{idx}},
@@ -406,16 +409,25 @@ func previewShardRange(i, n int) string {
 // so the partially-applied keyspace shows its divergent state.
 func PreviewCommentShardedPlanPartiallyApplied() string {
 	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	outcomesIdx := "ALTER TABLE `outcomes` ADD INDEX `status`(`status`)"
 	return RenderPlanComment(PlanCommentData{
 		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
 		Changes: []KeyspaceChangeData{{
 			Keyspace: "cdb_resolute_sharded",
+			// A table without a byte estimate beside one that has it renders
+			// as explicitly unavailable, so a failed size probe never reads as
+			// a small table. The satisfied shard needs no change, so the
+			// change spans three shards.
+			TableSizes: []TableSizeData{
+				{Table: "mutes", ShardCount: 3},
+				{Table: "outcomes", EstimatedBytes: previewBytes(4_210_000_000), ShardCount: 3},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Satisfied: true},
-				{Shard: "40-80", Statements: []string{idx}},
-				{Shard: "80-c0", Statements: []string{idx}},
-				{Shard: "c0-", Statements: []string{idx}},
+				{Shard: "40-80", Statements: []string{idx, outcomesIdx}},
+				{Shard: "80-c0", Statements: []string{idx, outcomesIdx}},
+				{Shard: "c0-", Statements: []string{idx, outcomesIdx}},
 			},
 		}},
 	})

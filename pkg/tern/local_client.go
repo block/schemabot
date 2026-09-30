@@ -1866,6 +1866,14 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 				"ignore_namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so ignored namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove ignore_namespaces",
 				req.GetIgnoredNamespaces())
 		}
+		// A namespace the target's entry does not select is withheld the same
+		// way, so its live tables, still on this database until moved, would be
+		// planned as drops too.
+		if len(req.GetUnselectedNamespaces()) > 0 {
+			return nil, fmt.Errorf(
+				"a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so unselected namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove the entry's namespaces list",
+				req.GetUnselectedNamespaces())
+		}
 		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
 	}
 	if len(schemaFiles) == 0 {

@@ -47,18 +47,36 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		if len(work) > 1 {
 			writeGroupHeading(sb, targetNoun, targetNames(data.Model, w.members), len(g.Members))
 		}
-		dialect := dialectForEngine(memberDetail(data.Details, w.members[0]).Engine, data.ApplyID)
+		first := memberDetail(data.Details, w.members[0])
+		dialect := dialectForEngine(first.Engine, data.ApplyID)
+		// The group's DDL is its first target's, so a cut block names that
+		// target's stored plan and says which other targets run the same.
+		restoreGroup := planScopeForWork(budget, targetNames(data.Model, w.members), len(work), silent)
+		restorePlan := budget.pointAt(first.storedPlan())
 		for _, t := range w.tables {
 			cells, targets := tableAcrossTargets(data, w.members, t)
 			writeTargetTableLine(sb, t.TableName, cells, targets, lineSilent)
 			writeDDLLine(sb, dialect, t.DDL, budget)
 			sb.WriteString("\n")
 		}
+		restorePlan()
+		restoreGroup()
 	}
 	if len(work) > 0 && silent > 0 {
 		fmt.Fprintf(sb, "_%d of %d targets have not reported progress yet._\n", silent, len(g.Members))
 	}
 	writeFailedTargets(sb, data.Model, g)
+}
+
+// planScopeForWork scopes the pointer a cut block in one work group carries.
+// Under a group heading the marker speaks for the targets the heading names;
+// a sole group has no heading, so the marker names its plan's target and
+// speaks only for the targets that have reported.
+func planScopeForWork(budget *ddlBlockBudget, members []string, groups, unreported int) (restore func()) {
+	if groups > 1 {
+		return budget.forTargetGroup(members)
+	}
+	return budget.forSoleTargetGroup(members, unreported)
 }
 
 // unreportedTargets counts the targets with no table progress to show yet, so
@@ -177,10 +195,19 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		if pct := ui.RowCopyDisplayPercent(int(copied*100/total), copied); pct > 0 {
 			fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
 			line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
-			if reporting < len(cells)+silent {
+			partial := reporting < len(cells)+silent
+			if partial {
 				line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
 			}
-			line += ui.FormatTableSizeClause(targetsTableBytes(cells, silent))
+			// The planned size is every target's, including those left out of
+			// the rows, so beside partial rows it names the full span rather
+			// than reading as the reporting targets' size.
+			if size := targetsTableBytes(cells, silent); size != nil {
+				line += ui.FormatTableSizeClause(size)
+				if partial {
+					line += fmt.Sprintf(" across all %d targets", len(cells))
+				}
+			}
 			if eta > 0 {
 				floor := ""
 				if unreported+silent > 0 {

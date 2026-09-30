@@ -187,8 +187,13 @@ type ApplyStatusCommentData struct {
 	// reader anything: it ties a running member back to the block it came from
 	// among the several the review showed. A rollout the review showed as one
 	// block names no plan, whether its members share a plan row or were each
-	// planned into their own and came out running the same change.
+	// planned into their own and came out running the same change. DDL cut to
+	// fit the comment names the command that prints this plan in full.
 	PlanID string
+
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
 
 	// InRolloutSection marks this comment as rendered inside one member's
 	// section of a rollout. The rollout comment carries the apply ID, who
@@ -213,7 +218,14 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	})
 }
 
+// storedPlan is the stored plan the apply's DDL comes from, when the comment
+// names one, so DDL cut to fit points at the command that prints it in full.
+func (data ApplyStatusCommentData) storedPlan() storedPlanRef {
+	return storedPlanRef{cliName: data.CLIName, environment: data.Environment, id: data.PlanID}
+}
+
 func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdated bool, renderedAt string, budget *ddlBlockBudget) string {
+	defer budget.pointAt(data.storedPlan())()
 	var sb strings.Builder
 
 	// Header varies by state
@@ -1472,6 +1484,7 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 }
 
 func renderApplySummaryComment(data ApplyStatusCommentData, budget *ddlBlockBudget) string {
+	defer budget.pointAt(data.storedPlan())()
 	var sb strings.Builder
 
 	completedCount, failedCount := countTableOutcomes(data.Tables)

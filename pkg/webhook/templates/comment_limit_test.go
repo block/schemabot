@@ -285,6 +285,47 @@ func TestMultiDeploymentApplyCommentsShareOneDDLBudget(t *testing.T) {
 	assert.LessOrEqual(t, len(progress), limit)
 }
 
+// A rollout whose deployments run different plans names each deployment's
+// plan, so DDL an apply comment cuts in a deployment's section points at the
+// command that prints that deployment's stored plan, starting with the cli
+// name and scoped to the environment. A deployment whose plan the comment
+// does not name keeps the schema-files marker.
+func TestMultiDeploymentApplyCommentCutDDLNamesEachDeploymentsStoredPlan(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:43:00 UTC")
+	limit := commentBodyLimit - applyCommentAppendReserve
+	ops := make([]presentation.Operation, 0, 3)
+	for _, dep := range []string{"us", "eu", "ap"} {
+		ops = append(ops, continuingOp(dep, so.Completed))
+	}
+	model := presentation.Derive(ops)
+	planIDs := map[string]string{"us": "plan_us", "eu": "plan_eu"}
+	details := make([]*ApplyStatusCommentData, 0, len(model.Deployments))
+	for _, d := range model.Deployments {
+		details = append(details, &ApplyStatusCommentData{
+			Database:    "payments_" + d.Deployment,
+			Environment: "production",
+			Engine:      "Spirit",
+			State:       state.Apply.Completed,
+			Tables:      greenfieldTables(d.Deployment+"_events", 60, state.Task.Completed),
+			PlanID:      planIDs[d.Deployment],
+			CLIName:     "acme schemabot",
+		})
+	}
+	data := MultiDeploymentApplyData{Model: model, ApplyID: "apply-123", Environment: "production", Details: details}
+
+	for name, body := range map[string]string{
+		"summary":  RenderMultiDeploymentApplySummaryComment(data),
+		"progress": RenderMultiDeploymentApplyComment(data),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.LessOrEqual(t, len(body), limit)
+			assert.Contains(t, body, "the full plan is available from the CLI with `acme schemabot list-plans -e production plan_us`.")
+			assert.Contains(t, body, "the full plan is available from the CLI with `acme schemabot list-plans -e production plan_eu`.")
+			assert.Contains(t, body, ddlTruncatedMarker, "the deployment with no named plan points at the schema files")
+		})
+	}
+}
+
 // The fit loop offers the DDL the whole limit first, then cuts it by exactly
 // what the rest of the comment turned out to need, so a comment fits in two
 // passes and the DDL keeps every byte the other sections leave.
@@ -359,7 +400,7 @@ func repeatedDDL(size int) string {
 // markers leave rather than a marker's worth per block besides.
 func TestRenderWithinCommentLimitChargesEachCutBlockOneMarker(t *testing.T) {
 	planID := storedPlanRef{environment: "production", id: "plan_" + strings.Repeat("7c41f9", 8)}
-	pointer := planPointerMarker(planID)
+	pointer := planPointer("plan", planID, nil)
 	require.Greater(t, len(pointer), len(ddlTruncatedMarker)+32, "the pointer marker outgrows the plain marker, so charging the plain one would undercharge")
 
 	t.Run("blocks first cut on the second pass are charged the pointer marker", func(t *testing.T) {
@@ -393,6 +434,67 @@ func TestRenderWithinCommentLimitChargesEachCutBlockOneMarker(t *testing.T) {
 	})
 }
 
+// A comment whose sections carry markers of different lengths reserves, for
+// each block the second pass cuts, the marker that block's own section writes.
+// Here four blocks with no stored plan carry the schema-files marker and one
+// block from a stored plan carries a pointer made long by the cli name. The
+// cut DDL keeps the room only the long pointer needs, rather than giving up
+// the long pointer's length for every block, and the comment still fits on
+// the second pass.
+func TestRenderWithinCommentLimitReservesEachBlocksOwnMarker(t *testing.T) {
+	plan := storedPlanRef{cliName: strings.Repeat("w", 100), environment: "production", id: "plan_" + strings.Repeat("7c41f9", 8)}
+	pointer := planPointer("plan", plan, nil)
+	overReservation := 4 * (len(pointer) - len(ddlTruncatedMarker))
+	require.Greater(t, overReservation, 256, "charging every block the long pointer would give up this much DDL")
+
+	passes := 0
+	block := repeatedDDL(commentBodyLimit / 10)
+	body := renderWithinCommentLimit(5, 0, func(budget *ddlBlockBudget) string {
+		passes++
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("h", commentBodyLimit/2+2048))
+		for range 4 {
+			writeSQLFencedBlock(&sb, block, budget)
+		}
+		restore := budget.pointAt(plan)
+		writeSQLFencedBlock(&sb, block, budget)
+		restore()
+		return sb.String()
+	})
+
+	assert.Equal(t, 2, passes, "the second pass reserved room for every marker it wrote")
+	assert.Equal(t, 4, strings.Count(body, ddlTruncatedMarker))
+	assert.Equal(t, 1, strings.Count(body, pointer))
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Greater(t, len(body), commentBodyLimit-overReservation/4, "the DDL kept the room the short markers leave")
+}
+
+// A comment whose second pass leaves a block a share too small to hold even an
+// empty code fence writes that block's marker alone, so the second pass still
+// fits: no block renders more DDL than its share.
+func TestRenderWithinCommentLimitFitsWhenSharesCannotHoldAFence(t *testing.T) {
+	const blocks, secondPassDDL = 10, 50
+	require.Less(t, secondPassDDL/blocks, len("```sql\n```\n"), "the first second-pass share is too small for an empty fence")
+	// Every block is cut on pass 1 and carries its marker there, so pass 2's
+	// DDL budget is the limit less the chrome and the markers.
+	chrome := commentBodyLimit - blocks*len(ddlTruncatedMarker) - secondPassDDL
+	passes := 0
+	body := renderWithinCommentLimit(blocks, 0, func(budget *ddlBlockBudget) string {
+		passes++
+		var sb strings.Builder
+		sb.WriteString(strings.Repeat("h", chrome))
+		for range blocks {
+			writeSQLFencedBlock(&sb, repeatedDDL(commentBodyLimit), budget)
+		}
+		return sb.String()
+	})
+
+	assert.Equal(t, 2, passes, "the second pass fits")
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Equal(t, blocks, strings.Count(body, ddlTruncatedMarker), "every block is still marked as cut")
+	assert.True(t, strings.HasPrefix(body[chrome:], ddlTruncatedMarker), "the first block, whose share cannot hold a fence, is its marker alone")
+}
+
 // Environments whose plans are the same render as one section drawn from the
 // first environment's plan, while each environment stored a plan of its own.
 // A block the section cuts names the first environment's stored plan and says
@@ -414,16 +516,27 @@ func TestMultiEnvPlanCommentSharedSectionSaysWhosePlanItNames(t *testing.T) {
 	require.Contains(t, body, "### Staging & Production")
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
 	assert.Contains(t, body, "the full staging plan is available from the CLI with `schemabot list-plans -e staging plan_staging1` (production runs the same DDL).")
-	stagingPlan := storedPlanRef{environment: "staging", id: "plan_staging1"}
-	assert.Equal(t, 1, strings.Count(body, sharedPlanPointerMarker(stagingPlan, []string{"staging", "production"})))
-	assert.NotContains(t, body, planPointerMarker(stagingPlan))
+	assert.Equal(t, 1, strings.Count(body, "_DDL truncated to fit GitHub's comment size limit; the full staging plan is available from the CLI with `schemabot list-plans -e staging plan_staging1` (production runs the same DDL)._\n"))
+	assert.NotContains(t, body, "the full plan is available")
 	assert.NotContains(t, body, ddlTruncatedMarker)
 
-	t.Run("more than one matching environment", func(t *testing.T) {
-		assert.Equal(t,
-			"_DDL truncated to fit GitHub's comment size limit; the full staging plan is available from the CLI with `schemabot list-plans -e staging plan_staging1` (production and sandbox run the same DDL)._\n",
-			sharedPlanPointerMarker(stagingPlan, []string{"staging", "production", "sandbox"}))
-	})
+	// The environments the section also stands for read as prose however
+	// many there are.
+	for _, tc := range []struct {
+		environments []string
+		note         string
+	}{
+		{[]string{"staging", "production", "sandbox"}, "production and sandbox run the same DDL"},
+		{[]string{"staging", "production", "sandbox", "demo"}, "production, sandbox and demo run the same DDL"},
+	} {
+		t.Run(strings.Join(tc.environments, "+"), func(t *testing.T) {
+			budget := newDDLBlockBudget(1, commentBodyLimit)
+			defer budget.shareAcross(tc.environments)()
+			assert.Equal(t,
+				"_DDL truncated to fit GitHub's comment size limit; the full staging plan is available from the CLI with `schemabot list-plans -e staging plan_staging1` ("+tc.note+")._\n",
+				budget.pointerMarker(storedPlanRef{environment: "staging", id: "plan_staging1"}))
+		})
+	}
 }
 
 // A shared section that renders target groups cuts each group's DDL under a
@@ -481,7 +594,7 @@ func TestPlanCommentCutDDLNamesTheStoredPlan(t *testing.T) {
 	body := RenderPlanComment(data)
 
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
-	assert.Equal(t, 1, strings.Count(body, planPointerMarker(storedPlanRef{environment: "production", id: "plan_7c41f9"})))
+	assert.Equal(t, 1, strings.Count(body, "the full plan is available from the CLI with"))
 	assert.Contains(t, body, "the full plan is available from the CLI with `schemabot list-plans -e production plan_7c41f9`.")
 	assert.NotContains(t, body, ddlTruncatedMarker)
 }
@@ -511,7 +624,7 @@ func TestPlanCommentCutDDLStartsTheStoredPlanCommandWithTheCLIName(t *testing.T)
 		body := RenderPlanComment(long)
 
 		assert.LessOrEqual(t, len(body), commentBodyLimit)
-		assert.Equal(t, 1, strings.Count(body, planPointerMarker(storedPlanRef{cliName: long.CLIName, environment: long.Environment, id: long.PlanID})))
+		assert.Equal(t, 1, strings.Count(body, "the full plan is available from the CLI with `"+long.CLIName+" list-plans -e "+long.Environment+" "+long.PlanID+"`._\n"))
 	})
 }
 

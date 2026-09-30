@@ -395,6 +395,14 @@ indexes in a different order are reported as `differs`. The comparison errs
 toward reporting: it will send you to look at a table that turns out to agree,
 but it will not call two different schemas equal.
 
+A target whose entry [selects namespaces](configuration.md#selecting-namespaces-per-target)
+is pulled for exactly those namespaces, by name, and an explicitly requested
+namespace it does not select is left out of its pull. The response shape does
+not change, but the comparison is still keyed by namespace and table: two
+targets holding different namespaces report each other's tables as
+`only_on_primary` and `only_on_target`, because neither holds the other's
+namespace.
+
 An environment that does not list `targets` carries no `targets` array at all.
 
 ### Engine support

@@ -836,8 +836,9 @@ check `CutoverBlocker` (same file, sharing the automatic cutover claim's
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`), through which every
-projection builds its children, with `completeLandedStopForHeldOpenApply` and `RolloutHeldByResumableChild` keeping a held-open
-rollout's stop resolved and its recovery claim quiet (`pkg/api/operator.go`).
+projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
+`updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
+`completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 
@@ -1100,8 +1101,14 @@ control paths (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`).
 Stop is the highest-priority intent. Once accepted, no actor may knowingly advance the apply
 toward deploy, cutover, or completion until the stop is processed: forward-progress commands are
 rejected while a stop pends, and contradictory intents are rejected at acceptance rather than
-resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the cutover paths
-(`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`); conflict rejection at request intake
+resolved by drive ordering. Cancel is not forward progress: it halts at least as far as stop, so it
+is accepted while a stop pends and every drive consumes it ahead of the stop, as an escalation.
+*Enforced:* pending-stop checks in pollers and the cutover paths
+(`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`), and in the group_finalizer drive
+before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
+`pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
+(`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
+`pkg/tern/grpc_client.go`); conflict rejection at request intake
 (`pkg/api/control_handlers.go`).
 
 ### CO-5: The revert phase owns the outcome
@@ -1568,6 +1575,9 @@ feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 a table declared by two desired schema files fails planning on every engine through one rule
 (`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,
 `pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
+A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
+refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
+`pkg/tern/local_client.go`).
 
 ## Routing and authorization (AZ)
 
@@ -1657,20 +1667,22 @@ published. Secret references remain references on disk.
 
 ### AZ-8: Profile registration preserves connection identity
 
-Registering a local profile must not replace a different connection, change the default profile,
+Registering a local profile must not replace a different connection, change an existing default profile,
 or overwrite a concurrent configuration update. Retrying an identical registration is safe.
 
 *Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
 
 ### AZ-9: Initialization preserves the target and existing files
 
-Initialization verifies the imported schema before publishing it and never applies changes to the
-target. It must not overwrite existing schema files or redirect an existing profile to another
-connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+Initialization verifies the imported schema before publishing it and never applies changes to an
+existing target. An explicitly requested sample is created and seeded separately before entering
+the same import-and-verify workflow. It must not overwrite existing schema files or redirect
+an existing profile to another connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
 its state so the retry uses the same execution authority.
 
 *Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
-`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
+`pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
+`pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
 
 ## Structural enforcement
 

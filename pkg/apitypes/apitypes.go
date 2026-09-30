@@ -763,12 +763,18 @@ type PlanResponse struct {
 	// current config re-resolves the same primary. The deployment alone is not
 	// sufficient: one deployment can address several targets, so a member is
 	// identified by the pair.
-	Deployment  string                   `json:"deployment,omitempty"`
-	Target      string                   `json:"target,omitempty"`
-	Engine      string                   `json:"engine"`
-	Changes     []*SchemaChangeResponse  `json:"changes"`
-	LintResults []*LintViolationResponse `json:"lint_violations"`
-	Errors      []string                 `json:"errors"`
+	Deployment string `json:"deployment,omitempty"`
+	Target     string `json:"target,omitempty"`
+	// SelectedNamespaces is the namespace selection of the primary's targets
+	// entry this plan was created under, empty when the entry selects every
+	// declared namespace. The rollup checks it against the primary's selection
+	// at rollup time alongside Deployment and Target, so a reloaded placement
+	// cannot pair this plan with members resolved under a different one.
+	SelectedNamespaces []string                 `json:"selected_namespaces,omitempty"`
+	Engine             string                   `json:"engine"`
+	Changes            []*SchemaChangeResponse  `json:"changes"`
+	LintResults        []*LintViolationResponse `json:"lint_violations"`
+	Errors             []string                 `json:"errors"`
 	// Shards carries the per-shard plan for a sharded engine: each changing shard
 	// and the changes it needs. The namespace-level Changes above collapse a
 	// keyspace to one entry, so a keyspace whose shards diverge is represented

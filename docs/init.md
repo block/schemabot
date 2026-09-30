@@ -7,6 +7,39 @@ The wizard and explicit CLI flags use the same setup workflow.
 
 ![SchemaBot setup, a schema edit, and the first plan](../assets/init-demo.gif)
 
+## Try without a database
+
+Run `schemabot init` in an empty project directory and choose **Try a sample database**,
+then choose MySQL or PostgreSQL. Docker must be running. SchemaBot starts a local
+container, seeds `customers` and `orders`, and uses the same import and verification flow.
+No connection string is needed.
+
+![Start a sample database, review and apply a change, then verify the result](../assets/init-sample-demo.gif)
+
+For scripts, select the sample explicitly:
+
+```console
+$ schemabot init --sample --type mysql --non-interactive --json
+{"database":"shop","environment":"development","profile":"schemabot-sample-example","schema_dir":"/project/schema","plan_id":"plan-example","tables":2,"verified":true}
+```
+
+Use `--type postgres` for PostgreSQL. Names and paths vary by project. The completion screen
+prints your next command, including a profile flag when needed. Each project gets its own sample and runtime;
+retrying setup keeps your data and never overwrites schema edits. Initialization only succeeds
+when the files match the live database; use `plan` to review edits you have not applied yet. Samples listen only on `127.0.0.1`.
+
+Docker retains sample data across restarts. To stop the database, run `docker stop` with the
+container name printed during setup. Start it again with `docker start <container-name>`,
+then continue with `plan` or `apply`. You do not need to rerun initialization to restart it.
+The container keeps its assigned port, so the saved connection continues to work. If another
+process takes that port while the sample is stopped, stop that process and retry `docker start`;
+do not remove the sample to resolve a port conflict.
+When finished, stop its SchemaBot runtime with `schemabot local stop <container-name>` before
+removing the disposable database with `docker rm -v <container-name>`. Removing the container
+permanently deletes its sample data. Your schema files remain in your project. After deleting
+a sample, start a new sample in a fresh project directory; the old project's saved connection
+belongs to the deleted database. Use `make demo DEMO_DIR=/absolute/path/to/new-project` to choose a fresh demo project.
+
 ## Before you start
 
 Use MySQL or PostgreSQL with an existing application database. You can paste a connection string or enter host, port, database, username, and password
