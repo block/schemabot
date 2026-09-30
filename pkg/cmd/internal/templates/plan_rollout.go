@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/ui"
@@ -104,4 +105,34 @@ func wrapNames(names []string, more int) []string {
 		lines = append(lines, line.String())
 	}
 	return lines
+}
+
+// WriteUnsafeBesideConvergedPrimary writes why an apply of a whole rollout was
+// refused when its primary is already at the desired schema and other members
+// carry unsafe changes, and the narrowed apply that runs each of those members
+// under its own plan and its own consent. reruns holds one command per member,
+// without the binary name, in the order of members; past
+// memberNamesInlineLimit the rest are named rather than spelled out.
+func WriteUnsafeBesideConvergedPrimary(noun presentation.Noun, primary string, members []string, changes []UnsafeChange, reruns []string) {
+	fmt.Printf("%s Apply blocked: %d unsafe change(s) on %s other than the rollout primary %s, which is already at the desired schema\n",
+		glyph.Refused, countUnsafeFindings(changes), noun.Plural, primary)
+	writeUnsafeChangesList(changes)
+	fmt.Println()
+	fmt.Println("An apply of the whole rollout runs from the primary's plan, which has no")
+	fmt.Println("unsafe change to consent to, so --allow-unsafe cannot run these. Apply")
+	fmt.Println("each " + noun.Singular + " that carries them on its own:")
+	fmt.Println()
+	shown := min(len(reruns), memberNamesInlineLimit)
+	for _, rerun := range reruns[:shown] {
+		fmt.Printf("  %s %s\n", cliname.Name(), rerun)
+	}
+	if rest := members[shown:]; len(rest) > 0 {
+		fmt.Println()
+		fmt.Printf("and the same for %d more %s:\n", len(rest), noun.Plural)
+		listed := rest[:min(len(rest), memberNamesListLimit)]
+		for _, line := range wrapNames(listed, len(rest)-len(listed)) {
+			fmt.Printf("  %s\n", line)
+		}
+	}
+	fmt.Println()
 }

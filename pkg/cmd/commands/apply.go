@@ -151,6 +151,16 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}
 	}
 
+	// A rollout whose primary is already at the desired schema is applied from
+	// the primary's empty plan, which runs only the other members' own plans,
+	// and apply creation refuses an unsafe change among them whatever the
+	// flags. Asking for --allow-unsafe here would ask for consent the apply
+	// cannot act on, so the members carrying the change are named with the
+	// narrowed apply that runs each under its own plan.
+	if members := unsafeMembersBesideAConvergedPrimary(planResult); len(members) > 0 {
+		return blockUnsafeBesideConvergedPrimary(planResult, members, cfg.Database, cmd.Environment, cfg.SchemaDir)
+	}
+
 	// Check for unsafe changes
 	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target)
@@ -536,6 +546,45 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 		retry += " --target " + target
 	}
 	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry+" --allow-unsafe")
+	return ErrSilent
+}
+
+// unsafeMembersBesideAConvergedPrimary returns the rollout members whose own
+// plans carry an unsafe change when the primary's plan has nothing to run, in
+// rollout group order. It returns nil for a plan that describes one member, and
+// for a rollout whose primary has work, where the apply runs from the
+// primary's plan and --allow-unsafe covers every member.
+func unsafeMembersBesideAConvergedPrimary(plan *apitypes.PlanResponse) []string {
+	rollout := plan.WholeRollout()
+	if rollout == nil || plan.HasChanges() {
+		return nil
+	}
+	var members []string
+	for i, memberPlan := range plan.MemberPlans() {
+		if len(memberPlan.UnsafeChanges()) > 0 {
+			members = append(members, rollout.Groups[i].Members...)
+		}
+	}
+	return members
+}
+
+// blockUnsafeBesideConvergedPrimary displays the plan and refuses an apply of
+// the whole rollout whose primary is already at the desired schema while other
+// members carry unsafe changes, naming the narrowed apply that runs each one.
+func blockUnsafeBesideConvergedPrimary(planResult *apitypes.PlanResponse, members []string, database, environment, schemaDir string) error {
+	OutputPlanResult(planResult, database, environment, schemaDir, true)
+	rollout := planResult.WholeRollout()
+	primary := "the primary"
+	for _, group := range rollout.Groups {
+		if group.Primary && len(group.Members) > 0 {
+			primary = group.Members[0]
+		}
+	}
+	reruns := make([]string, len(members))
+	for i, member := range members {
+		reruns[i] = fmt.Sprintf("apply -s %s -e %s --target %s --allow-unsafe", schemaDir, environment, member)
+	}
+	templates.WriteUnsafeBesideConvergedPrimary(templates.RolloutNoun(rollout), primary, members, planResult.RolloutUnsafeChanges(), reruns)
 	return ErrSilent
 }
 

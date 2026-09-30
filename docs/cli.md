@@ -522,6 +522,12 @@ Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
 
+In a rollout whose primary target is already at the desired schema, an apply
+of the whole rollout runs only the other targets' own plans, and it cannot run
+an unsafe change on them even with `--allow-unsafe`. The CLI refuses it before
+anything is applied and prints, for each target carrying the change, the
+`apply --target <target> --allow-unsafe` that applies that target's own plan.
+
 A database lock can also block a new apply. Inspect the owner and ongoing
 work before releasing it. Locks span the database's environments; forcing
 one away from its owner is an administrative action, not a routine retry.

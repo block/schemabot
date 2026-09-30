@@ -283,3 +283,42 @@ func TestApplyCmd_ProceedsWhenOnlyAnotherMemberHasWork(t *testing.T) {
 	assert.NotContains(t, out, "No changes. Your schema is up-to-date.", "%s", out)
 	assert.Contains(t, *paths, "/api/apply", "the apply is requested for the members with work:\n%s", out)
 }
+
+// A rollout whose primary is already at the desired schema is applied from the
+// primary's empty plan, and apply creation refuses another target's unsafe
+// change there whatever the flags. So even with --allow-unsafe the CLI refuses
+// before asking the server to apply, and names the narrowed apply that runs
+// each target carrying the change under its own plan and its own consent.
+func TestApplyCmd_UnsafeChangeBesideAConvergedPrimaryNamesTheNarrowedApply(t *testing.T) {
+	drop := []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders",
+		TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "legacy", Namespace: "orders", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+		}},
+	}}
+	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
+		PlanID: "plan-orders-1",
+		Engine: "mysql",
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: paymentsTargets(1, 1), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}},
+				{Members: paymentsTargets(2, 3), Changes: drop},
+			},
+		},
+	})
+
+	schemaDir := writeTestSchemaDir(t)
+	cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true, AllowUnsafe: true}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	assert.NotContains(t, *paths, "/api/apply", "no apply is requested that apply creation would refuse")
+	assert.Contains(t, out, "Apply blocked: 1 unsafe change(s) on targets other than the rollout primary prod/payments-001, which is already at the desired schema", "%s", out)
+	assert.Contains(t, out, "1. legacy: drops a table")
+	for _, target := range []string{"prod/payments-002", "prod/payments-003"} {
+		assert.Contains(t, out, "apply -s "+schemaDir+" -e production --target "+target+" --allow-unsafe", "%s", out)
+	}
+}
