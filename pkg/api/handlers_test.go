@@ -69,20 +69,27 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
-func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string) error { return nil }
-func (m *mockPlanLookupStore) Delete(context.Context, int64) error                       { return nil }
-func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error             { return nil }
+func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string, string) error {
+	return nil
+}
+func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
+func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
 type capturingPlanStore struct {
 	mockPlanLookupStore
 	created   *storage.Plan
 	createErr error
-	// routed records each UpdateRoute call as "plan_id deployment/target".
+	// routed records each UpdateRoute call as "plan_id deployment/target",
+	// followed by " narrowed to <member>" for a narrowed plan.
 	routed []string
 }
 
-func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target string) error {
-	s.routed = append(s.routed, planIdentifier+" "+deployment+"/"+target)
+func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target, narrowedTo string) error {
+	call := planIdentifier + " " + deployment + "/" + target
+	if narrowedTo != "" {
+		call += " narrowed to " + narrowedTo
+	}
+	s.routed = append(s.routed, call)
 	return nil
 }
 

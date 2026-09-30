@@ -64,7 +64,7 @@ func TestPlanStore_UpdateRouteRestampsOnlyTheRoute(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.Plans().UpdateRoute(ctx, "plan_route", "eu", "commerce-002"))
+	require.NoError(t, store.Plans().UpdateRoute(ctx, "plan_route", "eu", "commerce-002", ""))
 
 	plan, err := store.Plans().Get(ctx, "plan_route")
 	require.NoError(t, err)

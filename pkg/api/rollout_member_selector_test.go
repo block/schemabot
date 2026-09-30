@@ -383,14 +383,67 @@ func TestCreateStoredApply_RolloutWideApplyOfAPlanNarrowedToThePrimaryIsRefused(
 	assert.Equal(t, "payments-001", applies.operations[0].Target)
 }
 
-// A plan identifier that is already stored keeps the row already there. For a
-// narrowed plan that row must record the narrowing, or an apply could run the
-// plan across the rollout, so a row without it fails the plan.
-func TestExecutePlan_NarrowedPlanRefusedWhenItsStoredRowLacksTheNarrowing(t *testing.T) {
-	mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-narrowed"}}
+// A planner sharing the service's storage stores a plan's row first, with the
+// route it knows and no narrowing. The service keeps that row and records the
+// narrowing on it, since that is what holds an apply of the plan to its one
+// member. A row that already records a different narrowing, the whole rollout
+// or another member, is not this plan and fails it.
+func TestExecutePlan_NarrowedPlanRecordsItsNarrowingOnTheRowAlreadyStored(t *testing.T) {
+	member := DefaultDeployment + "/payments-002"
+	cases := []struct {
+		name       string
+		storedTo   string
+		wantRouted []string
+		wantErr    string
+	}{
+		{name: "row the planner stored without a narrowing takes the plan's", storedTo: "",
+			wantRouted: []string{"plan-narrowed " + DefaultDeployment + "/payments-002 narrowed to " + member}},
+		{name: "row already narrowed to the member is the same plan delivered twice", storedTo: member},
+		{name: "row narrowed to another member fails the plan", storedTo: DefaultDeployment + "/payments-003",
+			wantErr: "collides with a stored plan narrowed to \"" + DefaultDeployment + "/payments-003\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-narrowed"}}
+			plans := &capturingPlanStore{
+				mockPlanLookupStore: mockPlanLookupStore{plan: &storage.Plan{
+					PlanIdentifier: "plan-narrowed", Database: "payments", Environment: "production",
+					Deployment: DefaultDeployment, Target: "payments-002", NarrowedTo: tc.storedTo,
+				}},
+				createErr: storage.ErrPlanIDExists,
+			}
+			svc := New(&mockStorageWithPlanLookup{plans: plans}, narrowingServerConfig(), map[string]tern.Client{
+				DefaultDeployment + "/production": mockClient,
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+				Database: "payments", Environment: "production", Type: storage.DatabaseTypeMySQL,
+				Target: "payments-002", SchemaFiles: usersSchemaFiles("payments"),
+			})
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				assert.Empty(t, plans.routed, "a row on another narrowing is left as stored")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, member, resp.NarrowedTo)
+			assert.Equal(t, tc.wantRouted, plans.routed)
+		})
+	}
+}
+
+// A plan of the whole rollout whose identifier names a row already narrowed to
+// one member is not that plan: returning it would hand the caller a plan that
+// applies to one member only.
+func TestExecutePlan_RolloutWidePlanRefusedWhenItsStoredRowIsNarrowed(t *testing.T) {
+	mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-rollout"}}
 	plans := &capturingPlanStore{
-		mockPlanLookupStore: mockPlanLookupStore{plan: &storage.Plan{PlanIdentifier: "plan-narrowed", Database: "payments", Environment: "production"}},
-		createErr:           storage.ErrPlanIDExists,
+		mockPlanLookupStore: mockPlanLookupStore{plan: &storage.Plan{
+			PlanIdentifier: "plan-rollout", Database: "payments", Environment: "production",
+			Deployment: DefaultDeployment, Target: "payments-001", NarrowedTo: DefaultDeployment + "/payments-001",
+		}},
+		createErr: storage.ErrPlanIDExists,
 	}
 	svc := New(&mockStorageWithPlanLookup{plans: plans}, narrowingServerConfig(), map[string]tern.Client{
 		DefaultDeployment + "/production": mockClient,
@@ -398,17 +451,11 @@ func TestExecutePlan_NarrowedPlanRefusedWhenItsStoredRowLacksTheNarrowing(t *tes
 
 	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
 		Database: "payments", Environment: "production", Type: storage.DatabaseTypeMySQL,
-		Target: "payments-002", SchemaFiles: usersSchemaFiles("payments"),
+		SchemaFiles: usersSchemaFiles("payments"),
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "is narrowed to "+DefaultDeployment+"/payments-002, but its stored row records narrowing \"\"")
-
-	plans.plan.NarrowedTo = DefaultDeployment + "/payments-002"
-	_, err = svc.ExecutePlan(t.Context(), PlanRequest{
-		Database: "payments", Environment: "production", Type: storage.DatabaseTypeMySQL,
-		Target: "payments-002", SchemaFiles: usersSchemaFiles("payments"),
-	})
-	require.NoError(t, err, "a stored row that records the narrowing is the same plan delivered twice")
+	assert.Contains(t, err.Error(), "plan plan-rollout narrowed to \"\" collides with a stored plan narrowed to \""+DefaultDeployment+"/payments-001\"")
+	assert.Empty(t, plans.routed)
 }
 
 // serveNarrowing posts body to path on a mux serving svc's routes.
