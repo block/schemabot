@@ -308,10 +308,10 @@ ALTER TABLE `users`
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⚙️ **Direct execution**: 1 change will run as native MySQL DDL
-- `users`: dropping primary key is not supported; the table has ~1,240 rows
+⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
+- `users`: the table has ~1,240 rows
 
-Writes to each table are blocked until its statement finishes, and `--defer-cutover` does not apply to them. Confirming the apply consents to this.
+Writes to each table are blocked until its statement finishes. Confirming the apply consents to this.
 
 📋 **Plan**: **2** tables to alter
 

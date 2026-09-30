@@ -272,7 +272,7 @@ func TestPlanResponse_DirectChanges(t *testing.T) {
 		Changes: []*SchemaChangeResponse{{
 			Namespace: "testdb",
 			TableChanges: []*TableChangeResponse{
-				{TableName: "users", ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; the table has ~40 rows"},
+				{TableName: "users", ExecutionMode: "direct", ModeReason: "the table has ~40 rows"},
 				{TableName: "orders"},
 				{TableName: "items", ExecutionMode: "blocked"},
 			},
