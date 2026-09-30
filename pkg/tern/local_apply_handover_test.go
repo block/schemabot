@@ -127,7 +127,7 @@ func TestExecuteApplySequential_CancelledDriveLeavesApplyActive(t *testing.T) {
 		logger: slog.Default(),
 	}
 
-	client.executeApplySequential(ctx, apply, []*storage.Task{task}, &storage.Plan{}, nil)
+	require.NoError(t, client.executeApplySequential(ctx, apply, []*storage.Task{task}, &storage.Plan{}, nil))
 
 	stored, err := applies.Get(t.Context(), apply.ID)
 	require.NoError(t, err)
@@ -251,7 +251,8 @@ func TestExecuteApplySequential_StartsNoFurtherTaskUntilTheTerminalWriteLands(t 
 				logger: slog.Default(),
 			}
 
-			client.executeApplySequential(t.Context(), apply, []*storage.Task{first, second}, &storage.Plan{}, nil)
+			require.NoError(t, client.executeApplySequential(t.Context(), apply, []*storage.Task{first, second}, &storage.Plan{}, nil),
+				"a refused task write ends the drive as a hand-back, not a drive error")
 
 			storedApply, err := applies.Get(t.Context(), apply.ID)
 			require.NoError(t, err)
@@ -292,11 +293,11 @@ func TestExecuteApply_StandsDownWhenStartWriteEndsTheDrive(t *testing.T) {
 	}
 	drives := map[string]func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task){
 		"sequential": func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
-			c.executeApplySequential(ctx, apply, tasks, &storage.Plan{}, nil)
+			require.NoError(t, c.executeApplySequential(ctx, apply, tasks, &storage.Plan{}, nil))
 		},
 		"grouped": func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
 			plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"orders": {}}}
-			c.executeGroupedApply(ctx, apply, tasks, plan, nil, false)
+			require.NoError(t, c.executeGroupedApply(ctx, apply, tasks, plan, nil, false))
 		},
 	}
 	for driveName, drive := range drives {

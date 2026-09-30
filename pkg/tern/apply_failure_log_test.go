@@ -130,7 +130,7 @@ func TestFinalizeSequentialApplyRecordsAPermanentFailure(t *testing.T) {
 	}
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{failed})
 
-	client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{failed}, failed, false)
+	require.NoError(t, client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{failed}, failed, false))
 
 	require.Len(t, logs.entries, 1)
 	entry := logs.entries[0]
@@ -150,7 +150,7 @@ func TestFinalizeSequentialApplyRecordsARetryablePause(t *testing.T) {
 	}
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{failed})
 
-	client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{failed}, failed, false)
+	require.NoError(t, client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{failed}, failed, false))
 
 	require.Len(t, logs.entries, 1)
 	entry := logs.entries[0]
@@ -168,7 +168,7 @@ func TestFinalizeSequentialApplyRecordsNothingWithoutAFailure(t *testing.T) {
 	done := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders", State: state.Task.Completed}
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{done})
 
-	client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{done}, nil, false)
+	require.NoError(t, client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{done}, nil, false))
 
 	assert.Empty(t, logs.entries)
 	assert.Equal(t, state.Apply.Completed, apply.State)

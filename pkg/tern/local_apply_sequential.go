@@ -16,7 +16,7 @@ import (
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
-func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) error {
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
@@ -35,7 +35,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	)
 
 	if !c.recordDriveStarted(ctx, apply, logger) {
-		return
+		return nil
 	}
 
 	var failedTask *storage.Task
@@ -45,7 +45,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
-			return
+			return nil
 		} else if standDown {
 			stoppedByUser = true
 			break
@@ -53,19 +53,23 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 
 		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskHandover {
-			return
+			return nil
 		}
 		if action == taskAbort {
-			return
+			return nil
 		}
 		if action == taskMissing {
 			// A fresh drive has no operator projection to refuse, so exiting
 			// without a verdict is the whole fail-closed behaviour here; the
 			// operator's resume of the still-active apply reports the cause.
-			return
+			return nil
 		}
 		if action == taskStopped {
 			stoppedByUser = true
+			break
+		}
+		if action == taskAlreadyFailed {
+			failedTask = task
 			break
 		}
 		if action == taskSkip {
@@ -90,7 +94,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			break
 		}
 		if action == taskAbort || action == taskHandover {
-			return
+			return nil
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -104,8 +108,13 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		"failed_task", failedTask != nil,
 		"stopped_by_user", stoppedByUser,
 	)
-	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
+	if err := c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser); err != nil {
+		logger.Error("sequential drive exiting without finalizing the apply; it stays active for a later claim to finalize, so its pending control requests stay pending and no terminal summary is posted",
+			"deployment", apply.Deployment, "error", err)
+		return err
+	}
 	logger.Info("sequential apply finished", "state", apply.State)
+	return nil
 }
 
 // taskAction indicates the outcome of a single task execution step.
@@ -118,13 +127,14 @@ type taskAction int
 // the apply still active, to be reclaimed and resumed. Recording a handover as an
 // operator stop would park every apply a shutdown interrupts.
 const (
-	taskContinue taskAction = iota // Task completed successfully, proceed to next
-	taskFailed                     // Task failed, stop processing
-	taskStopped                    // Task/apply was stopped by user, stop processing
-	taskSkip                       // Task is already terminal in storage; move on to the next
-	taskAbort                      // Current owner should exit without changing final state
-	taskHandover                   // This drive's context was cancelled; the apply stays active for another driver to claim
-	taskMissing                    // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
+	taskContinue      taskAction = iota // Task completed successfully, proceed to next
+	taskFailed                          // Task failed, stop processing
+	taskStopped                         // Task/apply was stopped by user, stop processing
+	taskSkip                            // Task is already terminal in storage; move on to the next
+	taskAlreadyFailed                   // A previous drive failed the task permanently; it owns the apply's verdict, stop processing
+	taskAbort                           // Current owner should exit without changing final state
+	taskHandover                        // This drive's context was cancelled; the apply stays active for another driver to claim
+	taskMissing                         // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
 )
 
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
@@ -161,6 +171,18 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 	if freshTask.State == state.Task.Stopped {
 		logger.Info("task was stopped by user, skipping", "task_id", task.TaskIdentifier, "table", task.TableName)
 		return taskStopped
+	}
+	// A task a previous drive failed permanently still owns the apply's
+	// verdict: skipping it would let finalization derive the apply's outcome
+	// from the tasks that remain and record a failed schema change completed.
+	// Finalization reads the verdict from the task it is handed, so the
+	// in-memory row adopts the stored failure.
+	if state.IsState(freshTask.State, state.Task.Failed) {
+		logger.Info("task already failed permanently in a previous drive; the apply keeps that verdict",
+			"task_id", task.TaskIdentifier, "table", task.TableName, "error", freshTask.ErrorMessage)
+		task.State = freshTask.State
+		task.ErrorMessage = freshTask.ErrorMessage
+		return taskAlreadyFailed
 	}
 	if state.IsTerminalTaskState(freshTask.State) {
 		logger.Info("task already in terminal state, skipping",
@@ -326,6 +348,7 @@ type atomicPollState struct {
 	lastTaskState   string
 	lastLoggedState string
 	lastProgressLog time.Time
+	terminalErr     error
 
 	// stateEnteredAt tracks when the current waiting state was entered,
 	// used for timeout enforcement on deferred cutover and revert window.
@@ -1125,7 +1148,20 @@ func recoveryResumesFromCheckpoint(databaseType string) bool {
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
 // Permanent failures cancel remaining pending tasks; retryable failures leave
 // pending tasks queued for operator recovery.
-func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
+//
+// The apply-level side effects of the outcome — settling pending control
+// requests, releasing the active-apply gauge, and notifying the observer that
+// posts the terminal summary — run only once the outcome is durably stored.
+// When the apply cannot be reloaded or the outcome write fails, it returns an
+// error with the stored apply still active: the drive exits, and the claim
+// that picks the apply up next finalizes it and settles its requests then.
+// Once the outcome is stored it returns nil whatever happens to the side
+// effects: a failed request settlement is logged and left for the operator's
+// post-drive settlement, and the summary still posts.
+// A drive whose context was cancelled hands the apply back with nil instead:
+// its storage failures describe the cancellation, not the outcome, and the
+// caller reads its own context to learn why the drive stopped.
+func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) error {
 	now := time.Now()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	// A multi-operation drive owns only its operation: the tasks it drove carry
@@ -1146,12 +1182,13 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
 			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil, "settled_state", apply.State)
-		return
+		return nil
 	}
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
-		logger.Error("failed to reload apply before sequential finalization",
-			append(apply.MutableLogAttrs(), "error", err)...)
-		return
+		if c.driveCancelled(ctx, apply, "before reloading the apply for sequential finalization") {
+			return nil
+		}
+		return fmt.Errorf("reload apply %s (database %s) before sequential finalization: %w", apply.ApplyIdentifier, apply.Database, err)
 	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
 		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
 			"stored_state", freshApply.State)
@@ -1160,7 +1197,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}
-		return
+		return nil
 	}
 	previousState := apply.State
 	if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
@@ -1172,24 +1209,27 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	}
 	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-	} else {
-		// A sequential apply's failure reaches the operator through the same
-		// apply log stream as every other path, so a failed table does not read
-		// as an apply that went terminal for no stated reason.
-		switch apply.State {
-		case state.Apply.Failed:
-			c.logApplyFailure(ctx, apply, previousState, apply.ErrorMessage)
-		case state.Apply.FailedRetryable:
-			c.logApplyPausedForRetry(ctx, apply, previousState, apply.ErrorMessage)
+		if c.driveCancelled(ctx, apply, "while persisting the sequential outcome") {
+			return nil
 		}
+		// The stored apply is still active, so nothing that answers for its
+		// outcome may run: a pending control request completed here would
+		// resolve an operator's command against an apply storage still reports
+		// running, and the observer would post a terminal summary for it.
+		return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
+			apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+	}
+	// A sequential apply's failure reaches the operator through the same
+	// apply log stream as every other path, so a failed table does not read
+	// as an apply that went terminal for no stated reason.
+	switch apply.State {
+	case state.Apply.Failed:
+		c.logApplyFailure(ctx, apply, previousState, apply.ErrorMessage)
+	case state.Apply.FailedRetryable:
+		c.logApplyPausedForRetry(ctx, apply, previousState, apply.ErrorMessage)
 	}
 	if state.IsTerminalApplyState(apply.State) {
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-			logger.Warn("failed to settle pending control requests after sequential finalization",
-				append(apply.MutableLogAttrs(), "error", err)...)
-			return
-		}
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 
@@ -1197,7 +1237,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		if obs := c.getObserver(apply.ID); obs != nil {
 			obs.OnProgress(apply, tasks)
 		}
-		return
+		return nil
 	}
 
 	// Notify observer of terminal state, then clean up
@@ -1205,6 +1245,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		obs.OnTerminal(apply, tasks)
 		c.clearObserver(apply.ID)
 	}
+	return nil
 }
 
 // adoptSequentialOutcome mutates the in-memory apply to the outcome its

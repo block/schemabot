@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1014,16 +1015,19 @@ func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Tas
 }
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic
-// doesn't crash the entire process. On panic, all tasks and the apply are marked failed.
-func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			errMsg := fmt.Sprintf("panic in apply goroutine: %v", r)
-			c.logger.Error(errMsg, apply.LogAttrs()...)
-			c.failApplyWithTasks(ctx, apply, tasks, errMsg)
-		}
-	}()
-	fn()
+// doesn't crash the entire process. On panic, all tasks and the apply are marked
+// failed and the panic surfaces as a *panicsafe.Error, so the operator routes it
+// through its drive-panic handling (AV-5) rather than treating it as a transient
+// drive failure it should retry.
+func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func() error) error {
+	recovered, err := panicsafe.Catch(fn)
+	if recovered != nil {
+		errMsg := fmt.Sprintf("panic in apply goroutine: %v", recovered.Value)
+		c.logger.Error(errMsg, apply.LogAttrs()...)
+		c.failApplyWithTasks(ctx, apply, tasks, errMsg)
+		return recovered
+	}
+	return err
 }
 
 // groupedApplyMode classifies the grouped-apply strategy for a drive, for logs
@@ -1094,23 +1098,22 @@ func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
 	c.cancelMu.Unlock()
 }
 
-func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
 	// Admission normally refuses this work first. The admitting deployment's
 	// verdict also travels on each row so a drive loading work from a peer or
 	// prior build fails closed without relying on the plan it happens to hold.
 	if err := blockedTaskError(tasks); err != nil {
 		c.refuseBlockedTasks(ctx, apply, tasks, err)
-		return
+		return nil
 	}
 	if c.usesGroupedApply(apply, options) {
-		c.runWithRecovery(ctx, apply, tasks, func() {
-			c.executeGroupedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+		return c.runWithRecovery(ctx, apply, tasks, func() error {
+			return c.executeGroupedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 		})
-		return
 	}
 
-	c.runWithRecovery(ctx, apply, tasks, func() {
-		c.executeApplySequential(ctx, apply, tasks, plan, options)
+	return c.runWithRecovery(ctx, apply, tasks, func() error {
+		return c.executeApplySequential(ctx, apply, tasks, plan, options)
 	})
 }
 

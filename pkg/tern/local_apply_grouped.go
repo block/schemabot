@@ -18,7 +18,7 @@ import (
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
 // defer_cutover, this is atomic cutover; for Vitess, this is one deploy request.
-func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
 	// Bind stable apply identity for every grouped-drive emission; mutable attrs remain per-call snapshots.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	ctx, cancelApply := context.WithCancel(ctx)
@@ -50,7 +50,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	logger.Info("building changes from scoped tasks", "task_count", len(tasks), "plan_id", plan.PlanIdentifier)
 	if len(plan.Namespaces) == 0 {
 		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
-		return
+		return nil
 	}
 	if c.config.Type == storage.DatabaseTypeMySQL && len(plan.Namespaces) > 1 {
 		var names []string
@@ -59,12 +59,12 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		}
 		c.failApplyWithTasks(ctx, apply, tasks,
 			fmt.Sprintf("MySQL applies support one namespace per apply, but plan has %d: %v", len(plan.Namespaces), names))
-		return
+		return nil
 	}
 	creds, err := c.credentialsForGroupedApply(plan)
 	if err != nil {
 		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		return
+		return nil
 	}
 	changes := groupedResumeChanges(tasks, plan)
 
@@ -72,14 +72,14 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// for a long time (branch creation, DDL application, deploy request) and
 	// started_at should reflect when work actually began, not when it finished.
 	if !c.recordDriveStarted(ctx, apply, logger) {
-		return
+		return nil
 	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",
 			append(apply.MutableLogAttrs(), "error", err)...)
-		return
+		return nil
 	} else if standDown {
-		return
+		return nil
 	}
 
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
@@ -118,7 +118,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		// A cancelled drive is why the engine call returned, so the error
 		// describes the driver and not the change the engine already accepted.
 		if c.driveCancelled(ctx, apply, "while the engine was applying") {
-			return
+			return nil
 		}
 		newState := state.Apply.Failed
 		if c.shouldRetryEngineError(err) {
@@ -132,19 +132,19 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		} else {
 			logger.Error("apply failed", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
 		}
-		return
+		return nil
 	}
 
 	if !result.Accepted {
 		c.failApplyWithTasks(ctx, apply, tasks, result.Message)
-		return
+		return nil
 	}
 
 	if isTasklessVSchemaOnlyPlan(tasks, plan) {
 		if completeErr := c.completeTasklessGroupedApply(ctx, apply, result.Message); completeErr != nil {
 			logger.Error("failed to complete task-less grouped apply", append(apply.MutableLogAttrs(), "error", completeErr)...)
 		}
-		return
+		return nil
 	}
 
 	// Persist the engine resume state and set IsInstant on tasks before marking
@@ -162,18 +162,18 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			// of abandoning it as terminal.
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
 				if c.driveCancelled(ctx, apply, "while saving the engine resume state") {
-					return
+					return nil
 				}
 				logger.Warn("failed to save engine resume state after accepted apply; pausing apply for operator retry",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
-				return
+				return nil
 			}
 		}
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && resumeState == nil {
 		c.failApplyWithTasks(ctx, apply, tasks, "engine accepted Vitess apply without resume state")
-		return
+		return nil
 	}
 
 	if result.ResumeState != nil {
@@ -198,7 +198,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
 	// Poll for completion - all tasks share the same state
-	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+	return c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 }
 
 func (c *LocalClient) saveEngineResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, resumeState *engine.ResumeState) error {
@@ -603,7 +603,17 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // Each table copies and cuts over independently.
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
-func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) {
+//
+// It returns an error only when the drive settled the apply's outcome but could
+// not record it, so the caller knows the stored apply is still active and no
+// side effect of the outcome has run. Once the outcome is stored the poll
+// returns nil whatever happens to the side effects: a failed request
+// settlement is logged and left for the operator's post-drive settlement, and
+// the summary still posts. A drive context that ends — an operator's
+// stop cancelling the drive, a lost lease, the operator shutting down — is a
+// hand-back rather than a failure: the poll returns nil and the caller reads
+// its own context to learn why it stopped.
+func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) error {
 	eng := c.getEngine()
 	ticker := time.NewTicker(c.taskPollInterval())
 	defer ticker.Stop()
@@ -623,10 +633,10 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		case <-ctx.Done():
 			c.logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				apply.IdentityLogAttrs()...)
-			return
+			return nil
 		case <-ticker.C:
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
-				return
+				return ps.terminalErr
 			}
 		}
 	}
@@ -1090,19 +1100,29 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ensureApplyFailureMessage(apply, tasks)
 		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 		if err != nil {
-			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-		} else if !swapped {
+			// A cancelled drive is why the write failed, so the error describes
+			// the driver and not the outcome; the drive hands the apply back.
+			if c.driveCancelled(ctx, apply, "while persisting the apply's settled state") {
+				return true
+			}
+			// The stored apply is still active, so nothing that answers for its
+			// outcome may run: completing a pending control request here would
+			// resolve an operator's command against an apply storage still
+			// reports active, and the observer would post a terminal summary for
+			// it. The drive exits and a later claim finalizes the apply.
+			logger.Error("failed to persist the apply's settled state; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
+				"deployment", apply.Deployment, "stored_state", expectedState, "settled_state", apply.State, "error", err)
+			ps.terminalErr = fmt.Errorf("persist grouped outcome for apply %s: %w", apply.ApplyIdentifier, err)
+			return true
+		}
+		if !swapped {
 			// Another drive advanced the apply between our reload and write; it
 			// owns the terminal transition and its side-effects. Skip ours.
 			logger.Info("apply terminal-state write lost a race; yielding to the owning drive",
 				"expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-			logger.Warn("failed to settle pending control requests after terminal progress reconciliation; current apply owner will exit for operator retry",
-				"error", err)
-			return true
-		}
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		switch {
 		case retryableFailure:
