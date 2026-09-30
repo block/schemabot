@@ -2546,7 +2546,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 				CutoverPolicy: storage.CutoverPolicyBarrier,
 			},
 			tern:       baseTern,
-			wantErrSub: "sets cutover_policy without a deployments map",
+			wantErrSub: "sets cutover_policy without a deployments map or targets list",
 		},
 		{
 			name: "invalid cutover_policy value is rejected",
@@ -2590,6 +2590,18 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			tern: baseTern,
 		},
 		{
+			// A large fleet runs its targets in parallel, bounded by the
+			// server's max_drivers_per_apply, and keeps going past a failed one.
+			name: "cutover_policy parallel and on_failure continue with a targets list are accepted",
+			envConfig: EnvironmentConfig{
+				Deployment:    "payments-a",
+				Targets:       []string{"payments-001", "payments-002"},
+				CutoverPolicy: storage.CutoverPolicyParallel,
+				OnFailure:     storage.OnFailureContinue,
+			},
+			tern: baseTern,
+		},
+		{
 			name: "on_failure without a deployments map is rejected",
 			envConfig: EnvironmentConfig{
 				Target:     "payments",
@@ -2597,7 +2609,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 				OnFailure:  storage.OnFailureContinue,
 			},
 			tern:       baseTern,
-			wantErrSub: "sets on_failure without a deployments map",
+			wantErrSub: "sets on_failure without a deployments map or targets list",
 		},
 		{
 			name: "on_failure halt with a deployments map is accepted",
