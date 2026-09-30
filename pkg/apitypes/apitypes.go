@@ -89,6 +89,8 @@ const (
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
 	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
+	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
+	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
 )
 
 var retryableErrorCodes = map[string]bool{
