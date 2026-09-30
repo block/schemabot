@@ -7606,10 +7606,7 @@ _No details available yet._
 
 ---
 
-To cut over `eu`:
-```
-schemabot cutover apply-a1b2c3d4e5f6 -e production
-```
+SchemaBot will cut over `eu` next — no action needed.
 
 To stop this schema change:
 ```
@@ -7774,6 +7771,128 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 </details>
 
 ---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="barrier-rollout-with-deferred-cutover"></a><strong>Barrier Rollout With Deferred Cutover</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 ready for cutover, 1 running, 2 waiting
+
+- 🟢 `eu` — ready for cutover — next in order
+- 🔄 `us` — running table copy
+- ⏳ `au` — waiting for us
+- ⏳ `ca` — waiting for us
+
+<details open>
+<summary>🟢 eu — ready for cutover — next in order</summary>
+<dl><dd>
+
+**Database**: `payments_eu`
+
+**Status**: Waiting for Cutover
+
+**3/3** table(s) ready for cutover
+
+📊 3 waiting for cutover
+
+**Schema `testapp`**
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>🔄 us — running table copy</summary>
+<dl><dd>
+
+**Database**: `payments_us`
+
+**Status**: In Progress
+
+📊 1/3 complete · 1 running (62.38%) · 1 queued
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+</dd></dl>
+</details>
+
+<details>
+<summary>⏳ au — waiting for us</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+<details>
+<summary>⏳ ca — waiting for us</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+---
+
+To cut over `eu`:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e production
+```
 
 To stop this schema change:
 ```

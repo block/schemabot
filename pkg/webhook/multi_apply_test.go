@@ -52,6 +52,28 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 	assert.Contains(t, out, "- 🔄 `us` — running table copy")
 }
 
+// A barrier rollout with a deployment ready for cutover offers the cutover
+// command only when the apply was started with --defer-cutover. Otherwise
+// SchemaBot cuts that deployment over itself, and the comment says so instead
+// of handing the operator a command.
+func TestFormatApplyStatusComment_CutoverNextActionFollowsDeferCutover(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
+	}
+
+	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "")
+	assert.Contains(t, automatic, "SchemaBot will cut over `eu` next — no action needed.")
+	assert.NotContains(t, automatic, "schemabot cutover")
+
+	deferred := runningApply()
+	deferred.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
+	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "")
+	assert.Contains(t, manual, "To cut over `eu`:")
+	assert.Contains(t, manual, "schemabot cutover apply-1 -e production")
+	assert.NotContains(t, manual, "SchemaBot will cut over")
+}
+
 // An apply that failed under on_failure=pause with a held sibling renders the
 // paused "release or stop" guidance; once the operator releases it, the apply
 // renders running degraded instead — the boundary applies the apply-level

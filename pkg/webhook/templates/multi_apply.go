@@ -340,6 +340,14 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	na := data.Model.NextAction
 	switch na.Kind {
 	case presentation.NextActionCutover:
+		// Only an apply started with --defer-cutover waits for an operator at
+		// each cutover; otherwise SchemaBot cuts the ready member over itself,
+		// and offering the command would contradict that.
+		if !rolloutDefersCutover(data.Details) {
+			sb.WriteString("\n---\n\n")
+			fmt.Fprintf(sb, "SchemaBot will cut over %s next — no action needed.\n", inlineCode(na.Name))
+			return
+		}
 		writeFooterAction(sb,
 			fmt.Sprintf("To cut over %s:", inlineCode(na.Name)),
 			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
@@ -353,6 +361,18 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	case presentation.NextActionNone:
 		// No operator action is pending; nothing to render.
 	}
+}
+
+// rolloutDefersCutover reports whether the apply was started with
+// --defer-cutover. The members of one apply share its cutover option, so the
+// first member with detail speaks for all, as it does for the rollout footer.
+func rolloutDefersCutover(details []*ApplyStatusCommentData) bool {
+	for _, detail := range details {
+		if detail != nil {
+			return detail.DeferCutover
+		}
+	}
+	return false
 }
 
 // writeDeploymentSummaryList writes one line per deployment (status glyph,
