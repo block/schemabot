@@ -128,8 +128,7 @@ func TestLocalRuntimeRecovery(t *testing.T) {
 	execSQL(t, db, "UPDATE `schemabot_state`.`apply_operations` SET `updated_at` = NOW() - INTERVAL 1 HOUR")
 	process = start()
 	waitProgress(t, process.endpoint, apply.ApplyID, func(p apitypes.ProgressResponse) bool { return state.IsState(p.State, state.Apply.WaitingForCutover) })
-	var control apitypes.ControlResponse
-	request(t, process.endpoint, http.MethodPost, "/api/cutover", testToken, apitypes.ControlRequest{ApplyID: apply.ApplyID, Environment: "development"}, http.StatusOK, &control)
+	control := cutoverOnceRecovered(t, process.endpoint, apply.ApplyID)
 	require.True(t, control.Accepted, control.ErrorMessage)
 	waitProgress(t, process.endpoint, apply.ApplyID, func(p apitypes.ProgressResponse) bool { return state.IsState(p.State, state.Apply.Completed) })
 	var count, incorrectRows int64
@@ -231,6 +230,16 @@ func (p *localProcess) stop(t *testing.T, signal os.Signal) {
 
 func request(t *testing.T, endpoint, method, path, token string, payload any, want int, result any) {
 	t.Helper()
+	status, data := send(t, endpoint, method, path, token, payload)
+	require.Equal(t, want, status, string(data))
+	if result != nil {
+		require.NoError(t, json.Unmarshal(data, result), string(data))
+	}
+}
+
+// send makes one request to the local runtime and returns its status and body.
+func send(t *testing.T, endpoint, method, path, token string, payload any) (int, []byte) {
+	t.Helper()
 	var body io.Reader
 	if payload != nil {
 		data, err := json.Marshal(payload)
@@ -250,9 +259,36 @@ func request(t *testing.T, endpoint, method, path, token string, payload any, wa
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	require.Equal(t, want, resp.StatusCode, string(data))
-	if result != nil {
-		require.NoError(t, json.Unmarshal(data, result), string(data))
+	return resp.StatusCode, data
+}
+
+// cutoverOnceRecovered requests cutover for an apply a freshly started process
+// is taking over. The stored waiting_for_cutover state is visible before the
+// new driver claims the apply and enters recovery, and cutover is rejected
+// while it recovers, so a rejection is retried only while progress reports
+// the apply as recovering.
+func cutoverOnceRecovered(t *testing.T, endpoint, id string) apitypes.ControlResponse {
+	t.Helper()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(runtimeDeadline)
+	defer deadline.Stop()
+	for {
+		status, data := send(t, endpoint, http.MethodPost, "/api/cutover", testToken, apitypes.ControlRequest{ApplyID: id, Environment: "development"})
+		if status == http.StatusOK {
+			var control apitypes.ControlResponse
+			require.NoError(t, json.Unmarshal(data, &control), string(data))
+			return control
+		}
+		var progress apitypes.ProgressResponse
+		request(t, endpoint, http.MethodGet, fmt.Sprintf("/api/progress/apply/%s", id), testToken, nil, http.StatusOK, &progress)
+		require.Equal(t, http.StatusConflict, status, string(data))
+		require.True(t, state.IsState(progress.State, state.Apply.Recovering), "cutover rejected outside recovery (state %s): %s", progress.State, data)
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			require.FailNow(t, "cutover deadline exceeded: apply is still recovering", "%s", data)
+		}
 	}
 }
 
