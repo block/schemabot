@@ -9,41 +9,71 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/stretchr/testify/assert"
 )
 
+// An apply the database type refused for a requested feature is told which
+// feature was refused and the command to re-issue without the option that asked
+// for it, in the environment the refused command named, so the operator's next
+// action is in the comment rather than left to be inferred from the refusal.
 func TestApplyExecutionErrorMessage(t *testing.T) {
-	t.Run("unsupported feature is actionable", func(t *testing.T) {
+	t.Run("unsupported feature names the command to re-issue without the option", func(t *testing.T) {
 		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover}
-		assert.Equal(t, `database "orders": deferred cutover is not supported for database_type: postgres`, applyExecutionErrorMessage(err))
+		assert.Equal(t,
+			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
+				"Run `schemabot apply -e production` again without `--defer-cutover`.",
+			applyExecutionErrorMessage(action.Apply, "production", err))
+	})
+
+	t.Run("unsupported feature no command option requests has no remedy", func(t *testing.T) {
+		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureMultiTarget}
+		msg := applyExecutionErrorMessage(action.Apply, "staging", err)
+		assert.Equal(t, err.Error()+".", msg)
+		assert.NotContains(t, msg, "again without")
 	})
 
 	t.Run("lock intent change remains actionable", func(t *testing.T) {
-		assert.Contains(t, applyExecutionErrorMessage(fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "staging", fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
 	})
 
 	t.Run("internal error remains sanitized", func(t *testing.T) {
-		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(errors.New("secret DSN")))
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "staging", errors.New("secret DSN")))
 	})
 }
 
 // A rollback-confirm whose lock stopped pinning the confirmed plan is told that
 // nothing ran and to plan a fresh rollback, in SchemaBot's words rather than
-// the storage error's; other dispatch failures keep their own guidance.
+// the storage error's. A rollback the database type cannot run is told which
+// feature was refused and the rollback-confirm to re-issue without the option
+// that asked for it, because retrying the same command would be refused the
+// same way and the refusal left the pinned rollback in place for the re-issue.
+// Every other dispatch failure stays in server logs behind fixed guidance that
+// does not promise a retry will succeed.
 func TestRollbackExecutionErrorMessage(t *testing.T) {
 	t.Run("lock intent change coaches a fresh rollback", func(t *testing.T) {
-		msg := rollbackExecutionErrorMessage(fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
+		msg := rollbackExecutionErrorMessage("staging", fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
 		assert.Equal(t, msgRollbackLockIntentChanged, msg)
 		assert.Contains(t, msg, "nothing was applied")
 		assert.Contains(t, msg, "run the rollback command again")
 		assert.NotContains(t, msg, storage.ErrLockIntentChanged.Error())
 	})
 
-	t.Run("other dispatch failures use fixed guidance", func(t *testing.T) {
+	t.Run("unsupported feature names the refused feature and the rollback-confirm to re-issue", func(t *testing.T) {
+		err := fmt.Errorf("execute apply: %w", &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover})
+		assert.Equal(t,
+			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
+				"Run `schemabot rollback-confirm -e staging` again without `--defer-cutover`. "+
+				"The pending rollback stays pinned for it.",
+			rollbackExecutionErrorMessage("staging", err))
+	})
+
+	t.Run("internal errors use fixed guidance without a retry promise", func(t *testing.T) {
 		err := errors.New("dial tcp storage.internal:3306: connection refused")
-		msg := rollbackExecutionErrorMessage(err)
-		assert.Equal(t, "Failed to execute rollback; see server logs for details and retry rollback-confirm.", msg)
+		msg := rollbackExecutionErrorMessage("staging", err)
+		assert.Equal(t, "Failed to execute rollback. See SchemaBot server logs for details.", msg)
 		assert.NotContains(t, msg, err.Error())
+		assert.NotContains(t, msg, "retry")
 	})
 }
 
