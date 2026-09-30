@@ -471,8 +471,8 @@ func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, erro
 		if strings.Contains(namespace, "..") || strings.ContainsAny(namespace, `/\`) {
 			return nil, fmt.Errorf("pull namespace %q must be a single path component", namespace)
 		}
-		if strings.Contains(namespace, "$ENV") {
-			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve $ENV before calling pull", namespace)
+		if schema.HasNamespaceEnvironmentPlaceholder(namespace) {
+			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve {env} or $ENV before calling pull", namespace)
 		}
 		if schema.IsReservedPullNamespaceForDialect(dialect, namespace) {
 			return nil, fmt.Errorf("pull namespace %q is reserved and cannot be pulled", namespace)
@@ -1634,16 +1634,17 @@ func buildApplyOperationGroups(
 		return groups, true, nil
 	}
 
-	// A VSchema-only plan carries no per-table work: its only change is one or
-	// more namespaces' VSchema documents, which are never modeled as task rows.
+	// A finalizer-only plan carries no per-table work: its only change is one
+	// or more namespaces' finalizers — a VSchema document to apply, or a
+	// finalize the engine asked for — which are never modeled as task rows.
 	// Shape it as one deployment-scoped task-less group_finalizer per target —
-	// the kind whose drive applies every VSchema-changed namespace from the plan
-	// in a single engine apply — so no work operation is ever created without
-	// tasks to drive. One operation, not one per namespace: a branch-based
-	// engine stands up one branch covering the whole deployment and validates
-	// every keyspace in it, so splitting the namespaces across operations would
-	// have each drive validating keyspaces whose VSchema it never applied.
-	if len(taskChanges) == 0 && len(plan.VSchemaNamespaces()) > 0 {
+	// the kind whose drive finalizes every such namespace from the plan in a
+	// single engine apply — so no work operation is ever created without tasks
+	// to drive. One operation, not one per namespace: a branch-based engine
+	// stands up one branch covering the whole deployment and validates every
+	// keyspace in it, so splitting the namespaces across operations would have
+	// each drive validating keyspaces whose VSchema it never applied.
+	if len(taskChanges) == 0 && len(plan.FinalizerNamespaces()) > 0 {
 		groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
 		for _, member := range members {
 			operationKey, err := keys.qualify(member, finalizerOperationKeySegment)
@@ -1655,6 +1656,17 @@ func buildApplyOperationGroups(
 			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
 		}
 		return groups, false, nil
+	}
+
+	// Past this point the apply runs as one work operation per target with no
+	// finalizer. That shape carries a VSchema change inside the work itself,
+	// but it has nowhere to run a finalize the engine asked for, so refuse the
+	// plan rather than complete an apply that skipped it.
+	for _, member := range members {
+		if namespaces := member.Plan.EngineFinalizedNamespaces(); len(namespaces) > 0 {
+			return nil, false, fmt.Errorf("plan %s asks to finalize namespaces %v after their DDL, but its changes carry no per-shard plan to schedule a group finalizer behind; re-plan, and report this if it repeats",
+				member.Plan.PlanIdentifier, namespaces)
+		}
 	}
 
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
@@ -1716,11 +1728,12 @@ func settleConvergedMemberOperations(groups []*storage.ApplyOperationWithTasks, 
 }
 
 // buildNamespaceFinalizerOperations builds one task-less group_finalizer per
-// VSchema-changed namespace in the plan, for one target. The VSchema is applied
-// once the namespace's shard work (if any) completes; the finalizer drives it
-// from the plan (reconstructed by namespace at drive time), not from a
-// synthetic task. A namespace with no shard work still gets a finalizer so its
-// VSchema change is never dropped.
+// namespace in the plan that needs one — its VSchema changes, or the engine
+// asked to finalize it — for one target. The finalizer runs once the
+// namespace's shard work (if any) completes; it is driven from the plan
+// (reconstructed by namespace at drive time), not from a synthetic task. A
+// namespace with no shard work still gets a finalizer so its VSchema change or
+// requested finalize is never dropped.
 func buildNamespaceFinalizerOperations(
 	applyPlan *storage.Plan,
 	member applyMember,
@@ -1729,7 +1742,7 @@ func buildNamespaceFinalizerOperations(
 	onFailure string,
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
-	namespaces := member.Plan.VSchemaNamespaces()
+	namespaces := member.Plan.FinalizerNamespaces()
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(namespaces))
 	for _, namespace := range namespaces {
 		if err := validateOperationKeyPart("namespace", namespace); err != nil {

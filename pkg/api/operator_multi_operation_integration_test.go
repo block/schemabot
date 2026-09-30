@@ -276,7 +276,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 			"region-b": {taskState: state.Task.Pending},
 		}))
 
-		svc.recoverApplies(ctx, 1)
+		svc.recoverApplies(ctx, 1, openClaimGate())
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID("region-b")),
@@ -395,7 +395,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 			"region-a": {taskState: state.Task.Pending},
 		}))
 
-		svc.recoverApplies(ctx, 1)
+		svc.recoverApplies(ctx, 1, openClaimGate())
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any shard work")
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.workAID),

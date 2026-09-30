@@ -253,6 +253,7 @@ type capturedLog struct {
 type capturingLogger struct {
 	debugs []capturedLog
 	infos  []capturedLog
+	warns  []capturedLog
 	errors []capturedLog
 }
 
@@ -262,6 +263,10 @@ func (l *capturingLogger) Debug(msg string, args ...any) {
 
 func (l *capturingLogger) Info(msg string, args ...any) {
 	l.infos = append(l.infos, capturedLog{msg: msg, args: args})
+}
+
+func (l *capturingLogger) Warn(msg string, args ...any) {
+	l.warns = append(l.warns, capturedLog{msg: msg, args: args})
 }
 
 func (l *capturingLogger) Error(msg string, args ...any) {

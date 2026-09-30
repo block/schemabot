@@ -35,12 +35,20 @@ const (
 	// changes how Vitess routes through it, so it requires the same opt-in
 	// as a removal.
 	PlanMetadataVSchemaMutations = "vschema_mutations"
+
+	// PlanMetadataVSchemaGeneratedOnly is "true" when the engine generated the
+	// namespace's whole VSchema change from the plan's DDL, leaving no diff to
+	// review (engine.MetadataVSchemaGeneratedOnly). Persisting it lets
+	// stored-plan and apply-time surfaces show the namespace the way the plan
+	// did. Display-only: no safety gate reads it.
+	PlanMetadataVSchemaGeneratedOnly = "vschema_generated_only"
 )
 
 // VSchemaPlanMetadata extracts the subset of an engine's plan change-metadata
 // that must survive plan persistence: the keys apply-time safety gates read
 // (the VSchema-changed flag and the recorded structural deletions and vindex
-// mutations) plus the rendered diff apply-time display reads. Every plan
+// mutations) plus the rendered diff and generated-only marker apply-time
+// display reads. Every plan
 // persistence site uses this helper so stored plans carry the same metadata
 // regardless of which plane persisted them. Returns nil for a change without
 // VSchema work, so such namespaces store no metadata.
@@ -49,7 +57,7 @@ func VSchemaPlanMetadata(metadata map[string]string) map[string]string {
 		return nil
 	}
 	persisted := map[string]string{PlanMetadataVSchemaChanged: "true"}
-	for _, key := range []string{PlanMetadataVSchemaDeletions, PlanMetadataVSchemaMutations, PlanMetadataVSchemaDiff} {
+	for _, key := range []string{PlanMetadataVSchemaDeletions, PlanMetadataVSchemaMutations, PlanMetadataVSchemaDiff, PlanMetadataVSchemaGeneratedOnly} {
 		if raw := metadata[key]; raw != "" {
 			persisted[key] = raw
 		}

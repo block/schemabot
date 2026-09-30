@@ -112,11 +112,15 @@ type NamespaceChange struct {
 	Changes        []DDLChange
 	VSchemaChanged bool
 	VSchemaDiff    string
+	// Finalize marks a namespace the engine asked to finalize after its DDL.
+	// It gets its own line only when it is the namespace's only work.
+	Finalize bool
 }
 
 // WriteNamespaceChanges writes per-namespace DDL and VSchema sections.
 // For MySQL with a single namespace matching the database, the namespace header is omitted.
-// For Vitess, each keyspace gets a header with optional VSchema diff.
+// For Vitess, each keyspace gets a header, and a keyspace whose VSchema
+// changes shows that change whatever engine reported the plan.
 func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string, dialect schema.Dialect) {
 	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
 
@@ -136,13 +140,13 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 	}
 	var groups []nsGroup
 	for _, ns := range namespaces {
-		if len(ns.Changes) == 0 && !ns.VSchemaChanged {
+		if len(ns.Changes) == 0 && !ns.VSchemaChanged && !ns.Finalize {
 			continue
 		}
 		// Try to merge with previous group if DDL is identical
-		if len(groups) > 0 && !ns.VSchemaChanged {
+		if len(groups) > 0 && collapsible(ns) {
 			prev := &groups[len(groups)-1]
-			if !prev.namespaces[0].VSchemaChanged && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
+			if collapsible(prev.namespaces[0]) && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
 				prev.namespaces = append(prev.namespaces, ns)
 				continue
 			}
@@ -171,12 +175,15 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 				if !singleNamespace {
 					fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 				}
-				if ns.VSchemaChanged && !isMySQL {
+				if ns.VSchemaChanged {
 					fmt.Println(indentTable + "~ VSchema:")
 					if ns.VSchemaDiff != "" {
 						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, indentContent))
 						fmt.Println()
 					}
+				}
+				if ns.Finalize && !ns.VSchemaChanged && len(ns.Changes) == 0 {
+					fmt.Println(indentTable + "~ Finalized by the engine once every shard's DDL has landed")
 				}
 				if len(ns.Changes) > 0 {
 					WriteSQLChanges(ns.Changes, dialect)
@@ -184,6 +191,14 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 			}
 		}
 	}
+}
+
+// collapsible reports whether a namespace renders as its DDL alone, so it can
+// collapse with neighbours that have the same DDL. A VSchema change renders
+// its own section, and a finalize renders its own line when it is the
+// namespace's only work.
+func collapsible(ns NamespaceChange) bool {
+	return !ns.VSchemaChanged && (!ns.Finalize || len(ns.Changes) > 0)
 }
 
 // ddlChangesEqual returns true if two slices of DDL changes have identical content.
@@ -348,6 +363,12 @@ type VSchemaChange struct {
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
 func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
+	WritePlanSummaryWithKeyspaceUpdates(ddlChanges, vschemaChanges, 0)
+}
+
+// WritePlanSummaryWithKeyspaceUpdates writes a single plan summary line
+// including VSchema changes and the keyspaces whose only work is a finalize.
+func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
 	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
@@ -356,9 +377,16 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 		}
 		parts = append(parts, fmt.Sprintf("%d %s", len(vschemaChanges), word))
 	}
+	if finalizes > 0 {
+		word := "keyspace"
+		if finalizes > 1 {
+			word = "keyspaces"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s to finalize", finalizes, word))
+	}
 
 	if len(parts) > 0 {
-		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
+		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
 		fmt.Println()
 	}
 }

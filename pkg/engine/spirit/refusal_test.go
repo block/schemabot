@@ -32,6 +32,14 @@ const refusalNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
 	"  `name` varchar(100) DEFAULT NULL\n" +
 	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 
+// refusalStringKeyTable is keyed on a string column, whose collation decides
+// which rows the key treats as equal.
+const refusalStringKeyTable = "CREATE TABLE `codes` (\n" +
+	"  `code` varchar(32) NOT NULL,\n" +
+	"  `label` varchar(100) DEFAULT NULL,\n" +
+	"  PRIMARY KEY (`code`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
 // The engine's refusal verdict is what plan-time execution modes and apply-time
 // routing are both built on, and it comes from Spirit rather than from anything
 // this repo can see in a diff. This pins the shapes each side of the verdict at
@@ -107,6 +115,33 @@ func TestStatementRefusalContract(t *testing.T) {
 			name:       "set to enum conversion",
 			stmt:       "ALTER TABLE orders MODIFY COLUMN perms ENUM('read','write')",
 			wantReason: `unsafe SET to ENUM type conversion on column "perms"`,
+		},
+		{
+			name:       "primary key column changed to a BIT",
+			stmt:       "ALTER TABLE orders MODIFY COLUMN id BIT(64) NOT NULL",
+			wantReason: `changing primary key column "id" of table "orders" to a BIT is not supported`,
+		},
+		{
+			name:       "primary key column changed to a FLOAT",
+			stmt:       "ALTER TABLE orders MODIFY COLUMN id FLOAT NOT NULL",
+			wantReason: `changing primary key column "id" of table "orders" to a FLOAT is not supported`,
+		},
+		{
+			name:       "primary key column given another collation",
+			stmt:       "ALTER TABLE codes MODIFY COLUMN code VARCHAR(32) COLLATE utf8mb4_bin NOT NULL",
+			table:      refusalStringKeyTable,
+			wantReason: `changing the collation of primary key column "code" is not supported`,
+		},
+		{
+			name:       "table converted to a character set that re-collates its primary key",
+			stmt:       "ALTER TABLE codes CONVERT TO CHARACTER SET latin1",
+			table:      refusalStringKeyTable,
+			wantReason: "converting the table's character set changes the collation of its primary key, which is not supported",
+		},
+		{
+			name:       "table renamed to a name containing a dot",
+			stmt:       "ALTER TABLE orders RENAME TO `orders.archive`",
+			wantReason: `"orders.archive" contains a '.', which Spirit does not support`,
 		},
 		{
 			name: "add column",
@@ -187,6 +222,14 @@ const refusalCanaryOrdersTable = "CREATE TABLE `orders` (\n" +
 	"  PRIMARY KEY (`id`)\n" +
 	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 
+// refusalCanaryStringKeyTable is refusalStringKeyTable with its untouched
+// column's name and a default replaced by canaries.
+const refusalCanaryStringKeyTable = "CREATE TABLE `codes` (\n" +
+	"  `code` varchar(32) NOT NULL,\n" +
+	"  `cnry_label` varchar(100) DEFAULT 'cnry_unset',\n" +
+	"  PRIMARY KEY (`code`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
 // refusalCanaryNoPrimaryKeyTable is the unkeyed definition with canary column
 // names, for the refusal that reads the current key set rather than a column.
 const refusalCanaryNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
@@ -252,6 +295,27 @@ func TestStatementRefusalPublishesNothingFromTheTarget(t *testing.T) {
 			stmt:              "ALTER TABLE orders_log ADD COLUMN shipped_at DATETIME",
 			table:             refusalCanaryNoPrimaryKeyTable,
 			wantFromStatement: "primary key",
+		},
+		{
+			name:              "primary key column changed to a BIT",
+			stmt:              "ALTER TABLE orders MODIFY COLUMN id BIT(64) NOT NULL",
+			wantFromStatement: `"id"`,
+		},
+		{
+			name:              "primary key column changed to a FLOAT",
+			stmt:              "ALTER TABLE orders MODIFY COLUMN id FLOAT NOT NULL",
+			wantFromStatement: `"id"`,
+		},
+		{
+			name:              "primary key column given another collation",
+			stmt:              "ALTER TABLE codes MODIFY COLUMN code VARCHAR(32) COLLATE utf8mb4_bin NOT NULL",
+			table:             refusalCanaryStringKeyTable,
+			wantFromStatement: `"code"`,
+		},
+		{
+			name:              "table renamed to a name containing a dot",
+			stmt:              "ALTER TABLE orders RENAME TO `orders.archive`",
+			wantFromStatement: `"orders.archive"`,
 		},
 	}
 	for _, tt := range tests {

@@ -694,12 +694,13 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		writeStructuredRowsAndETA(&b, t)
+	case t.RowsTotal > 0 && ui.EstimateExceeded(t.RowsCopied, t.RowsTotal):
+		// The copy has passed the engine's estimate, so a percentage would
+		// read as done while rows are still moving. The block ends the way
+		// every in-progress block does, below: the throttle note, the blank
+		// line that separates it from the next table, and the shard rows.
+		writeEstimateExceededTable(&b, t, activityBar, activityLabel)
 	case t.RowsTotal > 0:
-		if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
-			b.WriteString(formatEstimateExceededTable(t, t.RowsCopied, activityBar, activityLabel))
-			return b.String()
-		}
-
 		// Row copy in progress — show progress bar with structured fields
 		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 		bar := ui.ProgressBarRowCopy(displayPercent)
@@ -764,9 +765,18 @@ func FormatThrottleReference(tables []TableProgress) string {
 		if !state.IsState(table.Status, state.Task.Running, state.Task.Checksumming) {
 			continue
 		}
-		return fmt.Sprintf("  %sDocs: %s%s\n\n", ANSIDim, ui.Link("Throttle reference", ui.ThrottleDocURL), ANSIReset)
+		return "  " + DocsLine(ui.ThrottleDocURL) + "\n\n"
 	}
 	return ""
+}
+
+// DocsLine points a terminal surface at one documentation page, the way a PR
+// comment's docs line does: the docs glyph and label at full weight, then the
+// page's short reference in link blue as the hyperlink text. Where hyperlinks
+// are unavailable the full URL takes the reference's place, so the line reads
+// the same and the address is never lost.
+func DocsLine(url string) string {
+	return glyph.Docs + " Docs: " + ANSIBlue + ui.Link(ui.DocRef(url), url) + ANSIReset
 }
 
 // writeThrottleTooltip explains the header's "(throttled)" annotation with the
@@ -799,16 +809,16 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 	fmt.Fprintf(b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
 }
 
-func formatEstimateExceededTable(t TableProgress, rowsCopied int64, activityBar, activityLabel string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, activityBar, activityLabel, throttledSuffix(t))
+// writeEstimateExceededTable writes the header and detail lines of a table
+// whose copy has passed the engine's row estimate: the rows copied so far and
+// a note that the copy is still running, in place of a percentage.
+func writeEstimateExceededTable(b *strings.Builder, t TableProgress, activityBar, activityLabel string) {
+	fmt.Fprintf(b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, activityBar, activityLabel, throttledSuffix(t))
 	if t.DDL != "" {
 		b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 	}
-	fmt.Fprintf(&b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(rowsCopied))
-	fmt.Fprintf(&b, indentDetail+"%s"+glyph.Info+" %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
-	writeThrottleTooltip(&b, t)
-	return b.String()
+	fmt.Fprintf(b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
+	fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
 }
 
 // writeTableProgress writes progress for a single table to stdout.

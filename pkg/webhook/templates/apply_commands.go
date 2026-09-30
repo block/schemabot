@@ -169,14 +169,14 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	sb.WriteString("\n")
 
 	// Count and show changes
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	if totalChanges > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
@@ -229,12 +229,12 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
 
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	if totalStatements+keyspacesWithVSchema > 0 {
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	if totalStatements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
