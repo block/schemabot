@@ -1461,7 +1461,7 @@ waive with.
 
 Unsafe changes (error-severity lint findings such as table and column drops) block without
 `--allow-unsafe`. Changes an operator cannot undo mid-flight, such as direct execution's
-write-blocking DDL with no cutover and no revert, require the operator to confirm the specific
+write-blocking DDL with no cutover to defer, require the operator to confirm the specific
 consequences disclosed to them. The re-plan that runs just before execution re-checks that
 verdict, so a plan that changed after the confirmation stops rather than running something the
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,

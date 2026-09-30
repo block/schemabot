@@ -203,7 +203,7 @@ func exactRowCountWithin(ctx context.Context, db *sql.DB, schema, tableName stri
 // trusting the stored verdict.
 type refusedModeDecision struct {
 	mode       string // engine.ExecutionModeDirect or engine.ExecutionModeBlocked
-	modeReason string // operator-facing reason, including table-size context
+	modeReason string // operator-facing reason: a blocked verdict leads with the engine's refusal, a direct one states only the table's size
 	outcome    string // metric outcome label when the decision blocks
 	rows       int64  // measured rows under a row bound: exact for a direct verdict, the estimate when the estimate alone blocked
 	bytes      int64  // estimated data plus index bytes under a byte bound
@@ -295,7 +295,7 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 	}
 	return refusedModeDecision{
 		mode:       engine.ExecutionModeDirect,
-		modeReason: fmt.Sprintf("%s; runs as native MySQL DDL on a table with ~%s rows", refusalReason, ui.FormatNumber(count)),
+		modeReason: fmt.Sprintf("the table has ~%s rows", ui.FormatNumber(count)),
 		rows:       count,
 	}
 }
@@ -315,10 +315,9 @@ func (e *Engine) resolveByteBound(policy directPolicy, database, tableName, refu
 		}
 	}
 	return refusedModeDecision{
-		mode: engine.ExecutionModeDirect,
-		modeReason: fmt.Sprintf("%s; runs as native MySQL DDL on a table with %s of data and indexes",
-			refusalReason, ui.FormatApproxBytes(size.bytes)),
-		bytes: size.bytes,
+		mode:       engine.ExecutionModeDirect,
+		modeReason: fmt.Sprintf("the table has %s of data and indexes", ui.FormatApproxBytes(size.bytes)),
+		bytes:      size.bytes,
 	}
 }
 
@@ -626,7 +625,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		progress := e.trackDirectStatement(ds.table, ds.stmt)
 		logger.Info("executing statement directly as native MySQL DDL",
 			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows, "estimated_bytes", ds.bytes)
-		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: writes to the table block while it runs; not revertible")
+		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: writes to the table block while it runs")
 		if _, err := conn.ExecContext(ctx, ds.stmt); err != nil {
 			if ctx.Err() != nil {
 				// A cancelled context closes the connection, but MySQL may

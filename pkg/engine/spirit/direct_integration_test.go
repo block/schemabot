@@ -154,8 +154,8 @@ func TestEngine_Plan_DirectVerdictWithinBound(t *testing.T) {
 	require.Len(t, changes, 1)
 	assert.Contains(t, changes[0].DDL, "DROP PRIMARY KEY")
 	assert.Equal(t, "direct", changes[0].ExecutionMode, "the refused statement resolves to the direct verdict")
-	assert.Contains(t, changes[0].ModeReason, "dropping primary key is not supported")
-	assert.Contains(t, changes[0].ModeReason, "runs as native MySQL DDL on a table with ~")
+	assert.Regexp(t, `^the table has ~\d+ rows$`, changes[0].ModeReason,
+		"a direct verdict states the table's size, not the refusal it runs past")
 }
 
 // A table whose row count exceeds max_table_rows keeps the blocked verdict
@@ -381,9 +381,7 @@ func TestEngine_Plan_DirectVerdictWithinByteBound(t *testing.T) {
 	change := planPKReshape(t, dsn, byteBoundPolicyMetadata(100<<20), "direct_bytes_only")["direct_bytes_only"]
 
 	assert.Equal(t, engine.ExecutionModeDirect, change.ExecutionMode)
-	assert.Contains(t, change.ModeReason, "dropping primary key is not supported")
-	assert.True(t, strings.HasSuffix(change.ModeReason, "; runs as native MySQL DDL on a table with "+
-		ui.FormatApproxBytes(measured)+" of data and indexes"), "reason %q", change.ModeReason)
+	assert.Equal(t, "the table has "+ui.FormatApproxBytes(measured)+" of data and indexes", change.ModeReason)
 }
 
 // A table above the byte bound is blocked. The reason names only the
@@ -944,12 +942,13 @@ func TestExecutionVerdicts_RecordMatchesPlan(t *testing.T) {
 	eng := New(Config{Logger: logger})
 
 	for _, tc := range []struct {
-		name     string
-		metadata map[string]string
-		mode     string
+		name       string
+		metadata   map[string]string
+		mode       string
+		wantReason string
 	}{
-		{name: "policy enabled within bound", metadata: directPolicyMetadata(100000), mode: engine.ExecutionModeDirect},
-		{name: "policy disabled", metadata: nil, mode: engine.ExecutionModeBlocked},
+		{name: "policy enabled within bound", metadata: directPolicyMetadata(100000), mode: engine.ExecutionModeDirect, wantReason: "the table has ~"},
+		{name: "policy disabled", metadata: nil, mode: engine.ExecutionModeBlocked, wantReason: "dropping primary key is not supported"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			creds := &engine.Credentials{DSN: dsn, Metadata: tc.metadata}
@@ -976,7 +975,7 @@ func TestExecutionVerdicts_RecordMatchesPlan(t *testing.T) {
 			require.NoError(t, verdicts.Record(t.Context(), &change))
 			assert.Equal(t, planned[0].ExecutionMode, change.ExecutionMode)
 			assert.Equal(t, planned[0].ModeReason, change.ModeReason)
-			assert.Contains(t, change.ModeReason, "dropping primary key is not supported")
+			assert.Contains(t, change.ModeReason, tc.wantReason)
 		})
 	}
 }

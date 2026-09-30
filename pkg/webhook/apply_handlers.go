@@ -490,7 +490,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Direct-execution changes never run without explicit confirmation: the
-	// operator must consent to their blocking, non-revertible native DDL
+	// operator must consent to their write-blocking native DDL
 	// against the locked comment that discloses it, so the apply never
 	// proceeds in one step — downgrade to the two-step confirm.
 	if len(planResp.DirectChanges()) > 0 {

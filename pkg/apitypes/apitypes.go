@@ -1274,8 +1274,8 @@ func (t *TableChangeResponse) EngineBlocked() bool {
 }
 
 // DirectExecution reports whether the planner's execution-mode verdict routes
-// this change to direct execution: it runs as native MySQL DDL — synchronous,
-// blocking writes to the table while it runs, and not revertible.
+// this change to direct execution: it runs synchronously as native MySQL DDL
+// and blocks writes to the table while it runs.
 func (t *TableChangeResponse) DirectExecution() bool {
 	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
 }

@@ -719,8 +719,8 @@ read off that apply rather than resolved again. The two can differ: a
 rollback runs after the change it reverses, and withdrawing the grant in
 between would otherwise refuse the statement that undoes a change it allowed.
 
-A direct statement is synchronous, blocks writes to the table while it runs,
-and cannot be reverted — the size bound is the fail-closed blast-radius cap.
+A direct statement is synchronous and blocks writes to the table while it
+runs — the size bound is the fail-closed blast-radius cap.
 An enabled policy sets exactly one of `max_table_rows` and `max_table_bytes`,
 and a refused statement runs directly only when the table is within it. A
 table above the bound, or whose size cannot be determined, stays blocked. The

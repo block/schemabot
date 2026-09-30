@@ -20,20 +20,44 @@ func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
 		}},
 		DirectChanges: []DirectChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+			{Table: "users", Reason: "the table has ~1,240 rows"},
 		},
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⚙️ **Direct execution**: 1 change will run as native MySQL DDL")
-	assert.Contains(t, plan, "`users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows")
-	assert.Contains(t, plan, "the change is **not revertible**")
-	assert.Contains(t, plan, "`--defer-cutover` does not apply")
+	assert.Contains(t, plan, "⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit")
+	assert.Contains(t, plan, "`users`: the table has ~1,240 rows")
+	assert.Contains(t, plan, "Writes to each table are blocked until its statement finishes. Confirming the apply consents to this.")
+	assert.NotContains(t, plan, "revertible", "a MySQL direct change is undone like any other MySQL change, so no revert warning is shown")
+	assert.NotContains(t, plan, "--defer-cutover", "a plan with no --defer-cutover apply behind it does not mention the flag")
 
 	data.IsLocked = true
 	apply := RenderPlanComment(data)
 	assert.Contains(t, apply, "⚙️ **Direct execution**", "the locked apply comment keeps the direct disclosure")
 	assert.Contains(t, apply, "Confirming the apply consents to this.")
+	assert.NotContains(t, apply, "--defer-cutover")
+}
+
+// An apply that passed --defer-cutover defers the cutover of the plan's
+// engine-driven changes only, so the direct disclosure on its locked comment
+// says the flag leaves the direct statements alone.
+func TestRenderPlanComment_DirectNotesDeferCutoverOnlyWhenPassed(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true, DeferCutover: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+				"ALTER TABLE `orders` ADD COLUMN `notes` text",
+			},
+		}},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "the table has ~1,240 rows"},
+		},
+	}
+
+	apply := RenderPlanComment(data)
+	assert.Contains(t, apply, "Writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer. Confirming the apply consents to this.")
 }
 
 func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {
@@ -76,11 +100,11 @@ func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
 			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY"},
 		}},
 		DirectChanges: []DirectChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows", Shards: []string{"-40", "40-80"}},
+			{Table: "users", Reason: "the table has ~40 rows", Shards: []string{"-40", "40-80"}},
 		},
 	})
 
-	assert.Contains(t, out, "`users` (shards `-40`, `40-80`): dropping primary key is not supported")
+	assert.Contains(t, out, "`users` (shards `-40`, `40-80`): the table has ~40 rows")
 }
 
 // The direct-execution consent copy is keyed by database type: MySQL-family
@@ -88,19 +112,18 @@ func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
 // semantics, and a database type without registered copy gets the
 // conservative engine-neutral disclosure rather than inheriting MySQL's.
 func TestDirectConsentCopy_KeyedByDatabaseType(t *testing.T) {
-	mysqlHeader, mysqlFooter := directConsentCopy("mysql", true)
-	assert.Equal(t, "native MySQL DDL", mysqlHeader)
-	assert.Contains(t, mysqlFooter, "writes to each table are blocked while its statement runs")
+	mysqlHeader, mysqlConsequence := directConsentCopy("mysql", true)
+	assert.Equal(t, "native MySQL DDL, not through Spirit", mysqlHeader)
+	assert.Equal(t, "Writes to each table are blocked until its statement finishes.", mysqlConsequence)
 
-	strataHeader, strataFooter := directConsentCopy("strata", false)
+	strataHeader, strataConsequence := directConsentCopy("strata", false)
 	assert.Equal(t, mysqlHeader, strataHeader, "Strata shards run the same native MySQL DDL")
-	assert.Equal(t, mysqlFooter, strataFooter)
+	assert.Equal(t, mysqlConsequence, strataConsequence)
 
-	otherHeader, otherFooter := directConsentCopy("postgres", false)
+	otherHeader, otherConsequence := directConsentCopy("postgres", false)
 	assert.Equal(t, "native DDL", otherHeader)
-	assert.Contains(t, otherFooter, "each table is unavailable while its statement runs")
-	assert.Contains(t, otherFooter, "**not revertible**")
-	assert.Contains(t, otherFooter, "Confirming the apply consents to this.")
+	assert.Contains(t, otherConsequence, "Each table is unavailable until its statement finishes")
+	assert.Contains(t, otherConsequence, "**not revertible**")
 }
 
 // A multi-environment plan renders each environment's own direct section,
@@ -113,7 +136,7 @@ func TestRenderMultiEnvPlanComment_DirectPerEnvironment(t *testing.T) {
 			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
 		}},
 		DirectChanges: []DirectChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows"},
+			{Table: "users", Reason: "the table has ~40 rows"},
 		},
 	}
 	productionPlan := &PlanCommentData{

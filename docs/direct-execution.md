@@ -26,8 +26,8 @@ change inside the system: under an explicit per-environment policy, a refused
 statement can run verbatim as native MySQL DDL.
 
 A direct statement behaves nothing like a normal SchemaBot apply. It is
-synchronous, it blocks writes to the table for its full duration, there is no
-throttling or checkpointing, and it cannot be reverted. The policy exists to
+synchronous, it blocks writes to the table for its full duration, and there is
+no throttling or checkpointing. The policy exists to
 bound those consequences, and every uncertain input fails closed.
 
 Lock acquisition is bounded too. Native DDL queues on the table's metadata
@@ -191,7 +191,9 @@ The mode reasons follow the row bound's shape. A table above the byte bound
 is blocked with a reason naming only the configured limit ("above the
 configured limit of 100.0 MiB of data and indexes"), so the same verdict on
 tables or shards of different sizes renders as one entry. A direct verdict
-reports the measured size ("on a table with ~45.8 MB of data and indexes").
+reports only the measured size ("the table has ~45.8 MB of data and
+indexes"), not the engine's refusal: SchemaBot runs the change, so the plan
+does not call it unsupported. The refusal stays in the server log.
 The limit is shown in
 binary units, matching how it is configured, and the measurement is shown as
 an approximate decimal figure, matching how plan output shows table sizes.
@@ -260,8 +262,9 @@ Engine notes:
 The apply command normally proceeds to execution in one step. A plan
 containing direct-execution changes never does:
 
-- The plan comment renders a ⚙️ direct-execution section listing each table,
-  the statement, and why the engine refused it.
+- The plan comment renders a ⚙️ direct-execution section saying the change
+  runs as native MySQL DDL instead of through Spirit, listing each table with
+  its measured size, above the statement in the plan.
 - `schemabot apply` stops at a locked apply comment that repeats the ⚙️
   disclosure and asks for `schemabot apply-confirm` — nothing executes, and
   the comment the operator confirms against is the one that spells out the
