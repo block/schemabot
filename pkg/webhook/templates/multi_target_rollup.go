@@ -35,8 +35,13 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		sb.WriteString("_No details available yet._\n")
 	}
 	silent := unreportedTargets(data, g)
+	// A target that has not reported is not known to run any one group's
+	// change, so when the groups diverge each line counts only its own
+	// targets and the silent ones are counted once, for the deployment.
+	lineSilent := silent
 	if len(work) > 1 {
 		sb.WriteString("Targets diverge — what applies where:\n\n")
+		lineSilent = 0
 	}
 	for _, w := range work {
 		if len(work) > 1 {
@@ -45,7 +50,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		dialect := dialectForEngine(memberDetail(data.Details, w.members[0]).Engine, data.ApplyID)
 		for _, t := range w.tables {
 			cells, targets := tableAcrossTargets(data, w.members, t)
-			writeTargetTableLine(sb, t.TableName, cells, targets, silent)
+			writeTargetTableLine(sb, t.TableName, cells, targets, lineSilent)
 			writeDDLLine(sb, dialect, t.DDL, budget)
 			sb.WriteString("\n")
 		}
@@ -125,12 +130,14 @@ func tableAcrossTargets(data MultiDeploymentApplyData, members []int, table Tabl
 // and the rows line names its coverage only when a target is left out of the
 // sum; until every target still to copy reports, the ETA (the slowest
 // target's) is a floor. Failed targets are counted rather than summed, since
-// their rows are not progressing. The running targets are named unless every
-// target is running. With nothing copying, the line names the table's phase.
-// silent is the deployment's targets with no progress reported at all; they
-// widen the row denominator and make the ETA a floor.
+// their rows are not progressing, and so are retrying targets. A completed
+// target has reported even when it had no rows to copy. The running targets
+// are named unless every target is running. With nothing copying, the line
+// names the table's phase. silent is the targets with no progress reported at
+// all that this line speaks for; they widen the row denominator and make the
+// ETA a floor.
 func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, targets []string, silent int) {
-	var done, queued, failed, reporting, unreported int
+	var done, queued, failed, retrying, reporting, unreported int
 	var copied, total, eta int64
 	var running []string
 	for i, c := range cells {
@@ -138,10 +145,17 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		switch status {
 		case state.Task.Completed:
 			done++
+			if c.RowsTotal == 0 {
+				reporting++
+				continue
+			}
 		case state.Task.Pending:
 			queued++
-		case state.Task.Failed, state.Task.FailedRetryable:
+		case state.Task.Failed:
 			failed++
+			continue
+		case state.Task.FailedRetryable:
+			retrying++
 			continue
 		case state.Task.Stopped, state.Task.Cancelled:
 			continue
@@ -158,7 +172,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		total += c.RowsTotal
 	}
 	name := inlineCode(table)
-	coverage := targetCoverage(done, len(running), queued, failed)
+	coverage := targetCoverage(done, len(running), queued, failed, retrying)
 	if len(running) > 0 && total > 0 {
 		if pct := ui.RowCopyDisplayPercent(int(copied*100/total), copied); pct > 0 {
 			fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
@@ -192,10 +206,11 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
 }
 
-// targetCoverage is the " · 40 complete, 4 running, 19 queued, 1 failed"
-// suffix of a table's line, naming only the states some target is in. Queued
-// targets are waiting on the apply's driver cap or on their turn in order.
-func targetCoverage(done, running, queued, failed int) string {
+// targetCoverage is the " · 40 complete, 4 running, 19 queued, 1 failed,
+// 1 retrying" suffix of a table's line, naming only the states some target is
+// in. Queued targets are waiting on the apply's driver cap or on their turn in
+// order.
+func targetCoverage(done, running, queued, failed, retrying int) string {
 	var parts []string
 	if done > 0 {
 		parts = append(parts, fmt.Sprintf("%d complete", done))
@@ -208,6 +223,9 @@ func targetCoverage(done, running, queued, failed int) string {
 	}
 	if failed > 0 {
 		parts = append(parts, fmt.Sprintf("%d failed", failed))
+	}
+	if retrying > 0 {
+		parts = append(parts, fmt.Sprintf("%d retrying", retrying))
 	}
 	if len(parts) == 0 {
 		return ""

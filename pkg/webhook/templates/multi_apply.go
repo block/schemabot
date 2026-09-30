@@ -230,15 +230,62 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
 }
 
-// writeRolloutFooter writes the rollout's one command at the bottom, where the
+// writeRolloutFooter writes the rollout's footer at the bottom, where the
 // single-deployment comment keeps its footer: every control command addresses
-// the whole apply. A pending rollup action takes the footer; otherwise it is
-// the footer the aggregate state would carry, such as stop while running.
+// the whole apply. A pending rollup action leads; otherwise the footer is the
+// one the aggregate state would carry, such as stop while running. Whenever a
+// member is still writing to its target, stop follows in the same footer, so
+// neither a pending action nor the aggregate state can take stop away from
+// live work.
 func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
-	if data.Model.NextAction.Kind != presentation.NextActionNone {
+	footer := rolloutFooterData(data)
+	footerStart := sb.Len()
+	actionPending := data.Model.NextAction.Kind != presentation.NextActionNone
+	if actionPending {
 		writeAggregateNextAction(sb, data)
+	}
+	// A pause-held rollout waits for a human to choose: release lets the held
+	// deployments proceed, and stop parks the whole apply instead.
+	paused := state.IsState(data.Model.State, state.Apply.Paused)
+	if paused {
+		writeFooterAction(sb, "Paused after a failure — to let the held deployments proceed:",
+			appendTenantFlag(fmt.Sprintf("schemabot release %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+	}
+	if !actionPending && !paused {
+		writeApplyFooter(sb, footer)
+		if applyFooterOffersStop(footer.State) {
+			return
+		}
+	}
+	// A paused rollout always offers stop beside release; otherwise stop
+	// follows only a member that is still writing to its target.
+	if !paused && !hasStoppableLiveWork(data.Model.Deployments) {
 		return
 	}
+	label, command := rolloutStopAction(footer)
+	if sb.Len() == footerStart {
+		writeFooterAction(sb, label, command)
+		return
+	}
+	// The footer already began above; stop joins it rather than opening a
+	// second one.
+	fmt.Fprintf(sb, "\n%s\n```\n%s\n```\n", label, command)
+}
+
+// rolloutStopAction is the label and command that stop the whole apply, or
+// cancel it on an engine whose control command is cancel.
+func rolloutStopAction(footer ApplyStatusCommentData) (string, string) {
+	command := stopOrCancelCommand(footer)
+	label := "To stop this schema change:"
+	if command == "cancel" {
+		label = "To cancel this schema change:"
+	}
+	return label, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, footer.ApplyID, footer.Environment), footer.Tenant)
+}
+
+// rolloutFooterData is the apply-wide comment data the rollout footer renders
+// its commands from. It is not a member section, so its footer actions render.
+func rolloutFooterData(data MultiDeploymentApplyData) ApplyStatusCommentData {
 	footer := ApplyStatusCommentData{State: data.Model.State, ApplyID: data.ApplyID, Environment: data.Environment, Tenant: data.Tenant}
 	// The members of one apply change one database, so they share its engine
 	// and its cutover option; the first member with detail speaks for all.
@@ -254,7 +301,33 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 		}
 		footer.Tables = append(footer.Tables, detail.Tables...)
 	}
-	writeApplyFooter(sb, footer)
+	return footer
+}
+
+// applyFooterOffersStop reports whether writeApplyFooter writes the stop (or
+// cancel) command for an apply in state s: the running family, the PlanetScale
+// setup phases, and an apply retrying a failed table.
+func applyFooterOffersStop(s string) bool {
+	return state.IsRunningApplyState(s) || state.IsState(s,
+		state.Apply.FailedRetryable,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest)
+}
+
+// hasStoppableLiveWork reports whether any member is still writing to its
+// target in a state where the single-deployment footer offers stop. A member
+// waiting for cutover is left out, as it is from that footer, so a rollout
+// whose members only wait for cutover keeps the cutover as its one command.
+func hasStoppableLiveWork(deployments []presentation.Deployment) bool {
+	for _, d := range deployments {
+		if applyFooterOffersStop(d.State) {
+			return true
+		}
+	}
+	return false
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived
