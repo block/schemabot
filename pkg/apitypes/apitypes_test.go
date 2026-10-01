@@ -67,6 +67,86 @@ func TestPlanResponse_UnsafeChangesToleratesNilEntries(t *testing.T) {
 	assert.Equal(t, "DROP TABLE removes all data", changes[0].Reason)
 }
 
+// A keyspace whose shards diverged carries the drop only one shard needs in
+// Shards; the namespace-level Changes, one entry per table, keep the safe
+// ALTER its sibling runs. The unsafe set has to include that shard's drop,
+// or a consent gate built on it consents to a change it never showed.
+func TestPlanResponse_UnsafeChangesIncludesShardOnlyChanges(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "shop",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);"},
+			},
+		}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "shop", Shard: "-80", Changes: []*TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);"},
+			}},
+			{Namespace: "shop", Shard: "80-", Changes: []*TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`;", IsUnsafe: true, UnsafeReason: `Column "legacy" is dropped`},
+			}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "orders", changes[0].Table)
+	assert.Equal(t, "ALTER TABLE `orders` DROP COLUMN `legacy`;", changes[0].DDL)
+	assert.Equal(t, `Column "legacy" is dropped`, changes[0].Reason)
+}
+
+// A drop uniform across shards appears at the namespace level and in every
+// shard; it is one change and is reported once, so the operator is not told
+// the plan drops a table three times.
+func TestPlanResponse_UnsafeChangesReportsAUniformShardChangeOnce(t *testing.T) {
+	drop := &TableChangeResponse{TableName: "refunds", ChangeType: "drop", DDL: "DROP TABLE `refunds`;"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{Namespace: "shop", TableChanges: []*TableChangeResponse{drop}}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "shop", Shard: "-80", Changes: []*TableChangeResponse{drop}},
+			{Namespace: "shop", Shard: "80-", Changes: []*TableChangeResponse{drop}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "refunds", changes[0].Table)
+}
+
+// The same statement against a same-named table in two keyspaces is two
+// changes: deduplication is per namespace, not per statement text.
+func TestPlanResponse_UnsafeChangesKeepsSameStatementInTwoNamespaces(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{{TableName: "audit", ChangeType: "drop", DDL: "DROP TABLE `audit`;"}}},
+			{Namespace: "payments", TableChanges: []*TableChangeResponse{{TableName: "audit", ChangeType: "drop", DDL: "DROP TABLE `audit`;"}}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 2)
+	assert.Equal(t, "audit", changes[0].Table)
+	assert.Equal(t, "audit", changes[1].Table)
+}
+
+// Nil shard rows and nil shard changes are skipped, as nil namespace rows are.
+func TestPlanResponse_UnsafeChangesToleratesNilShardEntries(t *testing.T) {
+	resp := &PlanResponse{
+		Shards: []*ShardPlanResponse{
+			nil,
+			{Namespace: "shop", Shard: "80-", Changes: []*TableChangeResponse{
+				nil,
+				{TableName: "refunds", ChangeType: "drop", DDL: "DROP TABLE `refunds`;"},
+			}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "refunds", changes[0].Table)
+}
+
 func TestPlanResponse_UnsafeChanges_None(t *testing.T) {
 	resp := &PlanResponse{
 		Changes: []*SchemaChangeResponse{{

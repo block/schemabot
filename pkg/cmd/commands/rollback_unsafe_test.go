@@ -136,3 +136,36 @@ func TestRollbackUnsafeChangesRequireAllowUnsafe(t *testing.T) {
 		assert.NotContains(t, submitted[0], "allow_unsafe")
 	})
 }
+
+// A keyspace whose shards diverged carries the drop only one shard needs in
+// the plan's shard rows, while the namespace-level changes keep the safe ALTER
+// its sibling runs. The rollback's gate judges the shard rows too: without
+// --allow-unsafe it is refused before any lock or apply request, naming the
+// shard's dropped column, and the preview lists the shard's statement, so the
+// operator who then re-runs with the flag consents to a change they were shown.
+func TestRollbackShardOnlyUnsafeChangeRequiresAllowUnsafe(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-rollback-test")
+	safeAlter := "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);"
+	shardDrop := "ALTER TABLE `orders` DROP COLUMN `legacy`;"
+	plan := apitypes.PlanResponse{PlanID: "plan-example-rollback", Database: "shop", DatabaseType: "vitess", Environment: "production",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: safeAlter}}}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "shop", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: safeAlter}}},
+			{Namespace: "shop", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: shardDrop, IsUnsafe: true, UnsafeReason: `Column "legacy" is dropped`}}},
+		}}
+	endpoint, requests, applyOptions := rollbackAPIServer(t, plan)
+
+	var runErr error
+	output := stripAnsi(captureStdout(func() {
+		cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true}
+		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+	}))
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	assert.Contains(t, output, "Apply blocked: 1 unsafe change(s) detected")
+	assert.Contains(t, output, `orders: Column "legacy" is dropped`)
+	assert.Contains(t, output, "DROP COLUMN `legacy`")
+	assert.Contains(t, output, "rollback apply-example-90 -e production --allow-unsafe")
+	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, requests())
+	assert.Empty(t, applyOptions())
+}

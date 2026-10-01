@@ -101,11 +101,6 @@ type AttributedChangeData struct {
 	Repository  string
 	PullRequest int
 	Unresolved  bool
-	// OutsideUnsafeGate marks a destructive change the --allow-unsafe opt-in
-	// never gated — one visible only on individual shards — so consent for it
-	// was never solicited and the disclosure must not be dropped as already
-	// consented to.
-	OutsideUnsafeGate bool
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -664,19 +659,13 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 // owning pull request and re-plan instead of applying. Once the locked
 // comment is applying automatically, that re-plan alternative is gone and the
 // operator consented to the destruction through --allow-unsafe, so the
-// disclosure is omitted — unless an attributed table never passed through the
-// unsafe opt-in gate, where no consent was ever solicited and this comment is
-// the operator's notice.
+// disclosure is omitted. That holds for every attributed table because the
+// unsafe gate reads the same set the attribution does, a divergent shard's
+// drops included (PlanResponse.UnsafeChanges walks the shard rows), so no
+// attributed destruction reaches an automatic apply without consent having
+// been solicited for it.
 func attributionStillActionable(data PlanCommentData) bool {
-	if !data.IsLocked || data.PendingManualConfirmation {
-		return true
-	}
-	for _, change := range data.AttributedChanges {
-		if change.OutsideUnsafeGate {
-			return true
-		}
-	}
-	return false
+	return !data.IsLocked || data.PendingManualConfirmation
 }
 
 // writeAttributedChanges writes the section for destructive changes to tables

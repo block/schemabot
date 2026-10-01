@@ -971,21 +971,48 @@ type UnsafeChange struct {
 // unsafe table changes, VSchema removals, and in-place vindex mutations. DROP
 // table changes are treated as unsafe even when an engine omits IsUnsafe, so
 // destructive table deletion fails closed.
+//
+// Per-shard changes are walked too. The namespace-level Changes list each
+// table once, taken from one shard, so a change only a divergent sibling shard
+// needs lives in Shards alone; the server's unsafe gate judges those as well
+// (`Plan.UnsafeDDLChanges`), and a consent gate on this type has to see the
+// same set or it consents to a change it never showed. A shard change that
+// repeats a namespace-level one, the uniform case, is reported once.
 func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	if r == nil {
 		return nil
 	}
 	var result []UnsafeChange
+	type statement struct{ namespace, table, ddl string }
+	seen := make(map[statement]struct{})
+	add := func(namespace string, t *TableChangeResponse) {
+		unsafeChange, ok := t.UnsafeChange()
+		if !ok {
+			return
+		}
+		key := statement{namespace: namespace, table: unsafeChange.Table, ddl: unsafeChange.DDL}
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		result = append(result, unsafeChange)
+	}
 	for _, sc := range r.Changes {
 		if sc == nil {
 			continue
 		}
 		for _, t := range sc.TableChanges {
-			if unsafeChange, ok := t.UnsafeChange(); ok {
-				result = append(result, unsafeChange)
-			}
+			add(sc.Namespace, t)
 		}
 		result = append(result, sc.VSchemaUnsafeChanges()...)
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			add(sp.Namespace, t)
+		}
 	}
 	return result
 }
