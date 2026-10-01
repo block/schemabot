@@ -45,11 +45,11 @@ type Mutation struct {
 // VSchema. A vindex, table, or column-vindex association that disappears
 // entirely is a removal, reported by Deletions and never duplicated here;
 // additions (a new vindex, table, or secondary vindex) are not mutations. A
-// blank current VSchema (a new keyspace) has nothing to mutate. Both documents must parse as
-// VSchema keyspace JSON; a document that cannot be parsed returns an error so
-// callers can fail closed rather than miss a mutation.
+// keyspace with no VSchema yet has nothing to mutate. Both documents must
+// parse as VSchema keyspace JSON; a document that cannot be parsed returns an
+// error so callers can fail closed rather than miss a mutation.
 func Mutations(current, desired string) ([]Mutation, error) {
-	if strings.TrimSpace(current) == "" {
+	if hasNoVSchema(current) {
 		return nil, nil
 	}
 

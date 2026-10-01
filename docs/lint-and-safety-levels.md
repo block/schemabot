@@ -153,10 +153,11 @@ guaranteed to generate an id. These sequence semantics also apply to
 unsharded keyspaces.
 
 Additions-only VSchema changes (new vindexes, new tables, new secondary
-column-vindex associations) are
-not unsafe. Removals and mutations are detected structurally
-by comparing the current and desired VSchema documents; a VSchema that cannot
-be parsed fails the plan rather than skipping detection.
+column-vindex associations) are not unsafe, and neither is a keyspace's first
+VSchema: a keyspace that has none yet routes no row, so there is nothing for
+that document to re-route, whatever it declares. Removals and mutations are
+detected structurally by comparing the current and desired VSchema documents;
+a VSchema that cannot be parsed fails the plan rather than skipping detection.
 
 Unsafe does not mean broken. An unsafe change will usually apply successfully —
 the point of the gate is that it is destructive or irreversible, so SchemaBot

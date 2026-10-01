@@ -14,11 +14,13 @@ func TestMutations_NoChange(t *testing.T) {
 }
 
 func TestMutations_EmptyCurrent(t *testing.T) {
-	// A new keyspace has no current VSchema, so nothing can mutate.
-	for _, current := range []string{"", "   "} {
+	// A keyspace with no VSchema yet reports nothing or the empty object, and
+	// routes no row by either, so its first VSchema mutates nothing even when
+	// it declares the keyspace sharded.
+	for _, current := range []string{"", "   ", "{}"} {
 		mutations, err := Mutations(current, shardedVSchema)
 		require.NoError(t, err)
-		assert.Empty(t, mutations)
+		assert.Empty(t, mutations, "current %q", current)
 	}
 }
 
@@ -320,13 +322,6 @@ func TestMutations_AutoIncrementChangesAreUnsafeInEveryKeyspace(t *testing.T) {
 			assert.Equal(t, tt.wantKinds, kinds)
 		})
 	}
-}
-
-func TestMutations_EmptyObjectCanBecomeSharded(t *testing.T) {
-	mutations, err := Mutations(`{}`, `{"sharded": true}`)
-	require.NoError(t, err)
-	require.Len(t, mutations, 1)
-	assert.Equal(t, MutationKindKeyspaceSharded, mutations[0].Kind)
 }
 
 func TestMutations_PrimaryVindexRemovedAlsoReportsNewPrimary(t *testing.T) {

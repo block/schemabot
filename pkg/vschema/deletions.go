@@ -30,12 +30,12 @@ type Deletion struct {
 }
 
 // Deletions returns the structural removals needed to go from the current
-// VSchema to the desired one. An empty or blank current VSchema (a new
-// keyspace) has nothing to remove. Both documents must parse as VSchema
-// keyspace JSON; a document that cannot be parsed returns an error so callers
-// can fail closed rather than miss a removal.
+// VSchema to the desired one. A keyspace with no VSchema yet has nothing to
+// remove. Both documents must parse as VSchema keyspace JSON; a document that
+// cannot be parsed returns an error so callers can fail closed rather than
+// miss a removal.
 func Deletions(current, desired string) ([]Deletion, error) {
-	if strings.TrimSpace(current) == "" || strings.TrimSpace(current) == "{}" {
+	if hasNoVSchema(current) {
 		return nil, nil
 	}
 
@@ -112,6 +112,19 @@ func vindexRemovalReason(name string, v *vschemapb.Vindex) string {
 		return fmt.Sprintf("lookup vindex %q is removed: Vitess immediately stops maintaining its lookup rows and queries routed through it can fail or scatter", name)
 	}
 	return fmt.Sprintf("vindex %q is removed: Vitess immediately stops using it for routing and lookups, and queries that depend on it can fail or scatter", name)
+}
+
+// hasNoVSchema reports whether the current document says the keyspace has no
+// VSchema yet. A data plane reports that as either nothing or the empty
+// object, which is how an empty keyspace proto serialises. Neither declares
+// a table, a vindex, or a sharded flag, so no row is routed by it and the
+// first VSchema to land cannot re-route or un-route anything. In particular a
+// sharded keyspace's first VSchema says `sharded: true` because its shards
+// already exist in the topology, not because the keyspace changed from
+// unsharded.
+func hasNoVSchema(current string) bool {
+	current = strings.TrimSpace(current)
+	return current == "" || current == "{}"
 }
 
 // parseKeyspace decodes a VSchema keyspace JSON document. Unlike Normalize,
