@@ -31,6 +31,10 @@ func (m *initWizard) loadConnectionEditor() {
 	m.connectionEditor = initConnectionEditor{mode: "menu", detected: err == nil}
 	m.input.EchoMode = textinput.EchoNormal
 	m.input.Placeholder = ""
+	if !m.connectionEditor.detected && m.step != stepAPIToken {
+		m.connectionEditor.mode = "details"
+		m.loadConnectionDetail()
+	}
 }
 func (m *initWizard) connectionOptions() []string {
 	options := []string{"Paste a connection string", "Enter connection details", "Use an environment variable or file"}
@@ -97,12 +101,37 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		if e.mode == "details" && e.detail > 0 {
 			e.values[e.detail] = m.input.Value()
 			e.detail--
+			if e.detail == 2 && m.usesPlanetScaleDatabaseName() {
+				e.detail--
+			}
 			m.loadConnectionDetail()
 		} else {
 			m.loadConnectionEditor()
+			m.connectionEditor.mode = "menu"
+			m.input.Placeholder = ""
 			m.input.SetValue(m.fields[m.step].value)
 		}
 		return true, nil
+	}
+	if e.mode == "details" && e.detail == 0 && m.step != stepAPIToken {
+		switch key {
+		case "ctrl+p":
+			e.values[0] = m.input.Value()
+			e.mode = "paste"
+			m.input.SetValue("")
+			m.input.Placeholder = ""
+			m.input.EchoMode = textinput.EchoPassword
+			m.err = ""
+			return true, textinput.Blink
+		case "ctrl+e":
+			e.values[0] = m.input.Value()
+			e.mode = "reference"
+			m.input.SetValue(m.fields[m.step].value)
+			m.showFieldSuggestion()
+			m.input.CursorEnd()
+			m.err = ""
+			return true, textinput.Blink
+		}
 	}
 	if e.mode == "menu" {
 		switch key {
@@ -207,6 +236,10 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		m.err = ""
 		if e.detail < 4 {
 			e.detail++
+			if e.detail == 2 && m.usesPlanetScaleDatabaseName() {
+				e.values[2] = strings.TrimSpace(m.fields[stepName].value)
+				e.detail++
+			}
 			m.loadConnectionDetail()
 			return true, textinput.Blink
 		}
@@ -232,6 +265,11 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, m.useDraftConnection(dsn)
 	}
 	return false, nil
+}
+
+// The PlanetScale API and SQL connection identify the same hosted database.
+func (m *initWizard) usesPlanetScaleDatabaseName() bool {
+	return m.step == stepDSN && m.isVitess() && strings.TrimSpace(m.fields[stepName].value) != ""
 }
 
 func (m *initWizard) connectionEditorView() string {
@@ -285,6 +323,9 @@ func (m *initWizard) connectionEditorView() string {
 		if m.input.Value() == "" && m.input.Placeholder != "" {
 			b.WriteString("\n\n" + muted.Render("tab use suggestion · or type your own"))
 		}
+		if e.detail == 0 && m.step != stepAPIToken {
+			b.WriteString("\n\n" + muted.Render("ctrl+p paste a connection string\nctrl+e use an environment variable or file"))
+		}
 	case "reference":
 		hint := "Use env:VARIABLE or file:/absolute/path.\nThe file should contain only the connection string."
 		if m.step == stepAPIToken {
@@ -332,6 +373,8 @@ func initConnectionLabel(ref string) string {
 // Keep the immediate recovery action visible without repeating driver details.
 func initConnectionFailure(message string) string {
 	switch {
+	case strings.Contains(message, "database error 1045"):
+		return "Authentication rejected. Check the database username and password from your provider’s connection details, not the API service token."
 	case strings.Contains(message, "connection refused"):
 		return "Couldn’t connect. Check that the database is running and the host and port are correct."
 	case strings.Contains(message, "hostname could not be resolved"):

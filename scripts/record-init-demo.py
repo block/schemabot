@@ -87,6 +87,7 @@ parser.add_argument('--sample', action='store_true')
 parser.add_argument('--binary', required=True)
 parser.add_argument('--output', required=True)
 parser.add_argument('--paste-connection', action='store_true')
+parser.add_argument('--connection-details', action='store_true')
 parser.add_argument('--integrated', action='store_true')
 parser.add_argument('--local-storage', action='store_true')
 parser.add_argument('--api-url', default='')
@@ -100,7 +101,7 @@ work = Path(tempfile.mkdtemp(prefix='shop-demo-', dir='/tmp'))
 env = dict(os.environ, HOME=str(work / 'home'), SCHEMABOT_PROFILE='', SCHEMABOT_ENDPOINT='', SCHEMABOT_TOKEN='', TERM='xterm-256color', COLORTERM='truecolor', CLICOLOR_FORCE='1', NO_COLOR='', COLORFGBG='0;15')
 pasted_connection = env.get('DATABASE_URL', '')
 token_parts = env.pop('PLANETSCALE_TOKEN', '').split(':', 1) if args.engine == 'vitess' else []
-if args.paste_connection:
+if args.paste_connection or args.connection_details:
     env.pop('DATABASE_URL', None)
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
@@ -117,8 +118,16 @@ engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [
 if args.engine == 'vitess':
     engine_keys = [(0.9, '\x1b[A'), (0.8, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
-if args.paste_connection:
-    steps.extend([('Paste a connection string', [(1.5, '\r')]), ('Input is hidden', [(0.8, '\x1b[200~' + pasted_connection + '\x1b[201~'), (1.0, '\r')])])
+if args.connection_details:
+    details = json.loads(env.pop('DEMO_CONNECTION_DETAILS'))
+    labels = ['Host', 'Port', 'Database', 'Username', 'Password (hidden; Enter for none)']
+    if args.engine == 'vitess':
+        labels.pop(2)
+        details.pop(2)
+    for label, value in zip(labels, details, strict=True):
+        steps.append((label, [(0.09, c) for c in value] + [(0.7, '\r')]))
+elif args.paste_connection:
+    steps.extend([('ctrl+p paste a connection string', [(1.5, '\x10')]), ('Input is hidden', [(0.8, '\x1b[200~' + pasted_connection + '\x1b[201~'), (1.0, '\r')])])
 else:
     steps.extend([('Connect to your Vitess database' if args.engine == 'vitess' else 'Connect your database', [(2.5, '\r')])])
 if args.engine == 'vitess':
