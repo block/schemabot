@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -87,4 +88,17 @@ func EnsureImage(ctx context.Context, image string) error {
 		}
 	}
 	return nil
+}
+
+// Probe inside the container until first-boot initialization finishes. Docker's
+// published port can accept a TCP connection before MySQL can greet a client.
+func ProbeDatabase(ctx context.Context, name, engine string) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	args := []string{"exec", name, "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres", "-d", "schemabot"}
+	if engine == "mysql" {
+		args = []string{"exec", name, "sh", "-c", `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -h127.0.0.1 -Dschemabot -Nse 'SELECT 1'`}
+	}
+	_, err := Run(ctx, nil, args...)
+	return err
 }

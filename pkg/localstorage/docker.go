@@ -164,7 +164,7 @@ func Prepare(ctx context.Context, dir string, progress ...func(string)) (string,
 	cfg.ParseTime = true
 	dsn := cfg.FormatDSN()
 	report("Waiting for the state database to accept connections")
-	if err := ready(ctx, dsn); err != nil {
+	if err := ready(ctx, name, dsn); err != nil {
 		return "", err
 	}
 	dsnPath := filepath.Join(dir, "docker-storage.dsn")
@@ -240,7 +240,7 @@ func Resume(ctx context.Context, dir string) error {
 	if err != nil || cfg.Addr != address {
 		return fmt.Errorf("local storage endpoint changed; refusing to redirect state")
 	}
-	return ready(ctx, string(dsn))
+	return ready(ctx, r.ID, string(dsn))
 }
 func owned(c container, name, volume string) error {
 	if c.Config.Labels[ownerLabel] != name {
@@ -271,7 +271,7 @@ func inspect(ctx context.Context, id string) (container, error) {
 	}
 	return list[0], nil
 }
-func ready(ctx context.Context, dsn string) error {
+func ready(ctx context.Context, name, dsn string) error {
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	db, err := mysqlconn.Open(dsn)
@@ -283,7 +283,10 @@ func ready(ctx context.Context, dsn string) error {
 	defer ticker.Stop()
 	for {
 		probe, cancel := context.WithTimeout(ctx, time.Second)
-		err = db.PingContext(probe)
+		err = localdocker.ProbeDatabase(probe, name, "mysql")
+		if err == nil {
+			err = db.PingContext(probe)
+		}
 		cancel()
 		if err == nil {
 			return nil

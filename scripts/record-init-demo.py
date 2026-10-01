@@ -241,6 +241,12 @@ finally:
             subprocess.run(['docker', 'rm', '-fv', runtime.name], capture_output=True, timeout=35)
     else:
         subprocess.run([binary, 'local', 'stop', 'local'], cwd=work, env=env, capture_output=True, timeout=35)
+        if args.local_storage:
+            for registration in (work / 'home' / '.schemabot' / 'runtimes').glob('*/docker-storage.json'):
+                state = json.loads(registration.read_text())
+                subprocess.run(['docker', 'rm', '-f', state['ID']], check=True, capture_output=True, timeout=35)
+                subprocess.run(['docker', 'volume', 'rm', state['Volume']], check=True, capture_output=True, timeout=35)
+
     # Leave the private work directory for troubleshooting; no credentials are
     # copied to the committed recording (references, token ID, and masked input only).
     print('Private demo workspace:', work)
