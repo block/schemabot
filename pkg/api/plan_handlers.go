@@ -2973,6 +2973,9 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
+	if err := s.refuseRollbackOfIndependentRollout(apply); err != nil {
+		return nil, err
+	}
 	if err := s.refuseRollbackAfterPrimaryMoved(apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
@@ -3057,6 +3060,41 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	return planResponseFromProto(resp), nil
 }
 
+// refuseRollbackOfIndependentRollout refuses a rollback of an apply across a
+// rollout whose members are each planned against their own schema.
+//
+// A rollback is one plan, made against the rollout primary, and such a
+// rollout runs no member from another member's plan (RV-9): apply creation
+// pairs each member with a plan stored for it, and a rollback stores none. The
+// rollback is refused here, before a plan is made, with the remedy that does
+// restore each member: an apply narrowed to it of the previous schema. A
+// configuration that cannot resolve the environment is left to apply
+// creation, which fails closed on the same pairing.
+func (s *Service) refuseRollbackOfIndependentRollout(apply *storage.Apply) error {
+	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
+	if err != nil {
+		s.logger.Debug("rollback member planning check skipped: config did not resolve the rollout members; apply creation pairs each member with its own plan",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if len(members) <= 1 {
+		return nil
+	}
+	planning, err := s.config.MemberPlanningFor(apply.Database, apply.Environment)
+	if err != nil {
+		s.logger.Debug("rollback member planning check skipped: config did not resolve member planning; apply creation pairs each member with its own plan",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if planning != PlanIndependent {
+		return nil
+	}
+	s.logger.Warn("rollback refused: the rollout's members are each planned against their own schema, and a rollback has one plan",
+		append(apply.LogAttrs(), "members", len(members))...)
+	return controlConflictf("apply %s ran across the %d targets of %s/%s, which are each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+		apply.ApplyIdentifier, len(members), apply.Database, apply.Environment, members[0].MemberID())
+}
+
 // refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply
 // whose rollout primary is no longer the environment's first member.
 //
@@ -3082,7 +3120,7 @@ func (s *Service) refuseRollbackAfterPrimaryMoved(apply *storage.Apply, applyPri
 	}
 	s.logger.Warn("rollback refused: the rollout primary changed since the apply ran",
 		append(apply.LogAttrs(), "apply_primary", applyPrimary.MemberID(), "rollout_primary", members[0].MemberID())...)
-	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order, or the order of the targets list) so %s is first, then retry the rollback",
+	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order) so %s is first, then retry the rollback",
 		apply.ApplyIdentifier, applyPrimary.MemberID(), members[0].MemberID(), applyPrimary.MemberID(), applyPrimary.MemberID())
 }
 

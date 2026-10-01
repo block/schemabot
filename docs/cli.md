@@ -524,7 +524,10 @@ refuses to start while one is queued or running there.
 A rollback of a rollout-wide apply is made against the first target the apply
 ran from. If the rollout order changed since, the rollback is refused rather
 than reverting that one target alone: restore the order the apply ran under,
-then retry it.
+then retry it. A rollout of a `targets:` list plans each target against its own
+schema, and a rollback is one plan, so its rollback is refused before anything
+is planned: restore each target by planning and applying the previous schema
+with `--target`.
 
 ### Understand a refusal
 

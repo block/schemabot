@@ -1618,8 +1618,8 @@ apply of the whole rollout runs from the rollout primary's plan. An apply that r
 is never rolled back across the rollout. *Enforced:* member pairing at apply creation
 (`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
 `pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
-(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply
-and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`); on a data plane, the plan each
+(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply,
+independent-rollout, and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackOfIndependentRollout` and `refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`); on a data plane, the plan each
 member target's operation records as it attaches to the deployment's apply
 (`attachDispatchOperation`, `pkg/tern/local_client.go`), which its drive runs (`drivePlanID`) and
 its lost-work verification re-plans from (`planIDForTasks`, `pkg/tern/local_control_resume.go`).

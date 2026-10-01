@@ -538,39 +538,96 @@ func TestPlanHandler_RefusesAnUnknownTargetAsAnInvalidRequest(t *testing.T) {
 	assert.Nil(t, mockClient.planReq)
 }
 
-// A rollout-wide apply ran its plan from payments-001, then the targets list
-// was reordered so payments-002 is first. The rollback is planned against
-// payments-001, and the rollout now runs only from payments-002's plan, so the
-// rollback could reach the rollout only by reverting payments-001 alone. It is
-// refused before planning, with the order the apply ran under as the remedy
-// rather than a target to revert by itself. In the order the apply ran under,
-// the rollback is planned against payments-001 as before.
-func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
+// rollbackSourceApply is a completed rollout-wide apply of payments whose
+// source plan was made against payments-001 on deployment, with the schema
+// files a rollback restores.
+func rollbackSourceApply(deployment string) (*storage.Plan, *storage.Apply) {
 	source := memberPlan("payments-001")
+	source.Deployment = deployment
 	source.Namespaces["payments"].OriginalFiles = map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}
 	source.Namespaces["payments"].OriginalFilesCaptured = true
-	apply := &storage.Apply{
+	return source, &storage.Apply{
 		ApplyIdentifier: "apply-rollout",
 		PlanID:          source.ID,
 		Database:        "payments",
 		DatabaseType:    storage.DatabaseTypeMySQL,
 		Environment:     "production",
-		Deployment:      DefaultDeployment,
+		Deployment:      deployment,
 		State:           state.Apply.Completed,
 	}
+}
+
+// A rollout-wide apply of two mirrored deployments ran its plan from eu, then
+// deployment_order was changed so us is first. The rollback is planned against
+// eu, and the rollout now runs only from us's plan, so the rollback could reach
+// the rollout only by reverting eu alone. It is refused before planning, with
+// the order the apply ran under as the remedy rather than a deployment to
+// revert by itself. In the order the apply ran under, the rollback is planned
+// against eu as before.
+func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
+	source, apply := rollbackSourceApply("eu")
+	cases := []struct {
+		name    string
+		order   []string
+		wantErr string
+	}{
+		{
+			name:  "reordered",
+			order: []string{"us", "eu"},
+			wantErr: "apply apply-rollout ran across the rollout from rollout primary eu/payments-001, but the rollout primary is now us/payments-001; " +
+				"a rollback made against eu/payments-001 cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. " +
+				"Restore the rollout order the apply ran under (deployment_order) so eu/payments-001 is first, then retry the rollback",
+		},
+		{name: "in the order the apply ran under", order: []string{"eu", "us"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := narrowingServerConfig()
+			cfg.Databases["payments"].Environments["production"] = EnvironmentConfig{
+				Deployments:     map[string]DeploymentTarget{"eu": {Target: "payments-001"}, "us": {Target: "payments-001"}},
+				DeploymentOrder: tc.order,
+			}
+			mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-rollback"}}
+			svc := New(&mockStorageWithPlanLookup{plans: &rollbackSourcePlanStore{source: source}}, cfg, map[string]tern.Client{
+				"eu/production": mockClient,
+				"us/production": &mockTernClient{isRemote: true},
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				require.NotNil(t, mockClient.planReq)
+				assert.Equal(t, "payments-001", mockClient.planReq.Target)
+				return
+			}
+			require.Error(t, err)
+			assert.Equal(t, tc.wantErr, err.Error())
+			assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
+			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback that cannot reach the rollout")
+		})
+	}
+}
+
+// A rollout-wide apply ran across payments-001, 002 and 003, which are each
+// planned against their own schema. A rollback is one plan made against
+// payments-001, and no member of such a rollout runs another member's plan, so
+// the rollback is refused before anything is planned, naming the narrowed
+// applies that do restore each target. A single-target environment rolls back
+// as before.
+func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *testing.T) {
+	source, apply := rollbackSourceApply(DefaultDeployment)
 	cases := []struct {
 		name    string
 		targets []string
 		wantErr string
 	}{
 		{
-			name:    "reordered",
-			targets: []string{"payments-002", "payments-001", "payments-003"},
-			wantErr: "apply apply-rollout ran across the rollout from rollout primary " + DefaultDeployment + "/payments-001, but the rollout primary is now " + DefaultDeployment + "/payments-002; " +
-				"a rollback made against " + DefaultDeployment + "/payments-001 cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. " +
-				"Restore the rollout order the apply ran under (deployment_order, or the order of the targets list) so " + DefaultDeployment + "/payments-001 is first, then retry the rollback",
+			name:    "three targets",
+			targets: []string{"payments-001", "payments-002", "payments-003"},
+			wantErr: "apply apply-rollout ran across the 3 targets of payments/production, which are each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
+				"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
 		},
-		{name: "in the order the apply ran under", targets: []string{"payments-001", "payments-002", "payments-003"}},
+		{name: "one target", targets: []string{"payments-001"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -593,7 +650,7 @@ func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
 			require.Error(t, err)
 			assert.Equal(t, tc.wantErr, err.Error())
 			assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
-			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback that cannot reach the rollout")
+			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback no member could run")
 		})
 	}
 }
