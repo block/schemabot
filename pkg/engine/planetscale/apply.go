@@ -968,7 +968,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	}
 
 	// The deploy request ID is persisted before PlanetScale finishes computing
-	// the schema diff, so a drive that stopped inside that window recovers a
+	// the schema diff, so a driver that stopped inside that window recovers a
 	// request still in "pending". Wait it out exactly as the fresh path does:
 	// every decision below is taken against the settled state, and a request
 	// left in "pending" is never deployed by anyone.
@@ -1147,7 +1147,7 @@ func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, defe
 // deployRequestAwaitsDeferredDeployRecord reports whether a recovered deploy
 // request belongs to a deferred deploy whose stored metadata does not yet say
 // so. The deferral is recorded only once the deploy request is ready, so a
-// drive that stopped before then leaves a ready, undeployed request the
+// driver that stopped before then leaves a ready, undeployed request the
 // operator asked to hold with metadata that reads as non-deferred. Until the
 // deferral is recorded, progress reports the apply as pending rather than
 // waiting for deploy, and the operator-triggered deploy is refused.
@@ -1156,7 +1156,7 @@ func deployRequestAwaitsDeferredDeployRecord(dr *ps.DeployRequest, meta *psMetad
 }
 
 // recordRecoveredDeferredDeploy finishes what the fresh deferred path does once
-// its deploy request is ready and the drive that created it did not: it
+// its deploy request is ready and the driver that created it did not: it
 // verifies a deferred cutover is held, takes the instant DDL decision, and
 // durably records the deferral so progress reports waiting_for_deploy and the
 // operator-triggered deploy is accepted. The deploy itself is left to the

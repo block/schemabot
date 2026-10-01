@@ -633,7 +633,7 @@ func TestResumeExistingDeployRequest_WaitsOutPendingThenDeploys(t *testing.T) {
 // operator: progress then reports waiting_for_deploy instead of pending, and the
 // operator-triggered deploy is accepted instead of refused. This holds whether
 // the recovered request is already ready or still computing its schema diff.
-func TestResumeExistingDeployRequest_RecordsDeferralTheStoppedDriveDidNot(t *testing.T) {
+func TestResumeExistingDeployRequest_RecordsDeferralTheStoppedDriverDidNot(t *testing.T) {
 	tests := []struct {
 		name        string
 		pendingGets int
@@ -694,6 +694,72 @@ func TestResumeExistingDeployRequest_RecordsDeferralTheStoppedDriveDidNot(t *tes
 			assert.Equal(t, 1, client.deployCalls)
 			require.NotNil(t, client.lastDeploy)
 			assert.Equal(t, uint64(52), client.lastDeploy.Number)
+		})
+	}
+}
+
+func TestResumeExistingDeployRequest_RecordsInstantDecisionForDeferredStart(t *testing.T) {
+	tests := []struct {
+		name        string
+		options     map[string]string
+		changes     []engine.SchemaChange
+		wantInstant bool
+	}{
+		{
+			name:        "instant-eligible safe change",
+			options:     map[string]string{"defer_deploy": "true"},
+			wantInstant: true,
+		},
+		{
+			name:    "unsafe change",
+			options: map[string]string{"defer_deploy": "true"},
+			changes: []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: "ALTER TABLE `users` DROP COLUMN `email`"}},
+			}},
+			wantInstant: false,
+		},
+		{
+			name:        "deferred cutover",
+			options:     map[string]string{"defer_deploy": "true", "defer_cutover": "true"},
+			wantInstant: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{
+					DeploymentState: deployState.Ready,
+					HtmlURL:         "https://app/dr/53",
+					Deployment:      &ps.Deployment{InstantDDLEligible: true},
+				},
+			}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+			meta := &psMetadata{BranchName: "schemabot-testdb-instant", DeployRequestID: 53}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Options = tt.options
+			req.Changes = tt.changes
+			persisted := captureStateChanges(req)
+
+			_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+			require.NoError(t, err)
+			require.Len(t, *persisted, 1)
+			stored, err := decodePSMetadata((*persisted)[0].Metadata)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantInstant, stored.IsInstant)
+
+			started, err := e.Start(t.Context(), &engine.ControlRequest{
+				Database:    "testdb",
+				ResumeState: (*persisted)[0],
+				Credentials: &engine.Credentials{Metadata: map[string]string{
+					"organization": "org", "token_name": "token", "token_value": "secret",
+				}},
+			})
+			require.NoError(t, err)
+			assert.True(t, started.Accepted)
+			require.NotNil(t, client.lastDeploy)
+			assert.Equal(t, tt.wantInstant, client.lastDeploy.InstantDDL)
 		})
 	}
 }
