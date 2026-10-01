@@ -10,6 +10,7 @@
 - [What happened in this change?](#what-happened-in-this-change)
 - [What’s running across the fleet?](#whats-running-across-the-fleet)
 - [Inspect a stored plan](#inspect-a-stored-plan)
+- [Apply a stored plan](#apply-a-stored-plan)
 - [Read the lifecycle log](#read-the-lifecycle-log)
 - [Check locks](#check-locks)
 - [Give a tool read-only access](#give-a-tool-read-only-access)
@@ -1258,6 +1259,55 @@ Response excerpt (illustrative values):
       }
     ]
   }
+}
+```
+
+</details>
+
+## Apply a stored plan
+
+`POST /api/apply` accepts a stored plan for execution. Two admission refusals
+require the caller to change the request or plan rather than retrying the same
+request:
+
+- `400 unsafe_opt_in_required` means the plan contains an unsafe change but
+  the request did not include `"options":{"allow_unsafe":"true"}`. Inspect the
+  plan, obtain the required consent, and resend the request with that option.
+  Retrying without the option cannot help.
+- `422 plan_blocked` means the plan contains a change the engine refuses to
+  execute. No apply option or retry can make that plan executable. Change the
+  schema, create a new plan, and apply the new plan.
+
+Match `error_code` rather than parsing the human-readable `error` field.
+
+<details>
+<summary>Admission refusal examples</summary>
+
+An unsafe plan without caller consent returns:
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+```
+
+```json
+{
+  "error": "apply rejected: stored plan plan-example-42 contains unsafe change for table \"old_orders\": DROP TABLE removes all data; retry with allow_unsafe=true",
+  "error_code": "unsafe_opt_in_required"
+}
+```
+
+A plan containing a blocked change returns:
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/json
+```
+
+```json
+{
+  "error": "apply rejected: stored plan plan-example-43 contains a blocked change for table \"orders\": statement is not supported by the configured engine",
+  "error_code": "plan_blocked"
 }
 ```
 
