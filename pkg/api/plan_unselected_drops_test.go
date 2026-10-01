@@ -1,7 +1,11 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -206,4 +210,51 @@ func TestExecutePlan_RefusedDropIsCountedOnlyAsAnError(t *testing.T) {
 		}
 	}
 	assert.Equal(t, []string{"error"}, statuses)
+}
+
+// A drop the plan places in an unselected namespace can only come from a data
+// plane that planned another target's namespace, so the refusal names the
+// upgrade. A drop refused by name alone is the MySQL case where the engine does
+// not say whose table it is: the refusal says the name collides with a table
+// an unselected namespace declares, which is also what a legitimate drop of
+// this target's own table of that name looks like.
+func TestUnselectedTableDropError_NamesTheCause(t *testing.T) {
+	svc := namespaceSelectionService(t, &mockTernClient{}, &capturingPlanStore{})
+	member := routing.ExecutionTarget{DatabaseType: storage.DatabaseTypeMySQL, Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
+	req := placedNamespacesRequest()
+	unselected := []string{"ns_1", "ns_2"}
+
+	err := svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, dropsPlan("ns_1", "legacy"), nil)
+	var placed *UnselectedTableDropError
+	require.ErrorAs(t, err, &placed)
+	assert.False(t, placed.MatchedName)
+	assert.Contains(t, err.Error(), "Upgrade that deployment to a build that supports selecting namespaces per target")
+
+	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, dropsPlan("ns_0", "payments"), nil)
+	var named *UnselectedTableDropError
+	require.ErrorAs(t, err, &named)
+	assert.True(t, named.MatchedName, "a drop the plan places in the selected namespace is refused by name alone")
+	assert.Equal(t, []string{"payments"}, named.Tables)
+	assert.Contains(t, err.Error(), `proposes dropping "payments", and namespaces [ns_1], which this target's entry does not select, declare tables of the same name`)
+	assert.Contains(t, err.Error(), "the drop is intended and its table name collides with a table those namespaces still declare")
+	assert.NotContains(t, err.Error(), "Upgrade that deployment", "a name collision does not prescribe an upgrade")
+}
+
+// A refused drop is the request's answer, not a server fault, so POST
+// /api/plan answers it as a bad request carrying the refusal, the same as a
+// namespace placement refusal, and a client that retries server errors does
+// not loop on it.
+func TestPlanHandler_UnselectedTableDropIsBadRequest(t *testing.T) {
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary", Changes: dropsPlan("ns_1", "legacy")}}
+	svc := namespaceSelectionService(t, client, &capturingPlanStore{})
+	body, err := json.Marshal(placedNamespacesRequest())
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.handlePlan(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `proposes dropping \"legacy\" in namespaces [ns_1], which this target's entry does not select`)
 }

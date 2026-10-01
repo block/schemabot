@@ -50,7 +50,11 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 		return nil
 	}
 	locatesDrops := engineLocatesDroppedTables(member.DatabaseType)
-	refused := map[string]bool{}
+	// placed holds the drops the plan itself attributes to an unselected
+	// namespace; named holds those refused only because an unselected
+	// namespace declares a table of that name.
+	placed := map[string]bool{}
+	named := map[string]bool{}
 	namespaces := map[string]bool{}
 	var judgedByName []string
 	for _, drop := range drops {
@@ -58,7 +62,7 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 			if slices.Contains(member.Namespaces, namespace) {
 				continue
 			}
-			refused[drop.table] = true
+			placed[drop.table] = true
 			namespaces[namespace] = true
 		}
 		// Only a located attribution clears a drop: one the plan attributes to
@@ -79,15 +83,19 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 			if !ok {
 				continue
 			}
-			refused[table] = true
+			named[table] = true
 			namespaces[namespace] = true
 		}
 	}
-	if len(refused) == 0 {
+	if len(placed) == 0 && len(named) == 0 {
 		return nil
 	}
+	refused := maps.Clone(placed)
+	maps.Copy(refused, named)
 	tables := slices.Sorted(maps.Keys(refused))
-	s.logger.Error("plan proposes dropping tables in namespaces the target's entry does not select",
+	// A refusal is the plan's deterministic answer for this configuration, not
+	// a server fault, so it is a warning; the caller reports it.
+	s.logger.Warn("plan proposes dropping tables in namespaces the target's entry does not select",
 		"database", req.Database,
 		"environment", req.Environment,
 		"deployment", member.Deployment,
@@ -95,13 +103,15 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 		"repository", req.Repository,
 		"tables", tables,
 		"refused_namespaces", slices.Sorted(maps.Keys(namespaces)),
+		"refused_by_name", slices.Sorted(maps.Keys(named)),
 		"selected_namespaces", member.Namespaces,
 		"unselected_namespaces", unselected)
 	return &UnselectedTableDropError{
-		Deployment: member.Deployment,
-		Target:     member.Target,
-		Tables:     tables,
-		Namespaces: slices.Sorted(maps.Keys(namespaces)),
+		Deployment:  member.Deployment,
+		Target:      member.Target,
+		Tables:      tables,
+		Namespaces:  slices.Sorted(maps.Keys(namespaces)),
+		MatchedName: len(placed) == 0,
 	}
 }
 
@@ -131,12 +141,23 @@ type UnselectedTableDropError struct {
 	// Tables are the refused drops, sorted.
 	Tables []string
 	// Namespaces are the unselected namespaces the refused drops belong to,
-	// sorted: the namespace the plan attributes a drop to, or for a drop it
-	// attributes to none, the unselected namespace declaring the table.
+	// sorted: the namespace the plan attributes a drop to, or for a drop judged
+	// by name, the unselected namespace declaring the table.
 	Namespaces []string
+	// MatchedName is set when every refused drop was refused by name alone: the
+	// plan placed none of them in an unselected namespace, but an unselected
+	// namespace declares a table of each name. The engine cannot say whose
+	// table such a drop is, so it is either a data plane planning another
+	// target's tables or a legitimate drop whose name collides with them.
+	MatchedName bool
 }
 
 func (e *UnselectedTableDropError) Error() string {
+	if e.MatchedName {
+		return fmt.Sprintf(
+			"the plan from deployment %q target %q proposes dropping %s, and namespaces [%s], which this target's entry does not select, declare tables of the same name. This target's engine does not report which namespace a dropped table belongs to, so SchemaBot cannot tell a drop of this target's own table from a drop of one of those namespaces' tables, and refuses the plan, --allow-unsafe included. Either that deployment predates selecting namespaces per target and planned those namespaces' tables, or the drop is intended and its table name collides with a table those namespaces still declare, which this target cannot drop while they do",
+			e.Deployment, e.Target, quotedTableList(e.Tables), strings.Join(e.Namespaces, ", "))
+	}
 	return fmt.Sprintf(
 		"the plan from deployment %q target %q proposes dropping %s in namespaces [%s], which this target's entry does not select. The schema files do not ask for these drops, so the plan is refused, --allow-unsafe included. Upgrade that deployment to a build that supports selecting namespaces per target",
 		e.Deployment, e.Target, quotedTableList(e.Tables), strings.Join(e.Namespaces, ", "))

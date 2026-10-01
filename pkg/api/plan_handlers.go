@@ -633,6 +633,18 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// A plan proposing drops in namespaces the target's entry does not
+		// select is refused the same way on every retry until the configuration,
+		// the schema files or the planning deployment changes, so it is the
+		// request's answer rather than a server fault. Drops that could not be
+		// checked (UnselectedTableDropCheckError) stay a server error below:
+		// SchemaBot failed to perform the check, which says nothing about the
+		// request.
+		if _, ok := errors.AsType[*UnselectedTableDropError](err); ok {
+			s.logger.Warn("plan rejected for proposing drops in namespaces the target's entry does not select", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*RolloutMemberSelectionError](err); ok {
 			s.logger.Warn("plan rejected for a target that names no single rollout member", "database", req.Database, "environment", req.Environment, "selector", req.Target, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
