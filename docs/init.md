@@ -54,7 +54,8 @@ Environment-variable and absolute file references remain available as an advance
 a referenced file must contain only the connection string. References stay references,
 so environment variables must remain available to later CLI invocations. Schema files
 never contain credentials. OS credential-store integration is not implemented.
-Vitess uses PlanetScale deploy requests and needs a separate MySQL database for SchemaBot’s state.
+Vitess uses PlanetScale deploy requests. For its state storage, choose **Local (Docker)**
+to let SchemaBot start MySQL on your computer, or **Standalone** to connect your own MySQL server.
 
 The wizard asks **Where should SchemaBot store its own data?**
 
@@ -75,7 +76,19 @@ until the new connection is verified. Re-running `init` never replaces existing 
 For Vitess, the application connection is your vtgate address, and the wizard also asks for the
 PlanetScale organization and a [service token](#configure-the-planetscale-service-token).
 SchemaBot opens deploy requests with that token and reads keyspaces from the `main` branch.
-Its own state lives in a MySQL database outside Vitess.
+Its own state lives in a MySQL database outside Vitess. The storage choice appears immediately
+after the application connection, before PlanetScale API setup.
+
+**Local (Docker)** needs a running local Docker installation. After you confirm setup, SchemaBot
+creates a MySQL container with a loopback-only port, generated credentials, and a persistent Docker
+volume. Plans and progress survive container and laptop restarts; Docker must be running before
+you use SchemaBot again. API commands start a stopped storage container automatically.
+`schemabot local stop` stops the SchemaBot process and leaves its state database intact.
+
+The local storage container is named `schemabot-state-<id>` and its volume adds `-data`.
+Do not delete that volume: it holds your change history and execution state. If a container or
+volume goes missing, SchemaBot asks you to restore it instead of creating empty replacement state.
+Keep a backup before moving to a shared server; switching storage is not an automatic migration.
 
 Setup initializes SchemaBot's metadata tables in the state database. Baseline planning also
 needs the engine's scratch privileges. Setup never applies application schema changes.
@@ -218,7 +231,8 @@ $ schemabot init --non-interactive --json --type mysql \
 
 Use `--integrated` instead of `--storage-dsn` to create SchemaBot’s own database on the application server. The flags are mutually exclusive.
 
-For Vitess, also pass `--organization` and `--api-token env:PLANETSCALE_TOKEN`.
+For Vitess, use `--local-storage` instead of `--storage-dsn` for Docker-managed state.
+Also pass `--organization` and `--api-token env:PLANETSCALE_TOKEN`.
 Use `--api-url` only for a PlanetScale-compatible private endpoint.
 
 Paths and plan IDs vary. Existing schema directories with a valid `schemabot.yaml` are verified and

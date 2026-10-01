@@ -39,3 +39,31 @@ func TestInitStorageChoices(t *testing.T) {
 		})
 	}
 }
+
+func TestInitVitessLocalStorageChoice(t *testing.T) {
+	cmd := InitCmd{Type: "vitess", Database: "shop", Organization: "demo", Namespaces: []string{"shop"}, SchemaDir: t.TempDir()}
+	m := newInitWizard(&cmd, "default", io.Discard)
+	m.step = stepStorageDSN
+	m.loadField()
+	require.True(t, m.choosingStorage)
+	require.Contains(t, m.View(), "Local (Docker)")
+	require.Contains(t, m.View(), "PlanetScale")
+	require.NotContains(t, m.View(), "Integrated")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepAPIToken, m.step) // organization supplied via flag
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, stepOrganization, m.step)
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, stepStorageDSN, m.step)
+	require.True(t, m.localStorage)
+	wizardKey(m, tea.KeyDown)
+	require.False(t, m.localStorage)
+	wizardKey(m, tea.KeyEnter)
+	require.Contains(t, m.View(), "Paste a connection string")
+	m.localStorage = true
+	m.confirmed = true
+	require.NoError(t, m.copyToCommand(&cmd, &Globals{}))
+	require.True(t, cmd.LocalStorage)
+	require.False(t, cmd.Integrated)
+	require.Empty(t, cmd.StorageDSN)
+}

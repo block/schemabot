@@ -30,9 +30,9 @@ const (
 	stepName
 	stepEnvironment
 	stepDSN
+	stepStorageDSN
 	stepOrganization
 	stepAPIToken
-	stepStorageDSN
 	stepNamespaces
 	stepSchemaDir
 	stepProfile
@@ -64,6 +64,7 @@ type initWizard struct {
 	suggestions                              map[int]string
 	editedFields                             map[int]bool
 	integrated, choosingStorage              bool
+	localStorage                             bool
 	connectionSummary                        string
 	existingProject                          string
 	originalNamespaces                       []string
@@ -103,9 +104,9 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Database name", "Give your database a name, like shop or analytics.", cmd.Database},
 		{"Environment", "Where are you working? Start with development if you’re trying things out.", value(cmd.Environment, "development")},
 		{"Connect your database", "Use a connection variable you’ve already set. Confirm it below, or edit the variable name.", value(cmd.DSN, "env:DATABASE_URL")},
+		{"Connect SchemaBot’s state database", "Plans and progress live in a separate database. It can share your application’s server.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
 		{"PlanetScale organization", "Which PlanetScale organization owns this database?", cmd.Organization},
 		{"Connect the PlanetScale API", "Use a service token for this database.", value(cmd.APIToken, "env:PLANETSCALE_TOKEN")},
-		{"Connect SchemaBot’s state database", "Plans and progress live in a separate database. It can share your application’s server.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
 		{"Namespaces", "Which namespaces would you like to bring in? You can list several, separated by commas.", strings.Join(cmd.Namespaces, ", ")},
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
 		{"Connection profile", "Give this connection a profile name so you can use it again.", profile},
@@ -130,6 +131,7 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		m.suggestions[stepProfile] = profile
 	}
 	m.integrated = cmd.Integrated || cmd.StorageDSN == ""
+	m.localStorage = cmd.LocalStorage || cmd.StorageDSN == ""
 	m.originalNamespaces = slices.Clone(cmd.Namespaces)
 	m.spinner = spinner.New()
 	m.spinner.Spinner = spinner.Dot
@@ -200,7 +202,7 @@ func (m *initWizard) loadField() {
 		m.input.Blur()
 		return
 	}
-	m.choosingStorage = m.step == stepStorageDSN && !m.isVitess()
+	m.choosingStorage = m.step == stepStorageDSN
 	if m.isVitess() {
 		m.integrated = false
 	}
@@ -311,10 +313,14 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.step == stepStorageDSN && m.choosingStorage {
 			switch msg.String() {
 			case "up", "down", "left", "right":
-				m.integrated = !m.integrated
+				if m.isVitess() {
+					m.localStorage = !m.localStorage
+				} else {
+					m.integrated = !m.integrated
+				}
 				return m, nil
 			case "enter":
-				if m.integrated {
+				if m.integrated || m.isVitess() && m.localStorage {
 					return m, m.advance()
 				}
 				m.choosingStorage = false
@@ -558,9 +564,12 @@ func (m *initWizard) contentView() string {
 		row("Environment", m.fields[stepEnvironment].value)
 		row("Namespaces", m.fields[stepNamespaces].value)
 		row("Profile", m.fields[stepProfile].value)
-		if m.integrated {
+		switch {
+		case m.isVitess() && m.localStorage:
+			row("Storage", "Local MySQL in Docker")
+		case m.integrated:
 			row("Storage", "schemabot (new database, same server)")
-		} else {
+		default:
 			row("Storage", initConnectionLabel(m.fields[stepStorageDSN].value))
 		}
 		if m.isVitess() && strings.HasPrefix(m.fields[stepAPIToken].value, "draft:") || strings.HasPrefix(m.fields[stepDSN].value, "draft:") || !m.integrated && strings.HasPrefix(m.fields[stepStorageDSN].value, "draft:") {
@@ -618,7 +627,7 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 		if i == stepAPIToken && !m.isVitess() {
 			continue
 		}
-		if i == stepStorageDSN && m.integrated {
+		if i == stepStorageDSN && (m.integrated || m.isVitess() && m.localStorage) {
 			continue
 		}
 		if dsn, ok := m.draftConnections[m.fields[i].value]; ok {
@@ -649,8 +658,9 @@ func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
 		cmd.APIURL = ""
 	}
 	cmd.Integrated = m.integrated
+	cmd.LocalStorage = m.isVitess() && m.localStorage
 	cmd.StorageDSN = m.fields[stepStorageDSN].value
-	if cmd.Integrated {
+	if cmd.Integrated || cmd.LocalStorage {
 		cmd.StorageDSN = ""
 	}
 	cmd.Namespaces = m.namespaceChoices(cmd.Namespaces)

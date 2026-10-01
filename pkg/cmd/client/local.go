@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/localstorage"
 )
 
 // ResolveLocalConnection is called only for API commands. Explicit remote
@@ -30,6 +31,9 @@ func ResolveLocalConnection(ctx context.Context, endpoint, profileFlag, token, v
 	}
 	binary, err := os.Executable()
 	if err != nil {
+		return nil, err
+	}
+	if err := localstorage.Resume(ctx, dir); err != nil {
 		return nil, err
 	}
 	connection, err := (localruntime.Manager{Dir: dir, Binary: binary, Version: version}).Ensure(ctx)

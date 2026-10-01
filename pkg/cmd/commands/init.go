@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/localdemo"
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/localsetup"
+	"github.com/block/schemabot/pkg/localstorage"
 )
 
 // InitCmd accepts explicit inputs or collects missing decisions in a terminal.
@@ -40,6 +41,7 @@ type InitCmd struct {
 	APIToken       string       `name:"api-token" help:"PlanetScale service token as env:VARIABLE or file:/absolute/path holding TOKEN_ID:TOKEN_SECRET"`
 	APIURL         string       `name:"api-url" help:"PlanetScale-compatible API base URL; defaults to PlanetScale"`
 	Integrated     bool         `help:"Create a separate schemabot database on the application server for SchemaBot state"`
+	LocalStorage   bool         `name:"local-storage" help:"Run SchemaBot state storage in local Docker (Vitess only)"`
 	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE or file:/absolute/path; startup initializes SchemaBot metadata tables"`
 	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
 	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
@@ -108,12 +110,19 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if cmd.Type == "vitess" && cmd.Integrated {
 		return nil, fmt.Errorf("vitess needs a separate MySQL state database; use --storage-dsn")
 	}
+	if cmd.LocalStorage && (cmd.Integrated || cmd.StorageDSN != "" || cmd.Type != "vitess") {
+		return nil, fmt.Errorf("--local-storage requires vitess and cannot be combined with --integrated or --storage-dsn")
+	}
 	storage := api.StorageConfig{Dialect: initStorageDialect(cmd.Type), DSN: cmd.StorageDSN}
 	if cmd.Integrated {
 		storage.DSN = cmd.DSN
 		storage.Database = "schemabot"
 	}
-	for _, ref := range []string{cmd.DSN, storage.DSN} {
+	refs := []string{cmd.DSN}
+	if !cmd.LocalStorage {
+		refs = append(refs, storage.DSN)
+	}
+	for _, ref := range refs {
 		if !validInitConnectionReference(ref) {
 			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE or file:/absolute/path references")
 		}
@@ -193,6 +202,14 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		if err := localsetup.CheckPlanetScale(ctx, localsetup.Target{Engine: cmd.Type, Database: cmd.Database, Organization: cmd.Organization, Token: token, APIURL: cmd.APIURL}); err != nil {
 			return nil, err
 		}
+	}
+	if cmd.LocalStorage {
+		cmd.reportProgress("Starting your local state database in Docker...")
+		storage.DSN, err = localstorage.Prepare(ctx, dir, cmd.reportProgress)
+		if err != nil {
+			return nil, err
+		}
+		cmd.StorageDSN = storage.DSN
 	}
 	registration := localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
