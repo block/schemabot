@@ -833,6 +833,56 @@ func TestWebhookNoMention(t *testing.T) {
 	}
 }
 
+// A status update that reports an apply in command words ("SchemaBot apply -e
+// staging succeeded") is a sentence, not a request: SchemaBot starts nothing
+// and posts nothing.
+func TestWebhookSentenceReportingAnApplyDoesNotApply(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "SchemaBot apply -e staging succeeded, and the check passes.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		t.Fatalf("unexpected comment posted: %s", body)
+	default:
+	}
+}
+
+// An agent's status update that opens a paragraph with the product name is a
+// sentence about SchemaBot, not a command. SchemaBot leaves it unanswered
+// rather than replying with the invalid-command help.
+func TestWebhookProseMentionIsNotAnswered(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "Rebased onto main.\n\nSchemaBot applied the `orders` table in staging from commit `abc1234`; the staging check passes.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		t.Fatalf("unexpected comment posted: %s", body)
+	default:
+	}
+}
+
 func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 

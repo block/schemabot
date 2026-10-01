@@ -99,6 +99,11 @@ func TestHasAutoConfirmFlag(t *testing.T) {
 	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging\n\nlast time I had to pass --yes locally"))
 	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging\n\n```\nschemabot apply -e staging -y\n```\n"))
 	assert.False(t, p.HasAutoConfirmFlag("we could pass --yes here"))
+
+	// A sentence opening with the product name is not the directive line, so
+	// a flag it mentions does not attach to the command that follows it.
+	assert.False(t, p.HasAutoConfirmFlag("SchemaBot runs with -y in the CLI only.\n\nschemabot apply -e staging"))
+	assert.True(t, p.HasAutoConfirmFlag("SchemaBot runs with -y in the CLI only.\n\nschemabot apply -e staging -y"))
 }
 
 func TestHasDatabaseFlag(t *testing.T) {
@@ -457,8 +462,81 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "unknown mention",
-			body: "schemabot what's up",
+			name: "mistyped command",
+			body: "schemabot aply -e staging",
+			expected: CommandResult{
+				IsMention: true,
+			},
+		},
+		{
+			name: "mistyped command with apply ID",
+			body: "schemabot stpo apply-abc123 -e staging",
+			expected: CommandResult{
+				IsMention: true,
+			},
+		},
+		{
+			name: "bare mention",
+			body: "schemabot",
+			expected: CommandResult{
+				IsMention: true,
+			},
+		},
+		{
+			name:     "sentence opening with the product name ignored",
+			body:     "Rebased onto main.\n\nSchemaBot applied the `orders` table in staging from commit `abc1234`; the staging check passes.",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "sentence addressed to schemabot ignored",
+			body:     "schemabot what's up",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "sentence opening with a command word does not plan",
+			body:     "SchemaBot plan output looks right",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "sentence reporting an apply does not apply",
+			body:     "SchemaBot apply -e staging succeeded",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "sentence about help does not post help",
+			body:     "SchemaBot help is linked below.",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name: "command word with trailing punctuation is not the command",
+			body: "SchemaBot plan.",
+			expected: CommandResult{
+				IsMention: true,
+			},
+		},
+		{
+			name: "control command copied with its usage placeholder",
+			body: "schemabot stop <apply-id> -e staging",
+			expected: CommandResult{
+				Action:      "stop",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "command after a sentence opening with the product name",
+			body: "SchemaBot planned this earlier.\n\nschemabot apply -e staging",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "mistyped command after a sentence opening with the product name",
+			body: "SchemaBot planned this earlier.\n\nschemabot aply -e staging",
 			expected: CommandResult{
 				IsMention: true,
 			},

@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -100,23 +99,9 @@ func commandSupportsDatabaseFlag(actionName string) bool {
 	return ok && spec.SupportsDB
 }
 
-// commandNamePattern is the alternation of every registered command name,
-// sorted by length descending so "apply-confirm" wins over "apply" at the same
-// start position under RE2's leftmost-first semantics.
-func commandNamePattern() string {
-	names := make([]string, 0, len(commandSpecs))
-	for _, s := range commandSpecs {
-		names = append(names, regexp.QuoteMeta(s.Name))
-	}
-	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
-	return strings.Join(names, "|")
-}
-
 // CommandParser parses SchemaBot commands from PR comments.
 type CommandParser struct {
-	commandRegex         *regexp.Regexp
 	mentionRegex         *regexp.Regexp
-	helpRegex            *regexp.Regexp
 	applyIDRegex         *regexp.Regexp
 	environmentRegex     *regexp.Regexp
 	environmentNameRegex *regexp.Regexp
@@ -133,9 +118,7 @@ type CommandParser struct {
 // NewCommandParser creates a new command parser.
 func NewCommandParser() *CommandParser {
 	return &CommandParser{
-		commandRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+(` + commandNamePattern() + `)\b`),
 		mentionRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot(?:[ \t]+|$)`),
-		helpRegex:            regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+help\b`),
 		applyIDRegex:         regexp.MustCompile(`(?i)\b(apply[_-][a-f0-9]+)\b`),
 		environmentRegex:     regexp.MustCompile(`(?i)-e\s+([^-\s][^\s]*)`),
 		environmentNameRegex: regexp.MustCompile(`^[a-z0-9][a-z0-9_]*(?:-[a-z0-9_]+)*$`),
@@ -177,6 +160,10 @@ type CommandResult struct {
 	Found        bool
 	IsHelp       bool
 	IsMention    bool
+	// ProseMention is true when the comment has a line opening with
+	// `schemabot` that reads as a sentence about SchemaBot, and no line
+	// addressed to it. Such a comment is not answered.
+	ProseMention bool
 	MissingEnv   bool
 	// EnvironmentError is true when `-e` is present but its value is not a
 	// valid environment name (for example a flag glued onto the value:
@@ -188,35 +175,32 @@ type CommandResult struct {
 
 // ParseCommand parses a SchemaBot command from a comment body.
 //
-// Resolution order:
-//  1. Help (`schemabot help`) is detected first and short-circuits with
-//     IsHelp=true so the dispatcher can branch on it without consulting the
-//     full spec table.
-//  2. The first registered command word that follows `schemabot ` is looked
-//     up in specByName and routed through applySpec. Commands must begin a
-//     non-code comment line so prose, filenames, URLs, and examples are not
-//     treated as directives.
-//  3. If a line starts with `schemabot` but no registered command follows, the
-//     result is a bare IsMention so the dispatcher can post a friendly
-//     "invalid command" comment under the respond_to_unscoped policy.
+// A comment addresses SchemaBot only on a non-code line that is shaped like a
+// command: `schemabot`, a command word, and then nothing but flags, the values
+// of flags that take one, and (for commands that act on an apply) one
+// positional apply ID. Any other line that opens with `schemabot` is a
+// sentence about SchemaBot ("SchemaBot apply -e staging succeeded") and is
+// skipped: it never runs a command or gets an answer, and it does not hide a
+// command on a later line. The first command-shaped line is the directive:
+//  1. Help (`schemabot help`) short-circuits with IsHelp=true so the
+//     dispatcher can branch on it without consulting the full spec table.
+//  2. A registered command word is looked up in specByName and routed through
+//     applySpec.
+//  3. Any other word, or `schemabot` alone, is a bare IsMention so the
+//     dispatcher can post a friendly "invalid command" comment under the
+//     respond_to_unscoped policy.
 func (p *CommandParser) ParseCommand(body string) CommandResult {
 	body = markdownDirectiveText(body)
-	directive, ok := p.firstDirectiveLine(body)
+	directive, name, ok, prose := p.firstDirectiveLine(body)
 	if !ok {
-		return CommandResult{}
+		return CommandResult{ProseMention: prose}
 	}
 	tenant, tenantErr := p.extractTenant(directive)
 
-	if p.helpRegex.MatchString(directive) {
+	if name == action.Help {
 		return CommandResult{Action: action.Help, Tenant: tenant, TenantError: tenantErr, IsHelp: true, IsMention: true}
 	}
 
-	matches := p.commandRegex.FindStringSubmatch(directive)
-	if len(matches) < 2 {
-		return CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true}
-	}
-
-	name := strings.ToLower(matches[1])
 	spec, ok := specByName[name]
 	if !ok {
 		return CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true}
@@ -224,14 +208,63 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 	return p.applySpec(spec, directive, tenant, tenantErr)
 }
 
-func (p *CommandParser) firstDirectiveLine(body string) (string, bool) {
+// firstDirectiveLine returns the first command-shaped line and the command
+// word it names, lowercased and empty for a bare `schemabot`. prose reports
+// whether a line opening with `schemabot` was skipped as a sentence on the
+// way, so a caller can say why a comment naming SchemaBot was not answered.
+func (p *CommandParser) firstDirectiveLine(body string) (directive, name string, ok, prose bool) {
 	for line := range strings.Lines(body) {
 		line = strings.TrimRight(line, "\r\n")
-		if p.mentionRegex.MatchString(line) {
-			return line, true
+		loc := p.mentionRegex.FindStringIndex(line)
+		if loc == nil {
+			continue
+		}
+		words := strings.Fields(line[loc[1]:])
+		if !p.commandShaped(words) {
+			prose = true
+			continue
+		}
+		if len(words) > 0 {
+			name = strings.ToLower(words[0])
+		}
+		return line, name, true, prose
+	}
+	return "", "", false, prose
+}
+
+// valueFlags are the flags that take the following word as their value.
+var valueFlags = map[string]bool{"-e": true, "-d": true, "-t": true, "--tenant": true}
+
+// commandShaped reports whether words, everything after `schemabot` on a
+// line, read as a command rather than a sentence. The first word is the
+// command, matched as a whole word so "planned" or "plan." is not `plan`.
+// Every later word must be a flag, the value of a flag that takes one, an
+// apply ID, or a usage placeholder such as `<apply-id>` copied from help text.
+// A plain word anywhere after the command makes the line a sentence:
+// "SchemaBot apply -e staging succeeded" is a report, not a request.
+func (p *CommandParser) commandShaped(words []string) bool {
+	expectValue := false
+	for i, word := range words {
+		if i == 0 {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(word, "-"):
+			expectValue = valueFlags[strings.ToLower(word)]
+		case expectValue:
+			expectValue = false
+		case p.applyIDRegex.MatchString(word), isUsagePlaceholder(word):
+		default:
+			return false
 		}
 	}
-	return "", false
+	return true
+}
+
+// isUsagePlaceholder reports whether word is a placeholder like `<apply-id>`,
+// which only appears in a command copied from usage text.
+func isUsagePlaceholder(word string) bool {
+	return len(word) > 2 && strings.HasPrefix(word, "<") && strings.HasSuffix(word, ">")
 }
 
 func (p *CommandParser) extractTenant(body string) (string, bool) {
@@ -342,7 +375,7 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 // reader who mentions the flag in prose, or pastes a CLI example in a fence, is
 // describing it, not passing it.
 func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
-	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	directive, _, ok, _ := p.firstDirectiveLine(markdownDirectiveText(body))
 	if !ok {
 		return false
 	}
@@ -355,7 +388,7 @@ func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
 // directive line the command was parsed from: prose or a fenced CLI example
 // mentioning the flag describes it, not passes it.
 func (p *CommandParser) HasDatabaseFlag(body string) bool {
-	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	directive, _, ok, _ := p.firstDirectiveLine(markdownDirectiveText(body))
 	if !ok {
 		return false
 	}
@@ -366,7 +399,7 @@ func (p *CommandParser) HasDatabaseFlag(body string) bool {
 // regardless of which command it accompanies. Read off the directive line for
 // the same reason as HasDatabaseFlag.
 func (p *CommandParser) HasDeferCutoverFlag(body string) bool {
-	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	directive, _, ok, _ := p.firstDirectiveLine(markdownDirectiveText(body))
 	if !ok {
 		return false
 	}

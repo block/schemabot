@@ -166,6 +166,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	result.DeliveryID = deliveryID
 
 	if !result.IsMention {
+		if result.ProseMention {
+			h.logger.Debug("ignoring comment that names SchemaBot in a sentence without addressing a command to it",
+				"repo", repo, "pr", pr, "comment_id", result.CommentID, "requested_by", requestedBy)
+		}
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "no SchemaBot command found",
 		})
