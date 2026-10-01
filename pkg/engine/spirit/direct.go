@@ -218,12 +218,12 @@ type refusedModeDecision struct {
 const blockedSizeUnknownReason = "; direct execution is enabled but the table's size is unavailable"
 
 // blockedForceKillUnavailableReason is the mode-reason suffix when the target
-// denies SchemaBot the tables it reads to find the sessions blocking a direct
-// statement's metadata lock: the performance_schema lock tables, and
-// information_schema.innodb_trx, which needs PROCESS. The denial itself stays
-// in the server log; the reason names the grants that fix it and the fresh
-// plan that picks them up.
-const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot cannot read the lock and transaction tables it uses to end sessions blocking the statement: grant its database user SELECT on performance_schema and PROCESS, then plan again"
+// denies SchemaBot a grant the kill needs to end the sessions blocking a direct
+// statement's metadata lock: SELECT on the performance_schema lock tables,
+// PROCESS for information_schema.innodb_trx, or CONNECTION_ADMIN (or SUPER) to
+// kill another user's session. The denial itself stays in the server log; the
+// reason names the grants that fix it and the fresh plan that picks them up.
+const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again"
 
 // blockedForceKillUnknownReason is the mode-reason suffix when checking those
 // tables failed for a reason other than a denied grant, such as a lost
@@ -249,28 +249,13 @@ func isAccessDenied(err error) bool {
 	return mysqlerr.Is(err, erDBAccessDenied, erTableAccessDenied, erColumnAccessDenied, erSpecificAccessDenied)
 }
 
-// innodbTrxProbe reads information_schema.innodb_trx, which the kill joins to
-// spare heavy transactions. MySQL checks PROCESS for that table only when it
-// fills it, and it skips the fill for a query that can return no rows, so the
-// LIMIT 0 probe in dbconn.CheckForceKillPrivileges passes for a user without
-// PROCESS. LIMIT 1 forces the fill. This retires once Spirit's own probe
-// forces it.
-const innodbTrxProbe = "SELECT 1 FROM information_schema.innodb_trx LIMIT 1"
-
-// checkInnodbTrxAccess runs innodbTrxProbe and drains it, so a denied PROCESS
-// grant surfaces here rather than when the kill first runs.
-func checkInnodbTrxAccess(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx, innodbTrxProbe)
-	if err != nil {
-		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
-	}
-	defer utils.CloseAndLog(rows)
-	for rows.Next() {
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
-	}
-	return nil
+// deniesForceKillGrant reports whether the force-kill privilege check failed
+// because the target lacks a grant, as opposed to a check that could not run.
+// Spirit marks every grant it finds missing, including CONNECTION_ADMIN, which
+// it reads from SHOW GRANTS rather than from a denied query, so its marker is
+// the primary signal. A denial code Spirit does not mark is still a denial.
+func deniesForceKillGrant(err error) bool {
+	return errors.Is(err, dbconn.ErrForceKillPrivilegeMissing) || isAccessDenied(err)
 }
 
 // resolveRefusedMode decides whether the policy routes a refused statement to
@@ -307,8 +292,9 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 }
 
 // requireForceKill blocks a statement the size gate approved when SchemaBot
-// cannot read the tables it uses to find the sessions blocking the
-// statement's metadata lock. Without them the kill could only fail at apply
+// lacks a grant the kill needs: reading the tables it uses to find the
+// sessions blocking the statement's metadata lock, or killing another user's
+// session. Without them the kill could only fail at apply
 // time, after the operator confirmed, leaving the statement queued on the lock
 // while table traffic stalls behind it. The statement is blocked rather than
 // run without the kill: as unavailable when the target denies a grant, and as
@@ -332,27 +318,18 @@ func (e *Engine) requireForceKill(ctx context.Context, target *lazyTargetDB, dat
 			"database", database, "table", tableName, "error", err)
 		return unknown
 	}
-	for _, probe := range []struct {
-		tables string
-		run    func(context.Context, *sql.DB) error
-	}{
-		{"performance_schema lock tables", dbconn.CheckForceKillPrivileges},
-		{"information_schema.innodb_trx", checkInnodbTrxAccess},
-	} {
-		err := probe.run(ctx, db)
-		if err == nil {
-			continue
-		}
-		if isAccessDenied(err) {
-			e.logger.Warn("direct execution blocked: the target denies a grant the kill needs to end sessions blocking the statement",
-				"database", database, "table", tableName, "tables", probe.tables, "error", err)
-			return unavailable
-		}
-		e.logger.Warn("direct execution blocked: checking the grants the kill needs failed",
-			"database", database, "table", tableName, "tables", probe.tables, "error", err)
-		return unknown
+	err = dbconn.CheckForceKillPrivileges(ctx, db)
+	if err == nil {
+		return approved
 	}
-	return approved
+	if deniesForceKillGrant(err) {
+		e.logger.Warn("direct execution blocked: the target denies a grant the kill needs to end sessions blocking the statement",
+			"database", database, "table", tableName, "error", err)
+		return unavailable
+	}
+	e.logger.Warn("direct execution blocked: checking the grants the kill needs failed",
+		"database", database, "table", tableName, "error", err)
+	return unknown
 }
 
 // resolveSizeGate applies the policy's size bound to a refused statement whose

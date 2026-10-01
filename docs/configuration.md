@@ -807,11 +807,10 @@ and gives a blocker less time to finish before it is killed; the value must
 be a whole number of seconds (at least `1s`).
 
 The kill reads `performance_schema` and `information_schema.innodb_trx` to
-find the blocking sessions, so the SchemaBot user needs `SELECT` on
-`performance_schema.*` and `PROCESS` for a statement to run directly; without
-either the statement is blocked at plan time. Killing
-another user's session also needs `CONNECTION_ADMIN` (or `SUPER`); without it
-the kill fails and a blocked apply fails as busy.
+find the blocking sessions and ends other users' sessions, so the SchemaBot
+user needs `SELECT` on `performance_schema.*`, `PROCESS`, and
+`CONNECTION_ADMIN` (or `SUPER`) for a statement to run directly; without any
+of them the statement is blocked at plan time.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is

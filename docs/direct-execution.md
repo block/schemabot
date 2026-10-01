@@ -60,11 +60,10 @@ when it is not set.
 The kill needs `SELECT` on `performance_schema` and `PROCESS` to find the
 blockers (`PROCESS` covers `information_schema.innodb_trx`, which it reads to
 spare large transactions), and `CONNECTION_ADMIN` (or `SUPER`) to kill
-sessions of other users. A target whose SchemaBot user is denied either of
-the first two blocks the statement at plan time rather than running it
-without the kill. A missing kill privilege
-surfaces only when a blocker is found: the kill fails, the attempts time out,
-and the apply fails as busy.
+sessions of other users. A target whose SchemaBot user lacks any of them
+blocks the statement at plan time rather than running it without the kill.
+`CONNECTION_ADMIN` is read from `SHOW GRANTS`; on RDS, holding
+`rds_superuser_role` counts when `activate_all_roles_on_login` is on.
 
 ## Routing
 
@@ -324,6 +323,6 @@ are rare, policy-approved events — a spike in
 the statement and MySQL error), a spike in `blocked_size_unknown` means table
 size statistics are unavailable (check target connectivity and
 `information_schema` access), `blocked_force_kill_unavailable` means the
-SchemaBot user is denied a table the kill reads on the target (grant `SELECT`
-on `performance_schema.*` and `PROCESS`), and `blocked_force_kill_unknown`
+SchemaBot user lacks a grant the kill needs on the target (grant `SELECT`
+on `performance_schema.*`, `PROCESS`, and `CONNECTION_ADMIN` or `SUPER`), and `blocked_force_kill_unknown`
 means checking those grants failed (check target connectivity).
