@@ -485,23 +485,37 @@ deployments address a target of the same name; an ambiguous bare name is
 refused. An unknown name is refused with the list of valid targets. `plan`
 takes the same flag and needs `-e` with it.
 
-A narrowed plan speaks for its one target. It never records a GitHub check
-result, so a narrowed plan or apply cannot pass a PR merge gate while other
-targets still need the change. The server records the narrowing on the stored
-plan and refuses to apply it anywhere but the target it was made for, and a
-narrowed apply cannot be rolled back with `rollback`: restore that target by
-planning and applying the previous schema with the same `--target`. In an
-environment with a single target, `--target` names the whole rollout, so the
-plan and apply are not narrowed.
+A narrowed plan speaks for its one target. It shows only that target's
+changes, never the whole rollout's split of what applies where, and it is
+never gated on another target that needs attention. It never records a GitHub
+check result, so a narrowed plan or apply cannot pass a PR merge gate while
+other targets still need the change. The server records the narrowing on the
+stored plan and refuses to apply it anywhere but the target it was made for,
+and a narrowed apply cannot be rolled back with `rollback`: restore that
+target by planning and applying the previous schema with the same `--target`.
+In an environment with a single target, `--target` names the whole rollout,
+so the plan and apply are not narrowed.
 
-A plan of the whole rollout is made against its first target, and the other
-targets run that plan. When the first target is already at the desired schema,
-the server also diffs every other target against its own live schema. The plan
-reports no changes only when every target is converged, so a re-run of an
-`apply` that already landed, or the verification step of `onboard`, reads as up
-to date. When a target still needs the change, for example after an apply
-narrowed to the first target, or a target cannot be diffed, the plan fails with
-an error that lists those targets. Plan and apply each of them with `--target`.
+A plan of the whole rollout plans every target beside the first one and shows
+what applies where. It reports no changes only when every target is at the
+desired schema, so a re-run of an `apply` that already landed, or the
+verification step of `onboard`, reads as up to date. When the first target is
+already at the desired schema, for example after an apply narrowed to it,
+another target can still need the change, and the plan says so rather than
+reading as up to date from the first target alone. A target planned against
+its own schema shows that work under its own heading. A deployment expected to
+mirror the first target is listed as needing attention instead, with the
+`--target` that applies it on its own, since its plan differs from the one it
+mirrors. A target that cannot be planned is listed as needing attention too.
+`apply` of the whole rollout refuses while any target needs attention, and
+`onboard` fails its verification.
+
+A plan or apply of a whole rollout of more than one target needs a CLI that
+renders every target's plan. The server refuses one from an older CLI, which
+would show only the first target's plan, with `upgrade the schemabot CLI to
+plan or apply a multi-target environment`; `--target` still works from it.
+Upgrade the server before the CLI, as [releases](release.md) describes: an
+older server refuses a request from a newer CLI as an unknown field.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
@@ -510,7 +524,14 @@ refuses to start while one is queued or running there.
 A rollback of a rollout-wide apply is made against the first target the apply
 ran from. If the rollout order changed since, the rollback is refused rather
 than reverting that one target alone: restore the order the apply ran under,
-then retry it.
+then retry it. A rollout of a `targets:` list plans each target against its own
+schema, and a rollback is one plan, so its rollback is refused before anything
+is planned: restore each target by planning and applying the previous schema
+with `--target`. The refusal follows how the apply ran, as recorded with its
+plan, not how the environment is configured now, so respelling the targets as
+mirrored deployments, or removing all but the first, does not let the rollback
+through. An apply that ran one plan on every target is refused only if its
+targets are now each planned against their own schema.
 
 ### Understand a refusal
 

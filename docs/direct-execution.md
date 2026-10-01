@@ -314,6 +314,16 @@ confirmation step:
   does the disclosure on a paused comment, since the flag can still be
   passed to `apply-confirm`.
 
+`schemabot plan` and `schemabot apply` in the terminal disclose the same
+routing: a plan with a direct-execution change names each table and the
+policy's reason under a "Direct execution" notice. For an environment with
+several targets, the notice sits under the targets that run the change
+natively. Targets that plan the same statement but run it differently are
+shown as separate groups, so a target running the change through Spirit never
+appears under the notice. So are targets that run it natively for different
+reasons, such as tables of different sizes, so each notice names its own
+target's measurement.
+
 ## Observability
 
 Every routing outcome increments

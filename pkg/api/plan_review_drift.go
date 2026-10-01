@@ -46,29 +46,11 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
-
-	planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
+	rollup, err := s.planRolloutMembers(ctx, req, primaryPlan, primaryMember, targets)
 	if err != nil {
-		return PlanRollup{}, fmt.Errorf("resolve member planning for %s/%s: %w", req.Database, req.Environment, err)
+		return PlanRollup{}, err
 	}
-
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryMember, targets)
-	if err != nil {
-		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
-	}
-
-	rollup, err := RollupDeploymentDiffs(diffs, targets, planning)
-	if err != nil {
-		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
-	}
-
-	// Members planned on their own each need a plan row of their own, since an
-	// apply has no single plan that covers them. Storing them here, before the
-	// rollup is reported, keeps "the review says this member is fine" and "this
-	// member has a plan to run" from being separately true.
-	if err := s.persistMemberPlans(ctx, req, planning, primaryPlan.GetPlanId(), diffs, &rollup); err != nil {
-		return PlanRollup{}, fmt.Errorf("persist member plans for %s/%s: %w", req.Database, req.Environment, err)
-	}
+	planning := rollup.Planning
 
 	// Include repo/pr/head SHA so an operator can tell which PR is blocked from
 	// the drift warn log alone.
@@ -172,4 +154,39 @@ func capDriftList(values []string) []string {
 	capped = append(capped, values[:maxDriftDiffLogItems]...)
 	capped = append(capped, fmt.Sprintf("+%d more", len(values)-maxDriftDiffLogItems))
 	return capped
+}
+
+// planRolloutMembers plans every rollout member of targets, classifies each
+// under the environment's member planning, and stores a plan row for each
+// member planned against its own live schema, so an apply created from the
+// primary's plan has a plan to run on every member.
+//
+// Members planned on their own each need a plan row of their own, since an
+// apply has no single plan that covers them. Storing them here, before the
+// rollup is reported, keeps "the rollup says this member is fine" and "this
+// member has a plan to run" from being separately true.
+//
+// Namespace coverage is not checked again here: every caller passes a
+// primaryPlan from ExecutePlanProto, which refuses a request declaring a
+// namespace no member selects.
+func (s *Service) planRolloutMembers(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget, targets []routing.ExecutionTarget) (PlanRollup, error) {
+	planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
+	if err != nil {
+		return PlanRollup{}, fmt.Errorf("resolve member planning for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryMember, targets)
+	if err != nil {
+		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, targets, planning)
+	if err != nil {
+		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	if err := s.persistMemberPlans(ctx, req, planning, primaryPlan.GetPlanId(), diffs, &rollup); err != nil {
+		return PlanRollup{}, fmt.Errorf("persist member plans for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	return rollup, nil
 }

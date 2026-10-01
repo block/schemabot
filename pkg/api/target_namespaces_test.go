@@ -328,7 +328,9 @@ func TestPlanHandler_UncoveredNamespaceIsBadRequest(t *testing.T) {
 	svc := namespaceSelectionServiceWith(t, client, &capturingPlanStore{}, []TargetEntry{
 		{Target: "orders-001", Namespaces: []string{"ns_0"}},
 	})
-	body, err := json.Marshal(threeNamespaceRequest())
+	planReq := threeNamespaceRequest()
+	planReq.RendersRollout = true
+	body, err := json.Marshal(planReq)
 	require.NoError(t, err)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
