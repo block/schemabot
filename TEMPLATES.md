@@ -7179,8 +7179,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cancelled)
-           ○ -80: cancelled
-           ○ 80-: cancelled
+           ○ -80: cancelled at 38.10% (800,000/2,100,000 rows)
+           ○ 80-: cancelled at 21.05% (400,000/1,900,000 rows)
 
 ```
 </details>
@@ -8410,7 +8410,7 @@ _No details available yet._
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
 ```
 schemabot apply -e production
 ```
@@ -8763,7 +8763,7 @@ _No details available yet._
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
 ```
 schemabot apply -e production
 ```
@@ -9301,8 +9301,6 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 │  Deployments:  1 ready for cutover · 1 running · 1 waiting  │
 └─────────────────────────────────────────────────────────────┘
 
-  Next: cut over us-east
-
 🟢 us-east — ready for cutover — next in order (orders-us-east)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
@@ -9322,6 +9320,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+SchemaBot will cut over us-east next — no action needed.
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
 
 ```
 </details>
@@ -9344,8 +9345,6 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
   ❌ First failure: eu-west — duplicate key name 'idx_orders_source'
 
-  Next: review failure in eu-west
-
 ✅ us-east — completed (orders-us-east)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
@@ -9365,6 +9364,8 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+  schemabot apply -s <schema_dir> -e production
 
 ```
 </details>
@@ -9387,8 +9388,6 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
   ❌ First failure: us-east — duplicate key name 'idx_orders_source'
 
-  Next: review failure in us-east
-
 ❌ us-east — failed (orders-us-east)
   duplicate key name 'idx_orders_source'
 
@@ -9409,6 +9408,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
+A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
 
 ```
 </details>
@@ -9447,6 +9449,124 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-past-a-failed-target"></a><strong>Multi-target Rollout Past A Failed Target</strong></summary>
+
+```
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                             │
+│  Environment:  production                                       │
+│  State:        running (degraded)                               │
+│  Caller:       github:octocat                                   │
+│  Source:       https://github.com/acme/shop/pull/412            │
+│  Started:      Jan 15 14:22:00 UTC                              │
+│  Duration:     8m                                               │
+│  Targets:      40 completed · 19 running · 4 queued · 1 failed  │
+└─────────────────────────────────────────────────────────────────┘
+
+  ❌ First failure: prod/payments-041 — duplicate key name 'idx_orders_source'
+
+❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72% · 40 of 60 targets complete · 1 failed
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+       • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
+       • Targets: 60 (40 complete, 19 copying, 1 failed)
+           ✗ payments-041: failed
+           ◉ payments-042: 25.00% (20,000/80,000 rows) ETA 10m 0s
+           ◉ payments-043: 28.75% (23,000/80,000 rows) ETA 9m 35s
+           ◉ payments-044: 32.50% (26,000/80,000 rows) ETA 9m 10s
+           ◉ payments-045: 36.25% (29,000/80,000 rows) ETA 8m 45s
+           ◉ payments-046: 40.00% (32,000/80,000 rows) ETA 8m 20s
+           ... 14 more copying targets
+           ... 40 complete
+
+  4 of 64 targets have not reported progress yet.
+
+  Targets needing attention:
+    ❌ payments-041 — failed: duplicate key name 'idx_orders_source'
+      External apply ID: spirit-apply-041
+
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-waiting-for-cutover"></a><strong>Multi-target Rollout Waiting For Cutover</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        waiting for cutover                    │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Targets:      3 ready for cutover                    │
+└───────────────────────────────────────────────────────┘
+
+🟢 prod — 3 ready for cutover (3 targets)
+
+▸ targets payments-001, payments-002
+
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover · 0 of 2 targets complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 2 (2 waiting for cutover)
+           ● payments-001: waiting for cutover
+           ● payments-002: waiting for cutover
+
+▸ target payments-003
+
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+       ALTER TABLE `orders` MODIFY COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 1 (1 waiting for cutover)
+           ● payments-003: waiting for cutover
+
+To cut over prod/payments-001:
+  schemabot cutover apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-stopped"></a><strong>Multi-target Rollout Stopped</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        stopped                                │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Targets:      1 completed · 2 stopped                │
+└───────────────────────────────────────────────────────┘
+
+⏹️ prod — 1 completed · 2 stopped (3 targets)
+
+     ~ orders: ⏹️ Stopped · 1 of 3 targets complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 3 (1 complete, 2 stopped)
+           ✓ payments-001: 80,000 rows
+           ○ payments-002: stopped at 40.00% (32,000/80,000 rows)
+           ○ payments-003: stopped at 25.00% (20,000/80,000 rows)
+
+To resume from where it stopped:
+  schemabot start apply-multi-a1b2c3d4 -e production
 ```
 </details>
 
@@ -10036,7 +10156,7 @@ ESC detach • s stop
 
 ```
 ⣾ running
-1 ready for cutover · 1 running · 1 waiting
+Deployments: 1 ready for cutover · 1 running · 1 waiting
 Apply ID: apply-multi-a1b2c3d4
 Environment: production
 
@@ -10062,6 +10182,10 @@ Environment: production
      ~ orders: ⏳ Queued
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
+
+SchemaBot will cut over us-east next — no action needed.
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
 
 ESC to detach
 ```

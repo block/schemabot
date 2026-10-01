@@ -56,28 +56,30 @@ func WriteRolloutAttention(noun presentation.Noun, attention []*apitypes.PlanMem
 	fmt.Println()
 }
 
-// WriteRolloutGroupHeading names the members that run the plan below it. Few
-// members whose names fit on the heading's line are named inline; any other
-// group leads with how much of the rollout it covers — "all 64 targets",
-// "40 of 64 targets" — and folds its names onto wrapped lines below, capped so
-// the heading stays one screen.
+// FormatRolloutGroupHeading names the members that run the work below it.
+// Few members whose names fit on the heading's line are named inline; any
+// other group leads with how much of the rollout it covers — "all 64
+// targets", "40 of 64 targets" — and folds its names onto wrapped lines below,
+// capped so the heading stays one screen.
 //
 // One blank line separates the heading from what follows. A plan that opens
 // on a namespace header brings that line itself, so opensOnNamespaceHeader
 // leaves it to the header rather than stacking a second one above it.
-func WriteRolloutGroupHeading(noun presentation.Noun, members []string, total int, opensOnNamespaceHeader bool) {
+func FormatRolloutGroupHeading(noun presentation.Noun, members []string, total int, opensOnNamespaceHeader bool) string {
+	var b strings.Builder
 	if heading, ok := inlineGroupHeading(noun, members); ok {
-		fmt.Printf("%s%s%s\n", ANSIBold, heading, ANSIReset)
+		fmt.Fprintf(&b, "%s%s%s\n", ANSIBold, heading, ANSIReset)
 	} else {
-		fmt.Printf("%s▸ %s%s\n", ANSIBold, presentation.CoveragePhrase(noun, len(members), total), ANSIReset)
+		fmt.Fprintf(&b, "%s▸ %s%s\n", ANSIBold, presentation.CoveragePhrase(noun, len(members), total), ANSIReset)
 		shown := members[:min(len(members), memberNamesListLimit)]
 		for _, line := range wrapNames(shown, len(members)-len(shown), utf8.RuneCountInString(memberNamesIndent)) {
-			fmt.Printf("%s%s%s%s\n", memberNamesIndent, ANSIDim, line, ANSIReset)
+			fmt.Fprintf(&b, "%s%s%s%s\n", memberNamesIndent, ANSIDim, line, ANSIReset)
 		}
 	}
 	if !opensOnNamespaceHeader {
-		fmt.Println()
+		b.WriteString("\n")
 	}
+	return b.String()
 }
 
 // WriteRolloutGroupNoChanges says, under a group's heading, that its members

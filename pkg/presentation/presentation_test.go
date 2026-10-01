@@ -1,6 +1,7 @@
 package presentation
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -728,4 +729,27 @@ func TestDerive_NeverStartedStoppedSettlesLikePending(t *testing.T) {
 
 	started := Operation{Deployment: "region-b", Work: true, State: so.Stopped}
 	assert.Equal(t, state.Apply.RunningDegraded, Derive([]Operation{failedA, started}).State)
+}
+
+// Each member carries its own operation's data-plane identifiers and whether
+// a driver ever started it, so a surface reads them from the member rather
+// than pairing the model with the operations it was derived from.
+func TestDerive_MemberCarriesItsOperationsIdentifiers(t *testing.T) {
+	model := Derive([]Operation{
+		{Deployment: "prod", Target: "payments-001", State: state.ApplyOperation.Completed, NeverStarted: true, ExternalID: "spirit-001", ExternalOperationID: "spirit-op-001"},
+		{Deployment: "prod", Target: "payments-002", State: state.ApplyOperation.Failed, Error: "Error 1062: Duplicate entry", ExternalID: "spirit-002", ExternalOperationID: "spirit-op-002"},
+	})
+	require.Len(t, model.Deployments, 2)
+	for _, want := range []struct {
+		target, externalID, externalOperationID string
+		neverStarted                            bool
+	}{
+		{"payments-001", "spirit-001", "spirit-op-001", true},
+		{"payments-002", "spirit-002", "spirit-op-002", false},
+	} {
+		d := model.Deployments[slices.IndexFunc(model.Deployments, func(d Deployment) bool { return d.Target == want.target })]
+		assert.Equal(t, want.externalID, d.ExternalID, want.target)
+		assert.Equal(t, want.externalOperationID, d.ExternalOperationID, want.target)
+		assert.Equal(t, want.neverStarted, d.NeverStarted, want.target)
+	}
 }

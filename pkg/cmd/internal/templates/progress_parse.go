@@ -83,7 +83,12 @@ type TableProgress struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
-	Shards         []ShardProgress
+	// Shards is the table's per-part progress: one entry per shard, or one per
+	// target when AcrossTargets is set.
+	Shards []ShardProgress
+	// AcrossTargets marks a table that stands for one change across a
+	// rollout's targets, rolled up the way a sharded table rolls up its shards.
+	AcrossTargets bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -107,6 +112,9 @@ type ShardCounts struct {
 	Queued            int
 	Failed            int
 	Cancelled         int
+	// Other counts every status the fields above do not name, keyed by
+	// status, so a part in any phase stays in the summary.
+	Other map[string]int
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)

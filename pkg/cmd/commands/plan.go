@@ -298,7 +298,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	var rolloutWork []planWork
 	for _, i := range order {
 		opensOnHeader := !work[i].empty() && opensOnNamespaceHeader(plans[i], work[i])
-		templates.WriteRolloutGroupHeading(noun, rollout.Groups[i].Members, rollout.Members, opensOnHeader)
+		fmt.Print(templates.FormatRolloutGroupHeading(noun, rollout.Groups[i].Members, rollout.Members, opensOnHeader))
 		if work[i].empty() {
 			if !settled {
 				templates.WriteRolloutGroupNoChanges()

@@ -42,7 +42,9 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "Deployments:")
 	assert.Contains(t, output, "1 completed · 1 halted · 1 failed")
 	assert.Contains(t, output, "First failure: region-b — duplicate column name 'region'")
-	assert.Contains(t, output, "Next: review failure in region-b")
+	assert.True(t, strings.HasSuffix(output, presentation.RetryLabel+":\n  "+ANSICyan+"schemabot apply -s <schema_dir> -e staging"+ANSIReset+"\n"),
+		"the one next command closes the output:\n%s", output)
+	assert.NotContains(t, output, "schemabot stop", "a failed apply refuses stop, so none is offered")
 	assertLess(t, output, "✅ region-a — completed", "❌ region-b — failed")
 	assert.Contains(t, output, "External operation ID: remote-region-a")
 	assert.Contains(t, output, "External apply ID: remote-apply-region-a")
@@ -82,7 +84,7 @@ func TestWriteProgressKeyedApplySectionsCarryOwnOperationIdentity(t *testing.T) 
 // Under on_failure continue a failed deployment with a still-running sibling
 // holds the rollout running_degraded: the aggregate shows "running (degraded)"
 // rather than a premature "failed", surfaces the first failure, and offers no
-// review-failure next action while the rollout is still in flight.
+// retry while the rollout is still in flight: stop is its one command.
 func TestWriteProgressMultiDeploymentContinueFailureShowsRunningDegraded(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
@@ -104,7 +106,8 @@ func TestWriteProgressMultiDeploymentContinueFailureShowsRunningDegraded(t *test
 	assert.Contains(t, output, "running (degraded)")
 	assert.Contains(t, output, "1 running · 1 failed")
 	assert.Contains(t, output, "First failure: region-a — duplicate column name 'region'")
-	assert.NotContains(t, output, "Next: review failure")
+	assert.NotContains(t, output, "To retry")
+	assert.Contains(t, output, "schemabot stop apply-degraded -e production")
 }
 
 // Under on_failure pause a failed deployment with a held sibling renders the
@@ -168,10 +171,10 @@ func assertLess(t *testing.T, output, left, right string) {
 }
 
 // One deployment can address several targets, each running its own copy of the
-// change. Every member is named by its routing pair so no two sections carry the
-// same heading, while a sibling deployment that addresses a single target keeps
-// its plain name.
-func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
+// change. The deployment renders as one rollup section counting its targets,
+// while a sibling deployment that addresses a single target keeps a section of
+// its own under its plain name.
+func TestWriteProgressMultiTargetDeploymentRollsUpBesideASingleTargetSibling(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
 			ApplyID:     "apply-multi-target",
@@ -185,14 +188,11 @@ func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
 		})
 	})
 
-	assert.Contains(t, output, "✅ primary/testapp-001 — completed")
-	assert.Contains(t, output, "🔄 primary/testapp-002 — running table copy")
+	assert.Contains(t, output, "Targets:", "the counts count targets once a deployment addresses several")
+	assert.Contains(t, output, "🔄 primary — 1 completed · 1 running (2 targets)")
 	assert.Contains(t, output, "⏳ eu-west — waiting for primary/testapp-002 (orders-eu)")
-
-	// A name that already carries the target does not repeat it in the
-	// trailing parenthetical.
-	assert.NotContains(t, output, "primary/testapp-001 — completed (testapp-001)")
-	assert.NotContains(t, output, "primary/testapp-002 — running table copy (testapp-002)")
+	assertLess(t, output, "primary — 1 completed", "eu-west — waiting")
+	assert.NotContains(t, output, "primary/testapp-001 —", "a rolled-up target has no section of its own")
 }
 
 // A keyed apply runs several operations of one deployment through one
@@ -254,17 +254,18 @@ func TestSectionExternalID_IgnoresOtherDeployments(t *testing.T) {
 }
 
 // Two targets of one deployment each run their own copy of the change against
-// their own schema. Each member's section shows only the tables its own target
-// copied and only its own data-plane identifiers — nothing is read off the
-// sibling member it shares a deployment with.
-func TestWriteProgressMultiTargetSectionsAreMemberScoped(t *testing.T) {
+// their own schema. The rollup reads each target's own table rows: targets
+// that copied different tables are split by what applies where, each table is
+// shown once under the target that copied it, and no target is credited with
+// its sibling's copy.
+func TestWriteProgressMultiTargetRollupIsMemberScoped(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
 			ApplyID:     "apply-multi-target",
 			Environment: "staging",
 			State:       state.Apply.Running,
 			Operations: []ProgressOperation{
-				{Deployment: "primary", Target: "testapp-001", ExternalID: "remote-apply-001", ExternalOperationID: "remote-op-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "primary", Target: "testapp-001", ExternalID: "remote-apply-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 				{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			},
 			Tables: []TableProgress{
@@ -274,18 +275,12 @@ func TestWriteProgressMultiTargetSectionsAreMemberScoped(t *testing.T) {
 		})
 	})
 
-	// The dispatched member's identifiers stay with it: the other member runs a
-	// separate data-plane apply, so it inherits neither.
-	assert.Equal(t, 1, strings.Count(output, "External apply ID: remote-apply-001"),
-		"a sibling target must not inherit another member's external apply ID")
-	assert.Equal(t, 1, strings.Count(output, "External operation ID: remote-op-001"))
-
-	// Each member lists only the tables its own target copied.
-	assertLess(t, output, "primary/testapp-001", "users_001")
-	assertLess(t, output, "users_001", "primary/testapp-002")
-	assertLess(t, output, "primary/testapp-002", "users_002")
-	assert.Equal(t, 1, strings.Count(output, "users_001"))
-	assert.Equal(t, 1, strings.Count(output, "users_002"))
+	assertLess(t, output, "▸ target testapp-001", "users_001")
+	assertLess(t, output, "users_001", "▸ target testapp-002")
+	assertLess(t, output, "▸ target testapp-002", "users_002")
+	assert.Equal(t, 1, strings.Count(output, "users_001:"))
+	assert.Equal(t, 1, strings.Count(output, "users_002:"))
+	assert.NotContains(t, output, "remote-apply-001", "a healthy target's apply ID is not lifted into the rollup")
 }
 
 // A keyed apply's operations share one target, and an operation that has not
