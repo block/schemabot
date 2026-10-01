@@ -982,6 +982,28 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 
 	migrationContext := req.ResumeState.MigrationContext
 
+	// A deploy request closed before it was deployed — by a cancel or stop
+	// whose storage write was lost, or by an operator in the PlanetScale UI —
+	// still reads "ready", so without this check a non-deferred recovery would
+	// try to deploy it, be refused, and fail the apply with a message about a
+	// closed deploy request instead of reporting the cancellation. Nothing can
+	// deploy it any more, so reattach without deploying and let Progress report
+	// the cancelled outcome. No schema change ran, so there is no Vitess context
+	// to rediscover.
+	if deployRequestClosedUndeployed(dr) {
+		e.logger.Info("deploy request was closed before it was deployed; reattaching so progress reports the cancellation",
+			"database", req.Database, "deploy_request", dr.Number, "state", dr.DeploymentState,
+			"deferred_deploy", meta.DeferredDeploy)
+		return &engine.ApplyResult{
+			Accepted: true,
+			Message:  fmt.Sprintf("Deploy request #%d was closed before it was deployed", dr.Number),
+			ResumeState: &engine.ResumeState{
+				MigrationContext: migrationContext,
+				Metadata:         updatedMeta,
+			},
+		}, nil
+	}
+
 	// A non-deferred deploy request that crashed after creation but before being
 	// deployed sits in "ready" indefinitely: Progress maps "ready" to pending,
 	// the deferred-deploy promotion to waiting_for_deploy does not apply, and the

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
@@ -137,18 +138,61 @@ func (e *Engine) closeUndeployedDeployRequest(ctx context.Context, client psclie
 		"database", req.Database,
 		"deploy_request", number,
 		"deployment_state", dr.DeploymentState)
-	if _, closeErr := client.CloseDeployRequest(ctx, &ps.CloseDeployRequestRequest{
+	closed, closeErr := client.CloseDeployRequest(ctx, &ps.CloseDeployRequestRequest{
 		Organization: credOrg(req.Credentials),
 		Database:     req.Database,
 		Number:       number,
-	}); closeErr != nil {
+	})
+	if closeErr != nil {
 		return nil, fmt.Errorf("close undeployed deploy request #%d in deployment state %q after its cancel was rejected (%w): %w", number, dr.DeploymentState, cancelErr, closeErr)
+	}
+	// The state classified above is one round trip old. A deferred deploy
+	// request stays startable from the PlanetScale UI in that window, so the
+	// close response — not the backend's acceptance of the close alone — is
+	// what proves nothing deployed. A response that reports a deploy means
+	// the cancel has not taken effect; the plain error is retryable so the
+	// next attempt's cancel reaches the now-queued deploy.
+	if closed == nil {
+		return nil, fmt.Errorf("close undeployed deploy request #%d after its rejected cancel (%w): close returned no deploy request", number, cancelErr)
+	}
+	if deployRequestReportsDeploy(closed) {
+		return nil, fmt.Errorf("close of deploy request #%d after its rejected cancel (%w) reported a deploy (deployment state %q, deployed at %s); the cancel has not taken effect",
+			number, cancelErr, closed.DeploymentState, formatDeployedAt(closed.DeployedAt))
 	}
 	return &engine.ControlResult{
 		Accepted:    true,
 		Message:     fmt.Sprintf("Deploy request #%d closed before it was deployed", number),
 		ResumeState: req.ResumeState,
 	}, nil
+}
+
+// deployRequestReportsDeploy reports whether a deploy request carries any
+// evidence that its deploy began: a deploy timestamp, or a deployment state
+// past the undeployed ones. Either field alone is enough; the two are not
+// guaranteed to move together.
+func deployRequestReportsDeploy(dr *ps.DeployRequest) bool {
+	if dr.DeployedAt != nil {
+		return true
+	}
+	class, classified := classifyCancelRejection(dr.DeploymentState)
+	return !classified || class != cancelRejectionUndeployed
+}
+
+// deployRequestClosedUndeployed recognises a deploy request that was closed
+// before its deploy began — the outcome of a cancel on a deferred deploy
+// waiting for its start. Progress reports it as cancelled and resume
+// reattaches without deploying. A closed request whose deployment state or
+// deploy timestamp reports a deploy was closed by deploying, not by cancel,
+// and is not matched here.
+func deployRequestClosedUndeployed(dr *ps.DeployRequest) bool {
+	return dr.State == deployRequestClosed && !deployRequestReportsDeploy(dr)
+}
+
+func formatDeployedAt(t *time.Time) string {
+	if t == nil {
+		return "never"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // cancelRejectionClass names how a rejected cancel must be reported, given the

@@ -68,9 +68,47 @@ func TestCloseUndeployedDeployRequest(t *testing.T) {
 	assert.Contains(t, err.Error(), "already closed")
 }
 
+// A deploy request that has been deployed cannot be closed: close is how an
+// undeployed deploy request is retired, and letting it land on a deployed one
+// would mark a completed schema change as cancelled. The deploy request stays
+// open with its deployment state intact. The PlanetScale engine's cancel path
+// relies on this refusal to tell a cancel that took effect from one that did
+// not.
+func TestCloseRefusesDeployedDeployRequest(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	deferCleanupActiveDeployRequests(t)
+	ctx := t.Context()
+
+	branchName := createBranchWithDDL(t, ctx, "close-deployed",
+		map[string][]string{"testapp_sharded": {"ALTER TABLE users ADD COLUMN close_deployed_col varchar(50)"}},
+		nil,
+	)
+	dr := createDeploy(t, ctx, branchName, true)
+	require.Equal(t, drState.Ready, dr.DeploymentState)
+
+	deploy(t, ctx, dr.Number, false)
+	settleDeploy(t, ctx, dr.Number)
+
+	_, err := testClient.CloseDeployRequest(ctx, &ps.CloseDeployRequestRequest{
+		Organization: testOrg, Database: testDB, Number: dr.Number,
+	})
+	require.Error(t, err, "a deployed deploy request must not be closable")
+	assert.Contains(t, err.Error(), "has been deployed")
+
+	got, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+		Organization: testOrg, Database: testDB, Number: dr.Number,
+	})
+	require.NoError(t, err, "GetDeployRequest")
+	assert.Equal(t, "open", got.State, "a refused close leaves the deploy request open")
+	assert.Equal(t, drState.Complete, got.DeploymentState)
+	assert.Nil(t, got.ClosedAt)
+}
+
 // A no-change deploy request remains closed when a deploy arrives afterward.
-// The no-change fast path must enforce the same close/deploy exclusion as a
-// deploy request carrying DDL.
+// The no-change fast path reads the deploy request before deploying and must
+// refuse a closed one the same way the DDL path does; this pins that
+// pre-check. The in-UPDATE closed_at guard that settles a close racing a deploy
+// is not reachable from a sequential client call, so it is not exercised here.
 func TestClosedNoChangeDeployRequestCannotDeploy(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
 	deferCleanupActiveDeployRequests(t)

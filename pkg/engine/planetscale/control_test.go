@@ -327,6 +327,113 @@ func TestCancelAndStop_CloseUndeployedDeployRequest(t *testing.T) {
 	}
 }
 
+// closeRacesDeployClient reads the deploy request as ready, but a deploy lands
+// before the close does, so the close response reports the deploy.
+type closeRacesDeployClient struct {
+	cancelDeployRequestClient
+	closeResponse *ps.DeployRequest
+}
+
+func (c *closeRacesDeployClient) CloseDeployRequest(_ context.Context, req *ps.CloseDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.closed = append(c.closed, req)
+	return c.closeResponse, nil
+}
+
+// The deploy request state the engine classifies is one round trip old by the
+// time the close is sent, and a deferred deploy request stays startable from
+// the PlanetScale UI in between. A deploy that starts in that window must not
+// be reported as a cancel that took effect, whichever field of the close
+// response carries the news — the deploy timestamp or a deployment state past
+// ready — and a close that returns nothing is not taken as proof either.
+func TestCancel_CloseResponseReportingADeployIsNotAccepted(t *testing.T) {
+	deployedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	tests := []struct {
+		name          string
+		closeResponse *ps.DeployRequest
+		wantInError   []string
+	}{
+		{
+			name:          "deployment state has moved to queued",
+			closeResponse: &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: deployState.Queued, DeployedAt: &deployedAt},
+			wantInError:   []string{`"queued"`, "2026-01-02T03:04:05Z", "the cancel has not taken effect"},
+		},
+		{
+			name:          "deploy timestamp set while the deployment state still reads ready",
+			closeResponse: &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: deployState.Ready, DeployedAt: &deployedAt},
+			wantInError:   []string{`"ready"`, "2026-01-02T03:04:05Z"},
+		},
+		{
+			name:          "deployment state past ready with no deploy timestamp",
+			closeResponse: &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: deployState.Submitting},
+			wantInError:   []string{`"submitting"`, "deployed at never"},
+		},
+		{
+			name:          "close returned no deploy request",
+			closeResponse: nil,
+			wantInError:   []string{"close returned no deploy request"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta, err := encodePSMetadata(&psMetadata{BranchName: "schemabot-mydb-abc", DeployRequestID: 42, DeployRequestURL: "https://example.test/deploys/42", DeferredDeploy: true})
+			require.NoError(t, err)
+			client := &closeRacesDeployClient{
+				cancelDeployRequestClient: cancelDeployRequestClient{
+					cancelErr: errors.New(`cannot cancel: deploy request is in state "ready"`),
+					dr:        &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.Ready},
+				},
+				closeResponse: tt.closeResponse,
+			}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+			result, err := e.Cancel(t.Context(), &engine.ControlRequest{
+				Database:    "mydb",
+				ResumeState: &engine.ResumeState{Metadata: meta},
+				Credentials: &engine.Credentials{Metadata: map[string]string{"organization": "org", "token_name": "tn", "token_value": "tv"}},
+			})
+
+			require.Error(t, err, "a close whose response reports a deploy must not read as an accepted cancel")
+			assert.Nil(t, result)
+			assert.False(t, engine.IsAlreadyCompleted(err), "the deploy is live, not completed; the next attempt's cancel must reach it")
+			assert.True(t, engine.IsRetryable(err), "a plain error lets the next attempt's cancel reach the queued deploy")
+			for _, want := range tt.wantInError {
+				assert.Contains(t, err.Error(), want)
+			}
+			assert.Contains(t, err.Error(), `cannot cancel: deploy request is in state "ready"`, "the original refusal stays in the error")
+			require.Len(t, client.closed, 1)
+		})
+	}
+}
+
+// The predicate Progress and resume share to recognise a deploy request that
+// was closed before its deploy began. Only a closed request in an undeployed
+// deployment state with no deploy timestamp qualifies: an open ready request
+// is a deploy waiting to start, a closed request in a later state closed by
+// deploying, and a closed no-change request completed rather than cancelled.
+func TestDeployRequestClosedUndeployed(t *testing.T) {
+	deployedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	tests := []struct {
+		name string
+		dr   ps.DeployRequest
+		want bool
+	}{
+		{name: "closed while ready", dr: ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Ready}, want: true},
+		{name: "closed while pending", dr: ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Pending}, want: true},
+		{name: "open and ready", dr: ps.DeployRequest{State: "open", DeploymentState: deployState.Ready}, want: false},
+		{name: "closed ready but reports a deploy", dr: ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Ready, DeployedAt: &deployedAt}, want: false},
+		{name: "closed by completing", dr: ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Complete, DeployedAt: &deployedAt}, want: false},
+		{name: "closed with no changes", dr: ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.NoChanges}, want: false},
+		{name: "closed by cancelling a running deploy", dr: ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Cancelled, DeployedAt: &deployedAt}, want: false},
+		{name: "closed in a state this engine has never seen", dr: ps.DeployRequest{State: deployRequestClosed, DeploymentState: "some_future_state"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, deployRequestClosedUndeployed(&tt.dr))
+		})
+	}
+}
+
 // applyDeployRequestErrorClient fails every cutover attempt with a fixed error.
 type applyDeployRequestErrorClient struct {
 	psclient.PSClient
