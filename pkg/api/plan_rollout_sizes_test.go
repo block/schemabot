@@ -76,3 +76,56 @@ func TestPlanRolloutResponse_LeavesDivergedMemberOutOfTableSizes(t *testing.T) {
 		{Member: "prod/orders-001", Namespace: "ns_0", Table: "orders", EstimatedBytes: &primary},
 	}, resp.TableSizes)
 }
+
+// Shards of one namespace usually carry the same statement, so each table's
+// shard DDL keeps one copy of every distinct statement, in the order the
+// shards first carry them, and a shard's change to another table stays under
+// that table.
+func TestDistinctShardDDL_KeepsEachStatementOnce(t *testing.T) {
+	addColumn := "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)"
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_note` (`note`)"
+	shard := func(name, ddl string) *ternv1.ShardPlan {
+		return &ternv1.ShardPlan{Namespace: "commerce", Shard: name, Changes: []*ternv1.TableChange{{TableName: "orders", Ddl: ddl}}}
+	}
+	shards := []*ternv1.ShardPlan{
+		shard("-40", addColumn),
+		shard("40-80", addIndex),
+		shard("80-c0", addColumn),
+		shard("c0-", addIndex),
+		{Namespace: "commerce", Shard: "c0-", Changes: []*ternv1.TableChange{{TableName: "refunds", Ddl: addColumn}}},
+	}
+
+	assert.Equal(t, map[memberTableRef][]string{
+		{"commerce", "orders"}:  {addColumn, addIndex},
+		{"commerce", "refunds"}: {addColumn},
+	}, distinctShardDDL(shards))
+}
+
+// A sharded table is sized when any shard's statement grows with the table,
+// even if the namespace view carries a metadata-only one, and is left out
+// when every shard runs the same metadata-only statement.
+func TestMemberSizedTables_JudgesEveryShardsStatement(t *testing.T) {
+	addColumn := "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)"
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_note` (`note`)"
+	bytes := int64(120_000_000_000)
+	entry := func(shardDDL ...string) DeploymentRollupEntry {
+		var shards []*ternv1.ShardPlan
+		for _, d := range shardDDL {
+			shards = append(shards, &ternv1.ShardPlan{Namespace: "commerce", Changes: []*ternv1.TableChange{{TableName: "orders", Ddl: d}}})
+		}
+		return DeploymentRollupEntry{DatabaseType: "vitess", Deployment: "prod", Target: "commerce-001", ChangeSet: tern.ChangeSet{
+			Changes: []*ternv1.SchemaChange{{Namespace: "commerce", TableChanges: []*ternv1.TableChange{
+				{TableName: "orders", Namespace: "commerce", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Ddl: addColumn, EstimatedBytes: &bytes},
+			}}},
+			Shards: shards,
+		}}
+	}
+
+	sized := MemberSizedTables(entry(addColumn, addIndex))
+	require.Len(t, sized, 1)
+	assert.Equal(t, "commerce", sized[0].Namespace)
+	assert.Equal(t, "orders", sized[0].Change.GetTableName())
+	assert.Equal(t, &bytes, sized[0].Change.EstimatedBytes)
+
+	assert.Empty(t, MemberSizedTables(entry(addColumn, addColumn, addColumn)))
+}

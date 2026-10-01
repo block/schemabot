@@ -244,18 +244,12 @@ type SizedTableChange struct {
 // estimate, and tables the member creates are left out, having no data yet.
 // The namespace view carries the estimate, which for a sharded namespace is
 // summed across its shards, while every shard's DDL decides whether the
-// table's cost grows with its size. logAttrs identify the plan in logs.
+// table's cost grows with its size. The tables come from the namespace view
+// alone: a plan lists every table it changes there, sharded or not, and the
+// shard plans repeat those same tables per shard, so they add DDL to judge but
+// never a table of their own. logAttrs identify the plan in logs.
 func MemberSizedTables(e DeploymentRollupEntry, logAttrs ...any) []SizedTableChange {
-	shardDDL := make(map[memberTableRef][]string)
-	for _, sp := range e.ChangeSet.Shards {
-		for _, tc := range sp.GetChanges() {
-			if tc.GetDdl() == "" {
-				continue
-			}
-			ref := memberTableRef{sp.GetNamespace(), tc.GetTableName()}
-			shardDDL[ref] = append(shardDDL[ref], tc.GetDdl())
-		}
-	}
+	shardDDL := distinctShardDDL(e.ChangeSet.Shards)
 	var sized []SizedTableChange
 	listed := make(map[memberTableRef]bool)
 	for _, sc := range e.ChangeSet.Changes {
@@ -270,7 +264,10 @@ func MemberSizedTables(e DeploymentRollupEntry, logAttrs ...any) []SizedTableCha
 				slog.Debug("table is created by this rollout member's plan; it has no size to show", attrs...)
 				continue
 			}
-			ddls := append([]string{tc.GetDdl()}, shardDDL[ref]...)
+			ddls := shardDDL[ref]
+			if !slices.Contains(ddls, tc.GetDdl()) {
+				ddls = append([]string{tc.GetDdl()}, ddls...)
+			}
 			if !ddl.TableCostScalesWithSize(e.DatabaseType, ddls, attrs...) {
 				slog.Debug("table's changes on this rollout member are metadata-only; it gets no size", attrs...)
 				continue
@@ -280,6 +277,26 @@ func MemberSizedTables(e DeploymentRollupEntry, logAttrs ...any) []SizedTableCha
 		}
 	}
 	return sized
+}
+
+// distinctShardDDL gathers each table's DDL across a plan's shard plans, each
+// distinct statement once in the order the shards first carry it. Shards of
+// one namespace usually run the same statement, so a wide keyspace would
+// otherwise hand the cost check one copy per shard to parse.
+func distinctShardDDL(shards []*ternv1.ShardPlan) map[memberTableRef][]string {
+	byTable := make(map[memberTableRef][]string)
+	for _, sp := range shards {
+		for _, tc := range sp.GetChanges() {
+			if tc.GetDdl() == "" {
+				continue
+			}
+			ref := memberTableRef{sp.GetNamespace(), tc.GetTableName()}
+			if !slices.Contains(byTable[ref], tc.GetDdl()) {
+				byTable[ref] = append(byTable[ref], tc.GetDdl())
+			}
+		}
+	}
+	return byTable
 }
 
 // memberTableSizes lists one rollout member's size estimate for each table
