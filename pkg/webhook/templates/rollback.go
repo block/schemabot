@@ -38,7 +38,6 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data, budget)
-	writeTableSizesSection(&sb, data)
 
 	// Unsafe warning — rollback typically produces DROP operations
 	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")
