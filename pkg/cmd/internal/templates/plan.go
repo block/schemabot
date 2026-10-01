@@ -122,7 +122,11 @@ type NamespaceChange struct {
 // For Vitess, each keyspace gets a header, and a keyspace whose VSchema
 // changes shows that change whatever engine reported the plan.
 func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string, dialect schema.Dialect) {
-	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
+	names := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		names[i] = ns.Namespace
+	}
+	singleNamespace := OmitsNamespaceHeader(names, isMySQL, database)
 
 	// Sort a copy so callers aren't affected by reordering. This keeps output
 	// stable and groups similarly named namespaces together, but collapsing
@@ -191,6 +195,14 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 			}
 		}
 	}
+}
+
+// OmitsNamespaceHeader reports whether WriteNamespaceChanges writes the
+// changes of these namespaces without a header above each: a MySQL plan of
+// the one namespace named for its database. Every other plan opens on a
+// namespace header, which brings its own blank line above it.
+func OmitsNamespaceHeader(namespaces []string, isMySQL bool, database string) bool {
+	return len(namespaces) == 1 && isMySQL && namespaces[0] == database
 }
 
 // collapsible reports whether a namespace renders as its DDL alone, so it can
@@ -369,6 +381,16 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 // WritePlanSummaryWithKeyspaceUpdates writes a single plan summary line
 // including VSchema changes and the keyspaces whose only work is a finalize.
 func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
+	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
+		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
+		fmt.Println()
+	}
+}
+
+// planSummaryParts builds the clauses of the plan summary: the table and
+// index clauses, then VSchema changes and keyspaces whose only work is a
+// finalize.
+func planSummaryParts(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) []string {
 	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
@@ -384,11 +406,7 @@ func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges 
 		}
 		parts = append(parts, fmt.Sprintf("%d %s to finalize", finalizes, word))
 	}
-
-	if len(parts) > 0 {
-		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
-		fmt.Println()
-	}
+	return parts
 }
 
 // ddlSummaryParts builds the table and index clauses of the plan summary.

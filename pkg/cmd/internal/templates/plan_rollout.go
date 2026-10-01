@@ -2,17 +2,27 @@ package templates
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // memberNamesInlineLimit caps how many member names a group heading names
 // inline, as the PR comment does. A wider group leads with its coverage and
 // lists the names on their own lines below.
 const memberNamesInlineLimit = 8
+
+// memberNamesListLimit caps a wide group's folded name list, so a group of
+// hundreds of targets does not wall the terminal. The coverage phrase in the
+// heading carries the total.
+const memberNamesListLimit = 24
+
+// memberNamesLineWidth is where a folded name list wraps.
+const memberNamesLineWidth = 76
 
 // RolloutNoun is what a plan calls its rollout's members: targets when each
 // was planned against its own schema, deployments when they mirror the
@@ -40,6 +50,76 @@ func WriteRolloutAttention(noun presentation.Noun, attention []*apitypes.PlanMem
 		fmt.Printf("  • %s — %s\n", a.Member, a.Detail)
 	}
 	fmt.Println()
+}
+
+// WriteRolloutDivergence introduces a rollout whose members run more than one
+// plan, the way the PR comment does.
+func WriteRolloutDivergence(noun presentation.Noun) {
+	fmt.Printf("%s diverge — what applies where:\n\n", ui.CapitalizeFirst(noun.Plural))
+}
+
+// WriteRolloutGroupHeading names the members that run the plan below it. Few
+// members are named inline; a wide group leads with how much of the rollout
+// it covers — "all 64 targets", "40 of 64 targets" — and folds its names
+// onto wrapped lines below, capped so the heading stays one screen.
+//
+// One blank line separates the heading from what follows. A plan that opens
+// on a namespace header brings that line itself, so opensOnNamespaceHeader
+// leaves it to the header rather than stacking a second one above it.
+func WriteRolloutGroupHeading(noun presentation.Noun, members []string, total int, opensOnNamespaceHeader bool) {
+	if len(members) <= memberNamesInlineLimit {
+		label := noun.Plural
+		if len(members) == 1 {
+			label = noun.Singular
+		}
+		fmt.Printf("%s▸ %s %s%s\n", ANSIBold, label, strings.Join(members, ", "), ANSIReset)
+	} else {
+		fmt.Printf("%s▸ %s%s\n", ANSIBold, presentation.CoveragePhrase(noun, len(members), total), ANSIReset)
+		shown := members[:min(len(members), memberNamesListLimit)]
+		for _, line := range wrapNames(shown, len(members)-len(shown)) {
+			fmt.Printf("  %s%s%s\n", ANSIDim, line, ANSIReset)
+		}
+	}
+	if !opensOnNamespaceHeader {
+		fmt.Println()
+	}
+}
+
+// WriteRolloutGroupNoChanges says, under a group's heading, that its members
+// are already at the desired schema. Such a group renders beside groups with
+// work, so it carries no ✓: the rollout is not done, and the plan's one
+// summary closes the output after every group.
+func WriteRolloutGroupNoChanges() {
+	fmt.Println("  No schema changes detected")
+	fmt.Println()
+}
+
+// wrapNames joins names into lines no wider than memberNamesLineWidth,
+// closing with how many more were left out.
+func wrapNames(names []string, more int) []string {
+	items := append([]string(nil), names...)
+	if more > 0 {
+		items = append(items, fmt.Sprintf("and %d more", more))
+	}
+	var lines []string
+	var line strings.Builder
+	for i, item := range items {
+		if i < len(items)-1 {
+			item += ","
+		}
+		if line.Len() > 0 && line.Len()+1+len(item) > memberNamesLineWidth {
+			lines = append(lines, line.String())
+			line.Reset()
+		}
+		if line.Len() > 0 {
+			line.WriteString(" ")
+		}
+		line.WriteString(item)
+	}
+	if line.Len() > 0 {
+		lines = append(lines, line.String())
+	}
+	return lines
 }
 
 // WriteRolloutApplyRefused writes why an apply of a whole rollout was refused
