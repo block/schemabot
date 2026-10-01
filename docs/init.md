@@ -126,6 +126,8 @@ and progress. It uses that MySQL server's credentials.
 
 ### Configure the PlanetScale service token
 
+The wizard links to PlanetScale’s [service-token guide](https://planetscale.com/docs/api/service-tokens#service-tokens) alongside the required permissions.
+
 The service token lets SchemaBot manage branches and deploy requests through the PlanetScale
 API. It is separate from the username and password in your database connection string.
 
