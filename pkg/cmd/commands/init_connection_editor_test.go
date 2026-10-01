@@ -22,8 +22,8 @@ func TestInitAdaptivePasteOnlySavesAfterConfirmation(t *testing.T) {
 	cmd := InitCmd{Type: "mysql", Database: "shop", Runtime: "demo", Namespaces: []string{"shop"}, SchemaDir: filepath.Join(t.TempDir(), "schema")}
 	m := newInitWizard(&cmd, "demo", io.Discard)
 	require.Equal(t, stepDSN, m.step)
-	require.Contains(t, m.contentView(), "Paste a connection string")
-	wizardKey(m, tea.KeyEnter)
+	require.Contains(t, m.contentView(), "ctrl+p paste a connection string")
+	wizardKey(m, tea.KeyCtrlP)
 	require.Equal(t, textinput.EchoPassword, m.input.EchoMode)
 	secret := "mysql://demo:very-secret@localhost:3306/shop"
 	m.input.SetValue(secret)
@@ -65,8 +65,6 @@ func TestInitAdaptiveDetailsAndCancellation(t *testing.T) {
 			t.Setenv("HOME", home)
 			t.Setenv("DATABASE_URL", "")
 			m := newInitWizard(&InitCmd{Type: engine, Database: "shop"}, "default", io.Discard)
-			wizardKey(m, tea.KeyDown)
-			wizardKey(m, tea.KeyEnter)
 			for _, value := range []string{"localhost", "1234", "shop", "demo", "secret@:/"} {
 				m.input.SetValue(value)
 				wizardKey(m, tea.KeyEnter)
@@ -108,7 +106,7 @@ func TestInitConnectionFileAndPrivateStorage(t *testing.T) {
 func TestInitConnectionScreenStates(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop"}, "default", io.Discard)
-	wizardKey(m, tea.KeyEnter)
+	wizardKey(m, tea.KeyCtrlP)
 	m.input.SetValue("mysql://demo:secret@127.0.0.1:13361/shop")
 	wizardKey(m, tea.KeyEnter)
 	checking := stripANSI(m.View())
@@ -137,7 +135,7 @@ func TestInitConnectionScreenStates(t *testing.T) {
 func TestInitPasteBackToConnectionChoices(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop"}, "default", io.Discard)
-	wizardKey(m, tea.KeyEnter)
+	wizardKey(m, tea.KeyCtrlP)
 	require.Equal(t, "paste", m.connectionEditor.mode)
 	m.input.SetValue("mysql://demo:private-password@localhost/shop")
 	require.Contains(t, stripANSI(m.View()), "shift+tab back")
@@ -155,9 +153,7 @@ func TestInitPasteBackToConnectionChoices(t *testing.T) {
 func TestInitReferenceEntryCursorStartsAtEnd(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop"}, "default", io.Discard)
-	wizardKey(m, tea.KeyDown)
-	wizardKey(m, tea.KeyDown)
-	wizardKey(m, tea.KeyEnter)
+	wizardKey(m, tea.KeyCtrlE)
 	require.Equal(t, "reference", m.connectionEditor.mode)
 	require.Empty(t, m.input.Value())
 	require.Equal(t, "env:DATABASE_URL", m.input.Placeholder)
@@ -219,9 +215,11 @@ func TestInitDetailsPlanetScaleTLS(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DATABASE_URL", "")
 			m := newInitWizard(&InitCmd{Type: tc.engine, Database: "shop"}, "default", io.Discard)
-			wizardKey(m, tea.KeyDown)
-			wizardKey(m, tea.KeyEnter)
-			for _, value := range []string{tc.host, "3306", "shop", "demo", "secret@:/"} {
+			values := []string{tc.host, "3306", "shop", "demo", "secret@:/"}
+			if tc.engine == "vitess" {
+				values = []string{tc.host, "3306", "demo", "secret@:/"}
+			}
+			for _, value := range values {
 				m.input.SetValue(value)
 				wizardKey(m, tea.KeyEnter)
 			}
@@ -294,8 +292,6 @@ func TestInitConnectionDetailsSuggestions(t *testing.T) {
 			m := newInitWizard(&InitCmd{Type: engine, Database: "shop"}, "demo", io.Discard)
 			m.step = stepDSN
 			m.loadField()
-			wizardKey(m, tea.KeyDown)
-			wizardKey(m, tea.KeyEnter)
 			require.Empty(t, m.input.Value())
 			require.Equal(t, "localhost", m.input.Placeholder)
 			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("db.example.com")})
@@ -329,4 +325,34 @@ func TestInitWizardSuggestionsPreserveEdits(t *testing.T) {
 		require.Equal(t, "custom", m.input.Value())
 		require.Empty(t, m.input.Placeholder)
 	}
+}
+
+func TestInitAuthenticationFailureGuidance(t *testing.T) {
+	message := initConnectionFailure("we couldn’t connect: database error 1045")
+	require.Contains(t, message, "Authentication rejected")
+	require.Contains(t, message, "database username and password")
+	require.NotContains(t, message, "network")
+}
+
+func TestInitPlanetScaleDatabaseNameIsReused(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("SCHEMABOT_STORAGE_DSN", "")
+	m := newInitWizard(&InitCmd{Type: "vitess", Database: "shop"}, "demo", io.Discard)
+	m.input.SetValue("aws.connect.psdb.cloud")
+	wizardKey(m, tea.KeyEnter)
+	m.input.SetValue("3306")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, 3, m.connectionEditor.detail)
+	require.Equal(t, "shop", m.connectionEditor.values[2])
+	require.Contains(t, m.View(), "Username")
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, 1, m.connectionEditor.detail)
+	m.step = stepStorageDSN
+	m.loadField()
+	m.choosingStorage = false
+	m.connectionEditor.detail = 1
+	m.input.SetValue("3306")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, 2, m.connectionEditor.detail)
+	require.Contains(t, m.View(), "Database")
 }

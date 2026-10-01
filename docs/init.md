@@ -42,8 +42,9 @@ belongs to the deleted database. Use `make demo DEMO_DIR=/absolute/path/to/new-p
 
 ## Before you start
 
-Use MySQL, PostgreSQL, or Vitess with an existing application database. You can paste a connection string or enter host, port, database, username, and password
-inside the wizard. Passwords and pasted strings are hidden. The final review asks you to
+Use MySQL, PostgreSQL, or Vitess with an existing application database. The wizard starts with
+host, port, database, username, and password. On the Host screen, use **Ctrl+P** to paste a
+connection string or **Ctrl+E** to use an environment variable or file. Passwords and pasted strings are hidden. The final review asks you to
 confirm saving entered credentials in private, **unencrypted** files under
 `~/.schemabot/credentials`, outside the project. These files persist across terminal and
 laptop restarts; keep them private and include them in your credential-management practices.
@@ -73,7 +74,8 @@ wizard toggle: drain in-flight work, stop the runtime, transfer the complete sta
 update its connection configuration, and verify it before restarting. Keep the original state
 until the new connection is verified. Re-running `init` never replaces existing state storage.
 
-For Vitess, the application connection is your vtgate address, and the wizard also asks for the
+For Vitess, the connection-details form reuses the PlanetScale database name you already entered.
+The application connection is your vtgate address, and the wizard also asks for the
 PlanetScale organization and a [service token](#configure-the-planetscale-service-token).
 SchemaBot opens deploy requests with that token and reads keyspaces from the `main` branch.
 Its own state lives in a MySQL database outside Vitess. The storage choice appears immediately

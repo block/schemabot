@@ -23,7 +23,7 @@ func TestInitStorageChoices(t *testing.T) {
 			require.Contains(t, m.contentView(), "Separate server")
 			wizardKey(m, tea.KeyEnter)
 			require.False(t, m.choosingStorage)
-			require.Contains(t, m.contentView(), "Paste a connection string")
+			require.Contains(t, m.contentView(), "ctrl+p paste a connection string")
 			m.loadField()
 			wizardKey(m, tea.KeyUp)
 			wizardKey(m, tea.KeyEnter)
@@ -59,7 +59,7 @@ func TestInitVitessLocalStorageChoice(t *testing.T) {
 	wizardKey(m, tea.KeyDown)
 	require.False(t, m.localStorage)
 	wizardKey(m, tea.KeyEnter)
-	require.Contains(t, m.View(), "Paste a connection string")
+	require.Contains(t, m.View(), "ctrl+p paste a connection string")
 	m.localStorage = true
 	m.confirmed = true
 	require.NoError(t, m.copyToCommand(&cmd, &Globals{}))
