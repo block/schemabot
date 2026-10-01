@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -14,7 +13,6 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
-	schemapkg "github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -973,43 +971,6 @@ func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoP
 	return ""
 }
 
-// tableCostScalesWithSize reports whether any statement the plan runs against
-// a table has a cost that grows with the table: an index build, a table copy or
-// rebuild, or a full-table validation scan. It uses the real parser for the
-// database's dialect. A table's DDL can join several statements, and a sharded
-// namespace carries each shard's DDL, so every entry is split and each
-// statement inspected. Table sizes are display-only context, so DDL that cannot
-// be split or parsed logs a warning and contributes no size line rather than
-// failing the comment. logAttrs identify the plan and table in those warnings.
-func tableCostScalesWithSize(databaseType string, ddls []string, logAttrs ...any) bool {
-	parser, err := ddl.ParserForDialect(schemapkg.DialectForDatabaseType(databaseType))
-	if err != nil {
-		slog.Warn("no statement parser for dialect; plan comment omits the table-size line",
-			slices.Concat(logAttrs, []any{"database_type", databaseType, "error", err})...)
-		return false
-	}
-	for _, d := range ddls {
-		stmts, err := parser.Split(d)
-		if err != nil {
-			slog.Warn("failed to split plan DDL for table-size-scaling cost; its statements get no table-size line",
-				slices.Concat(logAttrs, []any{"database_type", databaseType, "error", err})...)
-			continue
-		}
-		for _, stmt := range stmts {
-			scales, err := parser.CostScalesWithTableSize(stmt)
-			if err != nil {
-				slog.Warn("failed to inspect plan statement for table-size-scaling cost; it gets no table-size line",
-					slices.Concat(logAttrs, []any{"database_type", databaseType, "error", err})...)
-				continue
-			}
-			if scales {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // planTableRef names a table within a plan namespace.
 type planTableRef struct{ namespace, table string }
 
@@ -1053,7 +1014,7 @@ func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaCha
 			continue
 		}
 		ddls := append([]string{t.DDL}, shardDDL[planTableRef{sc.Namespace, t.TableName}]...)
-		if !tableCostScalesWithSize(schema.Type, ddls, logAttrs...) {
+		if !ddl.TableCostScalesWithSize(schema.Type, ddls, logAttrs...) {
 			slog.Debug("table's changes are metadata-only; it gets no size line", logAttrs...)
 			continue
 		}

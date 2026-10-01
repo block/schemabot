@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -219,7 +220,7 @@ func largestFirst(order []string) []string {
 
 // Up to the inline limit every table is listed in the open, in plan order.
 func TestRenderPlanComment_TableSizesAtInlineLimitStayInPlanOrder(t *testing.T) {
-	order, bytes := rankedTables(tableSizesInlineLimit)
+	order, bytes := rankedTables(presentation.TableSizesInlineLimit)
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "📊 **Table sizes**:\n"+
@@ -259,7 +260,7 @@ func TestRenderPlanComment_TableSizesOverInlineLimitCollapseLargestFirst(t *test
 // A collapsed section lists every table up to the listed cap, with no line
 // counting tables left out.
 func TestRenderPlanComment_TableSizesAtListedCapListEveryTable(t *testing.T) {
-	order, bytes := rankedTables(tableSizesShown)
+	order, bytes := rankedTables(presentation.TableSizesShown)
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
@@ -275,7 +276,7 @@ func TestRenderPlanComment_TableSizesPastListedCapCountTheRest(t *testing.T) {
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
-		sizeLines(bytes, largestFirst(order)[:tableSizesShown])+
+		sizeLines(bytes, largestFirst(order)[:presentation.TableSizesShown])+
 		"- …and 36 more tables\n"+
 		"\n</details>\n\n", tableSizesSection(t, out))
 }
@@ -283,12 +284,27 @@ func TestRenderPlanComment_TableSizesPastListedCapCountTheRest(t *testing.T) {
 // One table past the listed cap is counted in the closing line, in the
 // singular.
 func TestRenderPlanComment_TableSizesOnePastListedCap(t *testing.T) {
-	order, bytes := rankedTables(tableSizesShown + 1)
+	order, bytes := rankedTables(presentation.TableSizesShown + 1)
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
-		sizeLines(bytes, largestFirst(order)[:tableSizesShown])+
+		sizeLines(bytes, largestFirst(order)[:presentation.TableSizesShown])+
 		"- …and 1 more table\n"+
+		"\n</details>\n\n", tableSizesSection(t, out))
+}
+
+// A table with no estimate ranks last, so past the listed cap it is among the
+// tables the closing line counts. The line says how many of them have no
+// estimate, so a table whose size probe failed is never read as one of the
+// smallest.
+func TestRenderPlanComment_TableSizesPastListedCapCountTablesWithoutEstimate(t *testing.T) {
+	order, bytes := rankedTables(presentation.TableSizesShown + 1)
+	order = append([]string{"ledger"}, order...)
+	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
+
+	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
+		sizeLines(bytes, largestFirst(order[1:])[:presentation.TableSizesShown])+
+		"- …and 2 more tables (1 without a size estimate)\n"+
 		"\n</details>\n\n", tableSizesSection(t, out))
 }
 
@@ -315,7 +331,9 @@ func TestCompareTableSizesLargestFirst(t *testing.T) {
 	}
 	for _, in := range inputs {
 		sorted := slices.Clone(in)
-		slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
+		slices.SortStableFunc(sorted, func(a, b tableSizeEntry) int {
+			return presentation.CompareBytesLargestFirst(a.rankBytes(), b.rankBytes())
+		})
 		got := make([]string, 0, len(sorted))
 		for _, e := range sorted {
 			got = append(got, e.name)
@@ -504,7 +522,7 @@ func TestRenderPlanComment_TableSizeNamesStayInCodeSpans(t *testing.T) {
 // in its summary, where GitHub reads HTML rather than markdown, so the
 // reviewed target's name is escaped and set in a <code> tag.
 func TestRenderPlanComment_CollapsedReviewedTargetSizesKeepScope(t *testing.T) {
-	order, bytes := rankedTables(tableSizesInlineLimit + 1)
+	order, bytes := rankedTables(presentation.TableSizesInlineLimit + 1)
 	data := tableSizePlanData(sizedTables(bytes, order))
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()}
 	out := RenderPlanComment(data)

@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
@@ -82,7 +84,7 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 	if err != nil {
 		return nil, err
 	}
-	rollout := planRolloutResponse(rollup)
+	rollout := planRolloutResponse(rollup, "database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
 	if len(rollout.Attention) == 0 {
 		refused, err := s.rolloutApplyRefusals(ctx, req.Environment, primaryPlan.GetPlanId(), targets)
 		if err != nil {
@@ -164,7 +166,11 @@ func unplannedMemberApplyOutcome(planning MemberPlanning) string {
 // change runs under and its reason (see planGroupKey). A member that errored has no
 // fingerprint and no plan, and a mirrored member that diverged would still run
 // the primary's plan, so neither joins a group: each is listed for attention.
-func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
+//
+// Each grouped member's table sizes are read from its own plan, not from its
+// group's, since a group's changes are its first member's. logAttrs identify
+// the plan in logs.
+func planRolloutResponse(rollup PlanRollup, logAttrs ...any) *apitypes.PlanRolloutResponse {
 	members := make([]routing.ExecutionTarget, len(rollup.Entries))
 	for i, e := range rollup.Entries {
 		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
@@ -200,6 +206,7 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 			resp.Groups = append(resp.Groups, group)
 		}
 		group.Members = append(group.Members, names[i])
+		resp.TableSizes = append(resp.TableSizes, memberTableSizes(names[i], e, logAttrs...)...)
 	}
 	// The primary is the first member, so its group is already first unless
 	// the primary itself needs attention. Ordering is stated as a property of
@@ -215,6 +222,96 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 		}
 	})
 	return resp
+}
+
+// memberTableRef names a table within one member's plan namespace.
+type memberTableRef struct{ namespace, table string }
+
+// SizedTableChange is an existing table a rollout member's plan copies,
+// rebuilds, or scans, with the namespace-view change that carries its size
+// estimate.
+type SizedTableChange struct {
+	Namespace string
+	Change    *ternv1.TableChange
+}
+
+// MemberSizedTables lists each existing table one rollout member's own plan
+// copies, rebuilds, or scans, in plan order. It is the one rule both the CLI's
+// rollout plan and the PR comment's size section show sizes by, so the two
+// list the same tables. Sizes are read from the member's own plan, since each
+// member applies to its own data. A table is listed once however many
+// statements change it, since each statement carries the whole table's
+// estimate, and tables the member creates are left out, having no data yet.
+// The namespace view carries the estimate, which for a sharded namespace is
+// summed across its shards, while every shard's DDL decides whether the
+// table's cost grows with its size. The tables come from the namespace view
+// alone: a plan lists every table it changes there, sharded or not, and the
+// shard plans repeat those same tables per shard, so they add DDL to judge but
+// never a table of their own. logAttrs identify the plan in logs.
+func MemberSizedTables(e DeploymentRollupEntry, logAttrs ...any) []SizedTableChange {
+	shardDDL := distinctShardDDL(e.ChangeSet.Shards)
+	var sized []SizedTableChange
+	listed := make(map[memberTableRef]bool)
+	for _, sc := range e.ChangeSet.Changes {
+		for _, tc := range sc.GetTableChanges() {
+			ref := memberTableRef{sc.GetNamespace(), tc.GetTableName()}
+			attrs := slices.Concat(logAttrs, []any{"deployment", e.Deployment, "target", e.Target, "namespace", ref.namespace, "table", ref.table})
+			if listed[ref] {
+				slog.Debug("table already has a size on this rollout member; skipping its further statements", attrs...)
+				continue
+			}
+			if tc.GetChangeType() == ternv1.ChangeType_CHANGE_TYPE_CREATE {
+				slog.Debug("table is created by this rollout member's plan; it has no size to show", attrs...)
+				continue
+			}
+			ddls := shardDDL[ref]
+			if !slices.Contains(ddls, tc.GetDdl()) {
+				ddls = append([]string{tc.GetDdl()}, ddls...)
+			}
+			if !ddl.TableCostScalesWithSize(e.DatabaseType, ddls, attrs...) {
+				slog.Debug("table's changes on this rollout member are metadata-only; it gets no size", attrs...)
+				continue
+			}
+			listed[ref] = true
+			sized = append(sized, SizedTableChange{Namespace: ref.namespace, Change: tc})
+		}
+	}
+	return sized
+}
+
+// distinctShardDDL gathers each table's DDL across a plan's shard plans, each
+// distinct statement once in the order the shards first carry it. Shards of
+// one namespace usually run the same statement, so a wide keyspace would
+// otherwise hand the cost check one copy per shard to parse.
+func distinctShardDDL(shards []*ternv1.ShardPlan) map[memberTableRef][]string {
+	byTable := make(map[memberTableRef][]string)
+	for _, sp := range shards {
+		for _, tc := range sp.GetChanges() {
+			if tc.GetDdl() == "" {
+				continue
+			}
+			ref := memberTableRef{sp.GetNamespace(), tc.GetTableName()}
+			if !slices.Contains(byTable[ref], tc.GetDdl()) {
+				byTable[ref] = append(byTable[ref], tc.GetDdl())
+			}
+		}
+	}
+	return byTable
+}
+
+// memberTableSizes lists one rollout member's size estimate for each table
+// MemberSizedTables names for it. logAttrs identify the plan in logs.
+func memberTableSizes(member string, e DeploymentRollupEntry, logAttrs ...any) []*apitypes.PlanMemberTableSizeResponse {
+	var sizes []*apitypes.PlanMemberTableSizeResponse
+	for _, st := range MemberSizedTables(e, logAttrs...) {
+		sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{
+			Member:         member,
+			Namespace:      st.Namespace,
+			Table:          st.Change.GetTableName(),
+			EstimatedBytes: st.Change.EstimatedBytes,
+		})
+	}
+	return sizes
 }
 
 // planGroupKey is what two members share when one group describes both: the
