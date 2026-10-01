@@ -232,6 +232,11 @@ type PlanCommentData struct {
 	// place. Empty when the apply can run them, or when the comment renders the
 	// reviewed plan alone.
 	MemberApplyRefusal string
+
+	// namespaceLabelsInline renders each keyspace's label as a bold line
+	// rather than a heading, for changes rendered under a target group's
+	// heading so the label never outranks the heading it sits under.
+	namespaceLabelsInline bool
 }
 
 // ExemptTablesData describes live tables exempt from a plan verdict.
@@ -1220,11 +1225,11 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			if schemaNamespaces {
 				label = "Schema Name"
 			}
-			fmt.Fprintf(sb, "#### %s: %s\n", label, inlineCode(ks.Keyspace))
+			writeNamespaceLabel(sb, data, label, inlineCode(ks.Keyspace))
 		}
 
 		if hasVSchemaChanges {
-			sb.WriteString("#### VSchema\n")
+			writeNamespaceLabel(sb, data, "VSchema", "")
 			if ks.VSchemaDiff != "" {
 				writeVSchemaDiffFence(sb, ks.VSchemaDiff, diffBudget)
 			} else {
@@ -1714,6 +1719,49 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 	writeGroupHeading(sb, shardNoun, shards, totalShards)
 }
 
+// writeNamespaceLabel labels one keyspace's changes, or its VSchema diff: a
+// heading in a plan of its own, a bold line under a target group's heading.
+// value is the keyspace the label names, empty for a bare label.
+func writeNamespaceLabel(sb *strings.Builder, data PlanCommentData, label, value string) {
+	switch {
+	case data.namespaceLabelsInline && value != "":
+		fmt.Fprintf(sb, "**%s**: %s\n\n", label, value)
+	case data.namespaceLabelsInline:
+		fmt.Fprintf(sb, "**%s**\n\n", label)
+	case value != "":
+		fmt.Fprintf(sb, "#### %s: %s\n", label, value)
+	default:
+		fmt.Fprintf(sb, "#### %s\n", label)
+	}
+}
+
+// targetsDivergeIntro introduces a rollout whose targets run different
+// changes, ahead of one heading per group of targets that run the same.
+const targetsDivergeIntro = "**Targets diverge**: what applies where.\n\n"
+
+// writeTargetGroupHeading heads the targets of a rollout that run one plan. A
+// lone target is the heading; a group is headed by how many targets it holds,
+// and how many the rollout has when it holds only some, with the names on
+// their own line under it, collapsed when too many to read inline. The names
+// stay whole, as an operator addresses each target.
+func writeTargetGroupHeading(sb *strings.Builder, members []string, total int) {
+	if len(members) == 1 {
+		fmt.Fprintf(sb, "#### %s\n\n", inlineCode(members[0]))
+		return
+	}
+	count := presentation.CoveragePhrase(targetNoun, len(members), total)
+	if len(members) == total {
+		count = fmt.Sprintf("%d %s", total, targetNoun.Plural)
+	}
+	fmt.Fprintf(sb, "#### %s\n\n", count)
+	names := strings.Join(inlineCodeList(members), ", ")
+	if len(members) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "%s\n\n", names)
+		return
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>Target names</summary>\n\n%s\n\n</details>\n\n", names)
+}
+
 func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []string, total int) {
 	if len(members) <= shardNamesInlineLimit {
 		fmt.Fprintf(sb, "**%s**\n\n", planGroupList(noun, members, total))
@@ -1946,7 +1994,7 @@ func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget, collapse bool) {
 	drift := data.DeploymentDrift
 	if len(drift.Plans) > 1 {
-		sb.WriteString("Targets diverge — what applies where:\n\n")
+		sb.WriteString(targetsDivergeIntro)
 	}
 	// Targets with work lead, as changing shards do: they are what the apply
 	// will run, and the targets already at the schema follow them.
@@ -1955,12 +2003,13 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		return compareWorkFirst(a.Empty(), b.Empty())
 	})
 	for _, g := range plans {
-		writeGroupHeading(sb, targetNoun, g.Members, len(drift.Deployments))
+		writeTargetGroupHeading(sb, g.Members, len(drift.Deployments))
 		if g.Empty() {
 			sb.WriteString(groupNoChanges + "\n\n")
 			continue
 		}
 		group := data
+		group.namespaceLabelsInline = true
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)

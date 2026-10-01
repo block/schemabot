@@ -89,9 +89,9 @@ func TestReviewDriftComment_IndependentCleanDoesNotClaimAgreement(t *testing.T) 
 		assert.Equal(t, api.DeploymentPlanned, e.Class, "target %q", e.Target)
 	}
 
-	assert.Contains(t, out, "Targets diverge — what applies where:")
+	assert.Contains(t, out, "**Targets diverge**: what applies where.")
 	for _, target := range []string{"orders-001", "orders-002", "orders-003"} {
-		assert.Contains(t, out, "**target `commerce/"+target+"`**\n\n```sql\n",
+		assert.Contains(t, out, "#### `commerce/"+target+"`\n\n```sql\n",
 			"each target's plan renders under it alone, not as one shared plan")
 	}
 	assert.NotContains(t, out, "Same plan on all",
@@ -123,7 +123,7 @@ func TestReviewDriftComment_IndependentSurfacesBlockedMember(t *testing.T) {
 	// Both members are addressed by one deployment, so the deployment name alone
 	// would leave the reviewer unable to tell which target holds the refused
 	// change.
-	assert.Contains(t, out, "**target `commerce/orders-002`**\n\n```sql\nALTER TABLE `orders` DROP COLUMN `legacy`;\n```\n\n"+glyph.Refused+" **Cannot apply**: 1 change the engine refuses to execute\n- `orders`\n",
+	assert.Contains(t, out, "#### `commerce/orders-002`\n\n```sql\nALTER TABLE `orders` DROP COLUMN `legacy`;\n```\n\n"+glyph.Refused+" **Cannot apply**: 1 change the engine refuses to execute\n- `orders`\n",
 		"the refused change is disclosed under the target and DDL that carry it")
 	assert.Equal(t, 1, strings.Count(out, "**Cannot apply**"), "the target that refuses nothing carries no disclosure")
 	assert.NotContains(t, out, "planned against its own schema", "every target is already named under the plan it runs")
@@ -142,7 +142,7 @@ func TestReviewDriftComment_BlockedChangeNamesOnlyTheTargetsThatRefuseIt(t *test
 
 	rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
 	require.True(t, rollup.Clean)
-	assert.Contains(t, out, "**targets `commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`**\n\n```sql\n", "one DDL, one group")
+	assert.Contains(t, out, "`commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`\n\n```sql\n", "one DDL, one group")
 	assert.Contains(t, out, "- `orders` on target `commerce/orders-002`\n", "only the refusing target is named")
 
 	// When every target in the group refuses the change, the heading already
@@ -217,7 +217,7 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 		PlanID:          "plan_reviewed",
 		DeploymentDrift: deploymentDriftPreview(rollup),
 	})
-	primary, rest, found := strings.Cut(body, "**targets `commerce/orders-002`, `commerce/orders-003`**")
+	primary, rest, found := strings.Cut(body, "`commerce/orders-002`, `commerce/orders-003`")
 	require.True(t, found, "the second group renders under its own heading")
 	assert.True(t, strings.Contains(primary, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_reviewed`."),
 		"the primary's cut DDL names the reviewed plan")
@@ -247,7 +247,7 @@ func TestReviewDriftComment_IndependentDisclosesDirectMember(t *testing.T) {
 
 			rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
 			require.True(t, rollup.Clean)
-			assert.Contains(t, out, "**target `commerce/orders-002`**\n\n```sql\nALTER TABLE `orders` ADD COLUMN `phone` varchar(32);\n```\n\n⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit\n- `orders`: table is 12 MiB, within the direct execution bound\n",
+			assert.Contains(t, out, "#### `commerce/orders-002`\n\n```sql\nALTER TABLE `orders` ADD COLUMN `phone` varchar(32);\n```\n\n⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit\n- `orders`: table is 12 MiB, within the direct execution bound\n",
 				"the direct change is disclosed under the target and DDL that carry it")
 			assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the target that runs nothing directly carries no disclosure")
 		})

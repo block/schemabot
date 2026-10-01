@@ -40,12 +40,12 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	// targets and the silent ones are counted once, for the deployment.
 	lineSilent := silent
 	if len(work) > 1 {
-		sb.WriteString("Targets diverge — what applies where:\n\n")
+		sb.WriteString(targetsDivergeIntro)
 		lineSilent = 0
 	}
 	for _, w := range work {
 		if len(work) > 1 {
-			writeGroupHeading(sb, targetNoun, targetNames(data.Model, w.members), len(g.Members))
+			writeTargetGroupHeading(sb, targetNames(data.Model, w.members), len(g.Members))
 		}
 		first := memberDetail(data.Details, w.members[0])
 		dialect := dialectForEngine(first.Engine, data.ApplyID)

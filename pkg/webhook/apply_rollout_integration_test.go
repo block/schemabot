@@ -153,7 +153,7 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesAfterConfirmation(t *testing
 	assert.Contains(t, body, "The reviewed target already has this schema")
 	assert.Contains(t, body, "ADD COLUMN `email`", "the comment shows the plan us would run")
 	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
-	assert.Contains(t, body, "**target `eu`**\n\nNo schema changes detected\n\n", "eu is shown already at the desired schema")
+	assert.Contains(t, body, "#### `eu`\n\nNo schema changes detected\n\n", "eu is shown already at the desired schema")
 	assert.NotContains(t, body, "✅ **No schema changes detected**", "a target still has work, so the comment never closes as a no-op")
 
 	requireNoApplies(t, svc, dbName)
@@ -221,7 +221,7 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 	})
 	require.NotContains(t, body, "Failed to execute apply")
 	assert.Contains(t, body, "Each target runs its own plan")
-	assert.Contains(t, body, "**targets `eu`, `us`**", "the comment names every target the plan runs on")
+	assert.Contains(t, body, "`eu`, `us`", "the comment names every target the plan runs on")
 	assert.Contains(t, body, "ADD COLUMN `email`")
 	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
 	requireNoApplies(t, svc, dbName)
@@ -299,7 +299,7 @@ func TestE2EApplyConfirmRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied") || strings.Contains(body, "Failed to execute apply")
 	})
 	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
-	assert.Contains(t, body, "**targets `eu`, `us`**")
+	assert.Contains(t, body, "`eu`, `us`")
 	assert.Contains(t, body, "**Direct execution**", "the comment discloses the direct change under the targets that run it")
 	requireNoApplies(t, svc, dbName)
 
@@ -395,9 +395,9 @@ func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
 		action: "opened", headSHA: "abc123", headRef: "feature-branch",
 	}, nil))
 
-	body := awaitCommentContaining(t, result, "Targets diverge — what applies where:")
-	assert.Contains(t, body, "**target `eu`**\n\nNo schema changes detected\n\n")
-	assert.Contains(t, body, "**target `us`**\n\n```sql\n")
+	body := awaitCommentContaining(t, result, "**Targets diverge**: what applies where.")
+	assert.Contains(t, body, "#### `eu`\n\nNo schema changes detected\n\n")
+	assert.Contains(t, body, "#### `us`\n\n```sql\n")
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }
 

@@ -368,7 +368,7 @@ func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) 
 
 	out := RenderMultiEnvPlanComment(data)
 	assert.NotContains(t, out, "**No schema changes detected** for any environment.")
-	assert.Contains(t, out, "**target `primary/testapp_2`**")
+	assert.Contains(t, out, "#### `primary/testapp_2`")
 	assert.Contains(t, out, "ADD COLUMN `email`")
 	// Staging is genuinely converged, so its own section keeps the green line.
 	// Production still has work, so it carries no ✅ at all: the target already
@@ -376,7 +376,7 @@ func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) 
 	staging, production, found := strings.Cut(out, "Production")
 	require.True(t, found, out)
 	assert.Contains(t, staging, "✅ **No schema changes detected**")
-	assert.Contains(t, production, "**target `primary/testapp_1`**\n\nNo schema changes detected\n\n")
+	assert.Contains(t, production, "#### `primary/testapp_1`\n\nNo schema changes detected\n\n")
 	assert.NotContains(t, production, "✅")
 	assert.Contains(t, production, "📋 **Plan**: ")
 
@@ -448,7 +448,7 @@ func TestRenderPlanComment_OneTargetPlanNamesEveryTarget(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "\n**targets `primary/testapp-001`, `primary/testapp-002`, `eu-west`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "\n`primary/testapp-001`, `primary/testapp-002`, `eu-west`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.NotContains(t, out, "Targets diverge", "one plan is not divergence")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 }
@@ -482,21 +482,29 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 
 	t.Run("some targets are already there", func(t *testing.T) {
 		out := render(group(1, "a", "c"), group(0, "b"))
-		assert.Contains(t, out, "Targets diverge — what applies where:\n\n**targets `a`, `c`**\n\n```sql\n")
-		assert.Contains(t, out, "**target `b`**\n\nNo schema changes detected\n\n")
+		assert.Contains(t, out, "**Targets diverge**: what applies where.\n\n#### 2 of 3 targets\n\n`a`, `c`\n\n```sql\n")
+		assert.Contains(t, out, "#### `b`\n\nNo schema changes detected\n\n")
 		assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	})
 	t.Run("targets need different changes", func(t *testing.T) {
 		out := render(group(1, "a"), group(2, "b", "c"))
-		assert.Contains(t, out, "Targets diverge — what applies where:\n\n**target `a`**\n\n```sql\n")
-		assert.Contains(t, out, "**targets `b`, `c`**\n\n```sql\n")
+		assert.Contains(t, out, "**Targets diverge**: what applies where.\n\n#### `a`\n\n```sql\n")
+		assert.Contains(t, out, "`b`, `c`\n\n```sql\n")
 		assert.NotContains(t, out, "_Already applied")
 		assert.Equal(t, 1, strings.Count(out, "📋 **Plan**: "), "the plans are summarized once, together")
 	})
 	t.Run("a wide group collapses its names", func(t *testing.T) {
 		out := render(group(1, "a", "b", "c", "d", "e", "f", "g", "h", "i"), group(0, "j"))
-		assert.Contains(t, out, "<details>\n<summary><b>9 of 10 targets</b></summary>\n\n`a`, `b`, `c`, `d`, `e`, `f`, `g`, `h`, `i`\n\n</details>")
-		assert.Contains(t, out, "**target `j`**\n\nNo schema changes detected\n\n")
+		assert.Contains(t, out, "#### 9 of 10 targets\n\n<details>\n<summary>Target names</summary>\n\n`a`, `b`, `c`, `d`, `e`, `f`, `g`, `h`, `i`\n\n</details>")
+		assert.Contains(t, out, "#### `j`\n\nNo schema changes detected\n\n")
+	})
+	t.Run("a schema name sits under its targets' heading", func(t *testing.T) {
+		changes := planGroupChanges(1)
+		changes[0].Keyspace = "testapp_staging"
+		out := render(DeploymentPlanGroup{Members: []string{"a", "c"}, Changes: changes}, group(0, "b"))
+		assert.Contains(t, out, "#### 2 of 3 targets\n\n`a`, `c`\n\n**Schema Name**: `testapp_staging`\n\n```sql\nALTER TABLE `t0`",
+			"the schema is labelled inside the group, not as a heading that outranks it")
+		assert.NotContains(t, out, "#### Schema Name")
 	})
 }
 
@@ -526,7 +534,7 @@ func TestRenderPlanComment_VSchemaOnlyPlanIsNotAlreadyApplied(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.NotContains(t, out, "✅", "a rollout with work left is not all clear")
-	assert.Contains(t, out, "**target `primary/testapp_2`**\n\nNo schema changes detected\n\n")
+	assert.Contains(t, out, "#### `primary/testapp_2`\n\nNo schema changes detected\n\n")
 	assert.Contains(t, out, "📋 **Plan**: **1** vschema update")
 }
 
@@ -591,10 +599,10 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.NotContains(t, out, "✅", "a rollout with work left is not all clear")
-	assert.Contains(t, out, "**target `primary/testapp_1`**\n\nNo schema changes detected\n\n")
-	assert.Less(t, strings.Index(out, "**targets `primary/testapp_2`, `primary/testapp_3`**"), strings.Index(out, "**target `primary/testapp_1`**"),
+	assert.Contains(t, out, "#### `primary/testapp_1`\n\nNo schema changes detected\n\n")
+	assert.Less(t, strings.Index(out, "`primary/testapp_2`, `primary/testapp_3`"), strings.Index(out, "#### `primary/testapp_1`"),
 		"the targets with work read first")
-	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e production\n```\n",
 		"the other targets converge through the apply, which runs each target's own plan")
@@ -614,7 +622,7 @@ func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "⚠️ **The reviewed target already has this schema**\n\nNothing has run.")
 	assert.Contains(t, out, "**Confirmation required** — review the plan above, then confirm manually:\n```\nschemabot apply-confirm -e production\n```\n")
 	assert.NotContains(t, out, "**Applying automatically**")
@@ -646,7 +654,7 @@ func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t 
 	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 		"the other targets' plans are still shown")
 	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but target primary/testapp\\_2: its plan carries an unsafe change for table \"users\".")
 	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
@@ -876,20 +884,20 @@ func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 
 	positions := map[string]int{}
 	for _, want := range []string{
-		"Targets diverge — what applies where:",
-		"**targets `primary/testapp_1`, `primary/testapp_2`**",
+		"**Targets diverge**: what applies where.",
+		"`primary/testapp_1`, `primary/testapp_2`",
 		"ADD COLUMN `email`",
-		"**target `primary/testapp_4`**",
+		"#### `primary/testapp_4`",
 		"ADD INDEX `idx_email`",
-		"**target `primary/testapp_3`**\n\nNo schema changes detected\n\n",
+		"#### `primary/testapp_3`\n\nNo schema changes detected\n\n",
 		"📋 **Plan**: **1** table to alter",
 	} {
 		positions[want] = strings.Index(out, want)
 		require.GreaterOrEqual(t, positions[want], 0, "%q missing from:\n%s", want, out)
 	}
-	assert.Less(t, positions["**targets `primary/testapp_1`, `primary/testapp_2`**"], positions["ADD COLUMN `email`"])
-	assert.Less(t, positions["ADD COLUMN `email`"], positions["**target `primary/testapp_4`**"], "each plan's DDL sits under its own targets")
-	assert.Less(t, positions["**target `primary/testapp_4`**"], positions["ADD INDEX `idx_email`"])
+	assert.Less(t, positions["`primary/testapp_1`, `primary/testapp_2`"], positions["ADD COLUMN `email`"])
+	assert.Less(t, positions["ADD COLUMN `email`"], positions["#### `primary/testapp_4`"], "each plan's DDL sits under its own targets")
+	assert.Less(t, positions["#### `primary/testapp_4`"], positions["ADD INDEX `idx_email`"])
 	assert.Less(t, positions["ADD INDEX `idx_email`"], positions["📋 **Plan**: **1** table to alter"])
 
 	assert.NotContains(t, out, "stand_in", "the reviewed target's group renders the reviewed plan")
@@ -913,13 +921,13 @@ func TestRenderMultiEnvPlanComment_EachTargetPlanRendersUnderItsTargets(t *testi
 
 	_, production, found := strings.Cut(out, "Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "Targets diverge — what applies where:\n\n**targets `primary/testapp_1`, `primary/testapp_2`**")
-	otherHeader := strings.Index(production, "**target `primary/testapp_4`**")
+	assert.Contains(t, production, "**Targets diverge**: what applies where.\n\n#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`")
+	otherHeader := strings.Index(production, "#### `primary/testapp_4`")
 	details := strings.Index(production, "<details>\n<summary>Show SQL (2 statements)</summary>")
 	assert.GreaterOrEqual(t, otherHeader, 0)
 	assert.Greater(t, details, otherHeader, "the two-statement plan folds under its own targets")
 	assert.Less(t, details, strings.Index(production, "ADD INDEX `idx_email`"))
-	assert.Contains(t, production, "**target `primary/testapp_3`**\n\nNo schema changes detected\n\n")
+	assert.Contains(t, production, "#### `primary/testapp_3`\n\nNo schema changes detected\n\n")
 	assert.Equal(t, 1, strings.Count(production, "📋 **Plan**: "), "the plans are summarized once, together")
 }
 
@@ -1057,7 +1065,7 @@ func TestRenderPlanComment_BlockedChangeIsDisclosedOnce(t *testing.T) {
 
 	carried := render(blocked)
 	assert.Equal(t, 1, strings.Count(carried, "**Cannot apply**"))
-	assert.Less(t, strings.Index(carried, "**Cannot apply**"), strings.Index(carried, "**target `primary/testapp_2`**"),
+	assert.Less(t, strings.Index(carried, "**Cannot apply**"), strings.Index(carried, "#### `primary/testapp_2`"),
 		"the refused change is disclosed under its own target's DDL")
 
 	uncarried := render(nil)

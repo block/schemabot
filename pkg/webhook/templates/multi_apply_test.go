@@ -713,8 +713,8 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 		nil,
 	)
 
-	assert.Contains(t, out, "Targets diverge — what applies where:\n\n**targets `testapp-001`, `testapp-003`**\n\n**`orders`**: ")
-	assert.Contains(t, out, "**target `testapp-002`**\n\n**`orders`**: ")
+	assert.Contains(t, out, "**Targets diverge**: what applies where.\n\n#### 2 of 4 targets\n\n`testapp-001`, `testapp-003`\n\n**`orders`**: ")
+	assert.Contains(t, out, "#### `testapp-002`\n\n**`orders`**: ")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `note`"))
 	assert.Equal(t, 1, strings.Count(out, "ADD INDEX `idx_note`"))
 	assert.NotContains(t, out, "testapp-004`**", "a target without detail is not a change of its own")
@@ -956,7 +956,7 @@ func TestRenderMultiDeploymentApplyComment_DivergedTargetsCountSilentTargetsOnce
 		nil,
 	)
 
-	assert.Contains(t, out, "Targets diverge — what applies where:")
+	assert.Contains(t, out, "**Targets diverge**: what applies where.")
 	assert.Contains(t, out, "- Rows: 1,000 / 2,000 · ETA: "+ui.FormatETA(600)+"\n")
 	assert.Contains(t, out, "- Rows: 300 / 1,000 · ETA: "+ui.FormatETA(300)+"\n")
 	assert.NotContains(t, out, "across")
