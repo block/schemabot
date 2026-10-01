@@ -49,7 +49,7 @@ func (e *failingProgressEngine) Progress(context.Context, *engine.ProgressReques
 }
 
 // verdictRefusingTaskStore keeps task rows by value, the way a real store does,
-// and refuses the first refusals writes that record a failure verdict — failed
+// and refuses the first `refusals` writes that record a failure verdict — failed
 // or failed_retryable — with err, accepting every other write.
 type verdictRefusingTaskStore struct {
 	storage.TaskStore
