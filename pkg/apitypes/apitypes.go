@@ -891,6 +891,30 @@ const (
 	PlanMemberUnplanned = "unplanned"
 )
 
+// UnmarshalJSON refuses a rollout block that lists a null group, attention
+// entry or refusal. Each list is read as the members an apply runs on, needs
+// attention for, or refuses, so a null entry is a malformed response rather
+// than an empty one, and decoding it fails instead of handing a reader an
+// entry it would have to guess the meaning of.
+func (r *PlanRolloutResponse) UnmarshalJSON(data []byte) error {
+	type plain PlanRolloutResponse
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("decode rollout block: %w", err)
+	}
+	if i := slices.Index(decoded.Groups, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: group %d is null", i)
+	}
+	if i := slices.Index(decoded.Attention, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: attention entry %d is null", i)
+	}
+	if i := slices.Index(decoded.Refused, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: refusal %d is null", i)
+	}
+	*r = PlanRolloutResponse(decoded)
+	return nil
+}
+
 // WholeRollout returns the plan of every rollout member the response
 // describes, or nil when it describes one member: an environment with a single
 // member, or a plan narrowed to one member. A narrowed plan says nothing about

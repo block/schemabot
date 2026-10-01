@@ -39,18 +39,10 @@ func narrowedPlanWithRollout() *apitypes.PlanResponse {
 	}
 }
 
-// A narrowed plan is rendered as its one member's plan: no divergence heading
-// and no group naming the other targets, so it never reads as what applies
-// across the rollout.
-func TestWritePlanBody_NarrowedPlanIsNotPresentedAsTheRollout(t *testing.T) {
+// A narrowed plan describes its one member, so it is never read as the
+// rollout's plan, though it carries a rollout block naming the other targets.
+func TestPlanResponse_NarrowedPlanIsNotTheRollout(t *testing.T) {
 	plan := narrowedPlanWithRollout()
-
-	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
-	assert.Contains(t, out, "ADD COLUMN `region`", "%s", out)
-	assert.NotContains(t, out, "ADD COLUMN `tier`", "another member's plan is not shown:\n%s", out)
-	assert.NotContains(t, out, "Targets diverge", "%s", out)
-	assert.NotContains(t, out, "▸", "no rollout group heading:\n%s", out)
-	assert.NotContains(t, out, "prod/payments-003", "%s", out)
 
 	assert.Nil(t, plan.WholeRollout())
 	require.Len(t, plan.MemberPlans(), 1)

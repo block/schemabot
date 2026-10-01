@@ -158,9 +158,11 @@ func TestApplyCmd_RefusesWhileARolloutMemberNeedsAttention(t *testing.T) {
 	assert.NotContains(t, *paths, "/api/apply", "no apply is requested while a member has no plan")
 }
 
-// A primary already at the desired schema does not make the rollout a no-op:
-// the apply proceeds when another member still has work.
-func TestApplyCmd_ProceedsWhenOnlyAnotherMemberHasWork(t *testing.T) {
+// payments-001, the rollout primary, is already at the desired schema, and
+// payments-002 and 003 still need a column. This CLI shows only the primary's
+// plan before it asks for consent, so it refuses rather than prompt for work
+// on targets whose plan it never showed, and nothing is applied.
+func TestApplyCmd_RefusesARolloutWhosePlansItCannotShow(t *testing.T) {
 	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
 		PlanID: "plan-orders-1",
 		Engine: "mysql",
@@ -174,11 +176,15 @@ func TestApplyCmd_ProceedsWhenOnlyAnotherMemberHasWork(t *testing.T) {
 		},
 	})
 
-	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true, AutoApprove: true}
-	out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
 
-	assert.NotContains(t, out, "No changes. Your schema is up-to-date.", "%s", out)
-	assert.Contains(t, *paths, "/api/apply", "the apply is requested for the members with work:\n%s", out)
+	require.Error(t, runErr)
+	assert.NotContains(t, out, "No changes. Your schema is up-to-date.", "a converged primary does not make the rollout a no-op:\n%s", out)
+	assert.Contains(t, runErr.Error(), "the 3 targets of this rollout run 2 different plans, and only the first one's plan can be shown before consent; apply each target on its own with --target")
+	assert.NotContains(t, out, "Do you want to apply these changes?", "no consent is asked for plans that were not shown:\n%s", out)
+	assert.NotContains(t, *paths, "/api/apply")
 }
 
 // A rollout whose primary is already at the desired schema is applied from the
