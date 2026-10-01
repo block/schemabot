@@ -935,10 +935,11 @@ const (
 )
 
 // UnmarshalJSON refuses a rollout block that lists a null group, attention
-// entry or refusal. Each list is read as the members an apply runs on, needs
-// attention for, or refuses, so a null entry is a malformed response rather
-// than an empty one, and decoding it fails instead of handing a reader an
-// entry it would have to guess the meaning of.
+// entry, refusal or table size. Each list is read as the members an apply
+// runs on, needs attention for, or refuses, or as what each member's tables
+// weigh, so a null entry is a malformed response rather than an empty one,
+// and decoding it fails instead of handing a reader an entry it would have
+// to guess the meaning of.
 func (r *PlanRolloutResponse) UnmarshalJSON(data []byte) error {
 	type plain PlanRolloutResponse
 	var decoded plain
@@ -953,6 +954,9 @@ func (r *PlanRolloutResponse) UnmarshalJSON(data []byte) error {
 	}
 	if i := slices.Index(decoded.Refused, nil); i >= 0 {
 		return fmt.Errorf("decode rollout block: refusal %d is null", i)
+	}
+	if i := slices.Index(decoded.TableSizes, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: table size %d is null", i)
 	}
 	*r = PlanRolloutResponse(decoded)
 	return nil

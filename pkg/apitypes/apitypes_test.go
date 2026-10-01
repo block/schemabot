@@ -692,6 +692,7 @@ func TestPlanResponse_RolloutBlockWithANullEntryFailsToDecode(t *testing.T) {
 		{list: "groups", want: "group 1 is null"},
 		{list: "attention", want: "attention entry 1 is null"},
 		{list: "refused", want: "refusal 1 is null"},
+		{list: "table_sizes", want: "table size 1 is null"},
 	} {
 		t.Run(tc.list, func(t *testing.T) {
 			body := fmt.Sprintf(`{"plan_id":"plan-orders-1","rollout":{"members":2,%q:[{"member":"prod/payments-001","members":["prod/payments-001"]},null]}}`, tc.list)
