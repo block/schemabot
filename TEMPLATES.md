@@ -9320,8 +9320,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-To cut over us-east:
-  schemabot cutover apply-multi-a1b2c3d4 -e production
+SchemaBot will cut over us-east next — no action needed.
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 
@@ -9366,7 +9365,7 @@ To stop this schema change:
 
 
 To retry once the failure above is resolved:
-  schemabot apply -e production
+  schemabot apply -s <schema_dir> -e production
 
 ```
 </details>
@@ -9410,7 +9409,7 @@ To retry once the failure above is resolved:
 
 
 To retry once the failure above is resolved:
-  schemabot apply -e production
+  schemabot apply -s <schema_dir> -e production
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 
@@ -10153,8 +10152,7 @@ Environment: production
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-To cut over us-east:
-  schemabot cutover apply-multi-a1b2c3d4 -e production
+SchemaBot will cut over us-east next — no action needed.
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 

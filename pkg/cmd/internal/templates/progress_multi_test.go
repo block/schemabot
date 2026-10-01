@@ -42,7 +42,7 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "Deployments:")
 	assert.Contains(t, output, "1 completed · 1 halted · 1 failed")
 	assert.Contains(t, output, "First failure: region-b — duplicate column name 'region'")
-	assert.True(t, strings.HasSuffix(output, "To retry once the failure above is resolved:\n  "+ANSICyan+"schemabot apply -e staging"+ANSIReset+"\n"),
+	assert.True(t, strings.HasSuffix(output, "To retry once the failure above is resolved:\n  "+ANSICyan+"schemabot apply -s <schema_dir> -e staging"+ANSIReset+"\n"),
 		"the one next command closes the output:\n%s", output)
 	assert.NotContains(t, output, "schemabot stop", "a failed apply refuses stop, so none is offered")
 	assertLess(t, output, "✅ region-a — completed", "❌ region-b — failed")

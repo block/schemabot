@@ -31,6 +31,10 @@ type RolloutView struct {
 	// SetupPhase hides table progress while the apply is still in an engine
 	// setup phase, where every table reads as queued.
 	SetupPhase bool
+	// DeferCutover is whether the apply waits for an operator at each
+	// cutover. Without it SchemaBot cuts a ready member over itself, so the
+	// footer offers no cutover command.
+	DeferCutover bool
 }
 
 // RolloutCountsUnit is what the rollout's status counts count: targets once
@@ -107,13 +111,24 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		b.WriteString("\n")
 	}
 	for _, w := range work {
+		rolled := make([]TableProgress, 0, len(w.tables))
+		for _, t := range w.tables {
+			rolled = append(rolled, tableAcrossTargets(v, w.members, t))
+		}
+		// Tables are grouped under their namespace whenever they carry one,
+		// so the same table changed in two schemas reads as two changes.
+		namespaced := hasTableNamespaces(rolled)
 		if len(work) > 1 {
-			b.WriteString(FormatRolloutGroupHeading(presentation.TargetNoun, rolloutMemberNames(v.Model, w.members), len(g.Members), false))
-		} else {
+			b.WriteString(FormatRolloutGroupHeading(presentation.TargetNoun, rolloutMemberNames(v.Model, w.members), len(g.Members), namespaced))
+		} else if !namespaced {
 			b.WriteString("\n")
 		}
-		for _, t := range w.tables {
-			b.WriteString(FormatTableProgress(tableAcrossTargets(v, w.members, t)))
+		if namespaced {
+			b.WriteString(FormatNamespacedTables(rolled))
+			continue
+		}
+		for _, t := range rolled {
+			b.WriteString(FormatTableProgress(t))
 			b.WriteString("\n")
 		}
 	}
@@ -201,14 +216,32 @@ func countsTowardRolledRows(status string) bool {
 		state.IsState(status, state.Task.Completed, state.Task.RevertWindow)
 }
 
+// inFlightRollupOrder is every in-flight task state, copying first and the
+// rest in the order a target passes through them.
+var inFlightRollupOrder = []string{
+	state.Task.Running,
+	state.Task.WaitingForDeploy,
+	state.Task.Recovering,
+	state.Task.CatchingUp,
+	state.Task.Checksumming,
+	state.Task.PostChecksum,
+	state.Task.WaitingForCutover,
+	state.Task.CuttingOver,
+	state.Task.Reverting,
+}
+
 // rollupTaskStatus is a table's status across targets. While any target is
-// copying the table reads as copying, so the bar keeps showing the rows still
-// moving; the targets that failed are named in the per-target lines and the
-// attention list beneath it. Otherwise a failure or halt comes first, then
-// any target still moving, then queued, then complete.
+// still working on the change the table reads as in flight, never as failed:
+// copying first, so the bar keeps showing the rows still moving, otherwise
+// the earliest phase any target is in, so the table never reads further along
+// than its slowest target. The targets that failed are named in the
+// per-target lines and the attention list beneath it. With nothing in
+// flight, a failure or halt comes first, then queued, then complete.
 func rollupTaskStatus(statuses []string) string {
-	if slices.Contains(statuses, state.Task.Running) {
-		return state.Task.Running
+	for _, phase := range inFlightRollupOrder {
+		if slices.Contains(statuses, phase) {
+			return phase
+		}
 	}
 	for _, halting := range []string{state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled} {
 		if slices.Contains(statuses, halting) {
@@ -227,8 +260,8 @@ func rollupTaskStatus(statuses []string) string {
 }
 
 // writeTargetAttention names each failed or retrying target with its error
-// and the data-plane apply to look at, the way a sharded apply names a failed
-// shard.
+// and the data-plane operation and apply to look at, the way a sharded apply
+// names a failed shard.
 func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Group) {
 	var attention []int
 	for _, i := range g.Members {
@@ -247,6 +280,9 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 			line += ": " + d.Error
 		}
 		fmt.Fprintf(b, "%s%s%s\n", ANSIRed, line, ANSIReset)
+		if externalOperationID := v.Operations[i].ExternalOperationID; externalOperationID != "" {
+			fmt.Fprintf(b, "      %sExternal operation ID: %s%s\n", ANSIDim, externalOperationID, ANSIReset)
+		}
 		if externalID := v.Operations[i].ExternalID; externalID != "" {
 			fmt.Fprintf(b, "      %sExternal apply ID: %s%s\n", ANSIDim, externalID, ANSIReset)
 		}
@@ -280,11 +316,12 @@ func memberTargetName(d presentation.Deployment) string {
 }
 
 // FormatRolloutFooter writes the one command the rollout is waiting on, at
-// the bottom where an operator looks for it: the pending action (cut over,
-// resume, retry), or release while a failure holds the rollout. Every
-// command addresses the whole apply. Whenever a member is still writing to
-// its target, stop follows, so a pending action never takes stop away from
-// live work; a terminal apply refuses stop, so it is never offered under one.
+// the bottom where an operator looks for it: the pending action (cut over
+// when the apply defers cutover, resume, retry), or release while a failure
+// holds the rollout. Every command addresses the whole apply. Whenever a
+// member is still writing to its target, stop follows, so a pending action
+// never takes stop away from live work; a terminal apply refuses stop, so it
+// is never offered under one.
 func FormatRolloutFooter(v RolloutView) string {
 	var b strings.Builder
 	applyCommand := func(verb string) string {
@@ -293,13 +330,22 @@ func FormatRolloutFooter(v RolloutView) string {
 	next := v.Model.NextAction
 	switch next.Kind {
 	case presentation.NextActionCutover:
+		// Only an apply started with --defer-cutover waits for an operator at
+		// each cutover; otherwise SchemaBot cuts the ready member over itself,
+		// and offering the command would contradict that.
+		if !v.DeferCutover {
+			fmt.Fprintf(&b, "SchemaBot will cut over %s next — no action needed.\n", next.Name)
+			break
+		}
 		writeRolloutCommand(&b, fmt.Sprintf("To cut over %s", next.Name), applyCommand("cutover"))
 	case presentation.NextActionResume:
 		writeRolloutCommand(&b, "To resume from where it stopped", applyCommand("start"))
 	case presentation.NextActionReviewFailure:
 		// A failed apply is recovered by a fresh apply, which resumes from
-		// where this one stopped.
-		writeRolloutCommand(&b, "To retry once the failure above is resolved", fmt.Sprintf("%s apply -e %s", cliname.Name(), v.Environment))
+		// where this one stopped. Progress is read by apply ID and does not
+		// know which schema directory the apply was planned from, so the
+		// operator fills it in.
+		writeRolloutCommand(&b, "To retry once the failure above is resolved", fmt.Sprintf("%s apply -s <schema_dir> -e %s", cliname.Name(), v.Environment))
 	case presentation.NextActionNone:
 	}
 	paused := state.IsState(v.Model.State, state.Apply.Paused)

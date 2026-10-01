@@ -2,11 +2,14 @@ package templates
 
 import (
 	"fmt"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -28,7 +31,9 @@ type rolloutTarget struct {
 	eta        int64
 	err        string
 	externalID string
-	isInstant  bool
+	// externalOperationID is the target's own data-plane operation.
+	externalOperationID string
+	isInstant           bool
 }
 
 // targetRolloutData builds a running apply of orders to production whose prod
@@ -44,13 +49,14 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 	for i, target := range targets {
 		name := fmt.Sprintf("payments-%03d", i+1)
 		data.Operations = append(data.Operations, ProgressOperation{
-			Deployment:    "prod",
-			Target:        name,
-			State:         target.opState,
-			CutoverPolicy: storage.CutoverPolicyParallel,
-			OnFailure:     storage.OnFailureContinue,
-			ErrorMessage:  target.err,
-			ExternalID:    target.externalID,
+			Deployment:          "prod",
+			Target:              name,
+			State:               target.opState,
+			CutoverPolicy:       storage.CutoverPolicyParallel,
+			OnFailure:           storage.OnFailureContinue,
+			ErrorMessage:        target.err,
+			ExternalID:          target.externalID,
+			ExternalOperationID: target.externalOperationID,
 		})
 		if target.status == "" {
 			continue
@@ -102,6 +108,7 @@ func wideRollout() ProgressData {
 			targets = append(targets, rolloutTarget{
 				opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000,
 				err: "Error 1062: Duplicate entry 'x' for key 'orders.idx'", externalID: "spirit-041",
+				externalOperationID: "spirit-op-041",
 			})
 		case i < 60:
 			targets = append(targets, copyingTarget(int64(100+i*10)))
@@ -150,7 +157,8 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 	assert.Contains(t, out, "... 40 complete")
 	assert.Contains(t, out, "4 of 64 targets have not reported progress yet.")
 	assertLess(t, out, "Targets needing attention:", "❌ payments-041 — failed: Error 1062: Duplicate entry 'x' for key 'orders.idx'")
-	assertLess(t, out, "payments-041 — failed", "External apply ID: spirit-041")
+	assertLess(t, out, "payments-041 — failed", "External operation ID: spirit-op-041")
+	assertLess(t, out, "External operation ID: spirit-op-041", "External apply ID: spirit-041")
 	assert.True(t, strings.HasSuffix(out, "schemabot stop apply-7f3c -e production\n"), "%s", out)
 }
 
@@ -167,14 +175,16 @@ func TestWriteProgress_TargetRollupWithNothingCopyingReadsAsFailed(t *testing.T)
 }
 
 // Targets that hold different schemas run different changes, so the rollup
-// splits them by what applies where. Once every target waits for cutover, the
-// cutover is the one command and stop is not offered beside it.
+// splits them by what applies where. Once every target of an apply that
+// defers cutover waits for it, the cutover is the one command and stop is not
+// offered beside it.
 func TestWriteProgress_DivergedTargetsWaitingForCutover(t *testing.T) {
 	waiting := rolloutTarget{opState: state.ApplyOperation.WaitingForCutover, status: state.Task.WaitingForCutover, rowsCopied: 1000, rowsTotal: 1000}
 	zone := waiting
 	zone.ddl = "ALTER TABLE `orders` ADD COLUMN `zone` varchar(8)"
 	data := targetRolloutData([]rolloutTarget{waiting, waiting, zone})
 	data.State = state.Apply.WaitingForCutover
+	data.Options = map[string]string{"defer_cutover": "true"}
 	for i := range data.Operations {
 		data.Operations[i].CutoverPolicy = storage.CutoverPolicyRolling
 		data.Operations[i].OnFailure = storage.OnFailureHalt
@@ -276,4 +286,71 @@ func TestWriteProgress_WideTargetRollupNamesEveryPhase(t *testing.T) {
 	assert.NotContains(t, out, "payments-007:", "past the sample, a phase's targets are counted")
 	assert.Contains(t, out, "... 6 more checksumming")
 	assert.NotContains(t, out, "more catching up", "every catching-up target is already named")
+}
+
+// An apply that does not defer cutover is cut over by SchemaBot as each
+// member becomes ready, so the footer says so instead of handing the operator
+// a cutover command, and keeps stop while a target is still copying.
+func TestFormatRolloutFooter_CutoverNotDeferredNeedsNoAction(t *testing.T) {
+	waiting := rolloutTarget{opState: state.ApplyOperation.WaitingForCutover, status: state.Task.WaitingForCutover, rowsCopied: 1000, rowsTotal: 1000}
+	data := targetRolloutData([]rolloutTarget{waiting, copyingTarget(400)})
+	for i := range data.Operations {
+		data.Operations[i].CutoverPolicy = storage.CutoverPolicyRolling
+		data.Operations[i].OnFailure = storage.OnFailureHalt
+	}
+
+	out := renderRollout(t, data)
+	assertLess(t, out, "SchemaBot will cut over prod/payments-001 next — no action needed.",
+		"To stop this schema change:\n  schemabot stop apply-7f3c -e production")
+	assert.NotContains(t, out, "schemabot cutover", "%s", out)
+}
+
+// The same table changed in two namespaces is two changes, so the rollup
+// heads each with its namespace rather than printing two identical blocks.
+func TestWriteProgress_TargetRollupGroupsTablesByNamespace(t *testing.T) {
+	data := targetRolloutData([]rolloutTarget{copyingTarget(400), copyingTarget(600)})
+	var tables []TableProgress
+	for _, table := range data.Tables {
+		for _, ns := range []string{"orders", "billing"} {
+			table.Namespace, table.TableName = ns, "users"
+			table.DDL = "ALTER TABLE `users` ADD COLUMN `" + ns + "_region` varchar(32)"
+			tables = append(tables, table)
+		}
+	}
+	data.Tables = tables
+
+	out := renderRollout(t, data)
+	assertLess(t, out, "── orders ──", "ADD COLUMN `orders_region`")
+	assertLess(t, out, "ADD COLUMN `orders_region`", "── billing ──")
+	assertLess(t, out, "── billing ──", "ADD COLUMN `billing_region`")
+	assert.Equal(t, 1, strings.Count(out, "── orders ──"), "%s", out)
+	assert.Equal(t, 1, strings.Count(out, "── billing ──"), "%s", out)
+}
+
+// A table still in flight on any target reads as in flight, never as failed,
+// whatever phase the live targets are in; and it reads as the earliest phase a
+// target is in, not as a later one only some targets have reached.
+func TestRollupTaskStatus_InFlightTargetsDecide(t *testing.T) {
+	checksummingPastFailure := append([]string{state.Task.Failed}, slices.Repeat([]string{state.Task.Checksumming}, 19)...)
+	assert.Equal(t, state.Task.Checksumming, rollupTaskStatus(checksummingPastFailure))
+	assert.Equal(t, state.Task.Checksumming, rollupTaskStatus([]string{state.Task.WaitingForCutover, state.Task.Checksumming}))
+	assert.Equal(t, state.Task.Checksumming, rollupTaskStatus([]string{state.Task.Checksumming, state.Task.WaitingForCutover}))
+	assert.Equal(t, state.Task.Running, rollupTaskStatus([]string{state.Task.CatchingUp, state.Task.Running}))
+	assert.Equal(t, state.Task.Failed, rollupTaskStatus([]string{state.Task.Completed, state.Task.Failed, state.Task.Pending}))
+	assert.Equal(t, state.Task.Pending, rollupTaskStatus([]string{state.Task.Completed, state.Task.Pending}))
+	assert.Equal(t, state.Task.Completed, rollupTaskStatus([]string{state.Task.Completed, state.Task.Completed}))
+}
+
+// The phase order names every in-flight task state and nothing else, so a new
+// in-flight state cannot fall through to the failure-first branch.
+func TestInFlightRollupOrder_CoversEveryInFlightTaskState(t *testing.T) {
+	tasks := reflect.ValueOf(state.Task)
+	var inFlight []string
+	for _, field := range tasks.Fields() {
+		if s := field.String(); state.IsInFlightTaskState(s) {
+			inFlight = append(inFlight, s)
+		}
+	}
+	require.NotEmpty(t, inFlight)
+	assert.ElementsMatch(t, inFlight, inFlightRollupOrder)
 }

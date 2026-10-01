@@ -36,7 +36,9 @@ type WatchModel struct {
 	tables     []templates.TableProgress
 	operations []templates.ProgressOperation
 	released   bool // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg   string
+	// deferCutover is whether the apply waits for an operator at each cutover.
+	deferCutover bool
+	errorMsg     string
 
 	// Engine metadata
 	engine           string // "Spirit", "PlanetScale", etc.
@@ -77,18 +79,19 @@ func isRetryableFetchError(err error) bool {
 }
 
 type progressMsg struct {
-	state       string
-	tables      []templates.TableProgress
-	operations  []templates.ProgressOperation
-	released    bool              // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg    string            // Human-readable error message
-	failed      bool              // true when the API call didn't return usable progress data
-	retryable   bool              // when failed, whether the TUI should keep polling
-	applyID     string            // Populated from progress responses
-	database    string            // Populated from apply-id progress responses
-	environment string            // Populated from apply-id progress responses
-	engine      string            // Engine name (e.g., "Spirit", "PlanetScale")
-	metadata    map[string]string // Engine metadata (e.g., deploy_request_url)
+	state        string
+	tables       []templates.TableProgress
+	operations   []templates.ProgressOperation
+	released     bool              // apply-level release latch: a released pause runs degraded, not paused
+	deferCutover bool              // the apply waits for an operator at each cutover
+	errorMsg     string            // Human-readable error message
+	failed       bool              // true when the API call didn't return usable progress data
+	retryable    bool              // when failed, whether the TUI should keep polling
+	applyID      string            // Populated from progress responses
+	database     string            // Populated from apply-id progress responses
+	environment  string            // Populated from apply-id progress responses
+	engine       string            // Engine name (e.g., "Spirit", "PlanetScale")
+	metadata     map[string]string // Engine metadata (e.g., deploy_request_url)
 }
 
 type cutoverResultMsg struct {
@@ -194,6 +197,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
+		m.deferCutover = msg.deferCutover
 		m.errorMsg = msg.errorMsg
 
 		// Timeout skip-revert if state hasn't transitioned after 10s.

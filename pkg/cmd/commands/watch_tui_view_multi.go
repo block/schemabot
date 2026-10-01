@@ -16,13 +16,14 @@ func (m WatchModel) multiDeploymentProgressView() string {
 	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.released))
 	groups := model.Groups()
 	view := templates.RolloutView{
-		ApplyID:     m.applyID,
-		Environment: m.environment,
-		Engine:      m.engine,
-		Operations:  m.operations,
-		Model:       model,
-		Tables:      m.tables,
-		SetupPhase:  state.IsSetupPhase(m.state),
+		ApplyID:      m.applyID,
+		Environment:  m.environment,
+		Engine:       m.engine,
+		Operations:   m.operations,
+		Model:        model,
+		Tables:       m.tables,
+		SetupPhase:   state.IsSetupPhase(m.state),
+		DeferCutover: m.deferCutover,
 	}
 
 	var b strings.Builder

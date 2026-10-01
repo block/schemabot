@@ -16,13 +16,14 @@ func writeMultiDeploymentProgress(data ProgressData) {
 	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
 	groups := model.Groups()
 	view := RolloutView{
-		ApplyID:     data.ApplyID,
-		Environment: data.Environment,
-		Engine:      data.Engine,
-		Operations:  data.Operations,
-		Model:       model,
-		Tables:      data.Tables,
-		SetupPhase:  state.IsSetupPhase(data.State),
+		ApplyID:      data.ApplyID,
+		Environment:  data.Environment,
+		Engine:       data.Engine,
+		Operations:   data.Operations,
+		Model:        model,
+		Tables:       data.Tables,
+		SetupPhase:   state.IsSetupPhase(data.State),
+		DeferCutover: data.Options["defer_cutover"] == "true",
 	}
 
 	writeMultiDeploymentHeader(data, model, groups)

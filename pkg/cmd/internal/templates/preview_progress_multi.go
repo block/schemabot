@@ -111,9 +111,9 @@ func previewCLIMultiTargetRolloutInProgress() {
 	WriteProgress(data)
 }
 
-// previewCLIMultiTargetRolloutWaitingForCutover is three targets holding at
-// the cutover gate, one of which holds a schema of its own and so runs a
-// different change.
+// previewCLIMultiTargetRolloutWaitingForCutover is three targets of an apply
+// that defers cutover holding at the cutover gate, one of which holds a schema
+// of its own and so runs a different change.
 func previewCLIMultiTargetRolloutWaitingForCutover() {
 	var ops []ProgressOperation
 	var tables []TableProgress
@@ -128,6 +128,7 @@ func previewCLIMultiTargetRolloutWaitingForCutover() {
 	}
 	data := multiDeploymentProgressData(ops, tables)
 	data.State = state.Apply.WaitingForCutover
+	data.Options = map[string]string{"defer_cutover": "true"}
 	WriteProgress(data)
 }
 

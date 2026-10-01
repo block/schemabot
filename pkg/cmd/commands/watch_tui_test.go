@@ -354,6 +354,35 @@ func TestWatchModel_MultiDeploymentViewRunningDegraded(t *testing.T) {
 	assert.Contains(t, view, "🔄 us — running table copy")
 }
 
+// The watch view offers the cutover command only for an apply that defers
+// cutover, read from the apply's own options on each progress poll; otherwise
+// it says SchemaBot cuts the ready member over itself, as the PR comment does.
+func TestWatchModel_MultiDeploymentCutoverFollowsDeferCutover(t *testing.T) {
+	render := func(options map[string]string) string {
+		progress := apitypes.ProgressResponse{
+			State:       state.Apply.Running,
+			ApplyID:     "apply-cutover-test",
+			Database:    "orders",
+			Environment: "production",
+			Options:     options,
+			Operations: []*apitypes.ProgressOperationResponse{
+				{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			},
+		}
+		updated, _ := NewWatchModel("http://localhost:8080", "", "", false).Update(parseProgressResult(&progress))
+		return updated.(WatchModel).View()
+	}
+
+	automatic := render(nil)
+	assert.Contains(t, automatic, "SchemaBot will cut over us-east next — no action needed.")
+	assert.NotContains(t, automatic, "schemabot cutover")
+
+	deferred := render(map[string]string{"defer_cutover": "true"})
+	assert.Contains(t, deferred, "To cut over us-east:")
+	assert.Contains(t, deferred, "schemabot cutover apply-cutover-test -e production")
+}
+
 func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "orders", "production", false)
 	m.applyID = "apply-single-test"
