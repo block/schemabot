@@ -79,7 +79,7 @@ func TestProgressCmd_MultiTargetDeploymentsRenderAsRollups(t *testing.T) {
 
 	assert.Contains(t, out, "│  Targets:      4 completed  │", "the header counts targets, not deployments:\n%s", out)
 	assert.NotContains(t, out, "Deployments:")
-	assertInOrder(t, out,
+	assertContainsInOrder(t, out,
 		"✅ eu — 2 completed (2 targets)",
 		"ALTER TABLE `orders` ADD COLUMN `email` varchar(255) DEFAULT NULL;",
 		"• Targets: 2 (2 complete)",
@@ -95,17 +95,4 @@ func TestProgressCmd_MultiTargetDeploymentsRenderAsRollups(t *testing.T) {
 		assert.Equalf(t, 1, strings.Count(out, target), "%s is one line of its deployment's rollup, not a section of its own:\n%s", target, out)
 	}
 	assert.Equal(t, 1, strings.Count(out, "ALTER TABLE `orders` ADD COLUMN `email` varchar(255) DEFAULT NULL;"), "eu's change is shown once for both targets:\n%s", out)
-}
-
-// assertInOrder checks that each expected line appears after the previous one.
-func assertInOrder(t *testing.T, out string, expected ...string) {
-	t.Helper()
-	rest := out
-	for _, want := range expected {
-		i := strings.Index(rest, want)
-		if !assert.GreaterOrEqualf(t, i, 0, "expected %q after the previous line in:\n%s", want, out) {
-			return
-		}
-		rest = rest[i+len(want):]
-	}
 }
