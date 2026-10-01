@@ -150,15 +150,6 @@ func outputPlanRequestError(database, environment string, err error) bool {
 // outputMultiEnvPlanResult prints plan results for multiple environments.
 // If all environments have the same plan, it deduplicates and shows once.
 func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, database, schemaDir string) {
-	// Get first result to determine engine type
-	var engine string
-	for _, result := range results {
-		engine = result.Engine
-		break
-	}
-
-	isMySQL := !state.IsPlanetScaleEngine(engine)
-
 	// Sort environments: staging first, production second, then alphabetically
 	envOrder := make([]string, 0, len(results))
 	for env := range results {
@@ -166,14 +157,26 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 	}
 	sortEnvironments(envOrder)
 
+	// The first configured environment, in that order, names the engine.
+	var engine string
+	for _, env := range envOrder {
+		if result := results[env]; result != nil {
+			engine = result.Engine
+			break
+		}
+	}
+
+	isMySQL := !state.IsPlanetScaleEngine(engine)
+
 	// Check which environments have changes
 	stagingResult := results["staging"]
 	productionResult := results["production"]
 	stagingHasChanges := hasResultChanges(stagingResult)
 	productionHasChanges := hasResultChanges(productionResult)
 
-	// Check if every environment has the same plan as staging, so the combined
-	// section below never hides an environment whose plan differs.
+	// Check if every environment's section would render the same as staging's,
+	// so the combined section below never stands in for one that reads
+	// differently.
 	bothConfigured := stagingResult != nil && productionResult != nil
 	plansIdentical := bothConfigured && stagingHasChanges && productionHasChanges &&
 		everyPlanMatches(results, stagingResult)
@@ -356,6 +359,7 @@ func hasResultChanges(result *apitypes.PlanResponse) bool {
 
 // everyPlanMatches reports whether every environment's plan fingerprints the
 // same as reference, which is what lets them render as one combined section.
+// An environment with no plan is not a match: it renders as not configured.
 func everyPlanMatches(results map[string]*apitypes.PlanResponse, reference *apitypes.PlanResponse) bool {
 	want := planFingerprint(reference)
 	for _, result := range results {
@@ -389,10 +393,15 @@ func sortEnvironments(envs []string) {
 }
 
 // planFingerprint creates a string fingerprint of a plan result for deduplication.
-// Plans with identical DDL statements, VSchema updates, and exempt-table
-// disclosures are considered the same; the disclosure is part of what the
-// reader sees, so two environments that exempted different live tables render
-// their own sections.
+// Two plans fingerprint the same when their sections would read the same: the
+// same statements under the same namespaces, the same VSchema updates and
+// finalizes, the same unsafe findings, the same advisory lint, and the same
+// exempt-table disclosure. The unsafe and lint verdicts are part of it because
+// they come from each environment's live pre-state, not from the statement: an
+// index made invisible in staging but not yet in production gives both the
+// same DROP INDEX and only production a finding, and folding production under
+// staging's clean section would hide it. Whatever writePlanBody renders has to
+// be in here, or an environment that differs only in that detail folds away.
 func planFingerprint(result *apitypes.PlanResponse) string {
 	// Check for errors first
 	if len(result.Errors) > 0 {
@@ -402,7 +411,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 
 	var ddls []string
 	for _, tbl := range result.RenderedTables() {
-		ddls = append(ddls, tbl.DDL)
+		ddls = append(ddls, renderedNamespace(tbl.Namespace, result.Database)+":"+tbl.ChangeType+":"+tbl.TableName+":"+tbl.DDL)
 	}
 	namespacesWithDDL := map[string]bool{}
 	for _, tbl := range ddl.FilterInternalTablesTyped(result.RenderedTables()) {
@@ -424,6 +433,15 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		return "no-changes"
 	}
 
+	var unsafeFindings []string
+	for _, change := range result.UnsafeChanges() {
+		unsafeFindings = append(unsafeFindings, change.Table+":"+change.ChangeType+":"+change.Reason)
+	}
+	var lint []string
+	for _, violation := range result.LintNonErrors() {
+		lint = append(lint, violation.Table+":"+violation.Message)
+	}
+
 	var exempt []string
 	for _, group := range result.ExemptTables {
 		if group == nil || len(group.Tables) == 0 {
@@ -436,14 +454,18 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	sort.Strings(ddls)
 	sort.Strings(vschemas)
 	finalizes = slices.Compact(slices.Sorted(slices.Values(finalizes)))
+	sort.Strings(unsafeFindings)
+	sort.Strings(lint)
 	sort.Strings(exempt)
 
 	data, _ := json.Marshal(struct {
 		DDLs      []string `json:"ddls"`
 		VSchemas  []string `json:"vschemas"`
 		Finalizes []string `json:"finalizes"`
+		Unsafe    []string `json:"unsafe"`
+		Lint      []string `json:"lint"`
 		Exempt    []string `json:"exempt"`
-	}{ddls, vschemas, finalizes, exempt})
+	}{ddls, vschemas, finalizes, unsafeFindings, lint, exempt})
 	return string(data)
 }
 
