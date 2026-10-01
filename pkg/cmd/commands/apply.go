@@ -151,14 +151,15 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}
 	}
 
-	// A rollout whose primary is already at the desired schema is applied from
-	// the primary's empty plan, which runs only the other members' own plans,
-	// and apply creation refuses an unsafe change among them whatever the
-	// flags. Asking for --allow-unsafe here would ask for consent the apply
-	// cannot act on, so the members carrying the change are named with the
-	// narrowed apply that runs each under its own plan.
-	if members := unsafeMembersBesideAConvergedPrimary(planResult); len(members) > 0 {
-		return blockUnsafeBesideConvergedPrimary(planResult, members, cfg.Database, cmd.Environment, cfg.SchemaDir)
+	// The server lists the members whose own plans apply creation refuses in
+	// an apply of the whole rollout from the API, whatever the flags: an
+	// unsafe change the primary's plan does not carry, a direct-execution
+	// change, or work an apply created from the primary's plan has no place
+	// for. Asking for consent here would ask for something the apply cannot
+	// act on, so the apply is refused before it locks or prompts, and each
+	// member is named with the narrowed apply that runs it under its own plan.
+	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Refused) > 0 {
+		return blockRolloutApplyRefused(planResult, rollout, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
 	// Check for unsafe changes
@@ -549,42 +550,25 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 	return ErrSilent
 }
 
-// unsafeMembersBesideAConvergedPrimary returns the rollout members whose own
-// plans carry an unsafe change when the primary's plan has nothing to run, in
-// rollout group order. It returns nil for a plan that describes one member, and
-// for a rollout whose primary has work, where the apply runs from the
-// primary's plan and --allow-unsafe covers every member.
-func unsafeMembersBesideAConvergedPrimary(plan *apitypes.PlanResponse) []string {
-	rollout := plan.WholeRollout()
-	if rollout == nil || plan.HasChanges() {
-		return nil
-	}
-	var members []string
-	for i, memberPlan := range plan.MemberPlans() {
-		if len(memberPlan.UnsafeChanges()) > 0 {
-			members = append(members, rollout.Groups[i].Members...)
-		}
-	}
-	return members
-}
-
-// blockUnsafeBesideConvergedPrimary displays the plan and refuses an apply of
-// the whole rollout whose primary is already at the desired schema while other
-// members carry unsafe changes, naming the narrowed apply that runs each one.
-func blockUnsafeBesideConvergedPrimary(planResult *apitypes.PlanResponse, members []string, database, environment, schemaDir string) error {
+// blockRolloutApplyRefused displays the plan and refuses an apply of the
+// whole rollout that apply creation would refuse for the members the rollout
+// lists, naming the narrowed apply that runs each one. A rerun names the
+// member by the selector the server accepts, which for a deployment with one
+// target is its target rather than the deployment name it is shown under.
+func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apitypes.PlanRolloutResponse, database, environment, schemaDir string) error {
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
-	rollout := planResult.WholeRollout()
-	primary := "the primary"
-	for _, group := range rollout.Groups {
-		if group.Primary && len(group.Members) > 0 {
-			primary = group.Members[0]
+	var reruns []string
+	for _, r := range rollout.Refused {
+		if r.Reason == apitypes.PlanMemberBlocked {
+			continue
 		}
+		rerun := fmt.Sprintf("apply -s %s -e %s --target %s", schemaDir, environment, r.Target)
+		if r.AllowUnsafe {
+			rerun += " --allow-unsafe"
+		}
+		reruns = append(reruns, rerun)
 	}
-	reruns := make([]string, len(members))
-	for i, member := range members {
-		reruns[i] = fmt.Sprintf("apply -s %s -e %s --target %s --allow-unsafe", schemaDir, environment, member)
-	}
-	templates.WriteUnsafeBesideConvergedPrimary(templates.RolloutNoun(rollout), primary, members, planResult.RolloutUnsafeChanges(), reruns)
+	templates.WriteRolloutApplyRefused(templates.RolloutNoun(rollout), rollout.Refused, reruns)
 	return ErrSilent
 }
 

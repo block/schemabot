@@ -1025,12 +1025,12 @@ func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
 		want  string
 	}{
 		{"POST /api/apply", func(t *testing.T, svc *Service) string {
-			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production"}`)
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
 			assert.Equal(t, http.StatusInternalServerError, code)
 			return msg
 		}, refused},
 		{"POST /api/apply asserting the confirmation", func(t *testing.T, svc *Service) string {
-			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","ConfirmedMemberWork":true}`)
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true,"ConfirmedMemberWork":true}`)
 			assert.Equal(t, http.StatusBadRequest, code)
 			return msg
 		}, `unknown field "ConfirmedMemberWork"`},

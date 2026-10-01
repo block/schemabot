@@ -28,6 +28,17 @@ func (s *storingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64,
 	return int64(len(s.plans)), nil
 }
 
+// Get returns a plan this store holds under the identifier, or the seeded
+// lookup plan, which stands in for the reviewed plan its planner stored.
+func (s *storingPlanStore) Get(ctx context.Context, planIdentifier string) (*storage.Plan, error) {
+	for _, plan := range s.plans {
+		if plan.PlanIdentifier == planIdentifier {
+			return plan, nil
+		}
+	}
+	return s.mockPlanLookupStore.Get(ctx, planIdentifier)
+}
+
 // countingDiffClient diffs every member to the same plan and counts the
 // diffs, which the rollout runs concurrently across members.
 type countingDiffClient struct {
@@ -144,7 +155,7 @@ func TestPlanRollout_PlanOfANonPrimaryMemberIsRefused(t *testing.T) {
 // every other member's plan stored beside it, so the rollout-wide apply that
 // follows passes the primary-plan check and runs each target's own plan.
 func TestCreateStoredApply_RolloutWideApplyOfTheRolloutPlanRunsEveryMember(t *testing.T) {
-	plans := &storingPlanStore{}
+	plans := &storingPlanStore{listingPlanStore{mockPlanLookupStore: mockPlanLookupStore{plan: memberPlan("payments-001")}}}
 	applies := &capturingApplyStore{}
 	svc, client := rolloutPlanningService(t, plans, applies)
 

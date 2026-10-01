@@ -82,6 +82,13 @@ type PlanRequest struct {
 	// the way every plan did before members could be selected. A narrowed plan
 	// speaks for its one member only, so it never records stored check state.
 	Target string `json:"target,omitempty"`
+
+	// RendersRollout says the HTTP caller reads the response's rollout block
+	// and shows the operator what applies on every member. POST /api/plan
+	// refuses a rollout-wide plan of an environment with more than one member
+	// without it (refuseRolloutUnrenderedByCaller). The webhook calls the
+	// service in process and renders the rollout itself, so it never sets it.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 type unsupportedPullSchemaError struct {
@@ -548,6 +555,13 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
+	// RendersRollout says the HTTP caller showed the operator the plan of
+	// every rollout member; see PlanRequest.RendersRollout.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
+	// to say it rendered the rollout. The webhook and the trusted enqueue path
+	// call the service in process and leave it unset.
+	viaHTTP bool
 	// ExpectedLockOwner and ExpectedPendingPlanID are internal webhook guards;
 	// direct API callers cannot assert a lock intent through JSON.
 	ExpectedLockOwner     string `json:"-"`
@@ -597,6 +611,13 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	// Planning stages a change against a specific database and reads its live
 	// schema, so it takes the same per-database authorization as apply.
 	if !s.authorizeDirectWrite(w, r, "plan", req.Database, req.Environment) {
+		return
+	}
+
+	if err := s.refusePlanRolloutUnrenderedByCaller(req); err != nil {
+		s.logger.Warn("plan rejected: the caller does not render the plan of every rollout member",
+			"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "plan rejected: "+err.Error())
 		return
 	}
 
@@ -1313,6 +1334,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.viaHTTP = true
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
 		if errors.Is(err, errPlanLookupFailed) {
@@ -1357,6 +1379,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*PlanMemberMismatchError](err); ok {
 			s.logger.Warn("apply rejected because its plan was made for a different rollout member than the apply would run on", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*RolloutUnrenderedError](err); ok {
+			s.logger.Warn("apply rejected: the caller does not render the plan of every rollout member", "plan_id", req.PlanID, "environment", req.Environment, "caller", req.Caller, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
@@ -1762,6 +1789,9 @@ func (s *Service) createStoredApply(
 	if err != nil {
 		return nil, 0, err
 	}
+	if err := refuseApplyRolloutUnrenderedByCaller(plan, req, targets, narrowedTo); err != nil {
+		return nil, 0, err
+	}
 	// A narrowed apply records the member it ran on, so a later rollback can
 	// tell it changed that member alone and not the whole rollout.
 	applyOpts.NarrowedTo = narrowedTo
@@ -2116,7 +2146,7 @@ func rejectUnconfirmedMemberDirectExecution(member applyMember, applyPlan *stora
 		return nil
 	}
 	if table := firstDirectExecutionTable(member.Plan); table != "" {
-		return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, which runs only from a pull request apply-confirm on the comment that discloses it under that target; this apply's caller was shown only the reviewed plan %s",
+		return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, which runs only from a pull request apply-confirm on the comment that discloses it under that target; this apply's caller was shown only the reviewed plan %s; plan and apply the member with its target to run its own plan",
 			member.MemberID(), member.Plan.PlanIdentifier, table, applyPlan.PlanIdentifier)
 	}
 	return nil

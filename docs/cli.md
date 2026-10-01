@@ -506,6 +506,13 @@ work rather than reading as up to date from the first target alone. A target
 that cannot be planned is listed as needing attention: `apply` refuses until
 it is planned, and `onboard` fails its verification.
 
+A plan or apply of a whole rollout of more than one target needs a CLI that
+renders every target's plan. The server refuses one from an older CLI, which
+would show only the first target's plan, with `upgrade the schemabot CLI to
+plan or apply a multi-target environment`; `--target` still works from it.
+Upgrade the server before the CLI, as [releases](release.md) describes: an
+older server refuses a request from a newer CLI as an unknown field.
+
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
 refuses to start while one is queued or running there.
@@ -521,11 +528,17 @@ Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
 
-In a rollout whose primary target is already at the desired schema, an apply
-of the whole rollout runs only the other targets' own plans, and it cannot run
-an unsafe change on them even with `--allow-unsafe`. The CLI refuses it before
-anything is applied and prints, for each target carrying the change, the
-`apply --target <target> --allow-unsafe` that applies that target's own plan.
+An apply of the whole rollout runs the first target's plan everywhere, so it
+cannot run a change that only another target's plan carries when that change
+needs its own consent: an unsafe change the first target's plan does not
+carry, or a change the engine runs as direct-execution DDL there. The server
+refuses those whatever the flags, `--allow-unsafe` included, so the plan lists
+the targets carrying them and `apply` refuses before it takes a lock or
+prompts. For each target it prints the `apply --target <target>` that applies
+that target's own plan, with `--allow-unsafe` when that plan is unsafe; once
+those have landed, apply the rollout again for the rest. A target whose change
+its engine refuses gets no such command, because no apply runs it: change the
+schema files instead.
 
 A database lock can also block a new apply. Inspect the owner and ongoing
 work before releasing it. Locks span the database's environments; forcing

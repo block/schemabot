@@ -116,32 +116,41 @@ func wrapNames(names []string, more int) []string {
 	return lines
 }
 
-// WriteUnsafeBesideConvergedPrimary writes why an apply of a whole rollout was
-// refused when its primary is already at the desired schema and other members
-// carry unsafe changes, and the narrowed apply that runs each of those members
-// under its own plan and its own consent. reruns holds one command per member,
-// without the binary name, in the order of members; past
-// memberNamesInlineLimit the rest are named rather than spelled out.
-func WriteUnsafeBesideConvergedPrimary(noun presentation.Noun, primary string, members []string, changes []UnsafeChange, reruns []string) {
-	fmt.Printf("%s Apply blocked: %d unsafe change(s) on %s other than the rollout primary %s, which is already at the desired schema\n",
-		glyph.Refused, countUnsafeFindings(changes), noun.Plural, primary)
-	writeUnsafeChangesList(changes)
+// WriteRolloutApplyRefused writes why an apply of a whole rollout was refused
+// before it started: members whose own plans the server will not run in a
+// rollout-wide apply, each with why, and the narrowed apply that runs each
+// one under its own plan and its own consent. reruns holds one command per
+// refused member that a narrowed apply runs, without the binary name; a
+// member whose change its engine refuses has none. Past
+// memberNamesInlineLimit the rest are counted rather than spelled out.
+func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMemberRefusalResponse, reruns []string) {
+	label := noun.Plural
+	if len(refused) == 1 {
+		label = noun.Singular
+	}
+	fmt.Printf("%s Apply blocked: an apply of the whole rollout cannot run the plan of %d %s\n\n", glyph.Refused, len(refused), label)
+	shown := min(len(refused), memberNamesInlineLimit)
+	for _, r := range refused[:shown] {
+		fmt.Printf("  • %s — %s\n", r.Member, r.Detail)
+	}
+	if rest := len(refused) - shown; rest > 0 {
+		fmt.Printf("  and %d more\n", rest)
+	}
 	fmt.Println()
-	fmt.Println("An apply of the whole rollout runs from the primary's plan, which has no")
-	fmt.Println("unsafe change to consent to, so --allow-unsafe cannot run these. Apply")
-	fmt.Println("each " + noun.Singular + " that carries them on its own:")
+	if len(reruns) == 0 {
+		fmt.Println("No apply can run these changes; change the schema files so each target's engine accepts them.")
+		fmt.Println()
+		return
+	}
+	fmt.Println("Apply each " + noun.Singular + " on its own, under its own plan and its own consent,")
+	fmt.Println("then apply the rollout again for the rest:")
 	fmt.Println()
-	shown := min(len(reruns), memberNamesInlineLimit)
-	for _, rerun := range reruns[:shown] {
+	shownReruns := min(len(reruns), memberNamesInlineLimit)
+	for _, rerun := range reruns[:shownReruns] {
 		fmt.Printf("  %s %s\n", cliname.Name(), rerun)
 	}
-	if rest := members[shown:]; len(rest) > 0 {
-		fmt.Println()
-		fmt.Printf("and the same for %d more %s:\n", len(rest), noun.Plural)
-		listed := rest[:min(len(rest), memberNamesListLimit)]
-		for _, line := range wrapNames(listed, len(rest)-len(listed)) {
-			fmt.Printf("  %s\n", line)
-		}
+	if rest := len(reruns) - shownReruns; rest > 0 {
+		fmt.Printf("  and the same for %d more %s\n", rest, noun.Plural)
 	}
 	fmt.Println()
 }

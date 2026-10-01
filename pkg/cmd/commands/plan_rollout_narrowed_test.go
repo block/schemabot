@@ -110,7 +110,8 @@ func TestApplyCmd_NarrowedApplyIsNotGatedOnOtherMembers(t *testing.T) {
 }
 
 // An apply of the whole rollout is sent with no target, so the server holds it
-// to the rollout primary's plan.
+// to the rollout primary's plan, and says the CLI rendered every target's plan,
+// which the server requires before it applies a rollout from an API caller.
 func TestApplyCmd_RolloutWideApplySendsNoTarget(t *testing.T) {
 	server, applyRequest := applyRecordingServer(t, &apitypes.PlanResponse{
 		PlanID:  "plan-orders-1",
@@ -133,4 +134,5 @@ func TestApplyCmd_RolloutWideApplySendsNoTarget(t *testing.T) {
 	require.True(t, applied, "the rollout apply is requested:\n%s", out)
 	assert.Equal(t, "plan-orders-1", req.PlanID)
 	assert.Empty(t, req.Target)
+	assert.True(t, req.RendersRollout, "the apply says the CLI rendered the rollout")
 }

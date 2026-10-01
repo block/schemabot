@@ -708,13 +708,14 @@ func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.
 				diffs:          tc.diffs,
 				diffErrs:       tc.diffErrs,
 			}
-			svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, tc.config, map[string]tern.Client{
+			svc := New(&mockStorageWithPlanLookup{plans: &recordingPlanStore{}}, tc.config, map[string]tern.Client{
 				DefaultDeployment + "/production": client,
 			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 			body, err := json.Marshal(apitypes.PlanRequest{
 				Database: tc.database, Environment: "production", Type: storage.DatabaseTypeMySQL, Target: tc.target,
-				SchemaFiles: map[string]*apitypes.SchemaFiles{tc.database: {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}}},
+				SchemaFiles:    map[string]*apitypes.SchemaFiles{tc.database: {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}}},
+				RendersRollout: true,
 			})
 			require.NoError(t, err)
 			w := serveNarrowing(t, svc, "/api/plan", string(body))

@@ -731,6 +731,13 @@ type PlanRequest struct {
 	// Target narrows the plan to one rollout member of the environment, named
 	// by its target or by deployment/target. Empty plans the rollout primary.
 	Target string `json:"target,omitempty"`
+	// RendersRollout says the caller reads the plan's rollout block: it shows
+	// the operator what applies on every member, and refuses an apply for the
+	// members the rollout lists as needing attention or as refused. The server
+	// refuses a rollout-wide plan of an environment with more than one member
+	// from a caller that does not set it, since such a caller would present
+	// the primary's plan as the whole rollout's.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -742,6 +749,11 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
+	// RendersRollout says the caller showed the operator the plan of every
+	// rollout member before applying; see PlanRequest.RendersRollout. The
+	// server refuses a rollout-wide apply of an environment with more than one
+	// member from a caller that does not set it.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
@@ -827,7 +839,42 @@ type PlanRolloutResponse struct {
 	// that could not be planned, or one that diverged from the plan it is
 	// expected to mirror.
 	Attention []*PlanMemberAttentionResponse `json:"attention,omitempty"`
+	// Refused lists the members whose own plans apply creation refuses when
+	// this plan is applied rollout-wide through the API, which refuses the
+	// whole apply. Set only when no member needs attention.
+	Refused []*PlanMemberRefusalResponse `json:"refused,omitempty"`
 }
+
+// PlanMemberRefusalResponse is a rollout member whose own plan a rollout-wide
+// apply through the API refuses, and how to run it instead.
+type PlanMemberRefusalResponse struct {
+	// Member is the member's operator-facing name, as in Groups.
+	Member string `json:"member"`
+	// Target is the selector that names the member in a plan or apply
+	// request's target, and in the CLI's --target. It can differ from Member:
+	// a deployment with one target is named by its deployment, and selected by
+	// its target.
+	Target string `json:"target"`
+	// Reason is PlanMemberNeedsTarget or PlanMemberBlocked.
+	Reason string `json:"reason"`
+	// Detail is a short description of the refused change, naming only
+	// tables and namespaces.
+	Detail string `json:"detail"`
+	// AllowUnsafe is true when the member's own plan carries an unsafe
+	// change, so an apply narrowed to it needs the unsafe opt-in.
+	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
+}
+
+// Rollout member refusal reasons.
+const (
+	// PlanMemberNeedsTarget is a member whose own plan runs when the apply is
+	// narrowed to it, where its own plan is the one the operator reviews and
+	// consents to.
+	PlanMemberNeedsTarget = "needs_target"
+	// PlanMemberBlocked is a member whose own plan carries a change its
+	// engine refuses, which no apply runs.
+	PlanMemberBlocked = "blocked"
+)
 
 // PlanMemberGroupResponse is the rollout members that run one plan.
 type PlanMemberGroupResponse struct {
@@ -903,19 +950,21 @@ func (r *PlanResponse) RolloutHasChanges() bool {
 }
 
 // RolloutUnsafeChanges returns the unsafe changes of every plan in the
-// rollout, each once however many groups of members run it.
+// rollout, each once however many groups of members run it. A change is the
+// same when it is the same namespace's table, statement and reason, so one
+// table dropped in two namespaces is two changes.
 func (r *PlanResponse) RolloutUnsafeChanges() []UnsafeChange {
 	var result []UnsafeChange
 	seen := make(map[string]bool)
 	for _, plan := range r.MemberPlans() {
-		for _, c := range plan.UnsafeChanges() {
-			key := c.Table + "\x00" + c.Reason
+		plan.eachUnsafeChange(func(namespace string, c UnsafeChange) {
+			key := strings.Join([]string{namespace, c.Table, c.DDL, c.Reason}, "\x00")
 			if seen[key] {
-				continue
+				return
 			}
 			seen[key] = true
 			result = append(result, c)
-		}
+		})
 	}
 	return result
 }
@@ -1090,18 +1139,31 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 		return nil
 	}
 	var result []UnsafeChange
+	r.eachUnsafeChange(func(_ string, c UnsafeChange) {
+		result = append(result, c)
+	})
+	return result
+}
+
+// eachUnsafeChange calls fn with each unsafe change in the plan and the
+// namespace it is in, in plan order.
+func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange)) {
+	if r == nil {
+		return
+	}
 	for _, sc := range r.Changes {
 		if sc == nil {
 			continue
 		}
 		for _, t := range sc.TableChanges {
 			if unsafeChange, ok := t.UnsafeChange(); ok {
-				result = append(result, unsafeChange)
+				fn(sc.Namespace, unsafeChange)
 			}
 		}
-		result = append(result, sc.VSchemaUnsafeChanges()...)
+		for _, c := range sc.VSchemaUnsafeChanges() {
+			fn(sc.Namespace, c)
+		}
 	}
-	return result
 }
 
 // HasBlockedChanges reports whether any planned change carries the blocked

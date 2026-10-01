@@ -298,6 +298,10 @@ func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType,
 		IgnoreTables:      ignoreTables,
 		GroupedExecution:  groupedExecution,
 		Target:            target,
+		// The CLI renders the plan of every rollout member, and refuses an
+		// apply for the members its rollout lists as needing attention or
+		// as refused.
+		RendersRollout: true,
 	}
 	if pr != 0 {
 		prVal := int32(pr)
@@ -338,6 +342,9 @@ func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string,
 		Caller:      caller,
 		Options:     options,
 		Target:      target,
+		// The plan applied was rendered member by member; see
+		// postPlanRequestWithContext.
+		RendersRollout: true,
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {
