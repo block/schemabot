@@ -44,6 +44,10 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 		s.writeWebhookOpsError(w, err)
 		return
 	}
+	if err := validateChecksInspectRequest(s.config, req); err != nil {
+		s.writeWebhookOpsError(w, err)
+		return
+	}
 	if !s.checkChecksInspectCallerBudget(w, r, req) {
 		return
 	}
@@ -136,17 +140,7 @@ func executeChecksInspectWith(ctx context.Context, cfg *ServerConfig, store stor
 	if store == nil {
 		return nil, fmt.Errorf("storage is not configured")
 	}
-	if err := requireRepoFullName(req.Repo); err != nil {
-		return nil, err
-	}
-	if req.PullRequest <= 0 {
-		return nil, webhookOpsRequestErrorf("pull_request must be positive")
-	}
-	// A mistyped environment would silently narrow the response to nothing and
-	// read as "this pull request has no check state", which is the opposite of
-	// what an operator is here to find out. On an instance that scopes nothing
-	// by environment the filter would also drop the one global aggregate.
-	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+	if err := validateChecksInspectRequest(cfg, req); err != nil {
 		return nil, err
 	}
 	if logger == nil {
@@ -158,6 +152,23 @@ func executeChecksInspectWith(ctx context.Context, cfg *ServerConfig, store stor
 		return nil, err
 	}
 	return inspectChecks(ctx, cfg, store, client, req, logger)
+}
+
+func validateChecksInspectRequest(cfg *ServerConfig, req ChecksInspectRequest) error {
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return err
+	}
+	if req.PullRequest <= 0 {
+		return webhookOpsRequestErrorf("pull_request must be positive")
+	}
+	// A mistyped environment would silently narrow the response to nothing and
+	// read as "this pull request has no check state", which is the opposite of
+	// what an operator is here to find out. On an instance that scopes nothing
+	// by environment the filter would also drop the one global aggregate.
+	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+		return err
+	}
+	return nil
 }
 
 func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage, client checksInspectClient, req ChecksInspectRequest, logger *slog.Logger) (*ChecksInspectResponse, error) {

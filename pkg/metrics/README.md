@@ -452,13 +452,12 @@ failed before the target resolved.
 ### Rate Limits
 
 `schemabot.rate_limit_decisions.total` tracks the request-budget decisions made
-by the API's rate-limited endpoints (today `POST /api/pull`). Both outcomes are
-counted, so `decision=limit` has a denominator and a client approaching its
-budget shows up as a rising share of one endpoint's traffic before any request
-is actually refused.
+by `POST /api/pull` and `GET /api/checks/inspect`. Both outcomes are counted, so
+`decision=limit` has a denominator and a client approaching its budget shows up
+as a rising share of one endpoint's traffic before any request is refused.
 
-`scope` says which of the two budgets was consulted, and they answer different
-questions:
+`scope` says which budget was consulted. Pull requests consult both scopes;
+check inspection has only a caller budget.
 
 | Scope | Keyed on | A sustained `limit` rate means |
 |---|---|---|
@@ -471,12 +470,12 @@ per client per database. Every limited request logs both alongside the
 advertised retry delay, so a spike on this counter is triaged from the WARN
 logs, not by slicing the metric.
 
-`environment` arrives in the request body, so it is clamped to a configured
-environment before it is recorded and appears as `unconfigured` otherwise. A
-budget is still keyed on the environment the request named — an unroutable
-request spends budget like any other — so a rising `unconfigured` share means
-clients are asking for environments this server does not serve. The unclamped
-name is in the log.
+`environment` is clamped to a configured environment before it is recorded and
+appears as `unconfigured` otherwise. Pull budgets are still keyed on the
+environment the request named, so a rising `unconfigured` share on that
+endpoint means clients are asking for environments this server does not serve.
+Check inspection validates the environment before recording or spending its
+budget. The unclamped name is in the log.
 
 Budgets are enforced per server process, so a fleet-wide `limit` rate is the sum
 across replicas and the effective ceiling is `replicas ×` the configured rate.

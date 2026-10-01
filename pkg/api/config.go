@@ -448,18 +448,15 @@ func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
 // expected check name, all uncached, on the installation the merge gate writes
 // Check Runs through.
 //
-// The worst case one caller can cost the installation per hour is
+// The sustained per-caller inspection budget per hour is approximately
 //
 //	60 × requests_per_minute × (1 + N)
 //
-// GitHub calls, where N is the number of check names the deployment publishes
-// for the repository. At the default rate that is 360 × (1 + N): with three
-// check names, 1,440 calls, under a third of the installation's hourly quota,
-// which leaves the merge gate's own Check Run writes room even while one
-// caller is stuck in a loop. A dashboard polling three pull requests every 30
-// seconds spends exactly the sustained rate, and the burst lets it load a page
-// of them at once. Deployments publishing more check names cost more per
-// inspection and should lower requests_per_minute.
+// GitHub calls when each lookup fits on one page, where N is the number of
+// check names the deployment publishes for the repository. Pagination
+// multiplies the Check Run reads, and the initial burst adds inspections above
+// the sustained rate. Deployments publishing more check names or observing
+// deep Check Run histories should lower requests_per_minute.
 const (
 	defaultChecksInspectPerCallerRequestsPerMinute = 6
 	defaultChecksInspectPerCallerBurst             = 10

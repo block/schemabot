@@ -637,13 +637,13 @@ rate_limits:
       burst: 10               # default: 10
 ```
 
-Each inspection costs one GitHub read for the pull request plus one per
-expected check name, so one caller can cost the installation at most
-`60 × requests_per_minute × (1 + N)` calls an hour, where N is the number of
-check names. At the default that is `360 × (1 + N)`: 1,440 calls with three
-check names, under a third of the hourly quota. A dashboard polling three pull
-requests every 30 seconds fits the default; poll at 30 seconds or longer. A
-deployment that publishes more check names per repository should lower
+As an approximate sustained budget, each inspection costs one GitHub read for
+the pull request plus at least one per expected check name. The hourly estimate
+is `60 × requests_per_minute × (1 + N)`, where N is the number of check names.
+Check Run pagination multiplies those reads, and the initial burst permits
+additional inspections. A dashboard polling three pull requests every 30
+seconds fits the sustained default; poll at 30 seconds or longer. A deployment
+that publishes more check names or has deep Check Run histories should lower
 `requests_per_minute`.
 
 `per_caller` is keyed the same way as the pull endpoint's. With API auth

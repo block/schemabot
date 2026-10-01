@@ -53,6 +53,11 @@ func newRateLimitedInspectService(t *testing.T, limits CallerRateLimitConfig, au
 // the request unauthenticated.
 func inspectAs(t *testing.T, svc *Service, caller string) *httptest.ResponseRecorder {
 	t.Helper()
+	return inspectQueryAs(t, svc, caller, "/api/checks/inspect?repo=acme/store&pull_request=7")
+}
+
+func inspectQueryAs(t *testing.T, svc *Service, caller, target string) *httptest.ResponseRecorder {
+	t.Helper()
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
@@ -60,10 +65,27 @@ func inspectAs(t *testing.T, svc *Service, caller string) *httptest.ResponseReco
 	if caller != "" {
 		ctx = auth.WithUser(ctx, &auth.User{Subject: caller})
 	}
-	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/checks/inspect?repo=acme/store&pull_request=7", nil)
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	return w
+}
+
+func TestChecksInspectRateLimitValidatesBeforeChargingCaller(t *testing.T) {
+	svc, calls := newRateLimitedInspectService(t, CallerRateLimitConfig{
+		PerCaller: RateLimitBudgetConfig{RequestsPerMinute: 60, Burst: 1},
+	}, AuthConfig{})
+
+	invalid := inspectQueryAs(t, svc, "", "/api/checks/inspect?repo=malformed&pull_request=7")
+	require.Equal(t, http.StatusBadRequest, invalid.Code, invalid.Body.String())
+	assert.Zero(t, calls.total(), "an invalid target must not reach GitHub")
+
+	valid := inspectAs(t, svc, "")
+	require.Equal(t, http.StatusOK, valid.Code, valid.Body.String())
+	assert.Positive(t, calls.total(), "a valid target consumes the available token")
+
+	limited := inspectAs(t, svc, "")
+	assert.Equal(t, http.StatusTooManyRequests, limited.Code, limited.Body.String())
 }
 
 // A dashboard polling a pull request's check state is served while it stays
