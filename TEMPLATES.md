@@ -1861,7 +1861,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (reviewed target only; other targets not shown):
+📊 **Table sizes** (reviewed target only; targets could not be listed):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter

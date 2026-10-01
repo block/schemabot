@@ -1404,12 +1404,21 @@ func tableSizesHeading(qualifiers ...string) string {
 // reviewedTargetSizeScope names the target whose sizes a rollout's section
 // shows when the rollout carries no per-target sizes: the sizes come from the
 // reviewed plan alone, and a reader would otherwise take them for every
-// target's. The reviewed target is named when the rollup identifies it.
+// target's. The reviewed target is named when the rollup identifies it. A
+// rollup of one member has no other target, so its sizes need no scope. A
+// rollup that could not be computed names no members, so it cannot say
+// whether other targets exist and claims none.
 func reviewedTargetSizeScope(drift *DeploymentDriftData) string {
+	if !drift.Computed || len(drift.Deployments) == 0 {
+		return "reviewed target only; targets could not be listed"
+	}
+	if len(drift.Deployments) == 1 {
+		return ""
+	}
 	names := driftMemberNames(drift.Deployments)
 	for i, d := range drift.Deployments {
 		if d.Primary {
-			return fmt.Sprintf("reviewed target `%s` only; other targets not shown", names[i])
+			return fmt.Sprintf("reviewed target %s only; other targets not shown", inlineCode(names[i]))
 		}
 	}
 	return "reviewed target only; other targets not shown"
@@ -1517,7 +1526,7 @@ func writeTableSizesByTarget(sb *strings.Builder, entries []tableSizeEntry) {
 	sb.WriteString("<details>\n<summary>Size on each target</summary>\n\n")
 	listed := min(len(spread), tableSizesListedLimit)
 	for _, e := range spread[:listed] {
-		fmt.Fprintf(sb, "- `%s`\n", e.name)
+		fmt.Fprintf(sb, "- %s\n", inlineCode(e.name))
 		writeTargetSizeLines(sb, targetSizesLargestFirst(e.perTarget))
 	}
 	if unlisted := len(spread) - listed; unlisted > 0 {
@@ -1543,12 +1552,12 @@ func writeTargetSizeLines(sb *strings.Builder, sorted []TargetTableSize) {
 		shown = sized
 	}
 	for _, ts := range sorted[:shown] {
-		fmt.Fprintf(sb, "  - `%s`: %s\n", ts.Target, formatTableSize(ts.Size))
+		fmt.Fprintf(sb, "  - %s: %s\n", inlineCode(ts.Target), formatTableSize(ts.Size))
 	}
 	rest, unsized := sorted[shown:sized], sorted[sized:]
 	if len(unsized) <= tableSizesUnestimatedNamed {
 		for _, ts := range unsized {
-			fmt.Fprintf(sb, "  - `%s`: %s\n", ts.Target, formatTableSize(ts.Size))
+			fmt.Fprintf(sb, "  - %s: %s\n", inlineCode(ts.Target), formatTableSize(ts.Size))
 		}
 		unsized = nil
 	}
@@ -1590,7 +1599,7 @@ func targetSizesLargestFirst(perTarget []TargetTableSize) []TargetTableSize {
 
 func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
 	for _, e := range entries {
-		fmt.Fprintf(sb, "- `%s`: %s\n", e.name, formatTableSizeEntry(e))
+		fmt.Fprintf(sb, "- %s: %s\n", inlineCode(e.name), formatTableSizeEntry(e))
 	}
 }
 
@@ -1608,18 +1617,18 @@ func formatTableSizeEntry(e tableSizeEntry) string {
 	total, sized := e.totalBytes()
 	switch {
 	case sized == 0 && targets == 1:
-		return fmt.Sprintf("size estimate unavailable on `%s`", e.perTarget[0].Target)
+		return fmt.Sprintf("size estimate unavailable on %s", inlineCode(e.perTarget[0].Target))
 	case sized == 0:
 		return fmt.Sprintf("size estimate unavailable on all %d targets", targets)
 	case targets == 1:
-		return fmt.Sprintf("%s on `%s`", ui.FormatApproxBytes(total), e.perTarget[0].Target)
+		return fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), inlineCode(e.perTarget[0].Target))
 	}
 	ordered := targetSizesLargestFirst(e.perTarget)
 	largest, smallest := ordered[0], ordered[sized-1]
 	var parts []string
 	switch sized {
 	case 1:
-		parts = append(parts, fmt.Sprintf("%s on `%s`", ui.FormatApproxBytes(total), largest.Target))
+		parts = append(parts, fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), inlineCode(largest.Target)))
 	case targets:
 		parts = append(parts, fmt.Sprintf("%s across %d targets", ui.FormatApproxBytes(total), targets))
 	default:
@@ -1627,13 +1636,13 @@ func formatTableSizeEntry(e tableSizeEntry) string {
 	}
 	if sized > 1 {
 		parts = append(parts,
-			fmt.Sprintf("largest %s on `%s`", ui.FormatApproxBytes(*largest.Size.EstimatedBytes), largest.Target),
+			fmt.Sprintf("largest %s on %s", ui.FormatApproxBytes(*largest.Size.EstimatedBytes), inlineCode(largest.Target)),
 			fmt.Sprintf("smallest %s", ui.FormatApproxBytes(*smallest.Size.EstimatedBytes)))
 	}
 	switch unsized := ordered[sized:]; len(unsized) {
 	case 0:
 	case 1:
-		parts = append(parts, fmt.Sprintf("size estimate unavailable on `%s`", unsized[0].Target))
+		parts = append(parts, fmt.Sprintf("size estimate unavailable on %s", inlineCode(unsized[0].Target)))
 	default:
 		parts = append(parts, fmt.Sprintf("size estimate unavailable on %d targets", len(unsized)))
 	}

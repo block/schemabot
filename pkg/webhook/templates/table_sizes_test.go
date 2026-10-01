@@ -535,13 +535,49 @@ func TestRenderPlanComment_MultiTargetWithoutTargetSizesNamesReviewedTarget(t *t
 }
 
 // A rollup that could not be computed names no members, so the heading scopes
-// the sizes to the reviewed target without naming it.
+// the sizes to the reviewed target without naming it, and without claiming
+// other targets exist: the database may have only the reviewed one.
 func TestRenderPlanComment_UncomputedRollupScopesSizesToReviewedTarget(t *testing.T) {
 	data := multiTargetSizePlanData(nil)
 	data.DeploymentDrift = &DeploymentDriftData{Computed: false}
 	out := RenderPlanComment(data)
 
-	assert.Contains(t, out, "📊 **Table sizes** (reviewed target only; other targets not shown):\n")
+	assert.Contains(t, out, "📊 **Table sizes** (reviewed target only; targets could not be listed):\n")
+	assert.NotContains(t, out, "other targets")
+}
+
+// A rollup of a single target has no other target the sizes could be read
+// for, so the heading carries no scope.
+func TestRenderPlanComment_SingleTargetRollupSizesHaveNoScope(t *testing.T) {
+	data := multiTargetSizePlanData(nil)
+	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()[:1]}
+	out := RenderPlanComment(data)
+
+	assert.Contains(t, out, "📊 **Table sizes**:\n- `orders`: ~100 KB\n\n")
+}
+
+// Target and table names come from server config and the PR, so each renders
+// as a code span it cannot close: a name carrying a backtick or a line break
+// stays inside its span instead of writing markdown into the comment.
+func TestRenderPlanComment_TableSizeNamesStayInCodeSpans(t *testing.T) {
+	members := previewRolloutMembers()
+	members[0].Deployment = "prim`ary"
+	data := multiTargetSizePlanData(nil)
+	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: members}
+	assert.Contains(t, RenderPlanComment(data), "(reviewed target `` prim`ary `` only; other targets not shown)")
+
+	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
+		targetSize("primary/a`b", "ord`ers", 23_400_000_000),
+		targetSize("primary/c\n# d", "ord`ers", 1_130_000_000),
+		unsizedTarget("primary/e`f", "ord`ers"),
+		targetSize("primary/g`h", "us`ers", 1_000_000),
+	}))
+	assert.Contains(t, out, "- `` ord`ers ``: ~24.5 GB across 2 of 3 targets · largest ~23.4 GB on `` primary/a`b `` · smallest ~1.1 GB · size estimate unavailable on `` primary/e`f ``\n")
+	assert.Contains(t, out, "- `` us`ers ``: ~1 MB on `` primary/g`h ``\n")
+	assert.Contains(t, out, "- `` ord`ers ``\n"+
+		"  - `` primary/a`b ``: ~23.4 GB\n"+
+		"  - `primary/c # d`: ~1.1 GB\n"+
+		"  - `` primary/e`f ``: size estimate unavailable\n")
 }
 
 // A folded section on the reviewed-target fallback carries both the table
