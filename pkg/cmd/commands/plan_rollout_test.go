@@ -42,10 +42,10 @@ func paymentsTargets(from, to int) []string {
 }
 
 // A rollout of three targets, two of which still need the column and one
-// already at the desired schema, is planned one group at a time: the groups
-// are introduced as divergence, each heading names its targets, the group
-// with work leads with its DDL, and the settled target says it has nothing to
-// run. The primary's plan alone would have hidden that prod/payments-003 is done.
+// already at the desired schema, is planned one group at a time: each
+// heading names its targets, the group with work leads with its DDL, and the
+// settled target says it has nothing to run. The primary's plan alone would
+// have hidden that prod/payments-003 is done.
 func TestWritePlanBody_ThreeTargetRolloutGroupsTargetsByPlan(t *testing.T) {
 	plan := &apitypes.PlanResponse{
 		Database: "orders",
