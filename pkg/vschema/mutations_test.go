@@ -15,7 +15,7 @@ func TestMutations_NoChange(t *testing.T) {
 
 func TestMutations_EmptyCurrent(t *testing.T) {
 	// A new keyspace has no current VSchema, so nothing can mutate.
-	for _, current := range []string{"", "   ", "{}"} {
+	for _, current := range []string{"", "   "} {
 		mutations, err := Mutations(current, shardedVSchema)
 		require.NoError(t, err)
 		assert.Empty(t, mutations)
@@ -162,8 +162,8 @@ func TestMutations_CombinedTypeParamsOwner(t *testing.T) {
 func TestMutations_KeyspaceAndTableRouting(t *testing.T) {
 	// Changes to the keyspace's sharded flag or to a table's type, primary
 	// vindex, or auto-increment re-route rows or change where ids come from
-	// the moment the VSchema lands, so each is disclosed. Additions — a new
-	// secondary vindex, an auto-increment on a table that had none — are not.
+	// the moment the VSchema lands, so each is disclosed. A new secondary
+	// vindex is not.
 	const vindexes = `"vindexes": {"hash": {"type": "hash"}, "xxhash": {"type": "xxhash"}}`
 	usersTable := func(body string) string {
 		return `{"sharded": true, ` + vindexes + `, "tables": {"users": {` + body + `}}}`
@@ -203,7 +203,7 @@ func TestMutations_KeyspaceAndTableRouting(t *testing.T) {
 			desired:        usersTable(hashID),
 			wantKind:       MutationKindTableAutoIncrement,
 			wantName:       "users",
-			reasonContains: []string{`stops using sequence "users_seq" for column "id"`, "collide across shards"},
+			reasonContains: []string{`stops using sequence "users_seq" for column "id"`, "not guaranteed to generate"},
 		},
 		{
 			name:           "re-pointing the auto-increment sequence",
@@ -251,9 +251,12 @@ func TestMutations_KeyspaceAndTableRouting(t *testing.T) {
 			desired: usersTable(hashIDThenXXHashEmail),
 		},
 		{
-			name:    "adding an auto-increment to a table without one is not a mutation",
-			current: usersTable(hashID),
-			desired: usersTable(hashID + `, ` + usersSeq),
+			name:           "adding an auto-increment changes the id source",
+			current:        usersTable(hashID),
+			desired:        usersTable(hashID + `, ` + usersSeq),
+			wantKind:       MutationKindTableAutoIncrement,
+			wantName:       "users",
+			reasonContains: []string{`starts using sequence "users_seq" for column "id"`, "different source"},
 		},
 		{
 			name:    "giving a table its first column vindex is not a mutation",
@@ -279,11 +282,9 @@ func TestMutations_KeyspaceAndTableRouting(t *testing.T) {
 	}
 }
 
-func TestMutations_AutoIncrementRemovalFollowsSharding(t *testing.T) {
-	// Without its sequence each shard issues ids on its own, so dropping an
-	// auto-increment is disclosed whenever the keyspace is sharded before or
-	// after the change. A keyspace that stays unsharded keeps its database's
-	// own auto-increment column issuing unique ids, so the removal is not.
+func TestMutations_AutoIncrementChangesAreUnsafeInEveryKeyspace(t *testing.T) {
+	// Vitess uses a configured sequence in sharded and unsharded keyspaces, so
+	// every presence transition changes the id source.
 	const seq = `, "auto_increment": {"column": "id", "sequence": "users_seq"}`
 	unsharded := func(extra string) string { return `{"tables": {"users": {"column_vindexes": []` + extra + `}}}` }
 	sharded := func(extra string) string {
@@ -296,7 +297,8 @@ func TestMutations_AutoIncrementRemovalFollowsSharding(t *testing.T) {
 		desired   string
 		wantKinds []string
 	}{
-		{name: "stays unsharded", current: unsharded(seq), desired: unsharded("")},
+		{name: "remove while unsharded", current: unsharded(seq), desired: unsharded(""), wantKinds: []string{MutationKindTableAutoIncrement}},
+		{name: "add while unsharded", current: unsharded(""), desired: unsharded(seq), wantKinds: []string{MutationKindTableAutoIncrement}},
 		{name: "stays sharded", current: sharded(seq), desired: sharded(""), wantKinds: []string{MutationKindTableAutoIncrement}},
 		{name: "unsharded to sharded", current: unsharded(seq), desired: sharded(""), wantKinds: []string{MutationKindKeyspaceSharded, MutationKindTableAutoIncrement}},
 		{name: "sharded to unsharded", current: sharded(seq), desired: unsharded(""), wantKinds: []string{MutationKindKeyspaceSharded, MutationKindTableAutoIncrement}},
@@ -318,6 +320,13 @@ func TestMutations_AutoIncrementRemovalFollowsSharding(t *testing.T) {
 			assert.Equal(t, tt.wantKinds, kinds)
 		})
 	}
+}
+
+func TestMutations_EmptyObjectCanBecomeSharded(t *testing.T) {
+	mutations, err := Mutations(`{}`, `{"sharded": true}`)
+	require.NoError(t, err)
+	require.Len(t, mutations, 1)
+	assert.Equal(t, MutationKindKeyspaceSharded, mutations[0].Kind)
 }
 
 func TestMutations_PrimaryVindexRemovedAlsoReportsNewPrimary(t *testing.T) {

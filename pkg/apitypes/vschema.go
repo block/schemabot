@@ -73,8 +73,8 @@ func ParseVSchemaDeletions(metadata map[string]string) ([]VSchemaDeletion, error
 // JSON-encoded []VSchemaMutation. A mutation removes nothing but changes how
 // Vitess routes rows or issues ids — a vindex type change or a new primary
 // vindex re-computes every row's keyspace id, a repointed lookup backing
-// table moves lookup rows, a dropped auto-increment sequence lets shards
-// issue colliding ids — so any recorded mutation makes the plan's VSchema
+// table moves lookup rows, and an auto-increment change switches the source
+// of generated ids — so any recorded mutation makes the plan's VSchema
 // change an unsafe change requiring the same operator opt-in as a removal.
 const VSchemaMutationsMetadataKey = "vschema_mutations"
 
