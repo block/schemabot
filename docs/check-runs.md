@@ -979,8 +979,13 @@ which namespaces end with a finalizer, and the VSchema each of those writes.
 The reviewed target is held to the confirmed plan while the environment has
 several targets, and also when the confirmed round stored plans for other
 targets, even if the rollout has since shrunk to the reviewed target alone.
-The refusal names the target whose plan changed. An automatic apply never runs
-other targets' work.
+So a reviewed-target statement whose DDL is unchanged but that now runs as
+direct execution, or is now blocked, refuses here and releases the lock rather
+than pausing again or being rejected as blocked, as it would on a single
+target. The refusal names the target whose plan changed and the part of its
+work that differs: its statements, how they run, which namespaces it
+finalizes, or the VSchema it writes. An automatic apply never runs other
+targets' work.
 
 ### Apply confirmed
 

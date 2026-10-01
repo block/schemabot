@@ -667,7 +667,7 @@ func TestE2EApplyConfirmRefusesWhenAnotherTargetsStatementsChange(t *testing.T) 
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body = awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: target us/"+dbName+"-us-target would run statements the confirmed round did not plan")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the plan of target us/"+dbName+"-us-target differs from what the confirmed round planned, in its statements")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -699,7 +699,7 @@ func TestE2EApplyConfirmRefusesWhenTheReviewedTargetsStatementsChange(t *testing
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body = awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the reviewed target would run statements the confirmed plan did not show")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the reviewed target differs from the confirmed plan in its statements")
 	assert.NotContains(t, body, "other than the reviewed one", "the reviewed target's plan changed, not the other targets'")
 
 	requireNoApplies(t, svc, dbName)
@@ -734,7 +734,7 @@ func TestE2EApplyConfirmRefusesWhenOnlyTheReviewedTargetsStatementsChange(t *tes
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the reviewed target would run statements the confirmed plan did not show")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the reviewed target differs from the confirmed plan in its statements")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -830,7 +830,7 @@ func TestE2EApplyConfirmRechecksTheReviewedTargetAfterTheRolloutShrinks(t *testi
 
 	confirm := runRolloutCommand(t, shrunk, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body = awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the reviewed target would run statements the confirmed plan did not show")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the reviewed target differs from the confirmed plan in its statements")
 
 	requireNoApplies(t, shrunk, dbName)
 	requireNoApplyLock(t, shrunk, dbName)
@@ -905,10 +905,109 @@ func TestE2EApplyConfirmComparesTheReviewedTargetsWholePlan(t *testing.T) {
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the reviewed target would run statements the confirmed plan did not show")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the reviewed target differs from the confirmed plan in which namespaces it finalizes")
+	assert.NotContains(t, body, "in its statements", "the statements are the same on both sides, so the refusal does not point at them")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
+}
+
+// Two targets reshape the users primary key under the direct execution policy,
+// so the apply pauses on a rollout comment that shows each target's plan. Before
+// the confirm, us gets the reshape out of band, leaving only eu (the reviewed
+// target) with work, and the way eu's unchanged statement runs moves:
+//
+//   - newly direct: the confirmed comment showed the reshape running through the
+//     schema change engine, and the re-plan routes it to native DDL;
+//   - newly blocked: the confirmed comment disclosed it as direct execution, and
+//     the policy is then switched off, so the re-plan blocks it.
+//
+// How each statement runs is part of the plan the confirmation was given
+// against, so apply-confirm refuses and names that as what differs. It does not
+// stop to disclose the change for another confirmation or reject it as blocked,
+// as a single target's apply-confirm would: it runs nothing, leaves eu's primary
+// key alone, and releases the lock so the operator reviews the rollout again.
+func TestE2EApplyConfirmRefusesWhenHowTheReviewedTargetsStatementRunsMoves(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		dbName     string
+		pinnedMode string
+		confirmVia func(t *testing.T, svc *api.Service, dbName string) *api.Service
+	}{
+		{
+			name:       "newly direct",
+			dbName:     "webhook_rollout_reviewed_newly_direct",
+			pinnedMode: "",
+			confirmVia: func(_ *testing.T, svc *api.Service, _ string) *api.Service { return svc },
+		},
+		{
+			name:       "newly blocked",
+			dbName:     "webhook_rollout_reviewed_newly_blocked",
+			pinnedMode: "direct",
+			confirmVia: func(t *testing.T, svc *api.Service, dbName string) *api.Service {
+				return rolloutServiceOver(t, svc, dbName, "eu", "us")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbName := tc.dbName
+			preReshape := "CREATE TABLE `users` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  `tenant_id` bigint unsigned NOT NULL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+			svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+				{name: "eu", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+				{name: "us", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+			}, api.PlanIndependent)
+			t.Cleanup(func() {
+				_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+			})
+			files := map[string]string{"users.sql": pkSwapSchema}
+
+			apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
+			body := awaitCommentContaining(t, apply, "Confirmation required")
+			require.Contains(t, body, "**Direct execution**", "the policy routes the reshape to direct execution on both targets")
+
+			lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+			require.NoError(t, err)
+			require.NotNil(t, lock, "the paused apply pins its plan")
+			confirmed, err := svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
+			require.NoError(t, err)
+			require.NotNil(t, confirmed)
+			require.Len(t, confirmed.FlatDDLChanges(), 1)
+			require.Equal(t, "direct", confirmed.FlatDDLChanges()[0].ExecutionMode)
+			if tc.pinnedMode != "direct" {
+				confirmed.ID = 0
+				confirmed.PlanIdentifier = "plan-engine-routed-" + dbName
+				for _, namespace := range confirmed.Namespaces {
+					for i := range namespace.Tables {
+						namespace.Tables[i].ExecutionMode = tc.pinnedMode
+						namespace.Tables[i].ModeReason = ""
+					}
+				}
+				_, err = svc.Storage().Plans().Create(t.Context(), confirmed)
+				require.NoError(t, err)
+				lock.PendingPlanID = confirmed.PlanIdentifier
+				require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), lock))
+			}
+
+			us := openDriftDB(t, driftDSN(t, dbName+"_us"))
+			_, err = us.ExecContext(t.Context(), "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`,`tenant_id`)")
+			require.NoError(t, err)
+
+			confirmer := tc.confirmVia(t, svc, dbName)
+			confirm := runRolloutCommandWithFiles(t, confirmer, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe", files)
+			body = awaitCommentContaining(t, confirm, "nothing was applied")
+			assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the reviewed target differs from the confirmed plan in how its statements run")
+			assert.NotContains(t, body, "Changes run differently", "a rollout confirmation is refused, not re-disclosed for another confirmation")
+
+			requireNoApplies(t, svc, dbName)
+			requireNoApplyLock(t, svc, dbName)
+			assert.Equal(t, []string{"id"}, appPrimaryKeyColumns(t, dbName+"_eu", "users"),
+				"the refused confirm left eu's primary key unchanged")
+		})
+	}
 }
 
 // planResultFailingStorage fails every plan-result write to stored check

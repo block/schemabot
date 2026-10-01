@@ -238,7 +238,7 @@ func (h *Handler) executeApply(
 		// the confirmed comment showed. A rollout that has since shrunk to the
 		// reviewed target is still checked against its confirmed round.
 		if storedPlan == nil {
-			covered, coverErr := h.confirmationCoversReviewedTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
+			difference, coverErr := h.confirmationCoversReviewedTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
 			if coverErr != nil {
 				h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its round, or the re-plan to compare the reviewed target's work; the pending confirmation is preserved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
@@ -247,13 +247,14 @@ func (h *Handler) executeApply(
 					"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
 				return
 			}
-			if !covered {
+			if difference != workUnchanged {
+				reason := reviewedTargetDifferenceReason(difference)
 				h.logger.Info("apply-confirm refused: the reviewed target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
-				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the reviewed target's statements are not what was confirmed")
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
 				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-					unconfirmedWorkMessage(rollout.work, "the reviewed target would run statements the confirmed plan did not show"))
+					unconfirmedWorkMessage(rollout.work, reason))
 				return
 			}
 		}
@@ -264,7 +265,10 @@ func (h *Handler) executeApply(
 	// resolved a change to blocked even if the reviewed plan had none (e.g.
 	// the direct execution policy changed, or the table grew past its bound).
 	// Release the lock: no retry of this command can succeed, so holding it
-	// would only force a manual unlock after the schema is rewritten.
+	// would only force a manual unlock after the schema is rewritten. An
+	// apply-confirm given on a rollout's comment refuses a reviewed-target
+	// statement newly resolved to blocked above instead, since how each
+	// statement runs is part of the confirmed plan it is held to.
 	if planResp.HasBlockedChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
@@ -293,9 +297,16 @@ func (h *Handler) executeApply(
 	// route a statement to direct execution that the plan behind the comment the
 	// operator was last shown ran through the engine, without its DDL changing.
 	// That comment never disclosed the native DDL, so stop and ask against one
-	// that does. The pending confirmation moves onto this re-plan, so confirming
-	// it is checked against the comment that disclosed the direct statements
-	// rather than stopping again on the old one.
+	// that does.
+	//
+	// On a single target, the pending confirmation moves onto this re-plan, so
+	// confirming it is checked against the comment that disclosed the direct
+	// statements rather than stopping again on the old one. An apply-confirm
+	// given on a rollout's comment never reaches here with such a change: the
+	// reviewed target is held to its whole confirmed plan above, how each
+	// statement runs included, so a statement newly routed to direct execution
+	// refuses there and releases the lock, and the operator reviews the rollout
+	// again with a fresh apply.
 	if disclosedPlan != nil {
 		if newlyDirect := newlyDirectChanges(planResp, disclosedPlan); len(newlyDirect) > 0 {
 			h.logger.Info("apply stopped for confirmation: re-plan routes changes to direct execution that the disclosed plan did not",
