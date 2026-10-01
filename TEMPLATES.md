@@ -239,16 +239,14 @@ ALTER TABLE `users` ADD INDEX `idx_tenant_id`(`tenant_id`);
 ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
 ```
 
-📊 **Table sizes** (34 tables, largest first; 2 without a size estimate):
+<details>
+<summary>📊 <b>Table sizes</b></summary>
+
 - `audit_events`: ~186 GB
 - `ledger_entries`: ~121 GB
 - `line_items`: ~58 GB
 - `notifications`: ~44 GB
 - `orders`: ~26.5 GB
-
-<details>
-<summary>29 more tables</summary>
-
 - `payments`: ~23.1 GB
 - `invoices`: ~17.4 GB
 - `fulfillments`: ~11.8 GB
@@ -1666,7 +1664,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 📊 **Table sizes**:
-- `products`: ~1.1 GB
+- `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1726,7 +1724,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 📊 **Table sizes**:
-- `products`: ~1.1 GB
+- `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1785,7 +1783,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes**:
+📊 **Table sizes** (reviewed target `eu` only; other targets not shown):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -1841,7 +1839,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes**:
+📊 **Table sizes** (reviewed target only; targets could not be listed):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -2035,8 +2033,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24 GB across 2 targets (~610 MB on `primary/testapp_1`, ~23.4 GB on `primary/testapp_2`)
-- `users`: ~193 MB across 2 targets (~95 MB on `primary/testapp_1`, ~98 MB on `primary/testapp_2`)
+- `orders`: ~24 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
+- `users`: ~193 MB across 2 targets · largest ~98 MB on `primary/testapp_2` · smallest ~95 MB
 
 📋 **Plan**: **2** tables to alter
 
@@ -2071,8 +2069,48 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24 GB across 2 of 3 targets; 1 has no estimate
-- `users`: ~297 MB across 3 targets
+- `orders`: ~24 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
+- `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95 MB
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-table-sizes-reviewed-target-only"></a><strong>Rollout Plans (Table Sizes, Reviewed Target Only)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:
+
+- `primary/testapp_1` (primary) ✅ planned against its own schema
+- `primary/testapp_2` ✅ planned against its own schema
+- `primary/testapp_3` ❌ could not plan — diff failed; see server logs
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📊 **Table sizes** (reviewed target `primary/testapp_1` only; other targets not shown):
+- `orders`: ~610 MB
+- `users`: ~95 MB
 
 📋 **Plan**: **2** tables to alter
 
