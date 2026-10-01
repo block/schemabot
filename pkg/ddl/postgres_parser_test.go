@@ -814,6 +814,32 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 	})
 }
 
+// The serial verdict mirrors the server's transformColumnDefinition: a single
+// name that reaches the parser as one of the six serial spellings. A quoted
+// name keeps its case, so "BIGSERIAL" is an ordinary (nonexistent) type to the
+// server and is not refused here; a schema-qualified name is an ordinary type
+// lookup, so public.serial is not refused either.
+func TestPostgresAddColumnManualReasonSerialFollowsServerRule(t *testing.T) {
+	for _, tc := range []struct {
+		name, createDDL string
+		serial          bool
+	}{
+		{"quoted lowercase is serial", `CREATE TABLE metrics (a bigint, seq "bigserial")`, true},
+		{"quoted uppercase is not serial", `CREATE TABLE metrics (a bigint, seq "BIGSERIAL")`, false},
+		{"schema-qualified is not serial", `CREATE TABLE metrics (a bigint, seq public.serial)`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, err := PostgresAddColumnManualReason(tc.createDDL, "seq")
+			require.NoError(t, err)
+			if tc.serial {
+				assert.Contains(t, reason, "definition is serial")
+			} else {
+				assert.Empty(t, reason)
+			}
+		})
+	}
+}
+
 func TestPostgresParserCreateIndex(t *testing.T) {
 	p := postgresStatementParser{}
 
