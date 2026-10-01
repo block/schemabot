@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/localsetup"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -165,7 +166,7 @@ func (m *initWizard) hint(step int) string {
 		case stepName:
 			return "Use your PlanetScale database name. SchemaBot addresses the database by it."
 		case stepDSN:
-			return "Use the host, username, and password for your main branch.\nThese are database credentials, separate from your API token.\nhttps://planetscale.com/docs/api/reference/create_password"
+			return "Use the host, username, and password for your main branch.\nThese are database credentials, separate from your API token."
 		case stepStorageDSN:
 			return "SchemaBot needs a separate MySQL database to store plans and progress.\nUse that MySQL server’s connection details here."
 		}
@@ -492,6 +493,9 @@ func (m *initWizard) contentView() string {
 			b.WriteString(bold.Render(label) + "\n\n")
 			if m.isVitess() {
 				b.WriteString(wrap.Render(muted.Render(m.hint(m.step))) + "\n\n")
+			}
+			if m.step == stepDSN && m.isVitess() {
+				b.WriteString(blue.Render(ui.Link("Create a PlanetScale database password ↗", "https://planetscale.com/docs/vitess/connecting/connection-strings")) + "\n\n")
 			}
 			b.WriteString(wrap.Render(m.connectionEditorView()))
 			return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
