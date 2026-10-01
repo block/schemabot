@@ -570,8 +570,8 @@ type ApplyRequest struct {
 	// request apply-confirm that checked the confirmation against every other
 	// target's statements and execution modes, on a comment disclosing each
 	// target's direct changes under that target. Without it, apply creation
-	// refuses another target's direct-execution change: no other caller was
-	// shown it. Direct API callers cannot assert it through JSON.
+	// refuses another target's direct-execution change: no other caller
+	// confirms one. Direct API callers cannot assert it through JSON.
 	ConfirmedMemberWork bool `json:"-"`
 }
 
@@ -1846,12 +1846,13 @@ func (s *Service) createStoredApply(
 	//
 	// A member's direct-execution verdict is the verdict of the target that
 	// runs the statement (RV-4), so its task carries it, whether or not the
-	// reviewed plan has work. Only a pull request apply-confirm has disclosed
-	// it: that comment names each target's direct changes under that target,
-	// and the confirm re-checks each target's statements and execution modes
-	// against the confirmed round before it creates the apply. Any other caller
-	// was shown the reviewed plan alone, so a member's direct change is refused
-	// for it.
+	// reviewed plan has work. Only a pull request apply-confirm confirms it:
+	// that comment names each target's direct changes under that target, and
+	// the confirm re-checks each target's statements and execution modes
+	// against the confirmed round before it creates the apply. No other caller
+	// confirms another target's direct change, the CLI included, though it
+	// shows each target's notice, so a member's direct change is refused for
+	// it, and runs from an apply narrowed to that member.
 	names := applyMemberDisplayNames(members)
 	for i, member := range members {
 		if err := rejectUnapplyableMemberPlan(member, names[i], plan); err != nil {
@@ -2127,9 +2128,9 @@ func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *s
 }
 
 // rejectUnconfirmedMemberDirectExecution refuses a member planned on its own
-// whose plan runs direct-execution DDL, for an apply whose caller was not
-// shown that member's plan. A member running the apply's plan runs exactly the
-// statements, and the verdicts, the caller was shown.
+// whose plan runs direct-execution DDL, for an apply that carries no
+// confirmation of that member's verdict. A member running the apply's plan
+// runs exactly the statements, and the verdicts, of the plan being applied.
 //
 // This holds even when the reviewed plan runs the identical statement directly,
 // unlike an unsafe change the reviewed plan also carries
@@ -2139,14 +2140,17 @@ func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *s
 // that table's writes for as long as the statement runs, and the reviewed plan
 // names the reviewed target's table with the size the planner measured there.
 // Another target's copy of the table was measured on its own and can be any
-// size under the bound. Only the pull request comment shows that target's
-// verdict, with its own measured reason, under that target.
+// size under the bound. Only a pull request apply-confirm confirms that
+// target's verdict, given on the comment that shows it with its own measured
+// reason under that target. A rollout-wide apply over the API confirms no
+// other target's verdict, so that target's direct change runs from an apply
+// narrowed to it, where its plan is the plan being applied.
 func rejectUnconfirmedMemberDirectExecution(member applyMember, applyPlan *storage.Plan) error {
 	if member.Plan == applyPlan {
 		return nil
 	}
 	if table := firstDirectExecutionTable(member.Plan); table != "" {
-		return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, which runs only from a pull request apply-confirm on the comment that discloses it under that target; this apply's caller was shown only the reviewed plan %s",
+		return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, and an apply of the whole rollout from plan %s runs another target's direct-execution DDL only from a pull request apply-confirm on the comment that discloses it under that target; plan and apply the member with its target to run its own plan",
 			member.MemberID(), member.Plan.PlanIdentifier, table, applyPlan.PlanIdentifier)
 	}
 	return nil

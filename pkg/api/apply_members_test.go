@@ -933,12 +933,13 @@ func TestCreateStoredApply_ReviewedPlanWithWorkRunsAMembersDirectChange(t *testi
 		"each target's task carries its own plan's verdict")
 }
 
-// A caller other than a pull request apply-confirm was shown the reviewed plan
-// alone: a direct API caller that posts the reviewed plan's id never saw the
-// other target's own plan, nor that it runs orders as write-blocking native
-// DDL. Apply creation refuses that member's direct change for it, whether or
-// not the reviewed target has work, even when the reviewed plan runs the same
-// statement directly, and stores nothing.
+// A caller other than a pull request apply-confirm confirms no other target's
+// direct-execution verdict: whatever it showed the operator, nothing in an
+// apply of the reviewed plan's id confirms that the other target's own plan
+// runs orders as write-blocking native DDL. Apply creation refuses that
+// member's direct change for it, whether or not the reviewed target has work,
+// even when the reviewed plan runs the same statement directly, and stores
+// nothing.
 func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -969,7 +970,8 @@ func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
 			assert.Contains(t, err.Error(), "runs table \"orders\" as direct-execution DDL")
-			assert.Contains(t, err.Error(), "shown only the reviewed plan plan-primary")
+			assert.Contains(t, err.Error(), "an apply of the whole rollout from plan plan-primary runs another target's direct-execution DDL only from a pull request apply-confirm")
+			assert.Contains(t, err.Error(), "plan and apply the member with its target to run its own plan")
 			applies, ok := svc.storage.Applies().(*capturingApplyStore)
 			require.True(t, ok)
 			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
@@ -980,9 +982,14 @@ func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) 
 // Every entry point that creates an apply without a pull request apply-confirm
 // refuses another target's direct-execution change: the HTTP API that the CLI
 // and direct callers post to, ExecuteApply, which a rollback-confirm also calls
-// without the flag, and the trusted EnqueueAuthorizedApply. Each was shown the
-// reviewed plan alone, and none can assert the confirmation, including through
-// the JSON body of POST /api/apply, which rejects the field as unknown.
+// without the flag, and the trusted EnqueueAuthorizedApply. The HTTP caller
+// here says it renders the rollout, as the CLI does, and the CLI shows
+// eu/testapp-002's direct-execution notice under that target. Showing it is not
+// confirming it: only a pull request apply-confirm confirms another target's
+// direct-execution verdict, and none of these entry points can assert that
+// confirmation, including through the JSON body of POST /api/apply, which
+// rejects the field as unknown. The member's change runs from an apply
+// narrowed to it.
 func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
 	direct := storage.TableChange{
 		Namespace:     "testapp",
