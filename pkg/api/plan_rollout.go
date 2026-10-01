@@ -20,8 +20,12 @@ const unplannedMemberDetail = "could not be planned; see server logs for the cau
 
 // divergedMemberDetail is the detail a plan response gives for a member whose
 // own plan differs from the primary plan it is expected to mirror, with what
-// to do next.
-const divergedMemberDetail = "its live schema differs from the primary's, so the primary's plan does not describe it; bring it back in line with the primary, then plan again"
+// to do next. A rollout-wide apply is refused while it diverges, so the way
+// out is a narrowed apply: of this member when it lacks the change, or of the
+// others when it already has it. selector is what --target accepts for it.
+func divergedMemberDetail(selector string) string {
+	return fmt.Sprintf("its live schema differs from the primary's, so the primary's plan does not describe it; apply each target on its own with --target until they match (this one is --target %s), then plan again", selector)
+}
 
 // planRollout plans the other members of a rollout for a plan requested
 // through the API, so the response says what an apply would run on each
@@ -69,17 +73,23 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 	}
 	rollout := planRolloutResponse(rollup)
 	for i, entry := range rollup.Entries {
-		if entry.Class != DeploymentErrored {
-			continue
-		}
-		s.logger.Warn("rollout member could not be planned; an apply of this plan will be refused until it is",
+		attrs := []any{
 			"database", req.Database,
 			"environment", req.Environment,
 			"plan_id", primaryPlan.GetPlanId(),
+			"member_planning", rollup.Planning.String(),
 			"deployment", entry.Deployment,
 			"target", entry.Target,
 			"member_index", i,
-			"error", entry.Err)
+		}
+		switch entry.Class {
+		case DeploymentErrored:
+			s.logger.Warn("rollout member could not be planned; "+unplannedMemberApplyOutcome(rollup.Planning), append(attrs, "error", entry.Err)...)
+		case DeploymentDiverged:
+			s.logger.Warn("rollout member diverged from the primary it mirrors; the plan lists it as needing attention, and the CLI refuses a rollout-wide apply until it matches",
+				append(attrs, driftDiffLogAttrs(entry.Diff)...)...)
+		case DeploymentMatch, DeploymentPlanned:
+		}
 	}
 	s.logger.Info("planned every rollout member",
 		"database", req.Database,
@@ -90,6 +100,18 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		"distinct_plans", len(rollout.Groups),
 		"members_needing_attention", len(rollout.Attention))
 	return rollout, nil
+}
+
+// unplannedMemberApplyOutcome says what becomes of a rollout-wide apply of a
+// plan beside a member that could not be planned. A member planned against its
+// own schema has no stored plan, so apply creation refuses the apply; a
+// mirrored member would be paired with the primary's plan, so the refusal is
+// the CLI's, on the member the plan lists as needing attention.
+func unplannedMemberApplyOutcome(planning MemberPlanning) string {
+	if planning == PlanIndependent {
+		return "apply creation refuses a rollout-wide apply of this plan, which stores no plan for it"
+	}
+	return "the plan lists it as needing attention, and the CLI refuses a rollout-wide apply until it is planned"
 }
 
 // planRolloutResponse groups a rollout's members by the plan each would run,
@@ -107,6 +129,7 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
 	}
 	names := routing.DisplayNames(members)
+	selectors := rolloutMemberSelectors(members)
 
 	resp := &apitypes.PlanRolloutResponse{
 		Members:     len(rollup.Entries),
@@ -122,7 +145,7 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 			continue
 		case DeploymentDiverged:
 			resp.Attention = append(resp.Attention, &apitypes.PlanMemberAttentionResponse{
-				Member: names[i], Reason: apitypes.PlanMemberDiverged, Detail: divergedMemberDetail,
+				Member: names[i], Reason: apitypes.PlanMemberDiverged, Detail: divergedMemberDetail(selectors[i]),
 			})
 			continue
 		case DeploymentMatch, DeploymentPlanned:

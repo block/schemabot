@@ -501,10 +501,14 @@ what applies where. It reports no changes only when every target is at the
 desired schema, so a re-run of an `apply` that already landed, or the
 verification step of `onboard`, reads as up to date. When the first target is
 already at the desired schema, for example after an apply narrowed to it,
-another target can still need the change, so the plan reports that target's
-work rather than reading as up to date from the first target alone. A target
-that cannot be planned is listed as needing attention: `apply` refuses until
-it is planned, and `onboard` fails its verification.
+another target can still need the change, and the plan says so rather than
+reading as up to date from the first target alone. A target planned against
+its own schema shows that work under its own heading. A deployment expected to
+mirror the first target is listed as needing attention instead, with the
+`--target` that applies it on its own, since its plan differs from the one it
+mirrors. A target that cannot be planned is listed as needing attention too.
+`apply` of the whole rollout refuses while any target needs attention, and
+`onboard` fails its verification.
 
 A plan or apply of a whole rollout of more than one target needs a CLI that
 renders every target's plan. The server refuses one from an older CLI, which

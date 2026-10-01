@@ -469,7 +469,12 @@ func writeNarrowedTo(planResult *apitypes.PlanResponse) {
 // optionally watches progress. It returns the apply ID the server assigned,
 // which is empty when the server accepted the apply without naming one. Used by
 // both RunApply and RunRollback.
-func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
+//
+// rendersRollout is the caller's statement that it showed the operator the
+// plan every rollout member runs (apitypes.ApplyRequest.RendersRollout). Each
+// caller makes it for its own reason, so a new caller has to decide it rather
+// than inherit it.
+func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
@@ -483,7 +488,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		var applyErr error
 		// A narrowed plan is applied to the member it was made for and nowhere
 		// else; the server refuses to run it rollout-wide.
-		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, options)
+		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, options)
 		return applyErr
 	})
 	if err != nil {

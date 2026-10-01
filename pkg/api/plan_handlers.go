@@ -86,7 +86,7 @@ type PlanRequest struct {
 	// RendersRollout says the HTTP caller reads the response's rollout block
 	// and shows the operator what applies on every member. POST /api/plan
 	// refuses a rollout-wide plan of an environment with more than one member
-	// without it (refuseRolloutUnrenderedByCaller). The webhook calls the
+	// without it (refusePlanRolloutUnrenderedByCaller). The webhook calls the
 	// service in process and renders the rollout itself, so it never sets it.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
@@ -555,8 +555,8 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
-	// RendersRollout says the HTTP caller showed the operator the plan of
-	// every rollout member; see PlanRequest.RendersRollout.
+	// RendersRollout says the HTTP caller showed the operator the plan every
+	// rollout member runs; see apitypes.ApplyRequest.RendersRollout.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
 	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
 	// to say it rendered the rollout. The webhook and the trusted enqueue path

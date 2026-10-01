@@ -151,6 +151,12 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying rollback...")
 
-	_, err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
+	// A rollback has one plan, and it is the plan every member it runs on
+	// runs: the server refuses to roll back an apply narrowed to one member,
+	// pairs each member of a mirrored environment with this plan, and refuses
+	// a rollout-wide rollback where members are planned on their own, since
+	// none of them has a rollback plan. So showing this plan shows what runs
+	// on every member, though not which members those are.
+	_, err = applyAndWatch(ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	return err
 }

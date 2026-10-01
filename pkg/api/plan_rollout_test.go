@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -150,6 +152,65 @@ func TestPlanRollout_DivergedMirroredDeploymentNeedsAttention(t *testing.T) {
 	require.Len(t, rollout.Attention, 1)
 	assert.Equal(t, "us", rollout.Attention[0].Member)
 	assert.Equal(t, apitypes.PlanMemberDiverged, rollout.Attention[0].Reason)
+}
+
+// recordLogs points the service's logger at a buffer, so a test can read what
+// an operator would see in the server logs.
+func recordLogs(svc *Service) *bytes.Buffer {
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	return &logs
+}
+
+// After an apply narrowed to the primary eu lands, eu is at the desired schema
+// while us, which mirrors it, still lacks the email column. us diverges from
+// the primary, and a rollout-wide apply is refused while it does, so planning
+// again alone never changes the answer: its detail names the narrowed apply
+// that brings it in line, with the selector --target accepts for it. The
+// server log names what us would run that the primary does not, and says
+// that the refusal is the CLI's, since the server pairs a mirrored member
+// with the primary's plan.
+func TestPlanRollout_MirroredMemberBehindAConvergedPrimaryNamesTheNarrowedApply(t *testing.T) {
+	svc := mirroredService(t, &mockTernClient{},
+		&mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}, &recordingPlanStore{})
+	logs := recordLogs(svc)
+	converged := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
+
+	rollout, err := svc.planRollout(t.Context(), planDiffReq(t), converged,
+		&apitypes.PlanResponse{Deployment: "eu", Target: "testapp"})
+	require.NoError(t, err)
+	require.NotNil(t, rollout)
+	require.Len(t, rollout.Attention, 1)
+	assert.Equal(t, "us", rollout.Attention[0].Member)
+	assert.Equal(t, apitypes.PlanMemberDiverged, rollout.Attention[0].Reason)
+	assert.Contains(t, rollout.Attention[0].Detail, "apply each target on its own with --target until they match (this one is --target us/testapp)")
+
+	out := logs.String()
+	assert.Contains(t, out, `msg="rollout member diverged from the primary it mirrors; the plan lists it as needing attention, and the CLI refuses a rollout-wide apply until it matches"`)
+	assert.Contains(t, out, "deployment=us")
+	assert.Contains(t, out, "testapp.users")
+}
+
+// What becomes of a rollout-wide apply beside a member that could not be
+// planned depends on how the environment plans its members, and the warning
+// says which: a target planned against its own schema has no stored plan, so
+// apply creation refuses the apply; a mirrored deployment would be paired with
+// the primary's plan, so the CLI refuses it on the attention entry.
+func TestPlanRollout_UnplannedMemberLogSaysWhoRefusesTheApply(t *testing.T) {
+	dialErr := errors.New("dial tcp 10.0.0.7:3306: connection refused")
+	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+
+	independent := multiTargetService(t, &mockTernClient{planDiffErr: dialErr}, &recordingPlanStore{})
+	independentLogs := recordLogs(independent)
+	_, err := independent.planRollout(t.Context(), planDiffReq(t), reviewed, &apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
+	require.NoError(t, err)
+	assert.Contains(t, independentLogs.String(), `msg="rollout member could not be planned; apply creation refuses a rollout-wide apply of this plan, which stores no plan for it"`)
+
+	mirrored := mirroredService(t, &mockTernClient{}, &mockTernClient{planDiffErr: dialErr}, &recordingPlanStore{})
+	mirroredLogs := recordLogs(mirrored)
+	_, err = mirrored.planRollout(t.Context(), planDiffReq(t), reviewed, &apitypes.PlanResponse{Deployment: "eu", Target: "testapp"})
+	require.NoError(t, err)
+	assert.Contains(t, mirroredLogs.String(), `msg="rollout member could not be planned; the plan lists it as needing attention, and the CLI refuses a rollout-wide apply until it is planned"`)
 }
 
 // A primary plan that reported errors already fails the plan, so no member is

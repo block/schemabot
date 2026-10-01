@@ -749,10 +749,13 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
-	// RendersRollout says the caller showed the operator the plan of every
-	// rollout member before applying; see PlanRequest.RendersRollout. The
-	// server refuses a rollout-wide apply of an environment with more than one
-	// member from a caller that does not set it.
+	// RendersRollout says the caller showed the operator the plan every
+	// rollout member runs before applying: each member's plan from the
+	// rollout block (see PlanRequest.RendersRollout), or for a rollback its
+	// one rollback plan, which every member of a mirrored environment runs and
+	// which the server refuses to run rollout-wide where members are planned
+	// on their own. The server refuses a rollout-wide apply of an environment
+	// with more than one member from a caller that does not set it.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 

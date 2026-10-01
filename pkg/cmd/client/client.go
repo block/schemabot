@@ -328,23 +328,25 @@ func CallRollbackPlanAPI(endpoint, applyID, environment string) (*apitypes.PlanR
 	return &result, nil
 }
 
-// CallApplyAPI calls the apply API and returns the typed result.
+// CallApplyAPI calls the apply API for the whole rollout and returns the typed
+// result, for a caller that reads the plan of every rollout member itself, as
+// the end-to-end suites do; see apitypes.ApplyRequest.RendersRollout.
 func CallApplyAPI(endpoint, planID, environment, caller string, options map[string]string) (*apitypes.ApplyResponse, error) {
-	return CallApplyAPIForTarget(endpoint, planID, environment, caller, "", options)
+	return CallApplyAPIForTarget(endpoint, planID, environment, caller, "", true, options)
 }
 
 // CallApplyAPIForTarget is CallApplyAPI narrowed to the one rollout member
-// target names. An empty target applies the whole rollout.
-func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, options map[string]string) (*apitypes.ApplyResponse, error) {
+// target names. An empty target applies the whole rollout. rendersRollout says
+// the caller showed the operator the plan every rollout member runs; see
+// apitypes.ApplyRequest.RendersRollout.
+func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, rendersRollout bool, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{
-		PlanID:      planID,
-		Environment: environment,
-		Caller:      caller,
-		Options:     options,
-		Target:      target,
-		// The plan applied was rendered member by member; see
-		// postPlanRequestWithContext.
-		RendersRollout: true,
+		PlanID:         planID,
+		Environment:    environment,
+		Caller:         caller,
+		Options:        options,
+		Target:         target,
+		RendersRollout: rendersRollout,
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {
