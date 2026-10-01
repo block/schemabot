@@ -228,6 +228,7 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		Environment:  plan.Environment,
 		Deployment:   plan.Deployment,
 		Target:       plan.Target,
+		NarrowedTo:   plan.NarrowedTo,
 		Engine:       storage.EngineForType(plan.DatabaseType),
 		Changes:      []*apitypes.SchemaChangeResponse{},
 		LintResults:  []*apitypes.LintViolationResponse{},

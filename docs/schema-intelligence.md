@@ -992,7 +992,11 @@ primary deployment the plan was computed against, when one was recorded.
 DDL that was computed, the change type, whether it was classified unsafe and
 why, and whether it was classified for direct execution. The plan also names
 the rollout member it was computed against, as `deployment` and `target`
-together: one deployment can address several targets, so read the pair. Because a plan is
+together: one deployment can address several targets, so read the pair. A plan
+made for one member with a target selector (`schemabot plan --target`) carries
+that member's `deployment/target` as `narrowed_to`; it says nothing about the
+environment's other members and is applied to that member alone. A plan of the
+whole rollout omits the field. Because a plan is
 stamped with the commit it was computed from, a caller can join it back to the
 repository to inspect the proposed change at that commit. To establish what
 actually ran, inspect the apply's task DDL and outcome through progress.
@@ -1022,6 +1026,54 @@ apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
 engine generates the namespace's whole VSchema change from the plan's DDL, so
 there is no VSchema diff to review; plans show such a namespace by its DDL
 alone.
+
+<details>
+<summary>Stored plan narrowed to one rollout member</summary>
+
+```http
+GET /api/plans/plan-example-50
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-50",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "deployment": "us",
+  "created_at": "2026-09-01T04:40:00Z",
+  "change_counts": {
+    "alter": 1
+  },
+  "target": "payments-002",
+  "plan": {
+    "plan_id": "plan-example-50",
+    "database": "orders",
+    "environment": "production",
+    "deployment": "us",
+    "target": "payments-002",
+    "narrowed_to": "us/payments-002",
+    "engine": "spirit",
+    "changes": [
+      {
+        "namespace": "orders",
+        "table_changes": [
+          {
+            "table_name": "invoices",
+            "namespace": "orders",
+            "ddl": "ALTER TABLE `invoices` ADD COLUMN `memo` varchar(255)",
+            "change_type": "alter"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
 
 <details>
 <summary>Stored plan whose only work is a finalize</summary>
