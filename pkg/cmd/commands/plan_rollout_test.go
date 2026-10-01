@@ -587,10 +587,10 @@ func TestApplyCmd_RefusesWhileARolloutMemberNeedsAttention(t *testing.T) {
 }
 
 // payments-001, the rollout primary, is already at the desired schema, and
-// payments-002 and 003 still need a column. This CLI shows only the primary's
-// plan before it asks for consent, so it refuses rather than prompt for work
-// on targets whose plan it never showed, and nothing is applied.
-func TestApplyCmd_RefusesARolloutWhosePlansItCannotShow(t *testing.T) {
+// payments-002 and 003 still need a column. The apply is not a no-op, and
+// what it shows before asking for consent is every target's plan: the
+// column the other two targets add, and the targets that add it.
+func TestApplyCmd_PromptFollowsEveryTargetsPlan(t *testing.T) {
 	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
 		PlanID: "plan-orders-1",
 		Engine: "mysql",
@@ -605,14 +605,16 @@ func TestApplyCmd_RefusesARolloutWhosePlansItCannotShow(t *testing.T) {
 	})
 
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true}
-	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
 
-	require.Error(t, runErr)
 	assert.NotContains(t, out, "No changes. Your schema is up-to-date.", "a converged primary does not make the rollout a no-op:\n%s", out)
-	assert.Contains(t, runErr.Error(), "the 3 targets of this rollout run 2 different plans, and only the first one's plan can be shown before consent; apply each target on its own with --target")
-	assert.NotContains(t, out, "Do you want to apply these changes?", "no consent is asked for plans that were not shown:\n%s", out)
-	assert.NotContains(t, *paths, "/api/apply")
+	prompt := strings.Index(out, "Do you want to apply these changes?")
+	require.GreaterOrEqual(t, prompt, 0, "the apply asks for consent:\n%s", out)
+	shown := out[:prompt]
+	assert.Contains(t, shown, "ADD COLUMN `region`", "the other targets' change is shown before the prompt:\n%s", out)
+	assert.Contains(t, shown, "prod/payments-002", "%s", out)
+	assert.Contains(t, shown, "prod/payments-003", "%s", out)
+	assert.NotContains(t, *paths, "/api/apply", "nothing is applied without a yes")
 }
 
 // A rollout whose primary is already at the desired schema is applied from the
