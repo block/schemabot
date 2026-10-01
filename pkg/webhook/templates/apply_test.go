@@ -2354,6 +2354,46 @@ func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
 		"in-progress-only render must not surface the never-reported remediation")
 }
 
+// A check in "waiting" is an Actions job paused on an environment protection
+// rule: it will not finish until a deployment reviewer acts, so "wait and
+// retry" alone is not enough guidance. The render names the cause and the
+// configuration that lifts it (leave the check out of `required_checks`), while
+// the gate decision — still blocked, still retry — is unchanged. Rows in other
+// unfinished states do not get the note.
+func TestRenderApplyBlockedByInProgressChecks_WaitingNamesTheReviewerGate(t *testing.T) {
+	const waitingNote = "A check in `waiting` is paused for a deployment reviewer to approve or reject its environment and will not finish on its own."
+
+	t.Run("waiting row", func(t *testing.T) {
+		inProgress := []BlockingCheck{
+			{Name: "CI / unit-tests", State: "in_progress"},
+			{Name: "Deploy / production-approval", State: "waiting"},
+		}
+
+		result := RenderApplyBlockedByInProgressChecks("production", inProgress, nil)
+
+		assert.Contains(t, result, "| `Deploy / production-approval` | waiting |")
+		assert.Contains(t, result, waitingNote)
+		assert.Contains(t, result, "If the apply should not depend on that approval, leave the check out of `required_checks`.")
+		assert.Contains(t, result, "Wait for checks to complete and retry:\n```\nschemabot apply -e production\n```",
+			"the gate decision is unchanged: the apply is still blocked and still retried")
+		assert.Less(t, strings.Index(result, "| waiting |"), strings.Index(result, waitingNote),
+			"the note follows the table it explains")
+	})
+
+	t.Run("no waiting row", func(t *testing.T) {
+		inProgress := []BlockingCheck{
+			{Name: "CI / unit-tests", State: "in_progress"},
+			{Name: "CI / integration", State: "queued"},
+			{Name: "Security scan", State: "requested"},
+		}
+
+		result := RenderApplyBlockedByInProgressChecks("production", inProgress, nil)
+
+		assert.NotContains(t, result, waitingNote)
+		assert.NotContains(t, result, "deployment reviewer")
+	})
+}
+
 // A configured required check that has never reported on the commit gets
 // remediation distinct from the still-running checks: waiting will not unblock
 // it, so the operator is told to verify the name and that the check runs on the

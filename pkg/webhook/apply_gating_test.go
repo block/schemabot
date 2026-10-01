@@ -375,6 +375,24 @@ func TestFilterInProgressNonSchemaBotChecks_UnfinishedStatusesFailClosed(t *test
 		"unfinished checks block as in progress, not as completed checks with a failing conclusion")
 }
 
+// A check whose status is missing entirely (the API returned no status, or a
+// check-run was mapped without one) is not "completed", so it is unfinished and
+// blocks apply like any other status the gate does not recognize. Treating an
+// empty status as finished would let a check pass without ever having reported.
+func TestFilterInProgressNonSchemaBotChecks_MissingStatusFailsClosed(t *testing.T) {
+	statuses := []ghclient.PRCheckStatus{
+		{Name: "CI / tests", Status: "", Conclusion: ""},
+		{Name: "CI / lint", Status: "completed", Conclusion: "success"},
+	}
+
+	inProgress := filterInProgressNonSchemaBotChecks(statuses, nil)
+	require.Len(t, inProgress, 1)
+	assert.Equal(t, templates.BlockingCheck{Name: "CI / tests", State: ""}, inProgress[0])
+
+	assert.Empty(t, filterNonPassingNonSchemaBotChecks(statuses, nil),
+		"a check with no status blocks as unfinished, not as a completed check with a failing conclusion")
+}
+
 func TestFilterInProgressNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	tests := []struct {
 		name      string
