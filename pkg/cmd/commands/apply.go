@@ -162,6 +162,11 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// act on, so the apply is refused before it locks or prompts, and each
 	// member is named with the narrowed apply that runs it under its own plan.
 	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Refused) > 0 {
+		if cmd.Output == OutputFormatJSON {
+			// JSON output prints no member list, so the error itself names
+			// each refused member, why, and the narrowed apply that runs it.
+			return fmt.Errorf("an apply of the whole rollout cannot run the plan of %d of %d rollout members: %s", len(rollout.Refused), rollout.Members, rolloutRefusalSummary(rollout.Refused, cmd.Environment, cfg.SchemaDir))
+		}
 		return blockRolloutApplyRefused(planResult, rollout, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
@@ -572,11 +577,36 @@ func rolloutAttentionSummary(attention []*apitypes.PlanMemberAttentionResponse) 
 	return strings.Join(entries, "; ")
 }
 
+// rolloutRefusalSummary names each refused rollout member with why, on one
+// line: the narrowed apply that runs it, or, for a change its engine refuses,
+// that no apply runs it.
+func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
+	entries := make([]string, 0, len(refused))
+	for _, r := range refused {
+		if r.Reason == apitypes.PlanMemberBlocked {
+			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
+			continue
+		}
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, narrowedApplyRerun(r, environment, schemaDir)))
+	}
+	return strings.Join(entries, "; ")
+}
+
+// narrowedApplyRerun is the apply narrowed to one refused member, without the
+// binary name. It names the member by the selector the server accepts, which
+// for a deployment with one target is its target rather than the deployment
+// name it is shown under.
+func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
+	rerun := fmt.Sprintf("apply -s %s -e %s --target %s", initShellArg(schemaDir), initShellArg(environment), initShellArg(r.Target))
+	if r.AllowUnsafe {
+		rerun += " --allow-unsafe"
+	}
+	return rerun
+}
+
 // blockRolloutApplyRefused displays the plan and refuses an apply of the
 // whole rollout that apply creation would refuse for the members the rollout
-// lists, naming the narrowed apply that runs each one. A rerun names the
-// member by the selector the server accepts, which for a deployment with one
-// target is its target rather than the deployment name it is shown under.
+// lists, naming the narrowed apply that runs each one.
 func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apitypes.PlanRolloutResponse, database, environment, schemaDir string) error {
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
 	var reruns []string
@@ -584,11 +614,7 @@ func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apityp
 		if r.Reason == apitypes.PlanMemberBlocked {
 			continue
 		}
-		rerun := fmt.Sprintf("apply -s %s -e %s --target %s", initShellArg(schemaDir), initShellArg(environment), initShellArg(r.Target))
-		if r.AllowUnsafe {
-			rerun += " --allow-unsafe"
-		}
-		reruns = append(reruns, rerun)
+		reruns = append(reruns, narrowedApplyRerun(r, environment, schemaDir))
 	}
 	templates.WriteRolloutApplyRefused(templates.RolloutNoun(rollout), rollout.Refused, reruns)
 	return ErrSilent

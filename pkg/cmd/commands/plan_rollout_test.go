@@ -364,6 +364,40 @@ func TestApplyCmd_JSONOutputNamesTheMembersThatNeedAttention(t *testing.T) {
 	assert.NotContains(t, *paths, "/api/apply")
 }
 
+// With --output json the refusal's member list is not printed either, so the
+// error names each refused target, why, and what runs it: the narrowed apply
+// for a target whose own plan needs it, and no apply for one whose engine
+// refuses its change.
+func TestApplyCmd_JSONOutputNamesTheRefusedTargets(t *testing.T) {
+	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
+		PlanID:  "plan-orders-1",
+		Engine:  "mysql",
+		Changes: addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 3), Primary: true, Changes: addColumnTo("region")}},
+			Refused: []*apitypes.PlanMemberRefusalResponse{
+				{Member: "prod/payments-002", Target: "payments-002", Reason: apitypes.PlanMemberBlocked, Detail: "carries changes its target's engine refuses"},
+				{Member: "prod/payments-003", Target: "payments-003", Reason: apitypes.PlanMemberNeedsTarget, Detail: `carries an unsafe change for table "legacy" that the reviewed plan does not carry`, AllowUnsafe: true},
+			},
+		},
+	})
+
+	schemaDir := writeTestSchemaDir(t)
+	cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true, Output: OutputFormatJSON}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+	require.Error(t, runErr)
+	assert.Equal(t, "an apply of the whole rollout cannot run the plan of 2 of 3 rollout members: "+
+		"prod/payments-002 (carries changes its target's engine refuses; no apply runs it, so change the schema files); "+
+		`prod/payments-003 (carries an unsafe change for table "legacy" that the reviewed plan does not carry; run it with: apply -s `+schemaDir+" -e production --target payments-003 --allow-unsafe)",
+		runErr.Error())
+	assert.NotContains(t, out, "Apply blocked", "the human refusal is not printed in JSON mode:\n%s", out)
+	assert.Equal(t, []string{"/api/status", "/api/plan"}, *paths, "no lock is checked or taken and no apply is requested")
+}
+
 // A suggested command is pasted into a shell, so a schema directory or
 // selector that the shell would split or interpret is quoted.
 func TestApplyCmd_SuggestedCommandsQuoteTheirArguments(t *testing.T) {
