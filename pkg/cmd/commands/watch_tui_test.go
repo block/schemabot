@@ -386,6 +386,8 @@ func TestWatchModel_MultiDeploymentCutoverFollowsDeferCutover(t *testing.T) {
 // A failed or stopped multi-target rollout ends the watch view on the one
 // command that recovers it, as the progress output does, with the recovery
 // guidance said once rather than repeated in a banner beneath the command.
+// The retry's label carries the fact that decides whether to retry: a new
+// apply reprocesses only the tables that haven't completed.
 func TestWatchModel_MultiTargetRolloutEndsOnItsRecoveryCommand(t *testing.T) {
 	render := func(applyState, failedOpState string) string {
 		m := NewWatchModel("http://localhost:8080", "orders", "production", false)
@@ -406,7 +408,8 @@ func TestWatchModel_MultiTargetRolloutEndsOnItsRecoveryCommand(t *testing.T) {
 	failed := render(state.Apply.Failed, state.ApplyOperation.Failed)
 	assert.True(t, strings.HasSuffix(failed, "schemabot apply -s <schema_dir> -e production"+templates.ANSIReset+"\n\n"),
 		"the retry command closes the view:\n%s", failed)
-	assert.NotContains(t, failed, "run a new apply", "the retry guidance is not repeated beneath the command")
+	assert.Contains(t, failed, "To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:\n")
+	assert.Equal(t, 1, strings.Count(failed, "reprocesses only the tables that haven't completed"), "the retry guidance is said once:\n%s", failed)
 
 	stopped := render(state.Apply.Stopped, state.ApplyOperation.Stopped)
 	assert.True(t, strings.HasSuffix(stopped, "schemabot start apply-rollout-end -e production"+templates.ANSIReset+"\n\n"),

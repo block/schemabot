@@ -74,9 +74,11 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.Contains(t, out, "<details>\n<summary>⏳ ca — waiting for us</summary>")
 }
 
-// A halt-on-failure rollout with a failed deployment keeps the aggregate failed,
-// offers retry as the next action, and marks the never-started deployments as
-// halted (and open, since halted explains the next action).
+// A halt-on-failure rollout whose failure sits beside a deployment still
+// waiting for cutover has not settled, so a new apply would be refused: the
+// footer offers stop, not retry, and says when retry opens up and that it
+// resumes. The never-started deployments read as halted (and open, since
+// halted explains the next action).
 func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		rollingOp("eu", so.WaitingForCutover),
@@ -84,6 +86,7 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 		rollingOp("au", so.Pending),
 		rollingOp("ca", so.Pending),
 	})
+	require.False(t, state.IsTerminalApplyState(model.State), "the rollout has not settled: %s", model.State)
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
 		ApplyID:     "apply-123",
@@ -92,10 +95,9 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "**Deployments**: 1 ready for cutover, 2 halted, 1 failed")
-	// The recovery path for a failed apply is retry, matching the single-deployment
-	// footer. revert is only for a deployment in its post-cutover revert window.
-	assert.Contains(t, out, "To retry:")
-	assert.Contains(t, out, "schemabot apply -e production")
+	footer := out[strings.LastIndex(out, "\n---\n"):]
+	assert.Contains(t, footer, "To stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n\n"+presentation.RetryOnceSettledNote+"\n")
+	assert.NotContains(t, out, "schemabot apply", "a new apply is refused until this one settles")
 	assert.NotContains(t, out, "schemabot revert")
 	assert.Contains(t, out, "- ❌ `us` — failed")
 	assert.Contains(t, out, "- ⏸️ `au` — halted — us failed")
@@ -103,6 +105,30 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
 	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code>\n")
+}
+
+// Once a halted rollout is terminal, its footer is the retry, and the label
+// says the new apply resumes. The recovery path for a failed apply is retry,
+// matching the single-deployment footer; revert is only for a deployment in
+// its post-cutover revert window, and a terminal apply refuses stop.
+func TestRenderMultiDeploymentApplyComment_TerminalFailureOffersRetry(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("us", so.Failed),
+		rollingOp("au", so.Pending),
+	})
+	require.True(t, state.IsTerminalApplyState(model.State), "the rollout has settled: %s", model.State)
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	footer := out[strings.LastIndex(out, "\n---\n"):]
+	assert.Contains(t, footer, "To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:\n```\nschemabot apply -e production\n```\n")
+	assert.NotContains(t, out, "schemabot stop")
+	assert.NotContains(t, out, "schemabot revert")
+	assert.NotContains(t, out, presentation.RetryOnceSettledNote)
 }
 
 func TestRenderMultiDeploymentApplyComment_UsesOneRenderTimestamp(t *testing.T) {
@@ -423,7 +449,7 @@ func TestRenderMultiDeploymentApplySummaryComment_FailedDeploymentSummary(t *tes
 	// The failed deployment's section carries the single-deployment summary's
 	// error and retry guidance.
 	assert.Contains(t, out, "lock wait timeout")
-	assert.Contains(t, out, "To retry:")
+	assert.Contains(t, out, presentation.RetryLabel+":")
 }
 
 // When the first deployment's engine rejects the change before copying a
@@ -553,7 +579,7 @@ func TestRenderMultiDeploymentApplyComment_NoNextActionWhenCompleted(t *testing.
 	assert.NotContains(t, out, "schemabot cutover")
 	assert.NotContains(t, out, "schemabot revert")
 	assert.NotContains(t, out, "To resume:")
-	assert.NotContains(t, out, "To retry:")
+	assert.NotContains(t, out, "To retry")
 	assert.NotContains(t, out, "Last updated")
 }
 
@@ -1143,11 +1169,10 @@ func TestRenderMultiDeploymentApplyComment_RunningRolloutFooterStopsIt(t *testin
 }
 
 // A pending rollup action does not take stop away from a member that is still
-// writing to its target: a cutover ready beside a sibling still copying, a
-// halted rollout whose started sibling keeps copying, and a revert window
-// beside a running sibling each lead with their own line and then offer stop,
-// in the same footer. A deferred cutover leads with its command; an automatic
-// one says SchemaBot will run it.
+// writing to its target: a cutover ready beside a sibling still copying and a
+// revert window beside a running sibling each lead with their own line and
+// then offer stop, in the same footer. A deferred cutover leads with its
+// command; an automatic one says SchemaBot will run it.
 func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAction(t *testing.T) {
 	const stop = "To stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n"
 	for name, tc := range map[string]struct {
@@ -1163,10 +1188,6 @@ func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAc
 		"automatic cutover ready beside a copying sibling": {
 			ops:  []presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)},
 			lead: "SchemaBot will cut over `us` next — no action needed.\n",
-		},
-		"halted rollout with a copying sibling": {
-			ops:  []presentation.Operation{{Deployment: "us", State: so.Failed, Parallel: true}, {Deployment: "eu", State: so.Running, Parallel: true}},
-			lead: "To retry:\n```\nschemabot apply -e production\n```\n",
 		},
 		"revert window beside a running sibling": {
 			ops:  []presentation.Operation{rollingOp("us", so.RevertWindow), rollingOp("eu", so.Running)},
@@ -1190,6 +1211,31 @@ func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAc
 			assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
 		})
 	}
+}
+
+// A halting failure beside a sibling a driver already started leaves the
+// rollout active, and a new apply is refused until it settles: the footer
+// offers stop first and says retry opens once the apply finishes or is
+// stopped, rather than offering an apply that would be rejected.
+func TestRenderMultiDeploymentApplyComment_HaltedWithLiveSiblingOffersStopFirst(t *testing.T) {
+	ops := []presentation.Operation{{Deployment: "us", State: so.Failed, Parallel: true}, {Deployment: "eu", State: so.Running, Parallel: true}}
+	model := presentation.Derive(ops)
+	require.Equal(t, presentation.NextActionReviewFailure, model.NextAction.Kind)
+	require.False(t, state.IsTerminalApplyState(model.State), "the sibling keeps the rollout active: %s", model.State)
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			{Database: "orders_us", State: state.Apply.Failed, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
+			{Database: "orders_eu", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit},
+		},
+	})
+
+	footer := out[strings.LastIndex(out, "</details>"):]
+	assert.Contains(t, footer, "\n---\n\nTo stop this schema change:\n```\nschemabot stop apply-123 -e production\n```\n\n"+presentation.RetryOnceSettledNote+"\n")
+	assert.NotContains(t, out, "schemabot apply", "a new apply is refused until this one settles")
+	assert.Equal(t, 1, strings.Count(out, "\n---\n"), "the commands share one footer:\n%s", out)
 }
 
 // The rollout decides whether stop still has to follow its footer from the

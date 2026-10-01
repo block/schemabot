@@ -338,10 +338,12 @@ func memberTargetName(d presentation.Deployment) string {
 // FormatRolloutFooter writes the one command the rollout is waiting on, at
 // the bottom where an operator looks for it: the pending action (cut over
 // when the apply defers cutover, resume, retry), or release while a failure
-// holds the rollout. Every command addresses the whole apply. Whenever a
-// member is still writing to its target, stop follows, so a pending action
-// never takes stop away from live work; a terminal apply refuses stop, so it
-// is never offered under one.
+// holds the rollout. Every command addresses the whole apply. Whether stop
+// follows is presentation.Apply.OffersRolloutStop, which the PR comment's
+// footer decides with too: a pending action never takes stop away from live
+// work, a terminal apply refuses stop, and a failure on an apply that is
+// still active is offered stop first, since a new apply is refused until this
+// one settles.
 func FormatRolloutFooter(v RolloutView) string {
 	var b strings.Builder
 	applyCommand := func(verb string) string {
@@ -364,18 +366,17 @@ func FormatRolloutFooter(v RolloutView) string {
 		// A failed apply is recovered by a fresh apply, which resumes from
 		// where this one stopped. Progress is read by apply ID and does not
 		// know which schema directory the apply was planned from, so the
-		// operator fills it in.
-		writeRolloutCommand(&b, "To retry once the failure above is resolved", fmt.Sprintf("%s apply -s <schema_dir> -e %s", cliname.Name(), v.Environment))
+		// operator fills it in. Until the apply is terminal the fresh apply
+		// is refused, so stop is offered below instead.
+		if v.Model.OffersRetry() {
+			writeRolloutCommand(&b, presentation.RetryLabel, fmt.Sprintf("%s apply -s <schema_dir> -e %s", cliname.Name(), v.Environment))
+		}
 	case presentation.NextActionNone:
 	}
-	paused := state.IsState(v.Model.State, state.Apply.Paused)
-	if paused {
+	if state.IsState(v.Model.State, state.Apply.Paused) {
 		writeRolloutCommand(&b, "Paused after a failure — to let the held deployments proceed", applyCommand("release"))
 	}
-	if state.IsTerminalApplyState(v.Model.State) {
-		return b.String()
-	}
-	if !paused && !presentation.OffersStop(v.Model.State) && !v.Model.HasStoppableLiveWork() {
+	if !v.Model.OffersRolloutStop() {
 		return b.String()
 	}
 	verb, label := "stop", "To stop this schema change"
@@ -383,6 +384,9 @@ func FormatRolloutFooter(v RolloutView) string {
 		verb, label = "cancel", "To cancel this schema change"
 	}
 	writeRolloutCommand(&b, label, applyCommand(verb))
+	if v.Model.RetryWaitsOnActiveApply() {
+		fmt.Fprintf(&b, "%s\n", presentation.RetryOnceSettledNote)
+	}
 	return b.String()
 }
 

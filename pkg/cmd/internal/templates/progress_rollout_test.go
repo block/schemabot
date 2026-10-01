@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -405,4 +406,48 @@ func TestInFlightRollupOrder_CoversEveryInFlightTaskState(t *testing.T) {
 	}
 	require.NotEmpty(t, inFlight)
 	assert.ElementsMatch(t, inFlight, inFlightRollupOrder)
+}
+
+// A halting failure beside a target a driver already started leaves the
+// rollout active, and a new apply is refused until it settles: the footer
+// offers stop first and says retry opens once the apply finishes or is
+// stopped, whether the sibling is still copying or only waits for cutover.
+// The PR comment's footer decides the same way.
+func TestFormatRolloutFooter_FailureOnActiveRolloutOffersStopFirst(t *testing.T) {
+	waiting := rolloutTarget{opState: state.ApplyOperation.WaitingForCutover, status: state.Task.WaitingForCutover, rowsCopied: 1000, rowsTotal: 1000}
+	for name, sibling := range map[string]rolloutTarget{
+		"beside a target still copying":       copyingTarget(400),
+		"beside a target waiting for cutover": waiting,
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := targetRolloutData([]rolloutTarget{
+				{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000, err: "Error 1062"},
+				sibling,
+			})
+			data.Options = map[string]string{"defer_cutover": "true"}
+			for i := range data.Operations {
+				data.Operations[i].OnFailure = storage.OnFailureHalt
+			}
+
+			out := renderRollout(t, data)
+			assert.True(t, strings.HasSuffix(out, "To stop this schema change:\n  schemabot stop apply-7f3c -e production\n"+presentation.RetryOnceSettledNote+"\n"),
+				"stop closes the footer, followed by when retry opens up:\n%s", out)
+			assert.NotContains(t, out, "schemabot apply", "a new apply is refused until this one settles:\n%s", out)
+		})
+	}
+}
+
+// Once a failed rollout is terminal its footer is the retry, and the label
+// says that the new apply reprocesses only the tables that haven't completed.
+func TestFormatRolloutFooter_TerminalFailureOffersRetryThatResumes(t *testing.T) {
+	data := targetRolloutData([]rolloutTarget{
+		completedTarget(),
+		{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000, err: "Error 1062"},
+	})
+
+	out := renderRollout(t, data)
+	assert.True(t, strings.HasSuffix(out, "To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:\n  schemabot apply -s <schema_dir> -e production\n"),
+		"the retry closes the footer:\n%s", out)
+	assert.NotContains(t, out, "schemabot stop")
+	assert.NotContains(t, out, presentation.RetryOnceSettledNote)
 }

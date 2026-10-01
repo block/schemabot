@@ -8410,7 +8410,7 @@ _No details available yet._
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
 ```
 schemabot apply -e production
 ```
@@ -8763,7 +8763,7 @@ _No details available yet._
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
 ```
 schemabot apply -e production
 ```
@@ -9364,7 +9364,7 @@ To stop this schema change:
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-To retry once the failure above is resolved:
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
   schemabot apply -s <schema_dir> -e production
 
 ```
@@ -9408,10 +9408,9 @@ To retry once the failure above is resolved:
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-To retry once the failure above is resolved:
-  schemabot apply -s <schema_dir> -e production
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
+A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
 
 ```
 </details>
