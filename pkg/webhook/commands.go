@@ -3,6 +3,7 @@ package webhook
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -281,12 +282,15 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 // flag, the value of a flag that takes one, an apply ID, or a usage
 // placeholder such as `<apply-id>` copied from help text.
 //
-// A plain word anywhere makes the line a sentence. Otherwise the line is
-// malformed when a token is close to one SchemaBot accepts but is not exactly
-// it (an unknown or punctuated flag, a punctuated apply ID, an invalid or
-// missing database), or when it is ambiguous (a value flag given twice, two
-// apply IDs). The values of -e and -t are checked later, where an invalid one
-// gets its own usage answer.
+// A plain word anywhere makes the line a sentence, and so does a first word
+// with sentence punctuation after it that is not a command. Otherwise the line
+// is malformed when a token is close to one SchemaBot accepts but is not
+// exactly it (a punctuated command word, an unknown, punctuated, or
+// autocorrected flag, a punctuated apply ID, optional-argument brackets copied
+// from usage text, an invalid database, a missing environment or database),
+// or when it is ambiguous (a value flag given twice, two apply IDs). A
+// present -e or -t value is checked later, where an invalid one gets its own
+// usage answer.
 func (p *CommandParser) parseDirective(words []string) directive {
 	d := directive{kind: lineCommand, flags: map[string]bool{}, values: map[string]string{}, repeated: map[string]bool{}}
 	if len(words) == 0 {
@@ -294,16 +298,27 @@ func (p *CommandParser) parseDirective(words []string) directive {
 	}
 	d.name = strings.ToLower(words[0])
 	malformed := false
+	if word := strings.TrimRight(d.name, sentencePunctuation); word != d.name {
+		if _, ok := specByName[word]; !ok {
+			d.kind = lineProse
+			return d
+		}
+		malformed = true
+	}
 	for i := 1; i < len(words); i++ {
 		word := words[i]
 		lower := strings.ToLower(word)
+		if flag, ok := autocorrectedValueFlag(lower); ok {
+			lower = flag
+			malformed = true
+		}
 		if flag, ok := valueFlags[lower]; ok {
 			if _, given := d.values[flag]; given {
 				d.repeated[flag] = true
 				malformed = true
 			}
 			value := ""
-			if i+1 < len(words) && !strings.HasPrefix(words[i+1], "-") {
+			if i+1 < len(words) && !looksLikeFlag(words[i+1]) {
 				i++
 				value = words[i]
 			}
@@ -315,7 +330,7 @@ func (p *CommandParser) parseDirective(words []string) directive {
 			continue
 		}
 		switch {
-		case strings.HasPrefix(word, "-"):
+		case looksLikeFlag(word):
 			malformed = true
 		case p.applyIDRegex.MatchString(word):
 			if d.applyID != "" {
@@ -325,10 +340,15 @@ func (p *CommandParser) parseDirective(words []string) directive {
 		case p.applyIDPrefixRegex.MatchString(word):
 			malformed = true
 		case isUsagePlaceholder(word):
+		case isUsageNotation(word):
+			malformed = true
 		default:
 			d.kind = lineProse
 			return d
 		}
+	}
+	if env, given := d.values["-e"]; given && env == "" {
+		malformed = true
 	}
 	if database, given := d.values["-d"]; given && !p.databaseNameRegex.MatchString(database) {
 		malformed = true
@@ -339,10 +359,50 @@ func (p *CommandParser) parseDirective(words []string) directive {
 	return d
 }
 
+// sentencePunctuation ends a word in a sentence. A first word carrying it is
+// a command only when the rest of it is one: "SchemaBot plan." is a mistyped
+// command, "SchemaBot planned." a sentence.
+const sentencePunctuation = ".,;:!?"
+
+// looksLikeFlag reports whether word opens with a dash, including the en and
+// em dashes and the minus sign that autocorrect puts in place of `-`.
+func looksLikeFlag(word string) bool {
+	r, _ := utf8.DecodeRuneInString(word)
+	return strings.ContainsRune("-\u2010\u2011\u2012\u2013\u2014\u2015\u2212", r)
+}
+
+// autocorrectedValueFlag returns the value flag that word spells with its
+// leading `-` or `--` autocorrected to another dash, such as `–e`. The
+// line is still rejected, but the flag takes its value as usual, so the value
+// is not read as a plain word that turns the line into a sentence.
+func autocorrectedValueFlag(word string) (string, bool) {
+	r, size := utf8.DecodeRuneInString(word)
+	if r == '-' || !looksLikeFlag(word) {
+		return "", false
+	}
+	for _, flag := range []string{"-" + word[size:], "--" + word[size:]} {
+		if _, ok := valueFlags[flag]; ok {
+			return flag, true
+		}
+	}
+	return "", false
+}
+
 // isUsagePlaceholder reports whether word is a placeholder like `<apply-id>`,
 // which only appears in a command copied from usage text.
 func isUsagePlaceholder(word string) bool {
 	return len(word) > 2 && strings.HasPrefix(word, "<") && strings.HasSuffix(word, ">")
+}
+
+// isUsageNotation reports whether word is part of an optional argument written
+// the way usage text writes it, such as `[-e` or `<env>]` from
+// `schemabot plan [-e <env>]`.
+func isUsageNotation(word string) bool {
+	inner := strings.TrimRight(strings.TrimLeft(word, "["), "]")
+	if inner == word {
+		return false
+	}
+	return inner == "" || looksLikeFlag(inner) || strings.HasPrefix(inner, "<")
 }
 
 // tenantOf returns the directive's --tenant/-t routing target, and whether
@@ -358,60 +418,183 @@ func (p *CommandParser) tenantOf(d directive) (string, bool) {
 	return tenant, false
 }
 
-// markdownDirectiveText returns the lines of body that render as the
-// commenter's own text, dropping everything that only shows a command: fenced
-// and indented code, and quotes. A quote covers its `>` lines, the lines that
-// continue its paragraph without a `>` (which Markdown renders inside the
-// quote), and an HTML <blockquote>. A quote-reply to a SchemaBot command
-// therefore never runs that command.
+// markdownDirectiveText returns the text of body that renders as the
+// commenter's own words. It drops everything that only shows a command or is
+// not shown at all: fenced and indented code, HTML <pre> blocks, quotes, and
+// HTML comments. A quote covers its `>` lines, the lines that lazily continue
+// a quoted paragraph without a `>` (Markdown renders those inside the quote),
+// and an HTML <blockquote> nested to any depth. A quote-reply to a SchemaBot
+// command therefore never runs that command, while a line after the quote
+// that Markdown renders outside it is the commenter's own.
 func markdownDirectiveText(body string) string {
 	var b strings.Builder
-	inFence, inQuote, inHTMLQuote := false, false, false
+	var scan markdownScan
 	for line := range strings.Lines(body) {
-		leadingSpaces := len(line) - len(strings.TrimLeft(line, " "))
-		rest := line[leadingSpaces:]
-		markdownIndent := leadingSpaces <= 3
-		if inHTMLQuote {
-			inHTMLQuote = !closesHTMLQuote(line)
-			continue
-		}
-		if strings.TrimSpace(line) == "" {
-			inQuote = false
-			continue
-		}
-		if markdownIndent && isMarkdownFence(rest) {
-			inFence = !inFence
-			inQuote = false
-			continue
-		}
-		if inFence {
-			continue
-		}
-		if markdownIndent && strings.HasPrefix(rest, ">") {
-			inQuote = true
-			continue
-		}
-		if inQuote {
-			continue
-		}
-		if markdownIndent && opensHTMLQuote(rest) {
-			inHTMLQuote = !closesHTMLQuote(rest)
-			continue
-		}
-		if strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "\t") {
-			continue
-		}
-		b.WriteString(line)
+		b.WriteString(scan.ownText(line))
 	}
 	return b.String()
 }
 
-func opensHTMLQuote(line string) bool {
-	return strings.HasPrefix(strings.ToLower(line), "<blockquote")
+// markdownScan tracks which Markdown block each line of a comment falls in.
+type markdownScan struct {
+	inFence bool
+	// inQuote means the previous line was a `>` quote line, or lazily
+	// continued one.
+	inQuote bool
+	// quoteParagraph means the quote ends in paragraph text, which a
+	// following line without a `>` lazily continues.
+	quoteParagraph bool
+	// quoteFence means a code fence opened inside the quote is still open.
+	quoteFence bool
+	// htmlQuoteDepth and htmlPreDepth count the open HTML <blockquote> and
+	// <pre> elements.
+	htmlQuoteDepth int
+	htmlPreDepth   int
+	inHTMLComment  bool
 }
 
-func closesHTMLQuote(line string) bool {
-	return strings.Contains(strings.ToLower(line), "</blockquote>")
+var (
+	htmlBlockOpenRegex  = regexp.MustCompile(`(?i)^<(?:blockquote|pre)(?:[\s>]|$)`)
+	htmlQuoteOpenRegex  = regexp.MustCompile(`(?i)<blockquote(?:[\s>]|$)`)
+	htmlQuoteCloseRegex = regexp.MustCompile(`(?i)</blockquote\s*>`)
+	htmlPreOpenRegex    = regexp.MustCompile(`(?i)<pre(?:[\s>]|$)`)
+	htmlPreCloseRegex   = regexp.MustCompile(`(?i)</pre\s*>`)
+)
+
+// ownText returns the part of line that renders as the commenter's own text,
+// or "" when none of it does.
+func (s *markdownScan) ownText(line string) string {
+	if s.inHTMLComment {
+		s.inHTMLComment = !strings.Contains(line, "-->")
+		return ""
+	}
+	if s.inHTMLBlock() {
+		s.trackHTMLBlocks(line)
+		return ""
+	}
+	leadingSpaces := len(line) - len(strings.TrimLeft(line, " "))
+	rest := line[leadingSpaces:]
+	markdownIndent := leadingSpaces <= 3
+	switch {
+	case strings.TrimSpace(line) == "":
+		s.endQuote()
+		return ""
+	case s.inFence:
+		if markdownIndent && isMarkdownFence(rest) {
+			s.inFence = false
+		}
+		return ""
+	case markdownIndent && strings.HasPrefix(rest, ">"):
+		s.quoteLine(rest)
+		return ""
+	// A fence, an HTML block, or an HTML comment starts a block of its own
+	// even straight after quoted text, so these are checked before lazy
+	// continuation: a blank line inside one must not end the quote and
+	// expose the lines after it.
+	case markdownIndent && isMarkdownFence(rest):
+		s.endQuote()
+		s.inFence = true
+		return ""
+	case markdownIndent && htmlBlockOpenRegex.MatchString(rest):
+		s.endQuote()
+		s.trackHTMLBlocks(line)
+		return ""
+	case s.lazilyContinuesQuote(rest, markdownIndent):
+		return ""
+	case strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "\t"):
+		s.endQuote()
+		return ""
+	}
+	s.endQuote()
+	return s.stripHTMLComments(line)
+}
+
+func (s *markdownScan) inHTMLBlock() bool {
+	return s.htmlQuoteDepth > 0 || s.htmlPreDepth > 0
+}
+
+// lazilyContinuesQuote reports whether a line without a `>` renders inside
+// the quote above it: it continues a quoted paragraph and does not open an
+// HTML comment, which would start a block of its own.
+func (s *markdownScan) lazilyContinuesQuote(rest string, markdownIndent bool) bool {
+	opensComment := markdownIndent && strings.HasPrefix(rest, "<!--")
+	return s.inQuote && s.quoteParagraph && !opensComment
+}
+
+// quoteLine records a `>` line, tracking whether the quote now ends in
+// paragraph text that a following line could lazily continue. A blank quoted
+// line or a quoted code fence ends the paragraph, so the commenter's own line
+// after it is outside the quote.
+func (s *markdownScan) quoteLine(rest string) {
+	s.inQuote = true
+	content := quotedContent(rest)
+	indent := len(content) - len(strings.TrimLeft(content, " "))
+	quotedFence := indent <= 3 && isMarkdownFence(content[indent:])
+	switch {
+	case s.quoteFence:
+		s.quoteFence = !quotedFence
+		s.quoteParagraph = false
+	case strings.TrimSpace(content) == "":
+		s.quoteParagraph = false
+	case quotedFence:
+		s.quoteFence = true
+		s.quoteParagraph = false
+	case indent > 3:
+		// Continues an open paragraph, or is indented code that ends
+		// none: the paragraph state is unchanged either way.
+	default:
+		s.quoteParagraph = true
+	}
+}
+
+// quotedContent strips every `>` marker, nested quotes included, from a quote
+// line, leaving the text the quote holds.
+func quotedContent(rest string) string {
+	content := rest
+	for {
+		trimmed := strings.TrimLeft(content, " ")
+		if len(content)-len(trimmed) > 3 || !strings.HasPrefix(trimmed, ">") {
+			return content
+		}
+		content = strings.TrimPrefix(trimmed[1:], " ")
+	}
+}
+
+func (s *markdownScan) endQuote() {
+	s.inQuote, s.quoteParagraph, s.quoteFence = false, false, false
+}
+
+// trackHTMLBlocks updates the open HTML <blockquote> and <pre> counts with
+// the tags on line.
+func (s *markdownScan) trackHTMLBlocks(line string) {
+	s.htmlQuoteDepth = max(0, s.htmlQuoteDepth+len(htmlQuoteOpenRegex.FindAllString(line, -1))-len(htmlQuoteCloseRegex.FindAllString(line, -1)))
+	s.htmlPreDepth = max(0, s.htmlPreDepth+len(htmlPreOpenRegex.FindAllString(line, -1))-len(htmlPreCloseRegex.FindAllString(line, -1)))
+}
+
+// stripHTMLComments drops the HTML comments from line, which GitHub does not
+// render. A comment left open hides every following line up to and including
+// the one that closes it.
+func (s *markdownScan) stripHTMLComments(line string) string {
+	text, newline := strings.CutSuffix(line, "\n")
+	var b strings.Builder
+	for {
+		start := strings.Index(text, "<!--")
+		if start < 0 {
+			b.WriteString(text)
+			break
+		}
+		b.WriteString(text[:start])
+		end := strings.Index(text[start+len("<!--"):], "-->")
+		if end < 0 {
+			s.inHTMLComment = true
+			break
+		}
+		text = text[start+len("<!--")+end+len("-->"):]
+	}
+	if newline {
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func isMarkdownFence(line string) bool {

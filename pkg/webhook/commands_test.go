@@ -331,13 +331,11 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "env flag does not consume a following flag",
+			name: "env flag does not consume a following flag, and without a value is rejected",
 			body: "schemabot apply -e --tenant alpha",
 			expected: CommandResult{
-				Action:     "apply",
-				Tenant:     "alpha",
-				MissingEnv: true,
-				IsMention:  true,
+				Tenant:    "alpha",
+				IsMention: true,
 			},
 		},
 		{
@@ -512,6 +510,16 @@ func TestParseCommand(t *testing.T) {
 			expected: CommandResult{
 				IsMention: true,
 			},
+		},
+		{
+			name:     "single word with sentence punctuation that is not a command is prose",
+			body:     "SchemaBot rocks!",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "single-word sentence does not hide a command after it",
+			body:     "SchemaBot planned.\n\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
 		},
 		{
 			name: "control command copied with its usage placeholder",
@@ -1074,6 +1082,13 @@ func TestParseCommand_MalformedCommand(t *testing.T) {
 		{name: "apply ID with a full stop", body: "schemabot rollback apply-abc123. -e staging", expected: rejected},
 		{name: "apply ID with trailing letters", body: "schemabot rollback apply-abc123xyz -e staging", expected: rejected},
 		{name: "two apply IDs", body: "schemabot rollback apply-abc123 apply-def456 -e staging", expected: rejected},
+		{name: "command word with a comma", body: "schemabot apply, -e staging", expected: rejected},
+		{name: "unsafe flag autocorrected to an em dash", body: "schemabot apply -e staging \u2014allow-unsafe", expected: rejected},
+		{name: "environment flag autocorrected to an en dash", body: "schemabot apply \u2013e staging", expected: rejected},
+		{name: "optional environment copied from usage text", body: "schemabot plan [-e <env>]", expected: rejected},
+		{name: "optional tenant copied from usage text", body: "schemabot rollback <apply-id> -e staging [-t <tenant>]", expected: rejected},
+		{name: "environment flag without a value", body: "schemabot plan -e", expected: rejected},
+		{name: "environment flag followed by another flag", body: "schemabot plan -e -d billing", expected: rejected},
 		{name: "environment given twice", body: "schemabot apply -e staging -e production", expected: rejected},
 		{
 			name:     "tenant given twice has no single routing target",
@@ -1089,6 +1104,11 @@ func TestParseCommand_MalformedCommand(t *testing.T) {
 			name:     "rejected line is the directive; a later command does not run",
 			body:     "schemabot apply -e staging --allow-unsafe.\n\nschemabot plan -e staging",
 			expected: rejected,
+		},
+		{
+			name:     "a bracketed plain word is a sentence, not usage text",
+			body:     "SchemaBot plan [done]",
+			expected: CommandResult{ProseMention: true},
 		},
 		{
 			name:     "a plain word makes the line a sentence, not a rejected command",
@@ -1138,6 +1158,67 @@ func TestFlagHelpers_IgnoreAMalformedCommand(t *testing.T) {
 
 	assert.False(t, p.HasDeferCutoverFlag("schemabot plan -e staging --defer-cutover --foo"))
 	assert.True(t, p.HasDeferCutoverFlag("schemabot plan -e staging --defer-cutover"))
+}
+
+// GitHub does not render an HTML comment and renders an HTML <pre> block as
+// code, so a command in either is not the commenter's text and does not run.
+// Text around a comment on the same line, and lines after it, are the
+// commenter's own.
+func TestParseCommand_HiddenAndPreformattedHTML(t *testing.T) {
+	parser := NewCommandParser()
+
+	tests := []struct {
+		name     string
+		body     string
+		expected CommandResult
+	}{
+		{
+			name:     "command inside a multi-line HTML comment",
+			body:     "<!--\nschemabot apply -e production --allow-unsafe\n-->\nLGTM",
+			expected: CommandResult{},
+		},
+		{
+			name:     "command inside a one-line HTML comment",
+			body:     "<!-- schemabot apply -e production -->",
+			expected: CommandResult{},
+		},
+		{
+			name:     "command after an HTML comment",
+			body:     "<!--\nnote\n-->\nschemabot plan -e staging",
+			expected: CommandResult{Action: "plan", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "command with an HTML comment after it on the same line",
+			body:     "schemabot plan -e staging <!-- from the runbook -->",
+			expected: CommandResult{Action: "plan", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "command with a multi-line HTML comment opening after it",
+			body:     "schemabot plan -e staging <!--\nschemabot apply -e production\n-->",
+			expected: CommandResult{Action: "plan", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "command on its own line after a sentence that opens an HTML comment",
+			body:     "Rebased onto main. <!--\nnote\n-->\nschemabot plan -e staging",
+			expected: CommandResult{Action: "plan", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "command inside an HTML pre block",
+			body:     "<pre>\nschemabot apply -e production\n</pre>",
+			expected: CommandResult{},
+		},
+		{
+			name:     "command after an HTML pre block with blank lines inside",
+			body:     "<PRE class=\"shell\">\n\nschemabot apply -e production\n</PRE>\nschemabot plan -e staging",
+			expected: CommandResult{Action: "plan", Environment: "staging", Found: true, IsMention: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, parser.ParseCommand(tt.body))
+		})
+	}
 }
 
 // Quoting a command, as GitHub's quote-reply does, shows it rather than
@@ -1233,6 +1314,61 @@ func TestParseCommand_QuoteReply(t *testing.T) {
 			name:     "replier's own command after an HTML blockquote ends",
 			body:     "<blockquote>\nschemabot apply -e production\n</blockquote>\n\nschemabot plan -e staging",
 			expected: CommandResult{Action: "plan", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "nested HTML blockquote stays open after the inner one closes",
+			body:     "<blockquote>\n<blockquote>\nearlier\n</blockquote>\nschemabot apply -e production\n</blockquote>",
+			expected: CommandResult{},
+		},
+		{
+			name:     "nested HTML blockquotes opened on one line",
+			body:     "<blockquote><blockquote>earlier</blockquote>\nschemabot apply -e production\n</blockquote>",
+			expected: CommandResult{},
+		},
+		{
+			name:     "own command after a blank quoted line is outside the quote",
+			body:     "> Should this go to staging first?\n>\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "own command after a closed quoted fence is outside the quote",
+			body:     "> ```\n> schemabot apply -e production\n> ```\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "own command after an unclosed quoted fence is outside the quote",
+			body:     "> ```\n> schemabot apply -e production\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "own command straight after a quoted fence opens is outside the quote",
+			body:     "> ```\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "own command after a multi-line unclosed quoted fence is outside the quote",
+			body:     "> ```\n> schemabot plan -e production\n> schemabot apply -e production\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "indented quoted line continues the quoted paragraph rather than opening a fence",
+			body:     "> Can you run this?\n>     ```\nschemabot apply -e production",
+			expected: CommandResult{},
+		},
+		{
+			name:     "fence opened straight after a quote hides a command after a blank line inside it",
+			body:     "> Can you run this?\n```\nearlier\n\nschemabot apply -e production\n```",
+			expected: CommandResult{},
+		},
+		{
+			name:     "HTML blockquote opened straight after a quote hides a command after a blank line inside it",
+			body:     "> Can you run this?\n<blockquote>\n\nschemabot apply -e production\n</blockquote>",
+			expected: CommandResult{},
+		},
+		{
+			name:     "HTML comment opened straight after a quote hides a command after a blank line inside it",
+			body:     "> Can you run this?\n<!--\n\nschemabot apply -e production\n-->",
+			expected: CommandResult{},
 		},
 	}
 
