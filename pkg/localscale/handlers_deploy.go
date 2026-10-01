@@ -217,13 +217,22 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 
 	if totalDDL == 0 && !hasVSchema {
-		if err := s.execLog(r.Context(),
+		result, err := s.metadataDB.ExecContext(r.Context(),
 			`UPDATE localscale_deploy_requests
 			 SET deployed = TRUE, deployment_state = ?
-			 WHERE org = ? AND database_name = ? AND number = ?`,
+			 WHERE org = ? AND database_name = ? AND number = ?
+			 AND deployed = FALSE AND closed_at IS NULL`,
 			dr.NoChanges, org, database, number,
-		); err != nil {
+		)
+		if err != nil {
 			return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return newHTTPError(http.StatusInternalServerError, "read updated deploy rows: %v", err)
+		}
+		if affected == 0 {
+			return newHTTPError(http.StatusConflict, "deploy request already deployed or closed")
 		}
 		s.writeJSON(w, deployResponse(number, branch, dr.NoChanges, createdAt))
 		return nil

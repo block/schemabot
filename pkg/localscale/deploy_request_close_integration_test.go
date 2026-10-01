@@ -68,6 +68,39 @@ func TestCloseUndeployedDeployRequest(t *testing.T) {
 	assert.Contains(t, err.Error(), "already closed")
 }
 
+// A no-change deploy request remains closed when a deploy arrives afterward.
+// The no-change fast path must enforce the same close/deploy exclusion as a
+// deploy request carrying DDL.
+func TestClosedNoChangeDeployRequestCannotDeploy(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	deferCleanupActiveDeployRequests(t)
+	ctx := t.Context()
+
+	branchName := createBranchWithDDL(t, ctx, "close-no-change", nil, nil)
+	dr := createDeploy(t, ctx, branchName, false)
+	require.Equal(t, drState.NoChanges, dr.DeploymentState)
+
+	closed, err := testClient.CloseDeployRequest(ctx, &ps.CloseDeployRequestRequest{
+		Organization: testOrg, Database: testDB, Number: dr.Number,
+	})
+	require.NoError(t, err, "CloseDeployRequest")
+	assert.Equal(t, "closed", closed.State)
+
+	_, err = testClient.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+		Organization: testOrg, Database: testDB, Number: dr.Number,
+	})
+	require.Error(t, err, "a closed no-change deploy request must not deploy")
+	assert.Contains(t, err.Error(), "is closed")
+
+	got, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+		Organization: testOrg, Database: testDB, Number: dr.Number,
+	})
+	require.NoError(t, err, "GetDeployRequest")
+	assert.Equal(t, "closed", got.State)
+	assert.Equal(t, drState.NoChanges, got.DeploymentState)
+	assert.Nil(t, got.DeployedAt)
+}
+
 // A deferred deploy waiting for its start holds a ready deploy request. Cancel
 // through the PlanetScale engine must close that deploy request rather than
 // fail on the refused cancel, and a retried cancel must settle on the closed
