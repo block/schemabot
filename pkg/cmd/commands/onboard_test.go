@@ -581,6 +581,53 @@ func TestValidateOnboardPlanResult(t *testing.T) {
 	assert.Contains(t, err.Error(), "plan response is empty")
 }
 
+// Onboarding a database whose environment has several targets verifies every
+// target, not only the primary the plan is made against. A primary already at
+// the pulled schema passes verification only when every other target is too:
+// a target that still needs a change fails it, naming that target and the
+// change, and a target that could not be planned fails it as unverified.
+func TestValidateOnboardPlanResult_VerifiesEveryRolloutMember(t *testing.T) {
+	alterUsers := []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders",
+		TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "users", ChangeType: "ALTER", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		}},
+	}}
+	converged := &apitypes.PlanResponse{Environment: "production", Rollout: &apitypes.PlanRolloutResponse{
+		Members:     3,
+		Independent: true,
+		Groups:      []*apitypes.PlanMemberGroupResponse{{Primary: true, Members: []string{"orders-001", "orders-002", "orders-003"}}},
+	}}
+	assert.NoError(t, validateOnboardPlanResult(converged, "orders", "production"))
+
+	pending := &apitypes.PlanResponse{Environment: "production", Rollout: &apitypes.PlanRolloutResponse{
+		Members:     3,
+		Independent: true,
+		Groups: []*apitypes.PlanMemberGroupResponse{
+			{Primary: true, Members: []string{"orders-001", "orders-002"}},
+			{Members: []string{"orders-003"}, Changes: alterUsers},
+		},
+	}}
+	err := validateOnboardPlanResult(pending, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "still produce schema changes")
+	assert.Contains(t, err.Error(), "orders-003: orders/users (alter): ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.NotContains(t, err.Error(), "orders-001:")
+
+	unplanned := &apitypes.PlanResponse{Environment: "production", Rollout: &apitypes.PlanRolloutResponse{
+		Members:     3,
+		Independent: true,
+		Groups:      []*apitypes.PlanMemberGroupResponse{{Primary: true, Members: []string{"orders-001", "orders-003"}}},
+		Attention: []*apitypes.PlanMemberAttentionResponse{{
+			Member: "orders-002", Reason: apitypes.PlanMemberUnplanned, Detail: "could not be planned; see server logs for the cause, then plan again",
+		}},
+	}}
+	err = validateOnboardPlanResult(unplanned, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "1 of 3 rollout members could not be verified")
+	assert.Contains(t, err.Error(), "orders-002: could not be planned; see server logs for the cause, then plan again")
+}
+
 func TestDescribeOnboardPlanChangesIncludesVSchemaAndClampsDDL(t *testing.T) {
 	longDDL := "ALTER TABLE `users` ADD COLUMN " + strings.Repeat("`c` varchar(255), ", 20)
 	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{

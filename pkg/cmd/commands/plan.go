@@ -360,9 +360,10 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	templates.WriteExemptTables(result.ExemptTables)
 }
 
-// hasResultChanges returns true if the result has schema changes (DDL or VSchema).
+// hasResultChanges returns true if the result has schema changes (DDL or
+// VSchema) on any member of its rollout.
 func hasResultChanges(result *apitypes.PlanResponse) bool {
-	return result != nil && result.HasChanges()
+	return result != nil && result.RolloutHasChanges()
 }
 
 // sortEnvironments sorts environments with staging first, production second, then alphabetically.
